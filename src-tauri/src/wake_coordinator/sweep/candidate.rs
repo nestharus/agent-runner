@@ -9,9 +9,6 @@ use oulipoly_state::mailbox::{
 use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
 
 use super::{WakeSweepDisposition, consumed};
-use crate::wake_coordinator::auto_wake_env::{
-    auto_wake_cap_reached, auto_wake_max_for_runtime, emit_auto_wake_cap_reached,
-};
 
 pub(super) fn wake_sweep_candidate_disposition(
     db: &MailboxDb,
@@ -30,8 +27,8 @@ pub(super) fn wake_sweep_candidate_disposition(
     if wake_sweep_candidate_is_unclaimed_abandoned_transient(db, &candidate.session_id)? {
         return abandoned_transient_disposition(db, state, candidate);
     }
-    if let Some(runtime) = wake_sweep_candidate_resumable_runtime(db, state, candidate)? {
-        return Ok(resumable_disposition_with_cap_emit(candidate, &runtime));
+    if wake_sweep_candidate_resumable_runtime(db, state, candidate)?.is_some() {
+        return Ok(resumable_wake_sweep_disposition(candidate));
     }
     if wake_sweep_candidate_has_live_owner(db, &candidate.session_id)? {
         return Ok(WakeSweepDisposition::Skip);
@@ -79,28 +76,7 @@ fn runtime_has_produced_turns(evidence: Option<(bool, u64)>) -> bool {
         .unwrap_or(false)
 }
 
-fn resumable_disposition_with_cap_emit(
-    candidate: &WakeSweepCandidate,
-    runtime: &SessionRuntimeRow,
-) -> WakeSweepDisposition {
-    let auto_wake_max = auto_wake_max_for_runtime(Some(runtime));
-    emit_cap_reached_if_capped(candidate, auto_wake_max);
-    resumable_wake_sweep_disposition(candidate, auto_wake_max)
-}
-
-fn emit_cap_reached_if_capped(candidate: &WakeSweepCandidate, auto_wake_max: i64) {
-    if wake_sweep_candidate_reached_cap(candidate, auto_wake_max) {
-        emit_wake_sweep_candidate_cap_reached(&candidate.session_id, candidate, auto_wake_max);
-    }
-}
-
-fn resumable_wake_sweep_disposition(
-    candidate: &WakeSweepCandidate,
-    auto_wake_max: i64,
-) -> WakeSweepDisposition {
-    if wake_sweep_candidate_reached_cap(candidate, auto_wake_max) {
-        return WakeSweepDisposition::Skip;
-    }
+fn resumable_wake_sweep_disposition(candidate: &WakeSweepCandidate) -> WakeSweepDisposition {
     if !wake_sweep_candidate_has_deliverable_pending(&candidate.session_id) {
         return WakeSweepDisposition::Skip;
     }
@@ -295,22 +271,6 @@ fn mailbox_row_owner_identity(row: &MailboxRow) -> Option<ProcessIdentity> {
         os_boot_id: row.matched_os_boot_id.clone()?,
         os_pid_starttime_ticks: row.matched_os_pid_starttime_ticks?,
     })
-}
-
-fn wake_sweep_candidate_reached_cap(candidate: &WakeSweepCandidate, auto_wake_max: i64) -> bool {
-    auto_wake_cap_reached(candidate.auto_wake_count.saturating_sub(1), auto_wake_max)
-}
-
-fn emit_wake_sweep_candidate_cap_reached(
-    session_id: &str,
-    candidate: &WakeSweepCandidate,
-    auto_wake_max: i64,
-) {
-    emit_auto_wake_cap_reached(
-        session_id,
-        candidate.auto_wake_count.saturating_sub(1),
-        auto_wake_max,
-    );
 }
 
 fn trace_abandoned_transient_wake_skip(session_id: &str) {

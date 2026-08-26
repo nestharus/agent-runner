@@ -6640,7 +6640,6 @@ fn seed_mailbox(path: &Path, session_id: &str, cwd: Option<&str>) {
         pty_control_path: None,
         models_dir: None,
         effective_cwd: cwd,
-        selected_auto_wake_max: None,
     })
     .unwrap();
 }

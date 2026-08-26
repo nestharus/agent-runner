@@ -1055,7 +1055,6 @@ fn isolated_command(config_home: &Path, data_home: &Path) -> Command {
     command.env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID");
     command.env_remove("OULIPOLY_AUTO_WAKE_TOKEN");
     command.env_remove("OULIPOLY_AUTO_WAKE_COUNT");
-    command.env_remove("OULIPOLY_AUTO_WAKE_MAX");
     command.env_remove("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS");
     command.env_remove("OULIPOLY_PARENT_INVOCATION");
     command

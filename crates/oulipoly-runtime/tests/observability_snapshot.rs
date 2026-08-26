@@ -768,7 +768,6 @@ fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
             pty_control_path: None,
             models_dir: Some("/models/observability-read-only"),
             effective_cwd: Some("/work/observability-read-only"),
-            selected_auto_wake_max: Some(5),
         })
         .unwrap();
     let before = physical_file_snapshot(&fixture.data_dir);
@@ -804,7 +803,6 @@ fn pending_mailbox_without_claim_is_reported_as_stuck() {
             pty_control_path: Some("/tmp/oulipoly-observe.sock"),
             models_dir: None,
             effective_cwd: None,
-            selected_auto_wake_max: None,
         })
         .unwrap();
     mailbox

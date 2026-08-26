@@ -72,8 +72,8 @@ fn manual_resume_race_is_safe() {
 }
 
 #[test]
-fn batch_cap_followup_wake() {
-    cases_batch_sweep::batch_cap_followup_wake();
+fn persisted_count_at_five_allows_turn_end_followup_wake() {
+    cases_batch_sweep::persisted_count_at_five_allows_turn_end_followup_wake();
 }
 
 #[test]
@@ -117,13 +117,8 @@ fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
 }
 
 #[test]
-fn environment_empty_sweep_uses_persisted_wake_max_beyond_five() {
-    cases_batch_sweep::environment_empty_sweep_uses_persisted_wake_max_beyond_five();
-}
-
-#[test]
-fn persisted_wake_max_caps_sweep_at_selected_value() {
-    cases_batch_sweep::persisted_wake_max_caps_sweep_at_selected_value();
+fn persisted_count_at_five_allows_startup_sweep_delivery() {
+    cases_batch_sweep::persisted_count_at_five_allows_startup_sweep_delivery();
 }
 
 #[test]

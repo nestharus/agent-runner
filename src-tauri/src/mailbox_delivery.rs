@@ -1038,7 +1038,6 @@ fn headless_session_runtime_upsert<'a>(
         pty_control_path: None,
         models_dir,
         effective_cwd: None,
-        selected_auto_wake_max: None,
     }
 }
 

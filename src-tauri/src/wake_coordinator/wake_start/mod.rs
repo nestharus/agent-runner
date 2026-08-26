@@ -11,12 +11,9 @@ use oulipoly_state::mailbox::{
 };
 use uuid::Uuid;
 
-use super::auto_wake_env::{
-    auto_wake_cap_reached, auto_wake_max_for_runtime, emit_auto_wake_cap_reached,
-};
 use super::diagnostics::{
-    WakeDiagnostic, already_in_flight_diagnostic, auto_wake_cap_diagnostic, spawn_error_diagnostic,
-    spawned_wake_diagnostic, storage_error_diagnostic,
+    WakeDiagnostic, already_in_flight_diagnostic, spawn_error_diagnostic, spawned_wake_diagnostic,
+    storage_error_diagnostic,
 };
 use super::spawn::spawn_detached_resume;
 
@@ -33,7 +30,6 @@ struct WakeStartContext<'a> {
     db: MailboxDb,
     runtime: Option<SessionRuntimeRow>,
     claim: WakeClaimRow,
-    auto_wake_max: i64,
 }
 
 pub(crate) fn trigger_notify_wake(session_id: &str) -> WakeDiagnostic {
@@ -56,7 +52,6 @@ pub(super) fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
         context.runtime.as_ref(),
         &context.claim.claim_token,
         context.input.auto_wake_count,
-        context.auto_wake_max,
     );
     wake_spawn_diagnostic(
         &mut context.db,
@@ -89,15 +84,13 @@ fn prepare_wake_start_context_with_db<'a>(
     super::consumed_completion::reconcile_late_consumed_completions_on(&mut db, input.session_id)
         .map_err(storage_error_diagnostic)?;
     validate_wake_has_deliverable_pending(&db, input.session_id)?;
-    let auto_wake_max = auto_wake_max_for_runtime(runtime.as_ref());
-    validate_start_wake_cap(input, auto_wake_max)?;
     let liveness = wake_runtime_liveness(&mut db, input.session_id, runtime.as_ref())?;
     cleanup_idle_runtime(runtime.as_ref(), liveness);
     if wake_liveness_busy(liveness) {
         return Err(busy_diagnostic());
     }
     let claim = acquire_startable_wake_claim(&mut db, input, claim_token)?;
-    Ok(wake_start_context(input, db, runtime, claim, auto_wake_max))
+    Ok(wake_start_context(input, db, runtime, claim))
 }
 
 fn validate_wake_has_deliverable_pending(
@@ -140,14 +133,12 @@ fn wake_start_context<'a>(
     db: MailboxDb,
     runtime: Option<SessionRuntimeRow>,
     claim: WakeClaimRow,
-    auto_wake_max: i64,
 ) -> WakeStartContext<'a> {
     WakeStartContext {
         input,
         db,
         runtime,
         claim,
-        auto_wake_max,
     }
 }
 
@@ -162,34 +153,6 @@ fn normalize_start_wake_input<'a>(
         auto_wake_count: input.auto_wake_count.max(persisted_next).max(1),
         ..input
     }
-}
-
-fn start_wake_input_reached_cap(input: StartWakeInput<'_>, auto_wake_max: i64) -> bool {
-    auto_wake_cap_reached(input.auto_wake_count.saturating_sub(1), auto_wake_max)
-}
-
-fn validate_start_wake_cap(
-    input: StartWakeInput<'_>,
-    auto_wake_max: i64,
-) -> Result<(), WakeDiagnostic> {
-    if !start_wake_input_reached_cap(input, auto_wake_max) {
-        return Ok(());
-    }
-    let current_count = input.auto_wake_count.saturating_sub(1);
-    Err(start_wake_cap_diagnostic(
-        input.session_id,
-        current_count,
-        auto_wake_max,
-    ))
-}
-
-fn start_wake_cap_diagnostic(
-    session_id: &str,
-    current_count: i64,
-    auto_wake_max: i64,
-) -> WakeDiagnostic {
-    emit_auto_wake_cap_reached(session_id, current_count, auto_wake_max);
-    auto_wake_cap_diagnostic(current_count)
 }
 
 fn wake_runtime_liveness(
@@ -310,6 +273,69 @@ fn warn_wake_pid_record_failed(session_id: &str, claim_token: &str, err: String)
 mod tests {
     use super::*;
     use crate::wake_coordinator::consumed_completion::ConsumedCompletionFixture;
+    use oulipoly_state::mailbox::{SessionRuntimeUpsert, WakeClaimRequest};
+
+    #[test]
+    fn persisted_count_at_five_acquires_exact_wake_claim() {
+        let fixture = ConsumedCompletionFixture::new();
+        let mut db = fixture.mailbox();
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: ConsumedCompletionFixture::SESSION_ID,
+            mode: "headless",
+            invocation_uuid: Some(ConsumedCompletionFixture::INVOCATION_UUID),
+            provider_name: Some("fixture-provider"),
+            model_name: Some("fixture-model"),
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+        })
+        .unwrap();
+        let seeded = db
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: ConsumedCompletionFixture::SESSION_ID,
+                claim_token: "seed-count-token",
+                reason: "fixture",
+                auto_wake_count: 5,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+        assert!(matches!(seeded, WakeClaimAcquireResult::Acquired(_)));
+        db.release_wake_claim(
+            ConsumedCompletionFixture::SESSION_ID,
+            Some("seed-count-token"),
+        )
+        .unwrap();
+
+        let context = prepare_wake_start_context_with_db(
+            StartWakeInput {
+                session_id: ConsumedCompletionFixture::SESSION_ID,
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                renew_token: None,
+            },
+            "exact-new-claim-token",
+            db,
+        )
+        .unwrap_or_else(|diagnostic| {
+            panic!(
+                "pending work at persisted count five must acquire a claim, got {}",
+                diagnostic.status
+            )
+        });
+
+        assert_eq!(context.input.auto_wake_count, 6);
+        assert_eq!(context.claim.claim_token, "exact-new-claim-token");
+        assert_eq!(
+            context
+                .db
+                .wake_claim(ConsumedCompletionFixture::SESSION_ID)
+                .unwrap()
+                .unwrap()
+                .claim_token,
+            "exact-new-claim-token"
+        );
+    }
 
     #[test]
     fn wake_start_reconciles_late_consumption_before_claim() {

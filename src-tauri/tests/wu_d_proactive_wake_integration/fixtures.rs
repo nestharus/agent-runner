@@ -65,12 +65,6 @@ impl Fixture {
         cmd.output().unwrap()
     }
 
-    pub(crate) fn run_without_auto_wake_max(&self, mut cmd: Command) -> Output {
-        self.prepare_command(&mut cmd);
-        cmd.env_remove("OULIPOLY_AUTO_WAKE_MAX");
-        cmd.output().unwrap()
-    }
-
     fn prepare_command(&self, cmd: &mut Command) {
         cmd.env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
@@ -89,7 +83,7 @@ impl Fixture {
 
     pub(crate) fn run_agent(&self, prompt: &str) -> Output {
         let cmd = self.agent_command(prompt);
-        self.run_without_auto_wake_max(cmd)
+        self.run(cmd)
     }
 
     fn agent_command(&self, prompt: &str) -> Command {

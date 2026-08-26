@@ -2,13 +2,12 @@
 //!
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`, `validator`
 
-use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeRow};
+use oulipoly_state::mailbox::MailboxDb;
 use std::time::Duration;
 
 use super::constants::{
-    AUTO_WAKE_COUNT_ENV, AUTO_WAKE_ENV, AUTO_WAKE_MAX_ENV, AUTO_WAKE_RETRY_BASE_MS_ENV,
-    AUTO_WAKE_RETRY_MAX_MS, AUTO_WAKE_SESSION_ID_ENV, AUTO_WAKE_TOKEN_ENV, DEFAULT_AUTO_WAKE_MAX,
-    DEFAULT_AUTO_WAKE_RETRY_BASE_MS,
+    AUTO_WAKE_COUNT_ENV, AUTO_WAKE_ENV, AUTO_WAKE_RETRY_BASE_MS_ENV, AUTO_WAKE_RETRY_MAX_MS,
+    AUTO_WAKE_SESSION_ID_ENV, AUTO_WAKE_TOKEN_ENV, DEFAULT_AUTO_WAKE_RETRY_BASE_MS,
 };
 
 pub(super) struct AutoWakeEnv {
@@ -115,7 +114,10 @@ fn auto_wake_retry_delay(auto_wake_count: i64) -> Duration {
 }
 
 fn auto_wake_retry_delay_ms(auto_wake_count: i64) -> u64 {
-    let base_ms = auto_wake_retry_base_ms();
+    bounded_auto_wake_retry_delay_ms(auto_wake_retry_base_ms(), auto_wake_count)
+}
+
+fn bounded_auto_wake_retry_delay_ms(base_ms: u64, auto_wake_count: i64) -> u64 {
     let exponent = auto_wake_count.saturating_sub(1).clamp(0, 10) as u32;
     base_ms
         .saturating_mul(2_u64.saturating_pow(exponent))
@@ -144,38 +146,10 @@ pub(super) fn current_auto_wake_count(auto_wake: Option<&AutoWakeEnv>) -> i64 {
     auto_wake.map(|wake| wake.count).unwrap_or(0)
 }
 
-pub(super) fn auto_wake_cap_reached(current_count: i64, max_count: i64) -> bool {
-    current_count >= max_count
-}
-
-pub(super) fn emit_auto_wake_cap_reached(session_id: &str, current_count: i64, max_count: i64) {
-    eprintln!(
-        "auto_wake_cap_reached session_id={session_id} count={current_count} max={max_count}"
-    );
-}
-
 pub(super) fn current_auto_wake() -> Option<AutoWakeEnv> {
     auto_wake_marker_present()
         .then(current_auto_wake_env)
         .flatten()
-}
-
-pub(super) fn auto_wake_max() -> i64 {
-    validated_auto_wake_max(parsed_auto_wake_max())
-}
-
-pub(super) fn auto_wake_max_for_runtime(runtime: Option<&SessionRuntimeRow>) -> i64 {
-    runtime
-        .and_then(|runtime| runtime.selected_auto_wake_max)
-        .unwrap_or_else(auto_wake_max)
-}
-
-pub(super) fn auto_wake_max_for_session(session_id: &str) -> Result<i64, String> {
-    let Some(db) = MailboxDb::open_default_if_exists()? else {
-        return Ok(auto_wake_max());
-    };
-    let runtime = db.session_runtime(session_id)?;
-    Ok(auto_wake_max_for_runtime(runtime.as_ref()))
 }
 
 fn current_auto_wake_env() -> Option<AutoWakeEnv> {
@@ -186,10 +160,6 @@ fn auto_wake_count() -> i64 {
     parse_auto_wake_count(auto_wake_count_value())
 }
 
-fn parsed_auto_wake_max() -> Option<i64> {
-    parse_auto_wake_max(auto_wake_max_value())
-}
-
 fn auto_wake_token() -> Option<String> {
     std::env::var(AUTO_WAKE_TOKEN_ENV).ok()
 }
@@ -198,22 +168,8 @@ fn auto_wake_count_value() -> Option<String> {
     std::env::var(AUTO_WAKE_COUNT_ENV).ok()
 }
 
-fn auto_wake_max_value() -> Option<String> {
-    std::env::var(AUTO_WAKE_MAX_ENV).ok()
-}
-
 fn parse_auto_wake_count(value: Option<String>) -> i64 {
     value.and_then(|value| value.parse().ok()).unwrap_or(1)
-}
-
-fn parse_auto_wake_max(value: Option<String>) -> Option<i64> {
-    value.and_then(|value| value.parse::<i64>().ok())
-}
-
-fn validated_auto_wake_max(value: Option<i64>) -> i64 {
-    value
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_AUTO_WAKE_MAX)
 }
 
 fn auto_wake_env(token: String, count: i64) -> AutoWakeEnv {
@@ -246,4 +202,19 @@ fn warn_open_sidecar_for_release_failed(session_id: &str, err: String) {
         session_id,
         "Failed to open sidecar to release wake claim: {err}"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_failed_wake_sequence_keeps_bounded_exponential_retry_cadence() {
+        let delays = (1..=20)
+            .map(|count| bounded_auto_wake_retry_delay_ms(1_000, count))
+            .collect::<Vec<_>>();
+
+        assert_eq!(&delays[..6], &[1_000, 2_000, 4_000, 8_000, 16_000, 30_000]);
+        assert!(delays[6..].iter().all(|delay| *delay == 30_000));
+    }
 }

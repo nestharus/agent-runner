@@ -39,12 +39,6 @@ impl WakeDiagnostic {
     }
 }
 
-pub(super) fn auto_wake_cap_diagnostic(current_count: i64) -> WakeDiagnostic {
-    let mut diagnostic = WakeDiagnostic::status("auto_wake_cap_reached");
-    diagnostic.auto_wake_count = Some(current_count);
-    diagnostic
-}
-
 pub(super) fn storage_error_diagnostic(err: String) -> WakeDiagnostic {
     WakeDiagnostic::with_message("storage_error", err)
 }

@@ -81,7 +81,7 @@ fn assert_one_failed_delivery(fixture: &Fixture, session_id: &str) {
     assert_no_wake_claim(fixture, session_id);
 }
 
-pub(crate) fn batch_cap_followup_wake() {
+pub(crate) fn persisted_count_at_five_allows_turn_end_followup_wake() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script(
@@ -90,7 +90,7 @@ pub(crate) fn batch_cap_followup_wake() {
         "batch-${OULIPOLY_AUTO_WAKE_COUNT:-manual}.txt",
     ));
     fixture.seed_session_turn();
-    fixture.seed_idle_runtime();
+    fixture.seed_idle_runtime_with_wake_count(SESSION, 5);
     for index in 0..25 {
         fixture.seed_mailbox(SESSION, &format!("h-batch-{index:02}"));
     }
@@ -99,7 +99,7 @@ pub(crate) fn batch_cap_followup_wake() {
     let manual_invocation = direct_unconfirmed_invocation(&output);
 
     let first = wait_for_file(&fixture.prompt_file("batch-manual.txt"));
-    let second = wait_for_file(&fixture.prompt_file("batch-1.txt"));
+    let second = wait_for_file(&fixture.prompt_file("batch-6.txt"));
     assert_additional_notifications_remain_queued(&first);
     assert_prompt_contains_handle(&second, "h-batch-20");
     wait_until("batch rows delivered", || {
@@ -126,8 +126,8 @@ pub(crate) fn batch_cap_followup_wake() {
     assert_age270_invocation(&fixture, &manual_invocation);
     assert_age270_invocation(&fixture, followup.0);
     assert!(fixture.prompt_file("batch-manual.txt").exists());
-    assert!(fixture.prompt_file("batch-1.txt").exists());
-    assert!(!fixture.prompt_file("batch-2.txt").exists());
+    assert!(fixture.prompt_file("batch-6.txt").exists());
+    assert!(!fixture.prompt_file("batch-7.txt").exists());
     assert_xdg_isolated(&fixture);
 }
 
@@ -299,38 +299,6 @@ pub(crate) fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
 
     assert_prompt_file_missing(&fixture, "twice-unconfirmed-not-rewoken.txt");
     assert_pending_handle_with_delivery_attempts(&fixture, SESSION, "h-unconfirmed", 2);
-    assert_xdg_isolated(&fixture);
-}
-
-pub(crate) fn environment_empty_sweep_uses_persisted_wake_max_beyond_five() {
-    let _guard = integration_test_guard();
-    let fixture = Fixture::new();
-    fixture.write_provider(&provider_script(
-        "",
-        r#"printf '%s' "${OULIPOLY_AUTO_WAKE_MAX:-missing}" > "$work/sweep-persisted-max.txt""#,
-        "sweep-persisted-${OULIPOLY_AUTO_WAKE_COUNT:-missing}.txt",
-    ));
-    fixture.seed_session_turn();
-    fixture.seed_idle_runtime_with_wake_policy(SESSION, 32, 5);
-    fixture.seed_mailbox_for(SESSION, "h-sweep-persisted", None);
-    seed_dead_wake_claim(&fixture, "ffffffff-ffff-4fff-8fff-ffffffffffff", 601);
-
-    let output = fixture.run_mailbox_list(SESSION);
-    assert_success(&output);
-
-    let prompt = wait_for_file(&fixture.prompt_file("sweep-persisted-6.txt"));
-    assert_prompt_contains_handle(&prompt, "h-sweep-persisted");
-    assert_eq!(
-        wait_for_file(&fixture.prompt_file("sweep-persisted-max.txt")),
-        "32"
-    );
-    wait_until("persisted-max sweep delivery", || {
-        delivered_single_row_without_error_or_claim(&fixture, SESSION)
-    });
-    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
-    assert_eq!(runtime.selected_auto_wake_max, Some(32));
-    assert_eq!(runtime.auto_wake_count, 6);
-    assert_one_failed_delivery(&fixture, SESSION);
     assert_xdg_isolated(&fixture);
 }
 
@@ -517,23 +485,29 @@ fn process_start(pid: u32) -> Option<String> {
     tail.split_whitespace().nth(19).map(str::to_string)
 }
 
-pub(crate) fn persisted_wake_max_caps_sweep_at_selected_value() {
+pub(crate) fn persisted_count_at_five_allows_startup_sweep_delivery() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.write_provider(&provider_script("", "", "sweep-cap-should-not-run.txt"));
+    fixture.write_provider(&provider_script(
+        "",
+        "",
+        "sweep-count-${OULIPOLY_AUTO_WAKE_COUNT:-missing}.txt",
+    ));
     fixture.seed_session_turn();
-    fixture.seed_idle_runtime_with_wake_policy(SESSION, 32, 32);
-    fixture.seed_mailbox_for(SESSION, "h-sweep-cap", None);
+    fixture.seed_idle_runtime_with_wake_count(SESSION, 5);
+    fixture.seed_mailbox_for(SESSION, "h-sweep-count", None);
     seed_dead_wake_claim(&fixture, "abababab-abab-4bab-8bab-abababababab", 601);
 
     let output = fixture.run_mailbox_list(SESSION);
     assert_success(&output);
-    settle_wake_sweep();
 
-    assert_prompt_file_missing(&fixture, "sweep-cap-should-not-run.txt");
-    assert_pending_mailbox_count(&fixture, SESSION, 1);
+    let prompt = wait_for_file(&fixture.prompt_file("sweep-count-6.txt"));
+    assert_prompt_contains_handle(&prompt, "h-sweep-count");
+    wait_until("count-five startup sweep delivery", || {
+        delivered_single_row_without_error_or_claim(&fixture, SESSION)
+    });
     let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
-    assert_eq!(runtime.selected_auto_wake_max, Some(32));
-    assert_eq!(runtime.auto_wake_count, 32);
+    assert_eq!(runtime.auto_wake_count, 6);
+    assert_one_failed_delivery(&fixture, SESSION);
     assert_xdg_isolated(&fixture);
 }

@@ -128,7 +128,6 @@ impl Fixture {
                 pty_control_path: None,
                 models_dir: Some(&models_dir),
                 effective_cwd: None,
-                selected_auto_wake_max: None,
             })
             .unwrap();
         mailbox
@@ -232,7 +231,6 @@ impl Fixture {
             pty_control_path: None,
             models_dir: Some(&models_dir),
             effective_cwd: None,
-            selected_auto_wake_max: None,
         })
         .unwrap();
     }
@@ -248,17 +246,11 @@ impl Fixture {
             pty_control_path: None,
             models_dir: None,
             effective_cwd: None,
-            selected_auto_wake_max: None,
         })
         .unwrap();
     }
 
-    pub(crate) fn seed_idle_runtime_with_wake_policy(
-        &self,
-        session_id: &str,
-        selected_auto_wake_max: i64,
-        auto_wake_count: i64,
-    ) {
+    pub(crate) fn seed_idle_runtime_with_wake_count(&self, session_id: &str, auto_wake_count: i64) {
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
         let models_dir = path_string(&self.models_dir);
         db.upsert_session_runtime(SessionRuntimeUpsert {
@@ -270,7 +262,6 @@ impl Fixture {
             pty_control_path: None,
             models_dir: Some(&models_dir),
             effective_cwd: None,
-            selected_auto_wake_max: Some(selected_auto_wake_max),
         })
         .unwrap();
         self.sidecar_conn()

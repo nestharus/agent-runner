@@ -3,11 +3,10 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
 
 use super::auto_wake_env::{
-    AutoWakeEnv, auto_wake_cap_reached, auto_wake_max_for_session, current_auto_wake,
-    current_auto_wake_count, emit_auto_wake_cap_reached, release_current_auto_wake_claim,
+    AutoWakeEnv, current_auto_wake, current_auto_wake_count, release_current_auto_wake_claim,
     sleep_before_failed_auto_wake_retry,
 };
-use super::diagnostics::{WakeDiagnostic, auto_wake_cap_diagnostic, storage_error_diagnostic};
+use super::diagnostics::{WakeDiagnostic, storage_error_diagnostic};
 use super::idle::mark_session_idle_after_turn;
 use super::wake_start::{StartWakeInput, start_wake_chain};
 use oulipoly_state::mailbox::MailboxDb;
@@ -39,22 +38,14 @@ fn trigger_turn_end_recheck(session_id: &str) -> WakeDiagnostic {
         Err(err) => return storage_error_diagnostic(err),
     };
     let auto_wake = current_auto_wake();
-    let auto_wake_max = match auto_wake_max_for_session(session_id) {
-        Ok(value) => value,
-        Err(err) => return storage_error_diagnostic(err),
-    };
     let current_count = current_auto_wake_count(auto_wake.as_ref());
     apply_turn_end_recheck_decision(
         session_id,
         auto_wake.as_ref(),
         turn_end_recheck_decision(
             session_id,
-            RecheckConditions {
-                no_pending: no_pending(pending_count),
-                cap_reached: auto_wake_cap_reached(current_count, auto_wake_max),
-            },
+            no_pending(pending_count),
             current_count,
-            auto_wake_max,
             auto_wake.as_ref(),
         ),
     )
@@ -65,52 +56,25 @@ fn failed_auto_wake_recheck(session_id: &str, auto_wake: &AutoWakeEnv) -> WakeDi
         Ok(count) => count,
         Err(err) => return storage_error_diagnostic(err),
     };
-    let auto_wake_max = match auto_wake_max_for_session(session_id) {
-        Ok(value) => value,
-        Err(err) => return storage_error_diagnostic(err),
-    };
     apply_failed_auto_wake_recheck_decision(
-        session_id,
         auto_wake,
-        failed_auto_wake_recheck_decision(
-            session_id,
-            RecheckConditions {
-                no_pending: no_pending(pending_count),
-                cap_reached: auto_wake_cap_reached(auto_wake.count, auto_wake_max),
-            },
-            auto_wake,
-            auto_wake_max,
-        ),
+        failed_auto_wake_recheck_decision(session_id, no_pending(pending_count), auto_wake),
     )
 }
 
 enum TurnEndRecheckDecision<'a> {
     NoPending,
-    CapReached { current_count: i64, max_count: i64 },
     Start(StartWakeInput<'a>),
-}
-
-struct RecheckConditions {
-    no_pending: bool,
-    cap_reached: bool,
 }
 
 fn turn_end_recheck_decision<'a>(
     session_id: &'a str,
-    conditions: RecheckConditions,
+    no_pending: bool,
     current_count: i64,
-    auto_wake_max: i64,
     auto_wake: Option<&'a AutoWakeEnv>,
 ) -> TurnEndRecheckDecision<'a> {
-    if conditions.no_pending {
+    if no_pending {
         return TurnEndRecheckDecision::NoPending;
-    }
-    let max_count = auto_wake_max;
-    if conditions.cap_reached {
-        return TurnEndRecheckDecision::CapReached {
-            current_count,
-            max_count,
-        };
     }
     TurnEndRecheckDecision::Start(turn_end_start_wake_input(
         session_id,
@@ -142,38 +106,22 @@ fn apply_turn_end_recheck_decision(
             release_current_auto_wake_claim(session_id, auto_wake);
             no_pending_diagnostic()
         }
-        TurnEndRecheckDecision::CapReached {
-            current_count,
-            max_count,
-        } => {
-            release_current_auto_wake_claim(session_id, auto_wake);
-            cap_reached_diagnostic(session_id, current_count, max_count)
-        }
         TurnEndRecheckDecision::Start(input) => start_wake_chain(input),
     }
 }
 
 enum FailedAutoWakeRecheckDecision<'a> {
     NoPending,
-    CapReached { current_count: i64, max_count: i64 },
     Retry(StartWakeInput<'a>),
 }
 
 fn failed_auto_wake_recheck_decision<'a>(
     session_id: &'a str,
-    conditions: RecheckConditions,
+    no_pending: bool,
     auto_wake: &'a AutoWakeEnv,
-    auto_wake_max: i64,
 ) -> FailedAutoWakeRecheckDecision<'a> {
-    if conditions.no_pending {
+    if no_pending {
         return FailedAutoWakeRecheckDecision::NoPending;
-    }
-    let max_count = auto_wake_max;
-    if conditions.cap_reached {
-        return FailedAutoWakeRecheckDecision::CapReached {
-            current_count: auto_wake.count,
-            max_count,
-        };
     }
     FailedAutoWakeRecheckDecision::Retry(failed_auto_wake_retry_input(session_id, auto_wake))
 }
@@ -191,16 +139,11 @@ fn failed_auto_wake_retry_input<'a>(
 }
 
 fn apply_failed_auto_wake_recheck_decision(
-    session_id: &str,
     auto_wake: &AutoWakeEnv,
     decision: FailedAutoWakeRecheckDecision<'_>,
 ) -> WakeDiagnostic {
     match decision {
         FailedAutoWakeRecheckDecision::NoPending => no_pending_diagnostic(),
-        FailedAutoWakeRecheckDecision::CapReached {
-            current_count,
-            max_count,
-        } => cap_reached_diagnostic(session_id, current_count, max_count),
         FailedAutoWakeRecheckDecision::Retry(input) => {
             sleep_before_failed_auto_wake_retry(auto_wake.count);
             start_wake_chain(input)
@@ -224,11 +167,6 @@ fn no_pending_diagnostic() -> WakeDiagnostic {
     WakeDiagnostic::status("no_pending")
 }
 
-fn cap_reached_diagnostic(session_id: &str, current_count: i64, max_count: i64) -> WakeDiagnostic {
-    emit_auto_wake_cap_reached(session_id, current_count, max_count);
-    auto_wake_cap_diagnostic(current_count)
-}
-
 fn no_pending(pending_count: usize) -> bool {
     pending_count == 0
 }
@@ -237,6 +175,39 @@ fn no_pending(pending_count: usize) -> bool {
 mod tests {
     use super::*;
     use crate::wake_coordinator::consumed_completion::ConsumedCompletionFixture;
+
+    #[test]
+    fn successful_turn_recheck_ignores_former_cap_at_five() {
+        let auto_wake = AutoWakeEnv {
+            token: "turn-end-token".to_string(),
+            count: 5,
+        };
+
+        let decision =
+            turn_end_recheck_decision("session-a", false, auto_wake.count, Some(&auto_wake));
+
+        let TurnEndRecheckDecision::Start(input) = decision else {
+            panic!("pending work above the former cap must start a follow-up wake");
+        };
+        assert_eq!(input.auto_wake_count, 6);
+        assert_eq!(input.renew_token, Some("turn-end-token"));
+    }
+
+    #[test]
+    fn failed_auto_wake_recheck_ignores_former_cap_at_five() {
+        let auto_wake = AutoWakeEnv {
+            token: "failed-wake-token".to_string(),
+            count: 5,
+        };
+
+        let decision = failed_auto_wake_recheck_decision("session-a", false, &auto_wake);
+
+        let FailedAutoWakeRecheckDecision::Retry(input) = decision else {
+            panic!("pending work above the former cap must schedule a bounded retry");
+        };
+        assert_eq!(input.auto_wake_count, 6);
+        assert!(input.renew_token.is_none());
+    }
 
     #[test]
     fn turn_end_pending_count_reconciles_late_consumption() {

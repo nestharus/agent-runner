@@ -16,10 +16,6 @@ mod wake_start;
 pub(crate) type WakeDiagnostic = diagnostics::WakeDiagnostic;
 pub(crate) use sweep::LivePtyRetryDriverGuard;
 
-pub(crate) fn selected_auto_wake_max() -> i64 {
-    auto_wake_env::auto_wake_max()
-}
-
 pub(crate) fn mark_session_idle_after_turn(
     session_id: &str,
     invocation_uuid: &str,

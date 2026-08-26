@@ -11,7 +11,10 @@ use oulipoly_state::mailbox::{
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
 };
-use oulipoly_state::{InvocationStart, ProviderSessionBinding, SessionTurnIngest, StateDb};
+use oulipoly_state::{
+    COMPLETION_REGISTRATION_AUTHORITY_ENV, CompletionRegistrationAuthority, InvocationStart,
+    ProviderSessionBinding, SessionTurnIngest, StateDb,
+};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::fs::{self, File};
@@ -39,6 +42,8 @@ struct Fixture {
     home_dir: PathBuf,
     app_config_dir: PathBuf,
     models_dir: PathBuf,
+    completion_authorities:
+        Mutex<std::collections::HashMap<String, CompletionRegistrationAuthority>>,
 }
 
 struct NotifyArtifacts {
@@ -74,6 +79,7 @@ impl Fixture {
             home_dir,
             app_config_dir,
             models_dir,
+            completion_authorities: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -106,8 +112,30 @@ impl Fixture {
     }
 
     fn run_notify(&self, handle: &str, metadata: Value) -> Output {
+        let owner_invocation_uuid = metadata
+            .get("owner_invocation_uuid")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
         let artifacts = self.write_notify_artifacts(handle, metadata, 0);
-        let registration = self.run(self.register_command(handle, &artifacts));
+        let mut registration = self.register_command(handle, &artifacts);
+        if let Some(authority) = self
+            .completion_authorities
+            .lock()
+            .unwrap()
+            .get(&owner_invocation_uuid)
+        {
+            registration.env(
+                COMPLETION_REGISTRATION_AUTHORITY_ENV,
+                authority.process_environment_value(),
+            );
+        } else {
+            registration.env(
+                COMPLETION_REGISTRATION_AUTHORITY_ENV,
+                fs::read_to_string(self.completion_authority_path()).unwrap(),
+            );
+        }
+        let registration = self.run(registration);
         assert!(registration.status.success(), "{registration:?}");
         self.run(self.notify_command(handle, &artifacts))
     }
@@ -194,8 +222,8 @@ impl Fixture {
 
     fn record_owner_identity(&self, identity: &ProcessIdentity) {
         let state = StateDb::open(&self.state_path()).unwrap();
-        let invocation_id = state
-            .start_invocation(&InvocationStart {
+        let start = state
+            .start_invocation_with_completion_registration_authority(&InvocationStart {
                 invocation_uuid: INVOCATION_A.to_string(),
                 model_name: "fixture-model".to_string(),
                 provider_name: "fixture-provider".to_string(),
@@ -203,6 +231,11 @@ impl Fixture {
                 parent_invocation_id: None,
             })
             .unwrap();
+        let invocation_id = start.invocation_row_id;
+        self.completion_authorities.lock().unwrap().insert(
+            INVOCATION_A.to_string(),
+            start.completion_registration_authority,
+        );
         state
             .bind_invocation_provider_session_start(
                 invocation_id,
@@ -306,6 +339,10 @@ impl Fixture {
         fs::create_dir_all(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         dir.join(name)
+    }
+
+    fn completion_authority_path(&self) -> PathBuf {
+        self.dir.path().join("completion-registration-authority")
     }
 
     fn notify_trace_path(&self) -> PathBuf {
@@ -1229,12 +1266,14 @@ fn spawn_repl_under_pty(
 
 fn fixture_provider_waiting_for_notification(dir: &Path, received_log: &Path) -> PathBuf {
     let path = dir.join("fixture-live-provider.sh");
+    let authority = dir.join("completion-registration-authority");
     fs::write(
         &path,
         format!(
             r#"#!/usr/bin/env bash
 set -euo pipefail
 : > {received}
+printf '%s' "$OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY" > {authority}
 test -t 0
 test -t 1
 test -t 2
@@ -1250,7 +1289,8 @@ while IFS= read -r line; do
   fi
 done
 "#,
-            received = shell_single_quote(&path_string(received_log))
+            received = shell_single_quote(&path_string(received_log)),
+            authority = shell_single_quote(&path_string(&authority)),
         ),
     )
     .unwrap();
@@ -1262,12 +1302,14 @@ done
 
 fn fixture_provider_with_continuous_redraw(dir: &Path, received_log: &Path) -> PathBuf {
     let path = dir.join("fixture-continuous-redraw-provider.sh");
+    let authority = dir.join("completion-registration-authority");
     fs::write(
         &path,
         format!(
             r#"#!/usr/bin/env bash
 set -euo pipefail
 : > {received}
+printf '%s' "$OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY" > {authority}
 test -t 0
 test -t 1
 test -t 2
@@ -1287,7 +1329,8 @@ while true; do
   fi
 done
 "#,
-            received = shell_single_quote(&path_string(received_log))
+            received = shell_single_quote(&path_string(received_log)),
+            authority = shell_single_quote(&path_string(&authority)),
         ),
     )
     .unwrap();

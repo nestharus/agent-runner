@@ -501,6 +501,5 @@ fn record_external_session_runtime(
         pty_control_path: None,
         models_dir: Some(input.env.models_dir.to_string_lossy().as_ref()),
         effective_cwd: Some(effective_cwd.as_ref()),
-        selected_auto_wake_max: Some(crate::wake_coordinator::selected_auto_wake_max()),
     })
 }

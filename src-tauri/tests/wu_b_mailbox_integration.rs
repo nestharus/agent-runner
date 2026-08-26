@@ -99,7 +99,6 @@ impl Fixture {
         cmd.env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID");
         cmd.env_remove("OULIPOLY_AUTO_WAKE_TOKEN");
         cmd.env_remove("OULIPOLY_AUTO_WAKE_COUNT");
-        cmd.env_remove("OULIPOLY_AUTO_WAKE_MAX");
         cmd.env_remove("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS");
         cmd.output().unwrap()
     }
@@ -864,7 +863,6 @@ fn completion_for_headless_runtime_is_not_submitted_to_pty() {
             pty_control_path: None,
             models_dir: None,
             effective_cwd: None,
-            selected_auto_wake_max: None,
         })
         .unwrap();
 

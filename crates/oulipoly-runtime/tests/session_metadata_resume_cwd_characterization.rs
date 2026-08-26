@@ -222,7 +222,6 @@ fn imported_script_session_cwd_precedes_stale_mailbox_and_failing_script() {
             pty_control_path: Some("/tmp/oulipoly-stale.sock"),
             models_dir: None,
             effective_cwd: Some(&stale_mailbox_cwd_text),
-            selected_auto_wake_max: None,
         })
         .unwrap();
     drop(mailbox);
@@ -275,7 +274,6 @@ fn external_provider_runtime_cwd_precedes_recorded_script_session_cwd() {
             pty_control_path: Some("/tmp/oulipoly-live.sock"),
             models_dir: None,
             effective_cwd: Some(&live_runtime_cwd_text),
-            selected_auto_wake_max: None,
         })
         .unwrap();
     drop(mailbox);
@@ -320,7 +318,6 @@ fn mailbox_precedence_scenario() {
             pty_control_path: Some("/tmp/oulipoly-test.sock"),
             models_dir: None,
             effective_cwd: Some(&mailbox_cwd_text),
-            selected_auto_wake_max: None,
         })
         .unwrap();
     drop(mailbox);
