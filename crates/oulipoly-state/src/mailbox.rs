@@ -30,7 +30,6 @@ pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
 pub const MAILBOX_DELIVERY_UNCONFIRMED_ERROR: &str = "mailbox_delivery_unconfirmed";
 pub const MAILBOX_INGRESS_EXPIRED_ERROR: &str = "mailbox_ingress_expired";
 pub const MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR: &str = "mailbox_payload_verification_failed";
-pub const MAX_UNCONFIRMED_DELIVERY_ATTEMPTS: i64 = 2;
 pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
@@ -60,13 +59,8 @@ fn bounded_pending_mailbox_query() -> String {
          WHERE delivered_at IS NULL
            AND seq > ?3
            AND (delivery_error IS NULL OR delivery_error != ?5)
-           AND (delivery_error IS NULL OR delivery_error != ?8)
-           AND (delivery_error IS NULL OR delivery_error != ?9)
-           AND (
-               delivery_error IS NULL
-               OR delivery_error != ?6
-               OR delivery_attempts < ?7
-           )
+           AND (delivery_error IS NULL OR delivery_error != ?6)
+           AND (delivery_error IS NULL OR delivery_error != ?7)
            AND {PENDING_MAILBOX_TARGET_PREDICATE}
          ORDER BY seq ASC
          LIMIT ?4"
@@ -2802,8 +2796,6 @@ impl MailboxDb {
                     after_seq,
                     limit,
                     WAKE_SWEEP_ABANDONED_ERROR,
-                    MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
-                    MAX_UNCONFIRMED_DELIVERY_ATTEMPTS,
                     MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
                     MAILBOX_INGRESS_EXPIRED_ERROR,
                 ],
@@ -4691,10 +4683,7 @@ fn mailbox_writer_sqlite_timeout() -> StdDuration {
 }
 
 pub fn mailbox_row_is_deliverable_pending(row: &MailboxRow) -> bool {
-    row.delivered_at.is_none()
-        && row.delivery_error.as_deref() != Some(WAKE_SWEEP_ABANDONED_ERROR)
-        && (row.delivery_error.as_deref() != Some(MAILBOX_DELIVERY_UNCONFIRMED_ERROR)
-            || row.delivery_attempts < MAX_UNCONFIRMED_DELIVERY_ATTEMPTS)
+    row.delivered_at.is_none() && row.delivery_error.as_deref() != Some(WAKE_SWEEP_ABANDONED_ERROR)
 }
 
 fn resolve_completed_delivery_attempts(
@@ -5238,22 +5227,11 @@ fn pending_seq_bounds_for_claim_tx(
          FROM mailbox
          WHERE delivered_at IS NULL
            AND {PENDING_MAILBOX_TARGET_PREDICATE}
-           AND (delivery_error IS NULL OR delivery_error != ?3)
-           AND (
-                delivery_error IS NULL
-                OR delivery_error != ?4
-                OR delivery_attempts < ?5
-           )"
+           AND (delivery_error IS NULL OR delivery_error != ?3)"
     );
     tx.query_row(
         &query,
-        params![
-            session_id,
-            Option::<&str>::None,
-            WAKE_SWEEP_ABANDONED_ERROR,
-            MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
-            MAX_UNCONFIRMED_DELIVERY_ATTEMPTS,
-        ],
+        params![session_id, Option::<&str>::None, WAKE_SWEEP_ABANDONED_ERROR,],
         |row| {
             let min_seq: Option<i64> = row.get(0)?;
             let max_seq: Option<i64> = row.get(1)?;
@@ -12737,47 +12715,74 @@ mod tests {
     }
 
     #[test]
-    fn accepted_attempt_owner_skips_undeliverable_older_rows() {
+    fn twice_unconfirmed_oldest_row_remains_the_delivery_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let abandoned =
             inserted_row(db.enqueue_agent_bash_complete(&input("abandoned", "session-a")));
-        let exhausted =
-            inserted_row(db.enqueue_agent_bash_complete(&input("exhausted", "session-a")));
-        let deliverable =
-            inserted_row(db.enqueue_agent_bash_complete(&input("deliverable", "session-a")));
+        let unconfirmed =
+            inserted_row(db.enqueue_agent_bash_complete(&input("unconfirmed", "session-a")));
+        let newer = inserted_row(db.enqueue_agent_bash_complete(&input("newer", "session-a")));
         db.force_pending_abandoned_for_test("session-a", 1).unwrap();
-        for _ in 0..MAX_UNCONFIRMED_DELIVERY_ATTEMPTS {
+        for _ in 0..2 {
             db.mark_delivery_failed(
                 "session-a",
                 None,
-                &[exhausted.seq],
+                &[unconfirmed.seq],
                 MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
             )
             .unwrap();
         }
+        let unconfirmed = db
+            .list_pending("session-a")
+            .unwrap()
+            .into_iter()
+            .find(|row| row.seq == unconfirmed.seq)
+            .unwrap();
+        assert_eq!(unconfirmed.delivery_attempts, 2);
+        assert_eq!(
+            unconfirmed.delivery_error.as_deref(),
+            Some(MAILBOX_DELIVERY_UNCONFIRMED_ERROR)
+        );
         assert_eq!(
             db.list_pending_for_delivery_after("session-a", None, 0, 1)
                 .unwrap(),
-            vec![deliverable.clone()],
-            "the SQL limit counts only deliverable pending rows"
+            vec![unconfirmed.clone()],
+            "attempt count cannot remove the oldest pending row from FIFO selection"
         );
         db.register_delivery_attempt(
-            "deliverable-attempt",
+            "newer-attempt",
             "session-a",
             "invocation-a",
-            &[deliverable.seq],
+            &[newer.seq],
             0,
         )
         .unwrap();
-        db.record_delivery_attempt_transport_ack("deliverable-attempt")
+        db.record_delivery_attempt_transport_ack("newer-attempt")
+            .unwrap();
+        assert!(
+            db.accepted_delivery_attempt_windows("session-a")
+                .unwrap()
+                .is_empty(),
+            "a newer accepted attempt cannot bypass the unconfirmed oldest row"
+        );
+
+        db.register_delivery_attempt(
+            "unconfirmed-attempt",
+            "session-a",
+            "invocation-a",
+            &[unconfirmed.seq],
+            0,
+        )
+        .unwrap();
+        db.record_delivery_attempt_transport_ack("unconfirmed-attempt")
             .unwrap();
 
         let owners = db.accepted_delivery_attempt_windows("session-a").unwrap();
         assert_eq!(owners.len(), 1);
-        assert_eq!(owners[0].attempt_id, "deliverable-attempt");
-        assert_eq!(owners[0].rows, vec![deliverable]);
-        assert_eq!(owners[0].remaining_count, 0);
+        assert_eq!(owners[0].attempt_id, "unconfirmed-attempt");
+        assert_eq!(owners[0].rows, vec![unconfirmed]);
+        assert_eq!(owners[0].remaining_count, 1);
         let abandoned = db
             .list_pending("session-a")
             .unwrap()
@@ -13202,8 +13207,6 @@ mod tests {
                         0,
                         1,
                         WAKE_SWEEP_ABANDONED_ERROR,
-                        MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
-                        MAX_UNCONFIRMED_DELIVERY_ATTEMPTS,
                         MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
                         MAILBOX_INGRESS_EXPIRED_ERROR,
                     ],

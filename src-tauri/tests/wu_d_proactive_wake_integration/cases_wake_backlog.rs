@@ -8,20 +8,20 @@ use crate::SESSION;
 use crate::fake_cli::provider_script;
 use crate::fixtures::Fixture;
 use crate::liveness::{
-    backlog_recovered_and_debris_retained, newer_mailbox_delivered_with_exhausted_old_pending,
-    wait_for_file, wait_until,
+    backlog_recovered_and_debris_retained, delivered_rows_without_pending_or_claim, wait_for_file,
+    wait_until,
 };
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
     assert_age270_invocation, assert_dead_owner_prompts_missing, assert_prompt_contains_handle,
-    assert_prompt_excludes_handle, assert_success, assert_xdg_isolated,
+    assert_success, assert_xdg_isolated,
 };
 use crate::wake_claim_setup::seed_dead_wake_claim;
 
-pub(crate) fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox() {
+pub(crate) fn wake_sweep_retries_twice_unconfirmed_oldest_with_newer_mailbox() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.write_provider(&provider_script("", "", "newer-after-unconfirmed.txt"));
+    fixture.write_provider(&provider_script("", "", "oldest-after-unconfirmed.txt"));
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-unconfirmed-old");
@@ -32,40 +32,32 @@ pub(crate) fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending
     let output = fixture.run_mailbox_list(SESSION);
     assert_success(&output);
 
-    let prompt = wait_for_file(&fixture.prompt_file("newer-after-unconfirmed.txt"));
-    assert_prompt_excludes_handle(&prompt, "h-unconfirmed-old");
+    let prompt = wait_for_file(&fixture.prompt_file("oldest-after-unconfirmed.txt"));
+    assert_prompt_contains_handle(&prompt, "h-unconfirmed-old");
     assert_prompt_contains_handle(&prompt, "h-newer");
-    wait_until(
-        "newer mailbox delivered while exhausted row remains pending",
-        || newer_mailbox_delivered_with_exhausted_old_pending(&fixture),
-    );
+    wait_until("oldest and newer mailbox delivered in FIFO order", || {
+        delivered_rows_without_pending_or_claim(&fixture, SESSION, 2)
+    });
     let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
     let old = rows
         .iter()
         .find(|row| row.handle == "h-unconfirmed-old")
         .unwrap();
-    assert!(old.delivered_at.is_none());
-    assert_eq!(old.delivery_attempts, 2);
-    assert_eq!(
-        old.delivery_error.as_deref(),
-        Some("mailbox_delivery_unconfirmed")
-    );
+    assert!(old.delivered_at.is_some());
+    assert_eq!(old.delivery_attempts, 3);
+    assert!(old.delivery_error.is_none());
     let newer = rows.iter().find(|row| row.handle == "h-newer").unwrap();
     assert!(newer.delivered_at.is_some());
     assert_eq!(newer.delivery_attempts, 1);
     assert!(newer.delivery_error.is_none());
+    assert_eq!(
+        old.delivered_by_invocation_uuid, newer.delivered_by_invocation_uuid,
+        "the oldest row must remain in the selected FIFO batch"
+    );
     assert_age270_invocation(
         &fixture,
-        newer.delivered_by_invocation_uuid.as_deref().unwrap(),
+        old.delivered_by_invocation_uuid.as_deref().unwrap(),
     );
-    wait_until("unconfirmed wake claim released", || {
-        fixture
-            .mailbox()
-            .wake_session_reader()
-            .wake_claim(SESSION)
-            .unwrap()
-            .is_none()
-    });
     assert_xdg_isolated(&fixture);
 }
 

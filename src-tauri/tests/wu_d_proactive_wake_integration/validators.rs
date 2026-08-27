@@ -90,18 +90,6 @@ pub(crate) fn assert_pending_handle_without_error(
     );
 }
 
-pub(crate) fn assert_pending_handle_with_delivery_attempts(
-    fixture: &Fixture,
-    session_id: &str,
-    handle: &str,
-    attempts: i64,
-) {
-    let rows = pending_mailbox_rows(fixture, session_id);
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].handle, handle);
-    assert_eq!(rows[0].delivery_attempts, attempts);
-}
-
 pub(crate) fn assert_live_claim_token(fixture: &Fixture, session_id: &str, claim_token: &str) {
     assert_eq!(
         required_wake_claim(fixture, session_id).claim_token,

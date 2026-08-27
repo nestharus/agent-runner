@@ -13,9 +13,9 @@ use crate::liveness::{
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
     assert_additional_notifications_remain_queued, assert_age270_invocation,
-    assert_live_claim_token, assert_no_wake_claim, assert_pending_handle_with_delivery_attempts,
-    assert_pending_handle_without_error, assert_pending_mailbox_count,
-    assert_prompt_contains_handle, assert_prompt_file_missing, assert_success, assert_xdg_isolated,
+    assert_live_claim_token, assert_no_wake_claim, assert_pending_handle_without_error,
+    assert_pending_mailbox_count, assert_prompt_contains_handle, assert_prompt_file_missing,
+    assert_success, assert_xdg_isolated,
 };
 use crate::wake_claim_setup::{seed_dead_wake_claim, seed_live_wake_claim};
 use crate::{MODEL, PROVIDER, SESSION};
@@ -286,14 +286,10 @@ pub(crate) fn wake_sweep_does_not_rewake_consumed_pending_mailbox() {
     assert_xdg_isolated(&fixture);
 }
 
-pub(crate) fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
+pub(crate) fn wake_sweep_retries_twice_unconfirmed_pending_mailbox() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.write_provider(&provider_script(
-        "",
-        "",
-        "twice-unconfirmed-not-rewoken.txt",
-    ));
+    fixture.write_provider(&provider_script("", "", "twice-unconfirmed-retried.txt"));
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-unconfirmed");
@@ -302,10 +298,22 @@ pub(crate) fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
 
     let output = fixture.run_mailbox_list(SESSION);
     assert_success(&output);
-    settle_wake_sweep();
 
-    assert_prompt_file_missing(&fixture, "twice-unconfirmed-not-rewoken.txt");
-    assert_pending_handle_with_delivery_attempts(&fixture, SESSION, "h-unconfirmed", 2);
+    let prompt = wait_for_file(&fixture.prompt_file("twice-unconfirmed-retried.txt"));
+    assert_prompt_contains_handle(&prompt, "h-unconfirmed");
+    wait_until("twice-unconfirmed mailbox retried and delivered", || {
+        delivered_single_row_without_error_or_claim(&fixture, SESSION)
+    });
+    let row = fixture
+        .mailbox()
+        .list_mailbox(SESSION, true)
+        .unwrap()
+        .remove(0);
+    assert_eq!(row.delivery_attempts, 3);
+    assert_age270_invocation(
+        &fixture,
+        row.delivered_by_invocation_uuid.as_deref().unwrap(),
+    );
     assert_xdg_isolated(&fixture);
 }
 

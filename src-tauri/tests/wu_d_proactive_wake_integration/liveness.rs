@@ -99,12 +99,6 @@ pub(crate) fn delivered_single_row_without_error_or_claim(
         && wake_claim_is_absent(&wake_claim(fixture, session_id))
 }
 
-pub(crate) fn newer_mailbox_delivered_with_exhausted_old_pending(fixture: &Fixture) -> bool {
-    let rows = mailbox_rows(fixture, crate::SESSION);
-    old_mailbox_is_exhausted(row_with_handle(&rows, "h-unconfirmed-old"))
-        && mailbox_row_is_delivered(row_with_handle(&rows, "h-newer"))
-}
-
 pub(crate) fn backlog_recovered_and_debris_retained(
     fixture: &Fixture,
     idle_session: &str,
@@ -155,18 +149,6 @@ fn rows_are_empty(rows: &[MailboxRow]) -> bool {
 
 fn single_row_is_delivered_without_error(rows: &[MailboxRow]) -> bool {
     rows.len() == 1 && mailbox_row_has_delivery(&rows[0]) && rows[0].delivery_error.is_none()
-}
-
-fn row_with_handle<'a>(rows: &'a [MailboxRow], handle: &str) -> Option<&'a MailboxRow> {
-    rows.iter().find(|row| row.handle == handle)
-}
-
-fn old_mailbox_is_exhausted(row: Option<&MailboxRow>) -> bool {
-    row.is_some_and(|row| row.delivered_at.is_none() && row.delivery_attempts == 2)
-}
-
-fn mailbox_row_is_delivered(row: Option<&MailboxRow>) -> bool {
-    row.is_some_and(mailbox_row_has_delivery)
 }
 
 fn recovered_backlog_is_delivered(idle_rows: &[MailboxRow], recent_rows: &[MailboxRow]) -> bool {

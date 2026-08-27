@@ -112,8 +112,8 @@ fn wake_sweep_does_not_rewake_consumed_pending_mailbox() {
 }
 
 #[test]
-fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
-    cases_batch_sweep::wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox();
+fn wake_sweep_retries_twice_unconfirmed_pending_mailbox() {
+    cases_batch_sweep::wake_sweep_retries_twice_unconfirmed_pending_mailbox();
 }
 
 #[test]
@@ -122,9 +122,8 @@ fn persisted_count_at_five_allows_startup_sweep_delivery() {
 }
 
 #[test]
-fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox() {
-    cases_wake_backlog::wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox(
-    );
+fn wake_sweep_retries_twice_unconfirmed_oldest_with_newer_mailbox() {
+    cases_wake_backlog::wake_sweep_retries_twice_unconfirmed_oldest_with_newer_mailbox();
 }
 
 #[test]
