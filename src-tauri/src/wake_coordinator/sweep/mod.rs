@@ -44,7 +44,7 @@ use lease::{
 #[cfg(test)]
 use oulipoly_state::mailbox::WakeSweepCandidate;
 #[cfg(test)]
-use plan::select_recoverable_sweep_candidate;
+use plan::select_startable_sweep_candidate;
 #[cfg(test)]
 use std::fs::File;
 #[cfg(test)]
@@ -386,8 +386,8 @@ mod tests {
     }
 
     #[test]
-    fn wake_sweep_selects_only_the_oldest_recoverable_session() {
-        let selected = select_recoverable_sweep_candidate(vec![
+    fn wake_sweep_selects_only_the_oldest_startable_session() {
+        let selected = select_startable_sweep_candidate(vec![
             WakeSweepCandidate {
                 session_id: "newer".to_string(),
                 auto_wake_count: 0,

@@ -9,56 +9,64 @@ use oulipoly_state::mailbox::{
 use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
 
 use super::consumed;
-use super::plan::WakeSweepDisposition;
+use super::plan::{WakeSweepAction, WakeSweepRetentionReason};
 
-pub(super) fn wake_sweep_candidate_disposition(
+pub(super) fn wake_sweep_candidate_action(
     db: &mut MailboxDb,
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
-) -> Result<WakeSweepDisposition, String> {
-    // Recoverable candidates are eligible for sweep-start selection. Skip
-    // candidates remain retained but are not startable by this sweep, including
-    // live-owner protected work. Abandoned candidates remain retained debris
-    // because this scope has no terminal reap authority.
+) -> Result<WakeSweepAction, String> {
     if db.notifications_paused(&candidate.session_id)? {
-        return Ok(WakeSweepDisposition::Skip);
+        return Ok(WakeSweepAction::Retain(
+            WakeSweepRetentionReason::NotStartable,
+        ));
     }
     if consumed::pending_mailbox_consumed_marker_present(db, state, &candidate.session_id)? {
-        return Ok(WakeSweepDisposition::Skip);
+        return Ok(WakeSweepAction::Retain(
+            WakeSweepRetentionReason::NotStartable,
+        ));
     }
     if wake_sweep_candidate_is_unclaimed_abandoned_transient(db, &candidate.session_id)? {
-        return abandoned_transient_disposition(db, state, candidate);
+        return abandoned_transient_action(db, state, candidate);
     }
     if wake_sweep_candidate_has_resumable_runtime(db, state, candidate)? {
-        return Ok(resumable_wake_sweep_disposition(candidate));
+        return Ok(resumable_wake_sweep_action(candidate));
     }
     if wake_sweep_candidate_has_live_owner(db, &candidate.session_id)? {
-        return Ok(WakeSweepDisposition::Skip);
+        return Ok(WakeSweepAction::Retain(
+            WakeSweepRetentionReason::NotStartable,
+        ));
     }
-    Ok(WakeSweepDisposition::Abandoned)
+    Ok(WakeSweepAction::Retain(
+        WakeSweepRetentionReason::DebrisWithoutReapAuthority,
+    ))
 }
 
-/// Disposition for an unclaimed session with at least one recorded owner identity
-/// and no currently live recorded owner. Such a session is never auto-woken
-/// (anti-resurrection, #44/#55). When it also has no durable resume evidence, its
-/// pending rows are undeliverable debris retained under the fail-closed policy;
-/// a resumable session is also retained so a later deliberate resume can consume
-/// it.
-fn abandoned_transient_disposition(
+/// Selects the retention reason for an unclaimed session with at least one
+/// recorded owner identity and no currently live recorded owner. Such a session
+/// is never auto-woken (anti-resurrection, #44/#55). When it also has no durable
+/// resume evidence, its pending rows are undeliverable debris retained under the
+/// fail-closed policy; a resumable session is also retained so a later deliberate
+/// resume can consume it.
+fn abandoned_transient_action(
     db: &MailboxDb,
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
-) -> Result<WakeSweepDisposition, String> {
-    // Classify as Skip only sessions with durable WORK: at least one produced
-    // assistant turn. A bare resume target (a registered chain segment with zero
-    // turns) is an empty registration, not work. Both classifications remain
-    // pending because this scope assigns no terminal abandonment authority.
+) -> Result<WakeSweepAction, String> {
+    // Classify as not startable only sessions with durable WORK: at least one
+    // produced assistant turn. A bare resume target (a registered chain segment
+    // with zero turns) is an empty registration, not work. Both classifications
+    // remain pending because this scope assigns no terminal abandonment authority.
     if wake_sweep_candidate_has_produced_turns(db, state, candidate)? {
-        trace_abandoned_transient_wake_skip(&candidate.session_id);
-        return Ok(WakeSweepDisposition::Skip);
+        trace_abandoned_transient_work_retained(&candidate.session_id);
+        return Ok(WakeSweepAction::Retain(
+            WakeSweepRetentionReason::NotStartable,
+        ));
     }
     trace_abandoned_transient_wake_retained(&candidate.session_id);
-    Ok(WakeSweepDisposition::Abandoned)
+    Ok(WakeSweepAction::Retain(
+        WakeSweepRetentionReason::DebrisWithoutReapAuthority,
+    ))
 }
 
 fn wake_sweep_candidate_has_produced_turns(
@@ -75,11 +83,11 @@ fn wake_sweep_candidate_has_produced_turns(
     Ok(resume_evidence(state, &runtime)?.is_some_and(|evidence| evidence.turn_count > 0))
 }
 
-fn resumable_wake_sweep_disposition(candidate: &WakeSweepCandidate) -> WakeSweepDisposition {
+fn resumable_wake_sweep_action(candidate: &WakeSweepCandidate) -> WakeSweepAction {
     if !wake_sweep_candidate_has_deliverable_pending(&candidate.session_id) {
-        return WakeSweepDisposition::Skip;
+        return WakeSweepAction::Retain(WakeSweepRetentionReason::NotStartable);
     }
-    WakeSweepDisposition::Recoverable
+    WakeSweepAction::Start
 }
 
 fn wake_sweep_candidate_has_deliverable_pending(session_id: &str) -> bool {
@@ -197,10 +205,10 @@ fn mailbox_row_owner_identity(row: &MailboxRow) -> Option<ProcessIdentity> {
     })
 }
 
-fn trace_abandoned_transient_wake_skip(session_id: &str) {
+fn trace_abandoned_transient_work_retained(session_id: &str) {
     tracing::warn!(
         session_id,
-        "Skipping auto wake for abandoned transient session with dead owner lineage"
+        "Retaining abandoned transient work with dead owner lineage because it is not startable"
     );
 }
 

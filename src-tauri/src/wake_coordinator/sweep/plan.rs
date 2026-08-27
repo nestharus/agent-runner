@@ -1,4 +1,4 @@
-//! Recoverable wake-sweep candidate planning and selection.
+//! Startable wake-sweep candidate planning and selection.
 //!
 //! ## Declared roles
 //!
@@ -7,18 +7,20 @@
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{MailboxDb, WakeSweepCandidate};
 
-use super::candidate::wake_sweep_candidate_disposition;
+use super::candidate::wake_sweep_candidate_action;
 use crate::wake_coordinator::diagnostics::WakeDiagnostic;
 use crate::wake_coordinator::wake_start::StartWakeInput;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WakeSweepDisposition {
-    /// Eligible for selection and start by this sweep.
-    Recoverable,
-    /// Retained debris for which this scope has no terminal reap authority.
-    Abandoned,
-    /// Retained but not eligible for start by this sweep.
-    Skip,
+pub(super) enum WakeSweepAction {
+    Start,
+    Retain(WakeSweepRetentionReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WakeSweepRetentionReason {
+    NotStartable,
+    DebrisWithoutReapAuthority,
 }
 
 pub(super) fn plan_wake_sweep(
@@ -27,20 +29,20 @@ pub(super) fn plan_wake_sweep(
     state: Result<Option<StateDb>, String>,
 ) -> Result<Option<WakeSweepCandidate>, String> {
     let state = state?;
-    let mut recoverable = Vec::new();
+    let mut startable = Vec::new();
     for candidate in candidates {
-        match wake_sweep_candidate_disposition(db, state.as_ref(), &candidate)? {
-            WakeSweepDisposition::Recoverable => recoverable.push(candidate),
-            WakeSweepDisposition::Abandoned => {
-                trace_abandoned_candidate_retained(&candidate.session_id);
+        match wake_sweep_candidate_action(db, state.as_ref(), &candidate)? {
+            WakeSweepAction::Start => startable.push(candidate),
+            WakeSweepAction::Retain(WakeSweepRetentionReason::DebrisWithoutReapAuthority) => {
+                trace_retained_debris_candidate(&candidate.session_id);
             }
-            WakeSweepDisposition::Skip => {}
+            WakeSweepAction::Retain(WakeSweepRetentionReason::NotStartable) => {}
         }
     }
-    Ok(select_recoverable_sweep_candidate(recoverable))
+    Ok(select_startable_sweep_candidate(startable))
 }
 
-pub(super) fn select_recoverable_sweep_candidate(
+pub(super) fn select_startable_sweep_candidate(
     candidates: Vec<WakeSweepCandidate>,
 ) -> Option<WakeSweepCandidate> {
     candidates
@@ -60,10 +62,10 @@ pub(super) fn wake_sweep_start_input<'a>(
     }
 }
 
-fn trace_abandoned_candidate_retained(session_id: &str) {
+fn trace_retained_debris_candidate(session_id: &str) {
     tracing::warn!(
         session_id,
-        "Wake reclaim sweep retained abandoned candidate because terminal reap lacks cross-store authority"
+        "Wake reclaim sweep retained debris candidate because terminal reap lacks cross-store authority"
     );
 }
 

@@ -129,7 +129,7 @@ mod tests {
         assert_present_position(
             production_block_after(
                 orchestration_source(),
-                "fn resume_terminal_disposition_outcome(",
+                "fn apply_resume_terminal_disposition(",
             )
             .find("handle_terminal_signal_disposition"),
             "run_resume typed terminal-signal disposition",
