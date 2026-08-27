@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 const INVOCATION_A: &str = "11111111-1111-4111-8111-111111111111";
 const LIVE_INVOCATION: &str = "22222222-2222-4222-8222-222222222222";
 const SESSION_A: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
-const REGISTRATION_AUTHORITY_FILE: &str = "completion-registration-authority";
+const OBSERVED_COMPLETION_AUTHORITY_FILE: &str = "observed-completion-registration-authority";
 
 struct Fixture {
     _integration_test_guard: MutexGuard<'static, ()>,
@@ -101,10 +101,6 @@ impl Fixture {
             .join("state.db")
     }
 
-    fn registration_authority_path(&self) -> PathBuf {
-        self.dir.path().join(REGISTRATION_AUTHORITY_FILE)
-    }
-
     fn conn(&self) -> Connection {
         let _ = StateDb::open(&self.state_path()).unwrap();
         Connection::open(self.state_path()).unwrap()
@@ -129,22 +125,11 @@ impl Fixture {
             .to_string();
         let artifacts = self.write_notify_artifacts(handle, metadata, 0);
         let mut registration = self.register_command(handle, &artifacts);
-        if let Some(authority) = self
-            .completion_authorities
-            .lock()
-            .unwrap()
-            .get(&owner_invocation_uuid)
-        {
-            registration.env(
-                COMPLETION_REGISTRATION_AUTHORITY_ENV,
-                authority.process_environment_value(),
-            );
-        } else {
-            registration.env(
-                COMPLETION_REGISTRATION_AUTHORITY_ENV,
-                fs::read_to_string(self.completion_authority_path()).unwrap(),
-            );
-        }
+        let authority = self.completion_authority_for_owner(&owner_invocation_uuid);
+        registration.env(
+            COMPLETION_REGISTRATION_AUTHORITY_ENV,
+            authority.process_environment_value(),
+        );
         let registration = self.run(registration);
         assert!(registration.status.success(), "{registration:?}");
         self.run(self.notify_command(handle, &artifacts))
@@ -253,13 +238,6 @@ impl Fixture {
             })
             .unwrap();
         let invocation_id = started.invocation_row_id;
-        fs::write(
-            self.registration_authority_path(),
-            started
-                .completion_registration_authority
-                .process_environment_value(),
-        )
-        .unwrap();
         self.completion_authorities.lock().unwrap().insert(
             INVOCATION_A.to_string(),
             started.completion_registration_authority,
@@ -357,8 +335,31 @@ impl Fixture {
         dir.join(name)
     }
 
-    fn completion_authority_path(&self) -> PathBuf {
-        self.dir.path().join("completion-registration-authority")
+    fn associate_observed_completion_authority(&self, owner_invocation_uuid: &str) {
+        let authority = CompletionRegistrationAuthority::from_process_environment_value(
+            fs::read_to_string(observed_completion_authority_path(self.dir.path())).unwrap(),
+        )
+        .unwrap();
+        self.completion_authorities
+            .lock()
+            .unwrap()
+            .insert(owner_invocation_uuid.to_string(), authority);
+    }
+
+    fn completion_authority_for_owner(
+        &self,
+        owner_invocation_uuid: &str,
+    ) -> CompletionRegistrationAuthority {
+        self.completion_authorities
+            .lock()
+            .unwrap()
+            .get(owner_invocation_uuid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing owner-bound completion registration authority for {owner_invocation_uuid}"
+                )
+            })
+            .clone()
     }
 
     fn notify_trace_path(&self) -> PathBuf {
@@ -447,6 +448,23 @@ flag = "--resume"
 fn integration_test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn observed_completion_authority_path(dir: &Path) -> PathBuf {
+    dir.join(OBSERVED_COMPLETION_AUTHORITY_FILE)
+}
+
+#[test]
+#[should_panic(expected = "missing owner-bound completion registration authority")]
+fn completion_registration_authority_requires_owner_association() {
+    let fixture = Fixture::new();
+    fs::write(
+        observed_completion_authority_path(fixture.dir.path()),
+        "0".repeat(64),
+    )
+    .unwrap();
+
+    let _ = fixture.completion_authority_for_owner("unassociated-owner");
 }
 
 #[test]
@@ -799,6 +817,7 @@ fn fixture_interactive_session_agent_bash_completion_arrives_live() {
         "startup was {startup:?}"
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
+    fixture.associate_observed_completion_authority(&invocation_uuid);
     let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
 
     let output = fixture.run_notify("h-e2e-live", owner_metadata(SESSION_A, &invocation_uuid));
@@ -872,6 +891,7 @@ fn real_broker_ack_clear_fault_retains_obligation_without_duplicate_delivery() {
         "startup was {startup:?}"
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
+    fixture.associate_observed_completion_authority(&invocation_uuid);
     let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
     let fault = Connection::open(fixture.sidecar_path()).unwrap();
     fault
@@ -984,6 +1004,7 @@ fn production_plain_and_tui_confirmation_faults_remain_uncertain_after_provider_
             "startup was {startup:?}"
         );
         let invocation_uuid = wait_for_running_invocation(&fixture);
+        fixture.associate_observed_completion_authority(&invocation_uuid);
         let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
         let fault = Connection::open(fixture.sidecar_path()).unwrap();
         fault
@@ -1065,6 +1086,7 @@ fn production_plain_and_tui_state_open_faults_reconcile_exact_evidence_once() {
             "startup was {startup:?}"
         );
         let invocation_uuid = wait_for_running_invocation(&fixture);
+        fixture.associate_observed_completion_authority(&invocation_uuid);
         let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
 
         let state_path = fixture.state_path();
@@ -1169,6 +1191,7 @@ fn production_plain_and_tui_state_faults_reconcile_without_new_mailbox_rows() {
             "startup was {startup:?}"
         );
         let invocation_uuid = wait_for_running_invocation(&fixture);
+        fixture.associate_observed_completion_authority(&invocation_uuid);
         let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
         let fault = fixture.conn();
         fault
@@ -1261,6 +1284,7 @@ fn production_plain_and_tui_drain_faults_retain_attempt_through_provider_handoff
                 "startup was {startup:?}"
             );
             let invocation_uuid = wait_for_running_invocation(&fixture);
+            fixture.associate_observed_completion_authority(&invocation_uuid);
             let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
             let generation_id = running_generation_id(&fixture);
 
@@ -1345,6 +1369,7 @@ fn production_tui_pre_submission_fault_sends_no_provider_input() {
         "startup was {startup:?}"
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
+    fixture.associate_observed_completion_authority(&invocation_uuid);
     let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
 
     let notify = fixture.run_notify(
@@ -1388,6 +1413,7 @@ fn real_broker_confirmation_fault_reports_uncertain_and_reuses_without_retransmi
         "startup was {startup:?}"
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
+    fixture.associate_observed_completion_authority(&invocation_uuid);
     let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
     let fault = Connection::open(fixture.sidecar_path()).unwrap();
     fault
@@ -1524,6 +1550,7 @@ fn observed_tui_delivers_live_notification_during_continuous_child_redraw() {
         "startup was {startup:?}"
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
+    fixture.associate_observed_completion_authority(&invocation_uuid);
     let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
 
     let notify = fixture.run_notify(
@@ -2162,7 +2189,7 @@ fn spawn_repl_under_pty_mode_with_test_hooks(
 
 fn fixture_provider_waiting_for_notification(dir: &Path, received_log: &Path) -> PathBuf {
     let path = dir.join("fixture-live-provider.sh");
-    let authority = dir.join("completion-registration-authority");
+    let authority = observed_completion_authority_path(dir);
     fs::write(
         &path,
         format!(
@@ -2198,7 +2225,7 @@ done
 
 fn fixture_provider_with_continuous_redraw(dir: &Path, received_log: &Path) -> PathBuf {
     let path = dir.join("fixture-continuous-redraw-provider.sh");
-    let authority = dir.join("completion-registration-authority");
+    let authority = observed_completion_authority_path(dir);
     fs::write(
         &path,
         format!(
@@ -2265,7 +2292,7 @@ while IFS= read -r line; do
 done
 "#,
             received = shell_single_quote(&path_string(received_log)),
-            authority = shell_single_quote(&path_string(&dir.join(REGISTRATION_AUTHORITY_FILE))),
+            authority = shell_single_quote(&path_string(&observed_completion_authority_path(dir))),
         ),
     )
     .unwrap();
