@@ -74,46 +74,15 @@ fn apply_optional_prompt(
     argv_transformed: bool,
 ) {
     if let Some(prompt) = prompt {
-        rewrite_arg_prompt_if_needed(candidate, &prompt, argv_transformed);
+        if !argv_transformed
+            && matches!(candidate.prompt_mode, PromptMode::Arg)
+            && let Some(argument) = candidate.argv.last_mut()
+            && argument == &candidate.prompt
+        {
+            *argument = prompt.clone();
+        }
         candidate.prompt = prompt;
     }
-}
-
-fn rewrite_arg_prompt_if_needed(
-    candidate: &mut LaunchCandidate,
-    prompt: &str,
-    argv_transformed: bool,
-) {
-    if should_rewrite_arg_prompt(argv_transformed, candidate.prompt_mode) {
-        replace_arg_prompt(&mut candidate.argv, &candidate.prompt, prompt);
-    }
-}
-
-fn should_rewrite_arg_prompt(argv_transformed: bool, prompt_mode: PromptMode) -> bool {
-    !argv_transformed && matches!(prompt_mode, PromptMode::Arg)
-}
-
-fn replace_arg_prompt(argv: &mut [String], previous: &str, next: &str) {
-    if let Some(target) = matching_prompt_arg(argv, previous) {
-        replace_prompt_arg(target, next);
-    }
-}
-
-fn matching_prompt_arg<'a>(argv: &'a mut [String], expected: &str) -> Option<&'a mut String> {
-    let candidate = final_prompt_arg(argv)?;
-    prompt_arg_matches(candidate, expected).then_some(candidate)
-}
-
-fn final_prompt_arg(argv: &mut [String]) -> Option<&mut String> {
-    argv.last_mut()
-}
-
-fn prompt_arg_matches(candidate: &str, expected: &str) -> bool {
-    candidate == expected
-}
-
-fn replace_prompt_arg(target: &mut String, next: &str) {
-    *target = next.to_string();
 }
 
 #[cfg(test)]

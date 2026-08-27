@@ -25,7 +25,7 @@ pub struct ProviderTurnEffectReport {
     pub invocation_finalization: EffectWrite,
 }
 
-pub(crate) fn finalize_invocation_exact(
+pub(crate) fn apply_provider_turn_effects_exact(
     state: &mut StateDb,
     launch: &ProviderTurnLaunch,
     fence: &TurnFence,
@@ -33,7 +33,7 @@ pub(crate) fn finalize_invocation_exact(
     submitted_evidence: Option<&str>,
     confirmed_evidence: Option<&str>,
     observed_at: i64,
-) -> Result<(EffectWrite, EffectWrite), ProviderTurnAdapterError> {
+) -> Result<ProviderTurnEffectReport, ProviderTurnAdapterError> {
     let invocation = state
         .get_invocation_by_uuid(&launch.invocation.invocation.id)
         .map_err(ProviderTurnAdapterError::State)?
@@ -69,7 +69,10 @@ pub(crate) fn finalize_invocation_exact(
         } else {
             EffectWrite::NotApplicable
         };
-        return Ok((acknowledgement, EffectWrite::AlreadyApplied));
+        return Ok(ProviderTurnEffectReport {
+            acknowledgement,
+            invocation_finalization: EffectWrite::AlreadyApplied,
+        });
     }
     let artifacts = execution
         .result
@@ -105,7 +108,10 @@ pub(crate) fn finalize_invocation_exact(
     } else {
         EffectWrite::AlreadyApplied
     };
-    Ok((acknowledgement, EffectWrite::Applied))
+    Ok(ProviderTurnEffectReport {
+        acknowledgement,
+        invocation_finalization: EffectWrite::Applied,
+    })
 }
 
 fn validate_acknowledgement_replay(

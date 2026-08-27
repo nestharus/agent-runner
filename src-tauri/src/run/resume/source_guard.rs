@@ -126,15 +126,23 @@ mod tests {
             resume_diagnostics_fallback_position(),
             "run_resume diagnostics fallback",
         );
+        assert_present_position(
+            production_block_after(
+                orchestration_source(),
+                "fn resume_terminal_disposition_outcome(",
+            )
+            .find("handle_terminal_signal_disposition"),
+            "run_resume typed terminal-signal disposition",
+        );
     }
 
     fn resume_signal_precedence_positions() -> OrderedPositions {
         let run_resume = production_block_after(
             orchestration_source(),
-            "fn handle_resume_attempt_terminal_signal(",
+            "fn handle_ordinary_resume_attempt_terminal_signal(",
         );
         ordered_positions(
-            run_resume.find("handle_terminal_signal_disposition"),
+            run_resume.find("resume_terminal_disposition_outcome"),
             run_resume.find("finalize_completed_attempt"),
         )
     }

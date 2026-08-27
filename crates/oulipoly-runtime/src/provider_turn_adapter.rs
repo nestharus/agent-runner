@@ -10,7 +10,7 @@ use std::fmt;
 
 use oulipoly_state::{CompositeInvocationId, StateDb, TurnFence};
 
-use crate::provider_turn_effect_application::finalize_invocation_exact;
+use crate::provider_turn_effect_application::apply_provider_turn_effects_exact;
 use crate::provider_turn_evidence::{
     acknowledgement_evidence, evidence_from_execution, validate_evidence_fence,
 };
@@ -178,7 +178,7 @@ where
         }
         let (submitted_evidence, confirmed_evidence) =
             acknowledgement_evidence(launch, &fence, &evidence)?;
-        let (acknowledgement, invocation_finalization) = finalize_invocation_exact(
+        apply_provider_turn_effects_exact(
             state,
             launch,
             &fence,
@@ -186,11 +186,7 @@ where
             submitted_evidence.as_deref(),
             confirmed_evidence.as_deref(),
             observed_at,
-        )?;
-        Ok(ProviderTurnEffectReport {
-            acknowledgement,
-            invocation_finalization,
-        })
+        )
     }
 
     pub fn consume(

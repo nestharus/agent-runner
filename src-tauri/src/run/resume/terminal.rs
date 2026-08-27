@@ -91,8 +91,16 @@ pub(super) fn handle_resume_attempt_result(
         prompt_acceptance_confirmation.as_ref(),
         classification.recovered_generic_nonzero,
     );
-    if confirmed_prompt_acceptance_failure.is_some() {
-        result.terminal_reason = Some(ACCEPTED_PROMPT_PROVIDER_FAILED_TERMINAL_REASON.to_string());
+    if let Some(failure) = confirmed_prompt_acceptance_failure {
+        return apply_confirmed_prompt_acceptance_failure(
+            input,
+            &mut bound_attempt.attempt,
+            provider,
+            &bound_attempt.provider_session_id,
+            result,
+            classification,
+            failure,
+        );
     }
     record_resume_acceptance_if_present(input, bound_attempt.attempt.invocation_row_id, result)?;
     emit_captured_child_marker_lines(&result.captured_child_invocations);
@@ -102,28 +110,19 @@ pub(super) fn handle_resume_attempt_result(
         prompt_acceptance_confirmation: prompt_acceptance_confirmation.as_ref(),
     };
     let clean_exit_provenance = classification.clean_exit_mailbox_resolution_provenance;
-    let mailbox_delivery_outcome = if confirmed_prompt_acceptance_failure.is_some() {
-        None
-    } else {
-        // A completion failure may replace a physically clean result. Only the
-        // exact clean pre-failure provenance may still resolve mailbox evidence.
-        match clean_exit_mailbox_resolution_eligibility(
-            clean_exit_provenance.physical_clean_exit_candidate,
-            clean_exit_provenance.effective_clean_exit_candidate,
-            clean_exit_provenance.completion_failure_applied,
-        ) {
-            CleanExitMailboxResolutionEligibility::Ineligible => None,
-            CleanExitMailboxResolutionEligibility::PreCompletionFailureCleanExit => {
-                Some(wake::resolve_mailbox_delivery_outcome(
-                    input,
-                    provider,
-                    result,
-                    completion_evidence,
-                ))
-            }
-        }
+    // A completion failure may replace a physically clean result. Only the
+    // exact clean pre-failure provenance may still resolve mailbox evidence.
+    let mailbox_delivery_outcome = match clean_exit_mailbox_resolution_eligibility(
+        clean_exit_provenance.physical_clean_exit_candidate,
+        clean_exit_provenance.effective_clean_exit_candidate,
+        clean_exit_provenance.completion_failure_applied,
+    ) {
+        CleanExitMailboxResolutionEligibility::Ineligible => None,
+        CleanExitMailboxResolutionEligibility::PreCompletionFailureCleanExit => Some(
+            wake::resolve_mailbox_delivery_outcome(input, provider, result, completion_evidence),
+        ),
     };
-    handle_resume_attempt_terminal_signal(
+    handle_ordinary_resume_attempt_terminal_signal(
         input,
         &mut bound_attempt.attempt,
         provider,
@@ -132,7 +131,6 @@ pub(super) fn handle_resume_attempt_result(
         completion_evidence,
         classification.terminal_completion_confirmed,
         mailbox_delivery_outcome,
-        confirmed_prompt_acceptance_failure,
     )
 }
 
@@ -259,8 +257,7 @@ fn apply_unconfirmed_resume_completion_failure(
     result.produced_assistant_response = false;
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_resume_attempt_terminal_signal(
+fn handle_ordinary_resume_attempt_terminal_signal(
     input: &ResumeAttemptInput<'_>,
     attempt: &mut ResumeInvocationAttempt<'_>,
     provider: &oulipoly_config::ProviderConfig,
@@ -269,49 +266,19 @@ fn handle_resume_attempt_terminal_signal(
     completion_evidence: wake::ResumeCompletionEvidence<'_>,
     terminal_completion_confirmed: bool,
     mailbox_delivery_outcome: Option<wake::MailboxDeliveryOutcome>,
-    confirmed_prompt_acceptance_failure: Option<ConfirmedPromptAcceptanceFailure>,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    let terminal_signal_disposition = terminal_signal_disposition_for_result(
-        &input.env.state,
-        &attempt.invocation.id,
-        &provider.name,
+    let outcome = resume_terminal_disposition_outcome(
+        input,
+        attempt,
+        provider,
         provider_session_id,
         result,
-        completion_evidence.zero_turn_action,
-        completion_evidence.recovered_generic_nonzero,
-    );
-    let disposition_control = handle_terminal_signal_disposition(ResumeTerminalDispositionInput {
-        agent_runtime_services: input.agent_runtime_services,
-        env: input.env,
-        invocation_id: &attempt.invocation.id,
-        invocation_row_id: attempt.invocation_row_id,
-        guard: &mut attempt.guard,
-        provider_name: &provider.name,
-        provider_session_id,
-        result,
-        terminal_signal_disposition,
-        zero_turn_action: completion_evidence.zero_turn_action,
-        recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
-    })?;
-    let outcome =
-        mapper::resume_terminal_disposition_outcome(disposition_control, result.exit_code);
+        completion_evidence,
+    )?;
     let completion = ResumeCompletionClassification {
         recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
         terminal_completion_confirmed,
     };
-    if let Some(failure) = confirmed_prompt_acceptance_failure.as_ref() {
-        return apply_confirmed_prompt_acceptance_failure(
-            input,
-            attempt,
-            provider,
-            provider_session_id,
-            result,
-            completion_evidence,
-            &completion,
-            &outcome,
-            failure,
-        );
-    }
     apply_resume_terminal_disposition_effects(
         input,
         attempt,
@@ -348,6 +315,42 @@ fn handle_resume_attempt_terminal_signal(
         result,
         completion,
     )
+}
+
+fn resume_terminal_disposition_outcome(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &mut ResumeInvocationAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_session_id: &str,
+    result: &executor::ExecutionResult,
+    completion_evidence: wake::ResumeCompletionEvidence<'_>,
+) -> Result<ResumeTerminalDispositionOutcome, String> {
+    let terminal_signal_disposition = terminal_signal_disposition_for_result(
+        &input.env.state,
+        &attempt.invocation.id,
+        &provider.name,
+        provider_session_id,
+        result,
+        completion_evidence.zero_turn_action,
+        completion_evidence.recovered_generic_nonzero,
+    );
+    let disposition_control = handle_terminal_signal_disposition(ResumeTerminalDispositionInput {
+        agent_runtime_services: input.agent_runtime_services,
+        env: input.env,
+        invocation_id: &attempt.invocation.id,
+        invocation_row_id: attempt.invocation_row_id,
+        guard: &mut attempt.guard,
+        provider_name: &provider.name,
+        provider_session_id,
+        result,
+        terminal_signal_disposition,
+        zero_turn_action: completion_evidence.zero_turn_action,
+        recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
+    })?;
+    Ok(mapper::resume_terminal_disposition_outcome(
+        disposition_control,
+        result.exit_code,
+    ))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -396,23 +399,36 @@ fn apply_resume_terminal_disposition_effects(
     wake::mark_resume_attempt_idle(provider_session_id, &attempt.invocation.id, Some(exit_code))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_confirmed_prompt_acceptance_failure(
     input: &ResumeAttemptInput<'_>,
     attempt: &mut ResumeInvocationAttempt<'_>,
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
-    result: &executor::ExecutionResult,
-    completion_evidence: wake::ResumeCompletionEvidence<'_>,
-    completion: &ResumeCompletionClassification,
-    outcome: &ResumeTerminalDispositionOutcome,
-    failure: &ConfirmedPromptAcceptanceFailure,
+    result: &mut executor::ExecutionResult,
+    classification: ResumeAttemptClassification,
+    failure: ConfirmedPromptAcceptanceFailure,
 ) -> Result<ResumeAttemptLoopControl, String> {
+    result.terminal_reason = Some(ACCEPTED_PROMPT_PROVIDER_FAILED_TERMINAL_REASON.to_string());
+    record_resume_acceptance_if_present(input, attempt.invocation_row_id, result)?;
+    emit_captured_child_marker_lines(&result.captured_child_invocations);
+    let completion_evidence = wake::ResumeCompletionEvidence {
+        zero_turn_action: classification.zero_turn_action,
+        recovered_generic_nonzero: classification.recovered_generic_nonzero,
+        prompt_acceptance_confirmation: Some(&failure.prompt_acceptance),
+    };
+    let outcome = resume_terminal_disposition_outcome(
+        input,
+        attempt,
+        provider,
+        provider_session_id,
+        result,
+        completion_evidence,
+    )?;
     let shell_exit_code = match outcome {
         ResumeTerminalDispositionOutcome::Continue(_) => {
             nonzero_resume_exit_code(failure.physical_exit_code)
         }
-        ResumeTerminalDispositionOutcome::Return(shell_exit_code) => *shell_exit_code,
+        ResumeTerminalDispositionOutcome::Return(shell_exit_code) => shell_exit_code,
         ResumeTerminalDispositionOutcome::CompletedAttempt => {
             wake::ingest_mailbox_delivery_confirmation_turn_if_needed(
                 input,
@@ -436,7 +452,10 @@ fn apply_confirmed_prompt_acceptance_failure(
                 provider,
                 provider_session_id,
                 result,
-                completion,
+                &ResumeCompletionClassification {
+                    recovered_generic_nonzero: classification.recovered_generic_nonzero,
+                    terminal_completion_confirmed: classification.terminal_completion_confirmed,
+                },
             )? {
                 CompletedAttemptControl::Continue | CompletedAttemptControl::Return(_) => {
                     nonzero_resume_exit_code(failure.physical_exit_code)
