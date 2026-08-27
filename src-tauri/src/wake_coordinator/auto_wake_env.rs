@@ -10,7 +10,8 @@ use super::constants::DEFAULT_AUTO_WAKE_RETRY_BASE_MS;
 
 pub(super) struct AutoWakeEnv {
     pub(super) token: String,
-    pub(super) count: i64,
+    /// Chronology and cadence input, never an eligibility or exhaustion budget.
+    pub(super) chronological_attempt_count: i64,
     pub(super) retry_base_milliseconds: u64,
 }
 
@@ -51,7 +52,7 @@ pub(super) fn current_auto_wake() -> Option<AutoWakeEnv> {
         return None;
     }
     let token = std::env::var(AutoWakeEnvironmentVariable::CLAIM_TOKEN.name()).ok()?;
-    let count = std::env::var(AutoWakeEnvironmentVariable::COUNT.name())
+    let chronological_attempt_count = std::env::var(AutoWakeEnvironmentVariable::COUNT.name())
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(1);
@@ -63,7 +64,7 @@ pub(super) fn current_auto_wake() -> Option<AutoWakeEnv> {
             .unwrap_or(DEFAULT_AUTO_WAKE_RETRY_BASE_MS);
     Some(AutoWakeEnv {
         token,
-        count,
+        chronological_attempt_count,
         retry_base_milliseconds,
     })
 }

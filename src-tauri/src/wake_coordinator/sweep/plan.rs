@@ -13,8 +13,11 @@ use crate::wake_coordinator::wake_start::StartWakeInput;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WakeSweepDisposition {
+    /// Eligible for selection and start by this sweep.
     Recoverable,
+    /// Retained debris for which this scope has no terminal reap authority.
     Abandoned,
+    /// Retained but not eligible for start by this sweep.
     Skip,
 }
 

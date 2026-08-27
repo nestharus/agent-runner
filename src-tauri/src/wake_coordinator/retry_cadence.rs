@@ -1,3 +1,9 @@
+//! Frequency control for indefinitely eligible automatic-wake retries.
+//!
+//! The attempt count is chronology/backoff input, never an exhaustion budget.
+//! The delay ceiling bounds retry frequency, not retry lifetime; settlement or
+//! ordinary loss of eligibility ends the sequence.
+//!
 //! ## Declared roles
 //!
 //! `mapper`, `orchestration`
@@ -14,7 +20,7 @@ pub(super) fn sleep_before_failed_auto_wake_retry(auto_wake: &AutoWakeEnv) {
 fn auto_wake_retry_delay(auto_wake: &AutoWakeEnv) -> Duration {
     Duration::from_millis(bounded_auto_wake_retry_delay_ms(
         auto_wake.retry_base_milliseconds,
-        auto_wake.count,
+        auto_wake.chronological_attempt_count,
     ))
 }
 

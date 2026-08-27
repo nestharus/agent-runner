@@ -16,10 +16,10 @@ pub(super) fn wake_sweep_candidate_disposition(
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
 ) -> Result<WakeSweepDisposition, String> {
-    // Recoverable means either an idle headless runtime with durable resume
-    // evidence, or a live owner PID identity that must not be reaped. Missing
-    // runtime/history with no live owner is retained abandoned debris, not
-    // resumable work.
+    // Recoverable candidates are eligible for sweep-start selection. Skip
+    // candidates remain retained but are not startable by this sweep, including
+    // live-owner protected work. Abandoned candidates remain retained debris
+    // because this scope has no terminal reap authority.
     if db.notifications_paused(&candidate.session_id)? {
         return Ok(WakeSweepDisposition::Skip);
     }
@@ -38,21 +38,21 @@ pub(super) fn wake_sweep_candidate_disposition(
     Ok(WakeSweepDisposition::Abandoned)
 }
 
-/// Disposition for an unclaimed session whose pending rows all have a dead owner
-/// PID lineage. Such a session is never auto-woken (anti-resurrection, #44/#55).
-/// When it also has no durable resume evidence, its pending rows are
-/// undeliverable debris and are retained pending under the fail-closed policy;
-/// a resumable session is also left pending so a later deliberate resume can
-/// still consume it.
+/// Disposition for an unclaimed session with at least one recorded owner identity
+/// and no currently live recorded owner. Such a session is never auto-woken
+/// (anti-resurrection, #44/#55). When it also has no durable resume evidence, its
+/// pending rows are undeliverable debris retained under the fail-closed policy;
+/// a resumable session is also retained so a later deliberate resume can consume
+/// it.
 fn abandoned_transient_disposition(
     db: &MailboxDb,
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
 ) -> Result<WakeSweepDisposition, String> {
-    // Preserve only sessions with durable WORK — at least one produced assistant
-    // turn. A bare resume target (a registered chain segment with zero turns) is
-    // an empty registration, not work. Both cases remain pending because this
-    // scope assigns no terminal abandonment authority.
+    // Classify as Skip only sessions with durable WORK: at least one produced
+    // assistant turn. A bare resume target (a registered chain segment with zero
+    // turns) is an empty registration, not work. Both classifications remain
+    // pending because this scope assigns no terminal abandonment authority.
     if wake_sweep_candidate_has_produced_turns(db, state, candidate)? {
         trace_abandoned_transient_wake_skip(&candidate.session_id);
         return Ok(WakeSweepDisposition::Skip);

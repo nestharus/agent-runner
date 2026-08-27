@@ -34,7 +34,7 @@ fn terminal_attempt_recheck(session_id: &str) -> WakeDiagnostic {
     start_wake_chain(StartWakeInput {
         session_id,
         reason: "turn_end_recheck",
-        auto_wake_count: following_auto_wake_count(auto_wake.as_ref()),
+        auto_wake_count: following_auto_wake_chronology_count(auto_wake.as_ref()),
         renew_token: auto_wake.as_ref().map(|wake| wake.token.as_str()),
     })
 }
@@ -55,13 +55,16 @@ pub(crate) fn recheck_after_failed_auto_wake(session_id: &str) -> WakeDiagnostic
     start_wake_chain(StartWakeInput {
         session_id,
         reason: "wake_failure_retry",
-        auto_wake_count: following_auto_wake_count(Some(&auto_wake)),
+        auto_wake_count: following_auto_wake_chronology_count(Some(&auto_wake)),
         renew_token: None,
     })
 }
 
-fn following_auto_wake_count(auto_wake: Option<&AutoWakeEnv>) -> i64 {
-    auto_wake.map(|wake| wake.count).unwrap_or(0) + 1
+fn following_auto_wake_chronology_count(auto_wake: Option<&AutoWakeEnv>) -> i64 {
+    auto_wake
+        .map(|wake| wake.chronological_attempt_count)
+        .unwrap_or(0)
+        + 1
 }
 
 fn turn_end_pending_count(session_id: &str) -> Result<usize, String> {
@@ -85,22 +88,22 @@ mod tests {
     fn terminal_attempt_recheck_ignores_former_cap_at_five() {
         let auto_wake = AutoWakeEnv {
             token: "turn-end-token".to_string(),
-            count: 5,
+            chronological_attempt_count: 5,
             retry_base_milliseconds: 1_000,
         };
 
-        assert_eq!(following_auto_wake_count(Some(&auto_wake)), 6);
+        assert_eq!(following_auto_wake_chronology_count(Some(&auto_wake)), 6);
     }
 
     #[test]
     fn failed_auto_wake_recheck_ignores_former_cap_at_five() {
         let auto_wake = AutoWakeEnv {
             token: "failed-wake-token".to_string(),
-            count: 5,
+            chronological_attempt_count: 5,
             retry_base_milliseconds: 1_000,
         };
 
-        assert_eq!(following_auto_wake_count(Some(&auto_wake)), 6);
+        assert_eq!(following_auto_wake_chronology_count(Some(&auto_wake)), 6);
     }
 
     #[test]
