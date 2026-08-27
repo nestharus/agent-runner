@@ -7,7 +7,7 @@
 //! - mapper: derives sidecar metadata from the existing parent-invocation env
 //!   payload threaded through executor launches.
 
-use oulipoly_core::AUTO_WAKE_ENV;
+use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_state::CompositeInvocationId;
 use oulipoly_state::mailbox::{
     AdvanceRuntimeGenerationDrain, AttachRuntimeGenerationSession, BindRuntimeGenerationRunning,
@@ -101,7 +101,10 @@ pub(crate) fn context_from_parent_invocation_env(
 }
 
 pub(crate) fn provider_parent_invocation_env(current: Option<&str>) -> Option<String> {
-    let auto_wake = std::env::var(AUTO_WAKE_ENV).ok().as_deref() == Some("1");
+    let auto_wake = std::env::var(AutoWakeEnvironmentVariable::MARKER.name())
+        .ok()
+        .as_deref()
+        == Some("1");
     let inherited = std::env::var(PARENT_INVOCATION_ENV).ok();
     provider_parent_invocation_env_for(current, auto_wake, inherited.as_deref())
 }

@@ -25,7 +25,7 @@ use crate::provider_registry::ProviderRegistry;
 use crate::session_provider::SessionProviderIdentity;
 use chrono::{SecondsFormat, Utc};
 use oulipoly_config::ProviderConfig;
-use oulipoly_core::AUTO_WAKE_ENV;
+use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_state::mailbox::{MailboxDb, MailboxRow};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -486,7 +486,7 @@ pub(super) fn observed_tui_enabled() -> bool {
     if !controlling_terminal_available() {
         return false;
     }
-    if std::env::var_os(AUTO_WAKE_ENV).is_some() {
+    if std::env::var_os(AutoWakeEnvironmentVariable::MARKER.name()).is_some() {
         return false;
     }
     if tui_disabled_by_env() {

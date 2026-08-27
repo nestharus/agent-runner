@@ -3,10 +3,7 @@ use serde::{Deserialize, Serialize};
 mod auto_wake_environment;
 mod cancellation;
 
-pub use auto_wake_environment::{
-    AUTO_WAKE_COUNT_ENV, AUTO_WAKE_ENV, AUTO_WAKE_RETRY_BASE_MS_ENV, AUTO_WAKE_SESSION_ID_ENV,
-    AUTO_WAKE_TOKEN_ENV, RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES,
-};
+pub use auto_wake_environment::AutoWakeEnvironmentVariable;
 pub use cancellation::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

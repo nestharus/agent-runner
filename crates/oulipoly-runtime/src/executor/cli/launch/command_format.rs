@@ -23,7 +23,7 @@ use std::process::Command;
 use crate::executor::cli::spawn_identity::{
     provider_parent_invocation_env, split_invocation_launch_environment,
 };
-use oulipoly_core::RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES;
+use oulipoly_core::AutoWakeEnvironmentVariable;
 
 pub(super) fn command_from_parts(
     parts: &[String],
@@ -45,8 +45,8 @@ pub(super) fn command_from_parts(
         cmd.env_remove(name);
     }
     cmd.envs(environment);
-    for name in RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES {
-        cmd.env_remove(name);
+    for variable in AutoWakeEnvironmentVariable::ALL {
+        cmd.env_remove(variable.name());
     }
 
     if let Some(dir) = working_dir {
@@ -126,9 +126,9 @@ mod tests {
 
     #[test]
     fn provider_launch_removes_runner_private_auto_wake_environment() {
-        let environment = RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES
+        let environment = AutoWakeEnvironmentVariable::ALL
             .into_iter()
-            .map(|name| (name.to_string(), "private".to_string()))
+            .map(|variable| (variable.name().to_string(), "private".to_string()))
             .collect();
 
         let command = command_from_parts(
@@ -151,8 +151,8 @@ mod tests {
             })
             .collect();
 
-        for name in RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES {
-            assert_eq!(explicit_environment.get(name), Some(&None));
+        for variable in AutoWakeEnvironmentVariable::ALL {
+            assert_eq!(explicit_environment.get(variable.name()), Some(&None));
         }
     }
 }

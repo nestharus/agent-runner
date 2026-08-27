@@ -6,10 +6,8 @@ use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
 use std::time::Duration;
 
-use super::constants::{
-    AUTO_WAKE_COUNT_ENV, AUTO_WAKE_ENV, AUTO_WAKE_RETRY_BASE_MS_ENV, AUTO_WAKE_RETRY_MAX_MS,
-    AUTO_WAKE_SESSION_ID_ENV, AUTO_WAKE_TOKEN_ENV, DEFAULT_AUTO_WAKE_RETRY_BASE_MS,
-};
+use super::constants::{AUTO_WAKE_RETRY_MAX_MS, DEFAULT_AUTO_WAKE_RETRY_BASE_MS};
+use oulipoly_core::AutoWakeEnvironmentVariable;
 
 pub(super) struct AutoWakeEnv {
     pub(super) token: String,
@@ -68,7 +66,7 @@ pub(crate) fn release_current_auto_wake_claim_for_session(session_id: &str) {
 }
 
 pub(super) fn auto_wake_marker_present() -> bool {
-    std::env::var_os(AUTO_WAKE_ENV).is_some()
+    std::env::var_os(AutoWakeEnvironmentVariable::MARKER.name()).is_some()
 }
 
 fn auto_wake_child_marker() -> AutoWakeChildMarker {
@@ -76,11 +74,11 @@ fn auto_wake_child_marker() -> AutoWakeChildMarker {
 }
 
 fn auto_wake_expected_session() -> String {
-    std::env::var(AUTO_WAKE_SESSION_ID_ENV).unwrap_or_default()
+    std::env::var(AutoWakeEnvironmentVariable::SESSION_ID.name()).unwrap_or_default()
 }
 
 fn auto_wake_child_claim_token() -> String {
-    std::env::var(AUTO_WAKE_TOKEN_ENV).unwrap_or_default()
+    std::env::var(AutoWakeEnvironmentVariable::CLAIM_TOKEN.name()).unwrap_or_default()
 }
 
 fn auto_wake_child_marker_from_parts(
@@ -162,7 +160,7 @@ fn parsed_auto_wake_retry_base_ms() -> Option<u64> {
 }
 
 fn auto_wake_retry_base_ms_text() -> Option<String> {
-    std::env::var(AUTO_WAKE_RETRY_BASE_MS_ENV).ok()
+    std::env::var(AutoWakeEnvironmentVariable::RETRY_BASE_MILLISECONDS.name()).ok()
 }
 
 fn parse_auto_wake_retry_base_ms(value: Option<String>) -> Option<u64> {
@@ -188,11 +186,11 @@ fn auto_wake_count() -> i64 {
 }
 
 fn auto_wake_token() -> Option<String> {
-    std::env::var(AUTO_WAKE_TOKEN_ENV).ok()
+    std::env::var(AutoWakeEnvironmentVariable::CLAIM_TOKEN.name()).ok()
 }
 
 fn auto_wake_count_value() -> Option<String> {
-    std::env::var(AUTO_WAKE_COUNT_ENV).ok()
+    std::env::var(AutoWakeEnvironmentVariable::COUNT.name()).ok()
 }
 
 fn parse_auto_wake_count(value: Option<String>) -> i64 {

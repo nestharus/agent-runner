@@ -2,6 +2,7 @@
 //!
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`
 
+use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_state::{CompositeInvocationId, mailbox::SessionMetadataRow};
 use std::process::{Child, Command, Stdio};
 
@@ -11,7 +12,6 @@ use std::os::unix::process::CommandExt;
 use std::{fs::File, os::fd::AsRawFd};
 
 use super::constants::{
-    AUTO_WAKE_COUNT_ENV, AUTO_WAKE_ENV, AUTO_WAKE_SESSION_ID_ENV, AUTO_WAKE_TOKEN_ENV,
     PARENT_INVOCATION_ENV, WAKE_RECLAIM_HANDOFF_OWNER_ENV, WAKE_RECLAIM_HANDOFF_TOKEN_ENV,
 };
 
@@ -44,7 +44,7 @@ pub(super) fn spawn_detached_wake_reclaim_handoff(
         .stderr(Stdio::null())
         .env(WAKE_RECLAIM_HANDOFF_OWNER_ENV, owner_token)
         .env(WAKE_RECLAIM_HANDOFF_TOKEN_ENV, handoff_token)
-        .env_remove(AUTO_WAKE_ENV);
+        .env_remove(AutoWakeEnvironmentVariable::MARKER.name());
     configure_handoff_detached(&mut launch.command);
     launch
         .command
@@ -161,13 +161,36 @@ fn configure_wake_stdio_and_env(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .env(AUTO_WAKE_ENV, "1")
-        .env(AUTO_WAKE_SESSION_ID_ENV, session_id)
-        .env(AUTO_WAKE_TOKEN_ENV, claim_token)
-        .env(AUTO_WAKE_COUNT_ENV, auto_wake_count.to_string())
         .env_remove(WAKE_RECLAIM_HANDOFF_OWNER_ENV)
         .env_remove(WAKE_RECLAIM_HANDOFF_TOKEN_ENV);
+    for (variable, value) in
+        auto_wake_environment_bindings(session_id, claim_token, auto_wake_count)
+    {
+        cmd.env(variable.name(), value);
+    }
     configure_parent_invocation(cmd, runtime);
+}
+
+fn auto_wake_environment_bindings(
+    session_id: &str,
+    claim_token: &str,
+    auto_wake_count: i64,
+) -> [(AutoWakeEnvironmentVariable, String); 4] {
+    [
+        (AutoWakeEnvironmentVariable::MARKER, "1".to_string()),
+        (
+            AutoWakeEnvironmentVariable::SESSION_ID,
+            session_id.to_string(),
+        ),
+        (
+            AutoWakeEnvironmentVariable::CLAIM_TOKEN,
+            claim_token.to_string(),
+        ),
+        (
+            AutoWakeEnvironmentVariable::COUNT,
+            auto_wake_count.to_string(),
+        ),
+    ]
 }
 
 fn configure_parent_invocation(cmd: &mut Command, runtime: Option<&SessionMetadataRow>) {

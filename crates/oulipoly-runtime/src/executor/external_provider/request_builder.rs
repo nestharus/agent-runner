@@ -22,7 +22,7 @@ use crate::executor::cli::spawn_identity::{
 use crate::executor::cli::{provider_name, resolve_input_flags, shell_split};
 use crate::provider_registry::DescribeHostOptions;
 use oulipoly_config::PromptMode;
-use oulipoly_core::RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES;
+use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_provider::generated::{
     BytePayload, CONTRACT_VERSION, HostContext, JsonObject, LaunchParams, LaunchRequest,
     PROMPT_ACCEPTANCE_V1, PolicyEvaluateParams, PolicyEvaluateRequest, PromptAcceptanceRequestV1,
@@ -85,8 +85,8 @@ fn declared_launch_env(
     let inherited_authority = env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
     remove_configured_launch_env(&mut env, &context.provider.unset_environment);
     env.extend(context.provider.environment.clone());
-    for name in RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES {
-        env.remove(name);
+    for variable in AutoWakeEnvironmentVariable::ALL {
+        env.remove(variable.name());
     }
     env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
     insert_pinned_agent_data_dir(&mut env);
