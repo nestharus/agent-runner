@@ -62,12 +62,12 @@ pub(crate) fn start_live_pty_retry_driver_for_owner() -> Option<LivePtyRetryDriv
     sweep::start_live_pty_retry_driver_for_owner()
 }
 
-pub(crate) fn mark_successful_turn_idle_and_recheck(
+pub(crate) fn mark_terminal_attempt_idle_and_recheck(
     session_id: &str,
     invocation_uuid: &str,
     exit_code: i32,
 ) -> Result<WakeDiagnostic, String> {
-    turn_recheck::mark_successful_turn_idle_and_recheck(session_id, invocation_uuid, exit_code)
+    turn_recheck::mark_terminal_attempt_idle_and_recheck(session_id, invocation_uuid, exit_code)
 }
 
 pub(crate) fn validate_auto_wake_child(session_id: &str) -> Result<Option<i32>, String> {

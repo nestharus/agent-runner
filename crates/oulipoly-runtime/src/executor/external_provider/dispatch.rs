@@ -83,7 +83,7 @@ pub(crate) fn dispatch(
         .describe_model_provider(&context.model.name)
         .map_err(map_registry_error)?;
     gate_required_capabilities(&describe).map_err(service_error)?;
-    let prompt_acceptance_v1 = describe.capabilities.prompt_acceptance_v1;
+    let provider_supports_prompt_acceptance_v1 = describe.capabilities.prompt_acceptance_v1;
 
     // FIX #32: rotate over the pool on transport-timeout / account-unavailable
     // classes, terminal-failing only once every account has been tried. The
@@ -93,8 +93,12 @@ pub(crate) fn dispatch(
     let last_index = order.len().saturating_sub(1);
     for (position, account) in order.into_iter().enumerate() {
         let account_context = context.with_account(account);
-        match attempt_account_dispatch(registry, &artifact, &account_context, prompt_acceptance_v1)
-        {
+        match attempt_account_dispatch(
+            registry,
+            &artifact,
+            &account_context,
+            provider_supports_prompt_acceptance_v1,
+        ) {
             Ok(result) => return Ok(result),
             Err(attempt) => {
                 if attempt.rotatable && position < last_index {
@@ -132,7 +136,7 @@ fn attempt_account_dispatch(
     registry: &ProviderRegistry,
     artifact: &ProviderArtifactRef,
     context: &ExternalProviderDispatchContext,
-    prompt_acceptance_v1: bool,
+    provider_supports_prompt_acceptance_v1: bool,
 ) -> Result<ExecutionResult, AccountAttemptError> {
     let spawn_identity = external_launch_spawn_identity_context(context);
     let recorded_generation = recorded_launch_generation();
@@ -153,12 +157,13 @@ fn attempt_account_dispatch(
         .map_err(classify_provider_client_attempt_error)?;
     let candidate = apply_policy_transform(candidate, policy_result)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
-    let prompt_acceptance_v1 = prompt_acceptance_v1 && candidate.prompt_acceptance.is_some();
+    let launch_prompt_acceptance_v1_enabled =
+        provider_supports_prompt_acceptance_v1 && candidate.prompt_acceptance.is_some();
     let launch_request = build_launch_request(
         context,
         &candidate,
         registry.host_options(),
-        prompt_acceptance_v1,
+        launch_prompt_acceptance_v1_enabled,
     )
     .map_err(|_| terminal_attempt_error(protocol_service_error("schema_invalid_request")))?;
     register_runtime_generation_starting(spawn_identity.as_ref()).map_err(|_| {
@@ -209,7 +214,7 @@ fn attempt_account_dispatch(
         context.provider_index,
         &context.provider.name,
         classification,
-        prompt_acceptance_v1,
+        launch_prompt_acceptance_v1_enabled,
     ))
 }
 

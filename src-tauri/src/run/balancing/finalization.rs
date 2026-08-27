@@ -328,7 +328,7 @@ fn mark_balanced_successful_attempt_idle_and_recheck(
     let Some(provider_session_id) = input.zero_turn_provider_session_id else {
         return;
     };
-    if let Err(err) = crate::wake_coordinator::mark_successful_turn_idle_and_recheck(
+    if let Err(err) = crate::wake_coordinator::mark_terminal_attempt_idle_and_recheck(
         provider_session_id,
         &input.invocation.id,
         exit_code,

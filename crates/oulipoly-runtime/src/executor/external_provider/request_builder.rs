@@ -169,7 +169,7 @@ pub(crate) fn build_launch_request(
     context: &ExternalProviderDispatchContext,
     candidate: &LaunchCandidate,
     host_options: &DescribeHostOptions,
-    prompt_acceptance_v1: bool,
+    include_prompt_acceptance_v1: bool,
 ) -> Result<Value, serde_json::Error> {
     let (argv, launch_stdin) = project_launch_carrier(context, candidate);
     let mut launch_env = candidate.env.clone();
@@ -206,7 +206,7 @@ pub(crate) fn build_launch_request(
             env,
             stdin,
             session: launch_session(context),
-            prompt_acceptance: prompt_acceptance_v1
+            prompt_acceptance: include_prompt_acceptance_v1
                 .then(|| prompt_acceptance_request(candidate))
                 .flatten(),
         },

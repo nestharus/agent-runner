@@ -11,13 +11,13 @@ use super::idle::mark_session_idle_after_turn;
 use super::wake_start::{StartWakeInput, start_wake_chain};
 use oulipoly_state::mailbox::MailboxDb;
 
-pub(crate) fn mark_successful_turn_idle_and_recheck(
+pub(crate) fn mark_terminal_attempt_idle_and_recheck(
     session_id: &str,
     invocation_uuid: &str,
     exit_code: i32,
 ) -> Result<WakeDiagnostic, String> {
     mark_session_idle_after_turn(session_id, invocation_uuid, Some(exit_code))?;
-    Ok(successful_turn_recheck(session_id))
+    Ok(terminal_attempt_recheck(session_id))
 }
 
 pub(crate) fn recheck_after_failed_auto_wake(session_id: &str) -> WakeDiagnostic {
@@ -28,7 +28,7 @@ pub(crate) fn recheck_after_failed_auto_wake(session_id: &str) -> WakeDiagnostic
     failed_auto_wake_recheck(session_id, &auto_wake)
 }
 
-fn successful_turn_recheck(session_id: &str) -> WakeDiagnostic {
+fn terminal_attempt_recheck(session_id: &str) -> WakeDiagnostic {
     trigger_turn_end_recheck(session_id)
 }
 
@@ -177,7 +177,7 @@ mod tests {
     use crate::wake_coordinator::consumed_completion::ConsumedCompletionFixture;
 
     #[test]
-    fn successful_turn_recheck_ignores_former_cap_at_five() {
+    fn terminal_attempt_recheck_ignores_former_cap_at_five() {
         let auto_wake = AutoWakeEnv {
             token: "turn-end-token".to_string(),
             count: 5,

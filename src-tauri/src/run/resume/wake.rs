@@ -299,7 +299,7 @@ pub(super) fn mark_resume_attempt_idle(
     )
 }
 
-pub(super) fn complete_successful_mailbox_delivery(
+pub(super) fn settle_accepted_mailbox_delivery_and_recheck(
     input: &ResumeAttemptInput<'_>,
     provider_session_id: &str,
     invocation_uuid: &str,
@@ -311,7 +311,7 @@ pub(super) fn complete_successful_mailbox_delivery(
         input.mailbox_delivery_seqs,
         invocation_uuid,
     )?;
-    let _ = crate::wake_coordinator::mark_successful_turn_idle_and_recheck(
+    let _ = crate::wake_coordinator::mark_terminal_attempt_idle_and_recheck(
         provider_session_id,
         invocation_uuid,
         exit_code,
@@ -331,14 +331,14 @@ pub(super) fn settle_age270_mailbox_delivery_outcome(
         MailboxDeliveryOutcome::Absent => {
             mark_resume_attempt_idle(provider_session_id, invocation_uuid, Some(shell_exit_code))
         }
-        MailboxDeliveryOutcome::Confirmed => complete_successful_mailbox_delivery(
+        MailboxDeliveryOutcome::Confirmed => settle_accepted_mailbox_delivery_and_recheck(
             input,
             provider_session_id,
             invocation_uuid,
             physical_exit_code,
         ),
         MailboxDeliveryOutcome::ConfirmedPromptAcceptance(acceptance) => {
-            complete_successful_mailbox_delivery(
+            settle_accepted_mailbox_delivery_and_recheck(
                 input,
                 acceptance.provider_session_id(),
                 invocation_uuid,

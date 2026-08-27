@@ -265,7 +265,7 @@ pub(super) fn settle_confirmed_prompt_acceptance_failure(
             Some(shell_exit_code),
         )
     } else {
-        wake::complete_successful_mailbox_delivery(
+        wake::settle_accepted_mailbox_delivery_and_recheck(
             input,
             failure.prompt_acceptance.provider_session_id(),
             invocation_uuid,
@@ -299,7 +299,7 @@ fn finalize_successful_resume(
     exit_code: i32,
     physical_exit_code: i32,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    wake::complete_successful_mailbox_delivery(
+    wake::settle_accepted_mailbox_delivery_and_recheck(
         input,
         provider_session_id,
         &attempt.invocation.id,
