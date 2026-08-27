@@ -1167,6 +1167,39 @@ mod tests {
         TEST_HANDOFF_OWNER_MATCHED.store(owner_token == Some("test-owner"), Ordering::SeqCst);
     }
 
+    fn reacquire_wake_sweep_admission_after_release(mailbox_path: &Path) -> WakeSweepAdmission {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match try_acquire_wake_sweep_admission(mailbox_path).unwrap() {
+                WakeSweepAdmissionAttempt::Acquired(admission) => return admission,
+                WakeSweepAdmissionAttempt::CoordinationBusy if Instant::now() < deadline => {
+                    // A parallel test can fork while the flock descriptor is open;
+                    // the child retains it briefly until exec applies CLOEXEC.
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                WakeSweepAdmissionAttempt::CoordinationBusy => {
+                    panic!("admission remained busy after the owner exited")
+                }
+                WakeSweepAdmissionAttempt::Owned(owner_token) => {
+                    panic!("stale admission owner remained after release: {owner_token}")
+                }
+            }
+        }
+    }
+
+    fn reacquire_wake_sweep_bootstrap_after_release(mailbox_path: &Path) -> File {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match try_acquire_wake_sweep_bootstrap_admission(mailbox_path).unwrap() {
+                Some(admission) => return admission,
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                None => panic!("bootstrap admission remained busy after the owner exited"),
+            }
+        }
+    }
+
     #[test]
     fn wake_sweep_selects_only_the_oldest_recoverable_session() {
         let selected = select_recoverable_sweep_candidate(vec![
@@ -1402,13 +1435,7 @@ mod tests {
             "a second handle must not enter the same sweep"
         );
         drop(first);
-        assert!(
-            matches!(
-                try_acquire_wake_sweep_admission(&mailbox_path).unwrap(),
-                WakeSweepAdmissionAttempt::Acquired(_)
-            ),
-            "admission must return after the owner exits"
-        );
+        drop(reacquire_wake_sweep_admission_after_release(&mailbox_path));
     }
 
     #[test]
@@ -1427,12 +1454,7 @@ mod tests {
             "a second bootstrap must not run concurrently"
         );
         drop(first);
-        assert!(
-            try_acquire_wake_sweep_bootstrap_admission(&mailbox_path)
-                .unwrap()
-                .is_some(),
-            "bootstrap admission must return after the owner exits"
-        );
+        drop(reacquire_wake_sweep_bootstrap_after_release(&mailbox_path));
     }
 
     #[test]
