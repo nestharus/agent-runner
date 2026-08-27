@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
-const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
+pub(crate) const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
 const CHILD_CUSTODY_TEST_FAULT_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_FAULT";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

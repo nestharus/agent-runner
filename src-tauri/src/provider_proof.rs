@@ -1,14 +1,15 @@
 //! Declared role: orchestration, validator
 
-use oulipoly_provider::client::{ProviderClient, ProviderClientOptions};
+use oulipoly_provider::client::ProviderClientOptions;
 use oulipoly_provider::generated::{
     CONTRACT_VERSION, DescribeResult, EmptyParams, HostContext, RequestEnvelope,
 };
 use oulipoly_provider::resolver::{ProviderArtifactRef, ProviderResolveOptions};
+use oulipoly_runtime::provider_registry::ProviderClientFactory;
 use std::time::Duration;
 
 pub(crate) fn prove_provider_artifact(artifact: ProviderArtifactRef) -> Result<(), String> {
-    let client = ProviderClient::new(artifact, provider_client_options());
+    let client = ProviderClientFactory::new(provider_client_options()).client_for(artifact);
     let describe = client
         .invoke_typed::<DescribeResult, _>("describe", describe_request(), [])
         .map_err(|err| format!("provider proof failed: {err}"))?;

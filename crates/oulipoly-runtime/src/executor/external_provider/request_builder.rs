@@ -17,7 +17,7 @@
 
 use super::context::ExternalProviderDispatchContext;
 use crate::executor::cli::spawn_identity::{
-    provider_parent_invocation_env, split_invocation_launch_environment,
+    PARENT_INVOCATION_ENV, provider_parent_invocation_env, split_invocation_launch_environment,
 };
 use crate::executor::cli::{provider_name, resolve_input_flags, shell_split};
 use crate::provider_registry::DescribeHostOptions;
@@ -34,7 +34,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const DATA_DIR_ENV: &str = oulipoly_state::paths::DATA_DIR_ENV;
-const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
 // This is the OpenCode external-provider positional-prompt boundary, not a
 // universal provider or operating-system argv limit.
 const OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES: usize = 64 * 1024;
@@ -85,10 +84,7 @@ fn declared_launch_env(
     let inherited_authority = env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
     remove_configured_launch_env(&mut env, &context.provider.unset_environment);
     env.extend(context.provider.environment.clone());
-    for variable in AutoWakeEnvironmentVariable::ALL {
-        env.remove(variable.name());
-    }
-    env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
+    remove_runner_private_environment(&mut env);
     insert_pinned_agent_data_dir(&mut env);
     let mut completion_registration_authority = None;
     if let Some(parent) = provider_parent_invocation_env(context.parent_invocation_env.as_deref()) {
@@ -115,6 +111,14 @@ fn declared_launch_env(
         }
     }
     Ok((env, completion_registration_authority))
+}
+
+pub(crate) fn remove_runner_private_environment(env: &mut BTreeMap<String, String>) {
+    for variable in AutoWakeEnvironmentVariable::ALL {
+        env.remove(variable.name());
+    }
+    env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
+    env.remove(PARENT_INVOCATION_ENV);
 }
 
 fn remove_configured_launch_env(env: &mut BTreeMap<String, String>, names: &[String]) {

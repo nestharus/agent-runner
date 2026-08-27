@@ -133,6 +133,7 @@ pub struct ProviderClientOptions {
     pub timeout: Duration,
     pub cancellation: Option<CancellationToken>,
     pub resolver: ProviderResolveOptions,
+    pub environment_removals: Vec<OsString>,
     pub spawn_observer: Option<ProcessSpawnObserver>,
     pub launch_event_observer: Option<LaunchEventObserver>,
 }
@@ -172,6 +173,7 @@ impl Default for ProviderClientOptions {
             output_limits: ProviderOutputLimits::default(),
             cancellation: None,
             resolver: ProviderResolveOptions::default(),
+            environment_removals: Vec::new(),
             spawn_observer: None,
             launch_event_observer: None,
         }
@@ -198,6 +200,20 @@ impl ProviderClientOptions {
 
     pub fn with_cancellation(mut self, cancellation: Option<CancellationToken>) -> Self {
         self.cancellation = cancellation;
+        self
+    }
+
+    pub fn with_environment_removals<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        for name in names {
+            let name = name.into();
+            if !self.environment_removals.contains(&name) {
+                self.environment_removals.push(name);
+            }
+        }
         self
     }
 
@@ -378,7 +394,7 @@ impl ProviderClient {
         let request_id = request_id_from(&request);
         let request_bytes = serialize_request_bytes(subcommand, &request, request_id.clone())?;
         let limits = process_limits_for(subcommand, timeout, &self.options);
-        let command = process_command_from_resolved(resolved, subcommand);
+        let command = process_command_from_resolved(resolved, subcommand, &self.options);
         let runner = ProcessRunner::new(limits);
         let result = if subcommand == "launch" {
             runner.run_with_stdout_line_gap_timeout(command, request_bytes, envs.into_env_vec())
@@ -400,7 +416,7 @@ impl ProviderClient {
         let request_id = request_id_from(&request);
         let request_bytes = serialize_request_bytes("launch", &request, request_id.clone())?;
         let limits = process_limits_for("launch", self.options.timeouts.launch, &self.options);
-        let command = process_command_from_resolved(resolved, "launch");
+        let command = process_command_from_resolved(resolved, "launch", &self.options);
         let stdout_processor =
             LaunchStdoutProcessor::new(request_id.clone().unwrap_or_default(), limits.stdout_limit)
                 .with_event_observer(self.options.launch_event_observer.clone());
@@ -813,11 +829,14 @@ fn kill_after_grace_for(subcommand: &str, options: &ProviderClientOptions) -> Du
 fn process_command_from_resolved(
     resolved: &ResolvedProviderCommand,
     subcommand: &str,
+    options: &ProviderClientOptions,
 ) -> ProcessCommand {
     let mut argv = resolved.argv_for_subcommand(subcommand);
     let program = argv.remove(0);
     argv.into_iter().fold(
-        ProcessCommand::new(program).with_pinned_executable(resolved.pinned_executable()),
+        ProcessCommand::new(program)
+            .with_pinned_executable(resolved.pinned_executable())
+            .with_environment_removals(options.environment_removals.clone()),
         |command, arg| command.arg(arg),
     )
 }

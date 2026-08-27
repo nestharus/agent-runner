@@ -5,6 +5,7 @@ use oulipoly_provider::generated::{
     CONTRACT_VERSION, DescribeResult, EmptyParams, HostContext, RequestEnvelope,
     SetupBrainTurnResult, SetupObject,
 };
+use oulipoly_runtime::provider_registry::ProviderClientFactory;
 use oulipoly_setup::actions::AgentTurnResult;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -30,7 +31,8 @@ impl SetupBrainHost {
             .map_err(|error| setup_brain_protocol_error_for_operation("setup.brain", error))?;
         Ok(Self {
             config,
-            client: ProviderClient::new(artifact, ProviderClientOptions::default()),
+            client: ProviderClientFactory::new(ProviderClientOptions::default())
+                .client_for(artifact),
             system_prompt,
             host_context,
             conversation_id: None,

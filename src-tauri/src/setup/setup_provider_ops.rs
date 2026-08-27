@@ -5,6 +5,7 @@ use oulipoly_provider::generated::{
     CONTRACT_VERSION, DiscoveryAccountsResult, DiscoveryObject, ErrorCategory, HostContext,
     RequestEnvelope, SetupDetectResult, SetupInstallPlanResult, SetupObject, SetupSyncPlanResult,
 };
+use oulipoly_runtime::provider_registry::ProviderClientFactory;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -46,7 +47,9 @@ pub fn build_setup_provider_context(config: &SetupBrainConfig) -> SetupProviderC
     let mut operation_calls = Vec::new();
 
     let client = match provider_artifact_from_ref(&config.artifact) {
-        Ok(artifact) => ProviderClient::new(artifact, ProviderClientOptions::default()),
+        Ok(artifact) => {
+            ProviderClientFactory::new(ProviderClientOptions::default()).client_for(artifact)
+        }
         Err(_) => {
             for operation in SETUP_PROVIDER_OPERATIONS {
                 operation_calls.push(*operation);

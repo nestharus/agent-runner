@@ -1,7 +1,8 @@
 //! Role: mapper.
 
 use super::errors::ExternalProviderDispatchError;
-use super::request_builder::LaunchCandidate;
+use super::request_builder::{LaunchCandidate, remove_runner_private_environment};
+use crate::executor::cli::spawn_identity::PARENT_INVOCATION_ENV;
 use oulipoly_config::PromptMode;
 use oulipoly_provider::generated::PolicyEvaluateResult;
 use std::collections::BTreeMap;
@@ -57,8 +58,17 @@ fn apply_optional_argv(candidate: &mut LaunchCandidate, argv: Option<Vec<String>
 }
 
 fn apply_optional_env(candidate: &mut LaunchCandidate, env: Option<BTreeMap<String, String>>) {
+    let selected_parent_identity = candidate.env.get(PARENT_INVOCATION_ENV).cloned();
     if let Some(env) = env {
         candidate.env.extend(env);
+    }
+    remove_runner_private_environment(&mut candidate.env);
+    if let Some(parent_identity) = selected_parent_identity {
+        candidate
+            .env
+            .insert(PARENT_INVOCATION_ENV.to_string(), parent_identity);
+    } else {
+        candidate.env.remove(PARENT_INVOCATION_ENV);
     }
 }
 

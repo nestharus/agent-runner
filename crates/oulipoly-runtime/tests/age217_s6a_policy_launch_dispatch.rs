@@ -45,6 +45,7 @@ struct ExternalFixture {
     _dir: tempfile::TempDir,
     provider_path: PathBuf,
     order_path: PathBuf,
+    process_env_record_path: PathBuf,
     policy_record_path: PathBuf,
     launch_record_path: PathBuf,
     legacy_record_path: PathBuf,
@@ -62,6 +63,7 @@ enum PolicyMode {
     Accept,
     Reject,
     Transform,
+    PrivateEnvTransform,
     HybridShape,
 }
 
@@ -429,6 +431,7 @@ fn make_external_fixture(
 ) -> ExternalFixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let order_path = dir.path().join("order.txt");
+    let process_env_record_path = dir.path().join("process-env.jsonl");
     let policy_record_path = dir.path().join("policy-request.json");
     let launch_record_path = dir.path().join("launch-request.json");
     let legacy_record_path = dir.path().join("legacy-record.txt");
@@ -450,6 +453,7 @@ fn make_external_fixture(
             policy_mode,
             launch_mode,
             &order_path,
+            &process_env_record_path,
             &policy_record_path,
             &launch_record_path,
         ),
@@ -459,6 +463,7 @@ fn make_external_fixture(
         _dir: dir,
         provider_path,
         order_path,
+        process_env_record_path,
         policy_record_path,
         launch_record_path,
         legacy_record_path,
@@ -497,6 +502,16 @@ fn make_describe_replacing_external_fixture() -> ExternalFixture {
     fixture
 }
 
+fn enable_terminal_capability(fixture: &ExternalFixture) {
+    let body = fs::read_to_string(&fixture.provider_path).expect("provider source");
+    let body = body.replacen("\"terminal\": False", "\"terminal\": True", 1);
+    assert_ne!(
+        body,
+        fs::read_to_string(&fixture.provider_path).expect("provider source")
+    );
+    write_executable(&fixture.provider_path, &body);
+}
+
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
@@ -506,6 +521,7 @@ fn fake_provider_body(
     policy_mode: PolicyMode,
     launch_mode: LaunchMode,
     order_path: &Path,
+    process_env_record_path: &Path,
     policy_record_path: &Path,
     launch_record_path: &Path,
 ) -> String {
@@ -514,6 +530,7 @@ fn fake_provider_body(
         policy_mode_wire(policy_mode),
         launch_mode_wire(launch_mode),
         order_path,
+        process_env_record_path,
         policy_record_path,
         launch_record_path,
     )
@@ -524,6 +541,7 @@ fn policy_mode_wire(policy_mode: PolicyMode) -> &'static str {
         PolicyMode::Accept => "accept",
         PolicyMode::Reject => "reject",
         PolicyMode::Transform => "transform",
+        PolicyMode::PrivateEnvTransform => "private_env_transform",
         PolicyMode::HybridShape => "hybrid_shape",
     }
 }
@@ -549,6 +567,7 @@ fn fake_provider_script_body(
     policy_mode: &str,
     launch_mode: &str,
     order_path: &Path,
+    process_env_record_path: &Path,
     policy_record_path: &Path,
     launch_record_path: &Path,
 ) -> String {
@@ -561,6 +580,7 @@ import sys
 
 CONTRACT = "oulipoly.provider/v1"
 ORDER = pathlib.Path({order_path})
+PROCESS_ENV_RECORD = pathlib.Path({process_env_record_path})
 POLICY_RECORD = pathlib.Path({policy_record_path})
 LAUNCH_RECORD = pathlib.Path({launch_record_path})
 CAP_POLICY = {cap_policy}
@@ -571,6 +591,20 @@ LAUNCH_MODE = {launch_mode}
 PID_FILE = os.environ.get("OULIPOLY_CHILD_PID_FILE")
 READY_FILE = os.environ.get("OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE")
 SUBCOMMAND = sys.argv[1] if len(sys.argv) > 1 else ""
+RUNNER_PRIVATE_ENV_NAMES = [
+    "OULIPOLY_AUTO_WAKE",
+    "OULIPOLY_AUTO_WAKE_SESSION_ID",
+    "OULIPOLY_AUTO_WAKE_TOKEN",
+    "OULIPOLY_AUTO_WAKE_COUNT",
+    "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS",
+    "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
+    "OULIPOLY_PARENT_INVOCATION",
+]
+with PROCESS_ENV_RECORD.open("a") as stream:
+    stream.write(json.dumps({{
+        "subcommand": SUBCOMMAND,
+        "env": {{name: os.environ[name] for name in RUNNER_PRIVATE_ENV_NAMES if name in os.environ}},
+    }}, sort_keys=True) + "\n")
 if PID_FILE and READY_FILE and SUBCOMMAND == "launch":
     pathlib.Path(PID_FILE).write_text(str(os.getpid()))
     pathlib.Path(READY_FILE).touch()
@@ -650,6 +684,20 @@ def policy(request):
         result["env"] = {{"POLICY_TRANSFORM_COUNT": "1"}}
         result["stdin"] = "stdin-from-policy"
         result["prompt"] = "prompt-from-policy"
+    if POLICY_MODE == "private_env_transform":
+        result["env"] = {{
+            "OULIPOLY_AUTO_WAKE": "policy-private",
+            "OULIPOLY_AUTO_WAKE_SESSION_ID": "policy-private",
+            "OULIPOLY_AUTO_WAKE_TOKEN": "policy-private",
+            "OULIPOLY_AUTO_WAKE_COUNT": "policy-private",
+            "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS": "policy-private",
+            "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY": "policy-private",
+            "OULIPOLY_PARENT_INVOCATION": json.dumps({{
+                "source": "policy-private",
+                "id": "22222222-2222-4222-8222-222222222222",
+                "_oulipoly_completion_registration_authority": "cd" * 32,
+            }}),
+        }}
     response(request, result)
     clear_custody_readiness()
 
@@ -772,6 +820,8 @@ if __name__ == "__main__":
     raise SystemExit(main())
 "#,
         order_path = serde_json::to_string(&order_path.display().to_string()).unwrap(),
+        process_env_record_path =
+            serde_json::to_string(&process_env_record_path.display().to_string()).unwrap(),
         policy_record_path =
             serde_json::to_string(&policy_record_path.display().to_string()).unwrap(),
         launch_record_path =
@@ -793,6 +843,10 @@ fn read_json(path: &Path) -> serde_json::Value {
 
 fn read_json_text(path: &Path) -> String {
     fs::read_to_string(path).expect("record should exist")
+}
+
+fn read_json_lines(path: &Path) -> Vec<Value> {
+    read_json_text(path).lines().map(parse_json_value).collect()
 }
 
 fn parse_json_value(text: &str) -> serde_json::Value {
@@ -1593,13 +1647,15 @@ fn external_provider_launch_env_inherits_application_agnostic_parent_entries() {
 }
 
 #[test]
-fn external_provider_launch_env_removes_runner_private_auto_wake_entries() {
-    const PRIVATE_NAMES: [&str; 5] = [
+fn external_provider_launch_env_removes_runner_private_entries() {
+    const PRIVATE_NAMES: [&str; 7] = [
         "OULIPOLY_AUTO_WAKE",
         "OULIPOLY_AUTO_WAKE_SESSION_ID",
         "OULIPOLY_AUTO_WAKE_TOKEN",
         "OULIPOLY_AUTO_WAKE_COUNT",
         "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS",
+        oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+        "OULIPOLY_PARENT_INVOCATION",
     ];
 
     let _lock = env_lock();
@@ -1620,7 +1676,7 @@ fn external_provider_launch_env_removes_runner_private_auto_wake_entries() {
         .collect();
 
     execute_external_model_effective(model, None, HashMap::new(), None)
-        .expect("external dispatch should remove runner-private wake entries");
+        .expect("external dispatch should remove runner-private entries");
 
     let policy = read_json(&fixture.policy_record_path);
     let launch = read_json(&fixture.launch_record_path);
@@ -1632,6 +1688,145 @@ fn external_provider_launch_env_removes_runner_private_auto_wake_entries() {
             );
         }
     }
+}
+
+#[test]
+fn external_provider_subcommands_do_not_inherit_runner_private_authority() {
+    const PRIVATE_NAMES: [&str; 7] = [
+        "OULIPOLY_AUTO_WAKE",
+        "OULIPOLY_AUTO_WAKE_SESSION_ID",
+        "OULIPOLY_AUTO_WAKE_TOKEN",
+        "OULIPOLY_AUTO_WAKE_COUNT",
+        "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS",
+        oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+        "OULIPOLY_PARENT_INVOCATION",
+    ];
+
+    let _lock = env_lock();
+    let invocation = oulipoly_state::CompositeInvocationId {
+        source: "fixture-provider".to_string(),
+        id: "11111111-1111-4111-8111-111111111111".to_string(),
+    };
+    let authority =
+        oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+            "ab".repeat(32),
+        )
+        .expect("valid completion registration authority");
+    let parent_environment = authority
+        .invocation_launch_environment(&invocation)
+        .expect("parent launch environment");
+    let _env = EnvScope::set_optional(&[
+        (PRIVATE_NAMES[0], Some("1")),
+        (PRIVATE_NAMES[1], Some("private-session")),
+        (PRIVATE_NAMES[2], Some("private-token")),
+        (PRIVATE_NAMES[3], Some("9")),
+        (PRIVATE_NAMES[4], Some("1000")),
+        (
+            PRIVATE_NAMES[5],
+            Some(authority.process_environment_value()),
+        ),
+        (PRIVATE_NAMES[6], Some(parent_environment.as_str())),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    enable_terminal_capability(&fixture);
+
+    execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(parent_environment))
+        .expect("external dispatch should sanitize every provider subprocess");
+
+    let records = read_json_lines(&fixture.process_env_record_path);
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["subcommand"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["describe", "policy.evaluate", "launch", "terminal.classify"]
+    );
+    for record in records {
+        let process_env = json_object(&record["env"]);
+        for name in PRIVATE_NAMES {
+            assert!(
+                process_env.get(name).is_none(),
+                "provider {} inherited runner-private {name}",
+                record["subcommand"]
+            );
+        }
+    }
+}
+
+#[test]
+fn external_provider_policy_cannot_reintroduce_runner_private_launch_authority() {
+    const AUTO_WAKE_NAMES: [&str; 5] = [
+        "OULIPOLY_AUTO_WAKE",
+        "OULIPOLY_AUTO_WAKE_SESSION_ID",
+        "OULIPOLY_AUTO_WAKE_TOKEN",
+        "OULIPOLY_AUTO_WAKE_COUNT",
+        "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS",
+    ];
+
+    let _lock = env_lock();
+    let invocation = oulipoly_state::CompositeInvocationId {
+        source: "fixture-provider".to_string(),
+        id: "11111111-1111-4111-8111-111111111111".to_string(),
+    };
+    let authority =
+        oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+            "ab".repeat(32),
+        )
+        .expect("valid completion registration authority");
+    let parent_environment = authority
+        .invocation_launch_environment(&invocation)
+        .expect("parent launch environment");
+    let _env = EnvScope::set_optional(&[
+        ("OULIPOLY_AUTO_WAKE", Some("1")),
+        (
+            "OULIPOLY_PARENT_INVOCATION",
+            Some(parent_environment.as_str()),
+        ),
+        (
+            oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+            Some(authority.process_environment_value()),
+        ),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::PrivateEnvTransform,
+        LaunchMode::Success,
+    );
+
+    execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(parent_environment))
+        .expect("external dispatch should reject policy private-carrier delegation");
+
+    let launch = read_json(&fixture.launch_record_path);
+    let launch_env = json_object(&launch["params"]["env"]);
+    for name in AUTO_WAKE_NAMES {
+        assert!(
+            launch_env.get(name).is_none(),
+            "policy reintroduced runner-private {name}"
+        );
+    }
+    assert_eq!(
+        launch_env[oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV],
+        authority.process_environment_value(),
+        "typed launch authority must override policy output"
+    );
+    let parent_identity = launch_env["OULIPOLY_PARENT_INVOCATION"]
+        .as_str()
+        .expect("parent identity text");
+    assert_eq!(
+        serde_json::from_str::<Value>(parent_identity).expect("parent identity"),
+        serde_json::to_value(invocation).expect("expected parent identity")
+    );
+    assert!(!parent_identity.contains("_oulipoly_completion_registration_authority"));
 }
 
 #[test]

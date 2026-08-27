@@ -322,6 +322,7 @@ pub struct ProcessCommand {
     program: PathBuf,
     args: Vec<OsString>,
     pinned_executable: Option<Arc<File>>,
+    environment_removals: Vec<OsString>,
 }
 
 impl ProcessCommand {
@@ -330,6 +331,7 @@ impl ProcessCommand {
             program: program.into(),
             args: Vec::new(),
             pinned_executable: None,
+            environment_removals: Vec::new(),
         }
     }
 
@@ -346,6 +348,11 @@ impl ProcessCommand {
 
     pub(crate) fn with_pinned_executable(mut self, executable: Option<Arc<File>>) -> Self {
         self.pinned_executable = executable;
+        self
+    }
+
+    pub(crate) fn with_environment_removals(mut self, names: Vec<OsString>) -> Self {
+        self.environment_removals = names;
         self
     }
 }
@@ -651,6 +658,9 @@ where
         .stderr(Stdio::piped());
     for (key, value) in envs {
         process.env(key, value);
+    }
+    for name in &command.environment_removals {
+        process.env_remove(name);
     }
     process
 }

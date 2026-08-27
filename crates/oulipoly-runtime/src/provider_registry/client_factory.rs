@@ -1,3 +1,5 @@
+use crate::executor::cli::spawn_identity::PARENT_INVOCATION_ENV;
+use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_provider::client::{
     CancellationToken, ProcessSpawnObserver, ProviderClient, ProviderClientOptions,
 };
@@ -11,7 +13,9 @@ pub struct ProviderClientFactory {
 
 impl ProviderClientFactory {
     pub fn new(options: ProviderClientOptions) -> Self {
-        Self { options }
+        Self {
+            options: options.with_environment_removals(provider_process_environment_removals()),
+        }
     }
 
     pub fn client_for(&self, artifact: ProviderArtifactRef) -> ProviderClient {
@@ -45,4 +49,14 @@ impl ProviderClientFactory {
                 .with_launch_event_observer(launch_event_observer),
         )
     }
+}
+
+fn provider_process_environment_removals() -> impl Iterator<Item = &'static str> {
+    AutoWakeEnvironmentVariable::ALL
+        .into_iter()
+        .map(AutoWakeEnvironmentVariable::name)
+        .chain([
+            oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+            PARENT_INVOCATION_ENV,
+        ])
 }
