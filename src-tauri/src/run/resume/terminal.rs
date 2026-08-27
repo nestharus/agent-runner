@@ -28,23 +28,23 @@ const ACCEPTED_PROMPT_PROVIDER_FAILED_TERMINAL_REASON: &str =
     "resume_prompt_accepted_provider_failed";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Age270MailboxEligibility {
+enum CleanExitMailboxResolutionEligibility {
     Ineligible,
-    PreMutationCleanExit,
+    PreCompletionFailureCleanExit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Age270MailboxProvenance {
+struct CleanExitMailboxResolutionProvenance {
     physical_clean_exit_candidate: bool,
     effective_clean_exit_candidate: bool,
-    age270_failure_applied: bool,
+    completion_failure_applied: bool,
 }
 
 struct ResumeAttemptClassification {
     zero_turn_action: ZeroTurnAction,
     recovered_generic_nonzero: bool,
     terminal_completion_confirmed: bool,
-    age270_mailbox_provenance: Age270MailboxProvenance,
+    clean_exit_mailbox_resolution_provenance: CleanExitMailboxResolutionProvenance,
 }
 
 pub(super) fn resume_attempts_exhausted(attempts: usize, max_attempts: usize) -> bool {
@@ -94,17 +94,19 @@ pub(super) fn handle_resume_attempt_result(
         recovered_generic_nonzero: classification.recovered_generic_nonzero,
         prompt_acceptance_confirmation: prompt_acceptance_confirmation.as_ref(),
     };
-    let provenance = classification.age270_mailbox_provenance;
+    let clean_exit_provenance = classification.clean_exit_mailbox_resolution_provenance;
     let mailbox_delivery_outcome = if confirmed_prompt_acceptance_failure.is_some() {
         None
     } else {
-        match age270_mailbox_eligibility_for_classification(
-            provenance.physical_clean_exit_candidate,
-            provenance.effective_clean_exit_candidate,
-            provenance.age270_failure_applied,
+        // A completion failure may replace a physically clean result. Only the
+        // exact clean pre-failure provenance may still resolve mailbox evidence.
+        match clean_exit_mailbox_resolution_eligibility(
+            clean_exit_provenance.physical_clean_exit_candidate,
+            clean_exit_provenance.effective_clean_exit_candidate,
+            clean_exit_provenance.completion_failure_applied,
         ) {
-            Age270MailboxEligibility::Ineligible => None,
-            Age270MailboxEligibility::PreMutationCleanExit => {
+            CleanExitMailboxResolutionEligibility::Ineligible => None,
+            CleanExitMailboxResolutionEligibility::PreCompletionFailureCleanExit => {
                 Some(wake::resolve_mailbox_delivery_outcome(
                     input,
                     provider,
@@ -163,13 +165,13 @@ fn apply_resume_attempt_classification(
         provider_confirmed_assistant_response || completion.accepted_provider_turn;
     let zero_turn_classification = completion.classification;
     apply_zero_turn_classification_to_result(result, provider_name, &zero_turn_classification);
-    let mut age270_failure_applied = false;
+    let mut completion_failure_applied = false;
     if completion.incomplete_tool_boundary {
         apply_incomplete_tool_boundary_failure(result, provider_name);
-        age270_failure_applied = true;
+        completion_failure_applied = true;
     } else if effective_clean_exit_candidate && !terminal_completion_confirmed {
         apply_unconfirmed_resume_completion_failure(result, provider_name);
-        age270_failure_applied = true;
+        completion_failure_applied = true;
     }
     let action = next_action(
         input.zero_turn_confirmation,
@@ -183,24 +185,25 @@ fn apply_resume_attempt_classification(
     ResumeAttemptClassification {
         zero_turn_action: action,
         recovered_generic_nonzero: completion.recovered_generic_nonzero,
-        terminal_completion_confirmed: terminal_completion_confirmed && !age270_failure_applied,
-        age270_mailbox_provenance: Age270MailboxProvenance {
+        terminal_completion_confirmed: terminal_completion_confirmed && !completion_failure_applied,
+        clean_exit_mailbox_resolution_provenance: CleanExitMailboxResolutionProvenance {
             physical_clean_exit_candidate,
             effective_clean_exit_candidate,
-            age270_failure_applied,
+            completion_failure_applied,
         },
     }
 }
 
-fn age270_mailbox_eligibility_for_classification(
+fn clean_exit_mailbox_resolution_eligibility(
     physical_clean_exit_candidate: bool,
     effective_clean_exit_candidate: bool,
-    age270_failure_applied: bool,
-) -> Age270MailboxEligibility {
-    if physical_clean_exit_candidate && effective_clean_exit_candidate && age270_failure_applied {
-        Age270MailboxEligibility::PreMutationCleanExit
+    completion_failure_applied: bool,
+) -> CleanExitMailboxResolutionEligibility {
+    if physical_clean_exit_candidate && effective_clean_exit_candidate && completion_failure_applied
+    {
+        CleanExitMailboxResolutionEligibility::PreCompletionFailureCleanExit
     } else {
-        Age270MailboxEligibility::Ineligible
+        CleanExitMailboxResolutionEligibility::Ineligible
     }
 }
 
@@ -390,7 +393,7 @@ fn apply_resume_terminal_disposition_effects(
                 );
             }
         };
-        return wake::settle_age270_mailbox_delivery_outcome(
+        return wake::settle_clean_exit_mailbox_delivery_outcome(
             input,
             provider_session_id,
             &attempt.invocation.id,
@@ -482,9 +485,10 @@ fn emit_recovered_resume_terminal_signal_marker(
 #[cfg(test)]
 mod tests {
     use super::{
-        Age270MailboxEligibility, ResumeTerminalDispositionOutcome,
-        age270_mailbox_eligibility_for_classification, apply_incomplete_tool_boundary_failure,
+        CleanExitMailboxResolutionEligibility as MailboxEligibility,
+        ResumeTerminalDispositionOutcome, apply_incomplete_tool_boundary_failure,
         apply_unconfirmed_resume_completion_failure, classify_confirmed_prompt_acceptance_failure,
+        clean_exit_mailbox_resolution_eligibility,
         stop_retry_after_confirmed_prompt_acceptance_failure,
     };
     use oulipoly_provider::generated::{PROMPT_ACCEPTANCE_V1, PromptAcceptedMarkerValueV1};
@@ -584,25 +588,25 @@ mod tests {
     }
 
     #[test]
-    fn age270_mailbox_eligibility_requires_physical_effective_and_applied_provenance() {
+    fn clean_exit_mailbox_resolution_requires_physical_effective_and_applied_provenance() {
         let rows = [
-            (false, false, false, Age270MailboxEligibility::Ineligible),
-            (false, false, true, Age270MailboxEligibility::Ineligible),
-            (false, true, false, Age270MailboxEligibility::Ineligible),
-            (false, true, true, Age270MailboxEligibility::Ineligible),
-            (true, false, false, Age270MailboxEligibility::Ineligible),
-            (true, false, true, Age270MailboxEligibility::Ineligible),
-            (true, true, false, Age270MailboxEligibility::Ineligible),
+            (false, false, false, MailboxEligibility::Ineligible),
+            (false, false, true, MailboxEligibility::Ineligible),
+            (false, true, false, MailboxEligibility::Ineligible),
+            (false, true, true, MailboxEligibility::Ineligible),
+            (true, false, false, MailboxEligibility::Ineligible),
+            (true, false, true, MailboxEligibility::Ineligible),
+            (true, true, false, MailboxEligibility::Ineligible),
             (
                 true,
                 true,
                 true,
-                Age270MailboxEligibility::PreMutationCleanExit,
+                MailboxEligibility::PreCompletionFailureCleanExit,
             ),
         ];
         for (physical, effective, applied, expected) in rows {
             assert_eq!(
-                age270_mailbox_eligibility_for_classification(physical, effective, applied),
+                clean_exit_mailbox_resolution_eligibility(physical, effective, applied),
                 expected,
                 "unexpected eligibility for P={physical}, E={effective}, A={applied}"
             );

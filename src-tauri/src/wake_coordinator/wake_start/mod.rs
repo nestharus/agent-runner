@@ -2,7 +2,6 @@
 //!
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 
-mod claim;
 mod liveness;
 
 use oulipoly_state::mailbox::{
@@ -133,8 +132,8 @@ fn acquire_startable_wake_claim(
     input: StartWakeInput<'_>,
     claim_token: &str,
 ) -> Result<WakeClaimRow, WakeDiagnostic> {
-    let claim_result =
-        claim::acquire_wake_claim(db, input, claim_token).map_err(storage_error_diagnostic)?;
+    let claim_result = super::wake_claim::acquire_wake_claim(db, input, claim_token)
+        .map_err(storage_error_diagnostic)?;
     wake_claim_to_start(claim_result)
 }
 

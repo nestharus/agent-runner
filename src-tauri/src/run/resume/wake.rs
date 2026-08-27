@@ -319,7 +319,7 @@ pub(super) fn settle_accepted_mailbox_delivery_and_recheck(
     Ok(())
 }
 
-pub(super) fn settle_age270_mailbox_delivery_outcome(
+pub(super) fn settle_clean_exit_mailbox_delivery_outcome(
     input: &ResumeAttemptInput<'_>,
     provider_session_id: &str,
     invocation_uuid: &str,

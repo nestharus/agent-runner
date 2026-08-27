@@ -2,12 +2,11 @@
 //!
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
 
-use super::auto_wake_env::{
-    AutoWakeEnv, current_auto_wake, current_auto_wake_count, release_current_auto_wake_claim,
-    sleep_before_failed_auto_wake_retry,
-};
+use super::auto_wake_env::{AutoWakeEnv, current_auto_wake, current_auto_wake_count};
 use super::diagnostics::{WakeDiagnostic, storage_error_diagnostic};
 use super::idle::mark_session_idle_after_turn;
+use super::retry_cadence::sleep_before_failed_auto_wake_retry;
+use super::wake_claim::release_current_auto_wake_claim;
 use super::wake_start::{StartWakeInput, start_wake_chain};
 use oulipoly_state::mailbox::MailboxDb;
 
@@ -145,7 +144,7 @@ fn apply_failed_auto_wake_recheck_decision(
     match decision {
         FailedAutoWakeRecheckDecision::NoPending => no_pending_diagnostic(),
         FailedAutoWakeRecheckDecision::Retry(input) => {
-            sleep_before_failed_auto_wake_retry(auto_wake.count);
+            sleep_before_failed_auto_wake_retry(auto_wake);
             start_wake_chain(input)
         }
     }
@@ -181,6 +180,7 @@ mod tests {
         let auto_wake = AutoWakeEnv {
             token: "turn-end-token".to_string(),
             count: 5,
+            retry_base_milliseconds: 1_000,
         };
 
         let decision =
@@ -198,6 +198,7 @@ mod tests {
         let auto_wake = AutoWakeEnv {
             token: "failed-wake-token".to_string(),
             count: 5,
+            retry_base_milliseconds: 1_000,
         };
 
         let decision = failed_auto_wake_recheck_decision("session-a", false, &auto_wake);

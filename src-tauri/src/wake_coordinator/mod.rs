@@ -9,9 +9,11 @@ mod constants;
 mod consumed_completion;
 mod diagnostics;
 mod idle;
+mod retry_cadence;
 mod spawn;
 mod sweep;
 mod turn_recheck;
+mod wake_claim;
 mod wake_start;
 
 pub(crate) type WakeDiagnostic = diagnostics::WakeDiagnostic;
@@ -71,7 +73,7 @@ pub(crate) fn mark_terminal_attempt_idle_and_recheck(
 }
 
 pub(crate) fn validate_auto_wake_child(session_id: &str) -> Result<Option<i32>, String> {
-    auto_wake_env::validate_auto_wake_child(session_id)
+    wake_claim::validate_auto_wake_child(session_id)
 }
 
 pub(crate) fn is_auto_wake_invocation() -> bool {
@@ -79,11 +81,11 @@ pub(crate) fn is_auto_wake_invocation() -> bool {
 }
 
 pub(crate) fn reset_manual_resume_wake_claim(session_id: &str) -> Result<(), String> {
-    auto_wake_env::reset_manual_resume_wake_claim(session_id)
+    wake_claim::reset_manual_resume_wake_claim(session_id)
 }
 
 pub(crate) fn release_current_auto_wake_claim_for_session(session_id: &str) {
-    auto_wake_env::release_current_auto_wake_claim_for_session(session_id);
+    wake_claim::release_current_auto_wake_claim_for_session(session_id);
 }
 
 pub(crate) fn recheck_after_failed_auto_wake(session_id: &str) -> WakeDiagnostic {
