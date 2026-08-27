@@ -2,7 +2,9 @@ use crate::error::HostErrorKind;
 use crate::process::is_executable;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
+use std::fs::{File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderArtifactRef {
@@ -208,9 +210,10 @@ fn ensure_candidate_within_root(root: &Path, candidate: &Path) -> Result<(), Pro
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ResolvedProviderCommand {
     executable: PathBuf,
+    pinned_executable: Option<Arc<File>>,
     uses_shell_wrapper: bool,
 }
 
@@ -218,6 +221,15 @@ impl ResolvedProviderCommand {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
             executable: executable.into(),
+            pinned_executable: None,
+            uses_shell_wrapper: false,
+        }
+    }
+
+    fn pinned(executable: PathBuf, pinned_executable: File) -> Self {
+        Self {
+            executable,
+            pinned_executable: Some(Arc::new(pinned_executable)),
             uses_shell_wrapper: false,
         }
     }
@@ -235,6 +247,10 @@ impl ResolvedProviderCommand {
 
     pub fn uses_shell_wrapper(&self) -> bool {
         self.uses_shell_wrapper
+    }
+
+    pub(crate) fn pinned_executable(&self) -> Option<Arc<File>> {
+        self.pinned_executable.clone()
     }
 }
 
@@ -260,5 +276,26 @@ fn ensure_executable(path: PathBuf) -> Result<ResolvedProviderCommand, ProviderR
     if !is_executable(&path) {
         return Err(ProviderResolveError::new(HostErrorKind::NotExecutable));
     }
-    Ok(ResolvedProviderCommand::new(path))
+    let pinned_executable = open_pinned_executable(&path)?;
+    Ok(ResolvedProviderCommand::pinned(path, pinned_executable))
+}
+
+#[cfg(windows)]
+fn open_pinned_executable(path: &Path) -> Result<File, ProviderResolveError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|_| ProviderResolveError::new(HostErrorKind::MissingArtifact))
+}
+
+#[cfg(not(windows))]
+fn open_pinned_executable(path: &Path) -> Result<File, ProviderResolveError> {
+    OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|_| ProviderResolveError::new(HostErrorKind::MissingArtifact))
 }

@@ -50,6 +50,7 @@ use crate::error::{HostErrorKind, ProviderClientError, ProviderDiagnostics};
 use crate::generated::ProcessStatus;
 pub use oulipoly_core::CancellationToken;
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -320,6 +321,7 @@ impl Default for ProcessLimits {
 pub struct ProcessCommand {
     program: PathBuf,
     args: Vec<OsString>,
+    pinned_executable: Option<Arc<File>>,
 }
 
 impl ProcessCommand {
@@ -327,6 +329,7 @@ impl ProcessCommand {
         Self {
             program: program.into(),
             args: Vec::new(),
+            pinned_executable: None,
         }
     }
 
@@ -339,6 +342,11 @@ impl ProcessCommand {
         let mut argv = vec![self.program.as_os_str().to_os_string()];
         argv.extend(self.args.iter().cloned());
         argv
+    }
+
+    pub(crate) fn with_pinned_executable(mut self, executable: Option<Arc<File>>) -> Self {
+        self.pinned_executable = executable;
+        self
     }
 }
 
@@ -625,7 +633,7 @@ where
     V: AsRef<OsStr>,
 {
     let mut process = provider_process_command(command, envs);
-    configure_provider_process(&mut process);
+    configure_provider_process(&mut process, command);
     process
 }
 
@@ -635,7 +643,7 @@ where
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
-    let mut process = Command::new(&command.program);
+    let mut process = Command::new(provider_execution_path(command));
     process
         .args(&command.args)
         .stdin(Stdio::piped())
@@ -647,9 +655,62 @@ where
     process
 }
 
-fn configure_provider_process(process: &mut Command) {
+fn configure_provider_process(process: &mut Command, command: &ProcessCommand) {
     configure_process_group(process);
+    configure_pinned_executable(process, command);
 }
+
+#[cfg(unix)]
+fn provider_execution_path(command: &ProcessCommand) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    command
+        .pinned_executable
+        .as_ref()
+        .map(|file| inherited_fd_path(file.as_raw_fd()))
+        .unwrap_or_else(|| command.program.clone())
+}
+
+#[cfg(not(unix))]
+fn provider_execution_path(command: &ProcessCommand) -> PathBuf {
+    command.program.clone()
+}
+
+#[cfg(target_os = "linux")]
+fn inherited_fd_path(fd: std::os::fd::RawFd) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{fd}"))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn inherited_fd_path(fd: std::os::fd::RawFd) -> PathBuf {
+    PathBuf::from(format!("/dev/fd/{fd}"))
+}
+
+#[cfg(unix)]
+fn configure_pinned_executable(process: &mut Command, command: &ProcessCommand) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let Some(executable) = command.pinned_executable.as_ref() else {
+        return;
+    };
+    let fd = executable.as_raw_fd();
+    unsafe {
+        process.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_pinned_executable(_process: &mut Command, _command: &ProcessCommand) {}
 
 fn start_process_threads<P: StdoutProcessor>(
     child: &mut Child,

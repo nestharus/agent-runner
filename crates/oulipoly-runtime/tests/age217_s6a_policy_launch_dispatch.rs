@@ -466,6 +466,37 @@ fn make_external_fixture(
     }
 }
 
+fn make_describe_replacing_external_fixture() -> ExternalFixture {
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let replacement_path = fixture._dir.path().join("replacement-provider.sh");
+    write_executable(
+        &replacement_path,
+        &format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf 'replacement artifact invoked' > {}\nexit 77\n",
+            shell_quote(&fixture.legacy_record_path)
+        ),
+    );
+    let body = fs::read_to_string(&fixture.provider_path).expect("provider source");
+    let describe_start = "def describe(request):\n    response";
+    let replacement = format!(
+        "def describe(request):\n    os.replace({}, {})\n    response",
+        serde_json::to_string(&replacement_path.display().to_string()).unwrap(),
+        serde_json::to_string(&fixture.provider_path.display().to_string()).unwrap(),
+    );
+    let body = body.replacen(describe_start, &replacement, 1);
+    let body = body.replacen("\"terminal\": False", "\"terminal\": True", 1);
+    assert_ne!(body, fs::read_to_string(&fixture.provider_path).unwrap());
+    write_executable(&fixture.provider_path, &body);
+    fixture
+}
+
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
@@ -539,7 +570,8 @@ LAUNCH_MODE = {launch_mode}
 
 PID_FILE = os.environ.get("OULIPOLY_CHILD_PID_FILE")
 READY_FILE = os.environ.get("OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE")
-if PID_FILE and READY_FILE:
+SUBCOMMAND = sys.argv[1] if len(sys.argv) > 1 else ""
+if PID_FILE and READY_FILE and SUBCOMMAND == "launch":
     pathlib.Path(PID_FILE).write_text(str(os.getpid()))
     pathlib.Path(READY_FILE).touch()
 
@@ -620,6 +652,16 @@ def policy(request):
         result["prompt"] = "prompt-from-policy"
     response(request, result)
     clear_custody_readiness()
+
+def terminal_classify(request):
+    append_order("terminal.classify")
+    response(request, {{
+        "terminal_signal": {{
+            "kind": "clean_exit",
+            "evidence": "selected provider terminal classification",
+            "observed_at_unix_ms": 2005
+        }}
+    }})
 
 def hybrid_policy_result(request):
     params = request.get("params", {{}})
@@ -712,16 +754,18 @@ def launch(_request):
     return 6 if LAUNCH_MODE == "provider_nonzero_after_final" else 0
 
 def main():
-    subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
     request = read_request()
-    if subcommand == "describe":
+    if SUBCOMMAND == "describe":
         describe(request)
         return 0
-    if subcommand == "policy.evaluate":
+    if SUBCOMMAND == "policy.evaluate":
         policy(request)
         return 0
-    if subcommand == "launch":
+    if SUBCOMMAND == "launch":
         return launch(request)
+    if SUBCOMMAND == "terminal.classify":
+        terminal_classify(request)
+        return 0
     return 64
 
 if __name__ == "__main__":
@@ -1009,6 +1053,24 @@ fn external_provider_policy_evaluate_runs_before_launch_and_uses_selected_provid
         );
     }
     assert!(!fixture.legacy_record_path.exists());
+}
+
+#[test]
+fn external_dispatch_keeps_the_capability_advertiser_after_path_replacement() {
+    let fixture = make_describe_replacing_external_fixture();
+
+    let result = execute_external_fixture(&fixture)
+        .expect("the selected capability advertiser should perform policy and launch");
+
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        ["policy.evaluate", "launch", "terminal.classify"]
+    );
+    assert_eq!(result.stdout, vec![0, 1, 255]);
+    assert!(
+        !fixture.legacy_record_path.exists(),
+        "the replacement artifact must not inherit negotiated authority"
+    );
 }
 
 #[test]

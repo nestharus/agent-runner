@@ -34,7 +34,7 @@ use crate::executor::cli::spawn_identity::{
     mark_runtime_generation_orderly_completed, mark_runtime_generation_spawn_failed,
     record_child_identity, register_runtime_generation_starting,
 };
-use crate::provider_registry::ProviderRegistry;
+use crate::provider_registry::{ProviderRegistry, describe_provider_client};
 use crate::services::ServiceError;
 use oulipoly_provider::client::ProcessSpawnObserver;
 use oulipoly_provider::error::ProviderClientError;
@@ -72,18 +72,12 @@ pub(crate) fn dispatch(
     registry: &ProviderRegistry,
     context: ExternalProviderDispatchContext,
 ) -> Result<ExecutionResult, ServiceError> {
-    // Artifact lookup, describe, and the capability gate are model-scoped: every
-    // account in the pool shares one provider artifact, so they run once and
-    // their failures are terminal (rotating accounts cannot fix a missing or
-    // runtime-disabled artifact).
+    // Artifact lookup is model-scoped: every account in the pool shares one
+    // configured provider artifact. Each account attempt negotiates capabilities
+    // through the same execution-bound client that performs policy and launch.
     let artifact = registry
         .enabled_artifact_for_model(&context.model.name)
         .map_err(map_registry_error)?;
-    let describe = registry
-        .describe_model_provider(&context.model.name)
-        .map_err(map_registry_error)?;
-    gate_required_capabilities(&describe).map_err(service_error)?;
-    let provider_supports_prompt_acceptance_v1 = describe.capabilities.prompt_acceptance_v1;
 
     // FIX #32: rotate over the pool on transport-timeout / account-unavailable
     // classes, terminal-failing only once every account has been tried. The
@@ -93,12 +87,7 @@ pub(crate) fn dispatch(
     let last_index = order.len().saturating_sub(1);
     for (position, account) in order.into_iter().enumerate() {
         let account_context = context.with_account(account);
-        match attempt_account_dispatch(
-            registry,
-            &artifact,
-            &account_context,
-            provider_supports_prompt_acceptance_v1,
-        ) {
+        match attempt_account_dispatch(registry, &artifact, &account_context) {
             Ok(result) => return Ok(result),
             Err(attempt) => {
                 if attempt.rotatable && position < last_index {
@@ -136,7 +125,6 @@ fn attempt_account_dispatch(
     registry: &ProviderRegistry,
     artifact: &ProviderArtifactRef,
     context: &ExternalProviderDispatchContext,
-    provider_supports_prompt_acceptance_v1: bool,
 ) -> Result<ExecutionResult, AccountAttemptError> {
     let spawn_identity = external_launch_spawn_identity_context(context);
     let recorded_generation = recorded_launch_generation();
@@ -149,6 +137,11 @@ fn attempt_account_dispatch(
         spawn_observer,
         launch_event_observer,
     );
+    let describe = describe_provider_client(&client, registry.host_options())
+        .map_err(|error| terminal_attempt_error(map_registry_error(error)))?;
+    gate_required_capabilities(&describe)
+        .map_err(|error| terminal_attempt_error(service_error(error)))?;
+    let provider_supports_prompt_acceptance_v1 = describe.capabilities.prompt_acceptance_v1;
     let candidate = build_launch_candidate(context)
         .map_err(|message| terminal_attempt_error(invalid_provider_input_error(message)))?;
     let policy_request = build_policy_request(context, &candidate, registry.host_options())
@@ -207,7 +200,8 @@ fn attempt_account_dispatch(
             )));
         }
     }
-    let classification = classify_after_launch_success(registry, context, &launch_result);
+    let classification =
+        classify_after_launch_success(registry, &client, &describe, context, &launch_result);
 
     Ok(map_launch_result_with_terminal_classification(
         launch_result,

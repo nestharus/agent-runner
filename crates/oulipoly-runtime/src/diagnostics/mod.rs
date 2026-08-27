@@ -27,6 +27,8 @@ use crate::services::{
     TerminalClassification, TerminalClassifyServiceRequest,
 };
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
+use oulipoly_provider::client::ProviderClient;
+use oulipoly_provider::generated::DescribeResult;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -160,6 +162,15 @@ pub fn classify_terminal_with_registry(
     request: TerminalClassifyServiceRequest,
 ) -> Result<TerminalClassification, ServiceError> {
     external_provider::classify_terminal(registry, request)
+}
+
+pub(crate) fn classify_terminal_with_client(
+    registry: &ProviderRegistry,
+    client: &ProviderClient,
+    describe: &DescribeResult,
+    request: TerminalClassifyServiceRequest,
+) -> Result<TerminalClassification, ServiceError> {
+    external_provider::classify_terminal_with_client(registry, client, describe, request)
 }
 
 pub fn canonical_terminal_reason_for_kind(kind: TerminalSignalKind) -> Option<&'static str> {

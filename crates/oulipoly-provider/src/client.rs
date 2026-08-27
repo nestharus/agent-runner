@@ -62,7 +62,7 @@ use crate::stream::{LaunchEventObserver, LaunchResult, LaunchStdoutDrain, Launch
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::ffi::OsString;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 pub use crate::process::{CancellationToken, ProcessSpawnObserver};
@@ -216,6 +216,7 @@ impl ProviderClientOptions {
 pub struct ProviderClient {
     artifact: ProviderArtifactRef,
     options: ProviderClientOptions,
+    resolved: OnceLock<ResolvedProviderCommand>,
     last_diagnostics: Mutex<ProviderDiagnostics>,
     last_argv: Mutex<Vec<OsString>>,
 }
@@ -225,6 +226,7 @@ impl ProviderClient {
         Self {
             artifact,
             options,
+            resolved: OnceLock::new(),
             last_diagnostics: Mutex::new(ProviderDiagnostics::default()),
             last_argv: Mutex::new(Vec::new()),
         }
@@ -341,7 +343,10 @@ impl ProviderClient {
         subcommand: &str,
         request_id: Option<String>,
     ) -> Result<ResolvedProviderCommand, ProviderClientError> {
-        ProviderResolver::new(self.options.resolver.clone())
+        if let Some(resolved) = self.resolved.get() {
+            return Ok(resolved.clone());
+        }
+        let resolved = ProviderResolver::new(self.options.resolver.clone())
             .resolve(&self.artifact, None)
             .map_err(|error| {
                 ProviderClientError::host_transport(
@@ -350,7 +355,13 @@ impl ProviderClient {
                     request_id,
                     ProviderDiagnostics::default(),
                 )
-            })
+            })?;
+        let _ = self.resolved.set(resolved);
+        Ok(self
+            .resolved
+            .get()
+            .expect("resolved provider command should be initialized")
+            .clone())
     }
 
     fn run_resolved<I>(
@@ -805,10 +816,10 @@ fn process_command_from_resolved(
 ) -> ProcessCommand {
     let mut argv = resolved.argv_for_subcommand(subcommand);
     let program = argv.remove(0);
-    argv.into_iter()
-        .fold(ProcessCommand::new(program), |command, arg| {
-            command.arg(arg)
-        })
+    argv.into_iter().fold(
+        ProcessCommand::new(program).with_pinned_executable(resolved.pinned_executable()),
+        |command, arg| command.arg(arg),
+    )
 }
 
 fn launch_spawn_observer(

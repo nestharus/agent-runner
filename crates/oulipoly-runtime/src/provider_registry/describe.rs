@@ -1,5 +1,5 @@
 use super::{ProviderClientFactory, ProviderRegistryError};
-use oulipoly_provider::client::{CancellationToken, ProviderEnv};
+use oulipoly_provider::client::{CancellationToken, ProviderClient, ProviderEnv};
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
     CONTRACT_VERSION, DescribeRequest, DescribeResult, EmptyParams, HOST_PROMPT_ACCEPTANCE_V1_ENV,
@@ -22,7 +22,7 @@ pub fn describe_provider(
     host_options: &DescribeHostOptions,
 ) -> Result<DescribeResult, ProviderRegistryError> {
     let client = factory.client_for(artifact);
-    invoke_describe(client, host_options)
+    describe_provider_client(&client, host_options)
 }
 
 pub fn describe_provider_with_cancellation(
@@ -32,11 +32,11 @@ pub fn describe_provider_with_cancellation(
     cancellation: &CancellationToken,
 ) -> Result<DescribeResult, ProviderRegistryError> {
     let client = factory.client_for_with_cancellation(artifact, cancellation);
-    invoke_describe(client, host_options)
+    describe_provider_client(&client, host_options)
 }
 
-fn invoke_describe(
-    client: oulipoly_provider::client::ProviderClient,
+pub(crate) fn describe_provider_client(
+    client: &ProviderClient,
     host_options: &DescribeHostOptions,
 ) -> Result<DescribeResult, ProviderRegistryError> {
     let request = describe_request(host_options)?;

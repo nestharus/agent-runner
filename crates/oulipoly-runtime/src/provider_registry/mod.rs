@@ -9,7 +9,7 @@ mod options;
 
 use artifact_key::{ArtifactKey, artifact_key};
 use cache::DescribeCache;
-pub(crate) use describe::DescribeHostOptions;
+pub(crate) use describe::{DescribeHostOptions, describe_provider_client};
 use describe::{describe_provider, describe_provider_with_cancellation};
 use oulipoly_config::{
     ModelConfig, ProviderConfig, ProvidersConfig, derive_provider_name,

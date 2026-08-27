@@ -9,11 +9,16 @@ use oulipoly_provider::resolver::ProviderArtifactRef;
 use oulipoly_provider::schemas::SchemaRegistry;
 use serde_json::json;
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 use support::provider_client::{
-    REQUEST_ID, describe_request, executable_script, fake_provider_source,
-    read_recorded_invocation, schema_request, settings_list_request, temp_fixture_dir,
+    REQUEST_ID, describe_request, describe_success_response, executable_script,
+    fake_provider_source, read_recorded_invocation, schema_request, settings_list_request,
+    temp_fixture_dir,
     testkit::{FakeProvider, FakeProviderMode},
 };
 
@@ -305,6 +310,53 @@ fn invoke_script_uses_artifact_then_single_subcommand_arg() {
     assert_eq!(result["ok"], true);
     assert_eq!(client.last_invocation_argv().len(), 2);
     assert_eq!(client.last_invocation_argv()[1], "describe");
+}
+
+#[cfg(unix)]
+#[test]
+fn client_pins_executable_that_advertised_capabilities_across_invocations() {
+    let directory = temp_fixture_dir("pinned-provider-identity");
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let configured = directory.join("provider.sh");
+    let replacement = directory.join("replacement.sh");
+    write_describe_provider_script(&configured, "selected-provider");
+    write_describe_provider_script(&replacement, "replacement-provider");
+    let client = ProviderClient::new(
+        ProviderArtifactRef::Script {
+            path: configured.clone(),
+        },
+        ProviderClientOptions::default(),
+    );
+
+    let selected: DescribeResult = client
+        .invoke_typed("describe", describe_request(), [])
+        .expect("selected artifact should describe");
+    fs::rename(&replacement, &configured).expect("replace configured artifact");
+    let after_replacement: DescribeResult = client
+        .invoke_typed("describe", describe_request(), [])
+        .expect("pinned selected artifact should remain executable");
+
+    assert_eq!(selected.provider_id, "selected-provider");
+    assert_eq!(after_replacement.provider_id, "selected-provider");
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[cfg(unix)]
+fn write_describe_provider_script(path: &Path, provider_id: &str) {
+    let mut response = describe_success_response();
+    response["result"]["provider_id"] = json!(provider_id);
+    response["result"]["display_name"] = json!(provider_id);
+    fs::write(
+        path,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{}'\n",
+            serde_json::to_string(&response).expect("serialize describe response")
+        ),
+    )
+    .expect("write provider script");
+    let mut permissions = fs::metadata(path).expect("provider metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod provider script");
 }
 
 fn client_for(path: impl Into<std::path::PathBuf>) -> ProviderClient {
