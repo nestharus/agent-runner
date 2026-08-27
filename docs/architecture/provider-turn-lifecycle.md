@@ -20,13 +20,18 @@ and the existing CLI or external-provider execution boundaries.
 
 Until the joined cutover, changes to provider prompt acceptance, submission or
 confirmation evidence, exact session/generation/invocation fencing, invocation
-finalization, or per-turn caller results must be assessed against both paths.
-A change may update only one path when the other operating domain cannot
-express that concern, but the non-applicability must be explicit in the change.
-Neither path may weaken the shared validation performed by
+finalization, per-turn caller results, or mailbox batch bounds must be assessed
+against both paths. A change may update only one path when the other operating
+domain cannot express that concern, but the non-applicability must be explicit
+in the change. Neither path may weaken the shared validation performed by
 `promote_prompt_acceptance_attestation` or treat process launch, transport
 acceptance, assistant absence, malformed evidence, or
 `resume_completion_unconfirmed` as stronger evidence than its contract allows.
+
+`provider_turn_contract::MAILBOX_BATCH_MAX_ROWS` is the single provider-turn
+mailbox batch bound. The current mailbox selector and target adapter validator
+must consume that owner directly; changing the bound is one atomic compatibility
+change rather than an independently evolving producer and consumer decision.
 
 The paths deliberately differ at their lifecycle boundaries:
 

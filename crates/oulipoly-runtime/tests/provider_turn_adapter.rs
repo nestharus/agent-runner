@@ -28,6 +28,7 @@ use oulipoly_runtime::provider_turn_adapter::{
     ProviderTurnEffects, ProviderTurnExecutionRequest, ProviderTurnExecutor, ProviderTurnLaunch,
     classify_provider_evidence, prompt_sha256,
 };
+use oulipoly_runtime::provider_turn_contract::MAILBOX_BATCH_MAX_ROWS;
 use oulipoly_runtime::services::{
     ExecutorServiceOutput, ExecutorServicePort, ExecutorServiceRequest, ServiceError,
 };
@@ -901,8 +902,12 @@ fn malformed_mailbox_batches_report_exact_fences_without_executing() {
         (
             MailboxBatchIdentity {
                 session_id: SESSION.to_string(),
-                delivery_ids: (1..=21).map(|index| format!("delivery-{index}")).collect(),
-                sequences: (1..=21).collect(),
+                delivery_ids: (1..=MAILBOX_BATCH_MAX_ROWS + 1)
+                    .map(|index| format!("delivery-{index}"))
+                    .collect(),
+                sequences: (1..=MAILBOX_BATCH_MAX_ROWS + 1)
+                    .map(|sequence| sequence as i64)
+                    .collect(),
                 delivery_nonce: Some("nonce".to_string()),
             },
             "mailbox batch bounds",

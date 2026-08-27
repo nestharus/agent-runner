@@ -34,6 +34,7 @@ pub mod provider_settings;
 /// Target resident-supervisor provider-turn boundary. Its staged activation is
 /// owned by `docs/architecture/provider-turn-lifecycle.md`.
 pub mod provider_turn_adapter;
+pub mod provider_turn_contract;
 mod provider_turn_effect_application;
 mod provider_turn_evidence;
 mod provider_turn_execution;

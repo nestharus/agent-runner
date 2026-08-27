@@ -3,6 +3,7 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 
 use oulipoly_runtime::delivery_evidence::PtyTransportAcknowledgementEvidence;
+use oulipoly_runtime::provider_turn_contract::MAILBOX_BATCH_MAX_ROWS;
 #[cfg(test)]
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, RuntimeGenerationId,
@@ -27,7 +28,6 @@ use oulipoly_runtime::executor::cli::pty_broker::{
     unlink_control_socket_if_owned,
 };
 
-const MAILBOX_BATCH_MAX_ROWS: usize = 20;
 const MAILBOX_PREFIX_MAX_BYTES: usize = 64 * 1024;
 const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
 const DELIVERY_NONCE_SUFFIX: &str = "]";

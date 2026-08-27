@@ -19,6 +19,7 @@ use std::fmt;
 
 use oulipoly_state::{CompositeInvocationId, StateDb, TurnFence};
 
+use crate::provider_turn_contract::MAILBOX_BATCH_MAX_ROWS;
 use crate::provider_turn_effect_application::apply_provider_turn_effects_exact;
 use crate::provider_turn_evidence::{
     acknowledgement_evidence, evidence_from_execution, validate_evidence_fence,
@@ -35,8 +36,6 @@ pub use crate::provider_turn_execution::{
     ProviderExecutionOutcome, ProviderExecutionStatus, ProviderTurnExecutionRequest,
     ProviderTurnExecutor,
 };
-
-const MAX_MAILBOX_BATCH_ROWS: usize = 20;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvocationOwnership {
@@ -254,7 +253,7 @@ fn validate_mailbox_batch(
         return Err(ProviderTurnAdapterError::InvalidFence("mailbox session"));
     }
     if batch.delivery_ids.len() != batch.sequences.len()
-        || batch.delivery_ids.len() > MAX_MAILBOX_BATCH_ROWS
+        || batch.delivery_ids.len() > MAILBOX_BATCH_MAX_ROWS
     {
         return Err(ProviderTurnAdapterError::InvalidFence(
             "mailbox batch bounds",
