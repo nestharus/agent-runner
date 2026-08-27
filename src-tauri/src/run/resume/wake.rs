@@ -1,6 +1,14 @@
 //! ## Declared roles
 //!
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`
+//!
+//! ## Lifecycle relationship
+//!
+//! This module currently owns production resume evidence acquisition and
+//! mailbox/wake projection. It remains compatible with the target
+//! `ProviderTurnAdapter` until AGE-278 performs the joined cutover; the exact
+//! domain boundary and retirement criteria are owned by
+//! `docs/architecture/provider-turn-lifecycle.md`.
 
 use oulipoly_runtime::executor;
 use oulipoly_runtime::executor::prompt_acceptance::{

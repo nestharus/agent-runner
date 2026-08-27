@@ -4,6 +4,15 @@
 //! ## Declared roles
 //!
 //! `orchestration`, `validator`
+//!
+//! ## Lifecycle relationship
+//!
+//! This is the target `SessionSupervisor` adapter for AGE-278's joined cutover,
+//! not a second active production resume path. Until that cutover,
+//! `src-tauri/src/run/resume` remains authoritative and compatibility changes
+//! must assess both paths. The activation conditions, permitted domain
+//! differences, and retirement criteria are owned by
+//! `docs/architecture/provider-turn-lifecycle.md`.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
