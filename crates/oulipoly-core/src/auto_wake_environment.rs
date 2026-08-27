@@ -2,26 +2,25 @@
 //!
 //! ## Declared roles
 //!
-//! Roles: accessor, entity.
+//! Roles: accessor.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AutoWakeEnvironmentVariable(&'static str);
 
 impl AutoWakeEnvironmentVariable {
-    pub const ALL: [Self; 5] = [
-        Self("OULIPOLY_AUTO_WAKE"),
-        Self("OULIPOLY_AUTO_WAKE_SESSION_ID"),
-        Self("OULIPOLY_AUTO_WAKE_TOKEN"),
-        Self("OULIPOLY_AUTO_WAKE_COUNT"),
-        Self("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS"),
-    ];
+    pub const MARKER: Self = Self("OULIPOLY_AUTO_WAKE");
+    pub const SESSION_ID: Self = Self("OULIPOLY_AUTO_WAKE_SESSION_ID");
+    pub const CLAIM_TOKEN: Self = Self("OULIPOLY_AUTO_WAKE_TOKEN");
+    pub const COUNT: Self = Self("OULIPOLY_AUTO_WAKE_COUNT");
+    pub const RETRY_BASE_MILLISECONDS: Self = Self("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS");
 
-    // Producer handles derive from ALL; the private field prevents unregistered construction.
-    pub const MARKER: Self = Self::ALL[0];
-    pub const SESSION_ID: Self = Self::ALL[1];
-    pub const CLAIM_TOKEN: Self = Self::ALL[2];
-    pub const COUNT: Self = Self::ALL[3];
-    pub const RETRY_BASE_MILLISECONDS: Self = Self::ALL[4];
+    pub const ALL: [Self; 5] = [
+        Self::MARKER,
+        Self::SESSION_ID,
+        Self::CLAIM_TOKEN,
+        Self::COUNT,
+        Self::RETRY_BASE_MILLISECONDS,
+    ];
 
     pub const fn name(self) -> &'static str {
         self.0

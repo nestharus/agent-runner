@@ -1,16 +1,11 @@
 //! ## Declared roles
 //!
-//! Roles: mapper, accessor, predicate, filter, parser.
+//! Roles: mapper, parser.
 //!
 //! - mapper: `map_launch_result_with_terminal_classification`,
 //!   `launch_session_capture`, and `launch_provider_session_id` translate
 //!   provider launch results into runtime execution, terminal, session-capture,
 //!   prompt-acceptance-attestation, and assistant-productivity surfaces.
-//! - accessor: `raw_provider_session_id` reads optional session fields from
-//!   launch JSON values.
-//! - predicate: `provider_session_id_is_present` reports whether a session
-//!   identifier is present before runtime capture.
-//! - filter: `accepted_provider_session_id` selects non-empty session values.
 //! - parser: `parse_prompt_acceptance_attestation_marker` parses the negotiated
 //!   provider marker while leaving exact host-correlation trust to the separate
 //!   prompt-acceptance promotion boundary.
@@ -141,26 +136,10 @@ pub(crate) fn marker_provider_session_id(value: &Value) -> Option<String> {
 }
 
 fn provider_session_id_from_value(value: &Value) -> Option<String> {
-    raw_provider_session_id(value)
-        .and_then(accepted_provider_session_id)
-        .map(owned_provider_session_id)
-}
-
-fn raw_provider_session_id(value: &Value) -> Option<&str> {
     value
         .get("provider_session_id")
         .and_then(Value::as_str)
         .or_else(|| value.get("session_id").and_then(Value::as_str))
-}
-
-fn accepted_provider_session_id(session_id: &str) -> Option<&str> {
-    provider_session_id_is_present(session_id).then_some(session_id)
-}
-
-fn provider_session_id_is_present(session_id: &str) -> bool {
-    !session_id.is_empty()
-}
-
-fn owned_provider_session_id(session_id: &str) -> String {
-    session_id.to_string()
+        .filter(|session_id| !session_id.is_empty())
+        .map(ToOwned::to_owned)
 }
