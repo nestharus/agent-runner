@@ -179,14 +179,6 @@ pub(super) fn record_resume_acceptance_if_present(
 pub(super) struct ResumeCompletionClassification {
     pub(super) recovered_generic_nonzero: bool,
     pub(super) terminal_completion_confirmed: bool,
-    pub(super) confirmed_prompt_acceptance_failure: Option<ConfirmedPromptAcceptanceFailure>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ConfirmedPromptAcceptanceFailure {
-    pub(super) physical_exit_code: i32,
-    pub(super) prompt_acceptance:
-        oulipoly_runtime::executor::prompt_acceptance::ValidatedPromptAcceptance,
 }
 
 pub(super) fn finalize_completed_attempt_for_resume(
@@ -197,7 +189,40 @@ pub(super) fn finalize_completed_attempt_for_resume(
     result: &oulipoly_runtime::executor::ExecutionResult,
     completion: ResumeCompletionClassification,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    let control = finalize_completed_attempt(CompletedAttemptInput {
+    let control = finalize_completed_attempt_control_for_resume(
+        input,
+        attempt,
+        provider,
+        provider_session_id,
+        result,
+        &completion,
+    )?;
+    match control {
+        CompletedAttemptControl::Continue => {
+            finalize_retrying_resume(input, attempt, provider_session_id, result)
+        }
+        CompletedAttemptControl::Return(exit_code) if exit_code == 0 => finalize_successful_resume(
+            input,
+            attempt,
+            provider_session_id,
+            exit_code,
+            result.exit_code,
+        ),
+        CompletedAttemptControl::Return(exit_code) => {
+            finalize_failed_resume(input, attempt, provider_session_id, result, exit_code)
+        }
+    }
+}
+
+pub(super) fn finalize_completed_attempt_control_for_resume(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &mut ResumeInvocationAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_session_id: &str,
+    result: &oulipoly_runtime::executor::ExecutionResult,
+    completion: &ResumeCompletionClassification,
+) -> Result<CompletedAttemptControl, String> {
+    finalize_completed_attempt(CompletedAttemptInput {
         agent_runtime_services: input.agent_runtime_services,
         env: input.env,
         invocation: &attempt.invocation,
@@ -216,62 +241,7 @@ pub(super) fn finalize_completed_attempt_for_resume(
         max_attempts: input.max_attempts,
         recovered_generic_nonzero: completion.recovered_generic_nonzero,
         terminal_completion_confirmed: completion.terminal_completion_confirmed,
-    })?;
-    if let Some(failure) = completion.confirmed_prompt_acceptance_failure {
-        return finalize_confirmed_prompt_acceptance_failure(input, attempt, failure);
-    }
-    match control {
-        CompletedAttemptControl::Continue => {
-            finalize_retrying_resume(input, attempt, provider_session_id, result)
-        }
-        CompletedAttemptControl::Return(exit_code) if exit_code == 0 => finalize_successful_resume(
-            input,
-            attempt,
-            provider_session_id,
-            exit_code,
-            result.exit_code,
-        ),
-        CompletedAttemptControl::Return(exit_code) => {
-            finalize_failed_resume(input, attempt, provider_session_id, result, exit_code)
-        }
-    }
-}
-
-fn finalize_confirmed_prompt_acceptance_failure(
-    input: &ResumeAttemptInput<'_>,
-    attempt: &ResumeInvocationAttempt<'_>,
-    failure: ConfirmedPromptAcceptanceFailure,
-) -> Result<ResumeAttemptLoopControl, String> {
-    let shell_exit_code = mapper::failure_exit_code(failure.physical_exit_code);
-    settle_confirmed_prompt_acceptance_failure(
-        input,
-        &attempt.invocation.id,
-        &failure,
-        shell_exit_code,
-    )?;
-    Ok(ResumeAttemptLoopControl::Return(shell_exit_code))
-}
-
-pub(super) fn settle_confirmed_prompt_acceptance_failure(
-    input: &ResumeAttemptInput<'_>,
-    invocation_uuid: &str,
-    failure: &ConfirmedPromptAcceptanceFailure,
-    shell_exit_code: i32,
-) -> Result<(), String> {
-    if input.mailbox_delivery_seqs.is_empty() {
-        wake::mark_resume_attempt_idle(
-            failure.prompt_acceptance.provider_session_id(),
-            invocation_uuid,
-            Some(shell_exit_code),
-        )
-    } else {
-        wake::settle_accepted_mailbox_delivery_and_recheck(
-            input,
-            failure.prompt_acceptance.provider_session_id(),
-            invocation_uuid,
-            failure.physical_exit_code,
-        )
-    }
+    })
 }
 
 fn finalize_retrying_resume(

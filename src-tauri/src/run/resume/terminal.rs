@@ -6,9 +6,10 @@ use oulipoly_runtime::executor;
 use oulipoly_runtime::executor::prompt_acceptance::ValidatedPromptAcceptance;
 
 use super::disposition::{ResumeTerminalDispositionInput, handle_terminal_signal_disposition};
+use super::finalization::CompletedAttemptControl;
 use super::lifecycle::{
-    BoundResumeAttempt, ConfirmedPromptAcceptanceFailure, ResumeCompletionClassification,
-    ResumeInvocationAttempt, finalize_completed_attempt_for_resume,
+    BoundResumeAttempt, ResumeCompletionClassification, ResumeInvocationAttempt,
+    finalize_completed_attempt_control_for_resume, finalize_completed_attempt_for_resume,
     record_resume_acceptance_if_present,
 };
 use super::orchestration::{ResumeAttemptInput, ResumeAttemptLoopControl};
@@ -45,6 +46,12 @@ struct ResumeAttemptClassification {
     recovered_generic_nonzero: bool,
     terminal_completion_confirmed: bool,
     clean_exit_mailbox_resolution_provenance: CleanExitMailboxResolutionProvenance,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfirmedPromptAcceptanceFailure {
+    physical_exit_code: i32,
+    prompt_acceptance: ValidatedPromptAcceptance,
 }
 
 pub(super) fn resume_attempts_exhausted(attempts: usize, max_attempts: usize) -> bool {
@@ -288,10 +295,23 @@ fn handle_resume_attempt_terminal_signal(
     })?;
     let outcome =
         mapper::resume_terminal_disposition_outcome(disposition_control, result.exit_code);
-    let outcome = stop_retry_after_confirmed_prompt_acceptance_failure(
-        outcome,
-        confirmed_prompt_acceptance_failure.as_ref(),
-    );
+    let completion = ResumeCompletionClassification {
+        recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
+        terminal_completion_confirmed,
+    };
+    if let Some(failure) = confirmed_prompt_acceptance_failure.as_ref() {
+        return apply_confirmed_prompt_acceptance_failure(
+            input,
+            attempt,
+            provider,
+            provider_session_id,
+            result,
+            completion_evidence,
+            &completion,
+            &outcome,
+            failure,
+        );
+    }
     apply_resume_terminal_disposition_effects(
         input,
         attempt,
@@ -299,7 +319,6 @@ fn handle_resume_attempt_terminal_signal(
         result,
         &outcome,
         mailbox_delivery_outcome,
-        confirmed_prompt_acceptance_failure.as_ref(),
     )?;
     if let Some(control) = terminal_disposition_loop_control(outcome) {
         return Ok(control);
@@ -327,11 +346,7 @@ fn handle_resume_attempt_terminal_signal(
         provider,
         provider_session_id,
         result,
-        ResumeCompletionClassification {
-            recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
-            terminal_completion_confirmed,
-            confirmed_prompt_acceptance_failure,
-        },
+        completion,
     )
 }
 
@@ -342,20 +357,6 @@ pub(super) enum ResumeTerminalDispositionOutcome {
     CompletedAttempt,
 }
 
-fn stop_retry_after_confirmed_prompt_acceptance_failure(
-    outcome: ResumeTerminalDispositionOutcome,
-    failure: Option<&ConfirmedPromptAcceptanceFailure>,
-) -> ResumeTerminalDispositionOutcome {
-    match (failure, outcome) {
-        (Some(failure), ResumeTerminalDispositionOutcome::Continue(_)) => {
-            ResumeTerminalDispositionOutcome::Return(nonzero_resume_exit_code(
-                failure.physical_exit_code,
-            ))
-        }
-        (_, outcome) => outcome,
-    }
-}
-
 fn apply_resume_terminal_disposition_effects(
     input: &ResumeAttemptInput<'_>,
     attempt: &ResumeInvocationAttempt<'_>,
@@ -363,26 +364,7 @@ fn apply_resume_terminal_disposition_effects(
     result: &executor::ExecutionResult,
     outcome: &ResumeTerminalDispositionOutcome,
     mailbox_delivery_outcome: Option<wake::MailboxDeliveryOutcome>,
-    confirmed_prompt_acceptance_failure: Option<&ConfirmedPromptAcceptanceFailure>,
 ) -> Result<(), String> {
-    if let Some(failure) = confirmed_prompt_acceptance_failure {
-        let shell_exit_code = match outcome {
-            ResumeTerminalDispositionOutcome::Return(shell_exit_code) => *shell_exit_code,
-            ResumeTerminalDispositionOutcome::CompletedAttempt => return Ok(()),
-            ResumeTerminalDispositionOutcome::Continue(_) => {
-                return Err(
-                    "confirmed prompt acceptance failure cannot continue provider routing"
-                        .to_string(),
-                );
-            }
-        };
-        return super::lifecycle::settle_confirmed_prompt_acceptance_failure(
-            input,
-            &attempt.invocation.id,
-            failure,
-            shell_exit_code,
-        );
-    }
     if let Some(mailbox_delivery_outcome) = mailbox_delivery_outcome {
         let shell_exit_code = match outcome {
             ResumeTerminalDispositionOutcome::Return(shell_exit_code) => *shell_exit_code,
@@ -412,6 +394,71 @@ fn apply_resume_terminal_disposition_effects(
         &wake::failed_delivery_error(result, fallback),
     )?;
     wake::mark_resume_attempt_idle(provider_session_id, &attempt.invocation.id, Some(exit_code))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_confirmed_prompt_acceptance_failure(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &mut ResumeInvocationAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_session_id: &str,
+    result: &executor::ExecutionResult,
+    completion_evidence: wake::ResumeCompletionEvidence<'_>,
+    completion: &ResumeCompletionClassification,
+    outcome: &ResumeTerminalDispositionOutcome,
+    failure: &ConfirmedPromptAcceptanceFailure,
+) -> Result<ResumeAttemptLoopControl, String> {
+    let shell_exit_code = match outcome {
+        ResumeTerminalDispositionOutcome::Continue(_) => {
+            nonzero_resume_exit_code(failure.physical_exit_code)
+        }
+        ResumeTerminalDispositionOutcome::Return(shell_exit_code) => *shell_exit_code,
+        ResumeTerminalDispositionOutcome::CompletedAttempt => {
+            wake::ingest_mailbox_delivery_confirmation_turn_if_needed(
+                input,
+                provider,
+                result,
+                completion_evidence,
+            );
+            if let Some(control) = wake::handle_unconfirmed_mailbox_delivery_if_needed(
+                input,
+                attempt,
+                provider,
+                provider_session_id,
+                result,
+                completion_evidence,
+            )? {
+                return Ok(control);
+            }
+            match finalize_completed_attempt_control_for_resume(
+                input,
+                attempt,
+                provider,
+                provider_session_id,
+                result,
+                completion,
+            )? {
+                CompletedAttemptControl::Continue | CompletedAttemptControl::Return(_) => {
+                    nonzero_resume_exit_code(failure.physical_exit_code)
+                }
+            }
+        }
+    };
+    if input.mailbox_delivery_seqs.is_empty() {
+        wake::mark_resume_attempt_idle(
+            failure.prompt_acceptance.provider_session_id(),
+            &attempt.invocation.id,
+            Some(shell_exit_code),
+        )?;
+    } else {
+        wake::settle_accepted_mailbox_delivery_and_recheck(
+            input,
+            failure.prompt_acceptance.provider_session_id(),
+            &attempt.invocation.id,
+            failure.physical_exit_code,
+        )?;
+    }
+    Ok(ResumeAttemptLoopControl::Return(shell_exit_code))
 }
 
 fn terminal_disposition_loop_control(
@@ -486,10 +533,8 @@ fn emit_recovered_resume_terminal_signal_marker(
 mod tests {
     use super::{
         CleanExitMailboxResolutionEligibility as MailboxEligibility,
-        ResumeTerminalDispositionOutcome, apply_incomplete_tool_boundary_failure,
-        apply_unconfirmed_resume_completion_failure, classify_confirmed_prompt_acceptance_failure,
-        clean_exit_mailbox_resolution_eligibility,
-        stop_retry_after_confirmed_prompt_acceptance_failure,
+        apply_incomplete_tool_boundary_failure, apply_unconfirmed_resume_completion_failure,
+        classify_confirmed_prompt_acceptance_failure, clean_exit_mailbox_resolution_eligibility,
     };
     use oulipoly_provider::generated::{PROMPT_ACCEPTANCE_V1, PromptAcceptedMarkerValueV1};
     use oulipoly_runtime::executor::prompt_acceptance::{
@@ -614,27 +659,13 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_prompt_acceptance_failure_is_classified_once_and_stops_retry() {
+    fn confirmed_prompt_acceptance_failure_is_classified_once() {
         let mailbox_acceptance = validated_prompt_acceptance(Some("delivery-1"));
         let failure =
             classify_confirmed_prompt_acceptance_failure(29, Some(&mailbox_acceptance), false)
                 .expect("validated nonzero mailbox acceptance must classify as a failure outcome");
         assert_eq!(failure.prompt_acceptance, mailbox_acceptance);
-
-        assert_eq!(
-            stop_retry_after_confirmed_prompt_acceptance_failure(
-                ResumeTerminalDispositionOutcome::Continue(29),
-                Some(&failure),
-            ),
-            ResumeTerminalDispositionOutcome::Return(29)
-        );
-        assert_eq!(
-            stop_retry_after_confirmed_prompt_acceptance_failure(
-                ResumeTerminalDispositionOutcome::Continue(29),
-                None,
-            ),
-            ResumeTerminalDispositionOutcome::Continue(29)
-        );
+        assert_eq!(failure.physical_exit_code, 29);
         assert!(
             classify_confirmed_prompt_acceptance_failure(
                 29,
