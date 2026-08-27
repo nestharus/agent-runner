@@ -434,6 +434,28 @@ flag = "--resume"
             .unwrap();
     }
 
+    fn write_session_turn_source(
+        &self,
+        provider: &str,
+        session_id: &str,
+        turn_id: &str,
+        body: &str,
+    ) {
+        let turn = json!({
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "timestamp": "2026-08-27T09:37:00Z",
+            "role": "user",
+            "body": [{"type": "text", "text": body}],
+        });
+        let command = format!("printf '%s\\n' '{turn}'");
+        fs::write(
+            self.app_config_dir.join("sessions.toml"),
+            format!("[{provider}]\nturn_script = {}\n", toml_string(&command)),
+        )
+        .unwrap();
+    }
+
     fn assert_default_user_paths_untouched(&self) {
         assert!(
             !self
@@ -1390,7 +1412,7 @@ fn production_tui_pre_submission_fault_sends_no_provider_input() {
 }
 
 #[test]
-fn real_broker_confirmation_fault_reports_uncertain_and_reuses_without_retransmit() {
+fn real_broker_confirmation_fault_recovers_from_transcript_without_retransmit() {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("confirmation-fault-received.log");
     let script = fixture_provider_waiting_for_two_notifications(fixture.dir.path(), &received_log);
@@ -1521,8 +1543,66 @@ fn real_broker_confirmation_fault_reports_uncertain_and_reuses_without_retransmi
         state_delivery_evidence_counts(&fixture, &attempt_id),
         (0, 0)
     );
-    let _ = repl.kill();
-    let _ = repl.wait();
+
+    fixture.write_session_turn_source(
+        "fixture-provider",
+        SESSION_A,
+        "confirmation-fault-user-turn",
+        &format!("[OULIPOLY-DELIVERY {attempt_id}]"),
+    );
+    let confirmed = fixture.run_notify(
+        "h-confirmation-fault-confirmed",
+        owner_metadata(SESSION_A, &invocation_uuid),
+    );
+    assert_success(&confirmed);
+    let confirmed_value = stdout_json(&confirmed);
+    assert_eq!(
+        confirmed_value["pty_delivery"]["status"], "acked",
+        "unexpected transcript-confirmed diagnostic: {confirmed_value}"
+    );
+    let second_output = read_until(
+        pty.master.as_raw_fd(),
+        "GOT_NOTIFY_2",
+        Duration::from_secs(5),
+    );
+    if !second_output.contains("GOT_NOTIFY_2") {
+        let _ = repl.kill();
+        let _ = repl.wait();
+        panic!("transcript-confirmed retry did not reach provider: {second_output:?}");
+    }
+    assert!(repl.wait().unwrap().success());
+
+    let received = fs::read_to_string(&received_log).unwrap();
+    assert_eq!(
+        received
+            .matches("handle: h-confirmation-fault-first")
+            .count(),
+        1
+    );
+    assert!(received.contains("handle: h-confirmation-fault-recovery"));
+    assert!(received.contains("handle: h-confirmation-fault-confirmed"));
+    assert_eq!(
+        received
+            .matches(&format!("[OULIPOLY-DELIVERY {attempt_id}]"))
+            .count(),
+        1
+    );
+    let mailbox = fixture.mailbox();
+    assert!(mailbox.list_pending(SESSION_A).unwrap().is_empty());
+    let attempts: i64 = Connection::open(fixture.sidecar_path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM mailbox_delivery_attempts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &attempt_id),
+        (0, 0),
+        "transcript confirmation must not be mislabeled as PTY transport-ACK evidence"
+    );
     fixture.assert_default_user_paths_untouched();
 }
 

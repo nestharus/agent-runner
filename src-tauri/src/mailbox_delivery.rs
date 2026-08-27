@@ -62,6 +62,7 @@ struct PtyRuntimeAuthority {
     control_path: String,
     delivery_invocation_uuid: String,
     turn_generation_id: String,
+    provider_name: String,
 }
 
 #[cfg(unix)]
@@ -110,11 +111,13 @@ fn attempt_pty_mailbox_delivery_inner(
     let control_path = authority.control_path;
     let delivery_invocation_uuid = authority.delivery_invocation_uuid;
     let turn_generation_id = authority.turn_generation_id;
-    let Some(prepared) = (match prepare_pty_mailbox_delivery(
+    let provider_name = authority.provider_name;
+    let Some(prepared) = (match prepare_pty_mailbox_delivery_with_transcript_reconciliation(
         mailbox,
         session_id,
         &delivery_invocation_uuid,
         &turn_generation_id,
+        &provider_name,
     ) {
         Ok(prepared) => prepared,
         Err(err) => {
@@ -320,6 +323,7 @@ fn pty_runtime_authority(
                 control_path,
                 delivery_invocation_uuid: generation.spawn_invocation_uuid.clone(),
                 turn_generation_id: generation.generation_id.to_string(),
+                provider_name: generation.provider_name.clone(),
             })
         }
         Ok(SessionGenerationProjection::Multiple(_)) => Err(pty_status(
@@ -347,6 +351,119 @@ fn pty_runtime_authority(
             Some(err.to_string()),
         )),
     }
+}
+
+#[cfg(unix)]
+fn prepare_pty_mailbox_delivery_with_transcript_reconciliation(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+    delivery_invocation_uuid: &str,
+    turn_generation_id: &str,
+    provider_name: &str,
+) -> Result<Option<PreparedPtyMailboxDelivery>, String> {
+    let prepared = prepare_pty_mailbox_delivery(
+        mailbox,
+        session_id,
+        delivery_invocation_uuid,
+        turn_generation_id,
+    );
+    let uncertain_attempt_id = match &prepared {
+        Ok(Some(prepared))
+            if mailbox.delivery_attempt_submission_started(&prepared.attempt_id)? =>
+        {
+            Some(prepared.attempt_id.as_str())
+        }
+        Err(error) => error.strip_prefix("mailbox_delivery_submission_uncertain:"),
+        _ => None,
+    };
+    let Some(attempt_id) = uncertain_attempt_id else {
+        return prepared;
+    };
+    match reconcile_transcript_confirmed_pty_attempt(mailbox, session_id, provider_name, attempt_id)
+    {
+        Ok(true) => prepare_pty_mailbox_delivery(
+            mailbox,
+            session_id,
+            delivery_invocation_uuid,
+            turn_generation_id,
+        ),
+        Ok(false) => Err(format!(
+            "mailbox_delivery_submission_uncertain:{attempt_id}"
+        )),
+        Err(error) => Err(format!(
+            "mailbox_delivery_submission_uncertain:{attempt_id}; transcript reconciliation failed: {error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn reconcile_transcript_confirmed_pty_attempt(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+    provider_name: &str,
+    attempt_id: &str,
+) -> Result<bool, String> {
+    let state = StateDb::open_default()?;
+    if !state.has_session_user_turn_containing(provider_name, session_id, attempt_id)? {
+        let sessions_path = dirs::config_dir()
+            .map(|path| path.join("oulipoly-agent-runner"))
+            .unwrap_or_else(|| Path::new(".").to_path_buf())
+            .join("sessions.toml");
+        let sessions = match oulipoly_config::SessionsConfig::load(&sessions_path) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    provider_name,
+                    attempt_id,
+                    "Failed to load sessions config for uncertain PTY delivery: {error}"
+                );
+                return Ok(false);
+            }
+        };
+        let report = oulipoly_runtime::sessions::scan_provider_session(
+            provider_name,
+            &sessions,
+            &state,
+            session_id,
+        );
+        if !report.errors.is_empty() {
+            tracing::warn!(
+                session_id,
+                provider_name,
+                attempt_id,
+                errors = ?report.errors,
+                "Provider session scan could not fully reconcile uncertain PTY delivery"
+            );
+        }
+        if !state.has_session_user_turn_containing(provider_name, session_id, attempt_id)? {
+            return Ok(false);
+        }
+    }
+
+    let Some(window) = mailbox.delivery_attempt_window(attempt_id)? else {
+        return Ok(false);
+    };
+    if window.session_id != session_id
+        || window.submission_started_at.is_none()
+        || window.acknowledged_at.is_some()
+        || window.resolved_at.is_some()
+    {
+        return Ok(false);
+    }
+    let seqs = window.rows.iter().map(|row| row.seq).collect::<Vec<_>>();
+    if seqs.is_empty() {
+        return Ok(false);
+    }
+    mailbox.mark_delivered(session_id, None, &seqs, &window.delivery_invocation_uuid)?;
+    tracing::info!(
+        session_id,
+        provider_name,
+        attempt_id,
+        delivered = seqs.len(),
+        "Reconciled uncertain PTY mailbox delivery from an exact provider user turn"
+    );
+    Ok(true)
 }
 
 #[cfg(unix)]
