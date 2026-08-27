@@ -43,21 +43,26 @@ pub(crate) fn recheck_after_failed_auto_wake(session_id: &str) -> WakeDiagnostic
     let Some(auto_wake) = current_auto_wake() else {
         return WakeDiagnostic::status("not_auto_wake");
     };
-    release_current_auto_wake_claim(session_id, Some(&auto_wake));
     let pending_count = match turn_end_pending_count(session_id) {
         Ok(count) => count,
-        Err(err) => return storage_error_diagnostic(err),
+        Err(err) => {
+            release_current_auto_wake_claim(session_id, Some(&auto_wake));
+            return storage_error_diagnostic(err);
+        }
     };
     if pending_count == 0 {
+        release_current_auto_wake_claim(session_id, Some(&auto_wake));
         return WakeDiagnostic::status("no_pending");
     }
     sleep_before_failed_auto_wake_retry(&auto_wake);
-    start_wake_chain(StartWakeInput {
+    let diagnostic = start_wake_chain(StartWakeInput {
         session_id,
         reason: "wake_failure_retry",
         auto_wake_count: following_auto_wake_chronology_count(Some(&auto_wake)),
-        renew_token: None,
-    })
+        renew_token: Some(&auto_wake.token),
+    });
+    release_current_auto_wake_claim(session_id, Some(&auto_wake));
+    diagnostic
 }
 
 fn following_auto_wake_chronology_count(auto_wake: Option<&AutoWakeEnv>) -> i64 {

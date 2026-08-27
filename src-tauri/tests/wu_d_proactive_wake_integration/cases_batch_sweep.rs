@@ -317,6 +317,65 @@ pub(crate) fn wake_sweep_retries_twice_unconfirmed_pending_mailbox() {
     assert_xdg_isolated(&fixture);
 }
 
+pub(crate) fn failed_auto_wake_retains_retry_ownership_during_backoff() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    let first_failure = fixture.work_dir.join("first-auto-wake-failed");
+    let hook = format!(
+        r#"if [ "$WU_D_PROVIDER_RESUME_INDEX" = 2 ]; then
+  : > {}
+  exit 17
+fi"#,
+        shell_path(&first_failure),
+    );
+    fixture.write_provider(&provider_script(
+        "",
+        &hook,
+        "retry-owner-${WU_D_PROVIDER_RESUME_INDEX}.txt",
+    ));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    for index in 0..21 {
+        fixture.seed_mailbox(SESSION, &format!("h-retry-owner-{index:02}"));
+    }
+
+    let manual_resume = fixture.run_resume_with_retry_base(2_000);
+    direct_unconfirmed_invocation(&manual_resume);
+    wait_until("first automatic wake failed and entered backoff", || {
+        first_failure.exists()
+            && crate::liveness::runtime_is_idle(&fixture, SESSION)
+            && invocation_count(&fixture) == 2
+    });
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    let claim = fixture
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .expect("failed automatic wake must retain retry ownership during backoff");
+    assert_eq!(claim.auto_wake_count, 1);
+    assert!(claim.wake_pid.is_some());
+
+    let overlapping_sweep = fixture.run_mailbox_list(SESSION);
+    assert_success(&overlapping_sweep);
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert_eq!(
+        std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+        "2",
+        "a startup sweep must coalesce with the retry owner"
+    );
+
+    wait_until("owned retry renewed and delivered pending mailbox", || {
+        delivered_rows_without_pending_or_claim(&fixture, SESSION, 21)
+    });
+    assert_eq!(
+        std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+        "3"
+    );
+    assert_xdg_isolated(&fixture);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn renewed_followup_claim_survives_old_failed_child_recheck() {

@@ -97,6 +97,19 @@ impl Fixture {
     }
 
     pub(crate) fn run_resume(&self) -> Output {
+        self.run(self.resume_command())
+    }
+
+    pub(crate) fn run_resume_with_retry_base(&self, retry_base_milliseconds: u64) -> Output {
+        let mut cmd = self.resume_command();
+        cmd.env(
+            oulipoly_core::AutoWakeEnvironmentVariable::RETRY_BASE_MILLISECONDS.name(),
+            retry_base_milliseconds.to_string(),
+        );
+        self.run(cmd)
+    }
+
+    fn resume_command(&self) -> Command {
         let mut cmd = Command::new(crate::parse::runner_bin());
         cmd.arg("resume")
             .arg("-m")
@@ -105,17 +118,21 @@ impl Fixture {
             .arg(SESSION)
             .arg("--models-dir")
             .arg(&self.models_dir);
-        self.run(cmd)
+        cmd
     }
 
     pub(crate) fn run_mailbox_list(&self, session_id: &str) -> Output {
+        self.run(self.mailbox_list_command(session_id))
+    }
+
+    fn mailbox_list_command(&self, session_id: &str) -> Command {
         let mut cmd = Command::new(crate::parse::runner_bin());
         cmd.arg("mailbox")
             .arg("list")
             .arg("--session-id")
             .arg(session_id)
             .arg("--json");
-        self.run(cmd)
+        cmd
     }
 
     pub(crate) fn write_script(&self, name: &str, body: &str) -> PathBuf {

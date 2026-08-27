@@ -117,6 +117,11 @@ fn wake_sweep_retries_twice_unconfirmed_pending_mailbox() {
 }
 
 #[test]
+fn failed_auto_wake_retains_retry_ownership_during_backoff() {
+    cases_batch_sweep::failed_auto_wake_retains_retry_ownership_during_backoff();
+}
+
+#[test]
 fn persisted_count_at_five_allows_startup_sweep_delivery() {
     cases_batch_sweep::persisted_count_at_five_allows_startup_sweep_delivery();
 }
