@@ -760,8 +760,8 @@ pub struct SessionAdmissionRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionAdmissionAttempt {
-    Admitted(SessionAdmissionRow),
-    AtCapacity,
+    Admitted(Box<SessionAdmissionRow>),
+    Waiting,
     Empty,
 }
 
@@ -3950,12 +3950,34 @@ impl SessionAdmissionRepository<'_> {
         claim_token: &str,
         now_unix_ms: i64,
         stale_before_unix_ms: i64,
-        maximum_active_launches: Option<i64>,
+    ) -> Result<SessionAdmissionAttempt, String> {
+        self.try_admit(claim_token, now_unix_ms, stale_before_unix_ms, None)
+    }
+
+    pub fn try_admit_registration(
+        &mut self,
+        registration_identity: &str,
+        claim_token: &str,
+        now_unix_ms: i64,
+        stale_before_unix_ms: i64,
+    ) -> Result<SessionAdmissionAttempt, String> {
+        validate_session_admission_identity(registration_identity, "registration_identity")?;
+        self.try_admit(
+            claim_token,
+            now_unix_ms,
+            stale_before_unix_ms,
+            Some(registration_identity),
+        )
+    }
+
+    fn try_admit(
+        &mut self,
+        claim_token: &str,
+        now_unix_ms: i64,
+        stale_before_unix_ms: i64,
+        requested_registration_identity: Option<&str>,
     ) -> Result<SessionAdmissionAttempt, String> {
         validate_session_admission_identity(claim_token, "claim_token")?;
-        if maximum_active_launches.is_some_and(|maximum| maximum < 1) {
-            return Err("Session admission active launch maximum must be positive".to_string());
-        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3963,44 +3985,23 @@ impl SessionAdmissionRepository<'_> {
         cancel_dead_queued_session_admissions_on(&tx, now_unix_ms)?;
         reconcile_dead_starting_generations_on(&tx, now_unix_ms)?;
         recover_stale_session_admissions_on(&tx, stale_before_unix_ms, now_unix_ms)?;
-        let next = tx
-            .query_row(
-                "SELECT registration_identity
-                 FROM session_admission_queue
-                 WHERE state = 'queued'
-                 ORDER BY queue_sequence ASC
-                 LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|err| format!("Failed to select next session admission: {err}"))?;
+        let next = next_session_admission_on(&tx)?;
         let Some(registration_identity) = next else {
             tx.commit()
                 .map_err(|err| format!("Failed to commit empty admission drain: {err}"))?;
             return Ok(SessionAdmissionAttempt::Empty);
         };
-        if let Some(maximum_active_launches) = maximum_active_launches {
-            let active_launches = tx
-                .query_row(
-                    "SELECT COUNT(*)
-                     FROM session_admission_queue
-                     WHERE state IN ('admitted', 'launching')",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(|err| format!("Failed to count active session admissions: {err}"))?;
-            if active_launches >= maximum_active_launches {
-                tx.commit().map_err(|err| {
-                    format!("Failed to commit capacity-limited admission drain: {err}")
-                })?;
-                return Ok(SessionAdmissionAttempt::AtCapacity);
-            }
-        }
+        if requested_registration_identity
+            .is_some_and(|requested| requested != registration_identity)
+        {
+            tx.commit()
+                .map_err(|err| format!("Failed to commit waiting admission drain: {err}"))?;
+            return Ok(SessionAdmissionAttempt::Waiting);
+        };
         let changed = tx
             .execute(
                 "UPDATE session_admission_queue
-                 SET state = 'admitted', queue_reason = 'capacity_reserved', claim_token = ?2,
+                 SET state = 'admitted', queue_reason = 'admission_claimed', claim_token = ?2,
                      claimed_at_unix_ms = ?3, updated_at_unix_ms = ?3
                  WHERE registration_identity = ?1 AND state = 'queued'",
                 params![&registration_identity, claim_token, now_unix_ms],
@@ -4013,7 +4014,7 @@ impl SessionAdmissionRepository<'_> {
             .ok_or_else(|| "Admitted session row disappeared".to_string())?;
         tx.commit()
             .map_err(|err| format!("Failed to commit session admission: {err}"))?;
-        Ok(SessionAdmissionAttempt::Admitted(row))
+        Ok(SessionAdmissionAttempt::Admitted(Box::new(row)))
     }
 
     pub fn begin_launch(
@@ -8882,6 +8883,20 @@ fn validate_optional_session_admission_identity(
     }
 }
 
+fn next_session_admission_on(conn: &Connection) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT registration_identity
+         FROM session_admission_queue
+         WHERE state = 'queued'
+         ORDER BY queue_sequence ASC
+         LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|err| format!("Failed to select next eligible session admission: {err}"))
+}
+
 fn session_admission_by_registration_on(
     conn: &Connection,
     registration_identity: &str,
@@ -10395,7 +10410,7 @@ mod tests {
 
         let admitted = mailbox
             .session_admissions()
-            .try_admit_next("live-claim", 0, 3, None)
+            .try_admit_next("live-claim", 0, 3)
             .unwrap();
         let SessionAdmissionAttempt::Admitted(admitted) = admitted else {
             panic!("live admission was not admitted after dead generation recovery");

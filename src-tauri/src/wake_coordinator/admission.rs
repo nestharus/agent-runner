@@ -7,8 +7,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const MIN_AVAILABLE_MEMORY_ENV: &str = "OULIPOLY_SESSION_ADMISSION_MIN_AVAILABLE_MEMORY_BYTES";
 const DEFAULT_MEMORY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MEMORY_RESERVE_PERCENT: u64 = 10;
-// An indefinite provider turn can occupy one slot without removing all launch service.
-const MAX_ACTIVE_LAUNCHES: i64 = 2;
 const RESERVATION_STALE_AFTER: Duration = Duration::from_secs(60);
 const WAIT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -27,6 +25,7 @@ struct MemoryObservation {
 enum DrainOutcome {
     Admitted,
     Pressure,
+    Waiting,
     Empty,
     Contended,
 }
@@ -121,38 +120,42 @@ fn enqueue_and_wait_at(
         report_queued_status(
             registration_identity,
             QueueStatus {
-                reason: row.queue_reason,
+                reason: row.queue_reason.clone(),
                 position,
             },
             &mut reported,
         );
         drop(db);
         if position.is_some() {
-            let outcome = match drain_one_at_with_config(mailbox_path, config) {
-                Ok(DrainOutcome::Admitted) => continue,
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    report_queued_status(
-                        registration_identity,
-                        QueueStatus {
-                            reason: "coordination_unavailable".to_string(),
-                            position,
-                        },
-                        &mut reported,
-                    );
-                    tracing::warn!(
-                        registration_identity,
-                        "Session admission retry retained: {error}"
-                    );
-                    DrainOutcome::Contended
-                }
-            };
-            let mut db = MailboxDb::open(mailbox_path)?;
-            db.session_admissions().update_queued_reason(
-                registration_identity,
-                queued_reason(outcome),
-                unix_time_ms()?,
-            )?;
+            let outcome =
+                match drain_one_at_with_config(mailbox_path, config, Some(registration_identity)) {
+                    Ok(DrainOutcome::Admitted) => continue,
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        report_queued_status(
+                            registration_identity,
+                            QueueStatus {
+                                reason: "coordination_unavailable".to_string(),
+                                position,
+                            },
+                            &mut reported,
+                        );
+                        tracing::warn!(
+                            registration_identity,
+                            "Session admission retry retained: {error}"
+                        );
+                        DrainOutcome::Contended
+                    }
+                };
+            let next_reason = queued_reason(outcome);
+            if row.queue_reason != next_reason {
+                let mut db = MailboxDb::open(mailbox_path)?;
+                db.session_admissions().update_queued_reason(
+                    registration_identity,
+                    next_reason,
+                    unix_time_ms()?,
+                )?;
+            }
         }
         std::thread::sleep(WAIT_RETRY_INTERVAL);
     }
@@ -160,7 +163,7 @@ fn enqueue_and_wait_at(
 
 fn queued_reason(outcome: DrainOutcome) -> &'static str {
     match outcome {
-        DrainOutcome::Admitted | DrainOutcome::Empty => "fifo_wait",
+        DrainOutcome::Admitted | DrainOutcome::Waiting | DrainOutcome::Empty => "fifo_wait",
         DrainOutcome::Pressure => "memory_pressure",
         DrainOutcome::Contended => "drain_contended",
     }
@@ -205,16 +208,22 @@ fn admitted_claim_token(row: &SessionAdmissionRow) -> Option<&str> {
 
 fn drain_one_at(mailbox_path: &Path) -> Result<DrainOutcome, String> {
     let config = AdmissionCapacityConfig::from_env()?;
-    drain_one_at_with_config(mailbox_path, config)
+    drain_one_at_with_config(mailbox_path, config, None)
 }
 
 fn drain_one_at_with_config(
     mailbox_path: &Path,
     config: AdmissionCapacityConfig,
+    requested_registration_identity: Option<&str>,
 ) -> Result<DrainOutcome, String> {
     let result = super::sweep::try_with_serialized_drain(mailbox_path, || {
         let mut db = MailboxDb::open(mailbox_path)?;
-        drain_one_with(&mut db, config, observe_system_memory)
+        drain_with(
+            &mut db,
+            config,
+            observe_system_memory,
+            requested_registration_identity,
+        )
     })?;
     Ok(result.unwrap_or(DrainOutcome::Contended))
 }
@@ -230,32 +239,43 @@ fn drain_one_with(
     config: AdmissionCapacityConfig,
     observe_memory: impl FnOnce() -> Result<Option<MemoryObservation>, String>,
 ) -> Result<DrainOutcome, String> {
+    drain_with(db, config, observe_memory, None)
+}
+
+fn drain_with(
+    db: &mut MailboxDb,
+    config: AdmissionCapacityConfig,
+    observe_memory: impl FnOnce() -> Result<Option<MemoryObservation>, String>,
+    requested_registration_identity: Option<&str>,
+) -> Result<DrainOutcome, String> {
     let observation = match observe_memory() {
         Ok(observation) => observation,
         Err(error) => {
-            tracing::warn!(
-                maximum_active_launches = MAX_ACTIVE_LAUNCHES,
-                "Session admission memory observation unavailable; using bounded fallback: {error}"
-            );
+            tracing::warn!("Session admission memory observation unavailable: {error}");
             None
         }
     };
     if observation.is_some_and(|observation| memory_pressure(config, observation)) {
         return Ok(DrainOutcome::Pressure);
     }
-    let maximum_active_launches = Some(MAX_ACTIVE_LAUNCHES);
     let now = unix_time_ms()?;
     let stale_before =
         now.saturating_sub(i64::try_from(RESERVATION_STALE_AFTER.as_millis()).unwrap_or(i64::MAX));
     let claim_token = uuid::Uuid::new_v4().to_string();
-    match db.session_admissions().try_admit_next(
-        &claim_token,
-        now,
-        stale_before,
-        maximum_active_launches,
-    )? {
+    let attempt = match requested_registration_identity {
+        Some(registration_identity) => db.session_admissions().try_admit_registration(
+            registration_identity,
+            &claim_token,
+            now,
+            stale_before,
+        )?,
+        None => db
+            .session_admissions()
+            .try_admit_next(&claim_token, now, stale_before)?,
+    };
+    match attempt {
         SessionAdmissionAttempt::Admitted(_) => Ok(DrainOutcome::Admitted),
-        SessionAdmissionAttempt::AtCapacity => Ok(DrainOutcome::Pressure),
+        SessionAdmissionAttempt::Waiting => Ok(DrainOutcome::Waiting),
         SessionAdmissionAttempt::Empty => Ok(DrainOutcome::Empty),
     }
 }
@@ -305,20 +325,17 @@ fn observe_system_memory() -> Result<Option<MemoryObservation>, String> {
                 meminfo_bytes(&contents, "MemTotal")?,
             )
         });
-    Ok(linux_memavailable_or_bounded_fallback(proc_observation))
+    Ok(linux_memavailable_or_unavailable(proc_observation))
 }
 
 #[cfg(target_os = "linux")]
-fn linux_memavailable_or_bounded_fallback(
+fn linux_memavailable_or_unavailable(
     proc_observation: Result<MemoryObservation, String>,
 ) -> Option<MemoryObservation> {
     match proc_observation {
         Ok(observation) => Some(observation),
         Err(error) => {
-            tracing::warn!(
-                maximum_active_launches = MAX_ACTIVE_LAUNCHES,
-                "Linux MemAvailable observation unavailable; using bounded fallback: {error}"
-            );
+            tracing::warn!("Linux MemAvailable observation unavailable: {error}");
             None
         }
     }
@@ -500,9 +517,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn invalid_linux_memavailable_uses_bounded_fallback() {
+    fn invalid_linux_memavailable_is_reported_as_unavailable() {
         assert_eq!(
-            linux_memavailable_or_bounded_fallback(Err("injected procfs failure".to_string())),
+            linux_memavailable_or_unavailable(Err("injected procfs failure".to_string())),
             None
         );
     }
@@ -653,73 +670,51 @@ mod tests {
     }
 
     #[test]
-    fn configured_minimum_uses_bounded_fallback_without_removing_service() {
-        fn assert_bounded(observe_memory: fn() -> Result<Option<MemoryObservation>, String>) {
+    fn memory_observation_does_not_create_a_launch_budget() {
+        fn assert_unbounded(observe_memory: fn() -> Result<Option<MemoryObservation>, String>) {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("pid-identity.db");
             let mut db = MailboxDb::open(&path).unwrap();
-            enqueue(&mut db, "first", None, 1);
-            enqueue(&mut db, "second", None, 2);
-            enqueue(&mut db, "third", None, 3);
+            for index in 0..8 {
+                let identity = format!("invocation-{index}");
+                enqueue(&mut db, &identity, None, i64::from(index) + 1);
+            }
 
-            assert_eq!(
-                drain_one_with(&mut db, config(), observe_memory).unwrap(),
-                DrainOutcome::Admitted
-            );
-            let first = db.session_admissions().row("first").unwrap().unwrap();
-            assert!(
-                db.session_admissions()
-                    .begin_launch("first", first.claim_token.as_deref().unwrap(), 4)
-                    .unwrap()
-            );
-            assert_eq!(
-                drain_one_with(&mut db, config(), observe_memory).unwrap(),
-                DrainOutcome::Admitted
-            );
-            let second = db.session_admissions().row("second").unwrap().unwrap();
-            assert!(
-                db.session_admissions()
-                    .begin_launch("second", second.claim_token.as_deref().unwrap(), 5)
-                    .unwrap()
-            );
-            assert_eq!(
-                drain_one_with(&mut db, config(), observe_memory).unwrap(),
-                DrainOutcome::Pressure
-            );
-            assert_eq!(
-                db.session_admissions().row("third").unwrap().unwrap().state,
-                "queued"
-            );
+            for index in 0..8 {
+                assert_eq!(
+                    drain_one_with(&mut db, config(), observe_memory).unwrap(),
+                    DrainOutcome::Admitted
+                );
+                let identity = format!("invocation-{index}");
+                let row = db.session_admissions().row(&identity).unwrap().unwrap();
+                assert!(
+                    db.session_admissions()
+                        .begin_launch(&identity, row.claim_token.as_deref().unwrap(), 20 + index)
+                        .unwrap()
+                );
+            }
         }
 
-        assert_bounded(|| Ok(None));
-        assert_bounded(|| Err("injected observation failure".to_string()));
+        assert_unbounded(roomy_memory);
+        assert_unbounded(|| Ok(None));
+        assert_unbounded(|| Err("injected observation failure".to_string()));
     }
 
     #[test]
-    fn observed_memory_counts_outstanding_reservations() {
+    fn non_head_waiter_cannot_admit_another_launch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
         enqueue(&mut db, "first", None, 1);
         enqueue(&mut db, "second", None, 2);
-        enqueue(&mut db, "third", None, 3);
 
         assert_eq!(
-            drain_one_with(&mut db, config(), roomy_memory).unwrap(),
-            DrainOutcome::Admitted
-        );
-        assert_eq!(
-            drain_one_with(&mut db, config(), roomy_memory).unwrap(),
-            DrainOutcome::Admitted
-        );
-        assert_eq!(
-            drain_one_with(&mut db, config(), roomy_memory).unwrap(),
-            DrainOutcome::Pressure
+            drain_with(&mut db, config(), roomy_memory, Some("second")).unwrap(),
+            DrainOutcome::Waiting
         );
         assert_eq!(
             db.session_admissions().row("first").unwrap().unwrap().state,
-            "admitted"
+            "queued"
         );
         assert_eq!(
             db.session_admissions()
@@ -727,57 +722,16 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            "admitted"
-        );
-        assert_eq!(
-            db.session_admissions().row("third").unwrap().unwrap().state,
             "queued"
         );
-    }
-
-    #[test]
-    fn unavailable_memory_observation_allows_unrelated_launch_with_finite_bound() {
-        fn assert_bounded(observe_memory: fn() -> Result<Option<MemoryObservation>, String>) {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("pid-identity.db");
-            let mut db = MailboxDb::open(&path).unwrap();
-            enqueue(&mut db, "first", None, 1);
-            enqueue(&mut db, "second", None, 2);
-            enqueue(&mut db, "third", None, 3);
-
-            assert_eq!(
-                drain_one_with(&mut db, default_config(), observe_memory).unwrap(),
-                DrainOutcome::Admitted
-            );
-            let first = db.session_admissions().row("first").unwrap().unwrap();
-            assert!(
-                db.session_admissions()
-                    .begin_launch("first", first.claim_token.as_deref().unwrap(), 4)
-                    .unwrap()
-            );
-
-            assert_eq!(
-                drain_one_with(&mut db, default_config(), observe_memory).unwrap(),
-                DrainOutcome::Admitted
-            );
-            let second = db.session_admissions().row("second").unwrap().unwrap();
-            assert!(
-                db.session_admissions()
-                    .begin_launch("second", second.claim_token.as_deref().unwrap(), 5)
-                    .unwrap()
-            );
-            assert_eq!(
-                drain_one_with(&mut db, default_config(), observe_memory).unwrap(),
-                DrainOutcome::Pressure
-            );
-            assert_eq!(
-                db.session_admissions().row("third").unwrap().unwrap().state,
-                "queued"
-            );
-        }
-
-        assert_bounded(|| Ok(None));
-        assert_bounded(|| Err("injected observation failure".to_string()));
+        assert_eq!(
+            drain_with(&mut db, config(), roomy_memory, Some("first")).unwrap(),
+            DrainOutcome::Admitted
+        );
+        assert_eq!(
+            drain_with(&mut db, config(), roomy_memory, Some("second")).unwrap(),
+            DrainOutcome::Admitted
+        );
     }
 
     #[test]
@@ -863,7 +817,7 @@ mod tests {
         drain_one_with(&mut db, config(), roomy_memory).unwrap();
         let attempt = db
             .session_admissions()
-            .try_admit_next("replacement-token", i64::MAX, i64::MAX, None)
+            .try_admit_next("replacement-token", i64::MAX, i64::MAX)
             .unwrap();
         let SessionAdmissionAttempt::Admitted(row) = attempt else {
             panic!("stale row must recover")
@@ -896,7 +850,7 @@ mod tests {
 
         let SessionAdmissionAttempt::Admitted(second) = db
             .session_admissions()
-            .try_admit_next("replacement-token", i64::MAX, i64::MAX, None)
+            .try_admit_next("replacement-token", i64::MAX, i64::MAX)
             .unwrap()
         else {
             panic!("roomy memory must admit a successor while its parent is live");
