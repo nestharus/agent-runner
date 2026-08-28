@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const MIN_AVAILABLE_MEMORY_ENV: &str = "OULIPOLY_SESSION_ADMISSION_MIN_AVAILABLE_MEMORY_BYTES";
 const DEFAULT_MEMORY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MEMORY_RESERVE_PERCENT: u64 = 10;
+const DEGRADED_MAX_ACTIVE_LAUNCHES: i64 = 1;
 const RESERVATION_STALE_AFTER: Duration = Duration::from_secs(60);
 const WAIT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -227,18 +228,30 @@ fn drain_one_with(
             None
         }
     };
-    if observation.is_some_and(|observation| memory_pressure(config, observation)) {
-        return Ok(DrainOutcome::Pressure);
-    }
+    let maximum_active_launches = match observation {
+        Some(observation) => {
+            if memory_pressure(config, observation) {
+                return Ok(DrainOutcome::Pressure);
+            }
+            None
+        }
+        None if config.minimum_available_memory_bytes.is_some() => {
+            return Ok(DrainOutcome::Pressure);
+        }
+        None => Some(DEGRADED_MAX_ACTIVE_LAUNCHES),
+    };
     let now = unix_time_ms()?;
     let stale_before =
         now.saturating_sub(i64::try_from(RESERVATION_STALE_AFTER.as_millis()).unwrap_or(i64::MAX));
     let claim_token = uuid::Uuid::new_v4().to_string();
-    match db
-        .session_admissions()
-        .try_admit_next(&claim_token, now, stale_before)?
-    {
+    match db.session_admissions().try_admit_next(
+        &claim_token,
+        now,
+        stale_before,
+        maximum_active_launches,
+    )? {
         SessionAdmissionAttempt::Admitted(_) => Ok(DrainOutcome::Admitted),
+        SessionAdmissionAttempt::AtCapacity => Ok(DrainOutcome::Pressure),
         SessionAdmissionAttempt::Empty => Ok(DrainOutcome::Empty),
     }
 }
@@ -332,6 +345,12 @@ mod tests {
     fn config() -> AdmissionCapacityConfig {
         AdmissionCapacityConfig {
             minimum_available_memory_bytes: Some(100),
+        }
+    }
+
+    fn default_config() -> AdmissionCapacityConfig {
+        AdmissionCapacityConfig {
+            minimum_available_memory_bytes: None,
         }
     }
 
@@ -466,7 +485,7 @@ mod tests {
             enqueue(&mut db, "second", None, 2);
 
             assert_eq!(
-                drain_one_with(&mut db, config(), observe_memory).unwrap(),
+                drain_one_with(&mut db, default_config(), observe_memory).unwrap(),
                 DrainOutcome::Admitted
             );
             assert_eq!(
@@ -485,6 +504,91 @@ mod tests {
 
         assert_admitted(|| Ok(None));
         assert_admitted(|| Err("injected observation failure".to_string()));
+    }
+
+    #[test]
+    fn configured_minimum_requires_memory_observation() {
+        fn assert_queued(
+            observe_memory: impl FnOnce() -> Result<Option<MemoryObservation>, String>,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pid-identity.db");
+            let mut db = MailboxDb::open(&path).unwrap();
+            enqueue(&mut db, "first", None, 1);
+
+            assert_eq!(
+                drain_one_with(&mut db, config(), observe_memory).unwrap(),
+                DrainOutcome::Pressure
+            );
+            assert_eq!(
+                db.session_admissions().row("first").unwrap().unwrap().state,
+                "queued"
+            );
+        }
+
+        assert_queued(|| Ok(None));
+        assert_queued(|| Err("injected observation failure".to_string()));
+    }
+
+    #[test]
+    fn unavailable_memory_observation_limits_active_launches() {
+        fn assert_bounded(observe_memory: fn() -> Result<Option<MemoryObservation>, String>) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pid-identity.db");
+            let mut db = MailboxDb::open(&path).unwrap();
+            enqueue(&mut db, "first", None, 1);
+            enqueue(&mut db, "second", None, 2);
+            enqueue(&mut db, "third", None, 3);
+
+            assert_eq!(
+                drain_one_with(&mut db, default_config(), observe_memory).unwrap(),
+                DrainOutcome::Admitted
+            );
+            let first = db.session_admissions().row("first").unwrap().unwrap();
+            assert!(
+                db.session_admissions()
+                    .begin_launch("first", first.claim_token.as_deref().unwrap(), 4)
+                    .unwrap()
+            );
+
+            assert_eq!(
+                drain_one_with(&mut db, default_config(), observe_memory).unwrap(),
+                DrainOutcome::Pressure
+            );
+            for identity in ["second", "third"] {
+                assert_eq!(
+                    db.session_admissions()
+                        .row(identity)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "queued"
+                );
+            }
+
+            db.session_admissions()
+                .settle("first", first.claim_token.as_deref().unwrap())
+                .unwrap();
+            assert_eq!(
+                drain_one_with(&mut db, default_config(), observe_memory).unwrap(),
+                DrainOutcome::Admitted
+            );
+            assert_eq!(
+                db.session_admissions()
+                    .row("second")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "admitted"
+            );
+            assert_eq!(
+                db.session_admissions().row("third").unwrap().unwrap().state,
+                "queued"
+            );
+        }
+
+        assert_bounded(|| Ok(None));
+        assert_bounded(|| Err("injected observation failure".to_string()));
     }
 
     #[test]
@@ -570,7 +674,7 @@ mod tests {
         drain_one_with(&mut db, config(), roomy_memory).unwrap();
         let attempt = db
             .session_admissions()
-            .try_admit_next("replacement-token", i64::MAX, i64::MAX)
+            .try_admit_next("replacement-token", i64::MAX, i64::MAX, None)
             .unwrap();
         let SessionAdmissionAttempt::Admitted(row) = attempt else {
             panic!("stale row must recover")
@@ -603,7 +707,7 @@ mod tests {
 
         let SessionAdmissionAttempt::Admitted(second) = db
             .session_admissions()
-            .try_admit_next("replacement-token", i64::MAX, i64::MAX)
+            .try_admit_next("replacement-token", i64::MAX, i64::MAX, None)
             .unwrap()
         else {
             panic!("roomy memory must admit a successor while its parent is live");

@@ -761,6 +761,7 @@ pub struct SessionAdmissionRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionAdmissionAttempt {
     Admitted(SessionAdmissionRow),
+    AtCapacity,
     Empty,
 }
 
@@ -3949,8 +3950,12 @@ impl SessionAdmissionRepository<'_> {
         claim_token: &str,
         now_unix_ms: i64,
         stale_before_unix_ms: i64,
+        maximum_active_launches: Option<i64>,
     ) -> Result<SessionAdmissionAttempt, String> {
         validate_session_admission_identity(claim_token, "claim_token")?;
+        if maximum_active_launches.is_some_and(|maximum| maximum < 1) {
+            return Err("Session admission active launch maximum must be positive".to_string());
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3975,6 +3980,23 @@ impl SessionAdmissionRepository<'_> {
                 .map_err(|err| format!("Failed to commit empty admission drain: {err}"))?;
             return Ok(SessionAdmissionAttempt::Empty);
         };
+        if let Some(maximum_active_launches) = maximum_active_launches {
+            let active_launches = tx
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM session_admission_queue
+                     WHERE state IN ('admitted', 'launching')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|err| format!("Failed to count active session admissions: {err}"))?;
+            if active_launches >= maximum_active_launches {
+                tx.commit().map_err(|err| {
+                    format!("Failed to commit capacity-limited admission drain: {err}")
+                })?;
+                return Ok(SessionAdmissionAttempt::AtCapacity);
+            }
+        }
         let changed = tx
             .execute(
                 "UPDATE session_admission_queue
@@ -10373,7 +10395,7 @@ mod tests {
 
         let admitted = mailbox
             .session_admissions()
-            .try_admit_next("live-claim", 0, 3)
+            .try_admit_next("live-claim", 0, 3, None)
             .unwrap();
         let SessionAdmissionAttempt::Admitted(admitted) = admitted else {
             panic!("live admission was not admitted after dead generation recovery");
