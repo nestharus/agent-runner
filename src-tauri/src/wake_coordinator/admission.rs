@@ -25,7 +25,6 @@ struct MemoryObservation {
 enum DrainOutcome {
     Admitted,
     Pressure,
-    ObservationUnavailable,
     Empty,
     Contended,
 }
@@ -160,7 +159,6 @@ fn queued_reason(outcome: DrainOutcome) -> &'static str {
     match outcome {
         DrainOutcome::Admitted | DrainOutcome::Empty => "fifo_wait",
         DrainOutcome::Pressure => "memory_pressure",
-        DrainOutcome::ObservationUnavailable => "observation_unavailable",
         DrainOutcome::Contended => "drain_contended",
     }
 }
@@ -223,14 +221,13 @@ fn drain_one_with(
     observe_memory: impl FnOnce() -> Result<Option<MemoryObservation>, String>,
 ) -> Result<DrainOutcome, String> {
     let observation = match observe_memory() {
-        Ok(Some(observation)) => observation,
-        Ok(None) => return Ok(DrainOutcome::ObservationUnavailable),
+        Ok(observation) => observation,
         Err(error) => {
             tracing::warn!("Session admission memory observation unavailable: {error}");
-            return Ok(DrainOutcome::ObservationUnavailable);
+            None
         }
     };
-    if memory_pressure(config, observation) {
+    if observation.is_some_and(|observation| memory_pressure(config, observation)) {
         return Ok(DrainOutcome::Pressure);
     }
     let now = unix_time_ms()?;
@@ -423,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn pressure_and_observation_failure_retain_fifo_rows() {
+    fn pressure_retains_fifo_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
@@ -447,17 +444,6 @@ mod tests {
             "queued"
         );
 
-        let unavailable = || Ok(None);
-        assert_eq!(
-            drain_one_with(&mut db, config(), unavailable).unwrap(),
-            DrainOutcome::ObservationUnavailable
-        );
-
-        let failed = || Err("injected observation failure".to_string());
-        assert_eq!(
-            drain_one_with(&mut db, config(), failed).unwrap(),
-            DrainOutcome::ObservationUnavailable
-        );
         assert_eq!(
             db.session_admissions()
                 .row("pressure")
@@ -466,6 +452,39 @@ mod tests {
                 .state,
             "queued"
         );
+    }
+
+    #[test]
+    fn unavailable_memory_observation_preserves_fifo_admission() {
+        fn assert_admitted(
+            observe_memory: impl FnOnce() -> Result<Option<MemoryObservation>, String>,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pid-identity.db");
+            let mut db = MailboxDb::open(&path).unwrap();
+            enqueue(&mut db, "first", None, 1);
+            enqueue(&mut db, "second", None, 2);
+
+            assert_eq!(
+                drain_one_with(&mut db, config(), observe_memory).unwrap(),
+                DrainOutcome::Admitted
+            );
+            assert_eq!(
+                db.session_admissions().row("first").unwrap().unwrap().state,
+                "admitted"
+            );
+            assert_eq!(
+                db.session_admissions()
+                    .row("second")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "queued"
+            );
+        }
+
+        assert_admitted(|| Ok(None));
+        assert_admitted(|| Err("injected observation failure".to_string()));
     }
 
     #[test]
