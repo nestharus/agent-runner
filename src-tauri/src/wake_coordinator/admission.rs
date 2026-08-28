@@ -302,40 +302,23 @@ fn observe_system_memory() -> Result<Option<MemoryObservation>, String> {
                 meminfo_bytes(&contents, "MemTotal")?,
             )
         });
-    match proc_observation {
-        Ok(observation) => Ok(Some(observation)),
-        Err(proc_error) => observe_linux_sysinfo().map(Some).map_err(|fallback_error| {
-            format!(
-                "Failed to observe system memory pressure ({proc_error}; \
-                     sysinfo fallback failed: {fallback_error})"
-            )
-        }),
-    }
+    Ok(linux_memavailable_or_bounded_fallback(proc_observation))
 }
 
 #[cfg(target_os = "linux")]
-fn observe_linux_sysinfo() -> Result<MemoryObservation, String> {
-    let mut info = std::mem::MaybeUninit::<libc::sysinfo>::zeroed();
-    if unsafe { libc::sysinfo(info.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+fn linux_memavailable_or_bounded_fallback(
+    proc_observation: Result<MemoryObservation, String>,
+) -> Option<MemoryObservation> {
+    match proc_observation {
+        Ok(observation) => Some(observation),
+        Err(error) => {
+            tracing::warn!(
+                maximum_active_launches = DEGRADED_MAX_ACTIVE_LAUNCHES,
+                "Linux MemAvailable observation unavailable; using bounded fallback: {error}"
+            );
+            None
+        }
     }
-    let info = unsafe { info.assume_init() };
-    let unit = u64::from(info.mem_unit);
-    if unit == 0 {
-        return Err("Linux sysinfo returned a zero memory unit".to_string());
-    }
-    let total_bytes = info
-        .totalram
-        .checked_mul(unit)
-        .ok_or_else(|| "Linux sysinfo total memory overflowed".to_string())?;
-    let available_units = info
-        .freeram
-        .checked_add(info.bufferram)
-        .ok_or_else(|| "Linux sysinfo available memory overflowed".to_string())?;
-    let available_bytes = available_units
-        .checked_mul(unit)
-        .ok_or_else(|| "Linux sysinfo available memory overflowed".to_string())?;
-    memory_observation(available_bytes, total_bytes)
 }
 
 #[cfg(target_os = "macos")]
@@ -383,11 +366,28 @@ fn observe_system_memory() -> Result<Option<MemoryObservation>, String> {
             std::io::Error::last_os_error()
         ));
     }
-    let available_pages = u64::from(statistics.active_count)
-        .saturating_add(u64::from(statistics.inactive_count))
-        .saturating_add(u64::from(statistics.free_count));
-    let available_bytes = available_pages.saturating_mul(page_size as u64);
+    let available_bytes = macos_available_memory_bytes(
+        u64::from(statistics.active_count),
+        u64::from(statistics.inactive_count),
+        u64::from(statistics.free_count),
+        page_size as u64,
+    );
     memory_observation(available_bytes, total_bytes).map(Some)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_available_memory_bytes(
+    active_pages: u64,
+    inactive_pages: u64,
+    free_pages: u64,
+    page_size: u64,
+) -> u64 {
+    // XNU's doc/vm/memorystatus_notify.md defines this as active + inactive +
+    // free + speculative; osfmk/kern/host.c reports free_count as free + speculative.
+    active_pages
+        .saturating_add(inactive_pages)
+        .saturating_add(free_pages)
+        .saturating_mul(page_size)
 }
 
 #[cfg(target_os = "windows")]
@@ -490,12 +490,18 @@ mod tests {
         assert!(observation.available_bytes <= observation.total_bytes);
     }
 
+    #[test]
+    fn macos_available_memory_follows_xnu_non_compressed_capacity() {
+        assert_eq!(macos_available_memory_bytes(70, 20, 10, 4096), 409_600);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_sysinfo_fallback_returns_usable_values() {
-        let observation = observe_linux_sysinfo().unwrap();
-        assert!(observation.total_bytes > 0);
-        assert!(observation.available_bytes <= observation.total_bytes);
+    fn invalid_linux_memavailable_uses_bounded_fallback() {
+        assert_eq!(
+            linux_memavailable_or_bounded_fallback(Err("injected procfs failure".to_string())),
+            None
+        );
     }
 
     fn enqueue(db: &mut MailboxDb, identity: &str, session_id: Option<&str>, now: i64) {
