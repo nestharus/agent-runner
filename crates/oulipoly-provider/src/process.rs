@@ -322,6 +322,7 @@ pub struct ProcessCommand {
     program: PathBuf,
     args: Vec<OsString>,
     pinned_executable: Option<Arc<File>>,
+    is_script: bool,
     environment_removals: Vec<OsString>,
 }
 
@@ -331,6 +332,7 @@ impl ProcessCommand {
             program: program.into(),
             args: Vec::new(),
             pinned_executable: None,
+            is_script: false,
             environment_removals: Vec::new(),
         }
     }
@@ -348,6 +350,11 @@ impl ProcessCommand {
 
     pub(crate) fn with_pinned_executable(mut self, executable: Option<Arc<File>>) -> Self {
         self.pinned_executable = executable;
+        self
+    }
+
+    pub(crate) fn with_script(mut self, is_script: bool) -> Self {
+        self.is_script = is_script;
         self
     }
 
@@ -674,6 +681,10 @@ fn configure_provider_process(process: &mut Command, command: &ProcessCommand) {
 fn provider_execution_path(command: &ProcessCommand) -> PathBuf {
     use std::os::fd::AsRawFd;
 
+    // Keep script-visible path semantics while it still names the selected inode.
+    if command.is_script && script_path_still_names_pinned_executable(command) {
+        return command.program.clone();
+    }
     command
         .pinned_executable
         .as_ref()
@@ -684,6 +695,22 @@ fn provider_execution_path(command: &ProcessCommand) -> PathBuf {
 #[cfg(not(unix))]
 fn provider_execution_path(command: &ProcessCommand) -> PathBuf {
     command.program.clone()
+}
+
+#[cfg(unix)]
+fn script_path_still_names_pinned_executable(command: &ProcessCommand) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(executable) = command.pinned_executable.as_ref() else {
+        return false;
+    };
+    let Ok(pinned) = executable.metadata() else {
+        return false;
+    };
+    let Ok(current) = command.program.metadata() else {
+        return false;
+    };
+    pinned.dev() == current.dev() && pinned.ino() == current.ino()
 }
 
 #[cfg(target_os = "linux")]

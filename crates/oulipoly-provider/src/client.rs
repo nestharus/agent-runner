@@ -836,6 +836,7 @@ fn process_command_from_resolved(
     argv.into_iter().fold(
         ProcessCommand::new(program)
             .with_pinned_executable(resolved.pinned_executable())
+            .with_script(resolved.is_script())
             .with_environment_removals(options.environment_removals.clone()),
         |command, arg| command.arg(arg),
     )

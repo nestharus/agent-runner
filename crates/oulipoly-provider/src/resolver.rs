@@ -80,8 +80,8 @@ impl ProviderResolver {
         config_dir: Option<&Path>,
     ) -> Result<ResolvedProviderCommand, ProviderResolveError> {
         match artifact {
-            ProviderArtifactRef::Path { path } => self.resolve_path(path, config_dir),
-            ProviderArtifactRef::Script { path } => self.resolve_path(path, config_dir),
+            ProviderArtifactRef::Path { path } => self.resolve_path(path, config_dir, false),
+            ProviderArtifactRef::Script { path } => self.resolve_path(path, config_dir, true),
             ProviderArtifactRef::Binary { name } => {
                 self.resolve_binary(validate_binary_name(name)?)
             }
@@ -99,9 +99,10 @@ impl ProviderResolver {
         &self,
         path: &Path,
         config_dir: Option<&Path>,
+        is_script: bool,
     ) -> Result<ResolvedProviderCommand, ProviderResolveError> {
         let candidate = map_provider_path_candidate(path, config_dir);
-        ensure_executable(candidate)
+        ensure_executable(candidate, is_script)
     }
 
     fn resolve_binary(
@@ -185,7 +186,7 @@ fn resolve_binary_in_root(
         return Ok(None);
     }
     ensure_candidate_within_root(root, &candidate)?;
-    ensure_executable(candidate).map(Some)
+    ensure_executable(candidate, false).map(Some)
 }
 
 fn map_binary_candidate(root: &Path, name: &str) -> PathBuf {
@@ -214,6 +215,7 @@ fn ensure_candidate_within_root(root: &Path, candidate: &Path) -> Result<(), Pro
 pub struct ResolvedProviderCommand {
     executable: PathBuf,
     pinned_executable: Option<Arc<File>>,
+    is_script: bool,
     uses_shell_wrapper: bool,
 }
 
@@ -222,14 +224,16 @@ impl ResolvedProviderCommand {
         Self {
             executable: executable.into(),
             pinned_executable: None,
+            is_script: false,
             uses_shell_wrapper: false,
         }
     }
 
-    fn pinned(executable: PathBuf, pinned_executable: File) -> Self {
+    fn pinned(executable: PathBuf, pinned_executable: File, is_script: bool) -> Self {
         Self {
             executable,
             pinned_executable: Some(Arc::new(pinned_executable)),
+            is_script,
             uses_shell_wrapper: false,
         }
     }
@@ -252,6 +256,10 @@ impl ResolvedProviderCommand {
     pub(crate) fn pinned_executable(&self) -> Option<Arc<File>> {
         self.pinned_executable.clone()
     }
+
+    pub(crate) fn is_script(&self) -> bool {
+        self.is_script
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,19 +277,26 @@ impl ProviderResolveError {
     }
 }
 
-fn ensure_executable(path: PathBuf) -> Result<ResolvedProviderCommand, ProviderResolveError> {
+fn ensure_executable(
+    path: PathBuf,
+    is_script: bool,
+) -> Result<ResolvedProviderCommand, ProviderResolveError> {
     if !path.exists() {
         return Err(ProviderResolveError::new(HostErrorKind::MissingArtifact));
     }
     if !is_executable(&path) {
         return Err(ProviderResolveError::new(HostErrorKind::NotExecutable));
     }
-    let pinned_executable = open_pinned_executable(&path)?;
-    Ok(ResolvedProviderCommand::pinned(path, pinned_executable))
+    let pinned_executable = open_pinned_executable(&path, is_script)?;
+    Ok(ResolvedProviderCommand::pinned(
+        path,
+        pinned_executable,
+        is_script,
+    ))
 }
 
 #[cfg(windows)]
-fn open_pinned_executable(path: &Path) -> Result<File, ProviderResolveError> {
+fn open_pinned_executable(path: &Path, _is_script: bool) -> Result<File, ProviderResolveError> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_SHARE_READ: u32 = 0x00000001;
@@ -292,8 +307,53 @@ fn open_pinned_executable(path: &Path) -> Result<File, ProviderResolveError> {
         .map_err(|_| ProviderResolveError::new(HostErrorKind::MissingArtifact))
 }
 
-#[cfg(not(windows))]
-fn open_pinned_executable(path: &Path) -> Result<File, ProviderResolveError> {
+#[cfg(unix)]
+fn open_pinned_executable(path: &Path, is_script: bool) -> Result<File, ProviderResolveError> {
+    if is_script {
+        return OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|_| ProviderResolveError::new(HostErrorKind::MissingArtifact));
+    }
+    open_execute_handle(path)
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn open_execute_handle(path: &Path) -> Result<File, ProviderResolveError> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| ProviderResolveError::new(HostErrorKind::MissingArtifact))?;
+    let fd = unsafe { libc::open(path.as_ptr(), execute_open_flags()) };
+    if fd == -1 {
+        Err(ProviderResolveError::new(HostErrorKind::MissingArtifact))
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_open_flags() -> libc::c_int {
+    libc::O_PATH | libc::O_CLOEXEC
+}
+
+#[cfg(target_vendor = "apple")]
+fn execute_open_flags() -> libc::c_int {
+    libc::O_EXEC | libc::O_CLOEXEC
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_vendor = "apple"))))]
+fn open_execute_handle(path: &Path) -> Result<File, ProviderResolveError> {
+    OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|_| ProviderResolveError::new(HostErrorKind::MissingArtifact))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_pinned_executable(path: &Path, _is_script: bool) -> Result<File, ProviderResolveError> {
     OpenOptions::new()
         .read(true)
         .open(path)

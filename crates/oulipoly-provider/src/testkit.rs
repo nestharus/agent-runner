@@ -59,6 +59,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone)]
 pub struct FakeProvider {
     root: PathBuf,
+    binary: PathBuf,
     path: PathBuf,
     marker: PathBuf,
 }
@@ -69,11 +70,15 @@ impl FakeProvider {
         let binary = compile_fake_provider_binary(&root, source.as_ref());
         let marker = marker_path(&root);
         let path = wrapper_path(&root, &binary, &marker);
-        fake_provider_fixture(root, path, marker)
+        fake_provider_fixture(root, binary, path, marker)
     }
 
     pub fn path(&self) -> PathBuf {
         self.path.clone()
+    }
+
+    pub fn native_path(&self) -> PathBuf {
+        self.binary.clone()
     }
 
     pub fn is_executable(&self) -> bool {
@@ -121,8 +126,18 @@ impl FakeProvider {
     }
 }
 
-fn fake_provider_fixture(root: PathBuf, path: PathBuf, marker: PathBuf) -> FakeProvider {
-    FakeProvider { root, path, marker }
+fn fake_provider_fixture(
+    root: PathBuf,
+    binary: PathBuf,
+    path: PathBuf,
+    marker: PathBuf,
+) -> FakeProvider {
+    FakeProvider {
+        root,
+        binary,
+        path,
+        marker,
+    }
 }
 
 fn compile_fake_provider_binary(root: &Path, source: &Path) -> PathBuf {
