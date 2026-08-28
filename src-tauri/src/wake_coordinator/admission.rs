@@ -9,6 +9,7 @@ const DEFAULT_MEMORY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MEMORY_RESERVE_PERCENT: u64 = 10;
 const RESERVATION_STALE_AFTER: Duration = Duration::from_secs(60);
 const WAIT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const MEMORY_OBSERVATION_UNAVAILABLE: &str = "memory_observation_unavailable";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AdmissionCapacityConfig {
@@ -76,6 +77,20 @@ fn enqueue_and_wait_at(
     registration_identity: &str,
     session_id: Option<&str>,
 ) -> Result<SessionAdmissionGuard, String> {
+    enqueue_and_wait_at_with_memory_observer(
+        mailbox_path,
+        registration_identity,
+        session_id,
+        observe_system_memory,
+    )
+}
+
+fn enqueue_and_wait_at_with_memory_observer(
+    mailbox_path: &Path,
+    registration_identity: &str,
+    session_id: Option<&str>,
+    mut observe_memory: impl FnMut() -> Result<Option<MemoryObservation>, String>,
+) -> Result<SessionAdmissionGuard, String> {
     let config = AdmissionCapacityConfig::from_env()?;
     let admission_id = uuid::Uuid::new_v4().to_string();
     let now = unix_time_ms()?;
@@ -83,13 +98,14 @@ fn enqueue_and_wait_at(
         oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
             .ok_or_else(|| "Session admission launcher identity is not live".to_string())?;
     let mut db = MailboxDb::open(mailbox_path)?;
-    db.session_admissions().enqueue(
+    let admission = db.session_admissions().enqueue(
         &admission_id,
         registration_identity,
         session_id,
         &launcher,
         now,
     )?;
+    let admission_id = admission.admission_id;
     drop(db);
 
     let mut reported = None;
@@ -128,8 +144,28 @@ fn enqueue_and_wait_at(
         );
         drop(db);
         if position.is_some() {
-            match drain_one_at_with_config(mailbox_path, config, Some(registration_identity)) {
+            match drain_one_at_with_config_and_observer(
+                mailbox_path,
+                config,
+                Some(registration_identity),
+                &mut observe_memory,
+            ) {
                 Ok(DrainOutcome::Admitted) => continue,
+                Ok(DrainOutcome::ObservationUnavailable) => {
+                    let mut db = MailboxDb::open(mailbox_path)?;
+                    if db.session_admissions().cancel_queued(
+                        registration_identity,
+                        &admission_id,
+                        MEMORY_OBSERVATION_UNAVAILABLE,
+                        unix_time_ms()?,
+                    )? {
+                        return Err(format!(
+                            "Session admission {MEMORY_OBSERVATION_UNAVAILABLE}: provider launch \
+                             requires supported host-memory telemetry"
+                        ));
+                    }
+                    continue;
+                }
                 Ok(_) => {}
                 Err(error) => {
                     report_queued_status(
@@ -155,7 +191,7 @@ fn queued_reason(outcome: DrainOutcome) -> &'static str {
     match outcome {
         DrainOutcome::Admitted | DrainOutcome::Waiting | DrainOutcome::Empty => "fifo_wait",
         DrainOutcome::Pressure => "memory_pressure",
-        DrainOutcome::ObservationUnavailable => "memory_observation_unavailable",
+        DrainOutcome::ObservationUnavailable => MEMORY_OBSERVATION_UNAVAILABLE,
         DrainOutcome::Contended => "drain_contended",
     }
 }
@@ -207,12 +243,26 @@ fn drain_one_at_with_config(
     config: AdmissionCapacityConfig,
     requested_registration_identity: Option<&str>,
 ) -> Result<DrainOutcome, String> {
+    drain_one_at_with_config_and_observer(
+        mailbox_path,
+        config,
+        requested_registration_identity,
+        observe_system_memory,
+    )
+}
+
+fn drain_one_at_with_config_and_observer(
+    mailbox_path: &Path,
+    config: AdmissionCapacityConfig,
+    requested_registration_identity: Option<&str>,
+    observe_memory: impl FnOnce() -> Result<Option<MemoryObservation>, String>,
+) -> Result<DrainOutcome, String> {
     let result = super::sweep::try_with_serialized_drain(mailbox_path, || {
         let mut db = MailboxDb::open(mailbox_path)?;
         drain_with(
             &mut db,
             config,
-            observe_system_memory,
+            observe_memory,
             requested_registration_identity,
         )
     })?;
@@ -560,7 +610,12 @@ mod tests {
         );
     }
 
-    fn enqueue(db: &mut MailboxDb, identity: &str, session_id: Option<&str>, now: i64) {
+    fn enqueue(
+        db: &mut MailboxDb,
+        identity: &str,
+        session_id: Option<&str>,
+        now: i64,
+    ) -> SessionAdmissionRow {
         let launcher =
             oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
                 .unwrap()
@@ -573,7 +628,7 @@ mod tests {
                 &launcher,
                 now,
             )
-            .unwrap();
+            .unwrap()
     }
 
     #[test]
@@ -609,6 +664,43 @@ mod tests {
                 .unwrap(),
             Some(2)
         );
+    }
+
+    #[test]
+    fn unavailable_memory_observation_returns_visible_error_without_stranding_queue() {
+        fn assert_rejected(observe_memory: fn() -> Result<Option<MemoryObservation>, String>) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pid-identity.db");
+
+            let error = enqueue_and_wait_at_with_memory_observer(
+                &path,
+                "unobservable",
+                None,
+                observe_memory,
+            )
+            .err()
+            .expect("missing telemetry must reject the launch");
+            assert!(error.contains(MEMORY_OBSERVATION_UNAVAILABLE));
+            assert!(error.contains("requires supported host-memory telemetry"));
+
+            let mut db = MailboxDb::open(&path).unwrap();
+            let row = db
+                .session_admissions()
+                .row("unobservable")
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "cancelled");
+            assert_eq!(row.queue_reason, MEMORY_OBSERVATION_UNAVAILABLE);
+            assert_eq!(
+                db.session_admissions()
+                    .try_admit_next("claim", i64::MAX, i64::MIN)
+                    .unwrap(),
+                SessionAdmissionAttempt::Empty
+            );
+        }
+
+        assert_rejected(|| Ok(None));
+        assert_rejected(|| Err("injected observation failure".to_string()));
     }
 
     #[test]
@@ -711,6 +803,76 @@ mod tests {
 
         assert_recovery(|| Ok(None));
         assert_recovery(|| Err("injected observation failure".to_string()));
+    }
+
+    #[test]
+    fn unavailable_memory_observation_cancels_only_the_exact_queued_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let first = enqueue(&mut db, "first", None, 1);
+        let second = enqueue(&mut db, "second", None, 2);
+
+        assert_eq!(
+            drain_with(&mut db, default_config(), || Ok(None), Some("first")).unwrap(),
+            DrainOutcome::ObservationUnavailable
+        );
+        assert!(
+            db.session_admissions()
+                .cancel_queued(
+                    "first",
+                    &first.admission_id,
+                    MEMORY_OBSERVATION_UNAVAILABLE,
+                    3,
+                )
+                .unwrap()
+        );
+        let rejected = db.session_admissions().row("first").unwrap().unwrap();
+        assert_eq!(rejected.state, "cancelled");
+        assert_eq!(rejected.queue_reason, MEMORY_OBSERVATION_UNAVAILABLE);
+        assert_eq!(
+            db.session_admissions().queued_position("second").unwrap(),
+            Some(1)
+        );
+
+        assert!(
+            !db.session_admissions()
+                .cancel_queued(
+                    "second",
+                    &first.admission_id,
+                    MEMORY_OBSERVATION_UNAVAILABLE,
+                    4,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            drain_with(
+                &mut db,
+                default_config(),
+                roomy_default_memory,
+                Some("second"),
+            )
+            .unwrap(),
+            DrainOutcome::Admitted
+        );
+        assert!(
+            !db.session_admissions()
+                .cancel_queued(
+                    "second",
+                    &second.admission_id,
+                    MEMORY_OBSERVATION_UNAVAILABLE,
+                    5,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            db.session_admissions()
+                .row("second")
+                .unwrap()
+                .unwrap()
+                .state,
+            "admitted"
+        );
     }
 
     #[test]

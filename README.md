@@ -43,6 +43,13 @@ Output locations:
 
 The raw binary is at `src-tauri/target/release/oulipoly-agent-runner` (or `.exe` on Windows).
 
+Provider launch admission requires host-memory telemetry so the runner can
+preserve its configured or default memory reserve. Linux requires a mounted
+procfs exposing valid `MemTotal` and `MemAvailable` values (Linux 3.14 or newer);
+macOS and Windows use their native memory APIs. If that telemetry is unavailable,
+the launch fails explicitly before provider spawn instead of waiting indefinitely.
+Automatic mailbox work remains pending for its existing bounded-cadence retry.
+
 ### Manual install (Linux/macOS)
 
 ```bash

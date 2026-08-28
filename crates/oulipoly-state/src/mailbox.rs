@@ -3945,6 +3945,29 @@ impl SessionAdmissionRepository<'_> {
             .map_err(|err| format!("Failed to update session admission queue reason: {err}"))
     }
 
+    pub fn cancel_queued(
+        &mut self,
+        registration_identity: &str,
+        admission_id: &str,
+        reason: &str,
+        now_unix_ms: i64,
+    ) -> Result<bool, String> {
+        validate_session_admission_identity(registration_identity, "registration_identity")?;
+        validate_session_admission_identity(admission_id, "admission_id")?;
+        validate_session_admission_identity(reason, "queue_reason")?;
+        self.conn
+            .execute(
+                "UPDATE session_admission_queue
+                 SET state = 'cancelled', queue_reason = ?3, updated_at_unix_ms = ?4
+                 WHERE registration_identity = ?1
+                   AND admission_id = ?2
+                   AND state = 'queued'",
+                params![registration_identity, admission_id, reason, now_unix_ms],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|err| format!("Failed to cancel exact queued session admission: {err}"))
+    }
+
     pub fn try_admit_next(
         &mut self,
         claim_token: &str,
