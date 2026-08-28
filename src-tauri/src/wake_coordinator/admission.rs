@@ -8,7 +8,7 @@ const MIN_AVAILABLE_MEMORY_ENV: &str = "OULIPOLY_SESSION_ADMISSION_MIN_AVAILABLE
 const DEFAULT_MEMORY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MEMORY_RESERVE_PERCENT: u64 = 10;
 // An indefinite provider turn can occupy one slot without removing all launch service.
-const DEGRADED_MAX_ACTIVE_LAUNCHES: i64 = 2;
+const MAX_ACTIVE_LAUNCHES: i64 = 2;
 const RESERVATION_STALE_AFTER: Duration = Duration::from_secs(60);
 const WAIT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -234,21 +234,16 @@ fn drain_one_with(
         Ok(observation) => observation,
         Err(error) => {
             tracing::warn!(
-                maximum_active_launches = DEGRADED_MAX_ACTIVE_LAUNCHES,
+                maximum_active_launches = MAX_ACTIVE_LAUNCHES,
                 "Session admission memory observation unavailable; using bounded fallback: {error}"
             );
             None
         }
     };
-    let maximum_active_launches = match observation {
-        Some(observation) => {
-            if memory_pressure(config, observation) {
-                return Ok(DrainOutcome::Pressure);
-            }
-            None
-        }
-        None => Some(DEGRADED_MAX_ACTIVE_LAUNCHES),
-    };
+    if observation.is_some_and(|observation| memory_pressure(config, observation)) {
+        return Ok(DrainOutcome::Pressure);
+    }
+    let maximum_active_launches = Some(MAX_ACTIVE_LAUNCHES);
     let now = unix_time_ms()?;
     let stale_before =
         now.saturating_sub(i64::try_from(RESERVATION_STALE_AFTER.as_millis()).unwrap_or(i64::MAX));
@@ -321,7 +316,7 @@ fn linux_memavailable_or_bounded_fallback(
         Ok(observation) => Some(observation),
         Err(error) => {
             tracing::warn!(
-                maximum_active_launches = DEGRADED_MAX_ACTIVE_LAUNCHES,
+                maximum_active_launches = MAX_ACTIVE_LAUNCHES,
                 "Linux MemAvailable observation unavailable; using bounded fallback: {error}"
             );
             None
@@ -699,6 +694,45 @@ mod tests {
 
         assert_bounded(|| Ok(None));
         assert_bounded(|| Err("injected observation failure".to_string()));
+    }
+
+    #[test]
+    fn observed_memory_counts_outstanding_reservations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        enqueue(&mut db, "first", None, 1);
+        enqueue(&mut db, "second", None, 2);
+        enqueue(&mut db, "third", None, 3);
+
+        assert_eq!(
+            drain_one_with(&mut db, config(), roomy_memory).unwrap(),
+            DrainOutcome::Admitted
+        );
+        assert_eq!(
+            drain_one_with(&mut db, config(), roomy_memory).unwrap(),
+            DrainOutcome::Admitted
+        );
+        assert_eq!(
+            drain_one_with(&mut db, config(), roomy_memory).unwrap(),
+            DrainOutcome::Pressure
+        );
+        assert_eq!(
+            db.session_admissions().row("first").unwrap().unwrap().state,
+            "admitted"
+        );
+        assert_eq!(
+            db.session_admissions()
+                .row("second")
+                .unwrap()
+                .unwrap()
+                .state,
+            "admitted"
+        );
+        assert_eq!(
+            db.session_admissions().row("third").unwrap().unwrap().state,
+            "queued"
+        );
     }
 
     #[test]
