@@ -4255,7 +4255,7 @@ impl WakeSessionRepository<'_> {
         stale_after_seconds: i64,
         limit: usize,
     ) -> Result<Vec<WakeSweepCandidate>, String> {
-        let session_ids = self.pending_wake_session_ids(limit)?;
+        let session_ids = self.pending_wake_session_ids_for_sweep(limit)?;
         self.wake_sweep_candidates_for_sessions(stale_after_seconds, limit, session_ids)
     }
 
@@ -4488,6 +4488,29 @@ impl MailboxDb {
 }
 
 impl WakeSessionRepository<'_> {
+    fn pending_wake_session_ids_for_sweep(&self, limit: usize) -> Result<Vec<String>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rotating_limit = limit.saturating_sub(limit / 2);
+        let newest_limit = limit.saturating_sub(rotating_limit);
+        let cursor = self.wake_sweep_cursor()?;
+        let mut rotating = self.pending_wake_sessions_in_seq_range(cursor, None, rotating_limit)?;
+        if cursor.is_some() && rotating.len() < rotating_limit {
+            let remaining = rotating_limit.saturating_sub(rotating.len());
+            rotating.extend(self.pending_wake_sessions_in_seq_range(None, cursor, remaining)?);
+        }
+        if let Some((_, next_cursor)) = rotating.last() {
+            self.set_wake_sweep_cursor(*next_cursor)?;
+        }
+        let rotating = rotating
+            .into_iter()
+            .map(|(session_id, _)| session_id)
+            .collect();
+        let newest = self.newest_pending_wake_session_ids(newest_limit)?;
+        Ok(merge_pending_wake_session_ids(limit, rotating, newest))
+    }
+
     fn pending_wake_session_ids(&self, limit: usize) -> Result<Vec<String>, String> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -4524,6 +4547,58 @@ impl WakeSessionRepository<'_> {
             .map_err(|err| format!("Failed to query pending wake sessions: {err}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|err| format!("Failed to read pending wake session row: {err}"))
+    }
+
+    fn pending_wake_sessions_in_seq_range(
+        &self,
+        after_seq: Option<i64>,
+        through_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<(String, i64)>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(pending_wake_sessions_in_seq_range_query())
+            .map_err(|err| format!("Failed to prepare rotating wake session query: {err}"))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    limit as i64,
+                    WAKE_SWEEP_ABANDONED_ERROR,
+                    after_seq,
+                    through_seq
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|err| format!("Failed to query rotating wake sessions: {err}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("Failed to read rotating wake session row: {err}"))
+    }
+
+    fn wake_sweep_cursor(&self) -> Result<Option<i64>, String> {
+        self.conn
+            .query_row(
+                "SELECT after_pending_seq FROM wake_sweep_progress WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| format!("Failed to read wake sweep cursor: {err}"))
+    }
+
+    fn set_wake_sweep_cursor(&self, after_pending_seq: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO wake_sweep_progress (singleton, after_pending_seq)
+                 VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET
+                    after_pending_seq = excluded.after_pending_seq",
+                params![after_pending_seq],
+            )
+            .map(|_| ())
+            .map_err(|err| format!("Failed to advance wake sweep cursor: {err}"))
     }
 
     fn pending_seq_bounds(&self, session_id: &str) -> Result<Option<(i64, i64)>, String> {
@@ -5191,6 +5266,18 @@ fn pending_wake_session_ids_by_oldest_seq_query(direction: &str) -> String {
                   ORDER BY MIN(seq) {direction}
                   LIMIT ?1",
     )
+}
+
+fn pending_wake_sessions_in_seq_range_query() -> &'static str {
+    "SELECT session_id, MIN(seq) AS oldest_seq
+     FROM mailbox
+     WHERE delivered_at IS NULL
+       AND (delivery_error IS NULL OR delivery_error != ?2)
+     GROUP BY session_id
+     HAVING (?3 IS NULL OR oldest_seq > ?3)
+        AND (?4 IS NULL OR oldest_seq <= ?4)
+     ORDER BY oldest_seq ASC
+     LIMIT ?1"
 }
 
 fn wake_sweep_candidate(
@@ -8509,6 +8596,11 @@ fn mailbox_schema_definition() -> &'static str {
             updated_at                   TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS wake_sweep_progress (
+            singleton                     INTEGER PRIMARY KEY CHECK(singleton = 1),
+            after_pending_seq             INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS runtime_generation (
             generation_uuid                    TEXT PRIMARY KEY,
             lifecycle_state                   TEXT NOT NULL CHECK(lifecycle_state IN ('starting', 'running', 'draining', 'exited')),
@@ -8644,6 +8736,13 @@ fn mailbox_schema_definition() -> &'static str {
 
         CREATE INDEX IF NOT EXISTS idx_session_wake_claim_claimed_at
             ON session_wake_claim(claimed_at);"
+}
+
+pub(super) fn wake_sweep_progress_schema_definition() -> &'static str {
+    "CREATE TABLE IF NOT EXISTS wake_sweep_progress (
+        singleton         INTEGER PRIMARY KEY CHECK(singleton = 1),
+        after_pending_seq INTEGER NOT NULL
+     );"
 }
 
 pub(super) fn session_admission_schema_definition() -> &'static str {

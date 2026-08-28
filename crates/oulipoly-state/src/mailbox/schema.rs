@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 7;
+pub(super) const CURRENT_VERSION: i64 = 8;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -82,6 +82,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 7,
         owner: SidecarEntity::SessionAdmission,
         apply: ensure_session_admission_launcher_identity_schema,
+    },
+    MigrationStep {
+        target_version: 8,
+        owner: SidecarEntity::WakeAndSessionMetadata,
+        apply: ensure_wake_sweep_progress_schema,
     },
 ];
 
@@ -252,6 +257,11 @@ fn ensure_wake_and_session_metadata_schema(conn: &Connection) -> Result<(), Stri
 
 fn ensure_wake_process_identity_schema(conn: &Connection) -> Result<(), String> {
     super::ensure_wake_claim_process_identity_columns(conn)
+}
+
+fn ensure_wake_sweep_progress_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(super::wake_sweep_progress_schema_definition())
+        .map_err(|err| format!("Failed to ensure wake sweep progress schema: {err}"))
 }
 
 fn ensure_runtime_creator_identity_schema(conn: &Connection) -> Result<(), String> {

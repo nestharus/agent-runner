@@ -149,3 +149,46 @@ pub(crate) fn wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_deb
     }
     assert_xdg_isolated(&fixture);
 }
+
+pub(crate) fn wake_sweep_eventually_reaches_startable_session_between_paused_edges() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "", "middle-session.txt"));
+
+    seed_paused_sessions(&fixture, "old", 0..128);
+
+    let middle_session = "11111111-1111-4111-8111-000000000129";
+    fixture.seed_resumable_backlog_session(
+        "22222222-2222-4222-8222-000000000129",
+        middle_session,
+        "turn-middle-session",
+        "h-middle-session",
+        "eeee0000-0000-4000-8000-000000000129",
+        None,
+    );
+
+    seed_paused_sessions(&fixture, "new", 130..258);
+
+    for _ in 0..3 {
+        let output = fixture.run_mailbox_list(middle_session);
+        assert_success(&output);
+    }
+
+    let prompt = wait_for_file(&fixture.prompt_file("middle-session.txt"));
+    assert_prompt_contains_handle(&prompt, "h-middle-session");
+    wait_until("middle backlog session delivered", || {
+        delivered_rows_without_pending_or_claim(&fixture, middle_session, 1)
+    });
+    assert_xdg_isolated(&fixture);
+}
+
+fn seed_paused_sessions(fixture: &Fixture, cohort: &str, indexes: std::ops::Range<usize>) {
+    for index in indexes {
+        let session_id = format!("33333333-3333-4333-8333-{index:012}");
+        fixture.seed_mailbox_for(&session_id, &format!("h-{cohort}-paused-{index}"), None);
+        fixture
+            .mailbox()
+            .set_notifications_paused(&session_id, true)
+            .unwrap();
+    }
+}

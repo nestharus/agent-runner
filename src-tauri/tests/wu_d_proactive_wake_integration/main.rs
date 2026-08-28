@@ -135,3 +135,8 @@ fn wake_sweep_retries_twice_unconfirmed_oldest_with_newer_mailbox() {
 fn wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_debris() {
     cases_wake_backlog::wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_debris();
 }
+
+#[test]
+fn wake_sweep_eventually_reaches_startable_session_between_paused_edges() {
+    cases_wake_backlog::wake_sweep_eventually_reaches_startable_session_between_paused_edges();
+}
