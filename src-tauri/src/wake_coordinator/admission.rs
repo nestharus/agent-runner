@@ -127,7 +127,7 @@ fn enqueue_and_wait_at(
             &mut reported,
         );
         drop(db);
-        if position == Some(1) {
+        if position.is_some() {
             let outcome = match drain_one_at_with_config(mailbox_path, config) {
                 Ok(DrainOutcome::Admitted) => continue,
                 Ok(outcome) => outcome,
@@ -468,7 +468,7 @@ mod tests {
         AttachRuntimeGenerationSession, CreateRuntimeGeneration, ExitRuntimeGenerationNonOrderly,
         RuntimeGenerationFence, RuntimeGenerationId, RuntimeTerminalReason,
     };
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, mpsc};
 
     fn config() -> AdmissionCapacityConfig {
         AdmissionCapacityConfig {
@@ -901,6 +901,45 @@ mod tests {
             db.session_admissions().row("live").unwrap().unwrap().state,
             "admitted"
         );
+    }
+
+    #[test]
+    fn queued_successor_reconciles_dead_fifo_head_without_independent_drainer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let dead = oulipoly_state::pid_identity::ProcessIdentity {
+            os_pid: i64::MAX,
+            os_boot_id: "dead-boot".to_string(),
+            os_pid_starttime_ticks: 1,
+        };
+        db.session_admissions()
+            .enqueue("dead-admission", "dead", None, &dead, 1)
+            .unwrap();
+        drop(db);
+
+        let (sender, receiver) = mpsc::channel();
+        let waiter_path = path.clone();
+        std::thread::spawn(move || {
+            sender
+                .send(enqueue_and_wait_at(&waiter_path, "live", None))
+                .unwrap();
+        });
+        let guard = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("live successor did not reconcile the dead FIFO head")
+            .unwrap();
+
+        let mut db = MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            db.session_admissions().row("dead").unwrap().unwrap().state,
+            "cancelled"
+        );
+        assert_eq!(
+            db.session_admissions().row("live").unwrap().unwrap().state,
+            "launching"
+        );
+        drop(guard);
     }
 
     #[test]
