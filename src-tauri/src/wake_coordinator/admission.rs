@@ -76,6 +76,7 @@ fn enqueue_and_wait_at(
     registration_identity: &str,
     session_id: Option<&str>,
 ) -> Result<SessionAdmissionGuard, String> {
+    let config = AdmissionCapacityConfig::from_env()?;
     let admission_id = uuid::Uuid::new_v4().to_string();
     let now = unix_time_ms()?;
     let launcher =
@@ -127,7 +128,7 @@ fn enqueue_and_wait_at(
         );
         drop(db);
         if position == Some(1) {
-            let outcome = match drain_one_at(mailbox_path) {
+            let outcome = match drain_one_at_with_config(mailbox_path, config) {
                 Ok(DrainOutcome::Admitted) => continue,
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -204,6 +205,13 @@ fn admitted_claim_token(row: &SessionAdmissionRow) -> Option<&str> {
 
 fn drain_one_at(mailbox_path: &Path) -> Result<DrainOutcome, String> {
     let config = AdmissionCapacityConfig::from_env()?;
+    drain_one_at_with_config(mailbox_path, config)
+}
+
+fn drain_one_at_with_config(
+    mailbox_path: &Path,
+    config: AdmissionCapacityConfig,
+) -> Result<DrainOutcome, String> {
     let result = super::sweep::try_with_serialized_drain(mailbox_path, || {
         let mut db = MailboxDb::open(mailbox_path)?;
         drain_one_with(&mut db, config, observe_system_memory)

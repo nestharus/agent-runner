@@ -216,6 +216,89 @@ fn pressure_keeps_initial_request_alive_and_visibly_queued() {
     assert_eq!(states, ["cancelled", "settled"]);
 }
 
+#[test]
+fn invalid_admission_config_does_not_publish_a_fifo_owner() {
+    let fixture = Fixture::new();
+    let app_config = fixture.config_home.join("oulipoly-agent-runner");
+    let launched = fixture.directory.path().join("provider-launched");
+    let provider = fixture.directory.path().join("valid-successor-provider.sh");
+    write_executable(
+        &provider,
+        &format!(
+            "printf launched > {}\n",
+            toml_string(&launched.display().to_string())
+        ),
+    );
+    fs::write(
+        fixture.models_dir.join("admission-model.toml"),
+        "[[providers]]\nname = \"admission-provider\"\nargs = []\n",
+    )
+    .unwrap();
+    fs::write(
+        app_config.join("providers.toml"),
+        format!(
+            "[admission-provider]\ncommand = {}\nargs = []\nprompt_mode = \"arg\"\n",
+            toml_string(&provider.display().to_string())
+        ),
+    )
+    .unwrap();
+
+    let invalid = fixture
+        .runner_command()
+        .env(
+            "OULIPOLY_SESSION_ADMISSION_MIN_AVAILABLE_MEMORY_BYTES",
+            "not-a-byte-count",
+        )
+        .arg("--models-dir")
+        .arg(&fixture.models_dir)
+        .arg("--model")
+        .arg("admission-model")
+        .arg("invalid admission config")
+        .output()
+        .unwrap();
+
+    assert!(!invalid.status.success(), "{invalid:?}");
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr).contains(
+            "OULIPOLY_SESSION_ADMISSION_MIN_AVAILABLE_MEMORY_BYTES must be a positive byte count"
+        ),
+        "{invalid:?}"
+    );
+    let sidecar = fixture.sidecar();
+    let connection = Connection::open(&sidecar).unwrap();
+    let queue_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'session_admission_queue'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let queue_rows = if queue_tables == 0 {
+        0
+    } else {
+        connection
+            .query_row("SELECT COUNT(*) FROM session_admission_queue", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(queue_rows, 0);
+
+    let successor = fixture
+        .runner_command()
+        .env_remove("OULIPOLY_SESSION_ADMISSION_MIN_AVAILABLE_MEMORY_BYTES")
+        .arg("--models-dir")
+        .arg(&fixture.models_dir)
+        .arg("--model")
+        .arg("admission-model")
+        .arg("valid successor")
+        .output()
+        .unwrap();
+    assert!(successor.status.success(), "{successor:?}");
+    assert!(launched.exists(), "valid successor did not reach provider");
+}
+
 fn write_executable(path: &Path, body: &str) {
     fs::write(
         path,
