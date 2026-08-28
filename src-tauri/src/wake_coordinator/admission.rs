@@ -7,7 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const MIN_AVAILABLE_MEMORY_ENV: &str = "OULIPOLY_SESSION_ADMISSION_MIN_AVAILABLE_MEMORY_BYTES";
 const DEFAULT_MEMORY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MEMORY_RESERVE_PERCENT: u64 = 10;
-const DEGRADED_MAX_ACTIVE_LAUNCHES: i64 = 1;
+// An indefinite provider turn can occupy one slot without removing all launch service.
+const DEGRADED_MAX_ACTIVE_LAUNCHES: i64 = 2;
 const RESERVATION_STALE_AFTER: Duration = Duration::from_secs(60);
 const WAIT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -224,7 +225,10 @@ fn drain_one_with(
     let observation = match observe_memory() {
         Ok(observation) => observation,
         Err(error) => {
-            tracing::warn!("Session admission memory observation unavailable: {error}");
+            tracing::warn!(
+                maximum_active_launches = DEGRADED_MAX_ACTIVE_LAUNCHES,
+                "Session admission memory observation unavailable; using bounded fallback: {error}"
+            );
             None
         }
     };
@@ -234,9 +238,6 @@ fn drain_one_with(
                 return Ok(DrainOutcome::Pressure);
             }
             None
-        }
-        None if config.minimum_available_memory_bytes.is_some() => {
-            return Ok(DrainOutcome::Pressure);
         }
         None => Some(DEGRADED_MAX_ACTIVE_LAUNCHES),
     };
@@ -293,19 +294,138 @@ fn memory_pressure(config: AdmissionCapacityConfig, observation: MemoryObservati
 
 #[cfg(target_os = "linux")]
 fn observe_system_memory() -> Result<Option<MemoryObservation>, String> {
-    let contents = std::fs::read_to_string("/proc/meminfo")
-        .map_err(|error| format!("Failed to observe system memory pressure: {error}"))?;
-    let available_bytes = meminfo_bytes(&contents, "MemAvailable")?;
-    let total_bytes = meminfo_bytes(&contents, "MemTotal")?;
-    Ok(Some(MemoryObservation {
-        available_bytes,
-        total_bytes,
-    }))
+    let proc_observation = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|error| format!("Failed to read /proc/meminfo: {error}"))
+        .and_then(|contents| {
+            memory_observation(
+                meminfo_bytes(&contents, "MemAvailable")?,
+                meminfo_bytes(&contents, "MemTotal")?,
+            )
+        });
+    match proc_observation {
+        Ok(observation) => Ok(Some(observation)),
+        Err(proc_error) => observe_linux_sysinfo().map(Some).map_err(|fallback_error| {
+            format!(
+                "Failed to observe system memory pressure ({proc_error}; \
+                     sysinfo fallback failed: {fallback_error})"
+            )
+        }),
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "linux")]
+fn observe_linux_sysinfo() -> Result<MemoryObservation, String> {
+    let mut info = std::mem::MaybeUninit::<libc::sysinfo>::zeroed();
+    if unsafe { libc::sysinfo(info.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let info = unsafe { info.assume_init() };
+    let unit = u64::from(info.mem_unit);
+    if unit == 0 {
+        return Err("Linux sysinfo returned a zero memory unit".to_string());
+    }
+    let total_bytes = info
+        .totalram
+        .checked_mul(unit)
+        .ok_or_else(|| "Linux sysinfo total memory overflowed".to_string())?;
+    let available_units = info
+        .freeram
+        .checked_add(info.bufferram)
+        .ok_or_else(|| "Linux sysinfo available memory overflowed".to_string())?;
+    let available_bytes = available_units
+        .checked_mul(unit)
+        .ok_or_else(|| "Linux sysinfo available memory overflowed".to_string())?;
+    memory_observation(available_bytes, total_bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn observe_system_memory() -> Result<Option<MemoryObservation>, String> {
+    let mut total_bytes = 0_u64;
+    let mut total_size = std::mem::size_of::<u64>();
+    let mut total_mib = [libc::CTL_HW, libc::HW_MEMSIZE];
+    if unsafe {
+        libc::sysctl(
+            total_mib.as_mut_ptr(),
+            total_mib.len() as _,
+            (&mut total_bytes as *mut u64).cast(),
+            &mut total_size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "Failed to observe macOS total memory: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    static HOST_PORT: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+    #[allow(deprecated)]
+    let host = *HOST_PORT.get_or_init(|| unsafe { libc::mach_host_self() });
+    let mut statistics = unsafe { std::mem::zeroed::<libc::vm_statistics64>() };
+    let mut statistics_count = libc::HOST_VM_INFO64_COUNT;
+    if unsafe {
+        libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            (&mut statistics as *mut libc::vm_statistics64).cast(),
+            &mut statistics_count,
+        )
+    } != libc::KERN_SUCCESS
+    {
+        return Err("Failed to observe macOS available memory".to_string());
+    }
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return Err(format!(
+            "Failed to observe macOS memory page size: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let available_pages = u64::from(statistics.active_count)
+        .saturating_add(u64::from(statistics.inactive_count))
+        .saturating_add(u64::from(statistics.free_count));
+    let available_bytes = available_pages.saturating_mul(page_size as u64);
+    memory_observation(available_bytes, total_bytes).map(Some)
+}
+
+#[cfg(target_os = "windows")]
+fn observe_system_memory() -> Result<Option<MemoryObservation>, String> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..MEMORYSTATUSEX::default()
+    };
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return Err(format!(
+            "Failed to observe Windows system memory: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    memory_observation(status.ullAvailPhys, status.ullTotalPhys).map(Some)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn observe_system_memory() -> Result<Option<MemoryObservation>, String> {
     Ok(None)
+}
+
+fn memory_observation(available_bytes: u64, total_bytes: u64) -> Result<MemoryObservation, String> {
+    if total_bytes == 0 {
+        return Err("System memory observation reported zero total memory".to_string());
+    }
+    if available_bytes > total_bytes {
+        return Err(format!(
+            "System memory observation reported {available_bytes} available bytes but only \
+             {total_bytes} total bytes"
+        ));
+    }
+    Ok(MemoryObservation {
+        available_bytes,
+        total_bytes,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -359,6 +479,23 @@ mod tests {
             available_bytes: 1_000,
             total_bytes: 2_000,
         }))
+    }
+
+    #[test]
+    fn supported_platform_memory_observer_returns_usable_values() {
+        let observation = observe_system_memory()
+            .unwrap()
+            .expect("supported platforms must provide memory observation");
+        assert!(observation.total_bytes > 0);
+        assert!(observation.available_bytes <= observation.total_bytes);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_sysinfo_fallback_returns_usable_values() {
+        let observation = observe_linux_sysinfo().unwrap();
+        assert!(observation.total_bytes > 0);
+        assert!(observation.available_bytes <= observation.total_bytes);
     }
 
     fn enqueue(db: &mut MailboxDb, identity: &str, session_id: Option<&str>, now: i64) {
@@ -507,31 +644,51 @@ mod tests {
     }
 
     #[test]
-    fn configured_minimum_requires_memory_observation() {
-        fn assert_queued(
-            observe_memory: impl FnOnce() -> Result<Option<MemoryObservation>, String>,
-        ) {
+    fn configured_minimum_uses_bounded_fallback_without_removing_service() {
+        fn assert_bounded(observe_memory: fn() -> Result<Option<MemoryObservation>, String>) {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("pid-identity.db");
             let mut db = MailboxDb::open(&path).unwrap();
             enqueue(&mut db, "first", None, 1);
+            enqueue(&mut db, "second", None, 2);
+            enqueue(&mut db, "third", None, 3);
 
+            assert_eq!(
+                drain_one_with(&mut db, config(), observe_memory).unwrap(),
+                DrainOutcome::Admitted
+            );
+            let first = db.session_admissions().row("first").unwrap().unwrap();
+            assert!(
+                db.session_admissions()
+                    .begin_launch("first", first.claim_token.as_deref().unwrap(), 4)
+                    .unwrap()
+            );
+            assert_eq!(
+                drain_one_with(&mut db, config(), observe_memory).unwrap(),
+                DrainOutcome::Admitted
+            );
+            let second = db.session_admissions().row("second").unwrap().unwrap();
+            assert!(
+                db.session_admissions()
+                    .begin_launch("second", second.claim_token.as_deref().unwrap(), 5)
+                    .unwrap()
+            );
             assert_eq!(
                 drain_one_with(&mut db, config(), observe_memory).unwrap(),
                 DrainOutcome::Pressure
             );
             assert_eq!(
-                db.session_admissions().row("first").unwrap().unwrap().state,
+                db.session_admissions().row("third").unwrap().unwrap().state,
                 "queued"
             );
         }
 
-        assert_queued(|| Ok(None));
-        assert_queued(|| Err("injected observation failure".to_string()));
+        assert_bounded(|| Ok(None));
+        assert_bounded(|| Err("injected observation failure".to_string()));
     }
 
     #[test]
-    fn unavailable_memory_observation_limits_active_launches() {
+    fn unavailable_memory_observation_allows_unrelated_launch_with_finite_bound() {
         fn assert_bounded(observe_memory: fn() -> Result<Option<MemoryObservation>, String>) {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("pid-identity.db");
@@ -553,33 +710,17 @@ mod tests {
 
             assert_eq!(
                 drain_one_with(&mut db, default_config(), observe_memory).unwrap(),
-                DrainOutcome::Pressure
-            );
-            for identity in ["second", "third"] {
-                assert_eq!(
-                    db.session_admissions()
-                        .row(identity)
-                        .unwrap()
-                        .unwrap()
-                        .state,
-                    "queued"
-                );
-            }
-
-            db.session_admissions()
-                .settle("first", first.claim_token.as_deref().unwrap())
-                .unwrap();
-            assert_eq!(
-                drain_one_with(&mut db, default_config(), observe_memory).unwrap(),
                 DrainOutcome::Admitted
             );
-            assert_eq!(
+            let second = db.session_admissions().row("second").unwrap().unwrap();
+            assert!(
                 db.session_admissions()
-                    .row("second")
+                    .begin_launch("second", second.claim_token.as_deref().unwrap(), 5)
                     .unwrap()
-                    .unwrap()
-                    .state,
-                "admitted"
+            );
+            assert_eq!(
+                drain_one_with(&mut db, default_config(), observe_memory).unwrap(),
+                DrainOutcome::Pressure
             );
             assert_eq!(
                 db.session_admissions().row("third").unwrap().unwrap().state,
