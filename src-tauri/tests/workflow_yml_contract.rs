@@ -191,6 +191,20 @@ fn step_by_name<'a>(
     matching[0]
 }
 
+fn assert_checkout_fetches_full_history(workflow: &Value, workflow_name: &str, job_name: &str) {
+    let checkout = step_by_uses(workflow, workflow_name, job_name, "actions/checkout@v4");
+    assert_eq!(
+        value_at(
+            checkout,
+            &format!("{workflow_name} jobs.{job_name}.steps[checkout]"),
+            &["with", "fetch-depth"],
+        )
+        .as_i64(),
+        Some(0),
+        "{workflow_name} {job_name} must fetch full history for history-dependent source guards"
+    );
+}
+
 fn assert_agent_bash_install_precedes_test(
     workflow: &Value,
     workflow_name: &str,
@@ -1073,6 +1087,18 @@ fn assertion_a04_integration_workspace_commands() {
             "cargo clippy --workspace -- -D warnings",
         );
     }
+}
+
+#[test]
+fn history_dependent_source_guards_have_full_history_in_recurring_workflows() {
+    for (workflow_name, workflow) in workflow_pairs() {
+        for job_name in ["rust-client-check", "rust-integration"] {
+            assert_checkout_fetches_full_history(&workflow, workflow_name, job_name);
+        }
+    }
+
+    let coverage = parse_workflow("../../.github/workflows/coverage.yml");
+    assert_checkout_fetches_full_history(&coverage, "coverage.yml", "rust-coverage");
 }
 
 #[test]
