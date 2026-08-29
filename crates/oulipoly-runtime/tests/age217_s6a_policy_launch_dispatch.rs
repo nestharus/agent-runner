@@ -512,6 +512,20 @@ fn enable_terminal_capability(fixture: &ExternalFixture) {
     write_executable(&fixture.provider_path, &body);
 }
 
+fn enable_prompt_acceptance_capability(fixture: &ExternalFixture) {
+    let body = fs::read_to_string(&fixture.provider_path).expect("provider source");
+    let body = body.replacen(
+        "\"launch\": CAP_LAUNCH,",
+        "\"launch\": CAP_LAUNCH,\n            \"prompt_acceptance_v1\": True,",
+        1,
+    );
+    assert_ne!(
+        body,
+        fs::read_to_string(&fixture.provider_path).expect("provider source")
+    );
+    write_executable(&fixture.provider_path, &body);
+}
+
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
@@ -2318,6 +2332,42 @@ fn external_provider_enabled_binary_and_script_refs_dispatch_without_legacy_fall
         );
         assert!(!fixture.legacy_record_path.exists());
     }
+}
+
+#[test]
+fn script_ref_does_not_receive_prompt_acceptance_authority() {
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    enable_prompt_acceptance_capability(&fixture);
+    let model = external_model_with_ref(&fixture, provider_ref_script(&fixture.provider_path));
+    let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
+
+    let result = execute_dispatch_aware_result(
+        registry,
+        ExecutorServiceRequest::Facade {
+            model,
+            provider_index: 0,
+            prompt: "prompt-value".to_string(),
+            working_dir: None,
+            models_dir: None,
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: None,
+        },
+    )
+    .expect("script provider should remain dispatchable");
+
+    assert_eq!(result.exit_code, 0);
+    assert!(
+        read_json(&fixture.launch_record_path)["params"]["prompt_acceptance"].is_null(),
+        "a script path cannot receive prompt-acceptance authority because its executable identity is not pinned through exec"
+    );
+    assert!(!fixture.legacy_record_path.exists());
 }
 
 #[test]

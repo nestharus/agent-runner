@@ -142,7 +142,10 @@ fn attempt_account_dispatch(
         .map_err(|error| terminal_attempt_error(map_registry_error(error)))?;
     gate_required_capabilities(&describe)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
-    let provider_supports_prompt_acceptance_v1 = describe.capabilities.prompt_acceptance_v1;
+    // Script path semantics require pathname re-resolution, so their executable
+    // identity cannot remain pinned through exec.
+    let provider_supports_prompt_acceptance_v1 = describe.capabilities.prompt_acceptance_v1
+        && !matches!(artifact, ProviderArtifactRef::Script { .. });
     let candidate = build_launch_candidate(context)
         .map_err(|message| terminal_attempt_error(invalid_provider_input_error(message)))?;
     let policy_request = build_policy_request(context, &candidate, registry.host_options())
