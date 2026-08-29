@@ -43,6 +43,7 @@ pub(crate) struct SessionAdmissionGuard {
     mailbox_path: PathBuf,
     registration_identity: String,
     claim_token: String,
+    run_post_settlement_sweep: bool,
 }
 
 impl Drop for SessionAdmissionGuard {
@@ -61,7 +62,9 @@ impl Drop for SessionAdmissionGuard {
         if let Err(error) = drain_one_at(&self.mailbox_path) {
             tracing::warn!("Failed to drain session admission queue after settlement: {error}");
         }
-        super::sweep::run_post_settlement_wake_reclaim_sweep();
+        if self.run_post_settlement_sweep {
+            super::sweep::run_post_settlement_wake_reclaim_sweep();
+        }
     }
 }
 
@@ -70,9 +73,16 @@ pub(super) fn enqueue_and_wait(
     session_id: Option<&str>,
 ) -> Result<SessionAdmissionGuard, String> {
     let mailbox_path = MailboxDb::default_path()?;
-    enqueue_and_wait_at(&mailbox_path, registration_identity, session_id)
+    enqueue_and_wait_at_with_memory_observer(
+        &mailbox_path,
+        registration_identity,
+        session_id,
+        observe_system_memory,
+        true,
+    )
 }
 
+#[cfg(test)]
 fn enqueue_and_wait_at(
     mailbox_path: &Path,
     registration_identity: &str,
@@ -83,6 +93,7 @@ fn enqueue_and_wait_at(
         registration_identity,
         session_id,
         observe_system_memory,
+        false,
     )
 }
 
@@ -91,6 +102,7 @@ fn enqueue_and_wait_at_with_memory_observer(
     registration_identity: &str,
     session_id: Option<&str>,
     mut observe_memory: impl FnMut() -> Result<Option<MemoryObservation>, String>,
+    run_post_settlement_sweep: bool,
 ) -> Result<SessionAdmissionGuard, String> {
     let config = AdmissionCapacityConfig::from_env()?;
     let admission_id = uuid::Uuid::new_v4().to_string();
@@ -130,6 +142,7 @@ fn enqueue_and_wait_at_with_memory_observer(
                 mailbox_path: mailbox_path.to_path_buf(),
                 registration_identity: registration_identity.to_string(),
                 claim_token: claim_token.to_string(),
+                run_post_settlement_sweep,
             });
         }
         let queued = row.state == "queued";
@@ -669,6 +682,7 @@ mod tests {
                 "unobservable",
                 None,
                 observe_memory,
+                false,
             )
             .err()
             .expect("missing telemetry must reject the launch");
