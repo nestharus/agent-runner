@@ -309,6 +309,18 @@ turn_script = {}
             .unwrap()
     }
 
+    fn recorded_resume_prompts(&self) -> Vec<String> {
+        let path = self.work_dir.join("resume-prompts.jsonl");
+        if !path.exists() {
+            return Vec::new();
+        }
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
     fn assert_xdg_isolated(&self) {
         assert!(
             !self
@@ -596,6 +608,101 @@ fn trusted_prompt_acceptance_settles_mailbox_delivery_when_final_exit_is_missing
         &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
     ));
     assert_eq!(fixture.mailbox_row(notification.seq).delivery_attempts, 1);
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn trusted_prompt_acceptance_survives_mailbox_projection_failure_without_replay() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let connection = Connection::open(fixture.sidecar_path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_accepted_mailbox_projection
+             BEFORE UPDATE OF delivered_at ON mailbox
+             WHEN NEW.delivered_at IS NOT NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced accepted mailbox projection failure');
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let first = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_EXIT_NONZERO", "1"),
+        ],
+    );
+    let first_result = result_envelope(&first);
+    let first_invocation_uuid = first_result["id"].as_str().unwrap();
+    assert_eq!(
+        first_result["terminal_reason"],
+        "resume_prompt_accepted_provider_failed"
+    );
+    let pending = fixture.mailbox_row(notification.seq);
+    assert!(pending.delivered_at.is_none(), "{pending:?}");
+    let durable = Connection::open(fixture.state_path())
+        .unwrap()
+        .query_row(
+            "SELECT status, exit_code, terminal_reason,
+                    EXISTS(
+                        SELECT 1 FROM session_delivery_acknowledgements
+                        WHERE turn_generation_id = invocations.invocation_uuid
+                          AND confirmed_at IS NOT NULL
+                    )
+             FROM invocations
+             WHERE invocation_uuid = ?1",
+            [first_invocation_uuid],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        durable,
+        (
+            "failed".to_string(),
+            29,
+            "resume_prompt_accepted_provider_failed".to_string(),
+            true,
+        )
+    );
+
+    Connection::open(fixture.sidecar_path())
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_accepted_mailbox_projection;")
+        .unwrap();
+    assert_success(&fixture.run_resume_with_env(
+        "continue after projection recovery",
+        &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
+    ));
+
+    let delivered = fixture.mailbox_row(notification.seq);
+    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
+    assert_eq!(
+        delivered.delivered_by_invocation_uuid.as_deref(),
+        Some(first_invocation_uuid)
+    );
+    let prompts = fixture.recorded_resume_prompts();
+    assert_eq!(prompts.len(), 2, "{prompts:#?}");
+    assert!(prompts[0].contains("age291-detached-child"), "{prompts:#?}");
+    assert!(
+        !prompts[1].contains("age291-detached-child"),
+        "{prompts:#?}"
+    );
     fixture.assert_xdg_isolated();
 }
 
@@ -926,6 +1033,9 @@ def launch(request):
     known = params.get("session", {}).get("known_provider_session_id")
     prompt = params.get("model", {}).get("inputs", {}).get("prompt", "")
     if known:
+        prompt_log = pathlib.Path(os.environ["S11_WORK_DIR"]).joinpath("resume-prompts.jsonl")
+        with prompt_log.open("a") as stream:
+            stream.write(json.dumps(prompt, separators=(",", ":")) + "\n")
         seq = 1
         produced_assistant_response = False
         if os.environ.get("S11_NO_ASSISTANT_RESULT") != "1":

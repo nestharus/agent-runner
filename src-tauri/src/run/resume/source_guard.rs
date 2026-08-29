@@ -183,11 +183,19 @@ mod tests {
         let disposition_token = disposition_token(disposition);
         let disposition_idx = body.find(&disposition_token);
         let branch = disposition_idx.map(|idx| disposition_branch_source(&body[idx..]));
+        let finalization_source = branch.map(|source| {
+            if source.contains("finalize_terminal_disposition(") {
+                production_block_after(disposition_source(), "fn finalize_terminal_disposition(")
+            } else {
+                source
+            }
+        });
         guard_evidence(
             disposition_idx.is_some(),
-            branch.and_then(|source| source.find("finalize_invocation")),
-            branch.and_then(|source| source.find("guard.mark_finalized()")),
-            branch.is_some_and(|source| source.contains("finalize_invocation_from_guard")),
+            finalization_source.and_then(|source| source.find("finalize_invocation")),
+            finalization_source.and_then(|source| source.find("guard.mark_finalized()")),
+            finalization_source
+                .is_some_and(|source| source.contains("finalize_invocation_from_guard")),
         )
     }
 

@@ -24,6 +24,16 @@ pub(super) enum CompletedAttemptControl {
     Return(i32),
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ConfirmedDeliverySettlement<'a> {
+    pub(super) delivery_id: &'a str,
+    pub(super) session_id: &'a str,
+    pub(super) turn_generation_id: &'a str,
+    pub(super) submitted_evidence: &'a str,
+    pub(super) confirmed_evidence: &'a str,
+    pub(super) observed_at: i64,
+}
+
 pub(super) struct CompletedAttemptInput<'a, 'state> {
     pub(super) agent_runtime_services: &'a wiring::AgentRuntimeServices,
     pub(super) env: &'a ResumeExecutionEnvironment,
@@ -43,6 +53,7 @@ pub(super) struct CompletedAttemptInput<'a, 'state> {
     pub(super) max_attempts: usize,
     pub(super) recovered_generic_nonzero: bool,
     pub(super) terminal_completion_confirmed: bool,
+    pub(super) confirmed_delivery: Option<ConfirmedDeliverySettlement<'a>>,
 }
 
 pub(super) fn finalize_completed_attempt(
@@ -59,7 +70,9 @@ pub(super) fn finalize_completed_attempt(
     let quota_exhausted =
         super::predicate::completed_attempt_quota_exhausted(error_category.as_deref());
 
-    if let Err(err) = persist_returned_artifacts(&input) {
+    if input.confirmed_delivery.is_none()
+        && let Err(err) = persist_returned_artifacts(&input)
+    {
         return Ok(handle_returned_artifacts_persist_failure(&mut input, err));
     }
 
@@ -116,6 +129,19 @@ fn finalize_regular_completed_attempt(
     success: bool,
     error_category: Option<&str>,
 ) -> Result<(), String> {
+    if let Some(settlement) = input.confirmed_delivery {
+        finalize_confirmed_delivery(
+            &input.env.state,
+            input.invocation_row_id,
+            input.result,
+            success,
+            error_category,
+            input.result.terminal_reason.as_deref(),
+            settlement,
+        )?;
+        input.guard.mark_finalized();
+        return Ok(());
+    }
     let finalize_result = finalize_retained_outcome_with_contention_retry(
         input
             .agent_runtime_services
@@ -137,6 +163,37 @@ fn finalize_regular_completed_attempt(
     }
     finalize_result.map_err(|err| err.to_string())?;
     input.guard.mark_finalized();
+    Ok(())
+}
+
+pub(super) fn finalize_confirmed_delivery(
+    state: &oulipoly_state::StateDb,
+    invocation_row_id: i64,
+    result: &oulipoly_runtime::executor::ExecutionResult,
+    success: bool,
+    error_category: Option<&str>,
+    terminal_reason: Option<&str>,
+    settlement: ConfirmedDeliverySettlement<'_>,
+) -> Result<(), String> {
+    let delivery_ids = [settlement.delivery_id.to_string()];
+    let acceptance = result.resume_acceptance.as_ref();
+    state.apply_provider_turn_effects(oulipoly_state::ProviderTurnEffectInput {
+        invocation_row_id,
+        delivery_ids: &delivery_ids,
+        accept_delivery_if_missing: true,
+        session_id: settlement.session_id,
+        turn_generation_id: settlement.turn_generation_id,
+        submitted_evidence: Some(settlement.submitted_evidence),
+        confirmed_evidence: Some(settlement.confirmed_evidence),
+        observed_at: settlement.observed_at,
+        returned_artifacts: &result.returned_artifacts,
+        resume_acceptance_status: acceptance.map(|value| value.status.db_value()),
+        resume_acceptance_evidence: acceptance.and_then(|value| value.evidence.as_deref()),
+        success,
+        exit_code: result.exit_code,
+        error_category,
+        terminal_reason,
+    })?;
     Ok(())
 }
 

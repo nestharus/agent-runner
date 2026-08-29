@@ -16,6 +16,7 @@ use oulipoly_runtime::executor::prompt_acceptance::ValidatedPromptAcceptance;
 use super::disposition::{
     ResumeLoopControl, ResumeTerminalDispositionInput, handle_terminal_signal_disposition,
 };
+use super::finalization::ConfirmedDeliverySettlement;
 use super::lifecycle::{
     BoundResumeAttempt, ResumeCompletionClassification, ResumeInvocationAttempt,
     finalize_completed_attempt_control_for_resume, finalize_completed_attempt_for_resume,
@@ -78,6 +79,13 @@ fn nonzero_resume_exit_code(last_exit_code: i32) -> i32 {
     } else {
         last_exit_code
     }
+}
+
+fn current_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 pub(super) fn handle_resume_attempt_result(
@@ -342,6 +350,7 @@ fn resume_terminal_disposition_outcome(
         provider_session_id,
         result,
         completion_evidence,
+        None,
     )?;
     Ok(mapper::resume_terminal_disposition_outcome(
         disposition_control,
@@ -356,6 +365,7 @@ fn apply_resume_terminal_disposition(
     provider_session_id: &str,
     result: &executor::ExecutionResult,
     completion_evidence: wake::ResumeCompletionEvidence<'_>,
+    confirmed_delivery: Option<ConfirmedDeliverySettlement<'_>>,
 ) -> Result<ResumeLoopControl, String> {
     let terminal_signal_disposition = terminal_signal_disposition_for_result(
         &input.env.state,
@@ -378,6 +388,7 @@ fn apply_resume_terminal_disposition(
         terminal_signal_disposition,
         zero_turn_action: completion_evidence.zero_turn_action,
         recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
+        confirmed_delivery,
     })
 }
 
@@ -393,14 +404,19 @@ enum ConfirmedPromptAcceptanceTerminalOutcome {
     RequiresCompletedAttemptFinalization,
 }
 
+struct ConfirmedPromptAcceptanceTerminalEvidence<'a> {
+    completion: wake::ResumeCompletionEvidence<'a>,
+    physical_exit_code: i32,
+    delivery: Option<ConfirmedDeliverySettlement<'a>>,
+}
+
 fn confirmed_prompt_acceptance_terminal_outcome(
     input: &ResumeAttemptInput<'_>,
     attempt: &mut ResumeInvocationAttempt<'_>,
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &executor::ExecutionResult,
-    completion_evidence: wake::ResumeCompletionEvidence<'_>,
-    physical_exit_code: i32,
+    evidence: ConfirmedPromptAcceptanceTerminalEvidence<'_>,
 ) -> Result<ConfirmedPromptAcceptanceTerminalOutcome, String> {
     let control = apply_resume_terminal_disposition(
         input,
@@ -408,12 +424,13 @@ fn confirmed_prompt_acceptance_terminal_outcome(
         provider,
         provider_session_id,
         result,
-        completion_evidence,
+        evidence.completion,
+        evidence.delivery,
     )?;
     Ok(match control {
         ResumeLoopControl::Continue => {
             ConfirmedPromptAcceptanceTerminalOutcome::InvocationFinalized {
-                shell_exit_code: nonzero_resume_exit_code(physical_exit_code),
+                shell_exit_code: nonzero_resume_exit_code(evidence.physical_exit_code),
             }
         }
         ResumeLoopControl::Return(shell_exit_code) => {
@@ -481,14 +498,37 @@ fn apply_confirmed_prompt_acceptance_failure(
         recovered_generic_nonzero: classification.recovered_generic_nonzero,
         prompt_acceptance_confirmation: Some(&failure.prompt_acceptance),
     };
+    let turn_generation_id = attempt.invocation.id.clone();
+    let confirmed_evidence = format!(
+        "{};prompt_sha256={}",
+        failure.prompt_acceptance.protocol(),
+        failure.prompt_acceptance.prompt_sha256()
+    );
+    let confirmed_delivery = if input.mailbox_delivery_seqs.is_empty() {
+        None
+    } else {
+        Some(ConfirmedDeliverySettlement {
+            delivery_id: input.mailbox_delivery_nonce.ok_or_else(|| {
+                "trusted mailbox prompt acceptance is missing its delivery nonce".to_string()
+            })?,
+            session_id: input.mailbox_session_id,
+            turn_generation_id: &turn_generation_id,
+            submitted_evidence: failure.prompt_acceptance.prompt_sha256(),
+            confirmed_evidence: &confirmed_evidence,
+            observed_at: current_unix_millis(),
+        })
+    };
     let outcome = confirmed_prompt_acceptance_terminal_outcome(
         input,
         attempt,
         provider,
         provider_session_id,
         result,
-        completion_evidence,
-        failure.physical_exit_code,
+        ConfirmedPromptAcceptanceTerminalEvidence {
+            completion: completion_evidence,
+            physical_exit_code: failure.physical_exit_code,
+            delivery: confirmed_delivery,
+        },
     )?;
     let shell_exit_code = match outcome {
         ConfirmedPromptAcceptanceTerminalOutcome::InvocationFinalized { shell_exit_code } => {
@@ -510,6 +550,7 @@ fn apply_confirmed_prompt_acceptance_failure(
                 provider,
                 provider_session_id,
                 result,
+                confirmed_delivery,
                 &ResumeCompletionClassification {
                     recovered_generic_nonzero: classification.recovered_generic_nonzero,
                     terminal_completion_confirmed: classification.terminal_completion_confirmed,

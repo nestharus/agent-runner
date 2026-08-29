@@ -10,7 +10,7 @@ use super::idle::mark_session_idle_after_turn;
 use super::retry_cadence::sleep_before_failed_auto_wake_retry;
 use super::wake_claim::release_current_auto_wake_claim;
 use super::wake_start::{StartWakeInput, start_wake_chain};
-use oulipoly_state::mailbox::MailboxDb;
+use oulipoly_state::{StateDb, mailbox::MailboxDb};
 
 pub(crate) fn mark_terminal_attempt_idle_and_recheck(
     session_id: &str,
@@ -76,12 +76,17 @@ fn turn_end_pending_count(session_id: &str) -> Result<usize, String> {
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(0);
     };
-    turn_end_pending_count_on(&mut db, session_id)
+    let state = StateDb::open_default()?;
+    turn_end_pending_count_on(&mut db, &state, session_id)
 }
 
-fn turn_end_pending_count_on(db: &mut MailboxDb, session_id: &str) -> Result<usize, String> {
+fn turn_end_pending_count_on(
+    db: &mut MailboxDb,
+    state: &StateDb,
+    session_id: &str,
+) -> Result<usize, String> {
     super::consumed_completion::reconcile_late_consumed_completions_on(db, session_id)?;
-    crate::mailbox_delivery::deliverable_pending_count_on(db, session_id)
+    crate::mailbox_delivery::deliverable_pending_count_on(db, state, session_id)
 }
 
 #[cfg(test)]
@@ -116,9 +121,11 @@ mod tests {
         let fixture = ConsumedCompletionFixture::new();
         fixture.mark_consumed();
         let mut db = fixture.mailbox();
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
 
         assert_eq!(
-            turn_end_pending_count_on(&mut db, ConsumedCompletionFixture::SESSION_ID).unwrap(),
+            turn_end_pending_count_on(&mut db, &state, ConsumedCompletionFixture::SESSION_ID)
+                .unwrap(),
             0
         );
         assert!(
@@ -141,9 +148,11 @@ mod tests {
     fn turn_end_pending_count_keeps_unconsumed_completion_pending() {
         let fixture = ConsumedCompletionFixture::new();
         let mut db = fixture.mailbox();
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
 
         assert_eq!(
-            turn_end_pending_count_on(&mut db, ConsumedCompletionFixture::SESSION_ID).unwrap(),
+            turn_end_pending_count_on(&mut db, &state, ConsumedCompletionFixture::SESSION_ID)
+                .unwrap(),
             1
         );
         let listener = db

@@ -3367,6 +3367,44 @@ impl MailboxDb {
         seqs: &[i64],
         remaining_count: usize,
     ) -> Result<(), String> {
+        self.register_delivery_attempt_for_target(
+            attempt_id,
+            session_id,
+            None,
+            delivery_invocation_uuid,
+            seqs,
+            remaining_count,
+        )
+    }
+
+    pub fn register_headless_delivery_attempt(
+        &mut self,
+        attempt_id: &str,
+        session_id: &str,
+        chain_id: Option<&str>,
+        delivery_invocation_uuid: &str,
+        seqs: &[i64],
+        remaining_count: usize,
+    ) -> Result<(), String> {
+        self.register_delivery_attempt_for_target(
+            attempt_id,
+            session_id,
+            chain_id,
+            delivery_invocation_uuid,
+            seqs,
+            remaining_count,
+        )
+    }
+
+    fn register_delivery_attempt_for_target(
+        &mut self,
+        attempt_id: &str,
+        session_id: &str,
+        chain_id: Option<&str>,
+        delivery_invocation_uuid: &str,
+        seqs: &[i64],
+        remaining_count: usize,
+    ) -> Result<(), String> {
         if seqs.is_empty() {
             return Err("Cannot register an empty mailbox delivery attempt".to_string());
         }
@@ -3401,18 +3439,15 @@ impl MailboxDb {
             ],
         )
         .map_err(|err| format!("Failed to insert mailbox delivery attempt: {err}"))?;
-        for seq in seqs {
-            let belongs_to_session = tx
-                .query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM mailbox
-                        WHERE seq = ?1 AND session_id = ?2
-                     )",
-                    params![seq, session_id],
-                    |row| row.get::<_, bool>(0),
-                )
-                .map_err(|err| format!("Failed to validate mailbox delivery item: {err}"))?;
-            if !belongs_to_session {
+        let target_states = if chain_id.is_some() {
+            mailbox_delivery_target_states_on(&tx, session_id, chain_id, seqs)
+                .map_err(|err| format!("Failed to validate mailbox delivery item: {err}"))?
+        } else {
+            mailbox_delivery_states_on(&tx, session_id, seqs)
+                .map_err(|err| format!("Failed to validate mailbox delivery item: {err}"))?
+        };
+        for (seq, target_state) in seqs.iter().zip(target_states) {
+            if target_state.is_none() {
                 return Err(format!(
                     "Mailbox delivery item {seq} does not belong to session {session_id}"
                 ));
@@ -3428,6 +3463,31 @@ impl MailboxDb {
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox delivery attempt: {err}"))?;
         self.maintain_terminal_history();
+        Ok(())
+    }
+
+    pub fn bind_delivery_attempt_invocation(
+        &mut self,
+        attempt_id: &str,
+        session_id: &str,
+        delivery_invocation_uuid: &str,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts
+                 SET delivery_invocation_uuid = ?3
+                 WHERE attempt_id = ?1
+                   AND session_id = ?2
+                   AND resolved_at IS NULL",
+                params![attempt_id, session_id, delivery_invocation_uuid],
+            )
+            .map_err(|err| format!("Failed to bind mailbox delivery invocation: {err}"))?;
+        if changed == 0 {
+            return Err(format!(
+                "Mailbox delivery attempt {attempt_id} is missing, resolved, or belongs to another session"
+            ));
+        }
         Ok(())
     }
 
@@ -3666,6 +3726,44 @@ impl MailboxDb {
             remaining_count: pending_count.saturating_sub(rows.len()),
             rows,
         }))
+    }
+
+    pub fn unresolved_delivery_attempt_windows(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<MailboxDeliveryWindow>, String> {
+        let attempt_ids = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT attempts.attempt_id
+                     FROM mailbox_delivery_attempts AS attempts
+                     WHERE attempts.session_id = ?1
+                       AND attempts.resolved_at IS NULL
+                       AND EXISTS (
+                           SELECT 1
+                           FROM mailbox_delivery_attempt_items AS items
+                           JOIN mailbox ON mailbox.seq = items.mailbox_seq
+                           WHERE items.attempt_id = attempts.attempt_id
+                             AND mailbox.delivered_at IS NULL
+                       )
+                     ORDER BY attempts.created_at, attempts.attempt_id",
+                )
+                .map_err(|err| {
+                    format!("Failed to prepare unresolved mailbox delivery query: {err}")
+                })?;
+            stmt.query_map(params![session_id], |row| row.get::<_, String>(0))
+                .map_err(|err| format!("Failed to query unresolved mailbox deliveries: {err}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| format!("Failed to read unresolved mailbox deliveries: {err}"))?
+        };
+        attempt_ids
+            .into_iter()
+            .map(|attempt_id| {
+                self.delivery_attempt_window(&attempt_id)?
+                    .ok_or_else(|| format!("Mailbox delivery attempt {attempt_id} disappeared"))
+            })
+            .collect()
     }
 
     pub fn delivery_attempt_item_seqs(&self, attempt_id: &str) -> Result<Vec<i64>, String> {

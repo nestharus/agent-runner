@@ -4,6 +4,7 @@
 
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
 
+use super::finalization::{ConfirmedDeliverySettlement, finalize_confirmed_delivery};
 use super::{formatter, mapper};
 use crate::invocation::finalize::FinalizerGuard;
 use crate::migration_providers::ResumeExecutionEnvironment;
@@ -29,10 +30,11 @@ pub(super) struct ResumeTerminalDispositionInput<'a, 'state> {
     pub(super) terminal_signal_disposition: TerminalSignalDisposition,
     pub(super) zero_turn_action: ZeroTurnAction,
     pub(super) recovered_generic_nonzero: bool,
+    pub(super) confirmed_delivery: Option<ConfirmedDeliverySettlement<'a>>,
 }
 
 pub(super) fn handle_terminal_signal_disposition(
-    input: ResumeTerminalDispositionInput<'_, '_>,
+    mut input: ResumeTerminalDispositionInput<'_, '_>,
 ) -> Result<ResumeLoopControl, String> {
     if recovered_generic_nonzero_completed_attempt(&input) {
         return Ok(ResumeLoopControl::CompletedAttempt);
@@ -41,16 +43,7 @@ pub(super) fn handle_terminal_signal_disposition(
         TerminalSignalDisposition::MaybeQuotaVerify => handle_maybe_quota_verify(input),
         TerminalSignalDisposition::QuotaExhaustedRetry => {
             let terminal_reason = quota_retry_terminal_reason(input.result);
-            input
-                .agent_runtime_services
-                .invocation_lifecycle_service
-                .finalize_invocation(terminal_disposition_finalize_request(
-                    &input,
-                    Some("quota_exhausted"),
-                    terminal_reason,
-                ))
-                .map_err(|err| err.to_string())?;
-            input.guard.mark_finalized();
+            finalize_terminal_disposition(&mut input, Some("quota_exhausted"), terminal_reason)?;
             Ok(ResumeLoopControl::Continue)
         }
         TerminalSignalDisposition::ProlongedSilenceFail
@@ -58,16 +51,7 @@ pub(super) fn handle_terminal_signal_disposition(
             let terminal_reason = typed_failure_terminal_reason(input.result);
             let error_category =
                 terminal_signal_error_category(&input.result.terminal_signal, terminal_reason);
-            input
-                .agent_runtime_services
-                .invocation_lifecycle_service
-                .finalize_invocation(terminal_disposition_finalize_request(
-                    &input,
-                    error_category,
-                    terminal_reason,
-                ))
-                .map_err(|err| err.to_string())?;
-            input.guard.mark_finalized();
+            finalize_terminal_disposition(&mut input, error_category, terminal_reason)?;
             emit_resume_terminal_failure_output(&input, error_category, terminal_reason);
             Ok(ResumeLoopControl::Return(mapper::failure_exit_code(
                 input.result.exit_code,
@@ -109,21 +93,6 @@ fn typed_failure_terminal_reason(result: &oulipoly_runtime::executor::ExecutionR
     .expect("typed failure signal must have terminal reason")
 }
 
-fn terminal_disposition_finalize_request<'a>(
-    input: &'a ResumeTerminalDispositionInput<'_, '_>,
-    error_category: Option<&'a str>,
-    terminal_reason: &'a str,
-) -> oulipoly_runtime::services::InvocationLifecycleFinalizeRequest<'a> {
-    mapper::finalize_request(
-        &input.env.state,
-        input.invocation_row_id,
-        false,
-        input.result.exit_code,
-        error_category,
-        Some(terminal_reason),
-    )
-}
-
 fn emit_resume_terminal_failure_output(
     input: &ResumeTerminalDispositionInput<'_, '_>,
     error_category: Option<&str>,
@@ -142,23 +111,12 @@ fn emit_resume_terminal_failure_output(
 }
 
 fn handle_maybe_quota_verify(
-    input: ResumeTerminalDispositionInput<'_, '_>,
+    mut input: ResumeTerminalDispositionInput<'_, '_>,
 ) -> Result<ResumeLoopControl, String> {
     let outcome = maybe_quota_action_outcome(input.zero_turn_action);
     let error_category = outcome.error_category();
     let terminal_reason = maybe_quota_terminal_reason(input.result);
-    input
-        .agent_runtime_services
-        .invocation_lifecycle_service
-        .finalize_invocation(maybe_quota_finalize_request(
-            &input.env.state,
-            input.invocation_row_id,
-            input.result,
-            error_category,
-            terminal_reason,
-        ))
-        .map_err(|err| err.to_string())?;
-    input.guard.mark_finalized();
+    finalize_terminal_disposition(&mut input, error_category, terminal_reason)?;
     match outcome {
         MaybeQuotaActionOutcome::Continue { .. } => Ok(ResumeLoopControl::Continue),
         MaybeQuotaActionOutcome::ReturnFailure { .. } => {
@@ -204,27 +162,43 @@ fn maybe_quota_action_outcome(zero_turn_action: ZeroTurnAction) -> MaybeQuotaAct
     }
 }
 
-fn maybe_quota_finalize_request<'a>(
-    state: &'a oulipoly_state::StateDb,
-    invocation_row_id: i64,
-    result: &'a oulipoly_runtime::executor::ExecutionResult,
-    error_category: Option<&'a str>,
-    terminal_reason: &'a str,
-) -> oulipoly_runtime::services::InvocationLifecycleFinalizeRequest<'a> {
-    mapper::finalize_request(
-        state,
-        invocation_row_id,
-        false,
-        result.exit_code,
-        error_category,
-        Some(terminal_reason),
-    )
-}
-
 fn maybe_quota_terminal_reason(result: &oulipoly_runtime::executor::ExecutionResult) -> &str {
     crate::terminal_outcome_adapter::terminal_signal_reason(
         &result.terminal_signal,
         result.terminal_reason.as_deref(),
     )
     .unwrap_or("maybe_quota_exhausted")
+}
+
+fn finalize_terminal_disposition(
+    input: &mut ResumeTerminalDispositionInput<'_, '_>,
+    error_category: Option<&str>,
+    terminal_reason: &str,
+) -> Result<(), String> {
+    if let Some(settlement) = input.confirmed_delivery {
+        finalize_confirmed_delivery(
+            &input.env.state,
+            input.invocation_row_id,
+            input.result,
+            false,
+            error_category,
+            Some(terminal_reason),
+            settlement,
+        )?;
+    } else {
+        input
+            .agent_runtime_services
+            .invocation_lifecycle_service
+            .finalize_invocation(mapper::finalize_request(
+                &input.env.state,
+                input.invocation_row_id,
+                false,
+                input.result.exit_code,
+                error_category,
+                Some(terminal_reason),
+            ))
+            .map_err(|err| err.to_string())?;
+    }
+    input.guard.mark_finalized();
+    Ok(())
 }

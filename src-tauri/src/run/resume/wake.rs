@@ -77,6 +77,18 @@ pub(super) fn prepare_headless_resume_delivery(
     crate::mailbox_delivery::prepare_headless_resume_delivery(resolved, answer, models_dir)
 }
 
+pub(super) fn bind_headless_resume_delivery_attempt(
+    input: &ResumeAttemptInput<'_>,
+    invocation_uuid: &str,
+) -> Result<(), String> {
+    crate::mailbox_delivery::bind_headless_resume_delivery_attempt(
+        input.mailbox_session_id,
+        input.mailbox_delivery_nonce,
+        input.mailbox_delivery_seqs,
+        invocation_uuid,
+    )
+}
+
 pub(super) fn ingest_mailbox_delivery_confirmation_turn_if_needed(
     input: &ResumeAttemptInput<'_>,
     provider: &oulipoly_config::ProviderConfig,

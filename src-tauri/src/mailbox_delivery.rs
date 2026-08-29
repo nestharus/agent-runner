@@ -1123,24 +1123,35 @@ pub(crate) fn prepare_headless_resume_delivery(
         return Ok(empty_delivery(answer, session_id));
     };
     record_headless_session_metadata(&mut db, resolved, models_dir)?;
+    let state = StateDb::open_default()?;
+    reconcile_confirmed_headless_deliveries_on(&mut db, &state, &session_id)?;
     if db.notifications_paused(&session_id)? {
         return Ok(empty_delivery(answer, session_id));
     }
     let pending = pending_mailbox_rows(&db, &session_id, Some(&resolved.chain_id))?;
-    delivery_for_pending(session_id, pending, answer)
+    delivery_for_pending(
+        &mut db,
+        session_id,
+        Some(&resolved.chain_id),
+        pending,
+        answer,
+    )
 }
 
 pub(crate) fn deliverable_pending_count(session_id: &str) -> Result<usize, String> {
-    let Some(db) = open_mailbox_sidecar()? else {
+    let Some(mut db) = open_mailbox_sidecar()? else {
         return Ok(0);
     };
-    deliverable_pending_count_on(&db, session_id)
+    let state = StateDb::open_default()?;
+    deliverable_pending_count_on(&mut db, &state, session_id)
 }
 
 pub(crate) fn deliverable_pending_count_on(
-    db: &MailboxDb,
+    db: &mut MailboxDb,
+    state: &StateDb,
     session_id: &str,
 ) -> Result<usize, String> {
+    reconcile_confirmed_headless_deliveries_on(db, state, session_id)?;
     if notifications_paused_on(db, session_id)? {
         return Ok(0);
     }
@@ -1197,7 +1208,9 @@ fn deliverable_pending_rows(rows: Vec<MailboxRow>) -> Vec<MailboxRow> {
 }
 
 fn delivery_for_pending(
+    db: &mut MailboxDb,
     session_id: String,
+    chain_id: Option<&str>,
     pending: Vec<MailboxRow>,
     answer: Option<String>,
 ) -> Result<PreparedMailboxDelivery, String> {
@@ -1206,7 +1219,7 @@ fn delivery_for_pending(
     }
 
     let batch = select_batch(&pending);
-    delivery_for_batch(session_id, batch, answer)
+    delivery_for_batch(db, session_id, chain_id, batch, answer)
 }
 
 fn open_mailbox_sidecar() -> Result<Option<MailboxDb>, String> {
@@ -1232,7 +1245,9 @@ fn batch_seqs(batch: &MailboxBatch) -> Vec<i64> {
 }
 
 fn delivery_for_batch(
+    db: &mut MailboxDb,
     session_id: String,
+    chain_id: Option<&str>,
     batch: MailboxBatch,
     answer: Option<String>,
 ) -> Result<PreparedMailboxDelivery, String> {
@@ -1242,6 +1257,14 @@ fn delivery_for_batch(
         .iter()
         .any(|row| row.kind != SUBMITTED_INPUT_KIND);
     let delivery_nonce = new_delivery_nonce();
+    db.register_headless_delivery_attempt(
+        &delivery_nonce,
+        &session_id,
+        chain_id,
+        &delivery_nonce,
+        &seqs,
+        batch.remaining_count,
+    )?;
     let prefix = render_mailbox_prefix(&batch.rows, batch.remaining_count, &delivery_nonce)?;
     Ok(prepared_delivery(
         session_id,
@@ -1251,6 +1274,69 @@ fn delivery_for_batch(
         delivery_nonce,
         requires_turn_confirmation,
     ))
+}
+
+pub(crate) fn bind_headless_resume_delivery_attempt(
+    session_id: &str,
+    delivery_nonce: Option<&str>,
+    seqs: &[i64],
+    invocation_uuid: &str,
+) -> Result<(), String> {
+    if seqs.is_empty() {
+        return Ok(());
+    }
+    let delivery_nonce = delivery_nonce
+        .ok_or_else(|| "headless mailbox delivery is missing its durable nonce".to_string())?;
+    let Some(mut db) = open_mailbox_sidecar()? else {
+        return Err("mailbox sidecar missing while binding headless delivery".to_string());
+    };
+    db.bind_delivery_attempt_invocation(delivery_nonce, session_id, invocation_uuid)
+}
+
+fn reconcile_confirmed_headless_deliveries_on(
+    db: &mut MailboxDb,
+    state: &StateDb,
+    session_id: &str,
+) -> Result<(), String> {
+    for window in db.unresolved_delivery_attempt_windows(session_id)? {
+        let Some(acknowledgement) = state
+            .acknowledgement(&window.attempt_id)
+            .map_err(|error| error.to_string())?
+        else {
+            continue;
+        };
+        if acknowledgement.confirmed_at.is_none() {
+            continue;
+        }
+        if acknowledgement.session_id != window.session_id
+            || acknowledgement.turn_generation_id != window.delivery_invocation_uuid
+        {
+            return Err(format!(
+                "Confirmed delivery {} conflicts with its mailbox attempt identity",
+                window.attempt_id
+            ));
+        }
+        let seqs = window.rows.iter().map(|row| row.seq).collect::<Vec<_>>();
+        let mut chain_ids = window
+            .rows
+            .iter()
+            .filter(|row| row.target_kind.as_deref() == Some("chain"))
+            .filter_map(|row| row.target_id.as_deref());
+        let chain_id = chain_ids.next();
+        if chain_ids.any(|candidate| Some(candidate) != chain_id) {
+            return Err(format!(
+                "Confirmed mailbox delivery attempt {} spans multiple chains",
+                window.attempt_id
+            ));
+        }
+        db.mark_delivered(
+            &window.session_id,
+            chain_id,
+            &seqs,
+            &window.delivery_invocation_uuid,
+        )?;
+    }
+    Ok(())
 }
 
 fn prepared_delivery(

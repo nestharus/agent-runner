@@ -195,6 +195,7 @@ pub(super) fn finalize_completed_attempt_for_resume(
         provider,
         provider_session_id,
         result,
+        None,
         &completion,
     )?;
     match control {
@@ -220,6 +221,7 @@ pub(super) fn finalize_completed_attempt_control_for_resume(
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &oulipoly_runtime::executor::ExecutionResult,
+    confirmed_delivery: Option<super::finalization::ConfirmedDeliverySettlement<'_>>,
     completion: &ResumeCompletionClassification,
 ) -> Result<CompletedAttemptControl, String> {
     finalize_completed_attempt(CompletedAttemptInput {
@@ -241,6 +243,7 @@ pub(super) fn finalize_completed_attempt_control_for_resume(
         max_attempts: input.max_attempts,
         recovered_generic_nonzero: completion.recovered_generic_nonzero,
         terminal_completion_confirmed: completion.terminal_completion_confirmed,
+        confirmed_delivery,
     })
 }
 

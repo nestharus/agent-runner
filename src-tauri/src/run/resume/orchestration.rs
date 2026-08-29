@@ -244,6 +244,7 @@ fn run_resume_attempt(
     };
     let mut bound_attempt =
         lifecycle::setup_bound_resume_attempt(&input, &provider, provider_index)?;
+    wake::bind_headless_resume_delivery_attempt(&input, &bound_attempt.attempt.invocation.id)?;
     let _admission = crate::wake_coordinator::admit_session_launch(
         &bound_attempt.attempt.invocation.id,
         Some(&bound_attempt.provider_session_id),

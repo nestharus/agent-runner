@@ -87,6 +87,7 @@ pub(crate) fn apply_provider_turn_effects_exact(
         .apply_provider_turn_effects(ProviderTurnEffectInput {
             invocation_row_id: invocation.id,
             delivery_ids: &launch.mailbox_batch.delivery_ids,
+            accept_delivery_if_missing: false,
             session_id: &launch.mailbox_batch.session_id,
             turn_generation_id: &fence.generation_id,
             submitted_evidence,

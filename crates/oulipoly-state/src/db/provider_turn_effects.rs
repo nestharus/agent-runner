@@ -9,6 +9,7 @@ use oulipoly_agent_messenger::ReturnedArtifactRef;
 pub struct ProviderTurnEffectInput<'a> {
     pub invocation_row_id: i64,
     pub delivery_ids: &'a [String],
+    pub accept_delivery_if_missing: bool,
     pub session_id: &'a str,
     pub turn_generation_id: &'a str,
     pub submitted_evidence: Option<&'a str>,
@@ -29,7 +30,7 @@ pub struct ProviderTurnEffectWrite {
 
 impl StateDb {
     pub fn apply_provider_turn_effects(
-        &mut self,
+        &self,
         input: ProviderTurnEffectInput<'_>,
     ) -> Result<ProviderTurnEffectWrite, String> {
         Self::prepare_returned_artifacts_table(&self.conn)?;
@@ -80,19 +81,32 @@ impl StateDb {
     }
 
     fn apply_provider_turn_effects_transaction(
-        &mut self,
+        &self,
         input: &ProviderTurnEffectInput<'_>,
         finished_at: &str,
     ) -> Result<(FinalizeInvocationRow, AcknowledgementWrite), String> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
-            .map_err(Self::format_begin_transaction_error)?;
+        let tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(Self::format_begin_transaction_error)?;
         let mut acknowledgement = AcknowledgementWrite::AlreadyRecorded;
 
         for delivery_id in input.delivery_ids {
             validate_acknowledgement_fence(delivery_id, input.session_id, input.turn_generation_id)
                 .map_err(|error| error.to_string())?;
+            if input.accept_delivery_if_missing {
+                tx.execute(
+                    "INSERT OR IGNORE INTO session_delivery_acknowledgements (
+                        delivery_id, session_id, turn_generation_id, accepted_at
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        delivery_id,
+                        input.session_id,
+                        input.turn_generation_id,
+                        input.observed_at
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            }
             let existing = acknowledgement_with_fence(
                 &tx,
                 delivery_id,
