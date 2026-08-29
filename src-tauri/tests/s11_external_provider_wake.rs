@@ -488,6 +488,32 @@ fn accepted_manual_prompt_nonzero_has_one_typed_terminal_outcome() {
 }
 
 #[test]
+fn missing_final_exit_does_not_settle_mismatched_prompt_acceptance() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let resumed = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+            ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_OMIT_EXIT_EVENT", "1"),
+        ],
+    );
+
+    assert_ne!(resumed.status.code(), Some(0), "{resumed:?}");
+    let pending = fixture.mailbox_row(notification.seq);
+    assert!(pending.delivered_at.is_none(), "{pending:?}");
+    assert_eq!(pending.delivery_attempts, 1);
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
 fn trusted_prompt_acceptance_settles_mailbox_delivery_after_provider_nonzero() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
@@ -522,6 +548,54 @@ fn trusted_prompt_acceptance_settles_mailbox_delivery_after_provider_nonzero() {
         delivered.delivered_by_invocation_uuid.as_deref(),
         Some(invocation_uuid)
     );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn trusted_prompt_acceptance_settles_mailbox_delivery_when_final_exit_is_missing() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let resumed = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_OMIT_EXIT_EVENT", "1"),
+        ],
+    );
+
+    assert_ne!(resumed.status.code(), Some(0), "{resumed:?}");
+    let result = result_envelope(&resumed);
+    let invocation_uuid = result["id"].as_str().unwrap();
+    assert_eq!(result["status"], "failed");
+    assert_ne!(result["exit_code"], 0);
+    assert_eq!(
+        result["terminal_reason"],
+        "resume_prompt_accepted_provider_failed"
+    );
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains("missing_final_exit;provider_process=exited:0"),
+        "{stderr}"
+    );
+    let delivered = fixture.mailbox_row(notification.seq);
+    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
+    assert_eq!(delivered.delivery_attempts, 1);
+    assert_eq!(
+        delivered.delivered_by_invocation_uuid.as_deref(),
+        Some(invocation_uuid)
+    );
+
+    assert_success(&fixture.run_resume_with_env(
+        "continue after child completion",
+        &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
+    ));
+    assert_eq!(fixture.mailbox_row(notification.seq).delivery_attempts, 1);
     fixture.assert_xdg_isolated();
 }
 
@@ -868,7 +942,8 @@ def launch(request):
         if produced_assistant_response:
             emit(produced_assistant_response_marker_event(request, seq))
             seq += 1
-        emit(exit_event(request, seq, known))
+        if os.environ.get("S11_OMIT_EXIT_EVENT") != "1":
+            emit(exit_event(request, seq, known))
         return
     session_id = None if os.environ.get("S11_OMIT_EXIT_SESSION") == "1" else SESSION
     seq = 1

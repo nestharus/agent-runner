@@ -103,6 +103,24 @@ pub struct ProviderDiagnostics {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LaunchFailureEvidence {
+    retained_markers: Vec<(String, Value)>,
+}
+
+impl LaunchFailureEvidence {
+    pub(crate) fn from_retained_markers(retained_markers: Vec<(String, Value)>) -> Self {
+        Self { retained_markers }
+    }
+
+    fn retained_marker_value(&self, name: &str) -> Option<&Value> {
+        self.retained_markers
+            .iter()
+            .find(|(marker_name, _)| marker_name == name)
+            .map(|(_, value)| value)
+    }
+}
+
 impl ProviderDiagnostics {
     pub fn with_description(description: String) -> Self {
         Self {
@@ -188,6 +206,7 @@ pub enum ProviderClientError {
         description: String,
         diagnostics: Box<ProviderDiagnostics>,
         process_status: Option<Box<ProcessStatus>>,
+        launch_failure_evidence: Option<Box<LaunchFailureEvidence>>,
     },
     ProviderCapability(Box<ProviderCapabilityError>),
 }
@@ -222,6 +241,7 @@ impl ProviderClientError {
             request_id,
             diagnostics: Box::new(diagnostics),
             process_status: None,
+            launch_failure_evidence: None,
         }
     }
 
@@ -254,6 +274,7 @@ impl ProviderClientError {
                 subcommand,
                 request_id,
                 description,
+                launch_failure_evidence,
                 ..
             } => Self::Protocol {
                 kind,
@@ -262,6 +283,7 @@ impl ProviderClientError {
                 description,
                 diagnostics: Box::new(diagnostics),
                 process_status: Some(Box::new(process_status)),
+                launch_failure_evidence,
             },
             Self::ProviderCapability(error) => Self::ProviderCapability(error),
         }
@@ -291,6 +313,7 @@ impl ProviderClientError {
                 description,
                 diagnostics,
                 process_status,
+                launch_failure_evidence,
             } => Self::Protocol {
                 kind,
                 subcommand,
@@ -298,6 +321,7 @@ impl ProviderClientError {
                 description,
                 diagnostics,
                 process_status,
+                launch_failure_evidence,
             },
             Self::ProviderCapability(error) => Self::ProviderCapability(error),
         }
@@ -378,6 +402,41 @@ impl ProviderClientError {
             Self::ProviderCapability(error) => error.diagnostics(),
         }
     }
+
+    pub(crate) fn with_launch_failure_evidence(self, evidence: LaunchFailureEvidence) -> Self {
+        match self {
+            Self::Protocol {
+                kind,
+                subcommand,
+                request_id,
+                description,
+                diagnostics,
+                process_status,
+                ..
+            } => Self::Protocol {
+                kind,
+                subcommand,
+                request_id,
+                description,
+                diagnostics,
+                process_status,
+                launch_failure_evidence: Some(Box::new(evidence)),
+            },
+            other => other,
+        }
+    }
+
+    pub fn retained_launch_marker_value(&self, name: &str) -> Option<&Value> {
+        match self {
+            Self::Protocol {
+                launch_failure_evidence,
+                ..
+            } => launch_failure_evidence
+                .as_deref()
+                .and_then(|evidence| evidence.retained_marker_value(name)),
+            Self::Transport { .. } | Self::ProviderCapability(_) => None,
+        }
+    }
 }
 
 struct ErrorResponseEnvelopeParseError {
@@ -430,6 +489,7 @@ fn schema_invalid_error_response(
         description,
         diagnostics: Box::new(diagnostics),
         process_status: process_status.map(Box::new),
+        launch_failure_evidence: None,
     }
 }
 

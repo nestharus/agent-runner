@@ -50,7 +50,8 @@
 //! ```
 
 use crate::error::{
-    HostErrorKind, ProviderClientError, ProviderDiagnostics, check_contract_and_request,
+    HostErrorKind, LaunchFailureEvidence, ProviderClientError, ProviderDiagnostics,
+    check_contract_and_request,
 };
 use crate::generated::{LaunchEvent, ProcessStatus, TerminalSignal};
 use crate::process::{
@@ -428,10 +429,18 @@ impl LaunchStreamParser {
             return Err(protocol_error(HostErrorKind::SkippedSeq, &self.request_id));
         }
         if self.exit.is_none() {
-            return Err(protocol_error(
-                HostErrorKind::MissingFinalExit,
-                &self.request_id,
-            ));
+            let retained_markers = self
+                .markers
+                .markers
+                .iter()
+                .map(|marker| (marker.name.clone(), marker.value.clone()))
+                .collect();
+            return Err(
+                protocol_error(HostErrorKind::MissingFinalExit, &self.request_id)
+                    .with_launch_failure_evidence(LaunchFailureEvidence::from_retained_markers(
+                        retained_markers,
+                    )),
+            );
         };
         Ok(())
     }

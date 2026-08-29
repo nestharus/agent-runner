@@ -34,13 +34,13 @@ pub(crate) fn map_terminal_cancel_outcome(
         observed_at: UNIX_EPOCH + Duration::from_millis(signal.observed_at_unix_ms),
     };
     TerminalCancelOutcome {
-        exit_code: terminal_exit_code_from_signal(&terminal_signal, exit_code(status)),
+        exit_code: terminal_exit_code_from_signal(&terminal_signal, process_exit_code(status)),
         terminal_reason: terminal_reason(status, &terminal_signal),
         terminal_signal,
     }
 }
 
-fn exit_code(status: &ProcessStatus) -> i32 {
+pub(crate) fn process_exit_code(status: &ProcessStatus) -> i32 {
     match status {
         ProcessStatus::Exited { code } => *code,
         ProcessStatus::SignalTerminated { signal } => 128 + *signal,

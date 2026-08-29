@@ -35,15 +35,19 @@
 //!       - returned-artifact and child-invocation empty defaults for launch results
 //! ```
 
-use super::terminal_cancel_mapper::map_terminal_cancel_outcome;
+use super::terminal_cancel_mapper::{map_terminal_cancel_outcome, process_exit_code};
 use crate::executor::assistant_response::launch_result_produced_assistant_response;
+use crate::executor::cli::terminal_exit_code_from_signal;
+use crate::executor::terminal_signal::{TerminalSignal, TerminalSignalKind};
 use crate::executor::{ExecutionResult, SessionCaptureMethod, SessionCaptureResult};
 use crate::services::TerminalClassification;
+use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
-    PROMPT_ACCEPTANCE_V1, PROMPT_ACCEPTED_MARKER_V1, PromptAcceptedMarkerValueV1,
+    PROMPT_ACCEPTANCE_V1, PROMPT_ACCEPTED_MARKER_V1, ProcessStatus, PromptAcceptedMarkerValueV1,
 };
 use oulipoly_provider::stream::LaunchResult;
 use serde_json::Value;
+use std::time::SystemTime;
 
 pub(crate) const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 
@@ -98,11 +102,78 @@ fn prompt_acceptance_attestation(
         .and_then(parse_prompt_acceptance_attestation_marker)
 }
 
-fn parse_prompt_acceptance_attestation_marker(
+pub(crate) fn parse_prompt_acceptance_attestation_marker(
     value: &Value,
 ) -> Option<PromptAcceptedMarkerValueV1> {
     let attestation: PromptAcceptedMarkerValueV1 = serde_json::from_value(value.clone()).ok()?;
     (attestation.protocol == PROMPT_ACCEPTANCE_V1).then_some(attestation)
+}
+
+pub(crate) fn map_missing_final_exit_with_prompt_acceptance(
+    error: &ProviderClientError,
+    provider_index: usize,
+    provider_name: &str,
+    retain_prompt_acceptance_attestation_v1: bool,
+) -> Option<ExecutionResult> {
+    if !retain_prompt_acceptance_attestation_v1 || error.transport_kind() != "missing_final_exit" {
+        return None;
+    }
+    let prompt_acceptance_attestation = error
+        .retained_launch_marker_value(PROMPT_ACCEPTED_MARKER_V1)
+        .and_then(parse_prompt_acceptance_attestation_marker)?;
+    let provider_status = error.process_status();
+    let signal = TerminalSignal {
+        kind: TerminalSignalKind::Unknown,
+        provider_name: provider_name.to_string(),
+        evidence: missing_final_exit_evidence(provider_status),
+        observed_at: SystemTime::now(),
+    };
+    let exit_code = terminal_exit_code_from_signal(
+        &signal,
+        provider_status.map(process_exit_code).unwrap_or(1),
+    );
+    let mut stderr = error.to_string();
+    let provider_stderr = error.diagnostics().stderr_text();
+    if !provider_stderr.is_empty() {
+        stderr.push('\n');
+        stderr.push_str(&provider_stderr);
+    }
+    Some(ExecutionResult {
+        stdout: Vec::new(),
+        stderr,
+        exit_code,
+        provider_index,
+        session_capture: SessionCaptureResult {
+            session_id: None,
+            method: SessionCaptureMethod::None,
+        },
+        resume_acceptance: None,
+        terminal_reason: Some("external_provider_missing_final_exit".to_string()),
+        terminal_signal: Some(signal),
+        produced_assistant_response: false,
+        prompt_acceptance_attestation: Some(prompt_acceptance_attestation),
+        captured_child_invocations: Vec::new(),
+        returned_artifacts: Vec::new(),
+    })
+}
+
+fn missing_final_exit_evidence(status: Option<&ProcessStatus>) -> String {
+    let status = match status {
+        Some(ProcessStatus::Exited { code }) => format!("provider_process=exited:{code}"),
+        Some(ProcessStatus::SignalTerminated { signal }) => {
+            format!("provider_process=signal_terminated:{signal}")
+        }
+        Some(ProcessStatus::SpawnError { reason }) => {
+            format!("provider_process=spawn_error:{reason}")
+        }
+        Some(ProcessStatus::ProlongedSilence { reason }) => {
+            format!("provider_process=prolonged_silence:{reason}")
+        }
+        Some(ProcessStatus::Cancelled) => "provider_process=cancelled".to_string(),
+        Some(ProcessStatus::Unknown) => "provider_process=unknown".to_string(),
+        None => "provider_process=unreported".to_string(),
+    };
+    format!("missing_final_exit;{status}")
 }
 
 fn launch_session_capture(result: &LaunchResult) -> SessionCaptureResult {

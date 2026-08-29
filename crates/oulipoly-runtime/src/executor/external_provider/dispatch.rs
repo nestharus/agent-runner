@@ -22,7 +22,8 @@ use super::error_mapper::{
 };
 use super::launch_result_mapper::{
     PROVIDER_SESSION_MARKER, launch_provider_session_id,
-    map_launch_result_with_terminal_classification, marker_provider_session_id,
+    map_launch_result_with_terminal_classification, map_missing_final_exit_with_prompt_acceptance,
+    marker_provider_session_id,
 };
 use super::policy_transform::apply_policy_transform;
 use super::request_builder::{build_launch_candidate, build_launch_request, build_policy_request};
@@ -168,6 +169,14 @@ fn attempt_account_dispatch(
         Ok(result) => result,
         Err(error) => {
             finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            if let Some(result) = map_missing_final_exit_with_prompt_acceptance(
+                &error,
+                context.provider_index,
+                &context.provider.name,
+                launch_prompt_acceptance_v1_enabled,
+            ) {
+                return Ok(result);
+            }
             return Err(classify_provider_client_attempt_error(error));
         }
     };

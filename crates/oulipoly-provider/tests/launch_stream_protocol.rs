@@ -209,3 +209,17 @@ fn launch_reader_rejects_sequence_and_finality_errors() {
         assert_eq!(error.transport_kind(), expected, "{label}");
     }
 }
+
+#[test]
+fn missing_final_exit_preserves_retained_marker_evidence() {
+    let marker = launch_marker_event(1);
+    let error = LaunchJsonlReader::new(REQUEST_ID)
+        .read(json_line(&marker).as_bytes())
+        .expect_err("missing final exit should remain a protocol failure");
+
+    assert_eq!(error.transport_kind(), "missing_final_exit");
+    assert_eq!(
+        error.retained_launch_marker_value("example-marker"),
+        Some(&json!({ "phase": "example" }))
+    );
+}
