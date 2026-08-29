@@ -69,7 +69,7 @@ fn following_auto_wake_chronology_count(auto_wake: Option<&AutoWakeEnv>) -> i64 
     auto_wake
         .map(|wake| wake.chronological_attempt_count)
         .unwrap_or(0)
-        + 1
+        .saturating_add(1)
 }
 
 fn turn_end_pending_count(session_id: &str) -> Result<usize, String> {
@@ -114,6 +114,34 @@ mod tests {
         };
 
         assert_eq!(following_auto_wake_chronology_count(Some(&auto_wake)), 6);
+    }
+
+    #[test]
+    fn terminal_attempt_recheck_advances_near_maximum_chronology() {
+        let auto_wake = AutoWakeEnv {
+            token: "turn-end-boundary-token".to_string(),
+            chronological_attempt_count: i64::MAX - 1,
+            retry_base_milliseconds: 1_000,
+        };
+
+        assert_eq!(
+            following_auto_wake_chronology_count(Some(&auto_wake)),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn failed_auto_wake_recheck_saturates_maximum_chronology() {
+        let auto_wake = AutoWakeEnv {
+            token: "failed-wake-boundary-token".to_string(),
+            chronological_attempt_count: i64::MAX,
+            retry_base_milliseconds: 1_000,
+        };
+
+        assert_eq!(
+            following_auto_wake_chronology_count(Some(&auto_wake)),
+            i64::MAX
+        );
     }
 
     #[test]

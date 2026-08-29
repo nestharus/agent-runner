@@ -112,6 +112,37 @@ impl Fixture {
         self.run(cmd)
     }
 
+    pub(crate) fn run_auto_wake_resume(
+        &self,
+        claim_token: &str,
+        chronological_attempt_count: i64,
+        retry_base_milliseconds: u64,
+    ) -> Output {
+        let mut cmd = self.resume_command();
+        self.prepare_command(&mut cmd);
+        cmd.env(
+            oulipoly_core::AutoWakeEnvironmentVariable::MARKER.name(),
+            "1",
+        )
+        .env(
+            oulipoly_core::AutoWakeEnvironmentVariable::SESSION_ID.name(),
+            SESSION,
+        )
+        .env(
+            oulipoly_core::AutoWakeEnvironmentVariable::CLAIM_TOKEN.name(),
+            claim_token,
+        )
+        .env(
+            oulipoly_core::AutoWakeEnvironmentVariable::COUNT.name(),
+            chronological_attempt_count.to_string(),
+        )
+        .env(
+            oulipoly_core::AutoWakeEnvironmentVariable::RETRY_BASE_MILLISECONDS.name(),
+            retry_base_milliseconds.to_string(),
+        );
+        cmd.output().unwrap()
+    }
+
     fn resume_command(&self) -> Command {
         let mut cmd = Command::new(crate::parse::runner_bin());
         cmd.arg("resume")

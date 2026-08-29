@@ -116,8 +116,26 @@ jobs:
       - run: cargo test -p oulipoly-state read_only_snapshot
       - run: cargo test -p oulipoly-state pid_identity::tests
 
+  rust-native-wake:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-wake-${{ runner.os }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: cargo test -p oulipoly-agent-runner --lib wake_coordinator::admission::tests::supported_platform_memory_observer_returns_usable_values -- --exact
+      - run: cargo test -p oulipoly-agent-runner --lib wake_coordinator::admission::tests::unavailable_memory_observation_returns_visible_error_without_stranding_queue -- --exact
+      - run: cargo test -p oulipoly-agent-runner --test age309_native_wake_domain native_count_five_startup_sweep_reaches_one_detached_provider_turn -- --exact --nocapture
+
   rust-integration:
-    needs: [rust-lib-check, rust-client-check, rust-state-windows, rust-state-macos]
+    needs: [rust-lib-check, rust-client-check, rust-state-windows, rust-state-macos, rust-native-wake]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

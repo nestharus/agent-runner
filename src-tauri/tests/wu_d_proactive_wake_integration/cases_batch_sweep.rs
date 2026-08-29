@@ -17,7 +17,9 @@ use crate::validators::{
     assert_pending_mailbox_count, assert_prompt_contains_handle, assert_prompt_file_missing,
     assert_success, assert_xdg_isolated,
 };
-use crate::wake_claim_setup::{seed_dead_wake_claim, seed_live_wake_claim};
+use crate::wake_claim_setup::{
+    acquire_seed_wake_claim, seed_dead_wake_claim, seed_live_wake_claim,
+};
 use crate::{MODEL, PROVIDER, SESSION};
 
 fn direct_unconfirmed_invocation(output: &std::process::Output) -> String {
@@ -373,6 +375,65 @@ fi"#,
         std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
         "3"
     );
+    assert_xdg_isolated(&fixture);
+}
+
+pub(crate) fn maximum_chronology_stays_eligible_across_failed_and_terminal_rechecks() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    let first_failure = fixture.work_dir.join("maximum-chronology-first-failure");
+    let hook = format!(
+        r#"if [ "$WU_D_PROVIDER_RESUME_INDEX" = 1 ]; then
+  : > {}
+  exit 17
+fi"#,
+        shell_path(&first_failure),
+    );
+    fixture.write_provider(&provider_script(
+        "",
+        &hook,
+        "maximum-chronology-${WU_D_PROVIDER_RESUME_INDEX}.txt",
+    ));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime_with_wake_count(SESSION, i64::MAX);
+    for index in 0..21 {
+        fixture.seed_mailbox(SESSION, &format!("h-maximum-chronology-{index:02}"));
+    }
+    let claim_token = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    acquire_seed_wake_claim(&fixture, claim_token);
+    fixture
+        .sidecar_conn()
+        .execute(
+            "UPDATE session_wake_claim SET auto_wake_count = ?2 WHERE session_id = ?1",
+            rusqlite::params![SESSION, i64::MAX],
+        )
+        .unwrap();
+
+    let first = fixture.run_auto_wake_resume(claim_token, i64::MAX, 1);
+    assert!(
+        first_failure.exists(),
+        "maximum-count failure path was not reached"
+    );
+    assert!(
+        !String::from_utf8_lossy(&first.stderr).contains("attempt to add with overflow"),
+        "maximum chronology overflowed before retry renewal: {first:?}"
+    );
+
+    wait_until(
+        "maximum chronology retry delivered all pending rows",
+        || delivered_rows_without_pending_or_claim(&fixture, SESSION, 21),
+    );
+    let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert_eq!(rows.len(), 21);
+    assert!(rows[..20].iter().all(|row| row.delivery_attempts == 2));
+    assert_eq!(rows[20].delivery_attempts, 1);
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.auto_wake_count, i64::MAX);
     assert_xdg_isolated(&fixture);
 }
 

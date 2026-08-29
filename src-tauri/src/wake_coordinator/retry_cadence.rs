@@ -44,4 +44,16 @@ mod tests {
         assert_eq!(&delays[..6], &[1_000, 2_000, 4_000, 8_000, 16_000, 30_000]);
         assert!(delays[6..].iter().all(|delay| *delay == 30_000));
     }
+
+    #[test]
+    fn maximum_chronology_keeps_retry_delay_at_ceiling() {
+        assert_eq!(
+            bounded_auto_wake_retry_delay_ms(1_000, i64::MAX - 1),
+            AUTO_WAKE_RETRY_MAX_MS
+        );
+        assert_eq!(
+            bounded_auto_wake_retry_delay_ms(1_000, i64::MAX),
+            AUTO_WAKE_RETRY_MAX_MS
+        );
+    }
 }

@@ -809,6 +809,20 @@ fn assert_cargo_inventory_matches(workflow_name: &str, workflow: &Value) {
                 r"^cargo\s+test\s+-p\s+oulipoly-state\s+pid_identity::tests\s*$",
             ));
         }
+        allowed.extend([
+            (
+                "rust-native-wake",
+                r"^cargo\s+test\s+-p\s+oulipoly-agent-runner\s+--lib\s+wake_coordinator::admission::tests::supported_platform_memory_observer_returns_usable_values\s+--\s+--exact\s*$",
+            ),
+            (
+                "rust-native-wake",
+                r"^cargo\s+test\s+-p\s+oulipoly-agent-runner\s+--lib\s+wake_coordinator::admission::tests::unavailable_memory_observation_returns_visible_error_without_stranding_queue\s+--\s+--exact\s*$",
+            ),
+            (
+                "rust-native-wake",
+                r"^cargo\s+test\s+-p\s+oulipoly-agent-runner\s+--test\s+age309_native_wake_domain\s+native_count_five_startup_sweep_reaches_one_detached_provider_turn\s+--\s+--exact\s+--nocapture\s*$",
+            ),
+        ]);
     }
 
     for (job_name, line) in &inventory {
@@ -1347,6 +1361,7 @@ fn assertion_a10_dependency_graph_required_edges() {
         "rust-client-check".to_string(),
         "rust-state-windows".to_string(),
         "rust-state-macos".to_string(),
+        "rust-native-wake".to_string(),
         "rust-integration".to_string(),
     ]);
     let ci_expected_edges = BTreeSet::from([
@@ -1368,6 +1383,10 @@ fn assertion_a10_dependency_graph_required_edges() {
             "rust-state-macos".to_string(),
             "rust-integration".to_string(),
         ),
+        (
+            "rust-native-wake".to_string(),
+            "rust-integration".to_string(),
+        ),
     ]);
     assert_eq!(
         job_name_set(&ci),
@@ -1380,6 +1399,24 @@ fn assertion_a10_dependency_graph_required_edges() {
         "A10: ci.yml dependency graph must contain exactly the required edges, with frontend-check as a leaf"
     );
     assert_acyclic("ci.yml", &ci, "A10");
+    let native_wake_os = sequence_at(
+        job(&ci, "rust-native-wake", "ci.yml"),
+        "ci.yml jobs.rust-native-wake.strategy.matrix.os",
+        &["strategy", "matrix", "os"],
+    )
+    .iter()
+    .map(|value| {
+        value
+            .as_str()
+            .unwrap_or_else(|| panic!("native wake OS must be a string, got {value:?}"))
+            .to_string()
+    })
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        native_wake_os,
+        BTreeSet::from(["macos-latest".to_string(), "windows-latest".to_string()]),
+        "A10: native wake evidence must execute on both shipped non-Linux operating systems"
+    );
 
     let release = release_workflow();
     let release_expected_jobs = BTreeSet::from([

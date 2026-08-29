@@ -122,6 +122,11 @@ fn failed_auto_wake_retains_retry_ownership_during_backoff() {
 }
 
 #[test]
+fn maximum_chronology_stays_eligible_across_failed_and_terminal_rechecks() {
+    cases_batch_sweep::maximum_chronology_stays_eligible_across_failed_and_terminal_rechecks();
+}
+
+#[test]
 fn persisted_count_at_five_allows_startup_sweep_delivery() {
     cases_batch_sweep::persisted_count_at_five_allows_startup_sweep_delivery();
 }
