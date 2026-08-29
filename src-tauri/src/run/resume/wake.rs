@@ -256,7 +256,7 @@ fn ingested_user_turn_confirms_mailbox_delivery(
         .unwrap_or(false)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }

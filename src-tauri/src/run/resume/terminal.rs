@@ -285,6 +285,27 @@ fn handle_ordinary_resume_attempt_terminal_signal(
     terminal_completion_confirmed: bool,
     mailbox_delivery_outcome: Option<wake::MailboxDeliveryOutcome>,
 ) -> Result<ResumeAttemptLoopControl, String> {
+    let confirmed_delivery_evidence = ordinary_confirmed_delivery_evidence(
+        input,
+        result,
+        completion_evidence,
+        terminal_completion_confirmed,
+        mailbox_delivery_outcome.as_ref(),
+    )?;
+    let turn_generation_id = attempt.invocation.id.clone();
+    let confirmed_delivery = match confirmed_delivery_evidence.as_ref() {
+        Some(evidence) => Some(ConfirmedDeliverySettlement {
+            delivery_id: input.mailbox_delivery_nonce.ok_or_else(|| {
+                "confirmed mailbox delivery is missing its delivery nonce".to_string()
+            })?,
+            session_id: input.mailbox_session_id,
+            turn_generation_id: &turn_generation_id,
+            submitted_evidence: &evidence.submitted,
+            confirmed_evidence: &evidence.confirmed,
+            observed_at: current_unix_millis(),
+        }),
+        None => None,
+    };
     let outcome = resume_terminal_disposition_outcome(
         input,
         attempt,
@@ -292,6 +313,7 @@ fn handle_ordinary_resume_attempt_terminal_signal(
         provider_session_id,
         result,
         completion_evidence,
+        confirmed_delivery,
     )?;
     let completion = ResumeCompletionClassification {
         recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
@@ -331,8 +353,59 @@ fn handle_ordinary_resume_attempt_terminal_signal(
         provider,
         provider_session_id,
         result,
+        confirmed_delivery,
         completion,
     )
+}
+
+struct ConfirmedDeliveryEvidence {
+    submitted: String,
+    confirmed: String,
+}
+
+fn ordinary_confirmed_delivery_evidence(
+    input: &ResumeAttemptInput<'_>,
+    result: &executor::ExecutionResult,
+    completion_evidence: wake::ResumeCompletionEvidence<'_>,
+    terminal_completion_confirmed: bool,
+    mailbox_delivery_outcome: Option<&wake::MailboxDeliveryOutcome>,
+) -> Result<Option<ConfirmedDeliveryEvidence>, String> {
+    let completed_success = completion_evidence.recovered_generic_nonzero
+        || super::predicate::completed_attempt_success(result, terminal_completion_confirmed);
+    let delivery_confirmed = matches!(
+        mailbox_delivery_outcome,
+        Some(
+            wake::MailboxDeliveryOutcome::Confirmed
+                | wake::MailboxDeliveryOutcome::ConfirmedPromptAcceptance(_)
+        )
+    );
+    if input.mailbox_delivery_seqs.is_empty() || (!completed_success && !delivery_confirmed) {
+        return Ok(None);
+    }
+
+    let submitted = completion_evidence
+        .prompt_acceptance_confirmation
+        .map(|acceptance| acceptance.prompt_sha256().to_string())
+        .or_else(|| {
+            input
+                .answer
+                .map(|answer| wake::sha256_hex(answer.as_bytes()))
+        })
+        .ok_or_else(|| "confirmed mailbox delivery is missing its composed prompt".to_string())?;
+    let confirmed = completion_evidence
+        .prompt_acceptance_confirmation
+        .map(|acceptance| {
+            format!(
+                "{};prompt_sha256={}",
+                acceptance.protocol(),
+                acceptance.prompt_sha256()
+            )
+        })
+        .unwrap_or_else(|| format!("ordinary_resume_delivery_confirmed;prompt_sha256={submitted}"));
+    Ok(Some(ConfirmedDeliveryEvidence {
+        submitted,
+        confirmed,
+    }))
 }
 
 fn resume_terminal_disposition_outcome(
@@ -342,6 +415,7 @@ fn resume_terminal_disposition_outcome(
     provider_session_id: &str,
     result: &executor::ExecutionResult,
     completion_evidence: wake::ResumeCompletionEvidence<'_>,
+    confirmed_delivery: Option<ConfirmedDeliverySettlement<'_>>,
 ) -> Result<ResumeTerminalDispositionOutcome, String> {
     let disposition_control = apply_resume_terminal_disposition(
         input,
@@ -350,7 +424,7 @@ fn resume_terminal_disposition_outcome(
         provider_session_id,
         result,
         completion_evidence,
-        None,
+        confirmed_delivery,
     )?;
     Ok(mapper::resume_terminal_disposition_outcome(
         disposition_control,

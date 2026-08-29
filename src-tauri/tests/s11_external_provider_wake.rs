@@ -707,6 +707,86 @@ fn trusted_prompt_acceptance_survives_mailbox_projection_failure_without_replay(
 }
 
 #[test]
+fn ordinary_completion_survives_mailbox_projection_failure_without_replay() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let connection = Connection::open(fixture.sidecar_path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_ordinary_mailbox_projection
+             BEFORE UPDATE OF delivered_at ON mailbox
+             WHEN NEW.delivered_at IS NOT NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced ordinary mailbox projection failure');
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let first = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
+    );
+    let first_result = result_envelope(&first);
+    let first_invocation_uuid = first_result["id"].as_str().unwrap();
+    assert_eq!(first_result["status"], "succeeded");
+    assert_eq!(first_result["exit_code"], 0);
+    let pending = fixture.mailbox_row(notification.seq);
+    assert!(pending.delivered_at.is_none(), "{pending:?}");
+    let durable = Connection::open(fixture.state_path())
+        .unwrap()
+        .query_row(
+            "SELECT status, exit_code,
+                    EXISTS(
+                        SELECT 1 FROM session_delivery_acknowledgements
+                        WHERE turn_generation_id = invocations.invocation_uuid
+                          AND confirmed_at IS NOT NULL
+                    )
+             FROM invocations
+             WHERE invocation_uuid = ?1",
+            [first_invocation_uuid],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(durable, ("succeeded".to_string(), 0, true));
+
+    Connection::open(fixture.sidecar_path())
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_ordinary_mailbox_projection;")
+        .unwrap();
+    assert_success(&fixture.run_resume_with_env(
+        "continue after projection recovery",
+        &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
+    ));
+
+    let delivered = fixture.mailbox_row(notification.seq);
+    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
+    assert_eq!(
+        delivered.delivered_by_invocation_uuid.as_deref(),
+        Some(first_invocation_uuid)
+    );
+    let prompts = fixture.recorded_resume_prompts();
+    assert_eq!(prompts.len(), 2, "{prompts:#?}");
+    assert!(prompts[0].contains("age291-detached-child"), "{prompts:#?}");
+    assert!(
+        !prompts[1].contains("age291-detached-child"),
+        "{prompts:#?}"
+    );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
 fn delivery_nonce_does_not_override_a_mismatched_prompt_hash() {
     let fixture = Fixture::new();
     fixture.write_external_provider();

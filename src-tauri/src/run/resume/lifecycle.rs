@@ -187,6 +187,7 @@ pub(super) fn finalize_completed_attempt_for_resume(
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &oulipoly_runtime::executor::ExecutionResult,
+    confirmed_delivery: Option<super::finalization::ConfirmedDeliverySettlement<'_>>,
     completion: ResumeCompletionClassification,
 ) -> Result<ResumeAttemptLoopControl, String> {
     let control = finalize_completed_attempt_control_for_resume(
@@ -195,7 +196,7 @@ pub(super) fn finalize_completed_attempt_for_resume(
         provider,
         provider_session_id,
         result,
-        None,
+        confirmed_delivery,
         &completion,
     )?;
     match control {
