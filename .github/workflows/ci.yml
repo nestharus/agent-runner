@@ -118,6 +118,7 @@ jobs:
 
   rust-native-wake:
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}

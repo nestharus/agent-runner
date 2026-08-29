@@ -707,14 +707,17 @@ fn open_pty_fds(
 ) -> Result<(RawFd, RawFd), io::Error> {
     let mut master_fd = -1;
     let mut slave_fd = -1;
-    let size = *winsize;
+    let mut size = *winsize;
+    let mut terminal = *termios;
+    let size_ptr = std::ptr::addr_of_mut!(size);
+    let terminal_ptr = std::ptr::addr_of_mut!(terminal);
     let rc = unsafe {
         libc::openpty(
             &mut master_fd,
             &mut slave_fd,
             std::ptr::null_mut(),
-            termios,
-            &size,
+            terminal_ptr,
+            size_ptr,
         )
     };
     if rc == -1 {
@@ -896,7 +899,7 @@ fn create_child_session() -> io::Result<()> {
 }
 
 fn make_slave_controlling_terminal(slave_fd: RawFd) -> io::Result<()> {
-    if unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) } == -1 {
+    if unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) } == -1 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

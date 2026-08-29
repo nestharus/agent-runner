@@ -1417,6 +1417,16 @@ fn assertion_a10_dependency_graph_required_edges() {
         BTreeSet::from(["macos-latest".to_string(), "windows-latest".to_string()]),
         "A10: native wake evidence must execute on both shipped non-Linux operating systems"
     );
+    assert_eq!(
+        value_at(
+            job(&ci, "rust-native-wake", "ci.yml"),
+            "ci.yml jobs.rust-native-wake.strategy.fail-fast",
+            &["strategy", "fail-fast"],
+        )
+        .as_bool(),
+        Some(false),
+        "A10: one native wake leg must not cancel evidence collection for the other"
+    );
 
     let release = release_workflow();
     let release_expected_jobs = BTreeSet::from([
