@@ -329,6 +329,7 @@ fn drain_with(
             DrainOutcome::Pressure,
         );
     }
+    reconcile_requested_session_liveness(db, requested_registration_identity)?;
     let now = unix_time_ms()?;
     let stale_before =
         now.saturating_sub(i64::try_from(RESERVATION_STALE_AFTER.as_millis()).unwrap_or(i64::MAX));
@@ -351,6 +352,27 @@ fn drain_with(
         SessionAdmissionAttempt::Empty => DrainOutcome::Empty,
     };
     retain_queued_for_outcome(db, requested_registration_identity, outcome)
+}
+
+fn reconcile_requested_session_liveness(
+    db: &mut MailboxDb,
+    requested_registration_identity: Option<&str>,
+) -> Result<(), String> {
+    let Some(registration_identity) = requested_registration_identity else {
+        return Ok(());
+    };
+    let Some(row) = db.session_admissions().row(registration_identity)? else {
+        return Ok(());
+    };
+    if row.state != "queued" {
+        return Ok(());
+    }
+    let Some(session_id) = row.session_id else {
+        return Ok(());
+    };
+    db.runtime_lifecycle()
+        .reconcile_session_liveness(&session_id)?;
+    Ok(())
 }
 
 fn retain_queued_for_outcome(
@@ -574,7 +596,7 @@ mod tests {
     use oulipoly_state::mailbox::{
         AttachRuntimeGenerationSession, BindRuntimeGenerationRunning, CreateRuntimeGeneration,
         ExitRuntimeGenerationNonOrderly, RuntimeGenerationFence, RuntimeGenerationId,
-        RuntimeTerminalReason,
+        RuntimeLifecycleState, RuntimeTerminalReason,
     };
     use std::sync::{Arc, Barrier, mpsc};
 
@@ -1198,6 +1220,76 @@ mod tests {
                 .unwrap()
                 .state,
             "queued"
+        );
+    }
+
+    #[test]
+    fn dead_running_generation_is_reconciled_before_same_session_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        enqueue(&mut db, "first", Some("session-a"), 1);
+        enqueue(&mut db, "successor", Some("session-a"), 2);
+        drain_one_with(&mut db, config(), roomy_memory).unwrap();
+        let first = db.session_admissions().row("first").unwrap().unwrap();
+        assert!(
+            db.session_admissions()
+                .begin_launch("first", first.claim_token.as_deref().unwrap(), 3)
+                .unwrap()
+        );
+
+        let generation_id = RuntimeGenerationId::new();
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "first",
+                session_id: Some("session-a"),
+                runtime_mode: "headless",
+                provider_name: "test-provider",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        let dead_process = oulipoly_state::pid_identity::ProcessIdentity {
+            os_pid: i64::MAX,
+            os_boot_id: "dead-boot".to_string(),
+            os_pid_starttime_ticks: 1,
+        };
+        db.runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence: RuntimeGenerationFence {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: "first",
+                },
+                spawned_os_pid: dead_process.os_pid,
+                exact_process_identity: &dead_process,
+                os_pgid: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            drain_with(&mut db, config(), roomy_memory, Some("successor"),).unwrap(),
+            DrainOutcome::Admitted
+        );
+        let generation = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(generation.lifecycle_state, RuntimeLifecycleState::Exited);
+        assert_eq!(
+            generation.terminal_reason,
+            Some(RuntimeTerminalReason::RecoveredDead)
+        );
+        assert_eq!(
+            db.session_admissions()
+                .row("successor")
+                .unwrap()
+                .unwrap()
+                .state,
+            "admitted"
         );
     }
 
