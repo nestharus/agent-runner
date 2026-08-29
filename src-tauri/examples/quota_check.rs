@@ -13,12 +13,8 @@ use oulipoly_runtime::quota::{InFlight, RefreshOutcome, is_stale, refresh_provid
 use oulipoly_state::StateDb;
 
 fn main() {
-    let config_dir = dirs::config_dir()
-        .expect("no config dir")
-        .join("oulipoly-agent-runner");
-    let data_dir = dirs::data_dir()
-        .expect("no data dir")
-        .join("oulipoly-agent-runner");
+    let config_dir = oulipoly_state::paths::config_dir().expect("no configured config dir");
+    let data_dir = oulipoly_state::paths::data_dir().expect("no configured data dir");
     let models_dir = config_dir.join("models");
     let providers_path = config_dir.join("providers.toml");
     let db_path = data_dir.join("state.db");

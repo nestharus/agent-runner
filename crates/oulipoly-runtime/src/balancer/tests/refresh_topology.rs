@@ -45,7 +45,15 @@ fn select_provider_clears_stale_next_available_at_when_refresh_shows_healthy() {
             "OULIPOLY_DATA_HOME",
             Some(_lock_dir.path().as_os_str().to_os_string()),
         ),
-        ("OULIPOLY_DATA_DIR", None),
+        (
+            "OULIPOLY_DATA_DIR",
+            Some(
+                _lock_dir
+                    .path()
+                    .join(oulipoly_state::paths::APP_DATA_DIR_NAME)
+                    .into_os_string(),
+            ),
+        ),
     ]);
     let db = StateDb::open(Path::new(":memory:")).unwrap();
     let model = two_provider_model();
@@ -97,7 +105,15 @@ fn select_provider_keeps_marker_when_refresh_shows_exhausted_window() {
             "OULIPOLY_DATA_HOME",
             Some(_lock_dir.path().as_os_str().to_os_string()),
         ),
-        ("OULIPOLY_DATA_DIR", None),
+        (
+            "OULIPOLY_DATA_DIR",
+            Some(
+                _lock_dir
+                    .path()
+                    .join(oulipoly_state::paths::APP_DATA_DIR_NAME)
+                    .into_os_string(),
+            ),
+        ),
     ]);
     let db = StateDb::open(Path::new(":memory:")).unwrap();
     let model = two_provider_model();

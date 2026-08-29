@@ -190,7 +190,7 @@ fn pressure_keeps_initial_request_alive_and_visibly_queued() {
         stderr.contains("\"reason\":\"memory_pressure\""),
         "{stderr}"
     );
-    assert!(stderr.contains("\"queue_position\":1"), "{stderr}");
+    assert!(stderr.contains("\"queue_sequence\":1"), "{stderr}");
 
     let output = fixture
         .runner_command()

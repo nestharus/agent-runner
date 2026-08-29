@@ -54,7 +54,7 @@ struct SessionImportEnvironment {
 }
 
 fn load_session_import_environment() -> Result<SessionImportEnvironment, String> {
-    let config_root = default_config_root();
+    let config_root = default_config_root()?;
     let state = StateDb::open_default().map_err(format_session_import_state_error)?;
     let providers_cfg = load_default_session_import_providers(&config_root)?;
     let models = load_default_session_import_models(&providers_cfg)?;
@@ -75,7 +75,7 @@ fn load_default_session_import_providers(config_root: &Path) -> Result<Providers
 fn load_default_session_import_models(
     providers_cfg: &ProvidersConfig,
 ) -> Result<Vec<ModelConfig>, String> {
-    let mut models = load_models(&default_models_dir(), Some(providers_cfg))
+    let mut models = load_models(&default_models_dir()?, Some(providers_cfg))
         .map_err(|error| format!("Failed to load models: {error}"))?
         .into_values()
         .collect::<Vec<_>>();

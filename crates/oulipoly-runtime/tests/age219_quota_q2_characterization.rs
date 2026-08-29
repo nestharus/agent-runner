@@ -71,7 +71,7 @@ impl Drop for PathOverride {
     }
 }
 
-/// Points `OULIPOLY_DATA_HOME` at a fresh tempdir so the per-account
+/// Points the required data-directory variables at a fresh tempdir so the per-account
 /// auth-refresh single-flight lock's freshness stamp starts empty for this
 /// test (otherwise a reused provider key would coalesce one auth test's
 /// shell-out against another's). Caller MUST hold `env_lock()` for the guard's
@@ -90,7 +90,7 @@ impl DataHomeOverride {
         // SAFETY: callers hold ENV_LOCK for the override's lifetime, serializing
         // this process-global mutation with every other env-mutating test here.
         unsafe {
-            std::env::remove_var("OULIPOLY_DATA_DIR");
+            std::env::set_var("OULIPOLY_DATA_DIR", home.path());
             std::env::set_var("OULIPOLY_DATA_HOME", home.path());
         }
         Self {

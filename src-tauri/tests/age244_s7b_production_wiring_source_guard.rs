@@ -57,8 +57,8 @@ fn s7b_shared_external_provider_identity_resolver_uses_production_state_without_
         "Result<Option<SessionServiceExternalProviderIdentity>, String>",
         "access_resolved_session_for_external_identity(session_id)?",
         "StateDb::open_default().map_err(",
-        "ProvidersConfig::load(&default_config_root().join(\"providers.toml\"))",
-        "load_models(&default_models_dir(), Some(providers))\n        .map_err(",
+        "ProvidersConfig::load(&default_config_root()?.join(\"providers.toml\"))",
+        "load_models(&default_models_dir()?, Some(providers))\n        .map_err(",
         "match state.resolve_resume(models, session_id, None)",
         "Err(ResumeError::NoChainFound { .. })",
         "Err(ResumeError::WrongIdKind { .. })",
@@ -164,12 +164,12 @@ fn s7b_cli_defaults_builds_populated_default_path_provider_registry() {
     let wiring = read_source("src-tauri/src/wiring.rs");
     let cli_defaults = source_between(
         &wiring,
-        "pub fn cli_defaults() -> Self",
+        "pub fn cli_defaults() -> Result<Self, String>",
         "pub fn production(",
     );
 
     for needle in [
-        "let paths = default_cli_runtime_paths();",
+        "let paths = default_cli_runtime_paths()?;",
         "ProviderRegistryOptions::default()",
         ".with_config_root(paths.config_root.clone())",
         ".with_data_root(paths.data_root.clone())",
@@ -191,7 +191,7 @@ fn s10_production_provider_registries_populate_path_entries_from_process_path() 
     let wiring = read_source("src-tauri/src/wiring.rs");
     let cli_defaults = source_between(
         &wiring,
-        "pub fn cli_defaults() -> Self",
+        "pub fn cli_defaults() -> Result<Self, String>",
         "pub fn production(",
     );
     let production = source_between(

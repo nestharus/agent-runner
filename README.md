@@ -43,12 +43,18 @@ Output locations:
 
 The raw binary is at `src-tauri/target/release/oulipoly-agent-runner` (or `.exe` on Windows).
 
-Provider launch admission requires host-memory telemetry so the runner can
-preserve its configured or default memory reserve. Linux requires a mounted
-procfs exposing valid `MemTotal` and `MemAvailable` values (Linux 3.14 or newer);
-macOS and Windows use their native memory APIs. If that telemetry is unavailable,
-the launch fails explicitly before provider spawn instead of waiting indefinitely.
-Automatic mailbox work remains pending for its existing bounded-cadence retry.
+Provider launch admission requires host-memory telemetry and checks current
+available memory against its configured or default admission floor. Linux
+requires a mounted procfs exposing valid `MemTotal` and `MemAvailable` values
+(Linux 3.14 or newer); macOS and Windows use their native memory APIs. Concurrent
+starts are serialized until the preceding provider runtime is running, so a new
+observation cannot race an earlier unstarted provider. Already-running turns do
+not consume count slots or block child launches. The floor is an admission-time
+observation, not a reservation against later provider working-set growth; set an
+explicit floor that includes the deployment's expected post-start growth. If
+telemetry is unavailable, the launch fails explicitly before provider spawn
+instead of waiting indefinitely. Automatic mailbox work remains pending for its
+existing bounded-cadence retry.
 
 ### Manual install (Linux/macOS)
 
@@ -289,11 +295,20 @@ After the normal stale-refresh pass, balanced CLI routing also compares live quo
 
 Provider state is keyed by the provider's `name` field (the CLI account — e.g. `claude`, `claude2`) and is shared across every model routed through that account. This means two models pointing at the same provider share quota and error history.
 
-**Persistent state**: invocation history, quota snapshots, and ingested session turns live in SQLite at `~/.local/share/oulipoly-agent-runner/state.db`. No daemon or background process — state is shared via filesystem-level SQLite WAL locking, so multiple CLI invocations coordinate safely.
+**Persistent state**: set `OULIPOLY_DATA_DIR` to the application data directory before running any command. The runner does not infer this location from XDG, HOME, the current directory, the executable location, or the build profile:
+
+```bash
+export OULIPOLY_DATA_DIR="$HOME/.local/share/oulipoly-agent-runner"
+export OULIPOLY_CONFIG_HOME="$HOME/.config"
+```
+
+Invocation history, quota snapshots, and ingested session turns then live at `$OULIPOLY_DATA_DIR/state.db`; the PID-identity/mailbox sidecar, payload store, and application lock files use the same explicit root. An unset `OULIPOLY_DATA_DIR` is an error in installed, development, and test environments. No daemon or background process is required: state is shared through filesystem-level SQLite WAL locking, so multiple CLI invocations coordinate safely.
+
+Application configuration lives under `$OULIPOLY_CONFIG_HOME/oulipoly-agent-runner`. An explicitly set `XDG_CONFIG_HOME` is accepted when `OULIPOLY_CONFIG_HOME` is absent, but the runner does not derive an application config location from HOME, the executable, or the current directory.
 
 ### `providers.toml`
 
-Create `~/.config/oulipoly-agent-runner/providers.toml` with one entry per provider account. This is the runtime config for that account: how to invoke the CLI, how prompts are passed, how resume is composed, where local session files live, and optional quota/auth hooks.
+Create `$OULIPOLY_CONFIG_HOME/oulipoly-agent-runner/providers.toml` with one entry per provider account. This is the runtime config for that account: how to invoke the CLI, how prompts are passed, how resume is composed, where local session files live, and optional quota/auth hooks.
 
 ```toml
 [claude]
@@ -842,7 +857,7 @@ SQL is for ad-hoc debugging when `trace` or `oulipoly-agent-runner session locat
 
 ```bash
 # All invocations for one account today
-sqlite3 ~/.local/share/oulipoly-agent-runner/state.db "
+sqlite3 "$OULIPOLY_DATA_DIR/state.db" "
   SELECT invocation_uuid, model_name, status, created_at
   FROM invocations
   WHERE provider_name = 'claude2'
@@ -873,10 +888,10 @@ Falls back to heuristic keyword matching if the diagnostics model itself fails.
 
 ## Configuration
 
-All user config lives in `~/.config/oulipoly-agent-runner/`:
+All user config lives in `$OULIPOLY_CONFIG_HOME/oulipoly-agent-runner/`:
 
 ```
-~/.config/oulipoly-agent-runner/
+$OULIPOLY_CONFIG_HOME/oulipoly-agent-runner/
   config.toml          Global settings
   providers.toml       Per-provider runtime config, resume/session storage, quota scripts
   sessions.toml        Per-provider turn ingestion + transcript locator adapters

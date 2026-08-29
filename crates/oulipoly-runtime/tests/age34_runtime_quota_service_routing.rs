@@ -39,10 +39,8 @@ fn env_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Points `OULIPOLY_DATA_HOME` at a fresh tempdir for the lifetime of the
-/// guard, and scrubs the higher-precedence `OULIPOLY_DATA_DIR`, so the
-/// per-account auth-refresh single-flight lock's freshness stamp starts empty
-/// and never bleeds across tests or test binaries.
+/// Points the required data-directory variables at a fresh tempdir so the
+/// per-account auth-refresh single-flight lock's freshness stamp starts empty.
 struct DataHomeOverride {
     _home: tempfile::TempDir,
     _lock: MutexGuard<'static, ()>,
@@ -58,7 +56,7 @@ impl DataHomeOverride {
         let previous_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
         // SAFETY: the held ENV_LOCK serializes this process-global mutation.
         unsafe {
-            std::env::remove_var("OULIPOLY_DATA_DIR");
+            std::env::set_var("OULIPOLY_DATA_DIR", home.path());
             std::env::set_var("OULIPOLY_DATA_HOME", home.path());
         }
         Self {

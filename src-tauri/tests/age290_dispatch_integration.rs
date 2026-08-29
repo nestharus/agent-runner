@@ -1052,7 +1052,7 @@ fn isolated_command(config_home: &Path, data_home: &Path) -> Command {
     command.env("XDG_CONFIG_HOME", config_home);
     command.env("XDG_DATA_HOME", data_home);
     command.env("HOME", data_home);
-    command.env_remove("OULIPOLY_DATA_DIR");
+    command.env("OULIPOLY_DATA_DIR", data_home.join("oulipoly-agent-runner"));
     command.env_remove("OULIPOLY_AUTO_WAKE");
     command.env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID");
     command.env_remove("OULIPOLY_AUTO_WAKE_TOKEN");

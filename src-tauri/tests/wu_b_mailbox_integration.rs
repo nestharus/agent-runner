@@ -94,7 +94,10 @@ impl Fixture {
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env("HOME", &self.home_dir);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.env_remove("OULIPOLY_AUTO_WAKE");
         cmd.env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID");
@@ -221,6 +224,22 @@ impl Fixture {
             .arg("--json");
         if apply {
             cmd.arg("--apply");
+        }
+        self.run(cmd)
+    }
+
+    fn run_mailbox_prune(&self, limit: usize, apply: bool, vacuum: bool) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.arg("mailbox")
+            .arg("prune-terminal")
+            .arg("--limit")
+            .arg(limit.to_string())
+            .arg("--json");
+        if apply {
+            cmd.arg("--apply");
+        }
+        if vacuum {
+            cmd.arg("--vacuum");
         }
         self.run(cmd)
     }
@@ -1214,6 +1233,61 @@ fn mailbox_compact_delivered_is_dry_run_by_default_and_hydrates_list_output() {
         stdout_json(&listed)["rows"][0]["payload_json"],
         original_payload
     );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn mailbox_terminal_prune_is_dry_run_by_default_and_vacuums_without_backup() {
+    let fixture = Fixture::new();
+    let sidecar_path = fixture.sidecar_path();
+    drop(MailboxDb::open(&sidecar_path).unwrap());
+    Connection::open(&sidecar_path)
+        .unwrap()
+        .execute_batch(
+            "WITH RECURSIVE sequence(value) AS (
+                 SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 1026
+             )
+             INSERT INTO mailbox (
+                 session_id, kind, handle, payload_json, enqueued_at, delivered_at,
+                 state_dir, meta_path, log_path, rc_path, rc
+             )
+             SELECT 'retention-session', 'agent_bash_complete',
+                    printf('retention-handle-%04d', value), '{}',
+                    '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z',
+                    '/tmp/state', '/tmp/meta', '/tmp/log', '/tmp/rc', 0
+             FROM sequence;
+
+             WITH RECURSIVE sequence(value) AS (
+                 SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 1026
+             )
+             INSERT INTO mailbox_delivery_attempts (
+                 attempt_id, session_id, delivery_invocation_uuid, created_at,
+                 prepared_remaining_count, resolved_at
+             )
+             SELECT printf('retention-attempt-%04d', value), 'retention-session',
+                    'retention-delivery', printf('2026-08-01T00:%02d:00Z', value % 60),
+                    0, '2026-08-01T01:00:00Z'
+             FROM sequence;",
+        )
+        .unwrap();
+
+    let dry_run = fixture.run_mailbox_prune(1, false, false);
+    assert!(dry_run.status.success(), "{dry_run:?}");
+    let dry_run_json = stdout_json(&dry_run);
+    assert_eq!(dry_run_json["applied"], false);
+    assert_eq!(dry_run_json["before"]["prunable_mailbox_rows"], 2);
+    assert_eq!(dry_run_json["before"]["prunable_delivery_attempts"], 2);
+
+    let apply = fixture.run_mailbox_prune(1, true, true);
+    assert!(apply.status.success(), "{apply:?}");
+    let apply_json = stdout_json(&apply);
+    assert_eq!(apply_json["applied"], true);
+    assert_eq!(apply_json["vacuumed"], true);
+    assert_eq!(apply_json["report"]["mailbox_rows_deleted"], 1);
+    assert_eq!(apply_json["report"]["delivery_attempts_deleted"], 1);
+    assert_eq!(apply_json["after"]["prunable_mailbox_rows"], 1);
+    assert_eq!(apply_json["after"]["prunable_delivery_attempts"], 1);
+    assert!(!sidecar_path.with_extension("db.backup").exists());
     fixture.assert_default_user_paths_untouched();
 }
 

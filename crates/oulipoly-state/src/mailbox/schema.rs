@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 8;
+pub(super) const CURRENT_VERSION: i64 = 11;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -87,6 +87,21 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 8,
         owner: SidecarEntity::WakeAndSessionMetadata,
         apply: ensure_wake_sweep_progress_schema,
+    },
+    MigrationStep {
+        target_version: 9,
+        owner: SidecarEntity::SessionAdmission,
+        apply: ensure_session_admission_scaling_indexes,
+    },
+    MigrationStep {
+        target_version: 10,
+        owner: SidecarEntity::PayloadRetention,
+        apply: ensure_terminal_history_retention_schema,
+    },
+    MigrationStep {
+        target_version: 11,
+        owner: SidecarEntity::PayloadRetention,
+        apply: ensure_terminal_payload_lookup_indexes,
     },
 ];
 
@@ -249,6 +264,19 @@ fn ensure_session_admission_schema(conn: &Connection) -> Result<(), String> {
 
 fn ensure_session_admission_launcher_identity_schema(conn: &Connection) -> Result<(), String> {
     super::ensure_session_admission_launcher_identity_schema(conn)
+}
+
+fn ensure_session_admission_scaling_indexes(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(super::session_admission_scaling_indexes_definition())
+        .map_err(|err| format!("Failed to ensure session admission scaling indexes: {err}"))
+}
+
+fn ensure_terminal_history_retention_schema(conn: &Connection) -> Result<(), String> {
+    super::ensure_terminal_history_retention_schema(conn)
+}
+
+fn ensure_terminal_payload_lookup_indexes(conn: &Connection) -> Result<(), String> {
+    super::ensure_terminal_payload_lookup_indexes(conn)
 }
 
 fn ensure_wake_and_session_metadata_schema(conn: &Connection) -> Result<(), String> {

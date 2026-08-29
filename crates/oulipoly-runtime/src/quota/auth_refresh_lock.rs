@@ -130,7 +130,7 @@ struct AuthRefreshLock {
 
 impl AuthRefreshLock {
     fn acquire_blocking(account_key: &str) -> Result<Self, String> {
-        let path = lock_path(account_key);
+        let path = lock_path(account_key)?;
         ensure_parent_dir(&path)?;
         let file = open_lock_file(&path)?;
         lock_file(&file, &path)?;
@@ -183,12 +183,12 @@ impl Drop for AuthRefreshLock {
     }
 }
 
-fn lock_path(account_key: &str) -> PathBuf {
-    auth_refresh_lock_dir().join(format!("{}.lock", sanitize_lock_name(account_key)))
+fn lock_path(account_key: &str) -> Result<PathBuf, String> {
+    auth_refresh_lock_dir().map(|dir| dir.join(format!("{}.lock", sanitize_lock_name(account_key))))
 }
 
-fn auth_refresh_lock_dir() -> PathBuf {
-    app_data_dir().join("auth-refresh-locks")
+fn auth_refresh_lock_dir() -> Result<PathBuf, String> {
+    app_data_dir().map(|dir| dir.join("auth-refresh-locks"))
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), String> {

@@ -457,7 +457,10 @@ cwd_script = {cwd_script:?}
         cmd.args(extra_args);
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env("PATH", path);
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.output().unwrap()

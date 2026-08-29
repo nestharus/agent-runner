@@ -155,8 +155,9 @@ impl Fixture {
     fn base_command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_dir);
-        cmd.env("XDG_DATA_HOME", self.dir.path().join("xdg-data"));
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        let data_home = self.dir.path().join("xdg-data");
+        cmd.env("XDG_DATA_HOME", &data_home);
+        cmd.env("OULIPOLY_DATA_DIR", data_home.join("oulipoly-agent-runner"));
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         let prior_path = std::env::var_os("PATH").unwrap_or_default();
         let path_entries = std::iter::once(self.provider_bin_dir.clone())
@@ -5131,7 +5132,11 @@ fn assert_live_command_guard(cmd: &Command, fixture: &Fixture) {
 
     assert_command_env_eq(cmd, "XDG_CONFIG_HOME", &fixture.config_dir);
     assert_command_env_eq(cmd, "XDG_DATA_HOME", &fixture.dir.path().join("xdg-data"));
-    assert_command_env_removed(cmd, "OULIPOLY_DATA_DIR");
+    assert_command_env_eq(
+        cmd,
+        "OULIPOLY_DATA_DIR",
+        &fixture.dir.path().join("xdg-data/oulipoly-agent-runner"),
+    );
     let path = command_env_value(cmd, "PATH")
         .unwrap_or_else(|| panic!("PATH not set on guarded command"))
         .unwrap_or_else(|| panic!("PATH was removed on guarded command"));
@@ -5144,13 +5149,6 @@ fn assert_command_env_eq(cmd: &Command, key: &str, expected: &Path) {
         .unwrap_or_else(|| panic!("{key} not set on command"))
         .unwrap_or_else(|| panic!("{key} was removed on command"));
     assert_eq!(Path::new(&value), expected);
-}
-
-fn assert_command_env_removed(cmd: &Command, key: &str) {
-    assert!(
-        matches!(command_env_value(cmd, key), Some(None)),
-        "{key} was not explicitly removed"
-    );
 }
 
 fn command_env_value(cmd: &Command, key: &str) -> Option<Option<std::ffi::OsString>> {

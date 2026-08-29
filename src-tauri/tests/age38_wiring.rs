@@ -103,14 +103,14 @@ fn assert_service_port_fields(source: &str) {
 
 fn construct_runtime_services() {
     let dir = tempfile::tempdir().unwrap();
-    let _cli_services = AgentRuntimeServices::cli_defaults();
+    let _cli_services = AgentRuntimeServices::cli_defaults().expect("CLI services");
     let _production_services =
         AgentRuntimeServices::production(runtime_paths(dir.path())).expect("production services");
 }
 
 fn constructor_markers() -> [&'static str; 2] {
     [
-        "pub fn cli_defaults() -> Self",
+        "pub fn cli_defaults() -> Result<Self, String>",
         "pub fn production(paths: RuntimePaths)",
     ]
 }

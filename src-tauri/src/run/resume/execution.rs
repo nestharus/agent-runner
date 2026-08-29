@@ -152,23 +152,22 @@ fn refresh_resume_provider_registry(
     env: &ResumeExecutionEnvironment,
 ) -> Result<(), String> {
     let models = mapper::resume_provider_models(&env.models);
-    let registry = mapper::resume_provider_registry(&models, resume_provider_registry_options(env))
-        .map_err(formatter::resume_provider_registry_failure)?;
+    let registry =
+        mapper::resume_provider_registry(&models, resume_provider_registry_options(env)?)
+            .map_err(formatter::resume_provider_registry_failure)?;
     agent_runtime_services
         .provider_registry_handle
         .replace(Arc::new(registry));
     Ok(())
 }
 
-fn resume_provider_registry_options(env: &ResumeExecutionEnvironment) -> ProviderRegistryOptions {
-    ProviderRegistryOptions::default()
+fn resume_provider_registry_options(
+    env: &ResumeExecutionEnvironment,
+) -> Result<ProviderRegistryOptions, String> {
+    Ok(ProviderRegistryOptions::default()
         .with_path_entries_from_process_path()
         .with_config_root(env.config_root.clone())
-        .with_data_root(resume_provider_registry_data_root(env))
-}
-
-fn resume_provider_registry_data_root(env: &ResumeExecutionEnvironment) -> PathBuf {
-    oulipoly_state::paths::data_dir().unwrap_or_else(|_| env.config_root.clone())
+        .with_data_root(oulipoly_state::paths::data_dir()?))
 }
 
 fn headless_resume_retry_budget(resolved: &oulipoly_state::ResolvedResume) -> usize {

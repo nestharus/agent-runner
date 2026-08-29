@@ -56,7 +56,7 @@ fn lookup_agent_by_name(
     agent_config: &dyn AgentConfigRepository,
     name: &str,
 ) -> Result<AgentConfig, String> {
-    let agents_dir = resolve_agents_dir(cli);
+    let agents_dir = resolve_agents_dir(cli)?;
     let agents = agent_config.load_agents(&agents_dir)?;
     agents
         .get(name)

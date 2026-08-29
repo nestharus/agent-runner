@@ -156,7 +156,10 @@ fn scan_provider_with_timeout(
         return report;
     };
 
-    let state_dir = resolve_state_dir(provider_name, entry);
+    let state_dir = match resolve_state_dir(provider_name, entry) {
+        Ok(state_dir) => state_dir,
+        Err(error) => return scan_report_with_error(report, error),
+    };
     if let Err(error) = create_session_state_dir(&state_dir) {
         return scan_report_with_error(report, error);
     }
@@ -183,7 +186,10 @@ fn scan_provider_session_with_timeout(
         return report;
     };
 
-    let state_dir = resolve_state_dir(provider_name, entry);
+    let state_dir = match resolve_state_dir(provider_name, entry) {
+        Ok(state_dir) => state_dir,
+        Err(error) => return scan_report_with_error(report, error),
+    };
     if let Err(error) = create_session_state_dir(&state_dir) {
         return scan_report_with_error(report, error);
     }
@@ -616,17 +622,11 @@ fn sort_provider_scan_reports(mut reports: Vec<(String, ScanReport)>) -> Vec<(St
     reports
 }
 
-fn resolve_state_dir(provider_name: &str, entry: &SessionSourceEntry) -> PathBuf {
+fn resolve_state_dir(provider_name: &str, entry: &SessionSourceEntry) -> Result<PathBuf, String> {
     if let Some(dir) = &entry.state_dir {
-        return dir.clone();
+        return Ok(dir.clone());
     }
-    let base = default_app_data_dir().join("sessions");
-    base.join(provider_name)
-}
-
-fn default_app_data_dir() -> PathBuf {
-    oulipoly_state::paths::data_dir()
-        .unwrap_or_else(|_| PathBuf::from(".").join(oulipoly_state::paths::APP_DATA_DIR_NAME))
+    oulipoly_state::paths::data_dir().map(|base| base.join("sessions").join(provider_name))
 }
 
 fn run_turn_script(
@@ -649,7 +649,7 @@ pub fn locate_transcript(
         return Ok(None);
     };
 
-    let state_dir = resolve_state_dir(provider_name, entry);
+    let state_dir = resolve_state_dir(provider_name, entry)?;
     create_session_state_dir(&state_dir)?;
 
     let stdout = run_session_script(locator, &state_dir, Some(session_id), "transcript locator")?;
@@ -980,7 +980,7 @@ mod tests {
             SessionSourceEntry {
                 turn_script: script_path.to_string_lossy().into_owned(),
                 transcript_locator: None,
-                state_dir: None,
+                state_dir: script_path.parent().map(std::path::Path::to_path_buf),
             },
         );
         SessionsConfig { entries }

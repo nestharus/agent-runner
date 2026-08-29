@@ -1,15 +1,34 @@
-//! Default agent-runner data path resolution.
+//! Agent-runner data path resolution.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub const APP_DATA_DIR_NAME: &str = "oulipoly-agent-runner";
 pub const DATA_DIR_ENV: &str = "OULIPOLY_DATA_DIR";
+pub const CONFIG_HOME_ENV: &str = "OULIPOLY_CONFIG_HOME";
+const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
 
 pub fn data_dir() -> Result<PathBuf, String> {
     std::env::var_os(DATA_DIR_ENV)
+        .ok_or_else(|| {
+            format!(
+                "{DATA_DIR_ENV} is not set; set it to the runner's application data directory, for example: export {DATA_DIR_ENV}=/path/to/oulipoly-data"
+            )
+        })
         .map(PathBuf::from)
-        .map(absolutize_configured_data_dir)
-        .unwrap_or_else(default_data_dir)
+        .and_then(absolutize_configured_data_dir)
+}
+
+pub fn config_dir() -> Result<PathBuf, String> {
+    std::env::var_os(CONFIG_HOME_ENV)
+        .or_else(|| std::env::var_os(XDG_CONFIG_HOME_ENV))
+        .ok_or_else(|| {
+            format!(
+                "{CONFIG_HOME_ENV} is not set; set it to the runner's configuration home, for example: export {CONFIG_HOME_ENV}=/path/to/config-home"
+            )
+        })
+        .map(PathBuf::from)
+        .and_then(absolutize_configured_config_home)
+        .map(|home| home.join(APP_DATA_DIR_NAME))
 }
 
 fn absolutize_configured_data_dir(path: PathBuf) -> Result<PathBuf, String> {
@@ -21,43 +40,20 @@ fn absolutize_configured_data_dir(path: PathBuf) -> Result<PathBuf, String> {
         .map_err(|error| format!("Could not resolve relative {DATA_DIR_ENV}: {error}"))
 }
 
-fn default_data_dir() -> Result<PathBuf, String> {
-    if running_under_test_harness() {
-        return Err(
-            "refusing to resolve the production data dir in a test or bench binary; set \
-             OULIPOLY_DATA_DIR to an isolated temp dir"
-                .to_string(),
-        );
+fn absolutize_configured_config_home(path: PathBuf) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path);
     }
-    default_data_dir_unchecked()
-}
-
-fn default_data_dir_unchecked() -> Result<PathBuf, String> {
-    let data_dir =
-        dirs::data_dir().ok_or_else(|| "Could not determine data directory".to_string())?;
-    Ok(data_dir.join(APP_DATA_DIR_NAME))
-}
-
-fn running_under_test_harness() -> bool {
-    cfg!(test)
-        || std::env::current_exe()
-            .map(|path| path_has_deps_component(&path))
-            .unwrap_or(false)
-}
-
-fn path_has_deps_component(path: &Path) -> bool {
-    path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::Normal(name) if name == std::ffi::OsStr::new("deps")
-        )
-    })
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .map_err(|error| format!("Could not resolve relative {CONFIG_HOME_ENV}: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::path::Path;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     struct EnvGuard {
@@ -95,33 +91,14 @@ mod tests {
     }
 
     #[test]
-    fn deps_component_marks_cargo_test_binary_path() {
-        let path = Path::new("/repo/target/debug/deps/foo-abc123");
-
-        assert!(path_has_deps_component(path));
-    }
-
-    #[test]
-    fn production_binary_paths_do_not_mark_test_binary() {
-        for path in [
-            Path::new("/home/nes/.local/bin/agents"),
-            Path::new("/repo/target/release/agents"),
-        ] {
-            assert!(!path_has_deps_component(path));
-        }
-    }
-
-    #[test]
-    fn data_dir_refuses_production_default_under_test_without_override() {
+    fn data_dir_requires_explicit_environment_even_when_xdg_is_set() {
         let dir = tempfile::tempdir().unwrap();
         let _guard = EnvGuard::set(None, Some(dir.path()));
 
         let error = data_dir().unwrap_err();
 
-        assert!(
-            error.contains("refusing to resolve the production data dir in a test or bench binary"),
-            "unexpected error: {error}"
-        );
+        assert!(error.contains("OULIPOLY_DATA_DIR is not set"), "{error}");
+        assert!(error.contains("export OULIPOLY_DATA_DIR="), "{error}");
     }
 
     #[test]
@@ -143,18 +120,6 @@ mod tests {
         assert_eq!(
             data_dir().unwrap(),
             std::env::current_dir().unwrap().join(relative)
-        );
-    }
-
-    #[test]
-    fn unchecked_default_keeps_xdg_fallback_shape_for_production() {
-        let dir = tempfile::tempdir().unwrap();
-        let xdg = dir.path().join("xdg-data");
-        let _guard = EnvGuard::set(None, Some(&xdg));
-
-        assert_eq!(
-            default_data_dir_unchecked().unwrap(),
-            xdg.join(APP_DATA_DIR_NAME)
         );
     }
 

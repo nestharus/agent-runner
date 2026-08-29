@@ -111,7 +111,7 @@ impl Fixture {
             .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
             .env("WAKE_CONFIRM_WORK_DIR", &self.work_dir)
             .env("WAKE_CONFIRM_EXPORT_DIR", &self.export_dir)
-            .env_remove("OULIPOLY_DATA_DIR")
+            .env("OULIPOLY_DATA_DIR", self.app_data_dir())
             .env_remove("OULIPOLY_AUTO_WAKE")
             .env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID")
             .env_remove("OULIPOLY_AUTO_WAKE_TOKEN")

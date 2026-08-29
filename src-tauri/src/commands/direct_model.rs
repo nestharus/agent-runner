@@ -55,8 +55,8 @@ struct CliExecutionContextParts {
 }
 
 fn load_cli_execution_context_parts(cli: &Cli) -> Result<CliExecutionContextParts, String> {
-    let providers_cfg = load_providers_config();
-    let models_dir = crate::cli::paths::resolve_models_dir(cli);
+    let providers_cfg = load_providers_config()?;
+    let models_dir = crate::cli::paths::resolve_models_dir(cli)?;
     let models = load_cli_models(&models_dir, &providers_cfg)?;
     let extra_inputs = parse_cli_extra_inputs(cli)?;
     Ok(cli_execution_context_parts(
@@ -78,9 +78,11 @@ fn cli_execution_context_parts(
     }
 }
 
-fn load_providers_config() -> ProvidersConfig {
-    ProvidersConfig::load(&crate::cli::paths::default_config_root().join("providers.toml"))
-        .unwrap_or_default()
+fn load_providers_config() -> Result<ProvidersConfig, String> {
+    Ok(
+        ProvidersConfig::load(&crate::cli::paths::default_config_root()?.join("providers.toml"))
+            .unwrap_or_default(),
+    )
 }
 
 fn load_cli_models(

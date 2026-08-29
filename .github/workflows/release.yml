@@ -19,6 +19,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  OULIPOLY_DATA_DIR: ${{ github.workspace }}/target/ci-data
+  OULIPOLY_DATA_HOME: ${{ github.workspace }}/target/ci-data-home
+  XDG_CONFIG_HOME: ${{ github.workspace }}/target/ci-config-home
+  XDG_DATA_HOME: ${{ github.workspace }}/target/ci-xdg-data
+  XDG_CACHE_HOME: ${{ github.workspace }}/target/ci-cache
 
 jobs:
   prepare-matrix:

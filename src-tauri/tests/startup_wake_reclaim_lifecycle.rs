@@ -279,7 +279,7 @@ fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
         .env("TMPDIR", &snapshot_temp)
         .env("OULIPOLY_WAKE_RECLAIM_HANDOFF_OWNER", owner_token)
         .env("OULIPOLY_WAKE_RECLAIM_HANDOFF_TOKEN", handoff_token)
-        .env_remove("OULIPOLY_DATA_DIR")
+        .env("OULIPOLY_DATA_DIR", &data_root)
         .env_remove("OULIPOLY_PARENT_INVOCATION")
         .output()
         .unwrap();
@@ -349,7 +349,7 @@ fn runner_command(
         .env("XDG_DATA_HOME", data_home)
         .env("HOME", home)
         .env("TMPDIR", snapshot_temp)
-        .env_remove("OULIPOLY_DATA_DIR")
+        .env("OULIPOLY_DATA_DIR", data_home.join("oulipoly-agent-runner"))
         .env_remove("OULIPOLY_PARENT_INVOCATION");
     command
 }

@@ -61,7 +61,13 @@ fn lock_dir_env_vars(
     extra_env: Vec<(&'static str, Option<std::ffi::OsString>)>,
 ) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
     let mut vars = vec![
-        ("OULIPOLY_DATA_DIR", None),
+        (
+            "OULIPOLY_DATA_DIR",
+            Some(
+                path.join(oulipoly_state::paths::APP_DATA_DIR_NAME)
+                    .into_os_string(),
+            ),
+        ),
         ("OULIPOLY_DATA_HOME", Some(path.as_os_str().to_os_string())),
     ];
     vars.extend(extra_env);
@@ -289,7 +295,7 @@ fn stale_marker_with_failed_quota_script_keeps_marker_and_failure_class() {
 }
 
 #[test]
-fn lock_name_sanitization_and_lock_dir_env_precedence_are_stable() {
+fn lock_name_sanitization_and_required_lock_dir_are_stable() {
     assert_eq!(lock::sanitize_lock_name("az-AZ_09"), "az-AZ_09");
     assert_eq!(lock::sanitize_lock_name("a/b c.☃"), "a_b_c__");
 
@@ -312,47 +318,8 @@ fn lock_name_sanitization_and_lock_dir_env_precedence_are_stable() {
             ),
         ]);
         assert_eq!(
-            lock::usage_lock_dir(),
+            lock::usage_lock_dir().unwrap(),
             pinned_home.path().join("usage-refresh-locks")
-        );
-    }
-
-    {
-        let _env_guard = EnvGuard::set_many(vec![
-            ("OULIPOLY_DATA_DIR", None),
-            (
-                "OULIPOLY_DATA_HOME",
-                Some(oulipoly_home.path().as_os_str().to_os_string()),
-            ),
-            (
-                "XDG_DATA_HOME",
-                Some(xdg_home.path().as_os_str().to_os_string()),
-            ),
-        ]);
-        assert_eq!(
-            lock::usage_lock_dir(),
-            oulipoly_home
-                .path()
-                .join("oulipoly-agent-runner")
-                .join("usage-refresh-locks")
-        );
-    }
-
-    {
-        let _env_guard = EnvGuard::set_many(vec![
-            ("OULIPOLY_DATA_DIR", None),
-            ("OULIPOLY_DATA_HOME", None),
-            (
-                "XDG_DATA_HOME",
-                Some(xdg_home.path().as_os_str().to_os_string()),
-            ),
-        ]);
-        assert_eq!(
-            lock::usage_lock_dir(),
-            xdg_home
-                .path()
-                .join("oulipoly-agent-runner")
-                .join("usage-refresh-locks")
         );
     }
 }
@@ -511,7 +478,10 @@ fn lock_dir_create_failure_retains_marker() {
     let file_root = dir.path().join("not-a-directory");
     std::fs::write(&file_root, "").unwrap();
     let _env_guard = EnvGuard::set_many(vec![
-        ("OULIPOLY_DATA_DIR", None),
+        (
+            "OULIPOLY_DATA_DIR",
+            Some(file_root.as_os_str().to_os_string()),
+        ),
         (
             "OULIPOLY_DATA_HOME",
             Some(file_root.as_os_str().to_os_string()),

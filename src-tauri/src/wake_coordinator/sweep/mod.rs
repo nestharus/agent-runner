@@ -659,10 +659,7 @@ mod tests {
             write_wake_sweep_lease(&mailbox_path, &lease).unwrap();
         }
 
-        let second = match try_acquire_wake_sweep_admission(&mailbox_path).unwrap() {
-            WakeSweepAdmissionAttempt::Acquired(admission) => admission,
-            _ => panic!("an expired owner must not suppress a later sweep"),
-        };
+        let second = reacquire_wake_sweep_admission_after_release(&mailbox_path);
         assert_ne!(second.token, first_token);
         drop(first);
         assert_eq!(

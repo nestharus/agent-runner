@@ -112,7 +112,10 @@ impl Fixture {
         cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
         cmd.env("XDG_STATE_HOME", &self.state_home);
         cmd.env("HOME", &self.home_dir);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.output().unwrap()
     }
@@ -205,7 +208,10 @@ impl Fixture {
         cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
         cmd.env("XDG_STATE_HOME", &self.state_home);
         cmd.env("HOME", &self.home_dir);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
     }
 
@@ -932,17 +938,13 @@ fn real_broker_ack_clear_fault_retains_obligation_without_duplicate_delivery() {
     let first_value = stdout_json(&first);
     assert_eq!(first_value["pty_delivery"]["status"], "evidence_pending");
     assert_eq!(first_value["pty_delivery"]["submitted"], true);
-    let first_output = read_until(
+    let first_received = read_pty_until_file_occurrences(
         pty.master.as_raw_fd(),
-        "GOT_NOTIFY_1",
+        &received_log,
+        "[END OULIPOLY NOTIFICATIONS]",
+        1,
         Duration::from_secs(5),
     );
-    if !first_output.contains("GOT_NOTIFY_1") {
-        let _ = repl.kill();
-        let _ = repl.wait();
-        panic!("first notification did not reach provider: {first_output:?}");
-    }
-    let first_received = fs::read_to_string(&received_log).unwrap();
     let first_attempt_id = delivery_attempt_id(&first_received);
     assert_delivered_with_pending_evidence(&fixture, "h-clear-fault-first", &first_attempt_id);
     assert_eq!(
@@ -959,17 +961,13 @@ fn real_broker_ack_clear_fault_retains_obligation_without_duplicate_delivery() {
     );
     assert_success(&recovery);
     assert_eq!(stdout_json(&recovery)["pty_delivery"]["status"], "acked");
-    let second_output = read_until(
+    let received = read_pty_until_file_occurrences(
         pty.master.as_raw_fd(),
-        "GOT_NOTIFY_2",
+        &received_log,
+        "[END OULIPOLY NOTIFICATIONS]",
+        2,
         Duration::from_secs(5),
     );
-    if !second_output.contains("GOT_NOTIFY_2") {
-        let _ = repl.kill();
-        let _ = repl.wait();
-        panic!("recovery notification did not reach provider: {second_output:?}");
-    }
-    let received = fs::read_to_string(&received_log).unwrap();
     assert_eq!(received.matches("handle: h-clear-fault-first").count(), 1);
     assert_eq!(
         received
@@ -1457,17 +1455,13 @@ fn real_broker_confirmation_fault_recovers_from_transcript_without_retransmit() 
         "submission_uncertain"
     );
     assert_eq!(first_value["pty_delivery"]["submitted"], true);
-    let first_output = read_until(
+    let first_received = read_pty_until_file_occurrences(
         pty.master.as_raw_fd(),
-        "GOT_NOTIFY_1",
+        &received_log,
+        "[END OULIPOLY NOTIFICATIONS]",
+        1,
         Duration::from_secs(5),
     );
-    if !first_output.contains("GOT_NOTIFY_1") {
-        let _ = repl.kill();
-        let _ = repl.wait();
-        panic!("uncertain notification did not reach provider: {first_output:?}");
-    }
-    let first_received = fs::read_to_string(&received_log).unwrap();
     let attempt_id = delivery_attempt_id(&first_received);
     let mailbox = fixture.mailbox();
     let first_rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
@@ -1560,16 +1554,13 @@ fn real_broker_confirmation_fault_recovers_from_transcript_without_retransmit() 
         confirmed_value["pty_delivery"]["status"], "acked",
         "unexpected transcript-confirmed diagnostic: {confirmed_value}"
     );
-    let second_output = read_until(
+    read_pty_until_file_occurrences(
         pty.master.as_raw_fd(),
-        "GOT_NOTIFY_2",
+        &received_log,
+        "[END OULIPOLY NOTIFICATIONS]",
+        2,
         Duration::from_secs(5),
     );
-    if !second_output.contains("GOT_NOTIFY_2") {
-        let _ = repl.kill();
-        let _ = repl.wait();
-        panic!("transcript-confirmed retry did not reach provider: {second_output:?}");
-    }
     assert!(repl.wait().unwrap().success());
 
     let received = fs::read_to_string(&received_log).unwrap();
@@ -2416,6 +2407,36 @@ fn read_until(fd: RawFd, needle: &str, timeout: Duration) -> String {
         }
     }
     String::from_utf8_lossy(&output).into_owned()
+}
+
+fn read_pty_until_file_occurrences(
+    fd: RawFd,
+    path: &Path,
+    needle: &str,
+    expected_count: usize,
+    timeout: Duration,
+) -> String {
+    let start = Instant::now();
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    while start.elapsed() < timeout {
+        let contents = fs::read_to_string(path).unwrap_or_default();
+        if contents.matches(needle).count() >= expected_count {
+            return contents;
+        }
+        if poll_readable(fd, Duration::from_millis(50)).unwrap() {
+            let n = read_fd(fd, &mut buffer).unwrap();
+            if n > 0 {
+                output.extend_from_slice(&buffer[..n]);
+            }
+        }
+    }
+    panic!(
+        "timed out waiting for {expected_count} occurrences of {needle:?} at {}: provider={:?}, pty={:?}",
+        path.display(),
+        fs::read_to_string(path),
+        String::from_utf8_lossy(&output),
+    );
 }
 
 fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {

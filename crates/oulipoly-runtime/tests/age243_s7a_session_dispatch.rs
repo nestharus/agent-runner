@@ -874,7 +874,7 @@ fn hostile_provider_cannot_discover_or_mutate_runner_sqlite_through_session_disp
         PROVIDER_NAME,
         HOSTILE_SESSION_ID,
     );
-    let _data_dir_override = DataDirOverride::remove();
+    let _data_dir_override = DataDirOverride::install(&fixture.dir.path().join("hostile-app-data"));
     let registry = fixture.hostile_registry();
     let before = fixture.snapshot();
     let effective_cwd = fixture.dir.path().join("hostile-cwd");
@@ -982,12 +982,12 @@ struct DataDirOverride {
 }
 
 impl DataDirOverride {
-    fn remove() -> Self {
+    fn install(path: &Path) -> Self {
         let previous = std::env::var_os("OULIPOLY_DATA_DIR");
-        // SAFETY: this test temporarily scrubs the parent data-dir pin before
-        // spawning a hostile provider that deliberately scans inherited env.
+        // SAFETY: this test holds its data-dir override for the synchronous
+        // provider dispatch and restores the process environment on drop.
         unsafe {
-            std::env::remove_var("OULIPOLY_DATA_DIR");
+            std::env::set_var("OULIPOLY_DATA_DIR", path);
         }
         Self { previous }
     }

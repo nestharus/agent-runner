@@ -33,9 +33,7 @@ pub struct RuntimeServices<O: StateDbOpener = ProductionStateDbOpener> {
 
 impl RuntimeServices<ProductionStateDbOpener> {
     pub fn production(working_dir: Option<PathBuf>) -> Result<Self, String> {
-        let config_root = dirs::config_dir()
-            .map(|path| path.join("oulipoly-agent-runner"))
-            .unwrap_or_else(|| PathBuf::from("oulipoly-agent-runner"));
+        let config_root = oulipoly_state::paths::config_dir()?;
 
         Ok(Self {
             config_root,

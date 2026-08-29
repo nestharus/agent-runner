@@ -28,9 +28,10 @@ const RUNTIME_SERVICES_INIT_EXPECT_MESSAGE: &str = "failed to initialize runtime
 const TAURI_RUN_EXPECT_MESSAGE: &str = "error while running tauri application";
 
 pub fn run_tauri() {
-    let models_dir = default_models_dir();
+    let models_dir = default_models_dir().expect(RUNTIME_SERVICES_INIT_EXPECT_MESSAGE);
     let config_root = app_paths::models_config_root(&models_dir);
-    let runtime_paths = runtime_paths_for(&models_dir, &config_root);
+    let runtime_paths =
+        runtime_paths_for(&models_dir, &config_root).expect(RUNTIME_SERVICES_INIT_EXPECT_MESSAGE);
     crate::wake_coordinator::start_wake_reclaim_maintenance_driver();
     let services = wiring::AgentRuntimeServices::production(runtime_paths)
         .expect(RUNTIME_SERVICES_INIT_EXPECT_MESSAGE);
@@ -81,20 +82,24 @@ pub fn run_tauri() {
         .expect(TAURI_RUN_EXPECT_MESSAGE);
 }
 
-fn default_models_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner").join("models"))
-        .unwrap_or_else(|| PathBuf::from("models"))
+fn default_models_dir() -> Result<PathBuf, String> {
+    oulipoly_state::paths::config_dir().map(|root| root.join("models"))
 }
 
-fn runtime_paths_for(models_dir: &Path, config_root: &Path) -> wiring::RuntimePaths {
-    wiring::RuntimePaths {
+fn runtime_paths_for(
+    models_dir: &Path,
+    config_root: &Path,
+) -> Result<wiring::RuntimePaths, String> {
+    let data_root = oulipoly_state::paths::data_dir()?;
+    let working_dir = std::env::current_dir()
+        .map_err(|error| format!("Could not resolve current working directory: {error}"))?;
+    Ok(wiring::RuntimePaths {
         config_root: config_root.to_path_buf(),
         models_dir: models_dir.to_path_buf(),
         agents_dir: config_root.join("agents"),
-        data_root: config_root.to_path_buf(),
-        state_db_path: config_root.join("state.db"),
-        lock_dir: config_root.join("locks"),
-        working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    }
+        data_root: data_root.clone(),
+        state_db_path: data_root.join("state.db"),
+        lock_dir: data_root.join("locks"),
+        working_dir,
+    })
 }

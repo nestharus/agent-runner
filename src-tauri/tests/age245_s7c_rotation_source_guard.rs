@@ -11,7 +11,7 @@ fn s7c_production_wiring_passes_registry_handle_into_migration_service() {
     let wiring = read_source("src-tauri/src/wiring.rs");
     let cli_defaults = source_between(
         &wiring,
-        "pub fn cli_defaults() -> Self",
+        "pub fn cli_defaults() -> Result<Self, String>",
         "pub fn production(",
     );
     let production = source_between(

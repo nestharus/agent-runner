@@ -1388,18 +1388,18 @@ fn resolve_replace_metadata(session_id: &str) -> Result<SessionMetadata, Replace
     RESOLVE_REPLACE_METADATA_CALLS.fetch_add(1, Ordering::SeqCst);
     let state =
         StateDb::open_default().map_err(|e| ReplaceError::OperationalError { message: e })?;
-    let providers =
-        ProvidersConfig::load(&default_config_root().join("providers.toml")).map_err(|e| {
-            ReplaceError::OperationalError {
-                message: e.to_string(),
-            }
-        })?;
-    let models = load_models(&default_models_dir(), Some(&providers)).map_err(|e| {
+    let config_root = default_config_root()?;
+    let providers = ProvidersConfig::load(&config_root.join("providers.toml")).map_err(|e| {
         ReplaceError::OperationalError {
             message: e.to_string(),
         }
     })?;
-    let sessions = SessionsConfig::load(&default_config_root().join("sessions.toml"))
+    let models = load_models(&config_root.join("models"), Some(&providers)).map_err(|e| {
+        ReplaceError::OperationalError {
+            message: e.to_string(),
+        }
+    })?;
+    let sessions = SessionsConfig::load(&config_root.join("sessions.toml"))
         .map_err(|e| ReplaceError::OperationalError { message: e })?;
     locate_session_metadata(&state, &models, &providers, &sessions, session_id)
         .map_err(map_metadata_error)
@@ -1765,15 +1765,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn default_data_root() -> Result<PathBuf, ReplaceError> {
-    oulipoly_state::paths::data_dir().map_err(|_| ReplaceError::OperationalError {
-        message: "could not determine data directory".to_string(),
-    })
+    oulipoly_state::paths::data_dir().map_err(|message| ReplaceError::OperationalError { message })
 }
 
-fn default_config_root() -> PathBuf {
-    dirs::config_dir()
-        .map(|dir| dir.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."))
+fn default_config_root() -> Result<PathBuf, ReplaceError> {
+    oulipoly_state::paths::config_dir()
+        .map_err(|message| ReplaceError::OperationalError { message })
 }
 
 fn storage_type_from_str(raw: &str) -> SessionStorageType {
@@ -1800,12 +1797,6 @@ fn storage_type_to_export(
         SessionStorageType::CodexSession => crate::session_export::SessionStorageType::CodexSession,
         SessionStorageType::Other => crate::session_export::SessionStorageType::Other,
     }
-}
-
-fn default_models_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
-        .unwrap_or_else(|| PathBuf::from("models"))
 }
 
 fn maybe_test_hook(name: &str) {

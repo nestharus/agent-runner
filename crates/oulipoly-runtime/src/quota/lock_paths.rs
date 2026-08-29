@@ -10,7 +10,7 @@
 //!   - component: crates/oulipoly-runtime/src/quota/lock_paths.rs
 //!     role: adapter
 //!     Translates:
-//!       - process data-home environment contract (`OULIPOLY_DATA_DIR`, `OULIPOLY_DATA_HOME`, `XDG_DATA_HOME`, `dirs::data_dir`)
+//!       - explicit process data-home environment contract (`OULIPOLY_DATA_DIR`, `OULIPOLY_DATA_HOME`)
 //!       - lock-name sanitization contract (`[A-Za-z0-9_-]`)
 //! ```
 //!
@@ -19,38 +19,23 @@
 //! same process data home and share one sanitized key space, so a given
 //! account resolves to the same lock identity from every call site.
 
-use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// Process data home for runtime lock files: `OULIPOLY_DATA_HOME`, then
-/// `XDG_DATA_HOME`, then the platform data dir, then the current directory.
-/// Public so the usage CLI (a separate crate) can resolve the same lock root
-/// instead of re-deriving the env layout.
-pub fn data_home() -> PathBuf {
-    env_path("OULIPOLY_DATA_HOME")
-        .or_else(|| env_path("XDG_DATA_HOME"))
-        .unwrap_or_else(default_data_home)
+/// Explicit process data home for callers that own non-application data.
+pub fn data_home() -> Result<PathBuf, String> {
+    required_env_path("OULIPOLY_DATA_HOME")
 }
 
-pub fn app_data_dir() -> PathBuf {
-    env_path(oulipoly_state::paths::DATA_DIR_ENV)
-        .unwrap_or_else(|| data_home().join(oulipoly_state::paths::APP_DATA_DIR_NAME))
+pub fn app_data_dir() -> Result<PathBuf, String> {
+    oulipoly_state::paths::data_dir()
 }
 
-fn env_path(name: &str) -> Option<PathBuf> {
-    env_os(name).map(PathBuf::from)
-}
-
-fn env_os(name: &str) -> Option<OsString> {
-    std::env::var_os(name)
-}
-
-fn default_data_home() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(current_dir_path)
-}
-
-fn current_dir_path() -> PathBuf {
-    PathBuf::from(".")
+fn required_env_path(name: &str) -> Result<PathBuf, String> {
+    std::env::var_os(name).map(PathBuf::from).ok_or_else(|| {
+        format!(
+            "{name} is not set; set it to an explicit data directory, for example: export {name}=/path/to/data"
+        )
+    })
 }
 
 /// Sanitize an account/provider key into a single safe lock-file stem,

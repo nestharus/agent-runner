@@ -17,11 +17,11 @@ struct EnvRestore {
 }
 
 impl EnvRestore {
-    fn set_xdg_data_home(path: &Path) -> Self {
+    fn set_data_dir(path: &Path) -> Self {
         let old_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
         let old_data_home = std::env::var_os("XDG_DATA_HOME");
         unsafe {
-            std::env::remove_var("OULIPOLY_DATA_DIR");
+            std::env::set_var("OULIPOLY_DATA_DIR", path);
             std::env::set_var("XDG_DATA_HOME", path);
         }
         Self {
@@ -392,7 +392,7 @@ fn age_33_runtime_default_provider_uses_explicit_state_db_path_when_supplied() {
     let explicit_state_db = temp.path().join("explicit-state").join("state.db");
     let blocked_default_data_home = temp.path().join("blocked-default-data-home");
     fs::write(&blocked_default_data_home, "not a directory").unwrap();
-    let _restore = EnvRestore::set_xdg_data_home(&blocked_default_data_home);
+    let _restore = EnvRestore::set_data_dir(&blocked_default_data_home);
 
     let marker = temp.path().join("launched.txt");
     let provider_script = temp.path().join("provider.sh");

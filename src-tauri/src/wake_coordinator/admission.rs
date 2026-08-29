@@ -25,6 +25,7 @@ struct MemoryObservation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrainOutcome {
     Admitted,
+    LaunchMaterializing,
     Pressure,
     ObservationUnavailable,
     Waiting,
@@ -35,7 +36,7 @@ enum DrainOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct QueueStatus {
     reason: String,
-    position: Option<i64>,
+    sequence: i64,
 }
 
 pub(crate) struct SessionAdmissionGuard {
@@ -131,19 +132,19 @@ fn enqueue_and_wait_at_with_memory_observer(
                 claim_token: claim_token.to_string(),
             });
         }
-        let position = db
-            .session_admissions()
-            .queued_position(registration_identity)?;
-        report_queued_status(
-            registration_identity,
-            QueueStatus {
-                reason: row.queue_reason,
-                position,
-            },
-            &mut reported,
-        );
+        let queued = row.state == "queued";
+        if queued {
+            report_queued_status(
+                registration_identity,
+                QueueStatus {
+                    reason: row.queue_reason,
+                    sequence: row.queue_sequence,
+                },
+                &mut reported,
+            );
+        }
         drop(db);
-        if position.is_some() {
+        if queued {
             match drain_one_at_with_config_and_observer(
                 mailbox_path,
                 config,
@@ -172,7 +173,7 @@ fn enqueue_and_wait_at_with_memory_observer(
                         registration_identity,
                         QueueStatus {
                             reason: "coordination_unavailable".to_string(),
-                            position,
+                            sequence: row.queue_sequence,
                         },
                         &mut reported,
                     );
@@ -190,6 +191,7 @@ fn enqueue_and_wait_at_with_memory_observer(
 fn queued_reason(outcome: DrainOutcome) -> &'static str {
     match outcome {
         DrainOutcome::Admitted | DrainOutcome::Waiting | DrainOutcome::Empty => "fifo_wait",
+        DrainOutcome::LaunchMaterializing => "launch_materializing",
         DrainOutcome::Pressure => "memory_pressure",
         DrainOutcome::ObservationUnavailable => MEMORY_OBSERVATION_UNAVAILABLE,
         DrainOutcome::Contended => "drain_contended",
@@ -210,7 +212,7 @@ fn report_queued_status(
             "state": "queued",
             "registration_identity": registration_identity,
             "reason": &status.reason,
-            "queue_position": status.position,
+            "queue_sequence": status.sequence,
         })
     );
     *reported = Some(status);
@@ -331,6 +333,7 @@ fn drain_with(
     };
     let outcome = match attempt {
         SessionAdmissionAttempt::Admitted(_) => DrainOutcome::Admitted,
+        SessionAdmissionAttempt::LaunchMaterializing => DrainOutcome::LaunchMaterializing,
         SessionAdmissionAttempt::Waiting => DrainOutcome::Waiting,
         SessionAdmissionAttempt::Empty => DrainOutcome::Empty,
     };
@@ -556,8 +559,9 @@ fn unix_time_ms() -> Result<i64, String> {
 mod tests {
     use super::*;
     use oulipoly_state::mailbox::{
-        AttachRuntimeGenerationSession, CreateRuntimeGeneration, ExitRuntimeGenerationNonOrderly,
-        RuntimeGenerationFence, RuntimeGenerationId, RuntimeTerminalReason,
+        AttachRuntimeGenerationSession, BindRuntimeGenerationRunning, CreateRuntimeGeneration,
+        ExitRuntimeGenerationNonOrderly, RuntimeGenerationFence, RuntimeGenerationId,
+        RuntimeTerminalReason,
     };
     use std::sync::{Arc, Barrier, mpsc};
 
@@ -652,18 +656,6 @@ mod tests {
         assert_eq!(initial.state, "queued");
         assert_eq!(resumed.state, "queued");
         assert!(initial.queue_sequence < resumed.queue_sequence);
-        assert_eq!(
-            db.session_admissions()
-                .queued_position("initial-invocation")
-                .unwrap(),
-            Some(1)
-        );
-        assert_eq!(
-            db.session_admissions()
-                .queued_position("resume-invocation")
-                .unwrap(),
-            Some(2)
-        );
     }
 
     #[test]
@@ -798,6 +790,11 @@ mod tests {
                         )
                         .unwrap()
                 );
+                assert!(
+                    db.session_admissions()
+                        .settle(identity, row.claim_token.as_deref().unwrap())
+                        .unwrap()
+                );
             }
         }
 
@@ -830,10 +827,9 @@ mod tests {
         let rejected = db.session_admissions().row("first").unwrap().unwrap();
         assert_eq!(rejected.state, "cancelled");
         assert_eq!(rejected.queue_reason, MEMORY_OBSERVATION_UNAVAILABLE);
-        assert_eq!(
-            db.session_admissions().queued_position("second").unwrap(),
-            Some(1)
-        );
+        let remaining = db.session_admissions().row("second").unwrap().unwrap();
+        assert_eq!(remaining.state, "queued");
+        assert_eq!(remaining.queue_sequence, second.queue_sequence);
 
         assert!(
             !db.session_admissions()
@@ -876,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn known_memory_observation_does_not_create_a_launch_budget() {
+    fn roomy_memory_serializes_startup_without_a_lifetime_budget() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
@@ -895,6 +891,17 @@ mod tests {
             assert!(
                 db.session_admissions()
                     .begin_launch(&identity, row.claim_token.as_deref().unwrap(), 20 + index)
+                    .unwrap()
+            );
+            if index < 7 {
+                assert_eq!(
+                    drain_one_with(&mut db, config(), roomy_memory).unwrap(),
+                    DrainOutcome::LaunchMaterializing
+                );
+            }
+            assert!(
+                db.session_admissions()
+                    .settle(&identity, row.claim_token.as_deref().unwrap())
                     .unwrap()
             );
         }
@@ -927,6 +934,16 @@ mod tests {
         assert_eq!(
             drain_with(&mut db, config(), roomy_memory, Some("first")).unwrap(),
             DrainOutcome::Admitted
+        );
+        assert_eq!(
+            drain_with(&mut db, config(), roomy_memory, Some("second")).unwrap(),
+            DrainOutcome::LaunchMaterializing
+        );
+        let first = db.session_admissions().row("first").unwrap().unwrap();
+        assert!(
+            db.session_admissions()
+                .settle("first", first.claim_token.as_deref().unwrap())
+                .unwrap()
         );
         assert_eq!(
             drain_with(&mut db, config(), roomy_memory, Some("second")).unwrap(),
@@ -1034,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn live_launching_reservation_does_not_expire_or_block_its_successor() {
+    fn launching_reservation_blocks_only_until_its_runtime_is_running() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
@@ -1048,12 +1065,56 @@ mod tests {
                 .unwrap()
         );
 
+        assert_eq!(
+            db.session_admissions()
+                .try_admit_next("blocked-token", i64::MAX, i64::MIN)
+                .unwrap(),
+            SessionAdmissionAttempt::LaunchMaterializing
+        );
+
+        let generation_id = RuntimeGenerationId::new();
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "first",
+                session_id: None,
+                runtime_mode: "headless",
+                provider_name: "test-provider",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        assert_eq!(
+            db.session_admissions()
+                .try_admit_next("starting-token", i64::MAX, i64::MIN)
+                .unwrap(),
+            SessionAdmissionAttempt::LaunchMaterializing
+        );
+        let process_identity =
+            oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+                .unwrap()
+                .unwrap();
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "first",
+        };
+        db.runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence,
+                spawned_os_pid: process_identity.os_pid,
+                exact_process_identity: &process_identity,
+                os_pgid: None,
+            })
+            .unwrap();
+
         let SessionAdmissionAttempt::Admitted(second) = db
             .session_admissions()
             .try_admit_next("replacement-token", i64::MAX, i64::MAX)
             .unwrap()
         else {
-            panic!("roomy memory must admit a successor while its parent is live");
+            panic!("a running parent must not impose an active-turn budget");
         };
         assert_eq!(second.registration_identity, "second");
         assert_eq!(
@@ -1063,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn dead_queued_launcher_is_cancelled_before_fifo_admission() {
+    fn drain_cancels_one_dead_fifo_head_per_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
@@ -1076,10 +1137,13 @@ mod tests {
             .enqueue("dead-admission", "dead", None, &dead, 1)
             .unwrap();
         enqueue(&mut db, "live", None, 2);
+        db.session_admissions()
+            .enqueue("dead-tail-admission", "dead-tail", None, &dead, 3)
+            .unwrap();
 
         assert_eq!(
             drain_one_with(&mut db, config(), roomy_memory).unwrap(),
-            DrainOutcome::Admitted
+            DrainOutcome::Waiting
         );
         assert_eq!(
             db.session_admissions().row("dead").unwrap().unwrap().state,
@@ -1087,7 +1151,32 @@ mod tests {
         );
         assert_eq!(
             db.session_admissions().row("live").unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(
+            db.session_admissions()
+                .row("dead-tail")
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
+        );
+
+        assert_eq!(
+            drain_one_with(&mut db, config(), roomy_memory).unwrap(),
+            DrainOutcome::Admitted
+        );
+        assert_eq!(
+            db.session_admissions().row("live").unwrap().unwrap().state,
             "admitted"
+        );
+        assert_eq!(
+            db.session_admissions()
+                .row("dead-tail")
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
         );
     }
 
@@ -1169,13 +1258,29 @@ mod tests {
             .unwrap();
         assert_eq!(
             drain_one_with(&mut db, config(), roomy_memory).unwrap(),
-            DrainOutcome::Admitted
+            DrainOutcome::LaunchMaterializing
         );
-
+        let process_identity =
+            oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+                .unwrap()
+                .unwrap();
         let fence = RuntimeGenerationFence {
             generation_id: &generation_id,
             spawn_invocation_uuid: "initial-invocation",
         };
+        db.runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence,
+                spawned_os_pid: process_identity.os_pid,
+                exact_process_identity: &process_identity,
+                os_pgid: None,
+            })
+            .unwrap();
+        assert_eq!(
+            drain_one_with(&mut db, config(), roomy_memory).unwrap(),
+            DrainOutcome::Admitted
+        );
+
         db.runtime_lifecycle()
             .attach_runtime_generation_session(AttachRuntimeGenerationSession {
                 fence,

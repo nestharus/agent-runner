@@ -78,7 +78,10 @@ impl Fixture {
             .env("XDG_DATA_HOME", &self.data_home)
             .env("HOME", &self.home_dir)
             .env("S11_WORK_DIR", &self.work_dir)
-            .env_remove("OULIPOLY_DATA_DIR")
+            .env(
+                "OULIPOLY_DATA_DIR",
+                self.data_home.join("oulipoly-agent-runner"),
+            )
             .env_remove("OULIPOLY_AUTO_WAKE")
             .env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID")
             .env_remove("OULIPOLY_AUTO_WAKE_TOKEN")

@@ -1438,9 +1438,7 @@ fn sync_provider_owned_journal_directory(path: &Path) -> Result<(), ReplaceError
 }
 
 fn provider_owned_data_root() -> Result<PathBuf, ReplaceError> {
-    oulipoly_state::paths::data_dir().map_err(|_| ReplaceError::OperationalError {
-        message: "could not determine data directory".to_string(),
-    })
+    oulipoly_state::paths::data_dir().map_err(|message| ReplaceError::OperationalError { message })
 }
 
 fn provider_owned_session_lock(data_root: &Path) -> Result<SessionLock, ReplaceError> {

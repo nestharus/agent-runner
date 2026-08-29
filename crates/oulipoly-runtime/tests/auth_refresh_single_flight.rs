@@ -45,10 +45,9 @@ fn env_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Isolates `OULIPOLY_DATA_HOME` (where the auth-refresh lock dir lives) to a
-/// fresh tempdir, scrubs the higher-precedence `OULIPOLY_DATA_DIR`, and
-/// optionally sets extra env vars, restoring all of them on drop. Holds the
-/// process env lock for its whole lifetime.
+/// Isolates `OULIPOLY_DATA_HOME` (where the auth-refresh lock dir lives) and
+/// `OULIPOLY_DATA_DIR` to a fresh tempdir, optionally sets extra env vars, and
+/// restores all of them on drop. Holds the process env lock for its lifetime.
 struct EnvScope {
     _home: tempfile::TempDir,
     _lock: MutexGuard<'static, ()>,
@@ -63,7 +62,10 @@ impl EnvScope {
             ("OULIPOLY_DATA_HOME", std::env::var_os("OULIPOLY_DATA_HOME")),
             ("OULIPOLY_DATA_DIR", std::env::var_os("OULIPOLY_DATA_DIR")),
         ];
-        remove_env("OULIPOLY_DATA_DIR");
+        set_env(
+            "OULIPOLY_DATA_DIR",
+            home.path().join("oulipoly-agent-runner").as_os_str(),
+        );
         set_env("OULIPOLY_DATA_HOME", home.path().as_os_str());
         for (key, value) in extra {
             restores.push((*key, std::env::var_os(key)));

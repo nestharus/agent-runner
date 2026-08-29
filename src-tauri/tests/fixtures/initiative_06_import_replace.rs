@@ -1050,7 +1050,7 @@ fn base_command(config_home: &Path, data_home: &Path) -> Command {
     .unwrap();
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_DATA_HOME", data_home);
-    cmd.env_remove("OULIPOLY_DATA_DIR");
+    cmd.env("OULIPOLY_DATA_DIR", data_home.join("oulipoly-agent-runner"));
     cmd.env("HOME", data_home);
     cmd.env("PATH", path);
     cmd.env_remove("OULIPOLY_PARENT_INVOCATION");

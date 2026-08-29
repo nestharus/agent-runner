@@ -445,7 +445,7 @@ mod tests {
                 .expect("registry"),
             );
             let handle = ProviderRegistryHandle::new(registry.clone());
-            let mut services = wiring::AgentRuntimeServices::cli_defaults();
+            let mut services = wiring::AgentRuntimeServices::cli_defaults().unwrap();
             services.provider_registry = registry;
             services.provider_registry_handle = handle.clone();
             services.session_lifecycle_service = Arc::new(

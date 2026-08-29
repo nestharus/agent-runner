@@ -157,7 +157,10 @@ impl Fixture {
         cmd.current_dir(self.dir.path());
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.env_remove("OULIPOLY_AUTO_WAKE");
         cmd.env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID");

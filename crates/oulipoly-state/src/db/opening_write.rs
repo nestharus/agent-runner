@@ -663,11 +663,12 @@ impl StateDb {
     }
 
     fn create_state_parent_dir(parent: &Path) -> Result<(), String> {
-        std::fs::create_dir_all(parent).map_err(Self::format_state_directory_create_error)
-    }
-
-    fn format_state_directory_create_error(err: std::io::Error) -> String {
-        format!("Failed to create state directory: {err}")
+        std::fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "Failed to create state directory {}: {err}",
+                parent.display()
+            )
+        })
     }
 
     pub(super) fn run_open_migrations(

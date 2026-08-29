@@ -22,16 +22,18 @@ use crate::cli::paths::default_models_dir;
 use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 
-pub(crate) fn migrate_config_paths(models_dir_override: Option<&Path>) -> (PathBuf, PathBuf) {
+pub(crate) fn migrate_config_paths(
+    models_dir_override: Option<&Path>,
+) -> Result<(PathBuf, PathBuf), String> {
     let models_dir = models_dir_override
         .map(Path::to_path_buf)
-        .unwrap_or_else(default_models_dir);
+        .map_or_else(default_models_dir, Ok)?;
     let config_root = models_dir
         .parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .ok_or_else(|| format!("Models directory has no parent: {}", models_dir.display()))?;
     let providers_path = config_root.join("providers.toml");
-    (models_dir, providers_path)
+    Ok((models_dir, providers_path))
 }
 
 pub(crate) fn config_migration_report(

@@ -57,7 +57,10 @@ impl Fixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         command.env("XDG_CONFIG_HOME", &self.config_home);
         command.env("XDG_DATA_HOME", &self.data_home);
-        command.env_remove("OULIPOLY_DATA_DIR");
+        command.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         command.env_remove("OULIPOLY_PARENT_INVOCATION");
         command
     }

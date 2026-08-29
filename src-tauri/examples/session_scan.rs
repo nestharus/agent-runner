@@ -3,7 +3,7 @@
 //!
 //! Run: cargo run --example session_scan --release
 //!
-//! Loads `~/.config/oulipoly-agent-runner/sessions.toml`, scans all
+//! Loads `sessions.toml` from the configured application config root, scans all
 //! declared paths, ingests new turns into the unified `session_turns` store,
 //! then prints — for each provider — total assistant turns ever ingested
 //! and turns since the most recent quota refresh (the value the balancer
@@ -14,12 +14,8 @@ use oulipoly_runtime::sessions::scan_all;
 use oulipoly_state::StateDb;
 
 fn main() {
-    let config_dir = dirs::config_dir()
-        .expect("no config dir")
-        .join("oulipoly-agent-runner");
-    let data_dir = dirs::data_dir()
-        .expect("no data dir")
-        .join("oulipoly-agent-runner");
+    let config_dir = oulipoly_state::paths::config_dir().expect("no configured config dir");
+    let data_dir = oulipoly_state::paths::data_dir().expect("no configured data dir");
     let sessions_path = config_dir.join("sessions.toml");
     let db_path = data_dir.join("state.db");
 

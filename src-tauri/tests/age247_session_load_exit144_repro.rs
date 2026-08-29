@@ -206,7 +206,10 @@ fn fixture_command(fixture: &ScratchFixture) -> Command {
     command
         .env("XDG_CONFIG_HOME", &fixture.config_home)
         .env("XDG_DATA_HOME", &fixture.data_home)
-        .env_remove("OULIPOLY_DATA_DIR")
+        .env(
+            "OULIPOLY_DATA_DIR",
+            fixture.data_home.join("oulipoly-agent-runner"),
+        )
         .env("OULIPOLY_DATA_HOME", &fixture.data_home)
         .env("HOME", &fixture.root)
         .env("LD_PRELOAD", &fixture.preload_library)

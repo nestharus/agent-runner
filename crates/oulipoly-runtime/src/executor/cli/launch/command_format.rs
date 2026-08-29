@@ -73,15 +73,15 @@ pub(super) fn command_from_parts(
     } else {
         cmd.env_remove("OULIPOLY_RETURN_CHANNEL");
     }
-    pin_agent_data_dir(&mut cmd);
+    pin_agent_data_dir(&mut cmd)?;
 
     Ok(cmd)
 }
 
-fn pin_agent_data_dir(cmd: &mut Command) {
-    if let Ok(data_dir) = oulipoly_state::paths::data_dir() {
-        cmd.env(oulipoly_state::paths::DATA_DIR_ENV, data_dir);
-    }
+fn pin_agent_data_dir(cmd: &mut Command) -> Result<(), String> {
+    let data_dir = oulipoly_state::paths::data_dir()?;
+    cmd.env(oulipoly_state::paths::DATA_DIR_ENV, data_dir);
+    Ok(())
 }
 
 pub(in crate::executor::cli) fn append_command_args(cmd: &mut Command, args: &[String]) {

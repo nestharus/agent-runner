@@ -34,14 +34,14 @@ fn access_default_state_for_identity() -> Result<StateDb, String> {
 }
 
 fn access_default_providers_for_identity() -> Result<ProvidersConfig, String> {
-    ProvidersConfig::load(&default_config_root().join("providers.toml"))
+    ProvidersConfig::load(&default_config_root()?.join("providers.toml"))
         .map_err(|error| format!("failed to load providers: {error}"))
 }
 
 fn access_default_models_for_identity(
     providers: &ProvidersConfig,
 ) -> Result<oulipoly_state::ModelStore, String> {
-    load_models(&default_models_dir(), Some(providers))
+    load_models(&default_models_dir()?, Some(providers))
         .map_err(|error| format!("failed to load models: {error}"))
 }
 

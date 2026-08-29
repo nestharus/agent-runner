@@ -247,6 +247,10 @@ impl Fixture {
             .env("HOME", self._dir.path())
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
+            .env(
+                "OULIPOLY_DATA_DIR",
+                self.data_home.join("oulipoly-agent-runner"),
+            )
             .env("XDG_CACHE_HOME", &self.cache_home)
             .env("PATH", "/usr/bin:/bin")
             .output()

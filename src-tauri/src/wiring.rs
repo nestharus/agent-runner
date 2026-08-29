@@ -85,8 +85,8 @@ pub struct AgentRuntimeServices {
 }
 
 impl AgentRuntimeServices {
-    pub fn cli_defaults() -> Self {
-        let paths = default_cli_runtime_paths();
+    pub fn cli_defaults() -> Result<Self, String> {
+        let paths = default_cli_runtime_paths()?;
         let provider_registry_options = ProviderRegistryOptions::default()
             .with_path_entries_from_process_path()
             .with_config_root(paths.config_root.clone())
@@ -103,7 +103,7 @@ impl AgentRuntimeServices {
         let session_import_service = Arc::new(
             ProductionSessionImportService::with_registry_handle(provider_registry_handle.clone()),
         );
-        Self {
+        Ok(Self {
             state_db_opener: Arc::new(ProductionStateDbOpener),
             app_config: Arc::new(FilesystemAppConfigRepository),
             agent_config: Arc::new(FilesystemAgentConfigRepository),
@@ -145,7 +145,7 @@ impl AgentRuntimeServices {
                 ),
             ),
             session_lock_service: Arc::new(ProductionSessionLockService::default()),
-        }
+        })
     }
 
     pub fn production(paths: RuntimePaths) -> Result<Self, String> {
@@ -213,21 +213,21 @@ impl AgentRuntimeServices {
     }
 }
 
-fn default_cli_runtime_paths() -> RuntimePaths {
-    let config_root = dirs::config_dir()
-        .map(|dir| dir.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
+fn default_cli_runtime_paths() -> Result<RuntimePaths, String> {
+    let config_root = oulipoly_state::paths::config_dir()?;
     let models_dir = config_root.join("models");
-    let data_root = oulipoly_state::paths::data_dir().unwrap_or_else(|_| config_root.clone());
-    RuntimePaths {
+    let data_root = oulipoly_state::paths::data_dir()?;
+    let working_dir = std::env::current_dir()
+        .map_err(|error| format!("Could not resolve current working directory: {error}"))?;
+    Ok(RuntimePaths {
         config_root: config_root.clone(),
         models_dir,
         agents_dir: config_root.join("agents"),
         data_root: data_root.clone(),
         state_db_path: data_root.join("state.db"),
         lock_dir: data_root.join("locks"),
-        working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    }
+        working_dir,
+    })
 }
 
 fn production_provider_registry(

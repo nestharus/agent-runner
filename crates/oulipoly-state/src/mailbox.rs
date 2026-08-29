@@ -33,6 +33,11 @@ pub const MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR: &str = "mailbox_payload_ver
 pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
+pub const TERMINAL_HISTORY_KEEP_ROWS: usize = 1_024;
+const TERMINAL_HISTORY_MAINTENANCE_BATCH: usize = 256;
+const TERMINAL_HISTORY_MAINTENANCE_PROGRESS_OPS: i32 = 1_000;
+const TERMINAL_HISTORY_MAINTENANCE_TIMEOUT: StdDuration = StdDuration::from_millis(100);
+const TERMINAL_HISTORY_MAINTENANCE_BUSY_TIMEOUT: StdDuration = StdDuration::from_millis(50);
 const COMPACTED_PAYLOAD_SCHEMA_VERSION: u8 = 1;
 // Agent-bash registration must not inherit test-support's shortened generic writer wait.
 const COMPLETION_AUTHORITY_SQLITE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
@@ -494,6 +499,25 @@ pub struct DeliveredPayloadCompactionReport {
     pub inline_bytes_reclaimed: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct TerminalHistoryRetentionStats {
+    pub terminal_mailbox_rows: usize,
+    pub prunable_mailbox_rows: usize,
+    pub resolved_delivery_attempts: usize,
+    pub prunable_delivery_attempts: usize,
+    pub reclaimable_payload_files: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct TerminalHistoryPruneReport {
+    pub mailbox_rows_deleted: usize,
+    pub listeners_detached: usize,
+    pub delivery_attempts_deleted: usize,
+    pub delivery_attempt_items_deleted: usize,
+    pub payload_files_deleted: usize,
+    pub payload_bytes_reclaimed: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailboxRow {
     pub seq: i64,
@@ -585,6 +609,7 @@ pub struct CompletionEventRow {
     pub payload_retention_policy: Option<String>,
     pub created_at: String,
     pub triggered_at: Option<String>,
+    pub payload_reclaimed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -761,6 +786,7 @@ pub struct SessionAdmissionRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionAdmissionAttempt {
     Admitted(Box<SessionAdmissionRow>),
+    LaunchMaterializing,
     Waiting,
     Empty,
 }
@@ -2473,6 +2499,7 @@ impl MailboxDb {
             .map_err(|err| {
                 format!("Failed to start completion event trigger transaction: {err}")
             })?;
+        verify_published_payload(&published)?;
         let event = completion_event_by_id_on(&tx, input.event_id)?
             .ok_or_else(|| format!("Completion event {} is not registered", input.event_id))?;
         validate_completion_event_trigger_source(&event, &input)?;
@@ -2481,6 +2508,13 @@ impl MailboxDb {
             true
         } else {
             validate_completion_event_trigger_replay(&event, &input, &published)?;
+            tx.execute(
+                "UPDATE completion_event
+                 SET payload_reclaimed_at = NULL
+                 WHERE event_id = ?1 AND payload_reclaimed_at IS NOT NULL",
+                params![input.event_id],
+            )
+            .map_err(|err| format!("Failed to refresh replayed completion payload: {err}"))?;
             false
         };
         if input.consumed {
@@ -2491,6 +2525,7 @@ impl MailboxDb {
         materialize_completion_event_listeners(&tx, &event, &now)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit completion event trigger: {err}"))?;
+        self.maintain_terminal_history();
         self.completion_event_trigger_result(input.event_id, triggered)
     }
 
@@ -2532,6 +2567,7 @@ impl MailboxDb {
         validate_consumed_completion_change(listener_changed, "listener", mailbox_seq)?;
         resolve_completed_delivery_attempts_for_mailbox_seq(&tx, mailbox_seq, &now)?;
         commit_consumed_completion_acknowledgement(tx)?;
+        self.maintain_terminal_history();
         Ok(Some(binding.event_id))
     }
 
@@ -2564,8 +2600,9 @@ impl MailboxDb {
         let now = now_rfc3339();
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| format!("Failed to start mailbox enqueue transaction: {err}"))?;
+        verify_published_payload(&published)?;
         let result =
             enqueue_agent_bash_complete_in_tx(&tx, input, &payload_json, &published, &now)?;
         tx.commit()
@@ -2584,8 +2621,9 @@ impl MailboxDb {
         let now = now_rfc3339();
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| format!("Failed to start input enqueue transaction: {err}"))?;
+        verify_published_payload(&published)?;
         let result =
             enqueue_submitted_input_in_tx(&tx, input, &handle, &payload_json, &published, &now)?;
         tx.commit()
@@ -2713,8 +2751,14 @@ impl PayloadRetentionRepository<'_> {
             let original_len = candidate.payload_json.len() as u64;
             let published = self.retained_payload_for_compaction(&candidate)?;
             let compacted_json = compacted_payload_json(&candidate.kind, &published)?;
-            let changed =
-                mark_payload_compacted(self.conn, &candidate, &published, &compacted_json)?;
+            let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)
+                .map_err(|err| {
+                    format!("Failed to start delivered payload compaction transaction: {err}")
+                })?;
+            verify_published_payload(&published)?;
+            let changed = mark_payload_compacted(&tx, &candidate, &published, &compacted_json)?;
+            tx.commit()
+                .map_err(|err| format!("Failed to commit delivered payload compaction: {err}"))?;
             let delta = map_compaction_report_delta(
                 original_len,
                 &published,
@@ -2738,6 +2782,302 @@ impl PayloadRetentionRepository<'_> {
             None => self.publish_immutable_payload(candidate.payload_json.as_bytes()),
         }
     }
+}
+
+impl MailboxDb {
+    pub fn terminal_history_retention_stats(
+        &self,
+    ) -> Result<TerminalHistoryRetentionStats, String> {
+        terminal_history_retention_stats_on(&self.conn, TERMINAL_HISTORY_KEEP_ROWS)
+    }
+
+    pub fn prune_terminal_history(
+        &mut self,
+        limit: usize,
+    ) -> Result<TerminalHistoryPruneReport, String> {
+        self.prune_terminal_history_with_keep(limit, TERMINAL_HISTORY_KEEP_ROWS)
+    }
+
+    fn prune_terminal_history_with_keep(
+        &mut self,
+        limit: usize,
+        keep: usize,
+    ) -> Result<TerminalHistoryPruneReport, String> {
+        if limit == 0 {
+            return Ok(TerminalHistoryPruneReport::default());
+        }
+        let limit = i64::try_from(limit)
+            .map_err(|_| "Terminal history prune limit does not fit SQLite INTEGER".to_string())?;
+        let keep = i64::try_from(keep)
+            .map_err(|_| "Terminal history keep count does not fit SQLite INTEGER".to_string())?;
+        // Candidate discovery can scan retained history. Keep it outside the write
+        // transaction so maintenance cannot block unrelated mailbox writers.
+        let attempt_ids = prunable_delivery_attempt_ids(&self.conn, keep, limit)?;
+        let mailbox_rows = prunable_terminal_mailbox_rows(&self.conn, keep, limit)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("Failed to start terminal history prune transaction: {err}"))?;
+        let mut report = TerminalHistoryPruneReport::default();
+
+        for attempt_id in &attempt_ids {
+            let still_prunable: bool = tx
+                .query_row(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM mailbox_delivery_attempts
+                         WHERE attempt_id = ?1
+                           AND resolved_at IS NOT NULL
+                           AND (
+                               evidence_disposition IS NULL
+                               OR evidence_disposition NOT IN ('pending', 'legacy_pending')
+                               OR evidence_reconciled_at IS NOT NULL
+                           )
+                     )",
+                    params![attempt_id],
+                    |row| row.get(0),
+                )
+                .map_err(|err| format!("Failed to revalidate resolved delivery attempt: {err}"))?;
+            if !still_prunable {
+                continue;
+            }
+            report.delivery_attempt_items_deleted += tx
+                .execute(
+                    "DELETE FROM mailbox_delivery_attempt_items WHERE attempt_id = ?1",
+                    params![attempt_id],
+                )
+                .map_err(|err| format!("Failed to prune delivery attempt items: {err}"))?;
+            report.delivery_attempts_deleted += tx
+                .execute(
+                    "DELETE FROM mailbox_delivery_attempts
+                     WHERE attempt_id = ?1 AND resolved_at IS NOT NULL",
+                    params![attempt_id],
+                )
+                .map_err(|err| format!("Failed to prune resolved delivery attempt: {err}"))?;
+        }
+
+        for row in &mailbox_rows {
+            let still_prunable: bool = tx
+                .query_row(
+                    "SELECT EXISTS (
+                         SELECT 1
+                         FROM mailbox AS candidate
+                         WHERE candidate.seq = ?1
+                           AND candidate.delivered_at IS NOT NULL
+                           AND candidate.kind = ?2
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM completion_event_listener AS listener
+                               WHERE listener.mailbox_seq = candidate.seq
+                                 AND listener.acknowledged_at IS NULL
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM mailbox_delivery_attempt_items AS item
+                               JOIN mailbox_delivery_attempts AS attempt
+                                 ON attempt.attempt_id = item.attempt_id
+                               WHERE item.mailbox_seq = candidate.seq
+                                 AND attempt.resolved_at IS NULL
+                           )
+                     )",
+                    params![row.seq, AGENT_BASH_COMPLETE_KIND],
+                    |query_row| query_row.get(0),
+                )
+                .map_err(|err| format!("Failed to revalidate terminal mailbox row: {err}"))?;
+            if !still_prunable {
+                continue;
+            }
+            report.listeners_detached += tx
+                .execute(
+                    "UPDATE completion_event_listener
+                     SET mailbox_seq = NULL
+                     WHERE mailbox_seq = ?1 AND acknowledged_at IS NOT NULL",
+                    params![row.seq],
+                )
+                .map_err(|err| format!("Failed to detach terminal completion listener: {err}"))?;
+            report.delivery_attempt_items_deleted += tx
+                .execute(
+                    "DELETE FROM mailbox_delivery_attempt_items
+                     WHERE mailbox_seq = ?1",
+                    params![row.seq],
+                )
+                .map_err(|err| format!("Failed to detach terminal delivery history: {err}"))?;
+            report.mailbox_rows_deleted += tx
+                .execute(
+                    "DELETE FROM mailbox WHERE seq = ?1 AND delivered_at IS NOT NULL",
+                    params![row.seq],
+                )
+                .map_err(|err| format!("Failed to prune terminal mailbox row: {err}"))?;
+        }
+        tx.commit()
+            .map_err(|err| format!("Failed to commit terminal history prune: {err}"))?;
+
+        for row in mailbox_rows {
+            if let Some(payload) = row.payload {
+                merge_payload_reclaim_result(
+                    &mut report,
+                    self.reclaim_payload_if_terminal(&payload)?,
+                );
+            }
+        }
+        let completion_payloads = reclaimable_completion_payloads(&self.conn, limit)?;
+        for payload in completion_payloads {
+            merge_payload_reclaim_result(&mut report, self.reclaim_payload_if_terminal(&payload)?);
+        }
+        Ok(report)
+    }
+
+    pub fn vacuum_terminal_history(&mut self) -> Result<(), String> {
+        truncate_terminal_history_wal(&self.conn, "before VACUUM")?;
+        self.conn
+            .execute_batch("VACUUM;")
+            .map_err(|err| format!("Failed to reclaim PID mailbox sidecar pages: {err}"))?;
+        truncate_terminal_history_wal(&self.conn, "after VACUUM")
+    }
+
+    fn reclaim_payload_if_terminal(
+        &mut self,
+        payload: &RetiredPayload,
+    ) -> Result<PayloadReclaimResult, String> {
+        let expected_path = self.payloads().payload_path_for_sha256(&payload.sha256)?;
+        if payload.file_path != expected_path {
+            return Err(format!(
+                "Refusing to reclaim mailbox payload outside the content-addressed store: {}",
+                payload.file_path.display()
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("Failed to start mailbox payload reclaim transaction: {err}"))?;
+        let live: bool = tx
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM mailbox WHERE payload_sha256 = ?1
+                 ) OR EXISTS (
+                     SELECT 1
+                     FROM completion_event AS event
+                     JOIN completion_event_listener AS listener
+                       ON listener.event_id = event.event_id
+                     WHERE event.payload_sha256 = ?1
+                       AND listener.acknowledged_at IS NULL
+                 )",
+                params![&payload.sha256],
+                |row| row.get(0),
+            )
+            .map_err(|err| format!("Failed to inspect mailbox payload references: {err}"))?;
+        if live {
+            tx.commit()
+                .map_err(|err| format!("Failed to finish mailbox payload inspection: {err}"))?;
+            return Ok(PayloadReclaimResult::default());
+        }
+
+        let reclaimed_bytes = match fs::metadata(&payload.file_path) {
+            Ok(metadata) => {
+                fs::remove_file(&payload.file_path).map_err(|err| {
+                    format!(
+                        "Failed to remove terminal mailbox payload {}: {err}",
+                        payload.file_path.display()
+                    )
+                })?;
+                metadata.len()
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => 0,
+            Err(error) => {
+                return Err(format!(
+                    "Failed to inspect terminal mailbox payload {}: {error}",
+                    payload.file_path.display()
+                ));
+            }
+        };
+        tx.execute(
+            "UPDATE completion_event
+             SET payload_reclaimed_at = COALESCE(payload_reclaimed_at, ?2)
+             WHERE payload_sha256 = ?1
+               AND state = 'triggered'
+               AND NOT EXISTS (
+                   SELECT 1 FROM completion_event_listener AS listener
+                   WHERE listener.event_id = completion_event.event_id
+                     AND listener.acknowledged_at IS NULL
+               )",
+            params![&payload.sha256, now_rfc3339()],
+        )
+        .map_err(|err| format!("Failed to record terminal payload reclamation: {err}"))?;
+        tx.commit()
+            .map_err(|err| format!("Failed to commit mailbox payload reclamation: {err}"))?;
+        Ok(PayloadReclaimResult {
+            files_deleted: usize::from(reclaimed_bytes > 0),
+            bytes_reclaimed: reclaimed_bytes,
+        })
+    }
+
+    fn maintain_terminal_history(&mut self) {
+        let deadline = Instant::now() + TERMINAL_HISTORY_MAINTENANCE_TIMEOUT;
+        if let Err(error) =
+            self.conn.progress_handler(
+                TERMINAL_HISTORY_MAINTENANCE_PROGRESS_OPS,
+                Some(move || {
+                    #[cfg(test)]
+                    COUNT_COMPLETION_FINALIZATION_VM_STEPS.with(|enabled| {
+                        if enabled.get() {
+                            COMPLETION_FINALIZATION_VM_STEPS.with(|count| {
+                                count.set(count.get().saturating_add(
+                                    TERMINAL_HISTORY_MAINTENANCE_PROGRESS_OPS as usize,
+                                ))
+                            });
+                        }
+                    });
+                    Instant::now() >= deadline
+                }),
+            )
+        {
+            tracing::warn!(error = %error, "failed to bound terminal mailbox maintenance");
+            return;
+        }
+        if let Err(error) = self
+            .conn
+            .busy_timeout(TERMINAL_HISTORY_MAINTENANCE_BUSY_TIMEOUT)
+        {
+            let _ = self.conn.progress_handler(0, None::<fn() -> bool>);
+            #[cfg(test)]
+            install_completion_finalization_vm_counter(&self.conn);
+            tracing::warn!(error = %error, "failed to bound terminal mailbox writer wait");
+            return;
+        }
+
+        let result = self.prune_terminal_history(TERMINAL_HISTORY_MAINTENANCE_BATCH);
+        let progress_reset = self.conn.progress_handler(0, None::<fn() -> bool>);
+        let timeout_reset = self.conn.busy_timeout(mailbox_writer_sqlite_timeout());
+        #[cfg(test)]
+        install_completion_finalization_vm_counter(&self.conn);
+
+        if let Err(error) = result {
+            tracing::warn!(error = %error, "bounded terminal mailbox maintenance failed");
+        }
+        if let Err(error) = progress_reset {
+            tracing::warn!(error = %error, "failed to clear terminal mailbox maintenance budget");
+        }
+        if let Err(error) = timeout_reset {
+            tracing::warn!(error = %error, "failed to restore terminal mailbox writer wait");
+        }
+    }
+}
+
+fn truncate_terminal_history_wal(conn: &Connection, phase: &str) -> Result<(), String> {
+    let (busy, log_frames, checkpointed_frames) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|err| format!("Failed to checkpoint PID mailbox sidecar {phase}: {err}"))?;
+    if busy == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "PID mailbox sidecar checkpoint remained busy {phase}: checkpointed {checkpointed_frames} of {log_frames} WAL frames"
+    ))
 }
 
 impl MailboxDb {
@@ -2890,6 +3230,7 @@ impl MailboxDb {
         tx.commit().map_err(|err| {
             format!("Failed to commit mailbox range acknowledgement transaction: {err}")
         })?;
+        self.maintain_terminal_history();
         Ok(changed)
     }
 
@@ -3013,7 +3354,9 @@ impl MailboxDb {
         acknowledge_completion_event_listeners_for_seqs(&tx, session_id, chain_id, seqs, &now)?;
         resolve_completed_delivery_attempts(&tx, session_id, &now, None)?;
         tx.commit()
-            .map_err(|err| format!("Failed to commit mailbox delivery transaction: {err}"))
+            .map_err(|err| format!("Failed to commit mailbox delivery transaction: {err}"))?;
+        self.maintain_terminal_history();
+        Ok(())
     }
 
     pub fn register_delivery_attempt(
@@ -3083,7 +3426,9 @@ impl MailboxDb {
         }
         resolve_completed_delivery_attempts(&tx, session_id, &now, None)?;
         tx.commit()
-            .map_err(|err| format!("Failed to commit mailbox delivery attempt: {err}"))
+            .map_err(|err| format!("Failed to commit mailbox delivery attempt: {err}"))?;
+        self.maintain_terminal_history();
+        Ok(())
     }
 
     pub fn register_or_reuse_delivery_attempt(
@@ -3451,9 +3796,12 @@ impl MailboxDb {
     pub fn confirm_delivery_attempt(&mut self, attempt_id: &str) -> Result<bool, String> {
         let now = now_rfc3339();
         let observed_at = now_unix_millis()?;
-        let tx = self.conn.transaction().map_err(|err| {
-            format!("Failed to start mailbox delivery confirmation transaction: {err}")
-        })?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| {
+                format!("Failed to start mailbox delivery confirmation transaction: {err}")
+            })?;
         let Some((session_id, delivery_invocation_uuid)) = tx
             .query_row(
                 "SELECT session_id, delivery_invocation_uuid
@@ -3512,6 +3860,7 @@ impl MailboxDb {
         resolve_completed_delivery_attempts(&tx, &session_id, &now, Some(attempt_id))?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox delivery confirmation: {err}"))?;
+        self.maintain_terminal_history();
         Ok(true)
     }
 
@@ -3908,25 +4257,6 @@ impl SessionAdmissionRepository<'_> {
         session_admission_by_registration_on(self.conn, registration_identity)
     }
 
-    pub fn queued_position(&self, registration_identity: &str) -> Result<Option<i64>, String> {
-        self.conn
-            .query_row(
-                "SELECT CASE WHEN target.state = 'queued' THEN (
-                     SELECT COUNT(*)
-                     FROM session_admission_queue queued
-                     WHERE queued.state = 'queued'
-                       AND queued.queue_sequence <= target.queue_sequence
-                 ) END
-                 FROM session_admission_queue target
-                 WHERE target.registration_identity = ?1",
-                params![registration_identity],
-                |row| row.get(0),
-            )
-            .optional()
-            .map(Option::flatten)
-            .map_err(|err| format!("Failed to read session admission queue position: {err}"))
-    }
-
     pub fn update_queued_reason(
         &mut self,
         registration_identity: &str,
@@ -4005,9 +4335,18 @@ impl SessionAdmissionRepository<'_> {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| format!("Failed to start session admission drain: {err}"))?;
-        cancel_dead_queued_session_admissions_on(&tx, now_unix_ms)?;
+        if cancel_dead_session_admission_head_on(&tx, now_unix_ms)? {
+            tx.commit()
+                .map_err(|err| format!("Failed to commit dead admission cancellation: {err}"))?;
+            return Ok(SessionAdmissionAttempt::Waiting);
+        }
         reconcile_dead_starting_generations_on(&tx, now_unix_ms)?;
         recover_stale_session_admissions_on(&tx, stale_before_unix_ms, now_unix_ms)?;
+        if unmaterialized_session_admission_exists_on(&tx)? {
+            tx.commit()
+                .map_err(|err| format!("Failed to commit materializing admission drain: {err}"))?;
+            return Ok(SessionAdmissionAttempt::LaunchMaterializing);
+        }
         let next = next_session_admission_on(&tx)?;
         let Some(registration_identity) = next else {
             tx.commit()
@@ -5521,6 +5860,24 @@ struct DeliveredPayloadCompactionCandidate {
     payload_retention_policy: Option<String>,
 }
 
+#[derive(Debug)]
+struct PrunableTerminalMailboxRow {
+    seq: i64,
+    payload: Option<RetiredPayload>,
+}
+
+#[derive(Debug)]
+struct RetiredPayload {
+    file_path: PathBuf,
+    sha256: String,
+}
+
+#[derive(Debug, Default)]
+struct PayloadReclaimResult {
+    files_deleted: usize,
+    bytes_reclaimed: u64,
+}
+
 impl DeliveredPayloadCompactionCandidate {
     fn published_payload(&self) -> Result<Option<PublishedMailboxPayload>, String> {
         match (
@@ -5551,6 +5908,261 @@ impl DeliveredPayloadCompactionCandidate {
             )),
         }
     }
+}
+
+fn terminal_history_retention_stats_on(
+    conn: &Connection,
+    keep: usize,
+) -> Result<TerminalHistoryRetentionStats, String> {
+    let keep = i64::try_from(keep)
+        .map_err(|_| "Terminal history keep count does not fit SQLite INTEGER".to_string())?;
+    let terminal_mailbox_rows = count_rows(
+        conn,
+        "SELECT COUNT(*) FROM mailbox WHERE delivered_at IS NOT NULL",
+        [],
+        "terminal mailbox rows",
+    )?;
+    let prunable_mailbox_rows = count_rows(
+        conn,
+        "SELECT COUNT(*)
+         FROM mailbox AS candidate
+         WHERE candidate.delivered_at IS NOT NULL
+           AND candidate.kind = ?2
+           AND candidate.seq NOT IN (
+                SELECT seq FROM mailbox
+                WHERE delivered_at IS NOT NULL AND kind = ?2
+                ORDER BY seq DESC
+                LIMIT ?1
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM completion_event_listener AS listener
+               WHERE listener.mailbox_seq = candidate.seq
+                 AND listener.acknowledged_at IS NULL
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM mailbox_delivery_attempt_items AS item
+               JOIN mailbox_delivery_attempts AS attempt
+                 ON attempt.attempt_id = item.attempt_id
+               WHERE item.mailbox_seq = candidate.seq
+                 AND attempt.resolved_at IS NULL
+           )",
+        params![keep, AGENT_BASH_COMPLETE_KIND],
+        "prunable terminal mailbox rows",
+    )?;
+    let resolved_delivery_attempts = count_rows(
+        conn,
+        "SELECT COUNT(*) FROM mailbox_delivery_attempts WHERE resolved_at IS NOT NULL",
+        [],
+        "resolved mailbox delivery attempts",
+    )?;
+    let prunable_delivery_attempts = count_rows(
+        conn,
+        "SELECT COUNT(*)
+         FROM mailbox_delivery_attempts AS candidate
+         WHERE candidate.resolved_at IS NOT NULL
+           AND (
+               candidate.evidence_disposition IS NULL
+               OR candidate.evidence_disposition NOT IN ('pending', 'legacy_pending')
+               OR candidate.evidence_reconciled_at IS NOT NULL
+           )
+           AND candidate.attempt_id NOT IN (
+                SELECT attempt_id FROM mailbox_delivery_attempts
+                WHERE resolved_at IS NOT NULL
+                  AND (
+                      evidence_disposition IS NULL
+                      OR evidence_disposition NOT IN ('pending', 'legacy_pending')
+                      OR evidence_reconciled_at IS NOT NULL
+                  )
+                ORDER BY created_at DESC, attempt_id DESC
+                LIMIT ?1
+           )",
+        params![keep],
+        "prunable mailbox delivery attempts",
+    )?;
+    let reclaimable_payload_files = count_rows(
+        conn,
+        "SELECT COUNT(*) FROM (
+             SELECT DISTINCT event.payload_sha256
+             FROM completion_event AS event
+             WHERE event.state = 'triggered'
+               AND event.payload_reclaimed_at IS NULL
+               AND event.payload_file_path IS NOT NULL
+               AND event.payload_sha256 IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM mailbox
+                   WHERE mailbox.payload_sha256 = event.payload_sha256
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM completion_event AS shared_event
+                   JOIN completion_event_listener AS listener
+                     ON listener.event_id = shared_event.event_id
+                   WHERE shared_event.payload_sha256 = event.payload_sha256
+                     AND listener.acknowledged_at IS NULL
+               )
+         )",
+        [],
+        "reclaimable terminal payload files",
+    )?;
+    Ok(TerminalHistoryRetentionStats {
+        terminal_mailbox_rows,
+        prunable_mailbox_rows,
+        resolved_delivery_attempts,
+        prunable_delivery_attempts,
+        reclaimable_payload_files,
+    })
+}
+
+fn count_rows<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    target: &str,
+) -> Result<usize, String> {
+    let count = conn
+        .query_row(sql, params, |row| row.get::<_, i64>(0))
+        .map_err(|err| format!("Failed to count {target}: {err}"))?;
+    usize::try_from(count).map_err(|_| format!("{target} count does not fit usize"))
+}
+
+fn prunable_delivery_attempt_ids(
+    conn: &Connection,
+    keep: i64,
+    limit: i64,
+) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT attempt_id
+             FROM mailbox_delivery_attempts AS candidate
+             WHERE candidate.resolved_at IS NOT NULL
+               AND (
+                   candidate.evidence_disposition IS NULL
+                   OR candidate.evidence_disposition NOT IN ('pending', 'legacy_pending')
+                   OR candidate.evidence_reconciled_at IS NOT NULL
+               )
+               AND candidate.attempt_id NOT IN (
+                    SELECT attempt_id FROM mailbox_delivery_attempts
+                    WHERE resolved_at IS NOT NULL
+                      AND (
+                          evidence_disposition IS NULL
+                          OR evidence_disposition NOT IN ('pending', 'legacy_pending')
+                          OR evidence_reconciled_at IS NOT NULL
+                      )
+                    ORDER BY created_at DESC, attempt_id DESC
+                    LIMIT ?1
+               )
+             ORDER BY created_at ASC, attempt_id ASC
+             LIMIT ?2",
+        )
+        .map_err(|err| format!("Failed to prepare resolved delivery attempt pruning: {err}"))?;
+    let rows = statement
+        .query_map(params![keep, limit], |row| row.get(0))
+        .map_err(|err| format!("Failed to query resolved delivery attempts: {err}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to read resolved delivery attempt: {err}"))
+}
+
+fn prunable_terminal_mailbox_rows(
+    conn: &Connection,
+    keep: i64,
+    limit: i64,
+) -> Result<Vec<PrunableTerminalMailboxRow>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT candidate.seq, candidate.payload_file_path, candidate.payload_sha256
+             FROM mailbox AS candidate
+             WHERE candidate.delivered_at IS NOT NULL
+               AND candidate.kind = ?2
+               AND candidate.seq NOT IN (
+                   SELECT seq FROM mailbox
+                   WHERE delivered_at IS NOT NULL AND kind = ?2
+                   ORDER BY seq DESC
+                   LIMIT ?1
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM completion_event_listener AS listener
+                   WHERE listener.mailbox_seq = candidate.seq
+                     AND listener.acknowledged_at IS NULL
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM mailbox_delivery_attempt_items AS item
+                   JOIN mailbox_delivery_attempts AS attempt
+                     ON attempt.attempt_id = item.attempt_id
+                   WHERE item.mailbox_seq = candidate.seq
+                     AND attempt.resolved_at IS NULL
+               )
+             ORDER BY candidate.seq ASC
+             LIMIT ?3",
+        )
+        .map_err(|err| format!("Failed to prepare terminal mailbox pruning: {err}"))?;
+    let rows = statement
+        .query_map(params![keep, AGENT_BASH_COMPLETE_KIND, limit], |row| {
+            let file_path = row.get::<_, Option<String>>(1)?;
+            let sha256 = row.get::<_, Option<String>>(2)?;
+            Ok(PrunableTerminalMailboxRow {
+                seq: row.get(0)?,
+                payload: file_path
+                    .zip(sha256)
+                    .map(|(file_path, sha256)| RetiredPayload {
+                        file_path: PathBuf::from(file_path),
+                        sha256,
+                    }),
+            })
+        })
+        .map_err(|err| format!("Failed to query terminal mailbox rows: {err}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to read terminal mailbox row: {err}"))
+}
+
+fn reclaimable_completion_payloads(
+    conn: &Connection,
+    limit: i64,
+) -> Result<Vec<RetiredPayload>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT event.payload_file_path, event.payload_sha256
+             FROM completion_event AS event
+             WHERE event.state = 'triggered'
+               AND event.payload_reclaimed_at IS NULL
+               AND event.payload_file_path IS NOT NULL
+               AND event.payload_sha256 IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM mailbox
+                   WHERE mailbox.payload_sha256 = event.payload_sha256
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM completion_event AS shared_event
+                   JOIN completion_event_listener AS listener
+                     ON listener.event_id = shared_event.event_id
+                   WHERE shared_event.payload_sha256 = event.payload_sha256
+                     AND listener.acknowledged_at IS NULL
+               )
+             GROUP BY event.payload_sha256
+             ORDER BY MIN(event.triggered_at), event.payload_sha256
+             LIMIT ?1",
+        )
+        .map_err(|err| format!("Failed to prepare terminal payload reclamation: {err}"))?;
+    let rows = statement
+        .query_map(params![limit], |row| {
+            Ok(RetiredPayload {
+                file_path: PathBuf::from(row.get::<_, String>(0)?),
+                sha256: row.get(1)?,
+            })
+        })
+        .map_err(|err| format!("Failed to query terminal payloads: {err}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to read terminal payload: {err}"))
+}
+
+fn merge_payload_reclaim_result(
+    report: &mut TerminalHistoryPruneReport,
+    reclaimed: PayloadReclaimResult,
+) {
+    report.payload_files_deleted += reclaimed.files_deleted;
+    report.payload_bytes_reclaimed += reclaimed.bytes_reclaimed;
 }
 
 pub fn submitted_input_handle(
@@ -7677,7 +8289,8 @@ fn completion_event_by_id_on(
     conn.query_row(
         "SELECT event_id, kind, state, delivery_mode, state_dir, meta_path, log_path,
                 rc_path, rc, payload_json, payload_file_path, payload_sha256,
-                payload_byte_len, payload_retention_policy, created_at, triggered_at
+                payload_byte_len, payload_retention_policy, created_at, triggered_at,
+                payload_reclaimed_at
          FROM completion_event
          WHERE event_id = ?1",
         params![event_id],
@@ -7699,6 +8312,7 @@ fn completion_event_by_id_on(
                 payload_retention_policy: row.get(13)?,
                 created_at: row.get(14)?,
                 triggered_at: row.get(15)?,
+                payload_reclaimed_at: row.get(16)?,
             })
         },
     )
@@ -8320,6 +8934,7 @@ fn mailbox_schema_definition() -> &'static str {
             payload_retention_policy TEXT,
             created_at               TEXT NOT NULL,
             triggered_at             TEXT,
+            payload_reclaimed_at     TEXT,
             CHECK (
                 (state = 'pending' AND rc IS NULL AND payload_json IS NULL
                     AND payload_file_path IS NULL AND payload_sha256 IS NULL
@@ -8821,6 +9436,14 @@ pub(super) fn session_admission_schema_definition() -> &'static str {
        ON session_admission_queue(claim_token, claimed_at_unix_ms);"
 }
 
+pub(super) fn session_admission_scaling_indexes_definition() -> &'static str {
+    "CREATE INDEX IF NOT EXISTS idx_session_admission_state_runtime
+       ON session_admission_queue(state, runtime_generation_uuid);
+
+     CREATE INDEX IF NOT EXISTS idx_runtime_generation_lifecycle_created
+       ON runtime_generation(lifecycle_state, created_at);"
+}
+
 pub(super) fn ensure_session_admission_launcher_identity_schema(
     conn: &Connection,
 ) -> Result<(), String> {
@@ -8920,6 +9543,31 @@ fn next_session_admission_on(conn: &Connection) -> Result<Option<String>, String
     .map_err(|err| format!("Failed to select next eligible session admission: {err}"))
 }
 
+fn unmaterialized_session_admission_exists_on(conn: &Connection) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT
+             EXISTS (
+                 SELECT 1 FROM session_admission_queue
+                 WHERE state = 'admitted'
+             )
+             OR EXISTS (
+                 SELECT 1 FROM session_admission_queue
+                 WHERE state = 'launching' AND runtime_generation_uuid IS NULL
+             )
+             OR EXISTS (
+                 SELECT 1
+                 FROM runtime_generation generation
+                 JOIN session_admission_queue admission
+                   ON admission.runtime_generation_uuid = generation.generation_uuid
+                 WHERE generation.lifecycle_state = 'starting'
+                   AND admission.state = 'launching'
+             )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|err| format!("Failed to inspect materializing session admissions: {err}"))
+}
+
 fn session_admission_by_registration_on(
     conn: &Connection,
     registration_identity: &str,
@@ -8958,19 +9606,31 @@ fn recover_stale_session_admissions_on(
     stale_before_unix_ms: i64,
     now_unix_ms: i64,
 ) -> Result<(), String> {
-    conn.execute(
-        "UPDATE session_admission_queue
-         SET state = 'settled', queue_reason = 'settled', updated_at_unix_ms = ?1
-         WHERE state NOT IN ('settled', 'cancelled')
-           AND runtime_generation_uuid IS NOT NULL
-           AND NOT EXISTS (
-             SELECT 1 FROM runtime_generation AS generation
-             WHERE generation.generation_uuid = session_admission_queue.runtime_generation_uuid
-               AND generation.lifecycle_state != 'exited'
-           )",
-        params![now_unix_ms],
-    )
-    .map_err(|err| format!("Failed to settle exited session admissions: {err}"))?;
+    let exited_generation = conn
+        .query_row(
+            "SELECT generation.generation_uuid
+             FROM runtime_generation generation
+             JOIN session_admission_queue admission
+               ON admission.runtime_generation_uuid = generation.generation_uuid
+             WHERE generation.lifecycle_state = 'exited'
+               AND admission.state IN ('admitted', 'launching')
+             ORDER BY generation.created_at
+             LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| format!("Failed to inspect exited session admissions: {err}"))?;
+    if let Some(generation_uuid) = exited_generation {
+        conn.execute(
+            "UPDATE session_admission_queue
+             SET state = 'settled', queue_reason = 'settled', updated_at_unix_ms = ?2
+             WHERE runtime_generation_uuid = ?1
+               AND state IN ('admitted', 'launching')",
+            params![generation_uuid, now_unix_ms],
+        )
+        .map_err(|err| format!("Failed to settle exited session admission: {err}"))?;
+    }
     conn.execute(
         "UPDATE session_admission_queue
          SET state = 'queued', queue_reason = 'fifo_wait',
@@ -8985,42 +9645,66 @@ fn recover_stale_session_admissions_on(
     Ok(())
 }
 
-fn cancel_dead_queued_session_admissions_on(
+fn cancel_dead_session_admission_head_on(
     conn: &Connection,
     now_unix_ms: i64,
-) -> Result<(), String> {
-    let mut statement = conn
-        .prepare(
+) -> Result<bool, String> {
+    let owner = conn
+        .query_row(
             "SELECT registration_identity, launcher_os_pid, launcher_os_boot_id,
                     launcher_os_pid_starttime_ticks
              FROM session_admission_queue
-             WHERE (state = 'queued'
-                    OR (state = 'launching' AND runtime_generation_uuid IS NULL))
-             ORDER BY queue_sequence",
+             WHERE state = 'launching' AND runtime_generation_uuid IS NULL
+             ORDER BY queue_sequence
+             LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ProcessIdentity {
+                        os_pid: row.get(1)?,
+                        os_boot_id: row.get(2)?,
+                        os_pid_starttime_ticks: row.get(3)?,
+                    },
+                ))
+            },
         )
-        .map_err(|err| format!("Failed to prepare queued launcher reconciliation: {err}"))?;
-    let owners = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                ProcessIdentity {
-                    os_pid: row.get(1)?,
-                    os_boot_id: row.get(2)?,
-                    os_pid_starttime_ticks: row.get(3)?,
+        .optional()
+        .map_err(|err| format!("Failed to read unbound launcher identity: {err}"))?;
+    let owner = match owner {
+        Some(owner) => Some(owner),
+        None => conn
+            .query_row(
+                "SELECT registration_identity, launcher_os_pid, launcher_os_boot_id,
+                        launcher_os_pid_starttime_ticks
+                 FROM session_admission_queue
+                 WHERE state = 'queued'
+                 ORDER BY queue_sequence
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        ProcessIdentity {
+                            os_pid: row.get(1)?,
+                            os_boot_id: row.get(2)?,
+                            os_pid_starttime_ticks: row.get(3)?,
+                        },
+                    ))
                 },
-            ))
-        })
-        .map_err(|err| format!("Failed to query queued launcher identities: {err}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("Failed to read queued launcher identity: {err}"))?;
-    drop(statement);
-
-    for (registration_identity, recorded) in owners {
-        let live = pid_identity::read_live_process_identity(recorded.os_pid)?;
-        if live.as_ref() == Some(&recorded) {
-            continue;
-        }
-        conn.execute(
+            )
+            .optional()
+            .map_err(|err| format!("Failed to read FIFO launcher identity: {err}"))?,
+    };
+    let Some((registration_identity, recorded)) = owner else {
+        return Ok(false);
+    };
+    let live = pid_identity::read_live_process_identity(recorded.os_pid)?;
+    if live.as_ref() == Some(&recorded) {
+        return Ok(false);
+    }
+    let changed = conn
+        .execute(
             "UPDATE session_admission_queue
              SET state = 'cancelled', queue_reason = 'launcher_exited', claim_token = NULL,
                  claimed_at_unix_ms = NULL, updated_at_unix_ms = ?2
@@ -9039,75 +9723,72 @@ fn cancel_dead_queued_session_admissions_on(
             ],
         )
         .map_err(|err| format!("Failed to cancel dead queued launcher: {err}"))?;
-    }
-    Ok(())
+    Ok(changed == 1)
 }
 
 fn reconcile_dead_starting_generations_on(
     conn: &Connection,
     now_unix_ms: i64,
 ) -> Result<(), String> {
-    let mut statement = conn
-        .prepare(
+    let generation = conn
+        .query_row(
             "SELECT generation_uuid, creator_identity_os_pid,
                     creator_identity_os_boot_id,
                     creator_identity_os_pid_starttime_ticks
              FROM runtime_generation
              WHERE lifecycle_state = 'starting'
                AND identity_os_pid IS NULL
-               AND creator_identity_os_pid IS NOT NULL",
+               AND creator_identity_os_pid IS NOT NULL
+             ORDER BY created_at
+             LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ProcessIdentity {
+                        os_pid: row.get(1)?,
+                        os_boot_id: row.get(2)?,
+                        os_pid_starttime_ticks: row.get(3)?,
+                    },
+                ))
+            },
         )
-        .map_err(|err| format!("Failed to prepare starting-generation reconciliation: {err}"))?;
-    let generations = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                ProcessIdentity {
-                    os_pid: row.get(1)?,
-                    os_boot_id: row.get(2)?,
-                    os_pid_starttime_ticks: row.get(3)?,
-                },
-            ))
-        })
-        .map_err(|err| format!("Failed to query starting-generation creators: {err}"))?
-        .collect::<Result<Vec<_>, _>>()
+        .optional()
         .map_err(|err| format!("Failed to read starting-generation creator: {err}"))?;
-    drop(statement);
-    let exited_at = now_rfc3339();
-
-    for (generation_uuid, creator) in generations {
-        let live = pid_identity::read_live_process_identity(creator.os_pid)?;
-        if live.as_ref() == Some(&creator) {
-            continue;
-        }
-        conn.execute(
-            "UPDATE runtime_generation
-             SET lifecycle_state = 'exited', exited_at = ?2,
-                 terminal_reason = 'recovered_dead'
-             WHERE generation_uuid = ?1
-               AND lifecycle_state = 'starting'
-               AND identity_os_pid IS NULL
-               AND creator_identity_os_pid = ?3
-               AND creator_identity_os_boot_id = ?4
-               AND creator_identity_os_pid_starttime_ticks = ?5",
-            params![
-                &generation_uuid,
-                &exited_at,
-                creator.os_pid,
-                &creator.os_boot_id,
-                creator.os_pid_starttime_ticks,
-            ],
-        )
-        .map_err(|err| format!("Failed to reconcile dead starting generation: {err}"))?;
-        conn.execute(
-            "UPDATE session_admission_queue
-              SET state = 'settled', queue_reason = 'settled', updated_at_unix_ms = ?2
-             WHERE runtime_generation_uuid = ?1
-               AND state IN ('admitted', 'launching')",
-            params![&generation_uuid, now_unix_ms],
-        )
-        .map_err(|err| format!("Failed to settle dead starting admission: {err}"))?;
+    let Some((generation_uuid, creator)) = generation else {
+        return Ok(());
+    };
+    let live = pid_identity::read_live_process_identity(creator.os_pid)?;
+    if live.as_ref() == Some(&creator) {
+        return Ok(());
     }
+    conn.execute(
+        "UPDATE runtime_generation
+         SET lifecycle_state = 'exited', exited_at = ?2,
+             terminal_reason = 'recovered_dead'
+         WHERE generation_uuid = ?1
+           AND lifecycle_state = 'starting'
+           AND identity_os_pid IS NULL
+           AND creator_identity_os_pid = ?3
+           AND creator_identity_os_boot_id = ?4
+           AND creator_identity_os_pid_starttime_ticks = ?5",
+        params![
+            &generation_uuid,
+            now_rfc3339(),
+            creator.os_pid,
+            &creator.os_boot_id,
+            creator.os_pid_starttime_ticks,
+        ],
+    )
+    .map_err(|err| format!("Failed to reconcile dead starting generation: {err}"))?;
+    conn.execute(
+        "UPDATE session_admission_queue
+          SET state = 'settled', queue_reason = 'settled', updated_at_unix_ms = ?2
+         WHERE runtime_generation_uuid = ?1
+           AND state IN ('admitted', 'launching')",
+        params![&generation_uuid, now_unix_ms],
+    )
+    .map_err(|err| format!("Failed to settle dead starting admission: {err}"))?;
     Ok(())
 }
 
@@ -9516,6 +10197,43 @@ fn ensure_mailbox_compaction_index(conn: &Connection) -> Result<(), String> {
     .map_err(|err| format!("Failed to ensure mailbox compaction index: {err}"))
 }
 
+fn ensure_terminal_history_retention_schema(conn: &Connection) -> Result<(), String> {
+    let columns = table_columns(
+        conn,
+        "completion_event",
+        &format_table_columns_pragma("completion_event"),
+    )?;
+    if !columns
+        .iter()
+        .any(|column| column == "payload_reclaimed_at")
+    {
+        add_sidecar_column(conn, "completion_event", "payload_reclaimed_at", "TEXT")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mailbox_terminal_retention
+             ON mailbox(delivered_at, seq)
+             WHERE delivered_at IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_mailbox_delivery_attempt_terminal_retention
+             ON mailbox_delivery_attempts(resolved_at, created_at, attempt_id)
+             WHERE resolved_at IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_completion_event_payload_retention
+             ON completion_event(payload_reclaimed_at, triggered_at, event_id)
+             WHERE state = 'triggered';",
+    )
+    .map_err(|err| format!("Failed to ensure terminal history retention indexes: {err}"))
+}
+
+fn ensure_terminal_payload_lookup_indexes(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mailbox_payload_reference
+             ON mailbox(payload_sha256)
+             WHERE payload_sha256 IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_completion_event_payload_reference
+             ON completion_event(payload_sha256, event_id);",
+    )
+    .map_err(|err| format!("Failed to ensure terminal payload lookup indexes: {err}"))
+}
+
 fn ensure_mailbox_delivery_owner_index(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_mailbox_delivery_owner
@@ -9584,13 +10302,14 @@ fn settle_unverifiable_runtime_generations(conn: &Connection) -> Result<(), Stri
     Ok(())
 }
 
-fn runtime_generation_column_additions() -> [(&'static str, &'static str); 5] {
+fn runtime_generation_column_additions() -> [(&'static str, &'static str); 6] {
     [
         ("active_delivery_claimed_at", "TEXT"),
         ("active_delivery_seqs_json", "TEXT"),
         ("creator_identity_os_pid", "INTEGER"),
         ("creator_identity_os_boot_id", "TEXT"),
         ("creator_identity_os_pid_starttime_ticks", "INTEGER"),
+        ("created_at", "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'"),
     ]
 }
 
@@ -10235,8 +10954,185 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            current_open_steps < 512,
+            current_open_steps < 576,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
+        );
+    }
+
+    #[test]
+    fn v8_upgrade_adds_session_admission_scaling_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX idx_session_admission_state_runtime;
+                 DROP INDEX idx_runtime_generation_lifecycle_created;
+                 PRAGMA user_version = 8;",
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let connection = Connection::open(&sidecar_path).unwrap();
+        let index_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name IN (
+                     'idx_session_admission_state_runtime',
+                     'idx_runtime_generation_lifecycle_created'
+                   )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 2);
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema::CURRENT_VERSION
+        );
+    }
+
+    #[test]
+    fn v9_upgrade_adds_terminal_history_retention_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX idx_mailbox_terminal_retention;
+                 DROP INDEX idx_mailbox_delivery_attempt_terminal_retention;
+                 DROP INDEX idx_completion_event_payload_retention;
+                 DROP INDEX idx_mailbox_payload_reference;
+                 DROP INDEX idx_completion_event_payload_reference;
+                 ALTER TABLE completion_event DROP COLUMN payload_reclaimed_at;
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let connection = Connection::open(&sidecar_path).unwrap();
+        let index_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name IN (
+                     'idx_mailbox_terminal_retention',
+                     'idx_mailbox_delivery_attempt_terminal_retention',
+                     'idx_completion_event_payload_retention'
+                   )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let columns = table_columns(
+            &connection,
+            "completion_event",
+            &format_table_columns_pragma("completion_event"),
+        )
+        .unwrap();
+        assert_eq!(index_count, 3);
+        assert!(
+            columns
+                .iter()
+                .any(|column| column == "payload_reclaimed_at")
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema::CURRENT_VERSION
+        );
+    }
+
+    #[test]
+    fn v10_upgrade_adds_terminal_payload_lookup_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX idx_mailbox_payload_reference;
+                 DROP INDEX idx_completion_event_payload_reference;
+                 PRAGMA user_version = 10;",
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let connection = Connection::open(&sidecar_path).unwrap();
+        let index_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name IN (
+                     'idx_mailbox_payload_reference',
+                     'idx_completion_event_payload_reference'
+                   )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 2);
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema::CURRENT_VERSION
+        );
+    }
+
+    fn waiting_admission_drain_vm_steps(queued: usize) -> usize {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let identity = current_identity();
+        for index in 0..queued {
+            mailbox
+                .session_admissions()
+                .enqueue(
+                    &format!("bounded-admission-{index}"),
+                    &format!("bounded-registration-{index}"),
+                    None,
+                    &identity,
+                    index as i64,
+                )
+                .unwrap();
+        }
+
+        begin_completion_finalization_vm_count();
+        let result = mailbox
+            .session_admissions()
+            .try_admit_registration(
+                &format!("bounded-registration-{}", queued - 1),
+                "bounded-claim",
+                i64::MAX,
+                i64::MIN,
+            )
+            .unwrap();
+        let steps = end_completion_finalization_vm_count();
+        assert_eq!(result, SessionAdmissionAttempt::Waiting);
+        steps
+    }
+
+    #[test]
+    fn waiting_admission_drain_work_is_bounded_independently_of_queue_length() {
+        let small_steps = waiting_admission_drain_vm_steps(16);
+        let large_steps = waiting_admission_drain_vm_steps(1_024);
+        eprintln!("waiting admission VM steps: small={small_steps}, large={large_steps}");
+        assert!(
+            large_steps <= small_steps + 256,
+            "waiting drain grew with queue length: small={small_steps}, large={large_steps}"
         );
     }
 
@@ -10454,15 +11350,20 @@ mod tests {
     fn v3_upgrade_settles_unverifiable_runtime_authorities() {
         let directory = tempfile::tempdir().unwrap();
         let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
         let connection = Connection::open(&sidecar_path).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE runtime_generation (
+                "DROP TABLE runtime_generation;
+                 CREATE TABLE runtime_generation (
                     generation_uuid TEXT PRIMARY KEY,
                     lifecycle_state TEXT NOT NULL,
+                    spawn_invocation_uuid TEXT NOT NULL DEFAULT 'legacy-spawn',
+                    session_id TEXT,
                     identity_os_pid INTEGER,
                     identity_os_boot_id TEXT,
                     identity_os_pid_starttime_ticks INTEGER,
+                    created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z',
                     exited_at TEXT,
                     terminal_reason TEXT,
                     active_delivery_claim_uuid TEXT,
@@ -10500,6 +11401,7 @@ mod tests {
             "creator_identity_os_pid",
             "creator_identity_os_boot_id",
             "creator_identity_os_pid_starttime_ticks",
+            "created_at",
         ] {
             assert!(columns.iter().any(|candidate| candidate == column));
         }
@@ -13193,6 +14095,437 @@ mod tests {
                 .hydrate_agent_bash_payload_json(&compacted)
                 .unwrap(),
             payload
+        );
+    }
+
+    #[test]
+    fn terminal_history_pruning_is_bounded_and_preserves_live_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let old = inserted_row(db.enqueue_agent_bash_complete(&input("old", "session-a")));
+        let protected =
+            inserted_row(db.enqueue_agent_bash_complete(&input("protected", "session-a")));
+        db.register_completion_event(completion_registration(
+            "terminal-event",
+            "async",
+            "session-a",
+            "terminal-owner",
+        ))
+        .unwrap();
+        let event_result = db
+            .trigger_completion_event(completion_trigger(
+                "terminal-event",
+                r#"{"terminal":"payload"}"#,
+                false,
+            ))
+            .unwrap();
+        let event_row = event_result.mailbox_rows.into_iter().next().unwrap();
+        let event_payload_path = PathBuf::from(event_row.payload_file_path.as_deref().unwrap());
+        let newest = inserted_row(db.enqueue_agent_bash_complete(&input("newest", "session-a")));
+        let pending = inserted_row(db.enqueue_agent_bash_complete(&input("pending", "session-a")));
+        db.mark_delivered(
+            "session-a",
+            None,
+            &[old.seq, protected.seq, event_row.seq, newest.seq],
+            "delivery",
+        )
+        .unwrap();
+        db.connection()
+            .execute_batch(&format!(
+                "INSERT INTO mailbox_delivery_attempts (
+                     attempt_id, session_id, delivery_invocation_uuid, created_at,
+                     prepared_remaining_count
+                 ) VALUES
+                     ('resolved-evidence', 'session-a', 'delivery', '2026-07-31T00:00:00Z', 0),
+                     ('resolved-old', 'session-a', 'delivery', '2026-08-01T00:00:00Z', 0),
+                     ('resolved-middle', 'session-a', 'delivery', '2026-08-02T00:00:00Z', 0),
+                     ('resolved-new', 'session-a', 'delivery', '2026-08-03T00:00:00Z', 0),
+                     ('unresolved', 'session-a', 'delivery', '2026-08-04T00:00:00Z', 0);
+                 UPDATE mailbox_delivery_attempts
+                  SET resolved_at = created_at
+                  WHERE attempt_id LIKE 'resolved-%';
+                  UPDATE mailbox_delivery_attempts
+                  SET acknowledged_at = created_at,
+                      evidence_turn_generation_id = 'generation-a',
+                      evidence_observed_at = 1,
+                      evidence_disposition = 'pending'
+                  WHERE attempt_id = 'resolved-evidence';
+                  INSERT INTO mailbox_delivery_attempt_items (attempt_id, mailbox_seq)
+                  VALUES ('unresolved', {});",
+                protected.seq
+            ))
+            .unwrap();
+
+        let before = terminal_history_retention_stats_on(db.connection(), 1).unwrap();
+        assert_eq!(before.terminal_mailbox_rows, 4);
+        assert_eq!(before.prunable_mailbox_rows, 2);
+        assert_eq!(before.prunable_delivery_attempts, 2);
+
+        let report = db.prune_terminal_history_with_keep(10, 1).unwrap();
+
+        assert_eq!(report.mailbox_rows_deleted, 2);
+        assert_eq!(report.listeners_detached, 1);
+        assert_eq!(report.delivery_attempts_deleted, 2);
+        assert!(
+            db.delivery_attempt_window("resolved-evidence")
+                .unwrap()
+                .is_some()
+        );
+        assert!(!event_payload_path.exists());
+        let remaining = db.list_mailbox("session-a", true).unwrap();
+        assert_eq!(
+            remaining.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            vec![protected.seq, newest.seq, pending.seq]
+        );
+        assert!(
+            db.completion_event_listeners("terminal-event").unwrap()[0]
+                .mailbox_seq
+                .is_none()
+        );
+        assert!(
+            db.completion_event("terminal-event")
+                .unwrap()
+                .unwrap()
+                .payload_reclaimed_at
+                .is_some()
+        );
+        assert!(
+            db.connection()
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM mailbox_delivery_attempt_items
+                         WHERE attempt_id = 'unresolved' AND mailbox_seq = ?1
+                     )",
+                    params![protected.seq],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        let replay = db
+            .trigger_completion_event(completion_trigger(
+                "terminal-event",
+                r#"{"terminal":"payload"}"#,
+                false,
+            ))
+            .unwrap();
+        assert!(!replay.triggered);
+        assert!(!event_payload_path.exists());
+
+        db.vacuum_terminal_history().unwrap();
+        let after = inserted_row(db.enqueue_agent_bash_complete(&input("after", "session-a")));
+        assert!(after.seq > pending.seq);
+    }
+
+    #[test]
+    fn terminal_history_candidate_discovery_does_not_hold_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_path = dir.path().join("pid-identity.db");
+        let mut maintenance = MailboxDb::open(&sidecar_path).unwrap();
+        let old = inserted_row(maintenance.enqueue_agent_bash_complete(&input("old", "session-a")));
+        maintenance
+            .mark_delivered("session-a", None, &[old.seq], "delivery")
+            .unwrap();
+
+        let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_paused = std::sync::Arc::clone(&paused);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        let handler_release_rx = std::sync::Arc::clone(&release_rx);
+        maintenance
+            .connection()
+            .progress_handler(
+                1,
+                Some(move || {
+                    if !handler_paused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        entered_tx.send(()).unwrap();
+                        handler_release_rx.lock().unwrap().recv().unwrap();
+                    }
+                    false
+                }),
+            )
+            .unwrap();
+
+        let prune = std::thread::spawn(move || maintenance.prune_terminal_history_with_keep(1, 0));
+        entered_rx
+            .recv_timeout(StdDuration::from_secs(2))
+            .expect("terminal history candidate query did not start");
+
+        let writer = Connection::open(&sidecar_path).unwrap();
+        writer.busy_timeout(StdDuration::from_millis(100)).unwrap();
+        let write_result = writer.execute(
+            "INSERT INTO mailbox (
+                 session_id, kind, handle, payload_json, enqueued_at,
+                 state_dir, meta_path, log_path, rc_path, rc
+             ) VALUES (
+                 'session-b', 'input', 'concurrent-writer', '{}',
+                 '2026-08-28T00:00:00Z', '/state', '/meta', '/log', '/rc', 0
+             )",
+            [],
+        );
+        release_tx.send(()).unwrap();
+
+        assert_eq!(write_result.unwrap(), 1);
+        prune.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn terminal_payload_reclamation_lookup_work_is_bounded() {
+        const HISTORY_PER_REFERENCE_KIND: usize = 2_048;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.connection()
+            .execute_batch(&format!(
+                "WITH RECURSIVE counter(value) AS (
+                     VALUES(1)
+                     UNION ALL
+                     SELECT value + 1 FROM counter
+                     WHERE value < {HISTORY_PER_REFERENCE_KIND}
+                 )
+                 INSERT INTO completion_event (
+                     event_id, kind, state, delivery_mode, state_dir, meta_path,
+                     log_path, rc_path, rc, payload_json, payload_file_path,
+                     payload_sha256, payload_byte_len, payload_retention_policy,
+                     created_at, triggered_at
+                 )
+                 SELECT printf('mailbox-event-%d', value), 'agent_bash_complete',
+                        'triggered', 'async', '/state', '/meta', '/log', '/rc', 0,
+                        '{{}}', printf('/payload/mailbox-%d', value),
+                        printf('%064x', value), 2, 'immutable',
+                        '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z'
+                 FROM counter;
+
+                 WITH RECURSIVE counter(value) AS (
+                     VALUES(1)
+                     UNION ALL
+                     SELECT value + 1 FROM counter
+                     WHERE value < {HISTORY_PER_REFERENCE_KIND}
+                 )
+                 INSERT INTO mailbox (
+                     session_id, kind, handle, payload_json, enqueued_at,
+                     delivered_at, state_dir, meta_path, log_path, rc_path, rc,
+                     payload_file_path, payload_sha256, payload_byte_len,
+                     payload_retention_policy, payload_compacted_at
+                 )
+                 SELECT 'session-a', 'agent_bash_complete',
+                        printf('mailbox-handle-%d', value), '{{}}',
+                        '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z',
+                        '/state', '/meta', '/log', '/rc', 0,
+                        printf('/payload/mailbox-%d', value),
+                        printf('%064x', value), 2, 'immutable',
+                        '2026-08-01T00:00:00Z'
+                 FROM counter;
+
+                 WITH RECURSIVE counter(value) AS (
+                     VALUES(1)
+                     UNION ALL
+                     SELECT value + 1 FROM counter
+                     WHERE value < {HISTORY_PER_REFERENCE_KIND}
+                 )
+                 INSERT INTO completion_event (
+                     event_id, kind, state, delivery_mode, state_dir, meta_path,
+                     log_path, rc_path, rc, payload_json, payload_file_path,
+                     payload_sha256, payload_byte_len, payload_retention_policy,
+                     created_at, triggered_at
+                 )
+                 SELECT printf('listener-event-%d', value), 'agent_bash_complete',
+                        'triggered', 'async', '/state', '/meta', '/log', '/rc', 0,
+                        '{{}}', printf('/payload/listener-%d', value),
+                        printf('%064x', value + {HISTORY_PER_REFERENCE_KIND}),
+                        2, 'immutable', '2026-08-01T00:00:00Z',
+                        '2026-08-01T00:00:00Z'
+                 FROM counter;
+
+                 WITH RECURSIVE counter(value) AS (
+                     VALUES(1)
+                     UNION ALL
+                     SELECT value + 1 FROM counter
+                     WHERE value < {HISTORY_PER_REFERENCE_KIND}
+                 )
+                 INSERT INTO completion_event_listener (
+                     event_id, listener_id, session_id, owner_invocation_uuid,
+                     active, created_at
+                 )
+                 SELECT printf('listener-event-%d', value),
+                        printf('listener-%d', value), 'session-a',
+                        printf('listener-%d', value), 1,
+                        '2026-08-01T00:00:00Z'
+                 FROM counter;"
+            ))
+            .unwrap();
+
+        begin_completion_finalization_vm_count();
+        let reclaimable = reclaimable_completion_payloads(db.connection(), 256).unwrap();
+        let steps = end_completion_finalization_vm_count();
+        eprintln!("terminal payload lookup VM steps: {steps}");
+
+        assert!(reclaimable.is_empty());
+        assert!(
+            steps < 500_000,
+            "terminal payload lookup exceeded its bounded VM budget: {steps}"
+        );
+    }
+
+    #[test]
+    fn terminal_mailbox_pruning_work_is_independent_of_unrelated_resolved_attempts() {
+        const ATTEMPT_HISTORY: usize = 4_096;
+        const MAILBOX_HISTORY: usize = 256;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.connection()
+            .execute_batch(&format!(
+                "WITH RECURSIVE counter(value) AS (
+                     VALUES(1)
+                     UNION ALL
+                     SELECT value + 1 FROM counter
+                     WHERE value < {ATTEMPT_HISTORY}
+                 )
+                 INSERT INTO mailbox_delivery_attempts (
+                     attempt_id, session_id, delivery_invocation_uuid, created_at,
+                     prepared_remaining_count, resolved_at, evidence_disposition
+                 )
+                 SELECT printf('protected-attempt-%d', value), 'session-a',
+                        'delivery', '2026-08-01T00:00:00Z', 0,
+                        '2026-08-01T00:00:00Z', 'pending'
+                 FROM counter;
+
+                 WITH RECURSIVE counter(value) AS (
+                     VALUES(1)
+                     UNION ALL
+                     SELECT value + 1 FROM counter
+                     WHERE value < {MAILBOX_HISTORY}
+                 )
+                 INSERT INTO mailbox (
+                     session_id, kind, handle, payload_json, enqueued_at,
+                     delivered_at, state_dir, meta_path, log_path, rc_path, rc
+                 )
+                 SELECT 'session-a', 'agent_bash_complete',
+                        printf('terminal-handle-%d', value), '{{}}',
+                        '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z',
+                        '/state', '/meta', '/log', '/rc', 0
+                 FROM counter;"
+            ))
+            .unwrap();
+
+        begin_completion_finalization_vm_count();
+        let report = db
+            .prune_terminal_history_with_keep(MAILBOX_HISTORY, 0)
+            .unwrap();
+        let steps = end_completion_finalization_vm_count();
+
+        assert_eq!(report.mailbox_rows_deleted, MAILBOX_HISTORY);
+        assert_eq!(report.delivery_attempts_deleted, 0);
+        assert!(
+            steps < 500_000,
+            "terminal mailbox pruning exceeded its history-independent VM budget: {steps}"
+        );
+    }
+
+    #[test]
+    fn terminal_history_vacuum_rejects_a_busy_wal_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&sidecar_path).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO mailbox (
+                     session_id, kind, handle, payload_json, enqueued_at,
+                     state_dir, meta_path, log_path, rc_path, rc
+                 ) VALUES (
+                     'session-a', 'input', 'before-reader', '{}',
+                     '2026-08-28T00:00:00Z', '/state', '/meta', '/log', '/rc', 0
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let reader = Connection::open(&sidecar_path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        reader
+            .query_row("SELECT COUNT(*) FROM mailbox", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO mailbox (
+                     session_id, kind, handle, payload_json, enqueued_at,
+                     state_dir, meta_path, log_path, rc_path, rc
+                 ) VALUES (
+                     'session-a', 'input', 'after-reader', '{}',
+                     '2026-08-28T00:00:00Z', '/state', '/meta', '/log', '/rc', 0
+                 )",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .busy_timeout(StdDuration::from_millis(10))
+            .unwrap();
+
+        let error = db.vacuum_terminal_history().unwrap_err();
+
+        assert!(
+            error.contains("checkpoint remained busy before VACUUM"),
+            "{error}"
+        );
+        reader.execute_batch("ROLLBACK").unwrap();
+        db.connection()
+            .busy_timeout(mailbox_writer_sqlite_timeout())
+            .unwrap();
+        db.vacuum_terminal_history().unwrap();
+    }
+
+    #[test]
+    fn terminal_history_retains_submitted_input_idempotency() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let enqueue = submitted_input(
+            "submission-token",
+            InboxTargetKind::Session,
+            "session-a",
+            b"input payload",
+        );
+        let EnqueueResult::Inserted(row) = db.enqueue_submitted_input(&enqueue).unwrap() else {
+            panic!("expected inserted submitted input");
+        };
+        db.mark_delivered("session-a", None, &[row.seq], "delivery")
+            .unwrap();
+
+        let report = db.prune_terminal_history_with_keep(10, 0).unwrap();
+
+        assert_eq!(report.mailbox_rows_deleted, 0);
+        let EnqueueResult::AlreadyEnqueued(retry) = db.enqueue_submitted_input(&enqueue).unwrap()
+        else {
+            panic!("expected submitted input retry to retain its durable identity");
+        };
+        assert_eq!(retry.seq, row.seq);
+    }
+
+    #[test]
+    fn ordinary_delivery_runs_bounded_terminal_history_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let mut seqs = Vec::new();
+        for index in 0..(TERMINAL_HISTORY_KEEP_ROWS + 2) {
+            let handle = format!("maintenance-{index}");
+            seqs.push(
+                inserted_row(db.enqueue_agent_bash_complete(&input(&handle, "session-a"))).seq,
+            );
+        }
+
+        db.mark_delivered("session-a", None, &seqs, "delivery")
+            .unwrap();
+
+        let rows = db.list_mailbox("session-a", true).unwrap();
+        assert_eq!(rows.len(), TERMINAL_HISTORY_KEEP_ROWS);
+        assert_eq!(rows[0].seq, seqs[2]);
+        assert_eq!(
+            db.terminal_history_retention_stats()
+                .unwrap()
+                .prunable_mailbox_rows,
+            0
         );
     }
 

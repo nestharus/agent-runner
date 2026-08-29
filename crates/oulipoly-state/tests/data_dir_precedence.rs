@@ -44,7 +44,7 @@ impl Drop for EnvGuard {
 }
 
 #[test]
-fn default_state_locations_prefer_oulipoly_data_dir_over_xdg_data_home() {
+fn default_state_locations_use_required_oulipoly_data_dir() {
     let dir = tempfile::tempdir().unwrap();
     let pinned = dir.path().join("canonical-app-data");
     let shadow_xdg = dir.path().join("shadow-xdg-data");
@@ -54,12 +54,12 @@ fn default_state_locations_prefer_oulipoly_data_dir_over_xdg_data_home() {
 }
 
 #[test]
-fn default_state_locations_refuse_xdg_data_home_under_test_when_unpinned() {
+fn default_state_locations_refuse_xdg_data_home_when_unpinned() {
     let dir = tempfile::tempdir().unwrap();
     let xdg = dir.path().join("xdg-data");
     let _guard = EnvGuard::set(None, Some(&xdg));
 
-    assert_default_paths_refuse_under_test();
+    assert_default_paths_refuse_unpinned();
 }
 
 fn assert_default_paths_under(app_data_dir: &Path) {
@@ -77,16 +77,14 @@ fn assert_default_paths_under(app_data_dir: &Path) {
     );
 }
 
-fn assert_default_paths_refuse_under_test() {
+fn assert_default_paths_refuse_unpinned() {
     for error in [
         StateDb::default_path().unwrap_err(),
         PidIdentityDb::default_path().unwrap_err(),
         MailboxDb::default_path().unwrap_err(),
     ] {
-        assert!(
-            error.contains("refusing to resolve the production data dir in a test or bench binary"),
-            "unexpected error: {error}"
-        );
+        assert!(error.contains("OULIPOLY_DATA_DIR is not set"), "{error}");
+        assert!(error.contains("export OULIPOLY_DATA_DIR="), "{error}");
     }
 }
 

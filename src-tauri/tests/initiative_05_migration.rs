@@ -205,7 +205,10 @@ flag = "--resume"
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
     }
@@ -1758,8 +1761,8 @@ fn migrate_db_command_reports_open_error() {
     let fixture = Fixture::new();
     let data_home = data_home_file_fixture(&fixture);
     let mut command = fixture.command();
-    command.env("XDG_DATA_HOME", data_home);
-    command.env_remove("OULIPOLY_DATA_DIR");
+    command.env("XDG_DATA_HOME", &data_home);
+    command.env("OULIPOLY_DATA_DIR", &data_home);
 
     let output = command.arg("migrate-db").output().unwrap();
 

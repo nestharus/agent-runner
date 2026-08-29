@@ -104,7 +104,7 @@ fn emit_session_locate_environment_error(
 }
 
 fn load_session_locate_environment_result() -> Result<SessionLocateEnvironment, String> {
-    let config_root = default_config_root();
+    let config_root = default_config_root()?;
     let state = open_default_locate_state()?;
     let providers_cfg = load_default_locate_providers(&config_root);
     let models = load_default_locate_models(&providers_cfg)?;
@@ -130,7 +130,7 @@ fn load_default_locate_providers(config_root: &std::path::Path) -> ProvidersConf
 fn load_default_locate_models(
     providers_cfg: &ProvidersConfig,
 ) -> Result<HashMap<String, ModelConfig>, String> {
-    load_models(&default_models_dir(), Some(providers_cfg)).map_err(|error| error.to_string())
+    load_models(&default_models_dir()?, Some(providers_cfg)).map_err(|error| error.to_string())
 }
 
 fn load_default_locate_sessions(config_root: &std::path::Path) -> oulipoly_config::SessionsConfig {

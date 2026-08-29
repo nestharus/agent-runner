@@ -405,10 +405,7 @@ fn reconcile_transcript_confirmed_pty_attempt(
 ) -> Result<bool, String> {
     let state = StateDb::open_default()?;
     if !state.has_session_user_turn_containing(provider_name, session_id, attempt_id)? {
-        let sessions_path = dirs::config_dir()
-            .map(|path| path.join("oulipoly-agent-runner"))
-            .unwrap_or_else(|| Path::new(".").to_path_buf())
-            .join("sessions.toml");
+        let sessions_path = oulipoly_state::paths::config_dir()?.join("sessions.toml");
         let sessions = match oulipoly_config::SessionsConfig::load(&sessions_path) {
             Ok(sessions) => sessions,
             Err(error) => {
@@ -749,12 +746,34 @@ fn reconcile_pty_transport_evidence(
     }
     if !matched {
         let attempt_id = only_attempt_id.expect("an exact obligation was requested");
-        let obligation = mailbox
-            .delivery_evidence_obligation(attempt_id)?
-            .ok_or_else(|| format!("Mailbox evidence obligation {attempt_id} is missing"))?;
-        verify_exact_pty_transport_evidence(&obligation)?;
+        match mailbox.delivery_evidence_obligation(attempt_id)? {
+            Some(obligation) => verify_exact_pty_transport_evidence(&obligation)?,
+            None => verify_retained_pty_transport_evidence(session_id, attempt_id)?,
+        }
     }
     Ok(())
+}
+
+fn verify_retained_pty_transport_evidence(
+    session_id: &str,
+    attempt_id: &str,
+) -> Result<(), String> {
+    let state = StateDb::open_default()?;
+    let evidence_id = format!("pty_transport_ack:{attempt_id}");
+    let evidence = state
+        .delivery_evidence(&evidence_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Mailbox evidence obligation {attempt_id} is missing"))?;
+    if evidence.kind == DeliveryEvidenceKind::PtyTransportAck
+        && evidence.delivery_id == attempt_id
+        && evidence.session_id == session_id
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Retained State evidence for mailbox attempt {attempt_id} conflicts with its exact identity"
+        ))
+    }
 }
 
 fn reconcile_pty_transport_evidence_obligation(
@@ -822,11 +841,19 @@ fn delivery_evidence_identity_matches(
 pub(crate) static DATA_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-fn evidence_clear_barrier_slot()
--> &'static std::sync::Mutex<Option<(String, std::sync::Arc<std::sync::Barrier>)>> {
-    static SLOT: std::sync::OnceLock<
-        std::sync::Mutex<Option<(String, std::sync::Arc<std::sync::Barrier>)>>,
-    > = std::sync::OnceLock::new();
+type EvidenceClearBarrier = Option<(String, std::sync::Arc<std::sync::Barrier>)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static EVIDENCE_CLEAR_BARRIER_REACHED: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+fn evidence_clear_barrier_slot() -> &'static std::sync::Mutex<EvidenceClearBarrier> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<EvidenceClearBarrier>> =
+        std::sync::OnceLock::new();
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
@@ -839,8 +866,19 @@ fn wait_at_evidence_clear_barrier_for_test(attempt_id: &str) {
         .filter(|(expected_attempt_id, _)| expected_attempt_id == attempt_id)
         .map(|(_, barrier)| std::sync::Arc::clone(barrier));
     if let Some(barrier) = barrier {
+        EVIDENCE_CLEAR_BARRIER_REACHED.set(true);
         barrier.wait();
     }
+}
+
+#[cfg(test)]
+fn reset_evidence_clear_barrier_reached() {
+    EVIDENCE_CLEAR_BARRIER_REACHED.set(false);
+}
+
+#[cfg(test)]
+fn evidence_clear_barrier_was_reached() -> bool {
+    EVIDENCE_CLEAR_BARRIER_REACHED.get()
 }
 
 #[cfg(not(test))]
@@ -1584,18 +1622,29 @@ mod tests {
         ));
         let mut threads = Vec::new();
         for _ in 0..2 {
-            threads.push(std::thread::spawn(|| {
-                let mut mailbox = MailboxDb::open_default().unwrap();
-                reconcile_pty_transport_evidence(
-                    &mut mailbox,
-                    "session-a",
-                    Some("concurrent-attempt"),
-                )
+            let worker_barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                reset_evidence_clear_barrier_reached();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut mailbox = MailboxDb::open_default()?;
+                    reconcile_pty_transport_evidence(
+                        &mut mailbox,
+                        "session-a",
+                        Some("concurrent-attempt"),
+                    )
+                }));
+                if !evidence_clear_barrier_was_reached() {
+                    worker_barrier.wait();
+                }
+                result
             }));
         }
         let results = threads
             .into_iter()
-            .map(|thread| thread.join().unwrap())
+            .map(|thread| match thread.join().unwrap() {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            })
             .collect::<Vec<_>>();
         *evidence_clear_barrier_slot().lock().unwrap() = None;
 
@@ -1614,6 +1663,22 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        drop(state);
+        drop(mailbox);
+        let sidecar = rusqlite::Connection::open(directory.path().join("pid-identity.db")).unwrap();
+        sidecar
+            .execute_batch(
+                "DELETE FROM mailbox_delivery_attempt_items
+                 WHERE attempt_id = 'concurrent-attempt';
+                 DELETE FROM mailbox_delivery_attempts
+                 WHERE attempt_id = 'concurrent-attempt';",
+            )
+            .unwrap();
+        drop(sidecar);
+
+        let mut mailbox = MailboxDb::open_default().unwrap();
+        reconcile_pty_transport_evidence(&mut mailbox, "session-a", Some("concurrent-attempt"))
+            .unwrap();
     }
 
     #[test]

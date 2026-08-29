@@ -54,7 +54,14 @@ pub(crate) fn legacy_invocation_provider_names() -> LegacyProviderNames {
     // Provider-unaware load (matching the pre-PP-001 in-StateDb behavior): the
     // legacy lookup only needs each model's provider names, and the migrate path
     // must not surface providers.toml root-arg overlap diagnostics.
-    match load_models(&default_models_dir(), None) {
+    let models_dir = match default_models_dir() {
+        Ok(models_dir) => models_dir,
+        Err(error) => {
+            warn_legacy_provider_lookup_unavailable(&error);
+            return LegacyProviderNames::new();
+        }
+    };
+    match load_models(&models_dir, None) {
         Ok(models) => provider_names_from_models(models),
         Err(error) => {
             warn_legacy_provider_lookup_unavailable(&error.to_string());
@@ -140,8 +147,8 @@ pub(crate) fn load_resume_execution_environment(
     models_dir_override: Option<&Path>,
 ) -> Result<ResumeExecutionEnvironment, String> {
     let state = StateDb::open_default()?;
-    let models_dir = resume_execution_models_dir(models_dir_override);
-    let config_root = resume_execution_config_root(models_dir_override, &models_dir);
+    let models_dir = resume_execution_models_dir(models_dir_override)?;
+    let config_root = resume_execution_config_root(models_dir_override, &models_dir)?;
     let providers_cfg = oulipoly_config::ProvidersConfig::load(&config_root.join("providers.toml"))
         .unwrap_or_default();
     let models = load_models(&models_dir, Some(&providers_cfg))?;
@@ -157,18 +164,23 @@ pub(crate) fn load_resume_execution_environment(
     ))
 }
 
-fn resume_execution_models_dir(models_dir_override: Option<&Path>) -> std::path::PathBuf {
+fn resume_execution_models_dir(
+    models_dir_override: Option<&Path>,
+) -> Result<std::path::PathBuf, String> {
     models_dir_override
         .map(Path::to_path_buf)
-        .unwrap_or_else(default_models_dir)
+        .map_or_else(default_models_dir, Ok)
 }
 
-fn resume_execution_config_root(models_dir_override: Option<&Path>, models_dir: &Path) -> PathBuf {
+fn resume_execution_config_root(
+    models_dir_override: Option<&Path>,
+    models_dir: &Path,
+) -> Result<PathBuf, String> {
     if models_dir_override.is_some() {
         return models_dir
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(default_config_root);
+            .ok_or_else(|| format!("Models directory has no parent: {}", models_dir.display()));
     }
     default_config_root()
 }

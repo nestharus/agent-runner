@@ -97,9 +97,11 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     }
 
     // Maintenance must not trigger wake recovery before it inspects or compacts storage.
-    if let Some(Subcommands::Mailbox {
-        command: command @ MailboxSubcommands::CompactDelivered { .. },
-    }) = &cli.command
+    if let Some(Subcommands::Mailbox { command }) = &cli.command
+        && matches!(
+            command,
+            MailboxSubcommands::CompactDelivered { .. } | MailboxSubcommands::PruneTerminal { .. }
+        )
     {
         return dispatch_mailbox_subcommand(command.clone());
     }
@@ -122,7 +124,7 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
         return run_default_provider_repl(&cli);
     }
 
-    let agent_runtime_services = wiring::AgentRuntimeServices::cli_defaults();
+    let agent_runtime_services = wiring::AgentRuntimeServices::cli_defaults()?;
 
     if let Err(err) = recover_pending_provider_owned_session_replaces(&agent_runtime_services) {
         return Ok(handle_pending_session_replace_error(&err));
@@ -456,6 +458,12 @@ fn dispatch_mailbox_subcommand(command: MailboxSubcommands) -> Result<i32, Strin
         MailboxSubcommands::CompactDelivered { limit, apply, json } => {
             crate::commands::mailbox::run_compact_delivered(limit, apply, json)
         }
+        MailboxSubcommands::PruneTerminal {
+            limit,
+            apply,
+            vacuum,
+            json,
+        } => crate::commands::mailbox::run_prune_terminal(limit, apply, vacuum, json),
     }
 }
 

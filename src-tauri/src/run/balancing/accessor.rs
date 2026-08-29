@@ -25,7 +25,7 @@ pub(super) fn load_balanced_execution_environment(
     // SessionsConfig::load(&sessions_path).unwrap_or_default()
     // ExecutorServiceRequest::Effective
     let state = state_db_opener.open_default()?;
-    let config_root = default_config_root();
+    let config_root = default_config_root()?;
     let models_dir = config_root.join("models");
     let config_paths = super::mapper::balanced_config_toml_paths(config_root);
     let providers_path = config_paths.providers_path;

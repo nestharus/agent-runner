@@ -50,7 +50,7 @@ fn terminal_signal(kind: TerminalSignalKind) -> TerminalSignal {
 
 #[test]
 fn resume_fallback_typed_signal_parity() {
-    let services = crate::wiring::AgentRuntimeServices::cli_defaults();
+    let services = crate::wiring::AgentRuntimeServices::cli_defaults().unwrap();
     let models = HashMap::new();
 
     let quota = balanced_result_error_category(
