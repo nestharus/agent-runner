@@ -67,6 +67,8 @@ jobs:
         crate: ${{ fromJSON(needs.prepare-matrix.outputs.libs) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt

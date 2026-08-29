@@ -1092,7 +1092,7 @@ fn assertion_a04_integration_workspace_commands() {
 #[test]
 fn history_dependent_source_guards_have_full_history_in_recurring_workflows() {
     for (workflow_name, workflow) in workflow_pairs() {
-        for job_name in ["rust-client-check", "rust-integration"] {
+        for job_name in ["rust-lib-check", "rust-client-check", "rust-integration"] {
             assert_checkout_fetches_full_history(&workflow, workflow_name, job_name);
         }
     }
