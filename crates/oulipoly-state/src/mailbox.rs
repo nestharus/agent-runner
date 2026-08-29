@@ -9629,10 +9629,19 @@ fn validate_optional_session_admission_identity(
 
 fn next_session_admission_on(conn: &Connection) -> Result<Option<String>, String> {
     conn.query_row(
-        "SELECT registration_identity
-         FROM session_admission_queue
-         WHERE state = 'queued'
-         ORDER BY queue_sequence ASC
+        "SELECT admission.registration_identity
+         FROM session_admission_queue admission
+         WHERE admission.state = 'queued'
+           AND (
+               admission.session_id IS NULL
+               OR NOT EXISTS (
+                   SELECT 1
+                   FROM runtime_generation generation
+                   WHERE generation.session_id = admission.session_id
+                     AND generation.lifecycle_state != 'exited'
+               )
+           )
+         ORDER BY admission.queue_sequence ASC
          LIMIT 1",
         [],
         |row| row.get(0),

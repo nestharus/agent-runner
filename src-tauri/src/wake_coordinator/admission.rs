@@ -1138,6 +1138,70 @@ mod tests {
     }
 
     #[test]
+    fn running_generation_blocks_same_session_without_blocking_other_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        enqueue(&mut db, "first", Some("session-a"), 1);
+        enqueue(&mut db, "same-session", Some("session-a"), 2);
+        enqueue(&mut db, "other-session", Some("session-b"), 3);
+        drain_one_with(&mut db, config(), roomy_memory).unwrap();
+        let first = db.session_admissions().row("first").unwrap().unwrap();
+        assert!(
+            db.session_admissions()
+                .begin_launch("first", first.claim_token.as_deref().unwrap(), 4)
+                .unwrap()
+        );
+
+        let generation_id = RuntimeGenerationId::new();
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "first",
+                session_id: Some("session-a"),
+                runtime_mode: "headless",
+                provider_name: "test-provider",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        let process_identity =
+            oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+                .unwrap()
+                .unwrap();
+        db.runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence: RuntimeGenerationFence {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: "first",
+                },
+                spawned_os_pid: process_identity.os_pid,
+                exact_process_identity: &process_identity,
+                os_pgid: None,
+            })
+            .unwrap();
+
+        let SessionAdmissionAttempt::Admitted(next) = db
+            .session_admissions()
+            .try_admit_next("next-token", i64::MAX, i64::MAX)
+            .unwrap()
+        else {
+            panic!("a different session must remain launchable");
+        };
+        assert_eq!(next.registration_identity, "other-session");
+        assert_eq!(
+            db.session_admissions()
+                .row("same-session")
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
+        );
+    }
+
+    #[test]
     fn drain_cancels_one_dead_fifo_head_per_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
