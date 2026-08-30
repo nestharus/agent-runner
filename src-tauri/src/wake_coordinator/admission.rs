@@ -636,11 +636,13 @@ mod tests {
             independent.total_bytes >= DEFAULT_MEMORY_RESERVE_BYTES.saturating_mul(2),
             "native test host must independently report at least 1 GiB: {independent:?}"
         );
+        let total_drift = observation.total_bytes.abs_diff(independent.total_bytes);
+        let total_tolerance = (16 * 1024 * 1024).max(independent.total_bytes / 100);
         assert!(
-            observation.total_bytes >= independent.total_bytes / 2
-                && observation.total_bytes <= independent.total_bytes,
+            total_drift <= total_tolerance,
             "production total memory must agree with the independent host reading: \
-             production={observation:?}, independent={independent:?}"
+             production={observation:?}, independent={independent:?}, \
+             tolerance={total_tolerance}"
         );
         assert!(
             observation.available_bytes < observation.total_bytes,
@@ -694,6 +696,65 @@ mod tests {
                 .unwrap()
                 .state,
             "admitted"
+        );
+
+        let underreported_total = observation.total_bytes.saturating_mul(3) / 4;
+        let correct_reserve = DEFAULT_MEMORY_RESERVE_BYTES.max(
+            observation
+                .total_bytes
+                .saturating_mul(DEFAULT_MEMORY_RESERVE_PERCENT)
+                / 100,
+        );
+        let underreported_reserve = DEFAULT_MEMORY_RESERVE_BYTES
+            .max(underreported_total.saturating_mul(DEFAULT_MEMORY_RESERVE_PERCENT) / 100);
+        assert!(
+            underreported_reserve < correct_reserve,
+            "native test host must be large enough for total-memory truth to affect the default \
+             reserve: production={observation:?}, correct_reserve={correct_reserve}, \
+             underreported_reserve={underreported_reserve}"
+        );
+        let boundary_available =
+            underreported_reserve + (correct_reserve - underreported_reserve) / 2;
+        let correct_boundary = MemoryObservation {
+            available_bytes: boundary_available,
+            total_bytes: observation.total_bytes,
+        };
+        let underreported_boundary = MemoryObservation {
+            available_bytes: boundary_available,
+            total_bytes: underreported_total,
+        };
+        eprintln!(
+            "native total-reserve discrimination: total_drift={total_drift}, \
+             total_tolerance={total_tolerance}, correct_reserve={correct_reserve}, \
+             underreported_total={underreported_total}, \
+             underreported_reserve={underreported_reserve}, \
+             boundary_available={boundary_available}"
+        );
+        let boundary_directory = tempfile::tempdir().unwrap();
+        let mut boundary_db =
+            MailboxDb::open(&boundary_directory.path().join("pid-identity.db")).unwrap();
+        enqueue(&mut boundary_db, "native-total-boundary", None, 1);
+        assert_eq!(
+            drain_with(
+                &mut boundary_db,
+                default_config(),
+                || Ok(Some(correct_boundary)),
+                Some("native-total-boundary"),
+            )
+            .unwrap(),
+            DrainOutcome::Pressure
+        );
+        assert_eq!(
+            drain_with(
+                &mut boundary_db,
+                default_config(),
+                || Ok(Some(underreported_boundary)),
+                Some("native-total-boundary"),
+            )
+            .unwrap(),
+            DrainOutcome::Admitted,
+            "a 25% total-memory underreport must visibly change default admission at the reserve \
+             boundary"
         );
     }
 

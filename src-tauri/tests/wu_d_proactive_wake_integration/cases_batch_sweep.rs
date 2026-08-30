@@ -9,6 +9,7 @@ use crate::fixtures::Fixture;
 use crate::liveness::{
     assert_dead_owner_debris_retained, delivered_rows_without_pending_or_claim,
     delivered_single_row_without_error_or_claim, settle_wake_sweep, wait_for_file, wait_until,
+    wait_until_with_timeout,
 };
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
@@ -450,8 +451,8 @@ pub(crate) fn repeated_failed_wakes_keep_oldest_batch_owned_past_terminal_budget
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     let attempt_ledger = fixture.work_dir.join("persistent-failure-attempts.txt");
-    let fourth_started = fixture.work_dir.join("persistent-failure-fourth-started");
-    let release_fourth = fixture.work_dir.join("persistent-failure-release-fourth");
+    let sixth_started = fixture.work_dir.join("persistent-failure-sixth-started");
+    let release_sixth = fixture.work_dir.join("persistent-failure-release-sixth");
     let hook = format!(
         r#"python3 - {attempt_ledger} "$WU_D_PROVIDER_RESUME_INDEX" <<'PY'
 import sys
@@ -460,16 +461,16 @@ import time
 with open(sys.argv[1], "a", encoding="utf-8") as out:
     out.write(f"{{sys.argv[2]}} {{time.monotonic_ns()}}\n")
 PY
-if [ "$WU_D_PROVIDER_RESUME_INDEX" -le 3 ]; then
+if [ "$WU_D_PROVIDER_RESUME_INDEX" -le 5 ]; then
   exit 17
 fi
-if [ "$WU_D_PROVIDER_RESUME_INDEX" = 4 ]; then
-  : > {fourth_started}
-  while [ ! -e {release_fourth} ]; do sleep 0.01; done
+if [ "$WU_D_PROVIDER_RESUME_INDEX" = 6 ]; then
+  : > {sixth_started}
+  while [ ! -e {release_sixth} ]; do sleep 0.01; done
 fi"#,
         attempt_ledger = shell_path(&attempt_ledger),
-        fourth_started = shell_path(&fourth_started),
-        release_fourth = shell_path(&release_fourth),
+        sixth_started = shell_path(&sixth_started),
+        release_sixth = shell_path(&release_sixth),
     );
     fixture.write_provider(&provider_script(
         "",
@@ -493,46 +494,50 @@ fi"#,
 
     let first = fixture.run_auto_wake_resume(claim_token, 1, 1_000);
     assert_eq!(first.status.code(), Some(17), "{first:?}");
-    wait_for_file(&fourth_started);
+    wait_until_with_timeout(
+        "sixth production retry reached the provider",
+        std::time::Duration::from_secs(80),
+        || sixth_started.exists(),
+    );
 
     let retained_claim = fixture
         .mailbox()
         .wake_session_reader()
         .wake_claim(SESSION)
         .unwrap()
-        .expect("three consecutive failures must retain one claim for a fourth attempt");
+        .expect("five consecutive failures must retain one claim for a sixth attempt");
     assert_ne!(retained_claim.claim_token, claim_token);
-    assert_eq!(retained_claim.auto_wake_count, 4);
+    assert_eq!(retained_claim.auto_wake_count, 6);
     assert!(retained_claim.wake_pid.is_some());
     let pending = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
     assert!(pending[..20].iter().all(|row| {
-        row.delivery_attempts == 3 && row.delivery_error.as_deref() == Some("exit_nonzero")
+        row.delivery_attempts == 5 && row.delivery_error.as_deref() == Some("exit_nonzero")
     }));
     assert_eq!(pending[20].delivery_attempts, 0);
     assert!(pending[20].delivery_error.is_none());
     assert!(pending.iter().all(|row| row.delivered_at.is_none()));
 
-    std::fs::write(&release_fourth, "release\n").unwrap();
+    std::fs::write(&release_sixth, "release\n").unwrap();
     wait_until(
         "persistent failure lifecycle delivered oldest and newer work",
         || delivered_rows_without_pending_or_claim(&fixture, SESSION, 21),
     );
-    for index in 1..=4 {
+    for index in 1..=6 {
         let prompt =
             wait_for_file(&fixture.prompt_file(&format!("persistent-failure-{index}.txt")));
         assert_prompt_contains_handle(&prompt, "h-persistent-failure-00");
         assert_prompt_contains_handle(&prompt, "h-persistent-failure-19");
         assert!(!prompt.contains("h-persistent-failure-20"), "{prompt}");
     }
-    let newer = wait_for_file(&fixture.prompt_file("persistent-failure-5.txt"));
+    let newer = wait_for_file(&fixture.prompt_file("persistent-failure-7.txt"));
     assert_prompt_contains_handle(&newer, "h-persistent-failure-20");
 
     let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
-    assert!(rows[..20].iter().all(|row| row.delivery_attempts == 4));
+    assert!(rows[..20].iter().all(|row| row.delivery_attempts == 6));
     assert_eq!(rows[20].delivery_attempts, 1);
     assert_eq!(
         std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
-        "5"
+        "7"
     );
     let attempts = std::fs::read_to_string(&attempt_ledger)
         .unwrap()
@@ -547,14 +552,17 @@ fi"#,
         .collect::<Vec<_>>();
     assert_eq!(
         attempts.iter().map(|entry| entry.0).collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5]
+        [1, 2, 3, 4, 5, 6, 7]
     );
-    let retry_intervals_ms = attempts[..4]
+    let retry_intervals_ms = attempts[..6]
         .windows(2)
         .map(|pair| (pair[1].1 - pair[0].1) / 1_000_000)
         .collect::<Vec<_>>();
     eprintln!("production exponential retry intervals (ms): {retry_intervals_ms:?}");
-    for (elapsed_ms, expected_ms) in retry_intervals_ms.iter().zip([1_000_u128, 2_000, 4_000]) {
+    for (elapsed_ms, expected_ms) in retry_intervals_ms
+        .iter()
+        .zip([1_000_u128, 2_000, 4_000, 8_000, 16_000])
+    {
         assert!(
             (*elapsed_ms >= expected_ms.saturating_sub(100))
                 && *elapsed_ms <= expected_ms.saturating_add(3_000),

@@ -46,8 +46,16 @@ fn existing_sidecar_session_id(fixture: &Fixture, table: &str) -> String {
 }
 
 pub(crate) fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
+    wait_until_with_timeout(label, Duration::from_secs(10), &mut predicate);
+}
+
+pub(crate) fn wait_until_with_timeout(
+    label: &str,
+    timeout: Duration,
+    mut predicate: impl FnMut() -> bool,
+) {
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(10) {
+    while start.elapsed() < timeout {
         if predicate() {
             return;
         }
