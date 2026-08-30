@@ -1055,6 +1055,7 @@ fn launch_provider_nonzero_no_final() -> i32 {
 }
 
 fn launch_cancelled_final_event() -> i32 {
+    ignore_sigterm();
     let request_id = read_request_id();
     write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
     thread::sleep(Duration::from_millis(150));

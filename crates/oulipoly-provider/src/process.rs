@@ -2,9 +2,9 @@
 //!
 //! Roles: orchestration, mapper, predicate, accessor, filter, validator.
 //!
-//! - orchestration: `ProcessRunner` starts provider subprocesses, drains
-//!   stdio on worker threads, supervises total-runtime or stdout-line-gap
-//!   liveness, and terminates/reaps process trees on timeout or cancellation.
+//! - orchestration: `ProcessRunner` starts provider subprocesses and
+//!   `ProcessSupervisor` consumes bounded worker/cancellation events, polls
+//!   child lifecycle state, and terminates/reaps process trees.
 //! - mapper: `map_completed_process_outcome`, `termination_diagnostics_from_parts`,
 //!   `provider_process_command`, `host_process_error`, `process_status`, `exit_code`, and
 //!   `process_nonzero` translate OS process observations into provider DTOs
@@ -19,8 +19,8 @@
 //!   `ByteAccumulator`, `ByteTailAccumulator`, and `alive_descendants` retain
 //!   bounded byte/process subsets from larger streams or process sets.
 //! - validator: embedded process-runner and byte-accumulator tests validate
-//!   pipe pressure, process-tree cleanup, cancellation, and truncation
-//!   contracts.
+//!   bounded event delivery, poll cadence, worker failure, pipe pressure,
+//!   process-tree cleanup, cancellation, and truncation contracts.
 //!
 //! ## Adapter declarations
 //!
@@ -48,16 +48,18 @@
 
 use crate::error::{HostErrorKind, ProviderClientError, ProviderDiagnostics};
 use crate::generated::ProcessStatus;
+use oulipoly_core::CancellationRegistration;
 pub use oulipoly_core::CancellationToken;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteLimit {
@@ -415,6 +417,35 @@ struct ProcessThreads<T: StdoutDrainOutput> {
     stdin: thread::JoinHandle<bool>,
 }
 
+#[derive(Default)]
+struct PendingProcessEvents {
+    latest_stdout_line: Option<Instant>,
+    cancellation_requested: bool,
+    worker_failed: bool,
+}
+
+struct ProcessEvents {
+    latest_stdout_line: Option<Instant>,
+    cancellation_requested: bool,
+    worker_failed: bool,
+}
+
+#[derive(Clone)]
+struct ProcessEventPublisher {
+    bus: Arc<(Mutex<PendingProcessEvents>, Condvar)>,
+}
+
+struct ProcessEventSubscriber {
+    bus: Arc<(Mutex<PendingProcessEvents>, Condvar)>,
+}
+
+struct JoinedProcessThreads<T: StdoutDrainOutput> {
+    stdout: Option<T>,
+    stderr: Option<CapturedBytes>,
+    stdin_closed_early: Option<bool>,
+    failed_workers: Vec<&'static str>,
+}
+
 struct TerminatedProcess {
     status: Option<ExitStatus>,
     force_killed: bool,
@@ -424,6 +455,21 @@ struct TerminatedProcess {
 enum TimeoutMode {
     TotalRuntime,
     StdoutLineGap,
+}
+
+struct ProcessSupervisor<'a, T: StdoutDrainOutput> {
+    child: Child,
+    command: ProcessCommand,
+    threads: ProcessThreads<T>,
+    events: ProcessEventSubscriber,
+    timeout_mode: TimeoutMode,
+    started: Instant,
+    next_status_poll: Instant,
+    last_stdout_line: Instant,
+    cancellation_started: Option<Instant>,
+    _cancellation_registration: Option<CancellationRegistration>,
+    limits: &'a ProcessLimits,
+    argv: Vec<OsString>,
 }
 
 impl ProcessRunner {
@@ -526,94 +572,164 @@ impl ProcessRunner {
                 error,
             ));
         }
-        let (stdout_line_activity, stdout_line_rx) = stdout_line_activity_channel(timeout_mode);
+        let (event_publisher, events) = process_event_bus();
         let threads = start_process_threads(
             &mut child,
             stdin_bytes,
             self.limits.stderr_limit,
-            stdout_line_activity,
+            event_publisher.clone(),
+            stdout_line_activity_publisher(timeout_mode, &event_publisher),
             stdout_processor,
         );
 
-        let started = std::time::Instant::now();
-        let mut last_stdout_line = started;
-        let mut cancellation_started = None;
+        let started = Instant::now();
+        let cancellation_registration = self.limits.cancellation.as_ref().map(|cancellation| {
+            cancellation.register(move || event_publisher.publish_cancellation())
+        });
+        ProcessSupervisor {
+            child,
+            command,
+            threads,
+            events,
+            timeout_mode,
+            started,
+            next_status_poll: started,
+            last_stdout_line: started,
+            cancellation_started: None,
+            _cancellation_registration: cancellation_registration,
+            limits: &self.limits,
+            argv,
+        }
+        .run()
+    }
+}
+
+impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
+    fn run(mut self) -> Result<ProcessOutcome<T>, ProviderClientError> {
         loop {
-            record_stdout_line_activity(&stdout_line_rx, &mut last_stdout_line);
-
-            if self.limits.spawn_observer.is_some()
-                && child_custody_test_fault("external_status_poll").is_err()
-            {
-                return Err(self.terminate_and_collect(
-                    child,
-                    command,
-                    threads,
-                    HostErrorKind::WaitFailed,
-                    false,
-                ));
+            if self.record_pending_events() {
+                return Err(self.terminate_and_collect(HostErrorKind::WaitFailed, false));
             }
-            let status = match poll_child_status(&mut child, &command) {
-                Ok(status) => status,
-                Err(_) => {
-                    return Err(self.terminate_and_collect(
-                        child,
-                        command,
-                        threads,
-                        HostErrorKind::WaitFailed,
-                        false,
-                    ));
-                }
-            };
-            if let Some(status) = status {
-                return Ok(map_completed_process_outcome(
-                    status,
-                    threads,
-                    cancellation_started.is_some(),
-                    &self.limits,
-                    argv,
-                ));
-            }
-
-            if timeout_expired(timeout_mode, started, last_stdout_line, self.limits.timeout) {
-                return Err(self.terminate_and_collect(
-                    child,
-                    command,
-                    threads,
-                    HostErrorKind::Timeout,
-                    false,
-                ));
-            }
-
-            if cancellation_requested(&self.limits) {
-                let cancelled_at = cancellation_started.get_or_insert_with(Instant::now);
-                if cancellation_grace_expired(cancelled_at, self.limits.kill_after_grace) {
-                    return Err(self.terminate_and_collect(
-                        child,
-                        command,
-                        threads,
-                        HostErrorKind::Cancelled,
-                        true,
-                    ));
+            if Instant::now() >= self.next_status_poll {
+                self.next_status_poll = Instant::now() + STATUS_POLL_INTERVAL;
+                match poll_child_status(&mut self.child, &self.command) {
+                    Ok(Some(status)) => return self.collect_completed(status),
+                    Ok(None) => {}
+                    Err(_) => {
+                        return Err(self.terminate_and_collect(HostErrorKind::WaitFailed, false));
+                    }
                 }
             }
 
-            thread::sleep(Duration::from_millis(5));
+            if timeout_expired(
+                self.timeout_mode,
+                self.started,
+                self.last_stdout_line,
+                self.limits.timeout,
+            ) {
+                return Err(self.terminate_and_collect(HostErrorKind::Timeout, false));
+            }
+
+            if self.cancellation_started.as_ref().is_some_and(|started| {
+                cancellation_grace_expired(started, self.limits.kill_after_grace)
+            }) {
+                return Err(self.force_kill_and_collect());
+            }
+
+            self.events.wait_for_event_or_poll(self.next_wait());
         }
     }
 
-    fn terminate_and_collect<T: StdoutDrainOutput>(
-        &self,
-        mut child: Child,
-        command: ProcessCommand,
-        threads: ProcessThreads<T>,
+    fn record_pending_events(&mut self) -> bool {
+        let events = self.events.take_pending();
+        if let Some(observed_at) = events.latest_stdout_line {
+            self.last_stdout_line = observed_at;
+        }
+        if events.cancellation_requested {
+            self.begin_cancellation();
+        }
+        events.worker_failed
+    }
+
+    fn next_wait(&self) -> Duration {
+        let timeout_remaining = match self.timeout_mode {
+            TimeoutMode::TotalRuntime => self.limits.timeout.saturating_sub(self.started.elapsed()),
+            TimeoutMode::StdoutLineGap => self
+                .limits
+                .timeout
+                .saturating_sub(self.last_stdout_line.elapsed()),
+        };
+        let cancellation_remaining = self
+            .cancellation_started
+            .as_ref()
+            .map(|started| {
+                cancellation_grace(self.limits.kill_after_grace).saturating_sub(started.elapsed())
+            })
+            .unwrap_or(STATUS_POLL_INTERVAL);
+        self.next_status_poll
+            .saturating_duration_since(Instant::now())
+            .min(timeout_remaining)
+            .min(cancellation_remaining)
+    }
+
+    fn begin_cancellation(&mut self) {
+        if self.cancellation_started.is_none() {
+            terminate_tree(&mut self.child);
+            self.cancellation_started = Some(Instant::now());
+            self.next_status_poll = Instant::now();
+        }
+    }
+
+    fn collect_completed(
+        self,
+        status: ExitStatus,
+    ) -> Result<ProcessOutcome<T>, ProviderClientError> {
+        let host_cancellation_requested =
+            self.cancellation_started.is_some() || cancellation_requested(self.limits);
+        if host_cancellation_requested && self.timeout_mode == TimeoutMode::TotalRuntime {
+            let diagnostics = map_termination_diagnostics(
+                self.threads,
+                TerminatedProcess {
+                    status: Some(status),
+                    force_killed: false,
+                },
+                true,
+            );
+            return Err(termination_transport_error(
+                HostErrorKind::Cancelled,
+                &self.command,
+                diagnostics,
+            ));
+        }
+        map_completed_process_outcome(
+            status,
+            self.threads,
+            &self.command,
+            self.argv,
+            host_cancellation_requested,
+        )
+    }
+
+    fn terminate_and_collect(
+        mut self,
         kind: HostErrorKind,
         host_cancellation_requested: bool,
     ) -> ProviderClientError {
-        terminate_tree(&mut child);
-        let terminated = wait_for_terminated_process(&mut child, self.limits.kill_after_grace);
+        terminate_tree(&mut self.child);
+        let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
         let diagnostics =
-            map_termination_diagnostics(threads, terminated, host_cancellation_requested);
-        termination_transport_error(kind, &command, diagnostics)
+            map_termination_diagnostics(self.threads, terminated, host_cancellation_requested);
+        termination_transport_error(kind, &self.command, diagnostics)
+    }
+
+    fn force_kill_and_collect(mut self) -> ProviderClientError {
+        kill_tree(&mut self.child);
+        let terminated = TerminatedProcess {
+            status: self.child.wait().ok(),
+            force_killed: true,
+        };
+        let diagnostics = map_termination_diagnostics(self.threads, terminated, true);
+        termination_transport_error(HostErrorKind::Cancelled, &self.command, diagnostics)
     }
 }
 
@@ -753,7 +869,8 @@ fn start_process_threads<P: StdoutProcessor>(
     child: &mut Child,
     stdin_bytes: Vec<u8>,
     stderr_limit: ByteLimit,
-    stdout_line_activity: Option<Sender<Instant>>,
+    process_events: ProcessEventPublisher,
+    stdout_line_activity: Option<ProcessEventPublisher>,
     stdout_processor: P,
 ) -> ProcessThreads<P::Output> {
     let stdout = child
@@ -765,12 +882,30 @@ fn start_process_threads<P: StdoutProcessor>(
         .take()
         .expect("stderr pipe should be configured");
     let stdin = child.stdin.take().expect("stdin pipe should be configured");
+    let stdout_events = process_events.clone();
+    let stderr_events = process_events.clone();
     ProcessThreads {
         stdout: thread::spawn(move || {
-            drain_reader_with_processor(stdout, stdout_line_activity, stdout_processor)
+            run_process_worker(stdout_events, || {
+                drain_reader_with_processor(stdout, stdout_line_activity, stdout_processor)
+            })
         }),
-        stderr: thread::spawn(move || drain_reader(stderr, stderr_limit, None)),
-        stdin: thread::spawn(move || write_stdin(stdin, stdin_bytes)),
+        stderr: thread::spawn(move || {
+            run_process_worker(stderr_events, || drain_reader(stderr, stderr_limit, None))
+        }),
+        stdin: thread::spawn(move || {
+            run_process_worker(process_events, || write_stdin(stdin, stdin_bytes))
+        }),
+    }
+}
+
+fn run_process_worker<T>(events: ProcessEventPublisher, worker: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker)) {
+        Ok(output) => output,
+        Err(panic) => {
+            events.publish_worker_failure();
+            std::panic::resume_unwind(panic)
+        }
     }
 }
 
@@ -820,46 +955,112 @@ fn poll_child_status(
 fn map_completed_process_outcome<T: StdoutDrainOutput>(
     status: ExitStatus,
     threads: ProcessThreads<T>,
-    cancellation_started: bool,
-    limits: &ProcessLimits,
+    command: &ProcessCommand,
     argv: Vec<OsString>,
-) -> ProcessOutcome<T> {
-    ProcessOutcome {
-        status: process_status(status),
-        stdout: join_stdout(threads.stdout),
-        stderr: join_capture(threads.stderr),
-        stdin_closed_early: join_stdin(threads.stdin),
-        host_cancellation_requested: host_cancellation_was_requested(cancellation_started, limits),
+    host_cancellation_requested: bool,
+) -> Result<ProcessOutcome<T>, ProviderClientError> {
+    let process_status = process_status(status);
+    let joined = join_process_threads(threads);
+    if !joined.failed_workers.is_empty() {
+        return Err(process_worker_failure(
+            command,
+            joined,
+            Some(process_status),
+            host_cancellation_requested,
+        ));
+    }
+    Ok(ProcessOutcome {
+        status: process_status,
+        stdout: joined.stdout.expect("validated stdout worker result"),
+        stderr: joined.stderr.expect("validated stderr worker result"),
+        stdin_closed_early: joined
+            .stdin_closed_early
+            .expect("validated stdin worker result"),
+        host_cancellation_requested,
         argv,
-    }
+    })
 }
 
-fn host_cancellation_was_requested(cancellation_started: bool, limits: &ProcessLimits) -> bool {
-    cancellation_started
-        || limits
-            .cancellation
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
+fn process_event_bus() -> (ProcessEventPublisher, ProcessEventSubscriber) {
+    let bus = Arc::new((Mutex::new(PendingProcessEvents::default()), Condvar::new()));
+    (
+        ProcessEventPublisher {
+            bus: Arc::clone(&bus),
+        },
+        ProcessEventSubscriber { bus },
+    )
 }
 
-fn stdout_line_activity_channel(
+fn stdout_line_activity_publisher(
     timeout_mode: TimeoutMode,
-) -> (Option<Sender<Instant>>, Option<Receiver<Instant>>) {
+    event_publisher: &ProcessEventPublisher,
+) -> Option<ProcessEventPublisher> {
     match timeout_mode {
-        TimeoutMode::StdoutLineGap => {
-            let (tx, rx) = mpsc::channel();
-            (Some(tx), Some(rx))
-        }
-        TimeoutMode::TotalRuntime => (None, None),
+        TimeoutMode::StdoutLineGap => Some(event_publisher.clone()),
+        TimeoutMode::TotalRuntime => None,
     }
 }
 
-fn record_stdout_line_activity(rx: &Option<Receiver<Instant>>, last_stdout_line: &mut Instant) {
-    let Some(rx) = rx else {
-        return;
-    };
-    while let Ok(observed_at) = rx.try_recv() {
-        *last_stdout_line = observed_at;
+impl ProcessEventPublisher {
+    fn publish_stdout_line(&self, observed_at: Instant) {
+        let (state, wake) = &*self.bus;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let should_wake = state.latest_stdout_line.is_none();
+        state.latest_stdout_line = Some(observed_at);
+        if should_wake {
+            wake.notify_one();
+        }
+    }
+
+    fn publish_cancellation(&self) {
+        let (state, wake) = &*self.bus;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.cancellation_requested {
+            state.cancellation_requested = true;
+            wake.notify_one();
+        }
+    }
+
+    fn publish_worker_failure(&self) {
+        let (state, wake) = &*self.bus;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.worker_failed {
+            state.worker_failed = true;
+            wake.notify_one();
+        }
+    }
+}
+
+impl ProcessEventSubscriber {
+    fn take_pending(&self) -> ProcessEvents {
+        let (state, _) = &*self.bus;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ProcessEvents {
+            latest_stdout_line: state.latest_stdout_line.take(),
+            cancellation_requested: std::mem::take(&mut state.cancellation_requested),
+            worker_failed: std::mem::take(&mut state.worker_failed),
+        }
+    }
+
+    fn wait_for_event_or_poll(&self, timeout: Duration) {
+        let (state, wake) = &*self.bus;
+        let state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.latest_stdout_line.is_none()
+            && !state.cancellation_requested
+            && !state.worker_failed
+        {
+            let _ = wake.wait_timeout(state, timeout);
+        }
     }
 }
 
@@ -961,28 +1162,83 @@ fn map_termination_diagnostics<T: StdoutDrainOutput>(
     host_cancellation_requested: bool,
 ) -> ProviderDiagnostics {
     let joined = join_process_threads(threads);
-    termination_diagnostics_from_parts(
+    let mut diagnostics = termination_diagnostics_from_parts(
         terminated,
         host_cancellation_requested,
-        joined.stdout.captured_bytes(),
-        joined.stderr,
-    )
-}
-
-struct JoinedProcessThreads<T: StdoutDrainOutput> {
-    stdout: T,
-    stderr: CapturedBytes,
-    _stdin_closed_early: bool,
+        joined
+            .stdout
+            .as_ref()
+            .map(StdoutDrainOutput::captured_bytes)
+            .unwrap_or_default(),
+        joined.stderr.unwrap_or_default(),
+    );
+    diagnostics.stdin_closed_early = joined.stdin_closed_early.unwrap_or_default();
+    if !joined.failed_workers.is_empty() {
+        diagnostics.description = Some(worker_failure_description(&joined.failed_workers));
+    }
+    diagnostics
 }
 
 fn join_process_threads<T: StdoutDrainOutput>(
     threads: ProcessThreads<T>,
 ) -> JoinedProcessThreads<T> {
-    JoinedProcessThreads {
-        stdout: join_stdout(threads.stdout),
-        stderr: join_capture(threads.stderr),
-        _stdin_closed_early: join_stdin(threads.stdin),
+    let stdout = threads.stdout.join().ok();
+    let stderr = threads.stderr.join().ok();
+    let stdin_closed_early = threads.stdin.join().ok();
+    let mut failed_workers = Vec::new();
+    if stdout.is_none() {
+        failed_workers.push("stdout");
     }
+    if stderr.is_none() {
+        failed_workers.push("stderr");
+    }
+    if stdin_closed_early.is_none() {
+        failed_workers.push("stdin");
+    }
+    JoinedProcessThreads {
+        stdout,
+        stderr,
+        stdin_closed_early,
+        failed_workers,
+    }
+}
+
+fn process_worker_failure<T: StdoutDrainOutput>(
+    command: &ProcessCommand,
+    joined: JoinedProcessThreads<T>,
+    status: Option<ProcessStatus>,
+    host_cancellation_requested: bool,
+) -> ProviderClientError {
+    let mut diagnostics = ProviderDiagnostics {
+        stdout: joined
+            .stdout
+            .as_ref()
+            .map(StdoutDrainOutput::captured_bytes)
+            .unwrap_or_default(),
+        stderr: joined.stderr.unwrap_or_default(),
+        stdin_closed_early: joined.stdin_closed_early.unwrap_or_default(),
+        process_was_reaped: status.is_some(),
+        host_cancellation_requested,
+        description: Some(worker_failure_description(&joined.failed_workers)),
+        ..ProviderDiagnostics::default()
+    };
+    if let Some(status) = status {
+        diagnostics.provider_exit_code = exit_code(&status);
+        diagnostics.provider_process_nonzero = process_nonzero(&status);
+    }
+    ProviderClientError::host_transport(
+        HostErrorKind::WaitFailed,
+        subcommand_for_error(command),
+        None,
+        diagnostics,
+    )
+}
+
+fn worker_failure_description(failed_workers: &[&str]) -> String {
+    format!(
+        "process worker thread panicked: {}",
+        failed_workers.join(", ")
+    )
 }
 
 fn termination_diagnostics_from_parts(
@@ -1017,36 +1273,6 @@ fn notify_spawn_observer(
     Ok(())
 }
 
-fn child_custody_test_fault(site: &str) -> Result<(), String> {
-    if std::env::var("OULIPOLY_CHILD_CUSTODY_TEST_FAULT")
-        .ok()
-        .as_deref()
-        == Some(site)
-    {
-        wait_for_child_custody_test_ready()?;
-        return Err(format!("injected child custody failure at {site}"));
-    }
-    Ok(())
-}
-
-fn wait_for_child_custody_test_ready() -> Result<(), String> {
-    let Some(path) = std::env::var_os("OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE") else {
-        return Ok(());
-    };
-    let path = PathBuf::from(path);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if path.is_file() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    Err(format!(
-        "timed out waiting for child custody test readiness at {}",
-        path.display()
-    ))
-}
-
 fn terminate_after_spawn_observer_failure(
     mut child: Child,
     command: &ProcessCommand,
@@ -1074,7 +1300,7 @@ fn terminate_after_spawn_observer_failure(
 fn drain_reader(
     mut reader: impl Read,
     limit: ByteLimit,
-    stdout_line_activity: Option<Sender<Instant>>,
+    stdout_line_activity: Option<ProcessEventPublisher>,
 ) -> CapturedBytes {
     drain_reader_with_processor(
         &mut reader,
@@ -1085,7 +1311,7 @@ fn drain_reader(
 
 fn drain_reader_with_processor<P: StdoutProcessor>(
     mut reader: impl Read,
-    stdout_line_activity: Option<Sender<Instant>>,
+    stdout_line_activity: Option<ProcessEventPublisher>,
     mut processor: P,
 ) -> P::Output {
     let mut buffer = [0_u8; 8192];
@@ -1104,20 +1330,12 @@ fn drain_reader_with_processor<P: StdoutProcessor>(
     processor.finish()
 }
 
-fn notify_stdout_line_activity(activity: &Option<Sender<Instant>>, chunk: &[u8]) {
+fn notify_stdout_line_activity(activity: &Option<ProcessEventPublisher>, chunk: &[u8]) {
     let Some(activity) = activity else {
         return;
     };
-    send_stdout_line_activity(activity, stdout_line_count(chunk));
-}
-
-fn stdout_line_count(chunk: &[u8]) -> usize {
-    chunk.iter().filter(|byte| **byte == b'\n').count()
-}
-
-fn send_stdout_line_activity(activity: &Sender<Instant>, count: usize) {
-    for _ in 0..count {
-        let _ = activity.send(Instant::now());
+    if chunk.contains(&b'\n') {
+        activity.publish_stdout_line(Instant::now());
     }
 }
 
@@ -1129,13 +1347,13 @@ fn write_stdin(mut stdin: impl Write, bytes: Vec<u8>) -> bool {
 }
 
 fn write_stdin_bytes(stdin: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
-    for (index, byte) in bytes.iter().enumerate() {
-        stdin.write_all(std::slice::from_ref(byte))?;
-        if index == 0 {
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-    Ok(())
+    let Some((first, remaining)) = bytes.split_first() else {
+        return Ok(());
+    };
+    // Give a provider that rejects stdin a bounded chance to close before the bulk write.
+    stdin.write_all(std::slice::from_ref(first))?;
+    thread::sleep(Duration::from_millis(10));
+    stdin.write_all(remaining)
 }
 
 fn stdin_flush_closed_early(stdin: &mut impl Write) -> bool {
@@ -1151,18 +1369,6 @@ fn flush_stdin(stdin: &mut impl Write) -> std::io::Result<()> {
 
 fn stdin_error_closed_early(error: &std::io::Error) -> bool {
     error.kind() == ErrorKind::BrokenPipe || error.kind() == ErrorKind::WouldBlock
-}
-
-fn join_capture(handle: thread::JoinHandle<CapturedBytes>) -> CapturedBytes {
-    handle.join().unwrap_or_default()
-}
-
-fn join_stdout<T: StdoutDrainOutput>(handle: thread::JoinHandle<T>) -> T {
-    handle.join().unwrap_or_default()
-}
-
-fn join_stdin(handle: thread::JoinHandle<bool>) -> bool {
-    handle.join().unwrap_or(true)
 }
 
 fn host_process_error(
@@ -1301,10 +1507,13 @@ pub(crate) fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::{
         ByteAccumulator, ByteLimit, CancellationToken, ProcessCommand, ProcessLimits,
-        ProcessRunner, ProcessSpawnObserver,
+        ProcessRunner, ProcessSpawnObserver, STATUS_POLL_INTERVAL, StdoutProcessor,
+        process_event_bus, write_stdin_bytes,
     };
+    use crate::error::CapturedBytes;
     use crate::testkit::{FakeProvider, FakeProviderMode, LeakProbe};
     use serde_json::json;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1564,6 +1773,90 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_sends_termination_before_kill_grace_elapses() {
+        let fake = FakeProvider::compile(fake_provider_source());
+        let token = CancellationToken::new();
+        let limits = ProcessLimits {
+            timeout: Duration::from_secs(30),
+            kill_after_grace: Duration::from_secs(1),
+            cancellation: Some(token.clone()),
+            ..ProcessLimits::default()
+        };
+
+        token.cancel_after(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let error = ProcessRunner::new(limits)
+            .run(
+                ProcessCommand::new(fake.path()).arg("describe"),
+                serde_json::to_vec(&describe_request()).expect("request should serialize"),
+                FakeProviderMode::Sleep.env(),
+            )
+            .expect_err("sleeping provider should be cancelled");
+
+        assert_eq!(error.transport_kind(), "host_cancelled");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "SIGTERM was delayed until the force-kill grace elapsed"
+        );
+        assert!(!error.diagnostics().process_was_force_killed);
+    }
+
+    #[test]
+    fn steady_state_status_polling_is_bounded() {
+        let polls_per_second =
+            Duration::from_secs(1).as_millis() / STATUS_POLL_INTERVAL.as_millis();
+
+        assert_eq!(polls_per_second, 20);
+        assert_eq!(polls_per_second * 100, 2_000);
+    }
+
+    #[test]
+    fn stdout_line_activity_is_coalesced_to_one_pending_event() {
+        let (publisher, subscriber) = process_event_bus();
+        for _ in 0..100_000 {
+            publisher.publish_stdout_line(std::time::Instant::now());
+        }
+
+        assert!(subscriber.take_pending().latest_stdout_line.is_some());
+        assert!(subscriber.take_pending().latest_stdout_line.is_none());
+    }
+
+    #[test]
+    fn stdin_payload_is_written_in_bulk() {
+        let mut writer = CountingWriter::default();
+        let payload = vec![b'x'; 1024 * 1024];
+
+        write_stdin_bytes(&mut writer, &payload).expect("bulk stdin write should succeed");
+
+        assert_eq!(writer.write_calls, 2);
+        assert_eq!(writer.written, payload.len());
+    }
+
+    #[test]
+    fn stdout_worker_panic_is_reported_as_wait_failure() {
+        let fake = FakeProvider::compile(fake_provider_source());
+        let started = std::time::Instant::now();
+        let error = ProcessRunner::new(ProcessLimits::default())
+            .run_with_stdout_line_gap_timeout_and_stdout_processor(
+                ProcessCommand::new(fake.path()).arg("launch"),
+                serde_json::to_vec(&describe_request()).expect("request should serialize"),
+                FakeProviderMode::LaunchPartialHang.env(),
+                PanickingStdoutProcessor,
+            )
+            .expect_err("stdout worker panic should fail the process outcome");
+
+        assert_eq!(error.transport_kind(), "wait_failed");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "worker panic remained hidden until the process timeout"
+        );
+        assert_eq!(
+            error.diagnostics().description.as_deref(),
+            Some("process worker thread panicked: stdout")
+        );
+    }
+
+    #[test]
     fn byte_accumulator_is_byte_oriented_and_records_truncation_metadata() {
         let mut accumulator = ByteAccumulator::new(ByteLimit::new(5));
         accumulator.push(b"a");
@@ -1594,6 +1887,38 @@ mod tests {
         assert!(outcome.stdin_closed_early);
         assert!(outcome.status.exited_successfully());
         assert!(outcome.stdout_text().contains("\"ok\":true"));
+    }
+
+    #[derive(Default)]
+    struct CountingWriter {
+        write_calls: usize,
+        written: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.write_calls += 1;
+            self.written += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PanickingStdoutProcessor;
+
+    impl StdoutProcessor for PanickingStdoutProcessor {
+        type Output = CapturedBytes;
+
+        fn push(&mut self, _chunk: &[u8]) {
+            panic!("injected stdout worker panic");
+        }
+
+        fn finish(self) -> Self::Output {
+            CapturedBytes::default()
+        }
     }
 
     fn fake_provider_source() -> PathBuf {

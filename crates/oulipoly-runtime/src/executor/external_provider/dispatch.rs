@@ -259,7 +259,8 @@ fn external_launch_spawn_observer(
         let generation = record_child_identity(child_id, Some(&context)).and_then(|generation| {
             generation.ok_or_else(|| "Missing external runtime generation".to_string())
         });
-        remember_recorded_launch_generation(&recorded_generation, generation)
+        remember_recorded_launch_generation(&recorded_generation, generation)?;
+        child_custody_test_fault("external_status_poll")
     }))
 }
 

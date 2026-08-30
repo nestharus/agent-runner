@@ -119,7 +119,7 @@ fn launch_client(
         ProviderArtifactRef::Path { path: path.into() },
         ProviderClientOptions::default()
             .with_timeout(Duration::from_secs(5))
-            .with_kill_after_grace(Duration::from_millis(25))
+            .with_kill_after_grace(Duration::from_millis(200))
             .with_cancellation(cancellation),
     )
 }

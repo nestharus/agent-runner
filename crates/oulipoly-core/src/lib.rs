@@ -4,7 +4,7 @@ mod auto_wake_environment;
 mod cancellation;
 
 pub use auto_wake_environment::AutoWakeEnvironmentVariable;
-pub use cancellation::CancellationToken;
+pub use cancellation::{CancellationRegistration, CancellationToken};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

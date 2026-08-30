@@ -735,6 +735,17 @@ fn parse_launch_output(
             Ok(result)
         }
         Err(error) => {
+            if diagnostics.host_cancellation_requested
+                && error.transport_kind() == HostErrorKind::MissingFinalExit.as_str()
+            {
+                return Err(ProviderClientError::host_transport(
+                    HostErrorKind::Cancelled,
+                    "launch",
+                    request_id.map(str::to_owned),
+                    diagnostics.clone(),
+                )
+                .with_process_context(diagnostics, status));
+            }
             if let Some(capability_error) =
                 launch_capability_error(&captured_stdout.bytes, &diagnostics, &status, request_id)
             {
