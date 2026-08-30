@@ -698,9 +698,9 @@ mod tests {
             "admitted"
         );
 
-        let underreported_total = observation.total_bytes.saturating_mul(3) / 4;
+        let underreported_total = independent.total_bytes.saturating_mul(991) / 1_000;
         let correct_reserve = DEFAULT_MEMORY_RESERVE_BYTES.max(
-            observation
+            independent
                 .total_bytes
                 .saturating_mul(DEFAULT_MEMORY_RESERVE_PERCENT)
                 / 100,
@@ -710,12 +710,22 @@ mod tests {
         assert!(
             underreported_reserve < correct_reserve,
             "native test host must be large enough for total-memory truth to affect the default \
-             reserve: production={observation:?}, correct_reserve={correct_reserve}, \
+             reserve: independent={independent:?}, correct_reserve={correct_reserve}, \
              underreported_reserve={underreported_reserve}"
+        );
+        assert!(
+            independent.total_bytes.abs_diff(underreported_total) <= total_tolerance,
+            "the decision-changing underreport must remain inside the accepted total comparison \
+             band: independent={independent:?}, underreported_total={underreported_total}, \
+             total_tolerance={total_tolerance}"
         );
         let boundary_available =
             underreported_reserve + (correct_reserve - underreported_reserve) / 2;
-        let correct_boundary = MemoryObservation {
+        let independent_boundary = MemoryObservation {
+            available_bytes: boundary_available,
+            total_bytes: independent.total_bytes,
+        };
+        let production_boundary = MemoryObservation {
             available_bytes: boundary_available,
             total_bytes: observation.total_bytes,
         };
@@ -738,11 +748,24 @@ mod tests {
             drain_with(
                 &mut boundary_db,
                 default_config(),
-                || Ok(Some(correct_boundary)),
+                || Ok(Some(independent_boundary)),
                 Some("native-total-boundary"),
             )
             .unwrap(),
             DrainOutcome::Pressure
+        );
+        assert_eq!(
+            drain_with(
+                &mut boundary_db,
+                default_config(),
+                || Ok(Some(production_boundary)),
+                Some("native-total-boundary"),
+            )
+            .unwrap(),
+            DrainOutcome::Pressure,
+            "the production observation must preserve the independently derived default-admission \
+             decision: production={observation:?}, independent={independent:?}, \
+             boundary_available={boundary_available}"
         );
         assert_eq!(
             drain_with(
@@ -753,8 +776,8 @@ mod tests {
             )
             .unwrap(),
             DrainOutcome::Admitted,
-            "a 25% total-memory underreport must visibly change default admission at the reserve \
-             boundary"
+            "a within-tolerance total-memory underreport must visibly change default admission \
+             at the independently derived reserve boundary"
         );
     }
 
