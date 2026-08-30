@@ -10,7 +10,7 @@ use oulipoly_state::mailbox::{
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -112,15 +112,17 @@ impl Fixture {
         command.output().unwrap()
     }
 
-    fn run_startup_sweep(&self) -> Output {
+    fn start_startup_sweep(&self) -> Child {
         let mut command = self.command();
         command
             .arg("mailbox")
             .arg("list")
             .arg("--session-id")
             .arg(SESSION)
-            .arg("--json");
-        command.output().unwrap()
+            .arg("--json")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().unwrap()
     }
 
     fn sidecar_path(&self) -> PathBuf {
@@ -214,13 +216,10 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
     let owner_invocation_uuid = result_id(&initial);
     fixture.seed_pending_delivery(&owner_invocation_uuid);
 
-    let sweep = fixture.run_startup_sweep();
-    assert_success(&sweep);
+    let sweep = fixture.start_startup_sweep();
     assert!(
         wait_until(|| fixture.marker.exists()),
-        "native detached provider turn did not start\nsweep stdout={}\nsweep stderr={}\nmailbox={:?}\nruntime={:?}\nclaim={:?}",
-        String::from_utf8_lossy(&sweep.stdout),
-        String::from_utf8_lossy(&sweep.stderr),
+        "native detached provider turn did not start\nmailbox={:?}\nruntime={:?}\nclaim={:?}",
         MailboxDb::open(&fixture.sidecar_path())
             .unwrap()
             .list_mailbox(SESSION, true)
@@ -248,6 +247,8 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
     assert_eq!(live_claim.max_pending_seq_at_claim, Some(1));
     assert!(live_claim.wake_pid.is_some());
     fs::write(&fixture.provider_gate, "continue\n").unwrap();
+    let sweep = sweep.wait_with_output().unwrap();
+    assert_success(&sweep);
     assert!(
         wait_until(|| {
             let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();
