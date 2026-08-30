@@ -67,6 +67,7 @@ impl Fixture {
 
     fn prepare_command(&self, cmd: &mut Command) {
         cmd.env("XDG_CONFIG_HOME", &self.config_home)
+            .env_remove("OULIPOLY_CONFIG_HOME")
             .env("XDG_DATA_HOME", &self.data_home)
             .env("XDG_STATE_HOME", &self.state_home)
             .env("HOME", &self.home_dir)

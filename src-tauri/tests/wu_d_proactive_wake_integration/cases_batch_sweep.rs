@@ -437,6 +437,119 @@ fi"#,
     assert_xdg_isolated(&fixture);
 }
 
+pub(crate) fn repeated_failed_wakes_keep_oldest_batch_owned_past_terminal_budget() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    let attempt_ledger = fixture.work_dir.join("persistent-failure-attempts.txt");
+    let fourth_started = fixture.work_dir.join("persistent-failure-fourth-started");
+    let release_fourth = fixture.work_dir.join("persistent-failure-release-fourth");
+    let hook = format!(
+        r#"python3 - {attempt_ledger} "$WU_D_PROVIDER_RESUME_INDEX" <<'PY'
+import sys
+import time
+
+with open(sys.argv[1], "a", encoding="utf-8") as out:
+    out.write(f"{{sys.argv[2]}} {{time.monotonic_ns()}}\n")
+PY
+if [ "$WU_D_PROVIDER_RESUME_INDEX" -le 3 ]; then
+  exit 17
+fi
+if [ "$WU_D_PROVIDER_RESUME_INDEX" = 4 ]; then
+  : > {fourth_started}
+  while [ ! -e {release_fourth} ]; do sleep 0.01; done
+fi"#,
+        attempt_ledger = shell_path(&attempt_ledger),
+        fourth_started = shell_path(&fourth_started),
+        release_fourth = shell_path(&release_fourth),
+    );
+    fixture.write_provider(&provider_script(
+        "",
+        &hook,
+        "persistent-failure-${WU_D_PROVIDER_RESUME_INDEX}.txt",
+    ));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime_with_wake_count(SESSION, i64::MAX);
+    for index in 0..21 {
+        fixture.seed_mailbox(SESSION, &format!("h-persistent-failure-{index:02}"));
+    }
+    let claim_token = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    acquire_seed_wake_claim(&fixture, claim_token);
+    fixture
+        .sidecar_conn()
+        .execute(
+            "UPDATE session_wake_claim SET auto_wake_count = ?2 WHERE session_id = ?1",
+            rusqlite::params![SESSION, i64::MAX],
+        )
+        .unwrap();
+
+    let first = fixture.run_auto_wake_resume(claim_token, i64::MAX, 1);
+    assert_eq!(first.status.code(), Some(17), "{first:?}");
+    wait_for_file(&fourth_started);
+
+    let retained_claim = fixture
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .expect("three consecutive failures must retain one claim for a fourth attempt");
+    assert_ne!(retained_claim.claim_token, claim_token);
+    assert_eq!(retained_claim.auto_wake_count, i64::MAX);
+    assert!(retained_claim.wake_pid.is_some());
+    let pending = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert!(pending[..20].iter().all(|row| {
+        row.delivery_attempts == 3 && row.delivery_error.as_deref() == Some("exit_nonzero")
+    }));
+    assert_eq!(pending[20].delivery_attempts, 0);
+    assert!(pending[20].delivery_error.is_none());
+    assert!(pending.iter().all(|row| row.delivered_at.is_none()));
+
+    std::fs::write(&release_fourth, "release\n").unwrap();
+    wait_until(
+        "persistent failure lifecycle delivered oldest and newer work",
+        || delivered_rows_without_pending_or_claim(&fixture, SESSION, 21),
+    );
+    for index in 1..=4 {
+        let prompt =
+            wait_for_file(&fixture.prompt_file(&format!("persistent-failure-{index}.txt")));
+        assert_prompt_contains_handle(&prompt, "h-persistent-failure-00");
+        assert_prompt_contains_handle(&prompt, "h-persistent-failure-19");
+        assert!(!prompt.contains("h-persistent-failure-20"), "{prompt}");
+    }
+    let newer = wait_for_file(&fixture.prompt_file("persistent-failure-5.txt"));
+    assert_prompt_contains_handle(&newer, "h-persistent-failure-20");
+
+    let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert!(rows[..20].iter().all(|row| row.delivery_attempts == 4));
+    assert_eq!(rows[20].delivery_attempts, 1);
+    assert_eq!(
+        std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+        "5"
+    );
+    let attempts = std::fs::read_to_string(&attempt_ledger)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (index, timestamp) = line.split_once(' ').unwrap();
+            (
+                index.parse::<usize>().unwrap(),
+                timestamp.parse::<u128>().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempts.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5]
+    );
+    for pair in attempts[..4].windows(2) {
+        let elapsed_ms = (pair[1].1 - pair[0].1) / 1_000_000;
+        assert!(
+            (900..=10_000).contains(&elapsed_ms),
+            "maximum chronology retry escaped its bounded cadence: {attempts:?}"
+        );
+    }
+    assert_xdg_isolated(&fixture);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn renewed_followup_claim_survives_old_failed_child_recheck() {
@@ -609,21 +722,40 @@ fn process_start(pid: u32) -> Option<String> {
     tail.split_whitespace().nth(19).map(str::to_string)
 }
 
-pub(crate) fn persisted_count_at_five_allows_startup_sweep_delivery() {
+pub(crate) fn maximum_persisted_count_allows_startup_sweep_delivery() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.write_provider(&provider_script("", "", "sweep-count.txt"));
+    let started = fixture.work_dir.join("maximum-sweep-started");
+    let release = fixture.work_dir.join("maximum-sweep-release");
+    let hook = format!(
+        ": > {started}\nwhile [ ! -e {release} ]; do sleep 0.01; done",
+        started = shell_path(&started),
+        release = shell_path(&release),
+    );
+    fixture.write_provider(&provider_script("", &hook, "maximum-sweep-count.txt"));
     fixture.seed_session_turn();
-    fixture.seed_idle_runtime_with_wake_count(SESSION, 5);
+    fixture.seed_idle_runtime_with_wake_count(SESSION, i64::MAX);
     fixture.seed_mailbox_for(SESSION, "h-sweep-count", None);
-    seed_dead_wake_claim(&fixture, "abababab-abab-4bab-8bab-abababababab", 601);
+    let stale_token = "abababab-abab-4bab-8bab-abababababab";
+    seed_dead_wake_claim(&fixture, stale_token, 601);
 
     let output = fixture.run_mailbox_list(SESSION);
     assert_success(&output);
 
-    let prompt = wait_for_file(&fixture.prompt_file("sweep-count.txt"));
+    wait_for_file(&started);
+    let claim = fixture
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .expect("maximum chronology sweep must acquire a replacement claim");
+    assert_ne!(claim.claim_token, stale_token);
+    assert_eq!(claim.auto_wake_count, i64::MAX);
+    assert!(claim.wake_pid.is_some());
+    let prompt = wait_for_file(&fixture.prompt_file("maximum-sweep-count.txt"));
     assert_prompt_contains_handle(&prompt, "h-sweep-count");
-    wait_until("count-five startup sweep delivery", || {
+    std::fs::write(&release, "release\n").unwrap();
+    wait_until("maximum chronology startup sweep delivery", || {
         delivered_single_row_without_error_or_claim(&fixture, SESSION)
     });
     let runtime = fixture
@@ -632,7 +764,11 @@ pub(crate) fn persisted_count_at_five_allows_startup_sweep_delivery() {
         .session_metadata(SESSION)
         .unwrap()
         .unwrap();
-    assert_eq!(runtime.auto_wake_count, 6);
+    assert_eq!(runtime.auto_wake_count, i64::MAX);
+    assert_eq!(
+        std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+        "1"
+    );
     assert_one_failed_delivery(&fixture, SESSION);
     assert_xdg_isolated(&fixture);
 }

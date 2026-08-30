@@ -127,8 +127,13 @@ fn maximum_chronology_stays_eligible_across_failed_and_terminal_rechecks() {
 }
 
 #[test]
-fn persisted_count_at_five_allows_startup_sweep_delivery() {
-    cases_batch_sweep::persisted_count_at_five_allows_startup_sweep_delivery();
+fn repeated_failed_wakes_keep_oldest_batch_owned_past_terminal_budget() {
+    cases_batch_sweep::repeated_failed_wakes_keep_oldest_batch_owned_past_terminal_budget();
+}
+
+#[test]
+fn maximum_persisted_count_allows_startup_sweep_delivery() {
+    cases_batch_sweep::maximum_persisted_count_allows_startup_sweep_delivery();
 }
 
 #[test]

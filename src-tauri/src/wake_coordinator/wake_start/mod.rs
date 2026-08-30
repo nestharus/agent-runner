@@ -211,7 +211,7 @@ mod tests {
     use oulipoly_state::mailbox::{SessionMetadataUpsert, WakeClaimRequest};
 
     #[test]
-    fn persisted_count_at_five_acquires_exact_wake_claim() {
+    fn maximum_persisted_count_acquires_exact_wake_claim() {
         let fixture = ConsumedCompletionFixture::new();
         let mut db = fixture.mailbox();
         db.wake_sessions()
@@ -231,7 +231,7 @@ mod tests {
                 session_id: ConsumedCompletionFixture::SESSION_ID,
                 claim_token: "seed-count-token",
                 reason: "fixture",
-                auto_wake_count: 5,
+                auto_wake_count: i64::MAX,
                 wake_invocation_uuid: None,
                 stale_after_seconds: 600,
             })
@@ -253,12 +253,12 @@ mod tests {
         )
         .unwrap_or_else(|diagnostic| {
             panic!(
-                "pending work at persisted count five must acquire a claim, got {}",
+                "pending work at maximum chronology must acquire a claim, got {}",
                 diagnostic.status
             )
         });
 
-        assert_eq!(context.input.auto_wake_count, 6);
+        assert_eq!(context.input.auto_wake_count, i64::MAX);
         assert_eq!(context.claim.claim_token, "exact-new-claim-token");
         assert_eq!(
             context

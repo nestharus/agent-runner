@@ -77,6 +77,7 @@ impl Fixture {
         cmd.env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
             .env("HOME", &self.home_dir)
+            .env_remove("OULIPOLY_CONFIG_HOME")
             .env("S11_WORK_DIR", &self.work_dir)
             .env(
                 "OULIPOLY_DATA_DIR",
@@ -296,6 +297,20 @@ turn_script = {}
                 "SELECT invocation_uuid FROM invocations ORDER BY id DESC LIMIT 1",
                 [],
                 |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn latest_terminal_outcome(&self) -> (String, i32, String) {
+        Connection::open(self.state_path())
+            .unwrap()
+            .query_row(
+                "SELECT status, exit_code, terminal_reason
+                 FROM invocations
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap()
     }
@@ -609,6 +624,60 @@ fn trusted_prompt_acceptance_settles_mailbox_delivery_when_final_exit_is_missing
     ));
     assert_eq!(fixture.mailbox_row(notification.seq).delivery_attempts, 1);
     fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn absent_prompt_acceptance_retries_nonzero_and_missing_final_exit_delivery() {
+    for (label, failure_environment) in [
+        (
+            "provider-nonzero",
+            [("S11_NO_ASSISTANT_RESULT", "1"), ("S11_EXIT_NONZERO", "1")],
+        ),
+        (
+            "missing-final-exit",
+            [
+                ("S11_NO_ASSISTANT_RESULT", "1"),
+                ("S11_OMIT_EXIT_EVENT", "1"),
+            ],
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.write_external_provider();
+        fixture.remove_turn_script_fallback();
+        assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+        let owner_invocation_uuid = fixture.latest_invocation_uuid();
+        let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+        let failed = fixture.run_resume_with_env("continue owning workflow", &failure_environment);
+        assert_ne!(failed.status.code(), Some(0), "{label}: {failed:?}");
+        let (status, exit_code, terminal_reason) = fixture.latest_terminal_outcome();
+        assert_eq!(status, "failed", "{label}");
+        assert_ne!(exit_code, 0, "{label}");
+        assert_ne!(
+            terminal_reason, "resume_prompt_accepted_provider_failed",
+            "{label}: absent acceptance must not select the trusted terminal path"
+        );
+        let pending = fixture.mailbox_row(notification.seq);
+        assert!(pending.delivered_at.is_none(), "{label}: {pending:?}");
+        assert_eq!(pending.delivery_attempts, 1, "{label}: {pending:?}");
+
+        assert_success(&fixture.run_resume_with_env(
+            "retry pending detached child",
+            &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
+        ));
+        let delivered = fixture.mailbox_row(notification.seq);
+        assert!(delivered.delivered_at.is_some(), "{label}: {delivered:?}");
+        assert_eq!(delivered.delivery_attempts, 2, "{label}: {delivered:?}");
+        let prompts = fixture.recorded_resume_prompts();
+        assert_eq!(prompts.len(), 2, "{label}: {prompts:#?}");
+        assert!(
+            prompts
+                .iter()
+                .all(|prompt| prompt.contains("age291-detached-child")),
+            "{label}: pending delivery must replay exactly once: {prompts:#?}"
+        );
+        fixture.assert_xdg_isolated();
+    }
 }
 
 #[test]

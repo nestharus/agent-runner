@@ -126,6 +126,10 @@ mod tests {
 
     #[test]
     fn provider_launch_removes_runner_private_auto_wake_environment() {
+        assert!(
+            AutoWakeEnvironmentVariable::ALL.contains(&AutoWakeEnvironmentVariable::TEST_SENTINEL),
+            "runtime tests must extend the production catalog"
+        );
         let environment = AutoWakeEnvironmentVariable::ALL
             .into_iter()
             .map(|variable| (variable.name().to_string(), "private".to_string()))

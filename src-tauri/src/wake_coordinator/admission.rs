@@ -627,12 +627,103 @@ mod tests {
     }
 
     #[test]
-    fn supported_platform_memory_observer_returns_usable_values() {
+    fn native_memory_observer_matches_host_and_drives_default_admission() {
         let observation = observe_system_memory()
             .unwrap()
             .expect("supported platforms must provide memory observation");
-        assert!(observation.total_bytes > 0);
-        assert!(observation.available_bytes <= observation.total_bytes);
+        let independent_total = independently_observed_total_memory_bytes().unwrap();
+        assert!(
+            independent_total >= DEFAULT_MEMORY_RESERVE_BYTES.saturating_mul(2),
+            "native test host must independently report at least 1 GiB: {independent_total}"
+        );
+        assert!(
+            observation.total_bytes >= independent_total / 2
+                && observation.total_bytes <= independent_total,
+            "production total memory must agree with the independent host reading: \
+             production={observation:?}, independent_total={independent_total}"
+        );
+        let default_reserve = DEFAULT_MEMORY_RESERVE_BYTES.max(
+            observation
+                .total_bytes
+                .saturating_mul(DEFAULT_MEMORY_RESERVE_PERCENT)
+                / 100,
+        );
+        assert!(
+            observation.available_bytes >= default_reserve,
+            "native test host must have enough observed memory for default admission: \
+             production={observation:?}, reserve={default_reserve}"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        enqueue(&mut db, "native-memory-observation", None, 1);
+        assert_eq!(
+            drain_with(
+                &mut db,
+                default_config(),
+                || Ok(Some(observation)),
+                Some("native-memory-observation"),
+            )
+            .unwrap(),
+            DrainOutcome::Admitted
+        );
+        assert_eq!(
+            db.session_admissions()
+                .row("native-memory-observation")
+                .unwrap()
+                .unwrap()
+                .state,
+            "admitted"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn independently_observed_total_memory_bytes() -> Result<u64, String> {
+        let mut info = unsafe { std::mem::zeroed::<libc::sysinfo>() };
+        if unsafe { libc::sysinfo(&mut info) } != 0 {
+            return Err(format!(
+                "Failed independent Linux sysinfo observation: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        u64::from(info.mem_unit)
+            .checked_mul(info.totalram)
+            .ok_or_else(|| "Independent Linux total memory overflowed".to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn independently_observed_total_memory_bytes() -> Result<u64, String> {
+        let output = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .map_err(|error| format!("Failed independent macOS sysctl observation: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Independent macOS sysctl observation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|error| format!("Independent macOS memory output was not UTF-8: {error}"))?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("Invalid independent macOS total memory: {error}"))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn independently_observed_total_memory_bytes() -> Result<u64, String> {
+        use windows_sys::Win32::System::SystemInformation::GetPhysicallyInstalledSystemMemory;
+
+        let mut total_kib = 0_u64;
+        if unsafe { GetPhysicallyInstalledSystemMemory(&mut total_kib) } == 0 {
+            return Err(format!(
+                "Failed independent Windows memory observation: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        total_kib
+            .checked_mul(1024)
+            .ok_or_else(|| "Independent Windows total memory overflowed".to_string())
     }
 
     #[test]

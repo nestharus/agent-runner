@@ -12412,8 +12412,21 @@ mod tests {
         permissions.set_readonly(false);
         fs::set_permissions(&first.file_path, permissions).unwrap();
         fs::write(&first.file_path, b"payload-b").unwrap();
+        let mut permissions = fs::metadata(&first.file_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&first.file_path, permissions).unwrap();
+        assert!(
+            fs::metadata(&first.file_path)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
 
-        assert!(db.payloads().verify_published_payload(&first).is_err());
+        let error = db.payloads().verify_published_payload(&first).unwrap_err();
+        assert!(
+            error.contains("Mailbox payload integrity mismatch"),
+            "{error}"
+        );
     }
 
     #[test]

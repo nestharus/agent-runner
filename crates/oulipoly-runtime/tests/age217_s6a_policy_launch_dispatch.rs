@@ -12,6 +12,7 @@ use oulipoly_config::{
     InputDef, InputType, ModelConfig, PromptMode, ProviderConfig,
     provider_implementation_ref::ProviderImplementationRef,
 };
+use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_runtime::executor;
 use oulipoly_runtime::executor::cli::{self, EffectiveExecuteRequest};
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
@@ -35,6 +36,30 @@ const CHILD_CUSTODY_FAULT_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_FAULT";
 const CHILD_CUSTODY_READY_FILE_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE";
 const CHILD_PID_FILE_ENV: &str = "OULIPOLY_CHILD_PID_FILE";
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn auto_wake_environment_names() -> Vec<&'static str> {
+    AutoWakeEnvironmentVariable::ALL
+        .into_iter()
+        .map(AutoWakeEnvironmentVariable::name)
+        .collect()
+}
+
+fn runner_private_environment_names() -> Vec<&'static str> {
+    auto_wake_environment_names()
+        .into_iter()
+        .chain([
+            oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+            "OULIPOLY_PARENT_INVOCATION",
+        ])
+        .collect()
+}
+
+fn assert_test_catalog_extension() {
+    assert!(
+        AutoWakeEnvironmentVariable::ALL.contains(&AutoWakeEnvironmentVariable::TEST_SENTINEL),
+        "external-provider tests must extend the production catalog"
+    );
+}
 
 struct ScriptFixture {
     _dir: tempfile::TempDir,
@@ -585,6 +610,14 @@ fn fake_provider_script_body(
     policy_record_path: &Path,
     launch_record_path: &Path,
 ) -> String {
+    let runner_private_env_names = AutoWakeEnvironmentVariable::ALL
+        .into_iter()
+        .map(AutoWakeEnvironmentVariable::name)
+        .chain([
+            oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+            "OULIPOLY_PARENT_INVOCATION",
+        ])
+        .collect::<Vec<_>>();
     format!(
         r#"#!/usr/bin/env python3
 import json
@@ -605,15 +638,7 @@ LAUNCH_MODE = {launch_mode}
 PID_FILE = os.environ.get("OULIPOLY_CHILD_PID_FILE")
 READY_FILE = os.environ.get("OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE")
 SUBCOMMAND = sys.argv[1] if len(sys.argv) > 1 else ""
-RUNNER_PRIVATE_ENV_NAMES = [
-    "OULIPOLY_AUTO_WAKE",
-    "OULIPOLY_AUTO_WAKE_SESSION_ID",
-    "OULIPOLY_AUTO_WAKE_TOKEN",
-    "OULIPOLY_AUTO_WAKE_COUNT",
-    "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS",
-    "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
-    "OULIPOLY_PARENT_INVOCATION",
-]
+RUNNER_PRIVATE_ENV_NAMES = {runner_private_env_names}
 with PROCESS_ENV_RECORD.open("a") as stream:
     stream.write(json.dumps({{
         "subcommand": SUBCOMMAND,
@@ -699,19 +724,15 @@ def policy(request):
         result["stdin"] = "stdin-from-policy"
         result["prompt"] = "prompt-from-policy"
     if POLICY_MODE == "private_env_transform":
-        result["env"] = {{
-            "OULIPOLY_AUTO_WAKE": "policy-private",
-            "OULIPOLY_AUTO_WAKE_SESSION_ID": "policy-private",
-            "OULIPOLY_AUTO_WAKE_TOKEN": "policy-private",
-            "OULIPOLY_AUTO_WAKE_COUNT": "policy-private",
-            "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS": "policy-private",
+        result["env"] = {{name: "policy-private" for name in RUNNER_PRIVATE_ENV_NAMES}}
+        result["env"].update({{
             "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY": "policy-private",
             "OULIPOLY_PARENT_INVOCATION": json.dumps({{
                 "source": "policy-private",
                 "id": "22222222-2222-4222-8222-222222222222",
                 "_oulipoly_completion_registration_authority": "cd" * 32,
             }}),
-        }}
+        }})
     response(request, result)
     clear_custody_readiness()
 
@@ -844,6 +865,7 @@ if __name__ == "__main__":
         cap_launch = py_bool(capabilities.launch),
         policy_mode = serde_json::to_string(policy_mode).unwrap(),
         launch_mode = serde_json::to_string(launch_mode).unwrap(),
+        runner_private_env_names = serde_json::to_string(&runner_private_env_names).unwrap(),
     )
 }
 
@@ -1662,18 +1684,13 @@ fn external_provider_launch_env_inherits_application_agnostic_parent_entries() {
 
 #[test]
 fn external_provider_launch_env_removes_runner_private_entries() {
-    const PRIVATE_NAMES: [&str; 7] = [
-        "OULIPOLY_AUTO_WAKE",
-        "OULIPOLY_AUTO_WAKE_SESSION_ID",
-        "OULIPOLY_AUTO_WAKE_TOKEN",
-        "OULIPOLY_AUTO_WAKE_COUNT",
-        "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS",
-        oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
-        "OULIPOLY_PARENT_INVOCATION",
-    ];
-
+    assert_test_catalog_extension();
+    let private_names = runner_private_environment_names();
     let _lock = env_lock();
-    let inherited = PRIVATE_NAMES.map(|name| (name, Some("inherited-private")));
+    let inherited = private_names
+        .iter()
+        .map(|name| (*name, Some("inherited-private")))
+        .collect::<Vec<_>>();
     let _env = EnvScope::set_optional(&inherited);
     let fixture = make_external_fixture(
         Capabilities {
@@ -1684,8 +1701,8 @@ fn external_provider_launch_env_removes_runner_private_entries() {
         LaunchMode::Success,
     );
     let mut model = external_model(&fixture);
-    model.providers[0].environment = PRIVATE_NAMES
-        .into_iter()
+    model.providers[0].environment = private_names
+        .iter()
         .map(|name| (name.to_string(), "configured-private".to_string()))
         .collect();
 
@@ -1695,9 +1712,9 @@ fn external_provider_launch_env_removes_runner_private_entries() {
     let policy = read_json(&fixture.policy_record_path);
     let launch = read_json(&fixture.launch_record_path);
     for env in provider_launch_envs(&policy, &launch) {
-        for name in PRIVATE_NAMES {
+        for name in &private_names {
             assert!(
-                env.get(name).is_none(),
+                env.get(*name).is_none(),
                 "runner-private {name} must not cross the provider boundary"
             );
         }
@@ -1706,16 +1723,8 @@ fn external_provider_launch_env_removes_runner_private_entries() {
 
 #[test]
 fn external_provider_subcommands_do_not_inherit_runner_private_authority() {
-    const PRIVATE_NAMES: [&str; 7] = [
-        "OULIPOLY_AUTO_WAKE",
-        "OULIPOLY_AUTO_WAKE_SESSION_ID",
-        "OULIPOLY_AUTO_WAKE_TOKEN",
-        "OULIPOLY_AUTO_WAKE_COUNT",
-        "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS",
-        oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
-        "OULIPOLY_PARENT_INVOCATION",
-    ];
-
+    assert_test_catalog_extension();
+    let private_names = runner_private_environment_names();
     let _lock = env_lock();
     let invocation = oulipoly_state::CompositeInvocationId {
         source: "fixture-provider".to_string(),
@@ -1729,18 +1738,19 @@ fn external_provider_subcommands_do_not_inherit_runner_private_authority() {
     let parent_environment = authority
         .invocation_launch_environment(&invocation)
         .expect("parent launch environment");
-    let _env = EnvScope::set_optional(&[
-        (PRIVATE_NAMES[0], Some("1")),
-        (PRIVATE_NAMES[1], Some("private-session")),
-        (PRIVATE_NAMES[2], Some("private-token")),
-        (PRIVATE_NAMES[3], Some("9")),
-        (PRIVATE_NAMES[4], Some("1000")),
-        (
-            PRIVATE_NAMES[5],
-            Some(authority.process_environment_value()),
-        ),
-        (PRIVATE_NAMES[6], Some(parent_environment.as_str())),
-    ]);
+    let mut inherited = auto_wake_environment_names()
+        .into_iter()
+        .map(|name| (name, Some("inherited-private")))
+        .collect::<Vec<_>>();
+    inherited.push((
+        oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+        Some(authority.process_environment_value()),
+    ));
+    inherited.push((
+        "OULIPOLY_PARENT_INVOCATION",
+        Some(parent_environment.as_str()),
+    ));
+    let _env = EnvScope::set_optional(&inherited);
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -1764,9 +1774,9 @@ fn external_provider_subcommands_do_not_inherit_runner_private_authority() {
     );
     for record in records {
         let process_env = json_object(&record["env"]);
-        for name in PRIVATE_NAMES {
+        for name in &private_names {
             assert!(
-                process_env.get(name).is_none(),
+                process_env.get(*name).is_none(),
                 "provider {} inherited runner-private {name}",
                 record["subcommand"]
             );
@@ -1776,14 +1786,8 @@ fn external_provider_subcommands_do_not_inherit_runner_private_authority() {
 
 #[test]
 fn external_provider_policy_cannot_reintroduce_runner_private_launch_authority() {
-    const AUTO_WAKE_NAMES: [&str; 5] = [
-        "OULIPOLY_AUTO_WAKE",
-        "OULIPOLY_AUTO_WAKE_SESSION_ID",
-        "OULIPOLY_AUTO_WAKE_TOKEN",
-        "OULIPOLY_AUTO_WAKE_COUNT",
-        "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS",
-    ];
-
+    assert_test_catalog_extension();
+    let auto_wake_names = auto_wake_environment_names();
     let _lock = env_lock();
     let invocation = oulipoly_state::CompositeInvocationId {
         source: "fixture-provider".to_string(),
@@ -1822,7 +1826,7 @@ fn external_provider_policy_cannot_reintroduce_runner_private_launch_authority()
 
     let launch = read_json(&fixture.launch_record_path);
     let launch_env = json_object(&launch["params"]["env"]);
-    for name in AUTO_WAKE_NAMES {
+    for name in auto_wake_names {
         assert!(
             launch_env.get(name).is_none(),
             "policy reintroduced runner-private {name}"
