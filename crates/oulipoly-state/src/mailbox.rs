@@ -5523,20 +5523,61 @@ fn publish_payload_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         Uuid::new_v4()
     ));
     write_payload_temp_file(&temp_path, bytes)?;
-    match fs::hard_link(&temp_path, path) {
+    publish_payload_temp_file(&temp_path, path)?;
+    sync_directory(directory)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn publish_payload_temp_file(temp_path: &Path, path: &Path) -> Result<(), String> {
+    match fs::hard_link(temp_path, path) {
         Ok(()) => {}
         Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
         Err(err) => {
-            let _ = fs::remove_file(&temp_path);
+            let _ = fs::remove_file(temp_path);
             return Err(format!(
                 "Failed to publish immutable mailbox payload: {err}"
             ));
         }
     }
-    fs::remove_file(&temp_path)
-        .map_err(|err| format!("Failed to remove mailbox payload temporary file: {err}"))?;
-    sync_directory(directory)?;
-    Ok(())
+    fs::remove_file(temp_path)
+        .map_err(|err| format!("Failed to remove mailbox payload temporary file: {err}"))
+}
+
+#[cfg(windows)]
+fn publish_payload_temp_file(temp_path: &Path, path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let source = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0
+    {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    let _ = fs::remove_file(temp_path);
+    if err.kind() == ErrorKind::AlreadyExists {
+        Ok(())
+    } else {
+        Err(format!(
+            "Failed to publish immutable mailbox payload: {err}"
+        ))
+    }
 }
 
 fn write_payload_temp_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -5694,16 +5735,10 @@ fn sync_directory(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn sync_directory(path: &Path) -> Result<(), String> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|err| format!("Failed to sync directory {}: {err}", path.display()))
+fn sync_directory(_path: &Path) -> Result<(), String> {
+    // Windows cannot FlushFileBuffers on directory handles. Final payload
+    // publication uses MoveFileExW with MOVEFILE_WRITE_THROUGH instead.
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
