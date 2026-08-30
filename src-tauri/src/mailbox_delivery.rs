@@ -1006,6 +1006,7 @@ pub(crate) fn trace_notify_enabled() -> bool {
     )
 }
 
+#[cfg(unix)]
 fn trace_notify_pty_attempt(
     trigger: &str,
     session_id: &str,
@@ -1028,6 +1029,7 @@ fn trace_notify_pty_attempt(
     }
 }
 
+#[cfg(unix)]
 fn notify_trace_base_decision(diagnostic: &PtyMailboxDeliveryDiagnostic) -> &'static str {
     if diagnostic.submitted {
         "inject"
@@ -1036,6 +1038,7 @@ fn notify_trace_base_decision(diagnostic: &PtyMailboxDeliveryDiagnostic) -> &'st
     }
 }
 
+#[cfg(unix)]
 fn notify_trace_status(diagnostic: &PtyMailboxDeliveryDiagnostic) -> &str {
     if diagnostic.status == "stale_generation" {
         "connect_error"
@@ -1044,6 +1047,7 @@ fn notify_trace_status(diagnostic: &PtyMailboxDeliveryDiagnostic) -> &str {
     }
 }
 
+#[cfg(unix)]
 fn notify_trace_control_path_present(diagnostic: &PtyMailboxDeliveryDiagnostic) -> bool {
     diagnostic
         .control_path
@@ -1051,12 +1055,14 @@ fn notify_trace_control_path_present(diagnostic: &PtyMailboxDeliveryDiagnostic) 
         .is_some_and(|path| !path.is_empty())
 }
 
+#[cfg(unix)]
 fn notify_trace_remaining_pending(diagnostic: &PtyMailboxDeliveryDiagnostic) -> String {
     diagnostic
         .remaining_pending
         .map_or_else(|| "unknown".to_string(), |value| value.to_string())
 }
 
+#[cfg(unix)]
 fn notify_trace_message(diagnostic: &PtyMailboxDeliveryDiagnostic) -> String {
     diagnostic
         .message
@@ -1065,6 +1071,7 @@ fn notify_trace_message(diagnostic: &PtyMailboxDeliveryDiagnostic) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+#[cfg(unix)]
 fn format_notify_trace_record(
     trigger: &str,
     session_id: &str,
@@ -1095,14 +1102,17 @@ fn format_notify_trace_record(
     )
 }
 
+#[cfg(unix)]
 fn emit_notify_trace_record(record: &str) {
     eprintln!("{}", format_notify_trace_output(record));
 }
 
+#[cfg(unix)]
 fn format_notify_trace_output(record: &str) -> String {
     format!("oulipoly_notify_trace {record}")
 }
 
+#[cfg(unix)]
 fn notify_trace_summary_reason(status: &str) -> &'static str {
     match status {
         "acked" | "mark_delivered_error" => "control_ack",
@@ -2085,6 +2095,7 @@ mod tests {
         assert_eq!(pty_nack_status("broker_rejected"), "protocol_error");
     }
 
+    #[cfg(unix)]
     #[test]
     fn stale_generation_trace_uses_normalized_connect_error_reason() {
         let diagnostic = PtyMailboxDeliveryDiagnostic {

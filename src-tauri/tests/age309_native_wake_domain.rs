@@ -64,7 +64,7 @@ impl Fixture {
         fs::write(
             self.models_dir.join(format!("{MODEL}.toml")),
             format!(
-                "provider = {{ path = {} }}\nprompt_mode = \"arg\"\n\n[[providers]]\nname = \"{PROVIDER}\"\nargs = []\n",
+                "provider = {{ script = {} }}\nprompt_mode = \"arg\"\n\n[[providers]]\nname = \"{PROVIDER}\"\nargs = []\n",
                 toml_string(&path_string(&wrapper))
             ),
         )
@@ -248,17 +248,36 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
     assert_eq!(live_claim.max_pending_seq_at_claim, Some(1));
     assert!(live_claim.wake_pid.is_some());
     fs::write(&fixture.provider_gate, "continue\n").unwrap();
-    assert!(wait_until(|| {
-        let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();
-        let rows = mailbox.list_mailbox(SESSION, true).unwrap();
-        rows.len() == 1
-            && rows[0].delivered_at.is_some()
-            && mailbox
-                .wake_session_reader()
-                .wake_claim(SESSION)
-                .unwrap()
-                .is_none()
-    }));
+    assert!(
+        wait_until(|| {
+            let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+            let rows = mailbox.list_mailbox(SESSION, true).unwrap();
+            rows.len() == 1
+                && rows[0].delivered_at.is_some()
+                && mailbox
+                    .wake_session_reader()
+                    .wake_claim(SESSION)
+                    .unwrap()
+                    .is_none()
+        }),
+        "native detached provider turn did not settle\nmailbox={:?}\nruntime={:?}\nclaim={:?}\ninvocations={:?}\nmarker={}",
+        MailboxDb::open(&fixture.sidecar_path())
+            .unwrap()
+            .list_mailbox(SESSION, true)
+            .unwrap(),
+        MailboxDb::open(&fixture.sidecar_path())
+            .unwrap()
+            .wake_session_reader()
+            .session_metadata(SESSION)
+            .unwrap(),
+        MailboxDb::open(&fixture.sidecar_path())
+            .unwrap()
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .unwrap(),
+        invocation_diagnostics(&fixture.state_path()),
+        fs::read_to_string(&fixture.marker).unwrap_or_default()
+    );
 
     let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();
     let row = mailbox.list_mailbox(SESSION, true).unwrap().remove(0);
@@ -303,6 +322,22 @@ fn result_id(output: &Output) -> String {
         .as_str()
         .unwrap()
         .to_string()
+}
+
+fn invocation_diagnostics(state_path: &Path) -> Vec<(String, Option<String>, Option<String>)> {
+    let connection = Connection::open(state_path).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT status, error_category, terminal_reason
+             FROM invocations
+             ORDER BY created_at, id",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
 }
 
 fn assert_success(output: &Output) {
@@ -421,15 +456,17 @@ def launch(request):
             time.sleep(0.02)
         event(request, seq, "stdout", data_base64=base64.b64encode(b"native resumed\n").decode("ascii"))
         seq += 1
-        acceptance = params["prompt_acceptance"]
-        event(request, seq, "marker", name="oulipoly.prompt_accepted/v1", value={
+        acceptance = params.get("prompt_acceptance", {})
+        acceptance_marker = {
             "protocol": "oulipoly.prompt_acceptance/v1",
             "provider_session_id": known,
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-            "delivery_nonce": acceptance["delivery_nonce"],
             "source": "age309.native.fixture",
             "message_id": "native-accepted",
-        })
+        }
+        if acceptance.get("delivery_nonce"):
+            acceptance_marker["delivery_nonce"] = acceptance["delivery_nonce"]
+        event(request, seq, "marker", name="oulipoly.prompt_accepted/v1", value=acceptance_marker)
         seq += 1
         event(request, seq, "marker", name="oulipoly.produced_assistant_response", value=True)
         seq += 1
