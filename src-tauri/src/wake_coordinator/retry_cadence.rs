@@ -35,25 +35,47 @@ fn bounded_auto_wake_retry_delay_ms(base_ms: u64, auto_wake_count: i64) -> u64 {
 mod tests {
     use super::*;
 
+    fn retry_env(chronological_attempt_count: i64) -> AutoWakeEnv {
+        AutoWakeEnv {
+            token: String::new(),
+            chronological_attempt_count,
+            retry_base_milliseconds: 1_000,
+        }
+    }
+
     #[test]
     fn long_failed_wake_sequence_keeps_bounded_exponential_retry_cadence() {
         let delays = (1..=20)
-            .map(|count| bounded_auto_wake_retry_delay_ms(1_000, count))
+            .map(|count| auto_wake_retry_delay(&retry_env(count)))
             .collect::<Vec<_>>();
 
-        assert_eq!(&delays[..6], &[1_000, 2_000, 4_000, 8_000, 16_000, 30_000]);
-        assert!(delays[6..].iter().all(|delay| *delay == 30_000));
+        assert_eq!(
+            &delays[..6],
+            &[
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+            ]
+        );
+        assert!(
+            delays[6..]
+                .iter()
+                .all(|delay| *delay == Duration::from_secs(30))
+        );
     }
 
     #[test]
     fn maximum_chronology_keeps_retry_delay_at_ceiling() {
         assert_eq!(
-            bounded_auto_wake_retry_delay_ms(1_000, i64::MAX - 1),
-            AUTO_WAKE_RETRY_MAX_MS
+            auto_wake_retry_delay(&retry_env(i64::MAX - 1)),
+            Duration::from_millis(AUTO_WAKE_RETRY_MAX_MS)
         );
         assert_eq!(
-            bounded_auto_wake_retry_delay_ms(1_000, i64::MAX),
-            AUTO_WAKE_RETRY_MAX_MS
+            auto_wake_retry_delay(&retry_env(i64::MAX)),
+            Duration::from_millis(AUTO_WAKE_RETRY_MAX_MS)
         );
     }
 }

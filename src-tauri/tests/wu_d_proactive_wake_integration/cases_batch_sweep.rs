@@ -379,7 +379,7 @@ fi"#,
     assert_xdg_isolated(&fixture);
 }
 
-pub(crate) fn maximum_chronology_stays_eligible_across_failed_and_terminal_rechecks() {
+pub(crate) fn maximum_chronology_and_delivery_attempts_stay_eligible_across_rechecks() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     let first_failure = fixture.work_dir.join("maximum-chronology-first-failure");
@@ -409,6 +409,20 @@ fi"#,
             rusqlite::params![SESSION, i64::MAX],
         )
         .unwrap();
+    fixture
+        .sidecar_conn()
+        .execute(
+            "UPDATE mailbox
+             SET delivery_attempts = ?2
+             WHERE seq IN (
+                 SELECT seq FROM mailbox
+                 WHERE session_id = ?1
+                 ORDER BY enqueued_at, seq
+                 LIMIT 20
+             )",
+            rusqlite::params![SESSION, i64::MAX - 2],
+        )
+        .unwrap();
 
     let retry_started = std::time::Instant::now();
     let first = fixture.run_auto_wake_resume(claim_token, i64::MAX, 30);
@@ -435,7 +449,12 @@ fi"#,
     );
     let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
     assert_eq!(rows.len(), 21);
-    assert!(rows[..20].iter().all(|row| row.delivery_attempts == 2));
+    assert!(
+        rows[..20]
+            .iter()
+            .all(|row| row.delivery_attempts == i64::MAX),
+        "oldest-batch delivery attempts must survive failure and successful retry through i64::MAX"
+    );
     assert_eq!(rows[20].delivery_attempts, 1);
     let runtime = fixture
         .mailbox()

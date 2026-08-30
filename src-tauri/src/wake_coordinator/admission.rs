@@ -779,6 +779,79 @@ mod tests {
             "a within-tolerance total-memory underreport must visibly change default admission \
              at the independently derived reserve boundary"
         );
+
+        let overreported_total = independent.total_bytes.saturating_mul(1_009) / 1_000;
+        let overreported_reserve = DEFAULT_MEMORY_RESERVE_BYTES
+            .max(overreported_total.saturating_mul(DEFAULT_MEMORY_RESERVE_PERCENT) / 100);
+        assert!(
+            overreported_reserve > correct_reserve,
+            "native test host must be large enough for a total-memory overreport to inflate the \
+             default reserve: independent={independent:?}, correct_reserve={correct_reserve}, \
+             overreported_reserve={overreported_reserve}"
+        );
+        assert!(
+            independent.total_bytes.abs_diff(overreported_total) <= total_tolerance,
+            "the decision-changing overreport must remain inside the accepted total comparison \
+             band: independent={independent:?}, overreported_total={overreported_total}, \
+             total_tolerance={total_tolerance}"
+        );
+        let overreported_boundary_available =
+            correct_reserve + (overreported_reserve - correct_reserve) / 2;
+        let independent_overreported_boundary = MemoryObservation {
+            available_bytes: overreported_boundary_available,
+            total_bytes: independent.total_bytes,
+        };
+        let production_overreported_boundary = MemoryObservation {
+            available_bytes: overreported_boundary_available,
+            total_bytes: observation.total_bytes,
+        };
+        let overreported_boundary = MemoryObservation {
+            available_bytes: overreported_boundary_available,
+            total_bytes: overreported_total,
+        };
+        eprintln!(
+            "native inflated-total discrimination: total_drift={total_drift}, \
+             total_tolerance={total_tolerance}, correct_reserve={correct_reserve}, \
+             overreported_total={overreported_total}, \
+             overreported_reserve={overreported_reserve}, \
+             boundary_available={overreported_boundary_available}"
+        );
+        let drain_boundary = |session_id: &str, boundary: MemoryObservation| {
+            let directory = tempfile::tempdir().unwrap();
+            let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+            enqueue(&mut db, session_id, None, 1);
+            drain_with(
+                &mut db,
+                default_config(),
+                || Ok(Some(boundary)),
+                Some(session_id),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            drain_boundary(
+                "native-inflated-total-independent-boundary",
+                independent_overreported_boundary,
+            ),
+            DrainOutcome::Admitted
+        );
+        assert_eq!(
+            drain_boundary(
+                "native-inflated-total-production-boundary",
+                production_overreported_boundary,
+            ),
+            DrainOutcome::Admitted,
+            "the production observation must preserve the independently derived admission \
+             decision at the inflated-total boundary: production={observation:?}, \
+             independent={independent:?}, \
+             boundary_available={overreported_boundary_available}"
+        );
+        assert_eq!(
+            drain_boundary("native-inflated-total-mutant", overreported_boundary),
+            DrainOutcome::Pressure,
+            "a within-tolerance total-memory overreport must visibly change default admission \
+             at the independently derived reserve boundary"
+        );
     }
 
     #[cfg(target_os = "linux")]
