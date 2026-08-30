@@ -49,7 +49,7 @@ serde_yaml_ng.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_SystemInformation"] }
 
 [lints.clippy]
 bool-assert-comparison = "allow"

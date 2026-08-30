@@ -812,7 +812,7 @@ fn assert_cargo_inventory_matches(workflow_name: &str, workflow: &Value) {
         allowed.extend([
             (
                 "rust-native-wake",
-                r"^cargo\s+test\s+-p\s+oulipoly-agent-runner\s+--lib\s+wake_coordinator::admission::tests::supported_platform_memory_observer_returns_usable_values\s+--\s+--exact\s*$",
+                r"^cargo\s+test\s+-p\s+oulipoly-agent-runner\s+--lib\s+wake_coordinator::admission::tests::native_memory_observer_matches_host_and_drives_default_admission\s+--\s+--exact\s+--nocapture\s*$",
             ),
             (
                 "rust-native-wake",

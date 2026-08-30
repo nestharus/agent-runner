@@ -131,7 +131,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - run: cargo test -p oulipoly-agent-runner --lib wake_coordinator::admission::tests::native_memory_observer_matches_host_and_drives_default_admission -- --exact
+      - run: cargo test -p oulipoly-agent-runner --lib wake_coordinator::admission::tests::native_memory_observer_matches_host_and_drives_default_admission -- --exact --nocapture
       - run: cargo test -p oulipoly-agent-runner --lib wake_coordinator::admission::tests::unavailable_memory_observation_returns_visible_error_without_stranding_queue -- --exact
       - run: cargo test -p oulipoly-agent-runner --test age309_native_wake_domain native_count_five_startup_sweep_reaches_one_detached_provider_turn -- --exact --nocapture
 

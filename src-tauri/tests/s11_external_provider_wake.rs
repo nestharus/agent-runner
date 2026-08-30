@@ -681,6 +681,77 @@ fn absent_prompt_acceptance_retries_nonzero_and_missing_final_exit_delivery() {
 }
 
 #[test]
+fn wrong_prompt_acceptance_session_and_nonce_retry_failed_delivery() {
+    for (label, mismatch_environment, failure_environment) in [
+        (
+            "wrong-session-provider-nonzero",
+            "S11_MARKER_SESSION_MISMATCH",
+            "S11_EXIT_NONZERO",
+        ),
+        (
+            "wrong-session-missing-final-exit",
+            "S11_MARKER_SESSION_MISMATCH",
+            "S11_OMIT_EXIT_EVENT",
+        ),
+        (
+            "wrong-nonce-provider-nonzero",
+            "S11_MARKER_DELIVERY_NONCE_MISMATCH",
+            "S11_EXIT_NONZERO",
+        ),
+        (
+            "wrong-nonce-missing-final-exit",
+            "S11_MARKER_DELIVERY_NONCE_MISMATCH",
+            "S11_OMIT_EXIT_EVENT",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.write_external_provider();
+        fixture.remove_turn_script_fallback();
+        assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+        let owner_invocation_uuid = fixture.latest_invocation_uuid();
+        let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+        let failed = fixture.run_resume_with_env(
+            "continue owning workflow",
+            &[
+                ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+                (mismatch_environment, "1"),
+                ("S11_NO_ASSISTANT_RESULT", "1"),
+                (failure_environment, "1"),
+            ],
+        );
+        assert_ne!(failed.status.code(), Some(0), "{label}: {failed:?}");
+        let result = result_envelope(&failed);
+        assert_eq!(result["status"], "failed", "{label}");
+        assert_ne!(
+            result["terminal_reason"], "resume_prompt_accepted_provider_failed",
+            "{label}: mismatched correlation must not select the trusted terminal path"
+        );
+        let pending = fixture.mailbox_row(notification.seq);
+        assert!(pending.delivered_at.is_none(), "{label}: {pending:?}");
+        assert_eq!(pending.delivery_attempts, 1, "{label}: {pending:?}");
+
+        assert_success(&fixture.run_resume_with_env(
+            "retry pending detached child",
+            &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
+        ));
+        let delivered = fixture.mailbox_row(notification.seq);
+        assert!(delivered.delivered_at.is_some(), "{label}: {delivered:?}");
+        assert_eq!(delivered.delivery_attempts, 2, "{label}: {delivered:?}");
+        let prompts = fixture.recorded_resume_prompts();
+        assert_eq!(prompts.len(), 2, "{label}: {prompts:#?}");
+        assert!(
+            prompts
+                .iter()
+                .all(|prompt| prompt.contains("age291-detached-child")),
+            "{label}: mismatched acceptance must retain the exact delivery for replay: \
+             {prompts:#?}"
+        );
+        fixture.assert_xdg_isolated();
+    }
+}
+
+#[test]
 fn trusted_prompt_acceptance_survives_mailbox_projection_failure_without_replay() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
@@ -1132,8 +1203,12 @@ def prompt_acceptance_marker_event(request, seq, session_id, prompt):
         "source": "s11.fixture",
         "message_id": "msg-s11-prompt-accepted",
     }
+    if os.environ.get("S11_MARKER_SESSION_MISMATCH") == "1":
+        value["provider_session_id"] = "ses_s11-wrong-session"
     if acceptance.get("delivery_nonce"):
         value["delivery_nonce"] = acceptance["delivery_nonce"]
+    if os.environ.get("S11_MARKER_DELIVERY_NONCE_MISMATCH") == "1":
+        value["delivery_nonce"] = "s11-wrong-delivery-nonce"
     return {
         "contract": CONTRACT,
         "request_id": request_id(request),

@@ -631,16 +631,36 @@ mod tests {
         let observation = observe_system_memory()
             .unwrap()
             .expect("supported platforms must provide memory observation");
-        let independent_total = independently_observed_total_memory_bytes().unwrap();
+        let independent = independently_observed_memory().unwrap();
         assert!(
-            independent_total >= DEFAULT_MEMORY_RESERVE_BYTES.saturating_mul(2),
-            "native test host must independently report at least 1 GiB: {independent_total}"
+            independent.total_bytes >= DEFAULT_MEMORY_RESERVE_BYTES.saturating_mul(2),
+            "native test host must independently report at least 1 GiB: {independent:?}"
         );
         assert!(
-            observation.total_bytes >= independent_total / 2
-                && observation.total_bytes <= independent_total,
+            observation.total_bytes >= independent.total_bytes / 2
+                && observation.total_bytes <= independent.total_bytes,
             "production total memory must agree with the independent host reading: \
-             production={observation:?}, independent_total={independent_total}"
+             production={observation:?}, independent={independent:?}"
+        );
+        assert!(
+            observation.available_bytes < observation.total_bytes,
+            "a running native host must not report all physical memory as available: \
+             production={observation:?}"
+        );
+        let available_drift = observation
+            .available_bytes
+            .abs_diff(independent.available_bytes);
+        let available_tolerance =
+            DEFAULT_MEMORY_RESERVE_BYTES.max(independent.total_bytes.saturating_mul(5) / 100);
+        eprintln!(
+            "native memory discrimination: production={observation:?}, \
+             independent={independent:?}, available_tolerance={available_tolerance}"
+        );
+        assert!(
+            available_drift <= available_tolerance,
+            "production available memory must agree with an independent native reading: \
+             production={observation:?}, independent={independent:?}, \
+             tolerance={available_tolerance}"
         );
         let default_reserve = DEFAULT_MEMORY_RESERVE_BYTES.max(
             observation
@@ -678,52 +698,129 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn independently_observed_total_memory_bytes() -> Result<u64, String> {
-        let mut info = unsafe { std::mem::zeroed::<libc::sysinfo>() };
-        if unsafe { libc::sysinfo(&mut info) } != 0 {
-            return Err(format!(
-                "Failed independent Linux sysinfo observation: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        u64::from(info.mem_unit)
-            .checked_mul(info.totalram)
-            .ok_or_else(|| "Independent Linux total memory overflowed".to_string())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn independently_observed_total_memory_bytes() -> Result<u64, String> {
-        let output = std::process::Command::new("/usr/sbin/sysctl")
-            .args(["-n", "hw.memsize"])
+    fn independently_observed_memory() -> Result<MemoryObservation, String> {
+        let output = std::process::Command::new("free")
+            .args(["--bytes", "--wide"])
             .output()
-            .map_err(|error| format!("Failed independent macOS sysctl observation: {error}"))?;
+            .map_err(|error| format!("Failed independent Linux free observation: {error}"))?;
         if !output.status.success() {
             return Err(format!(
-                "Independent macOS sysctl observation failed: {}",
+                "Independent Linux free observation failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        String::from_utf8(output.stdout)
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|error| format!("Independent Linux memory output was not UTF-8: {error}"))?;
+        let mut lines = stdout.lines();
+        let columns = lines
+            .next()
+            .ok_or_else(|| "Independent Linux memory output omitted columns".to_string())?
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let values = lines
+            .find_map(|line| line.strip_prefix("Mem:"))
+            .ok_or_else(|| "Independent Linux memory output omitted Mem row".to_string())?
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let field = |name: &str| -> Result<u64, String> {
+            let index = columns
+                .iter()
+                .position(|column| *column == name)
+                .ok_or_else(|| format!("Independent Linux memory output omitted {name}"))?;
+            values
+                .get(index)
+                .ok_or_else(|| format!("Independent Linux memory row omitted {name}"))?
+                .parse::<u64>()
+                .map_err(|error| format!("Invalid independent Linux {name}: {error}"))
+        };
+        memory_observation(field("available")?, field("total")?)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn independently_observed_memory() -> Result<MemoryObservation, String> {
+        let total_output = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .map_err(|error| format!("Failed independent macOS sysctl observation: {error}"))?;
+        if !total_output.status.success() {
+            return Err(format!(
+                "Independent macOS sysctl observation failed: {}",
+                String::from_utf8_lossy(&total_output.stderr)
+            ));
+        }
+        let total_bytes = String::from_utf8(total_output.stdout)
             .map_err(|error| format!("Independent macOS memory output was not UTF-8: {error}"))?
             .trim()
             .parse::<u64>()
-            .map_err(|error| format!("Invalid independent macOS total memory: {error}"))
+            .map_err(|error| format!("Invalid independent macOS total memory: {error}"))?;
+
+        let vm_output = std::process::Command::new("/usr/bin/vm_stat")
+            .output()
+            .map_err(|error| format!("Failed independent macOS vm_stat observation: {error}"))?;
+        if !vm_output.status.success() {
+            return Err(format!(
+                "Independent macOS vm_stat observation failed: {}",
+                String::from_utf8_lossy(&vm_output.stderr)
+            ));
+        }
+        let stdout = String::from_utf8(vm_output.stdout)
+            .map_err(|error| format!("Independent macOS vm_stat output was not UTF-8: {error}"))?;
+        let page_size = stdout
+            .lines()
+            .next()
+            .and_then(|line| line.split_once("page size of "))
+            .and_then(|(_, suffix)| suffix.split_once(" bytes"))
+            .map(|(value, _)| value)
+            .ok_or_else(|| "Independent macOS vm_stat omitted page size".to_string())?
+            .parse::<u64>()
+            .map_err(|error| format!("Invalid independent macOS page size: {error}"))?;
+        let pages = |name: &str| -> Result<u64, String> {
+            stdout
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    (key == name).then_some(value)
+                })
+                .ok_or_else(|| format!("Independent macOS vm_stat omitted {name}"))?
+                .trim()
+                .trim_end_matches('.')
+                .parse::<u64>()
+                .map_err(|error| format!("Invalid independent macOS {name}: {error}"))
+        };
+        let available_pages = pages("Pages active")?
+            .saturating_add(pages("Pages inactive")?)
+            .saturating_add(pages("Pages free")?)
+            .saturating_add(pages("Pages speculative")?);
+        memory_observation(available_pages.saturating_mul(page_size), total_bytes)
     }
 
     #[cfg(target_os = "windows")]
-    fn independently_observed_total_memory_bytes() -> Result<u64, String> {
-        use windows_sys::Win32::System::SystemInformation::GetPhysicallyInstalledSystemMemory;
+    fn independently_observed_memory() -> Result<MemoryObservation, String> {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetPerformanceInfo, PERFORMANCE_INFORMATION,
+        };
 
-        let mut total_kib = 0_u64;
-        if unsafe { GetPhysicallyInstalledSystemMemory(&mut total_kib) } == 0 {
+        let mut info = PERFORMANCE_INFORMATION {
+            cb: std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32,
+            ..PERFORMANCE_INFORMATION::default()
+        };
+        if unsafe { GetPerformanceInfo(&mut info, info.cb) } == 0 {
             return Err(format!(
                 "Failed independent Windows memory observation: {}",
                 std::io::Error::last_os_error()
             ));
         }
-        total_kib
-            .checked_mul(1024)
-            .ok_or_else(|| "Independent Windows total memory overflowed".to_string())
+        let page_size = u64::try_from(info.PageSize)
+            .map_err(|_| "Independent Windows page size overflowed".to_string())?;
+        let available_bytes = u64::try_from(info.PhysicalAvailable)
+            .ok()
+            .and_then(|pages| pages.checked_mul(page_size))
+            .ok_or_else(|| "Independent Windows available memory overflowed".to_string())?;
+        let total_bytes = u64::try_from(info.PhysicalTotal)
+            .ok()
+            .and_then(|pages| pages.checked_mul(page_size))
+            .ok_or_else(|| "Independent Windows total memory overflowed".to_string())?;
+        memory_observation(available_bytes, total_bytes)
     }
 
     #[test]

@@ -409,10 +409,19 @@ fi"#,
         )
         .unwrap();
 
-    let first = fixture.run_auto_wake_resume(claim_token, i64::MAX, 1);
+    let retry_started = std::time::Instant::now();
+    let first = fixture.run_auto_wake_resume(claim_token, i64::MAX, 30);
+    let retry_elapsed = retry_started.elapsed();
+    eprintln!("production maximum-chronology retry elapsed: {retry_elapsed:?}");
     assert!(
         first_failure.exists(),
         "maximum-count failure path was not reached"
+    );
+    assert!(
+        retry_elapsed >= std::time::Duration::from_secs(29)
+            && retry_elapsed <= std::time::Duration::from_secs(45),
+        "the production maximum-chronology retry must select the 30-second cadence ceiling: \
+         {retry_elapsed:?}"
     );
     assert!(
         !String::from_utf8_lossy(&first.stderr).contains("attempt to add with overflow"),
@@ -468,7 +477,7 @@ fi"#,
         "persistent-failure-${WU_D_PROVIDER_RESUME_INDEX}.txt",
     ));
     fixture.seed_session_turn();
-    fixture.seed_idle_runtime_with_wake_count(SESSION, i64::MAX);
+    fixture.seed_idle_runtime_with_wake_count(SESSION, 1);
     for index in 0..21 {
         fixture.seed_mailbox(SESSION, &format!("h-persistent-failure-{index:02}"));
     }
@@ -478,11 +487,11 @@ fi"#,
         .sidecar_conn()
         .execute(
             "UPDATE session_wake_claim SET auto_wake_count = ?2 WHERE session_id = ?1",
-            rusqlite::params![SESSION, i64::MAX],
+            rusqlite::params![SESSION, 1],
         )
         .unwrap();
 
-    let first = fixture.run_auto_wake_resume(claim_token, i64::MAX, 1);
+    let first = fixture.run_auto_wake_resume(claim_token, 1, 1_000);
     assert_eq!(first.status.code(), Some(17), "{first:?}");
     wait_for_file(&fourth_started);
 
@@ -493,7 +502,7 @@ fi"#,
         .unwrap()
         .expect("three consecutive failures must retain one claim for a fourth attempt");
     assert_ne!(retained_claim.claim_token, claim_token);
-    assert_eq!(retained_claim.auto_wake_count, i64::MAX);
+    assert_eq!(retained_claim.auto_wake_count, 4);
     assert!(retained_claim.wake_pid.is_some());
     let pending = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
     assert!(pending[..20].iter().all(|row| {
@@ -540,11 +549,17 @@ fi"#,
         attempts.iter().map(|entry| entry.0).collect::<Vec<_>>(),
         [1, 2, 3, 4, 5]
     );
-    for pair in attempts[..4].windows(2) {
-        let elapsed_ms = (pair[1].1 - pair[0].1) / 1_000_000;
+    let retry_intervals_ms = attempts[..4]
+        .windows(2)
+        .map(|pair| (pair[1].1 - pair[0].1) / 1_000_000)
+        .collect::<Vec<_>>();
+    eprintln!("production exponential retry intervals (ms): {retry_intervals_ms:?}");
+    for (elapsed_ms, expected_ms) in retry_intervals_ms.iter().zip([1_000_u128, 2_000, 4_000]) {
         assert!(
-            (900..=10_000).contains(&elapsed_ms),
-            "maximum chronology retry escaped its bounded cadence: {attempts:?}"
+            (*elapsed_ms >= expected_ms.saturating_sub(100))
+                && *elapsed_ms <= expected_ms.saturating_add(3_000),
+            "production retry did not follow the selected exponential cadence: \
+             expected_ms={expected_ms}, intervals={retry_intervals_ms:?}"
         );
     }
     assert_xdg_isolated(&fixture);
