@@ -24,9 +24,10 @@ use crate::provider_registry::DescribeHostOptions;
 use oulipoly_config::PromptMode;
 use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_provider::generated::{
-    BytePayload, CONTRACT_VERSION, HostContext, JsonObject, LAUNCH_OUTPUT_V1,
-    LaunchOutputRequestV1, LaunchParams, LaunchRequest, PROMPT_ACCEPTANCE_V1, PolicyEvaluateParams,
-    PolicyEvaluateRequest, PromptAcceptanceRequestV1, ProviderModelRequest,
+    BytePayload, CONTRACT_VERSION, HOST_LAUNCH_OUTPUT_V1_ENV, HOST_LAUNCH_OUTPUT_V1_ENV_VALUE,
+    HostContext, JsonObject, LAUNCH_OUTPUT_V1, LaunchOutputRequestV1, LaunchParams, LaunchRequest,
+    PROMPT_ACCEPTANCE_V1, PolicyEvaluateParams, PolicyEvaluateRequest, PromptAcceptanceRequestV1,
+    ProviderModelRequest,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -194,7 +195,11 @@ pub(crate) fn build_launch_request(
         contract: CONTRACT_VERSION.to_string(),
         request_id: request_id("launch"),
         provider_instance_id: Some(context.provider.name.clone()),
-        host: host_context(host_options, &candidate.working_directory),
+        host: launch_host_context(
+            host_options,
+            &candidate.working_directory,
+            include_launch_output_v1,
+        ),
         params: LaunchParams {
             settings_id: context.settings_id.clone(),
             mode: mode(context),
@@ -353,6 +358,21 @@ fn host_context(host_options: &DescribeHostOptions, working_directory: &str) -> 
         env: BTreeMap::new(),
         deadline_unix_ms: None,
     }
+}
+
+fn launch_host_context(
+    host_options: &DescribeHostOptions,
+    working_directory: &str,
+    include_launch_output_v1: bool,
+) -> HostContext {
+    let mut host = host_context(host_options, working_directory);
+    if include_launch_output_v1 {
+        host.env.insert(
+            HOST_LAUNCH_OUTPUT_V1_ENV.to_string(),
+            HOST_LAUNCH_OUTPUT_V1_ENV_VALUE.to_string(),
+        );
+    }
+    host
 }
 
 fn provider_model_request(

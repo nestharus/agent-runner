@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use super::{execution, lifecycle, terminal, wake};
+use super::{execution, formatter, lifecycle, terminal, wake};
 use crate::migration_providers::ResumeExecutionEnvironment;
 use crate::run::reservation::ReservedRun;
 use crate::wiring;
@@ -263,7 +263,8 @@ fn run_resume_attempt(
         strategy,
     ) {
         Ok(result) => result,
-        Err(_spawn_err) => {
+        Err(spawn_err) => {
+            formatter::emit_resume_spawn_error(&spawn_err);
             wake::record_failed_mailbox_delivery_attempt(&input, "resume_spawn_error")?;
             lifecycle::finalize_resume_spawn_error(&input, &mut bound_attempt.attempt)?;
             return Ok(ResumeAttemptLoopControl::Return(1));

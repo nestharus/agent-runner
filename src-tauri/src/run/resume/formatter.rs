@@ -104,6 +104,10 @@ pub(super) fn emit_migration_service_failure(error: impl Display) {
     eprintln!("migration service failed: {error}");
 }
 
+pub(super) fn emit_resume_spawn_error(error: impl Display) {
+    eprintln!("resume launch failed: {error}");
+}
+
 pub(super) fn emit_finalize_invocation_warning(error: impl Display) {
     eprintln!("Warning: Failed to finalize invocation: {error}");
 }

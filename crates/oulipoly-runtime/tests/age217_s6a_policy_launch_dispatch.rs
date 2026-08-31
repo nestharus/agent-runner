@@ -1291,6 +1291,7 @@ fn external_provider_launch_request_carries_selected_settings_id_and_effective_i
         launch["params"]["output_delivery"]["protocol"],
         "oulipoly.launch_output/v1"
     );
+    assert_eq!(launch["host"]["env"]["OULIPOLY_HOST_LAUNCH_OUTPUT_V1"], "1");
 }
 
 fn explicit_working_dir(fixture: &ExternalFixture) -> PathBuf {

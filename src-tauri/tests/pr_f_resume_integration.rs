@@ -1776,7 +1776,11 @@ flag = "--resume"
         .unwrap();
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("resume launch failed:"), "{stderr}");
+    assert!(stderr.contains("Failed to spawn"), "{stderr}");
+    assert!(stderr.contains("No such file or directory"), "{stderr}");
+    let invocation = parse_invocation(&stderr);
     let row = fixture
         .open_db()
         .get_invocation_by_uuid(&invocation.id)
