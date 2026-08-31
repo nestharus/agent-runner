@@ -1,7 +1,7 @@
 //! Declared roles: accessor, predicate, validator, parser, mapper, formatter, orchestration.
 
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ProvidersConfig,
     provider_implementation_ref::{ProviderImplementationRef, ProviderImplementationRefError},
 };
 use oulipoly_provider::generated::{
@@ -766,6 +766,68 @@ fn binary_ref_resolves_from_process_path_entries() {
         .expect("binary provider should resolve through PATH-derived entries");
     assert_eq!(result.provider_id, "path-provider");
     assert_eq!(read_count(&count), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn account_path_authority_ignores_unsafe_command_inference_without_weakening_resolver() {
+    use std::collections::HashMap;
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path_root = temp.path().join("path-root");
+    fs::create_dir(&path_root).unwrap();
+    let count = temp.path().join("account-path-count");
+    let provider = write_fake_provider_script(
+        temp.path(),
+        "outside-provider",
+        &count,
+        Ok("account-provider"),
+    );
+    symlink(&provider, path_root.join("agent-runner-opencode")).unwrap();
+
+    let account_model = ModelConfig {
+        name: "opencode-model".to_string(),
+        prompt_mode: PromptMode::Arg,
+        providers: vec![ProviderConfig::model_provider("opencode5", Vec::new())],
+        inputs: Vec::new(),
+        provider: Some(binary_ref("agent-runner-opencode")),
+    };
+    let providers = ProvidersConfig {
+        entries: HashMap::from([(
+            "opencode5".to_string(),
+            ProviderEntry {
+                implementation: Some(path_ref(provider.display().to_string())),
+                command: Some("opencode5".to_string()),
+                ..Default::default()
+            },
+        )]),
+    };
+    let options = ProviderRegistryOptions::default().with_path_entries([path_root.clone()]);
+
+    let registry = ProviderRegistry::from_model_configs_with_provider_config(
+        std::slice::from_ref(&account_model),
+        &providers,
+        options.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        registry.artifact_key_for_model_provider("opencode-model", "opencode5"),
+        Some(format!("path:{}", provider.display()))
+    );
+    assert_eq!(
+        registry
+            .describe_model_provider_instance("opencode-model", "opencode5")
+            .unwrap()
+            .provider_id,
+        "account-provider"
+    );
+
+    let unsafe_error = registry_from_single_ref(binary_ref("agent-runner-opencode"), options)
+        .describe_model_provider("example-model")
+        .expect_err("the escaping PATH symlink must remain unsafe for binary authority");
+    assert_transport_kind(unsafe_error, "unsafe_binary");
 }
 
 #[test]

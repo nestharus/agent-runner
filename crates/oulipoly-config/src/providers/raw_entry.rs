@@ -21,12 +21,15 @@
 use crate::model::{
     ResumeAcceptanceRules, ResumeStrategy, SessionCapture, SessionStorage, ToolRestrictions,
 };
+use crate::provider_implementation_ref::ProviderImplementationRef;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 pub(crate) type RawProvidersToml = HashMap<String, RawEntry>;
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct RawEntry {
+    #[serde(default)]
+    pub(crate) implementation: Option<ProviderImplementationRef>,
     #[serde(default)]
     pub(crate) quota_script: Option<String>,
     #[serde(default)]

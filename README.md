@@ -1103,6 +1103,21 @@ To implement a provider, begin with the [`Provider Contract Crate (oulipoly-prov
 
 > **Parse-only in this release:** Dynamic loading and runtime dispatch are not implemented in this release; the `provider = { ... }` field is recorded by the parser but has no effect on routing or execution.
 
+### Required Complete Launch Output
+
+Current runner hosts always select `OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1` when
+describing a provider for launch dispatch. The provider must then advertise
+`capabilities.launch_output_v1: true` and implement the
+`oulipoly.launch_output/v1` stream. A missing or false capability is an
+incompatible provider version: the runner returns
+`complete_launch_output_unsupported` before policy evaluation or launch, and
+the provider must be upgraded. There is no legacy launch-output fallback.
+
+The provider protocol remains additive at the JSON parsing boundary, but that
+does not make every older provider launch-compatible with a newer host. The
+host may require a selected extension before dispatch when that extension is
+necessary to preserve execution correctness.
+
 ### Prompt Acceptance Attestation
 
 External provider binaries advertise `capabilities.prompt_acceptance_v1: true` only when they implement the `oulipoly.prompt_acceptance/v1` launch extension and the describe request explicitly selects it with `host.env.OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1=1`. The provider crate exposes `host_requested_prompt_acceptance_v1` for this check. A provider must omit the capability property for a host that does not select it, preserving the closed legacy `oulipoly.provider/v1` describe shape for older hosts; older providers can ignore the already-open host environment map and return their existing shape to a new host. For an advertised provider, the host adds `params.prompt_acceptance` with the protocol id, the SHA-256 of the exact launch prompt, and the mailbox delivery nonce when that prompt contains one. This contract data lets the provider correlate delivery without parsing an application-local prompt envelope. If provider policy changes the `argv`, `stdin`, or canonical `prompt` bytes, the host omits the extension for that launch and ignores any acceptance marker; byte-identical policy results retain eligibility.

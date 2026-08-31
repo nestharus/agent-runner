@@ -13,7 +13,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::executor::cli::InteractiveLiveSessionBinding;
-use crate::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
+use crate::provider_registry::{
+    PinnedProviderEndpoint, ProviderRegistry, ProviderRegistryOptions,
+};
 use crate::services::{
     LauncherServiceOutput, LauncherServicePort, LauncherServiceRequest, ServiceError,
 };
@@ -193,6 +195,18 @@ where
         .ok_or_else(|| format!("selected provider index {provider_index} is out of bounds"))?;
     let (provider, _prompt_mode) = providers.runtime_provider(member_name)?;
     let selected_provider_name = provider.name.clone();
+    let provider_endpoint = provider_registry
+        .preflight_model_provider_instance(&carrier_model.name, &selected_provider_name)
+        .map_err(|error| {
+            format!(
+                "provider account {selected_provider_name} implementation preflight failed: {error}"
+            )
+        })?;
+    if !provider_endpoint.capabilities().capabilities.session {
+        return Err(format!(
+            "provider account {selected_provider_name} implementation preflight failed: provider describe did not advertise session capability"
+        ));
+    }
     let launch_provider = ProviderConfig {
         name: carrier_model.name.clone(),
         ..provider
@@ -207,6 +221,7 @@ where
             provider_index,
             carrier_model: &carrier_model,
             provider_registry,
+            provider_endpoint,
             state_db_path: state_db_path.as_deref(),
             launch_provider: &launch_provider,
             launcher,
@@ -223,6 +238,7 @@ struct RegisteredDefaultProviderReplInput<'a, O: StateDbOpener> {
     provider_index: usize,
     carrier_model: &'a ModelConfig,
     provider_registry: Arc<ProviderRegistry>,
+    provider_endpoint: Arc<PinnedProviderEndpoint>,
     state_db_path: Option<&'a Path>,
     launch_provider: &'a ProviderConfig,
     launcher: &'a dyn InteractiveLauncher,
@@ -329,6 +345,7 @@ fn default_provider_live_session_binding<O: StateDbOpener>(
     let state_db_path = input.state_db_path?;
     Some(InteractiveLiveSessionBinding {
         registry: Arc::clone(&input.provider_registry),
+        endpoint: Arc::clone(&input.provider_endpoint),
         identity: SessionProviderIdentity {
             model_name: input.carrier_model.name.clone(),
             provider_name: input.provider_name.to_string(),
@@ -602,9 +619,10 @@ mod tests {
     use crate::services::{LauncherServicePort, LauncherServiceRequest};
     use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
     use rusqlite::Connection;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::OnceLock;
 
     fn runtime_services(config_root: PathBuf) -> RuntimeServices {
         RuntimeServices {
@@ -645,12 +663,75 @@ mod tests {
     }
 
     fn provider_fixture(name: &str) -> String {
+        let implementation = repl_test_provider_path()
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
         format!(
             r#"[{name}]
 command = "printf"
 interactive_args = ["ok"]
+
+[{name}.implementation]
+path = "{implementation}"
 "#
         )
+    }
+
+    fn repl_test_provider_path() -> &'static Path {
+        static PROVIDER: OnceLock<PathBuf> = OnceLock::new();
+        PROVIDER
+            .get_or_init(|| {
+                let dir = std::env::temp_dir().join(format!(
+                    "oulipoly-default-repl-provider-{}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let path = dir.join("provider.py");
+                std::fs::write(
+                    &path,
+                    r#"#!/usr/bin/env python3
+import json
+import sys
+
+request = json.load(sys.stdin)
+print(json.dumps({
+    "contract": request["contract"],
+    "request_id": request["request_id"],
+    "ok": True,
+    "result": {
+        "provider_id": "default-repl-test",
+        "display_name": "Default REPL Test",
+        "contract_versions": ["oulipoly.provider/v1"],
+        "preferred_contract": "oulipoly.provider/v1",
+        "capabilities": {
+            "launch": False,
+            "policy": False,
+            "quota": False,
+            "session": True,
+            "session_enumerate": False,
+            "terminal": False,
+            "rotation": False,
+            "discovery": False,
+            "settings": False,
+            "setup_brain": False,
+            "setup": False,
+            "migration": False
+        }
+    }
+}))
+"#,
+                )
+                .unwrap();
+                #[cfg(unix)]
+                {
+                    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                    permissions.set_mode(0o755);
+                    std::fs::set_permissions(&path, permissions).unwrap();
+                }
+                path
+            })
+            .as_path()
     }
 
     fn load_providers(root: &Path, contents: &str) -> ProvidersConfig {
@@ -671,6 +752,11 @@ interactive_args = ["ok"]
         calls: RefCell<Vec<LauncherCall>>,
     }
 
+    struct PreflightAssertingLauncher {
+        marker: PathBuf,
+        launched: Cell<bool>,
+    }
+
     impl InteractiveLauncher for RecordingLauncher {
         fn launch(
             &self,
@@ -687,6 +773,25 @@ interactive_args = ["ok"]
                 provider.environment.clone(),
                 provider.unset_environment.clone(),
             ));
+            Ok(successful_interactive_result())
+        }
+    }
+
+    impl InteractiveLauncher for PreflightAssertingLauncher {
+        fn launch(
+            &self,
+            _provider: &ProviderConfig,
+            _working_dir: Option<&Path>,
+            _parent_invocation_env: Option<&str>,
+            _state_db_path: Option<&Path>,
+            _live_session_binding: Option<InteractiveLiveSessionBinding>,
+        ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
+            assert_eq!(
+                std::fs::read_to_string(&self.marker).unwrap(),
+                "described",
+                "provider describe preflight must complete before native launch"
+            );
+            self.launched.set(true);
             Ok(successful_interactive_result())
         }
     }
@@ -805,6 +910,55 @@ interactive_args = ["ok"]
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
         (dir, path)
+    }
+
+    #[cfg(unix)]
+    fn preflight_provider_script(dir: &Path, marker: &Path) -> PathBuf {
+        let path = dir.join("preflight-provider.py");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+request = json.load(sys.stdin)
+pathlib.Path({marker:?}).write_text("described")
+print(json.dumps({{
+    "contract": request["contract"],
+    "request_id": request["request_id"],
+    "ok": True,
+    "result": {{
+        "provider_id": "preflight-test",
+        "display_name": "Preflight Test",
+        "contract_versions": ["oulipoly.provider/v1"],
+        "preferred_contract": "oulipoly.provider/v1",
+        "capabilities": {{
+            "launch": False,
+            "policy": False,
+            "quota": False,
+            "session": True,
+            "session_enumerate": False,
+            "terminal": False,
+            "rotation": False,
+            "discovery": False,
+            "settings": False,
+            "setup_brain": False,
+            "setup": False,
+            "migration": False
+        }}
+    }}
+}}))
+"#,
+                marker = marker.display().to_string()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
     }
 
     #[cfg(unix)]
@@ -1107,6 +1261,69 @@ interactive_args = ["ok"]
     }
 
     #[test]
+    fn missing_account_implementation_prevents_default_provider_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        StateDb::open(&state_path).unwrap();
+        write_config(temp.path(), r#"default_provider = "fixture""#);
+        write_providers(
+            temp.path(),
+            r#"[fixture]
+command = "printf"
+interactive_args = ["ok"]
+"#,
+        );
+        let launcher = RecordingLauncher::default();
+
+        let error = run_repl_with_default_provider_with_launcher(
+            runtime_services_with_state(temp.path().to_path_buf(), state_path),
+            &launcher,
+        )
+        .expect_err("missing account implementation must fail before launch");
+
+        assert!(error.contains("provider account fixture implementation preflight failed"));
+        assert!(error.contains("<provider-family:fixture>/fixture"));
+        assert!(launcher.calls.borrow().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_account_implementation_is_preflighted_before_native_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        let marker = temp.path().join("describe.marker");
+        StateDb::open(&state_path).unwrap();
+        let implementation = preflight_provider_script(temp.path(), &marker);
+        write_config(temp.path(), r#"default_provider = "fixture""#);
+        write_providers(
+            temp.path(),
+            &format!(
+                r#"[fixture]
+command = "printf"
+interactive_args = ["ok"]
+
+[fixture.implementation]
+path = "{}"
+"#,
+                toml_path(&implementation)
+            ),
+        );
+        let launcher = PreflightAssertingLauncher {
+            marker,
+            launched: Cell::new(false),
+        };
+
+        let code = run_repl_with_default_provider_with_launcher(
+            runtime_services_with_state(temp.path().to_path_buf(), state_path),
+            &launcher,
+        )
+        .expect("valid account implementation should launch after preflight");
+
+        assert_eq!(code, 0);
+        assert!(launcher.launched.get());
+    }
+
+    #[test]
     fn preserves_selected_provider_environment_for_interactive_launch() {
         let temp = tempfile::tempdir().unwrap();
         let state_path = temp.path().join("state.db");
@@ -1114,12 +1331,18 @@ interactive_args = ["ok"]
         write_config(temp.path(), r#"default_provider = "opencode""#);
         write_providers(
             temp.path(),
-            r#"[opencode]
+            &format!(
+                r#"[opencode]
 command = "printf"
 interactive_args = ["ok"]
-environment = { XDG_DATA_HOME = "/tmp/opencode-profile" }
+environment = {{ XDG_DATA_HOME = "/tmp/opencode-profile" }}
 unset_environment = ["OPENAI_API_KEY"]
+
+[opencode.implementation]
+path = "{}"
 "#,
+                repl_test_provider_path().display()
+            ),
         );
         let launcher = RecordingLauncher::default();
 

@@ -9,8 +9,8 @@
 //! predicates, assertion validators, and test orchestration.
 
 use oulipoly_config::{
-    InputDef, InputType, ModelConfig, PromptMode, ProviderConfig,
-    provider_implementation_ref::ProviderImplementationRef,
+    provider_implementation_ref::ProviderImplementationRef, InputDef, InputType, ModelConfig,
+    PromptMode, ProviderConfig,
 };
 use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_runtime::executor;
@@ -568,6 +568,20 @@ fn enable_prompt_acceptance_capability(fixture: &ExternalFixture) {
     write_executable(&fixture.provider_path, &body);
 }
 
+fn disable_launch_output_capability(fixture: &ExternalFixture) {
+    let body = fs::read_to_string(&fixture.provider_path).expect("provider source");
+    let body = body.replacen(
+        "\"launch_output_v1\": True",
+        "\"launch_output_v1\": False",
+        1,
+    );
+    assert_ne!(
+        body,
+        fs::read_to_string(&fixture.provider_path).expect("provider source")
+    );
+    write_executable(&fixture.provider_path, &body);
+}
+
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
@@ -919,7 +933,11 @@ if __name__ == "__main__":
 }
 
 fn py_bool(value: bool) -> &'static str {
-    if value { "True" } else { "False" }
+    if value {
+        "True"
+    } else {
+        "False"
+    }
 }
 
 fn read_json(path: &Path) -> serde_json::Value {
@@ -1144,6 +1162,29 @@ fn external_provider_missing_policy_or_launch_capability_fails_without_builtin_f
         assert!(!fixture.legacy_record_path.exists());
         assert!(!fixture.launch_record_path.exists());
     }
+}
+
+#[test]
+fn external_provider_missing_launch_output_capability_requires_provider_upgrade() {
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    disable_launch_output_capability(&fixture);
+
+    let error = execute_external_fixture(&fixture)
+        .expect_err("launch_output_v1 is mandatory for external-provider dispatch");
+
+    assert!(error
+        .to_string()
+        .contains("complete_launch_output_unsupported"));
+    assert!(!fixture.policy_record_path.exists());
+    assert!(!fixture.launch_record_path.exists());
+    assert!(!fixture.legacy_record_path.exists());
 }
 
 #[test]
@@ -1683,10 +1724,8 @@ fn external_provider_launch_env_separates_completion_authority_from_parent_ident
             serde_json::from_str::<Value>(parent_identity).expect("parent identity"),
             serde_json::to_value(&invocation).expect("expected parent identity")
         );
-        assert!(
-            !parent_identity
-                .contains(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD)
-        );
+        assert!(!parent_identity
+            .contains(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD));
     }
     assert_eq!(
         launch_env[oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV],

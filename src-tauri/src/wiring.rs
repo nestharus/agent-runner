@@ -309,7 +309,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn registry_keeps_account_inferred_and_explicit_artifacts_without_spawning_on_build() {
+    fn registry_uses_account_artifact_instead_of_model_or_command_authority() {
         let dir = tempfile::tempdir().expect("tempdir");
         let count = dir.path().join("describe-count");
         let inferred = write_describe_provider(dir.path(), "agent-runner-fixture", &count);
@@ -331,6 +331,13 @@ mod tests {
             entries: HashMap::from([(
                 "account".to_string(),
                 ProviderEntry {
+                    implementation: Some(ProviderImplementationRef {
+                        path: Some(inferred.display().to_string()),
+                        crate_name: None,
+                        version: None,
+                        binary: None,
+                        script: None,
+                    }),
                     command: Some("fixture5".to_string()),
                     ..Default::default()
                 },
@@ -362,7 +369,7 @@ mod tests {
         assert_eq!(
             registry
                 .describe_model_provider_instance("account-model", "account")
-                .expect("inferred account artifact")
+                .expect("account-owned artifact")
                 .provider_id,
             "fixture-provider"
         );
@@ -370,13 +377,13 @@ mod tests {
         assert_eq!(
             registry
                 .describe_model_provider_instance("explicit-model", "account")
-                .expect("explicit model artifact")
+                .expect("account-owned artifact must override model authority")
                 .provider_id,
             "fixture-provider"
         );
-        assert_eq!(
-            fs::read_to_string(&explicit_count).expect("explicit count"),
-            "1"
+        assert!(
+            !explicit_count.exists(),
+            "model implementation must not be invoked by production registry wiring"
         );
     }
 

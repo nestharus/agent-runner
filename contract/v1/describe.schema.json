@@ -29,7 +29,7 @@
         },
         "launch_output_v1": {
           "type": "boolean",
-          "description": "Advertises complete, duration-independent oulipoly.launch_output/v1 custody. A provider must omit this property unless selected with host.env.OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1."
+          "description": "Advertises complete, duration-independent oulipoly.launch_output/v1 custody. A provider must omit this property unless selected with host.env.OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1. Current hosts select this extension for launch dispatch and reject the dispatch before policy evaluation or launch unless the provider advertises true; providers that omit it or advertise false must be upgraded."
         },
         "policy": { "type": "boolean" },
         "quota": { "type": "boolean" },

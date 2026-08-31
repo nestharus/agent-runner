@@ -317,6 +317,18 @@ mod tests {
             entries: HashMap::from([(
                 "account".to_string(),
                 ProviderEntry {
+                    implementation: Some(ProviderImplementationRef {
+                        path: Some(
+                            dir.path()
+                                .join("agent-runner-fixture")
+                                .display()
+                                .to_string(),
+                        ),
+                        crate_name: None,
+                        version: None,
+                        binary: None,
+                        script: None,
+                    }),
                     command: Some("fixture9".to_string()),
                     ..Default::default()
                 },
@@ -339,7 +351,7 @@ mod tests {
             handle
                 .current()
                 .describe_model_provider_instance("account-model", "account")
-                .expect("initial inferred artifact")
+                .expect("initial account artifact")
                 .provider_id,
             "fixture-provider"
         );
@@ -354,7 +366,7 @@ mod tests {
             handle
                 .current()
                 .describe_model_provider_instance("account-model", "account")
-                .expect("refreshed inferred artifact")
+                .expect("refreshed account artifact")
                 .provider_id,
             "fixture-provider"
         );

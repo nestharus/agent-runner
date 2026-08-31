@@ -4,12 +4,12 @@
 use super::spawn_identity::{
     RunningRuntimeGeneration, SpawnIdentityContext, backfill_captured_session_id,
 };
-use crate::provider_registry::ProviderRegistry;
+use crate::provider_registry::{PinnedProviderEndpoint, ProviderRegistry};
 #[cfg(unix)]
 use crate::services::emit_live_session_marker;
 use crate::session_provider::SessionProviderIdentity;
 #[cfg(unix)]
-use crate::session_provider::{SessionProviderLiveCaptureRequest, capture_live_report};
+use crate::session_provider::{SessionProviderLiveCaptureRequest, capture_live_report_with_client};
 #[cfg(unix)]
 use oulipoly_state::{InvocationStatus, ProviderSessionBinding, StateDb};
 #[cfg(unix)]
@@ -62,6 +62,7 @@ const WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 #[derive(Clone)]
 pub(crate) struct InteractiveLiveSessionBinding {
     pub registry: Arc<ProviderRegistry>,
+    pub endpoint: Arc<PinnedProviderEndpoint>,
     pub identity: SessionProviderIdentity,
     pub state_db_path: PathBuf,
     pub invocation_row_id: i64,
@@ -259,13 +260,16 @@ fn handle_live_session_report(
         .map_err(|err| format!("Failed to configure live-session report write timeout: {err}"))?;
     let report = read_report(stream)?;
     validate_report(&report, context, token)?;
-    let capture = capture_live_report(SessionProviderLiveCaptureRequest {
-        registry: context.registry.as_ref(),
-        identity: context.identity.clone(),
-        invocation_uuid: &context.invocation_uuid,
-        provider_session_id: &report.provider_session_id,
-        effective_cwd: context.effective_cwd.as_deref(),
-    })
+    let capture = capture_live_report_with_client(
+        context.endpoint.client(),
+        SessionProviderLiveCaptureRequest {
+            registry: context.registry.as_ref(),
+            identity: context.identity.clone(),
+            invocation_uuid: &context.invocation_uuid,
+            provider_session_id: &report.provider_session_id,
+            effective_cwd: context.effective_cwd.as_deref(),
+        },
+    )
     .map_err(|err| format!("Provider rejected live session report: {err}"))?;
     let captured = capture
         .provider_session_id
@@ -793,8 +797,12 @@ mod tests {
                 )
                 .unwrap(),
             );
+            let endpoint = registry
+                .preflight_model_provider_instance(MODEL_NAME, PROVIDER_NAME)
+                .unwrap();
             let context = InteractiveLiveSessionBinding {
                 registry,
+                endpoint,
                 identity: SessionProviderIdentity {
                     model_name: MODEL_NAME.to_string(),
                     provider_name: PROVIDER_NAME.to_string(),

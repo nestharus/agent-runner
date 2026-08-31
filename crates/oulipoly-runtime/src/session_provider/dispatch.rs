@@ -114,8 +114,15 @@ pub fn capture_live_report(
     request: SessionProviderLiveCaptureRequest<'_>,
 ) -> Result<SessionProviderCaptureResult, SessionProviderError> {
     let client = session_client(request.registry, &request.identity)?;
+    capture_live_report_with_client(&client, request)
+}
+
+pub(crate) fn capture_live_report_with_client(
+    client: &ProviderClient,
+    request: SessionProviderLiveCaptureRequest<'_>,
+) -> Result<SessionProviderCaptureResult, SessionProviderError> {
     capture_with_client(
-        &client,
+        client,
         &request.identity,
         request.effective_cwd,
         request.registry.host_options(),
