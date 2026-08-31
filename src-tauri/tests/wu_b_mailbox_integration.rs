@@ -1598,7 +1598,7 @@ fn resume_with_only_mailbox_sends_notification_prompt() {
 }
 
 #[test]
-fn resume_marks_delivered_after_exact_turn_confirmation() {
+fn resume_does_not_synchronously_confirm_from_a_legacy_turn_script() {
     let fixture = Fixture::new();
     let prompt_dump = fixture.dir.path().join("prompt.txt");
     fixture.write_confirming_resume_model("fixture-model", &prompt_dump, SESSION_A);
@@ -1609,20 +1609,22 @@ fn resume_marks_delivered_after_exact_turn_confirmation() {
     cmd.arg("--prompt").arg("continue");
     let output = fixture.run(cmd);
 
-    let invocation = assert_unconfirmed_resume(&output, SESSION_A);
+    assert_unconfirmed_resume(&output, SESSION_A);
     let rows = fixture.mailbox_rows(SESSION_A, true);
-    let delivered = rows
+    let pending = rows
         .iter()
         .find(|candidate| candidate.seq == row.seq)
         .unwrap();
-    assert!(delivered.delivered_at.is_some());
+    assert!(pending.delivered_at.is_none());
+    assert!(pending.delivered_by_invocation_uuid.is_none());
+    assert_eq!(pending.delivery_attempts, 1);
     assert_eq!(
-        delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(invocation.id.as_str())
+        pending.delivery_error.as_deref(),
+        Some("mailbox_delivery_unconfirmed")
     );
     assert!(
-        Path::new(delivered.payload_file_path.as_deref().unwrap()).exists(),
-        "confirmed delivery must not remove payload before governed cleanup"
+        Path::new(pending.payload_file_path.as_deref().unwrap()).exists(),
+        "pending delivery must retain its immutable payload"
     );
     let history = MailboxDb::open(&fixture.sidecar_path())
         .unwrap()
@@ -1664,7 +1666,7 @@ fn resume_fails_closed_when_immutable_payload_is_missing() {
 }
 
 #[test]
-fn resume_marks_delivered_from_exact_ingested_user_turn_without_assistant_delta() {
+fn legacy_turn_script_cannot_confirm_an_exact_user_turn_synchronously() {
     let fixture = Fixture::new();
     let prompt_dump = fixture.dir.path().join("prompt.txt");
     let turns = fixture.dir.path().join("turns.jsonl");
@@ -1689,18 +1691,20 @@ fn resume_marks_delivered_from_exact_ingested_user_turn_without_assistant_delta(
     cmd.arg("--prompt").arg("continue");
     let output = fixture.run(cmd);
 
-    let invocation = assert_unconfirmed_resume(&output, SESSION_A);
+    assert_unconfirmed_resume(&output, SESSION_A);
     let prompt = fs::read_to_string(&prompt_dump).unwrap();
     assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
     let rows = fixture.mailbox_rows(SESSION_A, true);
-    let delivered = rows
+    let pending = rows
         .iter()
         .find(|candidate| candidate.seq == row.seq)
         .unwrap();
-    assert!(delivered.delivered_at.is_some());
+    assert!(pending.delivered_at.is_none());
+    assert!(pending.delivered_by_invocation_uuid.is_none());
+    assert_eq!(pending.delivery_attempts, 1);
     assert_eq!(
-        delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(invocation.id.as_str())
+        pending.delivery_error.as_deref(),
+        Some("mailbox_delivery_unconfirmed")
     );
     fixture.assert_default_user_paths_untouched();
 }
@@ -1900,9 +1904,11 @@ fn resume_drains_in_order_and_respects_batch_cap() {
     let all = fixture.mailbox_rows(SESSION_A, true);
     assert_eq!(
         all.iter().filter(|row| row.delivered_at.is_some()).count(),
-        20
+        0
     );
-    assert_eq!(fixture.mailbox_rows(SESSION_A, false)[0].handle, "h-21");
+    assert!(all[..20].iter().all(|row| row.delivery_attempts == 1));
+    assert_eq!(all[20].handle, "h-21");
+    assert_eq!(all[20].delivery_attempts, 0);
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -1922,7 +1928,10 @@ fn resume_uses_resolved_active_session_id() {
     let prompt = fs::read_to_string(&prompt_dump).unwrap();
     assert!(prompt.contains("handle: h-active"), "{prompt}");
     assert!(fixture.mailbox_rows(CHAIN_ID, false).is_empty());
-    assert!(fixture.mailbox_rows(SESSION_B, false).is_empty());
+    let pending = fixture.mailbox_rows(SESSION_B, false);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].handle, "h-active");
+    assert_eq!(pending[0].delivery_attempts, 1);
     fixture.assert_default_user_paths_untouched();
 }
 

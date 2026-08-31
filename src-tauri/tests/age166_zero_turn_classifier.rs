@@ -57,6 +57,7 @@ fn nonzero_result_without_typed_signal() -> ExecutionResult {
     ExecutionResult {
         stdout: Vec::new(),
         stderr: "ordinary provider failure".to_string(),
+        output_spool: None,
         exit_code: 1,
         provider_index: 0,
         session_capture: SessionCaptureResult {

@@ -738,6 +738,7 @@ mod tests {
         ExecutionResult {
             stdout: b"tool output".to_vec(),
             stderr: String::new(),
+            output_spool: None,
             exit_code: 0,
             provider_index: 0,
             session_capture: SessionCaptureResult {

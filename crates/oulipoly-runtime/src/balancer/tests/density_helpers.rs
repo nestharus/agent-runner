@@ -29,6 +29,7 @@ fn fanout_usage_key_derives_reset_when_projected_usage_is_nonfinite() {
             },
         ],
         binding_score: Some(1.0),
+        turn_count_fresh: true,
         recent_error_count: 0,
     };
 

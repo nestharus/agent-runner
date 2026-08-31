@@ -142,6 +142,12 @@ const SESSION_TURNS_PAYLOAD: &[&str] = &[
     "source_file",
     "ingested_at",
     "body",
+    "ingest_digest",
+    "body_state",
+    "body_sha256",
+    "body_bytes",
+    "canonical_text_sha256",
+    "canonical_text_digest_verified",
 ];
 /// Payload columns from PRAGMA order: started_at, ended_at, outcome, turn_count.
 const SETUP_SESSIONS_PAYLOAD: &[&str] = &["started_at", "ended_at", "outcome", "turn_count"];

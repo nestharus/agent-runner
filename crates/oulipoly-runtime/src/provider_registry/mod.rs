@@ -72,7 +72,12 @@ impl ProviderRegistry {
         models: &[ModelConfig],
         options: ProviderRegistryOptions,
     ) -> Result<Self, ProviderRegistryError> {
-        let inventory = artifact_inventory(configured_provider_refs(models))?;
+        let mut inventory = artifact_inventory(configured_provider_refs(models))?;
+        for model in models {
+            if let Some(model_key) = inventory.model_artifacts.get(&model.name).cloned() {
+                add_model_provider_artifact_keys(&mut inventory, model, model_key);
+            }
+        }
         Ok(Self::from_inventory(inventory, options))
     }
 
@@ -151,6 +156,10 @@ impl ProviderRegistry {
             return Some(model_name.to_string());
         }
 
+        self.resolve_model_name_for_provider(provider_name)
+    }
+
+    pub fn resolve_model_name_for_provider(&self, provider_name: &str) -> Option<String> {
         let mut candidates = self
             .model_provider_artifacts
             .iter()

@@ -39,7 +39,9 @@ use super::terminal_cancel_mapper::{map_terminal_cancel_outcome, process_exit_co
 use crate::executor::assistant_response::launch_result_produced_assistant_response;
 use crate::executor::cli::terminal_exit_code_from_signal;
 use crate::executor::terminal_signal::{TerminalSignal, TerminalSignalKind};
-use crate::executor::{ExecutionResult, SessionCaptureMethod, SessionCaptureResult};
+use crate::executor::{
+    ExecutionOutputSpool, ExecutionResult, SessionCaptureMethod, SessionCaptureResult,
+};
 use crate::services::TerminalClassification;
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
@@ -57,6 +59,7 @@ pub(crate) fn map_launch_result_with_terminal_classification(
     provider_name: &str,
     classification: Option<TerminalClassification>,
     retain_prompt_acceptance_attestation_v1: bool,
+    output_spool: ExecutionOutputSpool,
 ) -> ExecutionResult {
     let stdout = result.stdout_bytes();
     let stderr = String::from_utf8_lossy(&result.stderr_bytes()).into_owned();
@@ -74,6 +77,7 @@ pub(crate) fn map_launch_result_with_terminal_classification(
     ExecutionResult {
         stdout,
         stderr,
+        output_spool: Some(output_spool),
         exit_code: terminal.exit_code,
         provider_index,
         session_capture: launch_session_capture(&result),
@@ -141,6 +145,7 @@ pub(crate) fn map_missing_final_exit_with_prompt_acceptance(
     Some(ExecutionResult {
         stdout: Vec::new(),
         stderr,
+        output_spool: None,
         exit_code,
         provider_index,
         session_capture: SessionCaptureResult {

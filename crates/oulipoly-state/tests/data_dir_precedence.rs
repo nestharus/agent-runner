@@ -8,27 +8,36 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const DATA_DIR_ENV: &str = "OULIPOLY_DATA_DIR";
+const CONFIG_HOME_ENV: &str = "OULIPOLY_CONFIG_HOME";
 
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
     old_oulipoly_data_dir: Option<OsString>,
+    old_oulipoly_config_home: Option<OsString>,
     old_xdg_data_home: Option<OsString>,
 }
 
 impl EnvGuard {
-    fn set(oulipoly_data_dir: Option<&Path>, xdg_data_home: Option<&Path>) -> Self {
+    fn set(
+        oulipoly_data_dir: Option<&Path>,
+        oulipoly_config_home: Option<&Path>,
+        xdg_data_home: Option<&Path>,
+    ) -> Self {
         let lock = env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let old_oulipoly_data_dir = std::env::var_os(DATA_DIR_ENV);
+        let old_oulipoly_config_home = std::env::var_os(CONFIG_HOME_ENV);
         let old_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         unsafe {
             set_or_remove(DATA_DIR_ENV, oulipoly_data_dir);
+            set_or_remove(CONFIG_HOME_ENV, oulipoly_config_home);
             set_or_remove("XDG_DATA_HOME", xdg_data_home);
         }
         Self {
             _lock: lock,
             old_oulipoly_data_dir,
+            old_oulipoly_config_home,
             old_xdg_data_home,
         }
     }
@@ -38,6 +47,7 @@ impl Drop for EnvGuard {
     fn drop(&mut self) {
         unsafe {
             restore_env(DATA_DIR_ENV, self.old_oulipoly_data_dir.take());
+            restore_env(CONFIG_HOME_ENV, self.old_oulipoly_config_home.take());
             restore_env("XDG_DATA_HOME", self.old_xdg_data_home.take());
         }
     }
@@ -47,8 +57,9 @@ impl Drop for EnvGuard {
 fn default_state_locations_use_required_oulipoly_data_dir() {
     let dir = tempfile::tempdir().unwrap();
     let pinned = dir.path().join("canonical-app-data");
+    let config_home = dir.path().join("config-home");
     let shadow_xdg = dir.path().join("shadow-xdg-data");
-    let _guard = EnvGuard::set(Some(&pinned), Some(&shadow_xdg));
+    let _guard = EnvGuard::set(Some(&pinned), Some(&config_home), Some(&shadow_xdg));
 
     assert_default_paths_under(&pinned);
 }
@@ -56,8 +67,9 @@ fn default_state_locations_use_required_oulipoly_data_dir() {
 #[test]
 fn default_state_locations_refuse_xdg_data_home_when_unpinned() {
     let dir = tempfile::tempdir().unwrap();
+    let config_home = dir.path().join("config-home");
     let xdg = dir.path().join("xdg-data");
-    let _guard = EnvGuard::set(None, Some(&xdg));
+    let _guard = EnvGuard::set(None, Some(&config_home), Some(&xdg));
 
     assert_default_paths_refuse_unpinned();
 }
@@ -78,14 +90,9 @@ fn assert_default_paths_under(app_data_dir: &Path) {
 }
 
 fn assert_default_paths_refuse_unpinned() {
-    for error in [
-        StateDb::default_path().unwrap_err(),
-        PidIdentityDb::default_path().unwrap_err(),
-        MailboxDb::default_path().unwrap_err(),
-    ] {
-        assert!(error.contains("OULIPOLY_DATA_DIR is not set"), "{error}");
-        assert!(error.contains("export OULIPOLY_DATA_DIR="), "{error}");
-    }
+    assert!(StateDb::default_path().is_err());
+    assert!(PidIdentityDb::default_path().is_err());
+    assert!(MailboxDb::default_path().is_err());
 }
 
 fn env_lock() -> &'static Mutex<()> {

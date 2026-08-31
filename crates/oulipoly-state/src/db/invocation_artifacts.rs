@@ -29,6 +29,12 @@ use super::{InvocationStart, StateDb, lc_log_adapter};
 use crate::result_envelope::{ResultEnvelopeInput, result_envelope_payload};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvocationOutputArtifactPaths {
+    pub stdout: PathBuf,
+    pub stderr: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RawArtifactKind {
     Stdout,
@@ -55,6 +61,133 @@ impl StateDb {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."))
             .join("invocations")
+    }
+
+    pub fn invocation_output_artifact_paths(
+        &self,
+        invocation_uuid: &str,
+    ) -> Result<Option<InvocationOutputArtifactPaths>, String> {
+        if invocation_uuid.is_empty()
+            || invocation_uuid
+                .bytes()
+                .any(|byte| matches!(byte, b'/' | b'\\' | 0))
+        {
+            return Err("invalid invocation UUID for output artifact path".to_string());
+        }
+        let Some(invocations_dir) = self.invocations_dir() else {
+            return Ok(None);
+        };
+        let dir = invocations_dir.join("output");
+        Self::ensure_artifact_dir(&dir)?;
+        Ok(Some(InvocationOutputArtifactPaths {
+            stdout: dir.join(format!("{invocation_uuid}.stdout")),
+            stderr: dir.join(format!("{invocation_uuid}.stderr")),
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_invocation_output_pending(
+        &self,
+        invocation_id: i64,
+        invocation_uuid: &str,
+        paths: &InvocationOutputArtifactPaths,
+        stdout_bytes: u64,
+        stdout_sha256: &str,
+        stderr_bytes: u64,
+        stderr_sha256: &str,
+        data_event_count: u64,
+    ) -> Result<(), String> {
+        let now = Self::current_rfc3339_timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO invocation_output_deliveries (
+                    invocation_id, invocation_uuid, provider_outcome_state, delivery_state,
+                    stdout_path, stdout_bytes, stdout_sha256,
+                    stderr_path, stderr_bytes, stderr_sha256, data_event_count,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, 'pending', 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+                 ON CONFLICT(invocation_id) DO UPDATE SET
+                    invocation_uuid = excluded.invocation_uuid,
+                    stdout_path = excluded.stdout_path,
+                    stdout_bytes = excluded.stdout_bytes,
+                    stdout_sha256 = excluded.stdout_sha256,
+                    stderr_path = excluded.stderr_path,
+                    stderr_bytes = excluded.stderr_bytes,
+                    stderr_sha256 = excluded.stderr_sha256,
+                    data_event_count = excluded.data_event_count,
+                    updated_at = excluded.updated_at",
+                rusqlite::params![
+                    invocation_id,
+                    invocation_uuid,
+                    paths.stdout.to_string_lossy(),
+                    i64::try_from(stdout_bytes)
+                        .map_err(|_| "stdout byte count exceeds SQLite INTEGER".to_string())?,
+                    stdout_sha256,
+                    paths.stderr.to_string_lossy(),
+                    i64::try_from(stderr_bytes)
+                        .map_err(|_| "stderr byte count exceeds SQLite INTEGER".to_string())?,
+                    stderr_sha256,
+                    i64::try_from(data_event_count)
+                        .map_err(|_| "output event count exceeds SQLite INTEGER".to_string())?,
+                    now,
+                ],
+            )
+            .map_err(|error| format!("Failed to record pending invocation output: {error}"))?;
+        Ok(())
+    }
+
+    pub fn mark_invocation_output_delivered(&self, invocation_id: i64) -> Result<(), String> {
+        let now = Self::current_rfc3339_timestamp();
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE invocation_output_deliveries
+                 SET delivery_state = 'delivered', delivered_at = ?2, updated_at = ?2,
+                     delivery_failure_stage = NULL, delivery_failure_kind = NULL,
+                     delivery_failure_bytes = NULL
+                 WHERE invocation_id = ?1 AND provider_outcome_state = 'settled'",
+                rusqlite::params![invocation_id, now],
+            )
+            .map_err(|error| format!("Failed to mark invocation output delivered: {error}"))?;
+        if changed != 1 {
+            return Err(
+                "invocation output is missing or provider outcome is unsettled".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn mark_invocation_output_delivery_failed(
+        &self,
+        invocation_id: i64,
+        stage: &str,
+        kind: &str,
+        delivered_bytes: Option<u64>,
+    ) -> Result<(), String> {
+        let now = Self::current_rfc3339_timestamp();
+        let delivered_bytes = delivered_bytes
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| "delivered byte count exceeds SQLite INTEGER".to_string())?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE invocation_output_deliveries
+                 SET delivery_state = 'failed', delivery_failure_stage = ?2,
+                     delivery_failure_kind = ?3, delivery_failure_bytes = ?4,
+                     updated_at = ?5
+                 WHERE invocation_id = ?1 AND provider_outcome_state = 'settled'",
+                rusqlite::params![invocation_id, stage, kind, delivered_bytes, now],
+            )
+            .map_err(|error| {
+                format!("Failed to mark invocation output delivery failed: {error}")
+            })?;
+        if changed != 1 {
+            return Err(
+                "invocation output is missing or provider outcome is unsettled".to_string(),
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn write_invocation_artifact(

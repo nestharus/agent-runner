@@ -5,7 +5,7 @@
 //! TEST: proactive wake integration orchestration cases (wake-sweep backlog regressions).
 
 use crate::SESSION;
-use crate::fake_cli::provider_script;
+use crate::fake_provider::provider_script;
 use crate::fixtures::Fixture;
 use crate::liveness::{
     backlog_recovered_and_debris_retained, delivered_rows_without_pending_or_claim, wait_for_file,

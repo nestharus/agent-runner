@@ -72,7 +72,11 @@ fn cli_repairs_each_exact_missing_suffix_row_without_expired_owner_authority() {
     let changed_log = directory.path().join("changed-log");
     fs::write(&changed_log, b"different registration identity\n").unwrap();
     let changed_identity = first.run_repair_with_log(&data_dir, &changed_log);
-    assert_eq!(changed_identity.status.code(), Some(74));
+    assert_eq!(
+        changed_identity.status.code(),
+        Some(74),
+        "{changed_identity:?}"
+    );
     assert!(
         String::from_utf8_lossy(&changed_identity.stdout)
             .contains("requires an exact admitted replay")
@@ -220,6 +224,7 @@ impl CompletionFixture {
                 "--json",
             ])
             .env("OULIPOLY_DATA_DIR", data_dir)
+            .env("OULIPOLY_CONFIG_HOME", data_dir.join("config"))
             .env_remove("OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY")
             .output()
             .unwrap()

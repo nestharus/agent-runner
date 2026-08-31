@@ -1,11 +1,13 @@
 use crate::provider_registry::{ProviderRegistry, ProviderRegistryHandle};
 use crate::session_metadata::{SessionStorageType, TranscriptLookupMode};
 use chrono::{DateTime, Utc};
+use oulipoly_provider::client::CancellationToken;
 use oulipoly_provider::generated::Artifact;
 use oulipoly_state::StateDb;
 use serde_json::Value;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const S7A_NEUTRAL_SETTINGS_ID: &str = "s7a-neutral-settings";
 
@@ -38,11 +40,22 @@ pub struct SessionProviderLocatedTranscript {
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionProviderReadTurnsRequest<'a> {
+pub struct SessionProviderReadPageRequest<'a> {
     pub registry: &'a ProviderRegistry,
     pub identity: SessionProviderIdentity,
     pub session_id: &'a str,
     pub effective_cwd: Option<&'a Path>,
+    pub projection: SessionProviderTurnProjection,
+    pub expected_delivery_nonce: Option<&'a str>,
+    pub cursor: SessionProviderPageCursor,
+    pub expected_page_index: u64,
+    pub expected_turn_sequence: u64,
+    pub max_turns: u64,
+    pub max_response_bytes: u64,
+    pub max_source_bytes: u64,
+    pub max_inline_body_bytes: u64,
+    pub cancellation: &'a CancellationToken,
+    pub timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -85,23 +98,77 @@ pub struct SessionProviderLifecycleContext<'a> {
     pub start_bound_provider_session_id: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct SessionProviderReadTurnsResult {
-    pub turns: Vec<SessionProviderTurn>,
-    pub turn_count: u64,
-    pub complete: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionProviderTurnProjection {
+    CanonicalIngest,
+    UserObservation,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SessionProviderTurn {
+pub enum SessionProviderPageCursor {
+    Beginning {
+        after_token: Option<String>,
+    },
+    Tail,
+    Continuation {
+        snapshot_id: String,
+        page_token: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionProviderReadPageResult {
+    pub provider_instance_id: String,
+    pub settings_id: String,
+    pub session_id: String,
+    pub projection: SessionProviderTurnProjection,
+    pub snapshot_id: String,
+    pub page_index: u64,
+    pub page_start_sequence: u64,
+    pub turns: Vec<SessionProviderPageTurn>,
+    pub page_turn_count: u64,
+    pub source_bytes_examined: u64,
+    pub scan_progress: bool,
+    pub snapshot_complete: bool,
+    pub next_page_token: Option<String>,
+    pub resume_token: Option<String>,
+    pub source_final: bool,
+    pub warnings: Vec<String>,
+    pub request_token_sha256: String,
+    pub page_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionProviderPageTurn {
     pub session_id: String,
     pub turn_id: String,
+    pub snapshot_sequence: u64,
     pub timestamp: DateTime<Utc>,
     pub role: String,
     pub parent_turn_id: Option<String>,
     pub is_sidechain: bool,
     pub is_compaction_boundary: bool,
+    pub body_state: oulipoly_state::SessionTurnPageBodyState,
     pub body: Option<Value>,
+    pub body_bytes: Option<u64>,
+    pub body_sha256: Option<String>,
+    pub canonical_text_sha256: Option<String>,
+    pub canonical_text_digest_verified: bool,
+}
+
+pub struct SessionTurnIngestQuantumRequest<'a> {
+    pub state: &'a StateDb,
+    pub registry: &'a ProviderRegistry,
+    pub lease_owner: &'a str,
+    pub identity: SessionProviderIdentity,
+    pub session_id: &'a str,
+    pub effective_cwd: Option<&'a Path>,
+    pub cancellation: &'a CancellationToken,
+    pub timeout: Duration,
+    pub max_turns: u64,
+    pub max_response_bytes: u64,
+    pub max_source_bytes: u64,
+    pub max_inline_body_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

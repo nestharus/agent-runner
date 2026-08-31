@@ -21,11 +21,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const SLOW_SLEEP_SECONDS: u64 = 5;
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -50,6 +51,13 @@ fn make_fixture_with_launch_stalls(
     unavailable: &[&str],
     launch_stalls: &[&str],
 ) -> Fixture {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
     let dir = tempfile::tempdir().expect("tempdir");
     let order_path = dir.path().join("order.txt");
     let launch_record_path = dir.path().join("launch-request.json");
@@ -147,6 +155,7 @@ def describe(request):
         "preferred_contract": CONTRACT,
         "capabilities": {{
             "launch": True,
+            "launch_output_v1": True,
             "policy": True,
             "quota": False,
             "session": False,
@@ -216,7 +225,8 @@ def launch(request):
         write_json({{"contract": CONTRACT, "request_id": reqid, "seq": 2, "time_unix_ms": 1002, "kind": "heartbeat", "detail": "stall before final exit"}})
         time.sleep(SLEEP_SECONDS)
         return 0
-    write_json(exit_event(request, 2, 0, "clean_exit"))
+    write_json({{"contract": CONTRACT, "request_id": reqid, "seq": 2, "time_unix_ms": 1002, "kind": "marker", "name": "oulipoly.launch_output_complete/v1", "value": {{"protocol": "oulipoly.launch_output/v1", "stdout": {{"bytes": 3, "sha256": "26a66b061e8f48f39927c312f25293959729eee95978e2892d49d3512a5cc092"}}, "stderr": {{"bytes": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}, "data_event_count": 1}}}})
+    write_json(exit_event(request, 3, 0, "clean_exit"))
     return 0
 
 

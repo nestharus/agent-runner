@@ -76,6 +76,31 @@ pub(super) fn finalize_completed_attempt(
         return Ok(handle_returned_artifacts_persist_failure(&mut input, err));
     }
 
+    if success
+        && let Err(error) = input.result.persist_output_for_invocation(
+            &input.env.state,
+            input.invocation_row_id,
+            &input.invocation.id,
+        )
+    {
+        formatter::emit_stderr(&format!("failed to persist provider output: {error}"));
+        input
+            .agent_runtime_services
+            .invocation_lifecycle_service
+            .finalize_invocation(mapper::finalize_request(
+                &input.env.state,
+                input.invocation_row_id,
+                false,
+                1,
+                Some("output_persistence"),
+                Some("output_persistence_failed"),
+            ))
+            .map(|_| ())
+            .unwrap_or_else(formatter::emit_finalize_invocation_warning);
+        input.guard.mark_finalized();
+        return Ok(CompletedAttemptControl::Return(1));
+    }
+
     finalize_regular_completed_attempt(&mut input, success, error_category.as_deref())?;
 
     if success {
@@ -225,13 +250,33 @@ fn handle_completed_success(
             },
         },
     );
-    formatter::emit_resume_success_output(
-        &input.invocation.id,
-        input.result.exit_code,
-        error_category,
-        input.result.terminal_reason.as_deref(),
-        &input.result.stdout,
-    );
+    if let Err(error) =
+        formatter::emit_resume_success_output(&input.invocation.id, error_category, input.result)
+    {
+        if let Err(state_error) = input.env.state.mark_invocation_output_delivery_failed(
+            input.invocation_row_id,
+            "payload_or_control",
+            &format!("{:?}", error.kind()),
+            None,
+        ) {
+            formatter::emit_stderr(&format!(
+                "failed to record provider output delivery failure: {state_error}"
+            ));
+        }
+        formatter::emit_stderr(&format!("failed to deliver provider output: {error}"));
+        return CompletedAttemptControl::Return(1);
+    }
+    if input.result.output_spool.is_some()
+        && let Err(error) = input
+            .env
+            .state
+            .mark_invocation_output_delivered(input.invocation_row_id)
+    {
+        formatter::emit_stderr(&format!(
+            "failed to record provider output delivery: {error}"
+        ));
+        return CompletedAttemptControl::Return(1);
+    }
     CompletedAttemptControl::Return(if input.recovered_generic_nonzero {
         0
     } else {

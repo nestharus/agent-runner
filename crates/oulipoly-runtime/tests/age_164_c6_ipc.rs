@@ -44,13 +44,45 @@ use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, Stor
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use oulipoly_runtime::executor::{
     ExecutionResult,
-    cli::{execute, execute_with_mailbox_db_path},
+    cli::{execute as runtime_execute, execute_with_mailbox_db_path},
 };
 use oulipoly_state::CompositeInvocationId;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use uuid::Uuid;
+
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+fn ensure_test_data_dir() {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
+}
+
+fn execute(
+    model: &ModelConfig,
+    provider_index: usize,
+    prompt: &str,
+    cwd: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    parent_invocation_env: Option<&str>,
+) -> Result<ExecutionResult, String> {
+    ensure_test_data_dir();
+    runtime_execute(
+        model,
+        provider_index,
+        prompt,
+        cwd,
+        extra_inputs,
+        parent_invocation_env,
+    )
+}
 
 fn script_with_observed_env(
     env_name: &str,
@@ -116,6 +148,7 @@ fn execute_isolated(
     parent: &str,
     dir: &Path,
 ) -> Result<ExecutionResult, String> {
+    ensure_test_data_dir();
     execute_with_mailbox_db_path(
         model,
         0,

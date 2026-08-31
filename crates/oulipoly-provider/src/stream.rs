@@ -53,7 +53,7 @@ use crate::error::{
     HostErrorKind, LaunchFailureEvidence, ProviderClientError, ProviderDiagnostics,
     check_contract_and_request,
 };
-use crate::generated::{LaunchEvent, ProcessStatus, TerminalSignal};
+use crate::generated::{LaunchEvent, PROMPT_ACCEPTED_MARKER_V1, ProcessStatus, TerminalSignal};
 use crate::process::{
     ByteAccumulator, ByteLimit, ByteTailAccumulator, CapturedBytes, StdoutDrainOutput,
     StdoutProcessor,
@@ -66,6 +66,11 @@ use std::sync::Arc;
 
 const DEFAULT_RETAINED_LAUNCH_EVENTS: usize = 1024;
 const DEFAULT_LAUNCH_RETAINED_BYTES: usize = 1024 * 1024;
+const LAUNCH_ERROR_ENVELOPE_KIND: &str = "launch_error_envelope";
+const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
+const PRODUCED_ASSISTANT_RESPONSE_MARKER: &str = "oulipoly.produced_assistant_response";
+
+type LaunchEventCallback = dyn Fn(&DecodedLaunchEvent) -> Result<(), String> + Send + Sync;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodedLaunchEvent {
@@ -132,18 +137,20 @@ impl DecodedLaunchEvent {
 
 #[derive(Clone)]
 pub struct LaunchEventObserver {
-    callback: Arc<dyn Fn(&DecodedLaunchEvent) + Send + Sync>,
+    callback: Arc<LaunchEventCallback>,
 }
 
 impl LaunchEventObserver {
-    pub fn new(callback: impl Fn(&DecodedLaunchEvent) + Send + Sync + 'static) -> Self {
+    pub fn new(
+        callback: impl Fn(&DecodedLaunchEvent) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             callback: Arc::new(callback),
         }
     }
 
-    fn observe(&self, event: &DecodedLaunchEvent) {
-        (self.callback)(event);
+    fn observe(&self, event: &DecodedLaunchEvent) -> Result<(), String> {
+        (self.callback)(event)
     }
 }
 
@@ -170,6 +177,7 @@ pub struct LaunchResult {
     stdout: CapturedBytes,
     stderr: CapturedBytes,
     retained_markers: Vec<RetainedLaunchMarker>,
+    semantic_markers: SemanticLaunchMarkers,
     retained_events_omitted: usize,
 }
 
@@ -187,10 +195,56 @@ impl LaunchResult {
     }
 
     pub fn retained_marker_value(&self, name: &str) -> Option<&Value> {
-        self.retained_markers
-            .iter()
-            .find(|marker| marker.name == name)
-            .map(|marker| &marker.value)
+        self.semantic_markers.get(name).or_else(|| {
+            self.retained_markers
+                .iter()
+                .find(|marker| marker.name == name)
+                .map(|marker| &marker.value)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct SemanticLaunchMarkers {
+    prompt_accepted: Option<Value>,
+    provider_session: Option<Value>,
+    produced_assistant_response: Option<Value>,
+}
+
+impl SemanticLaunchMarkers {
+    fn record(&mut self, name: &str, value: &Value) {
+        let slot = match name {
+            PROMPT_ACCEPTED_MARKER_V1 => &mut self.prompt_accepted,
+            PROVIDER_SESSION_MARKER => &mut self.provider_session,
+            PRODUCED_ASSISTANT_RESPONSE_MARKER => &mut self.produced_assistant_response,
+            _ => return,
+        };
+        if slot.is_none() {
+            *slot = Some(value.clone());
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&Value> {
+        match name {
+            PROMPT_ACCEPTED_MARKER_V1 => self.prompt_accepted.as_ref(),
+            PROVIDER_SESSION_MARKER => self.provider_session.as_ref(),
+            PRODUCED_ASSISTANT_RESPONSE_MARKER => self.produced_assistant_response.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn retained_values(&self) -> Vec<(String, Value)> {
+        [
+            (PROMPT_ACCEPTED_MARKER_V1, &self.prompt_accepted),
+            (PROVIDER_SESSION_MARKER, &self.provider_session),
+            (
+                PRODUCED_ASSISTANT_RESPONSE_MARKER,
+                &self.produced_assistant_response,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.clone().map(|value| (name.to_string(), value)))
+        .collect()
     }
 }
 
@@ -283,7 +337,7 @@ impl LaunchJsonlReader {
 pub(crate) struct LaunchStdoutProcessor {
     parser: LaunchStreamParser,
     raw_stdout: ByteTailAccumulator,
-    error: Option<ProviderClientError>,
+    deferred_error_envelope: Option<ProviderClientError>,
 }
 
 impl LaunchStdoutProcessor {
@@ -296,7 +350,7 @@ impl LaunchStdoutProcessor {
                 LaunchStreamLimits::bounded_by(limit_bytes),
             ),
             raw_stdout: ByteTailAccumulator::new(stdout_limit),
-            error: None,
+            deferred_error_envelope: None,
         }
     }
 
@@ -309,19 +363,23 @@ impl LaunchStdoutProcessor {
 impl StdoutProcessor for LaunchStdoutProcessor {
     type Output = LaunchStdoutDrain;
 
-    fn push(&mut self, chunk: &[u8]) {
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderClientError> {
         self.raw_stdout.push(chunk);
-        if self.error.is_some() {
-            return;
+        if self.deferred_error_envelope.is_some() {
+            return Ok(());
         }
-        if let Err(error) = self.parser.push(chunk) {
-            self.error = Some(error);
+        match self.parser.push(chunk) {
+            Err(error) if error.transport_kind() == LAUNCH_ERROR_ENVELOPE_KIND => {
+                self.deferred_error_envelope = Some(error);
+                Ok(())
+            }
+            result => result,
         }
     }
 
-    fn finish(self) -> Self::Output {
+    fn finish(self, error: Option<ProviderClientError>) -> Self::Output {
         let captured = self.raw_stdout.finish();
-        let result = match self.error {
+        let result = match error.or(self.deferred_error_envelope) {
             Some(error) => Err(error),
             None => self.parser.finish(),
         };
@@ -351,6 +409,13 @@ impl StdoutDrainOutput for LaunchStdoutDrain {
     fn captured_bytes(&self) -> CapturedBytes {
         self.captured.clone()
     }
+
+    fn processor_error(&self) -> Option<&ProviderClientError> {
+        self.result.as_ref().err().filter(|error| {
+            error.transport_kind() != LAUNCH_ERROR_ENVELOPE_KIND
+                && error.transport_kind() != HostErrorKind::MissingFinalExit.as_str()
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -362,6 +427,7 @@ struct LaunchStreamParser {
     line_number: usize,
     retention: LaunchEventRetention,
     markers: LaunchMarkerRetention,
+    semantic_markers: SemanticLaunchMarkers,
     stdout: ByteAccumulator,
     stderr: ByteAccumulator,
     exit: Option<LaunchExit>,
@@ -387,6 +453,7 @@ impl LaunchStreamParser {
                 limits.retained_events,
                 limits.retained_event_bytes,
             ),
+            semantic_markers: SemanticLaunchMarkers::default(),
             stdout: ByteAccumulator::new(ByteLimit::new(limits.retained_output_bytes)),
             stderr: ByteAccumulator::new(ByteLimit::new(limits.retained_output_bytes)),
             exit: None,
@@ -429,12 +496,14 @@ impl LaunchStreamParser {
             return Err(protocol_error(HostErrorKind::SkippedSeq, &self.request_id));
         }
         if self.exit.is_none() {
-            let retained_markers = self
-                .markers
-                .markers
-                .iter()
-                .map(|marker| (marker.name.clone(), marker.value.clone()))
-                .collect();
+            let mut retained_markers = self.semantic_markers.retained_values();
+            retained_markers.extend(
+                self.markers
+                    .markers
+                    .iter()
+                    .filter(|marker| self.semantic_markers.get(&marker.name).is_none())
+                    .map(|marker| (marker.name.clone(), marker.value.clone())),
+            );
             return Err(
                 protocol_error(HostErrorKind::MissingFinalExit, &self.request_id)
                     .with_launch_failure_evidence(LaunchFailureEvidence::from_retained_markers(
@@ -457,6 +526,7 @@ impl LaunchStreamParser {
             stdout: self.stdout.finish(),
             stderr: self.stderr.finish(),
             retained_markers: self.markers.markers,
+            semantic_markers: self.semantic_markers,
             retained_events_omitted: self.retention.omitted,
         }
     }
@@ -483,6 +553,12 @@ impl LaunchStreamParser {
     fn process_line(&mut self, line: &str) -> Result<(), ProviderClientError> {
         self.validate_line_not_blank(line)?;
         let value = parse_line(line, &self.request_id)?;
+        if value.get("ok").and_then(Value::as_bool) == Some(false) {
+            return Err(protocol_error(
+                HostErrorKind::Other(LAUNCH_ERROR_ENVELOPE_KIND.to_string()),
+                &self.request_id,
+            ));
+        }
         self.validate_line_before_exit(&value)?;
         self.process_launch_event_value(value)
     }
@@ -522,8 +598,7 @@ impl LaunchStreamParser {
     fn process_launch_event_value(&mut self, value: Value) -> Result<(), ProviderClientError> {
         self.validate_launch_event_value(&value)?;
         let decoded = decode_event(value, &self.request_id)?;
-        self.record_launch_event(decoded);
-        Ok(())
+        self.record_launch_event(decoded)
     }
 
     fn validate_launch_event_value(&mut self, value: &Value) -> Result<(), ProviderClientError> {
@@ -579,17 +654,28 @@ impl LaunchStreamParser {
         let DecodedLaunchEvent::Marker { name, value, .. } = event else {
             return;
         };
+        self.semantic_markers.record(name, value);
         self.markers.push(name, value);
     }
 
-    fn record_launch_event(&mut self, decoded: DecodedLaunchEvent) {
+    fn record_launch_event(
+        &mut self,
+        decoded: DecodedLaunchEvent,
+    ) -> Result<(), ProviderClientError> {
         if let Some(observer) = &self.event_observer {
-            observer.observe(&decoded);
+            observer.observe(&decoded).map_err(|description| {
+                transport_error_with_description(
+                    HostErrorKind::Other("launch_event_delivery_failed".to_string()),
+                    &self.request_id,
+                    description,
+                )
+            })?;
         }
         self.record_decoded_bytes(&decoded);
         self.record_marker(&decoded);
         self.record_exit(&decoded);
         self.retention.push(decoded);
+        Ok(())
     }
 
     fn record_exit(&mut self, event: &DecodedLaunchEvent) {

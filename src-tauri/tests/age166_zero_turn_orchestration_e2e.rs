@@ -175,6 +175,7 @@ fn execution_result_with_signal(
     ExecutionResult {
         stdout: Vec::new(),
         stderr: "ordinary provider failure".to_string(),
+        output_spool: None,
         exit_code,
         provider_index: 0,
         session_capture: SessionCaptureResult {

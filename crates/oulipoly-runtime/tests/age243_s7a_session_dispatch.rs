@@ -6,7 +6,7 @@ use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, SessionSourceEntry, SessionsConfig,
     provider_implementation_ref::ProviderImplementationRef,
 };
-use oulipoly_provider::client::ProviderClientOptions;
+use oulipoly_provider::client::{CancellationToken, ProviderClientOptions};
 use oulipoly_runtime::provider_registry::{
     ProviderRegistry, ProviderRegistryHandle, ProviderRegistryOptions,
 };
@@ -15,9 +15,10 @@ use oulipoly_runtime::session_metadata::{
 };
 use oulipoly_runtime::session_provider::{
     self, SessionProviderCaptureRequest, SessionProviderEnumerateRequest, SessionProviderIdentity,
-    SessionProviderLocateRequest, SessionProviderReadTurnsRequest,
+    SessionProviderLocateRequest, SessionProviderPageCursor, SessionProviderReadPageRequest,
+    SessionProviderTurnProjection, SessionTurnIngestQuantumRequest,
 };
-use oulipoly_state::{InvocationStart, StateDb};
+use oulipoly_state::{InvocationStart, SessionTurnStreamProjection, StateDb};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -36,8 +37,7 @@ const PROVIDER_INSTANCE_ID: &str = "provider-a-instance";
 const SETTINGS_ID: &str = "provider-a-test-settings";
 const SESSION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const NATIVE_SESSION_ID: &str = "native-session-opaque-id";
-const HOSTILE_SESSION_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-const OPENCODE_SESSION_ID: &str = "ses_fixture";
+const LEASE_OWNER: &str = "age243-worker";
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -254,18 +254,6 @@ fn locate_request<'a>(
     }
 }
 
-fn read_request<'a>(
-    registry: &'a ProviderRegistry,
-    session_id: &'a str,
-) -> SessionProviderReadTurnsRequest<'a> {
-    SessionProviderReadTurnsRequest {
-        registry,
-        identity: provider_identity(),
-        session_id,
-        effective_cwd: None,
-    }
-}
-
 fn capture_request<'a>(
     registry: &'a ProviderRegistry,
     invocation_uuid: &'a str,
@@ -275,6 +263,29 @@ fn capture_request<'a>(
         identity: provider_identity(),
         invocation_uuid,
         effective_cwd: None,
+    }
+}
+
+fn page_request<'a>(
+    registry: &'a ProviderRegistry,
+    cancellation: &'a CancellationToken,
+) -> SessionProviderReadPageRequest<'a> {
+    SessionProviderReadPageRequest {
+        registry,
+        identity: provider_identity(),
+        session_id: SESSION_ID,
+        effective_cwd: None,
+        projection: SessionProviderTurnProjection::CanonicalIngest,
+        expected_delivery_nonce: None,
+        cursor: SessionProviderPageCursor::Beginning { after_token: None },
+        expected_page_index: 0,
+        expected_turn_sequence: 0,
+        max_turns: 16,
+        max_response_bytes: 16 * 1024,
+        max_source_bytes: 64 * 1024,
+        max_inline_body_bytes: 1024,
+        cancellation,
+        timeout: Duration::from_secs(2),
     }
 }
 
@@ -445,82 +456,6 @@ fn external_provider_locate_unknown_format_maps_to_other_storage_class() {
 }
 
 #[test]
-fn external_provider_read_turns_maps_transport_into_owned_turn_interface_before_persistence() {
-    let fixture = Fixture::new();
-    fixture.set_mode("read_success");
-    let registry = fixture.registry();
-    let before = fixture.snapshot();
-
-    let result =
-        session_provider::read_turns(read_request(&registry, SESSION_ID)).expect("read turns");
-
-    assert_eq!(result.turn_count, 2);
-    assert!(result.complete);
-    assert_eq!(result.turns.len(), 2);
-    assert_eq!(result.turns[0].session_id, SESSION_ID);
-    assert_eq!(result.turns[0].turn_id, "turn-user-1");
-    assert_eq!(result.turns[0].timestamp, parse_ts("2026-05-01T00:00:01Z"));
-    assert_eq!(result.turns[0].role, "user");
-    assert_eq!(
-        result.turns[0]
-            .body
-            .as_ref()
-            .and_then(|body: &Value| body.as_array())
-            .and_then(|chunks: &Vec<Value>| chunks.first())
-            .and_then(|chunk: &Value| chunk.get("text")),
-        Some(&Value::String("hello".to_string()))
-    );
-    assert!(
-        !result.turns[0].is_sidechain,
-        "omitted is_sidechain defaults to false at the owned boundary"
-    );
-    assert!(
-        !result.turns[0].is_compaction_boundary,
-        "omitted is_compaction_boundary defaults to false at the owned boundary"
-    );
-    assert_eq!(
-        result.turns[1].parent_turn_id.as_deref(),
-        Some("turn-user-1")
-    );
-    assert!(
-        result.turns[1].is_sidechain,
-        "explicit is_sidechain=true must map through the owned boundary"
-    );
-    assert!(
-        result.turns[1].is_compaction_boundary,
-        "explicit is_compaction_boundary=true must map through the owned boundary"
-    );
-    assert_eq!(
-        fixture.snapshot(),
-        before,
-        "provider read mapping itself must not mutate SQLite"
-    );
-    assert_request_shape(
-        &fixture.request_records_for("session.read_turns"),
-        "session.read_turns",
-        Some(SESSION_ID),
-    );
-}
-
-#[test]
-fn outbound_user_turn_observation_requests_bounded_provider_projection() {
-    let fixture = Fixture::new();
-    fixture.set_mode("read_success");
-    let registry = fixture.registry();
-
-    session_provider::read_user_turn_observations(read_request(&registry, SESSION_ID))
-        .expect("read projected user-turn observation");
-
-    let records = fixture.request_records_for("session.read_turns");
-    assert_eq!(records.len(), 1);
-    assert_eq!(
-        records[0]["request"]["params"]["turn_projection"],
-        "user_observation"
-    );
-    assert_eq!(records[0]["request"]["params"]["body_tail_limit"], 4);
-}
-
-#[test]
 fn external_provider_enumerate_maps_provider_native_sessions_without_mutating_sqlite() {
     let fixture = Fixture::new();
     fixture.set_mode("enumerate_success");
@@ -568,184 +503,354 @@ fn external_provider_enumerate_without_capability_is_clear_unsupported_noop() {
 }
 
 #[test]
-fn external_provider_read_turns_provider_transport_and_schema_failures_do_not_mutate_sqlite() {
-    for (mode, expected_token) in [
-        ("read_provider_error", "provider_read_failed"),
-        ("read_malformed_json", "invalid_json"),
-        ("read_empty_stdout", "empty_stdout"),
-        ("leading_stdout_text", "leading_stdout_text"),
-        ("multiple_json_objects", "multiple_json_objects"),
-        ("trailing_junk", "trailing_non_whitespace"),
-        ("read_schema_invalid", "schema_invalid_response"),
-        ("schema_invalid_error", "schema_invalid_error_response"),
-        ("read_nonzero", "read_nonzero_mode"),
-        ("nonzero_no_envelope", "provider_process_nonzero"),
-    ] {
-        let fixture = Fixture::new();
-        fixture.set_mode(mode);
-        let registry = fixture.registry();
-        let before = fixture.snapshot();
-
-        let err =
-            session_provider::read_turns(read_request(&registry, SESSION_ID)).expect_err(mode);
-
-        assert_eq!(
-            fixture.snapshot(),
-            before,
-            "read failure {mode} must not mutate host SQLite"
-        );
-        assert_error_token(&err, expected_token);
-        assert_eq!(
-            fixture.request_records_for("session.read_turns").len(),
-            1,
-            "read failure {mode} must exercise provider read dispatch exactly once"
-        );
-    }
-}
-
-#[test]
-fn external_provider_read_turns_rejects_invalid_or_mismatched_provider_evidence_without_mutation() {
-    for (mode, expected_token) in [
-        ("read_invalid_missing_role", "provider_turn_missing_role"),
-        ("read_invalid_timestamp", "provider_turn_invalid_timestamp"),
-        ("read_duplicate_turns", "provider_turn_duplicate"),
-        ("read_wrong_field_type", "provider_turn_invalid_type"),
-        ("read_noncanonical_body", "provider_turn_noncanonical_body"),
-    ] {
-        let fixture = Fixture::new();
-        fixture.set_mode(mode);
-        let registry = fixture.registry();
-        let before = fixture.snapshot();
-
-        let err =
-            session_provider::read_turns(read_request(&registry, SESSION_ID)).expect_err(mode);
-
-        assert_eq!(
-            fixture.snapshot(),
-            before,
-            "invalid read mode {mode} must not mutate host SQLite"
-        );
-        assert_error_token(&err, expected_token);
-    }
-}
-
-#[test]
-fn external_provider_read_turns_complete_partial_idempotency_and_turn_count_are_evidence_only() {
-    for (mode, complete, expected_turns) in [
-        (
-            "read_incomplete",
-            false,
-            vec!["turn-user-1", "turn-assistant-1"],
-        ),
-        ("read_partial", true, vec!["turn-user-1"]),
-        (
-            "read_turn_count_mismatch",
-            true,
-            vec!["turn-user-1", "turn-assistant-1"],
-        ),
-    ] {
-        let fixture = Fixture::new();
-        fixture.set_mode(mode);
-        let registry = fixture.registry();
-        let before = fixture.snapshot();
-
-        let first = session_provider::read_turns(read_request(&registry, SESSION_ID))
-            .expect("read-turn evidence is accepted");
-        let second = session_provider::read_turns(read_request(&registry, SESSION_ID))
-            .expect("re-reading provider evidence is stable");
-
-        assert_eq!(first.complete, complete, "{mode}");
-        assert_eq!(
-            second, first,
-            "{mode} should be idempotent at mapper boundary"
-        );
-        assert_eq!(
-            first
-                .turns
-                .iter()
-                .map(|turn| turn.turn_id.as_str())
-                .collect::<Vec<_>>(),
-            expected_turns,
-            "{mode}"
-        );
-        assert_eq!(
-            fixture.snapshot(),
-            before,
-            "read-turn mapping must not mutate SQLite before host ingest for {mode}"
-        );
-        if mode == "read_turn_count_mismatch" {
-            session_provider::assert_turn_count_diagnostic(&first)
-                .expect("turn_count mismatch should be reported, not rejected");
-        }
-    }
-}
-
-#[test]
-fn external_provider_read_turns_ingest_uses_owned_interface_and_host_idempotency() {
+fn external_provider_page_dispatch_enforces_bounded_request_and_maps_one_page() {
     let fixture = Fixture::new();
-    fixture.set_mode("read_turn_count_mismatch");
+    fixture.set_mode("page_success");
     let registry = fixture.registry();
-    let result =
-        session_provider::read_turns(read_request(&registry, SESSION_ID)).expect("read turns");
+    let cancellation = CancellationToken::new();
+    let before = fixture.snapshot();
 
-    let inserted = session_provider::ingest_owned_turns(&fixture.state, PROVIDER_NAME, &result)
-        .expect("host ingests owned provider turns");
-    let repeated = session_provider::ingest_owned_turns(&fixture.state, PROVIDER_NAME, &result)
-        .expect("host ingest remains idempotent");
+    let result = session_provider::read_turn_page(page_request(&registry, &cancellation))
+        .expect("bounded page");
 
-    assert_eq!(inserted, 2);
-    assert_eq!(repeated, 0);
+    assert_eq!(result.session_id, SESSION_ID);
+    assert_eq!(result.page_index, 0);
+    assert_eq!(result.page_start_sequence, 0);
+    assert_eq!(result.page_turn_count, 1);
+    assert_eq!(result.turns.len(), 1);
+    assert_eq!(result.turns[0].turn_id, "turn-user-1");
+    assert!(result.turns[0].canonical_text_digest_verified);
+    assert!(result.snapshot_complete);
+    assert_eq!(result.resume_token.as_deref(), Some("resume-1"));
+    assert_eq!(fixture.snapshot(), before);
+
+    let records = fixture.request_records_for("session.read_turns");
+    assert_eq!(records.len(), 1);
+    let params = &records[0]["request"]["params"];
+    assert_eq!(params["read_protocol"], "oulipoly.session_turn_pages/v1");
+    assert_eq!(params["turn_projection"], "canonical_ingest");
+    assert!(params.get("expected_delivery_nonce").is_none());
+    assert_eq!(params["start_mode"], "beginning");
+    assert_eq!(params["max_turns"], 16);
+    assert_eq!(params["max_response_bytes"], 16 * 1024);
+    assert_eq!(params["max_source_bytes"], 64 * 1024);
+    assert_eq!(params["max_inline_body_bytes"], 1024);
+    assert!(records[0]["request"]["host"]["deadline_unix_ms"].is_u64());
+}
+
+#[test]
+fn user_observation_uses_an_empty_tail_anchor_then_reads_only_after_that_token() {
+    let fixture = Fixture::new();
+    fixture.set_mode("page_success");
+    let registry = fixture.registry();
+    let cancellation = CancellationToken::new();
+    let delivery_nonce = "a".repeat(64);
+    let mut request = page_request(&registry, &cancellation);
+    request.projection = SessionProviderTurnProjection::UserObservation;
+    request.expected_delivery_nonce = Some(&delivery_nonce);
+    request.cursor = SessionProviderPageCursor::Tail;
+    request.max_inline_body_bytes = 0;
+
+    let anchor = session_provider::read_turn_page(request).expect("tail anchor");
+    assert!(anchor.turns.is_empty());
+    assert!(anchor.snapshot_complete);
+    assert_eq!(anchor.resume_token.as_deref(), Some("observation-anchor"));
+
+    let mut request = page_request(&registry, &cancellation);
+    request.projection = SessionProviderTurnProjection::UserObservation;
+    request.expected_delivery_nonce = Some(&delivery_nonce);
+    request.cursor = SessionProviderPageCursor::Beginning {
+        after_token: anchor.resume_token,
+    };
+    request.max_inline_body_bytes = 0;
+    let observed = session_provider::read_turn_page(request).expect("post-anchor page");
+    assert_eq!(observed.turns.len(), 1);
+    assert_eq!(observed.turns[0].turn_id, "turn-user-1");
     assert_eq!(
-        fixture.snapshot().session_turns,
-        vec![
-            (
-                PROVIDER_NAME.to_string(),
-                SESSION_ID.to_string(),
-                "turn-assistant-1".to_string(),
-                "2026-05-01T00:00:02+00:00".to_string(),
-                "assistant".to_string(),
-                Some("turn-user-1".to_string()),
-                1,
-                1,
-            ),
-            (
-                PROVIDER_NAME.to_string(),
-                SESSION_ID.to_string(),
-                "turn-user-1".to_string(),
-                "2026-05-01T00:00:01+00:00".to_string(),
-                "user".to_string(),
-                None,
-                0,
-                0,
-            ),
-        ]
+        observed.turns[0].canonical_text_sha256.as_deref(),
+        Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+    );
+    assert!(observed.turns[0].body.is_none());
+
+    let records = fixture.request_records_for("session.read_turns");
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[0]["request"]["params"]["turn_projection"],
+        "user_observation"
+    );
+    assert_eq!(records[0]["request"]["params"]["start_mode"], "tail");
+    assert_eq!(
+        records[0]["request"]["params"]["expected_delivery_nonce"],
+        delivery_nonce
+    );
+    assert_eq!(
+        records[1]["request"]["params"]["expected_delivery_nonce"],
+        delivery_nonce
+    );
+    assert_eq!(records[1]["request"]["params"]["start_mode"], "beginning");
+    assert_eq!(
+        records[1]["request"]["params"]["after_token"],
+        "observation-anchor"
     );
 }
 
 #[test]
-fn opencode_read_turns_ingests_normalized_jsonl() {
-    let fixture = tempfile::tempdir().expect("tempdir");
-    let state = StateDb::open(&fixture.path().join("state.db")).expect("state db");
-    let opencode_root = fixture.path().join("opencode-data");
-    let opencode_bin = write_fake_opencode(fixture.path());
-    let sessions_cfg = opencode_sessions_config(
-        &repo_script_path("opencode-turns"),
-        &opencode_bin,
-        &opencode_root,
-        &fixture.path().join("cursor"),
+fn one_page_quantum_commits_turn_and_checkpoint_once() {
+    let fixture = Fixture::new();
+    fixture.set_mode("page_success");
+    let registry = fixture.registry();
+    let identity = provider_identity();
+    let key = session_provider::canonical_stream_key(&identity, SESSION_ID);
+    fixture
+        .state
+        .enqueue_session_turn_ingest_stream(&key)
+        .expect("queue stream");
+    lease_stream(&fixture.state);
+    let cancellation = CancellationToken::new();
+
+    let outcome =
+        session_provider::ingest_one_canonical_turn_page(SessionTurnIngestQuantumRequest {
+            state: &fixture.state,
+            registry: &registry,
+            lease_owner: LEASE_OWNER,
+            identity,
+            session_id: SESSION_ID,
+            effective_cwd: None,
+            cancellation: &cancellation,
+            timeout: Duration::from_secs(2),
+            max_turns: 16,
+            max_response_bytes: 16 * 1024,
+            max_source_bytes: 64 * 1024,
+            max_inline_body_bytes: 1024,
+        })
+        .expect("one page quantum");
+
+    assert_eq!(outcome.inserted_turns, 1);
+    assert_eq!(outcome.checkpoint_generation, 1);
+    let stream = fixture
+        .state
+        .session_turn_ingest_stream(&key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stream.status, "caught_up");
+    assert_eq!(stream.after_token.as_deref(), Some("resume-1"));
+    assert_eq!(stream.committed_page_count, 1);
+    assert_eq!(stream.committed_turn_count, 1);
+    assert_eq!(
+        fixture
+            .state
+            .count_session_turns(PROVIDER_NAME, SESSION_ID)
+            .unwrap()
+            .total,
+        1
     );
+}
 
-    let report = oulipoly_runtime::sessions::scan_provider("opencode", &sessions_cfg, &state);
-    let repeated = oulipoly_runtime::sessions::scan_provider("opencode", &sessions_cfg, &state);
-    let counts = state
-        .count_session_turns("opencode", OPENCODE_SESSION_ID)
-        .expect("count turns");
+#[test]
+fn provider_page_failure_leaves_checkpoint_unchanged() {
+    let fixture = Fixture::new();
+    fixture.set_mode("page_provider_error");
+    let registry = fixture.registry();
+    let identity = provider_identity();
+    let key = session_provider::canonical_stream_key(&identity, SESSION_ID);
+    fixture
+        .state
+        .enqueue_session_turn_ingest_stream(&key)
+        .expect("queue stream");
+    lease_stream(&fixture.state);
+    let cancellation = CancellationToken::new();
 
-    assert_eq!(report.errors, Vec::<String>::new());
-    assert_eq!(report.new_turns, 2);
-    assert_eq!(repeated.new_turns, 0);
-    assert_eq!(counts.total, 2);
-    assert_eq!(counts.assistant, 1);
+    let error = session_provider::ingest_one_canonical_turn_page(SessionTurnIngestQuantumRequest {
+        state: &fixture.state,
+        registry: &registry,
+        lease_owner: LEASE_OWNER,
+        identity,
+        session_id: SESSION_ID,
+        effective_cwd: None,
+        cancellation: &cancellation,
+        timeout: Duration::from_secs(2),
+        max_turns: 16,
+        max_response_bytes: 16 * 1024,
+        max_source_bytes: 64 * 1024,
+        max_inline_body_bytes: 1024,
+    })
+    .expect_err("provider page failure");
+
+    assert_error_token(&error, "provider_page_failed");
+    let stream = fixture
+        .state
+        .session_turn_ingest_stream(&key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stream.checkpoint_generation, 0);
+    assert_eq!(stream.committed_page_count, 0);
+    assert_eq!(stream.committed_turn_count, 0);
+    assert_eq!(
+        fixture
+            .state
+            .count_session_turns(PROVIDER_NAME, SESSION_ID)
+            .unwrap()
+            .total,
+        0
+    );
+}
+
+#[test]
+fn bounded_worker_leases_and_applies_exactly_one_ready_page() {
+    let fixture = Fixture::new();
+    fixture.set_mode("page_success");
+    let registry = fixture.registry();
+    let key = session_provider::canonical_stream_key(&provider_identity(), SESSION_ID);
+    fixture
+        .state
+        .enqueue_session_turn_ingest_stream(&key)
+        .expect("queue stream");
+    let cancellation = CancellationToken::new();
+
+    let outcome = session_provider::run_one_session_turn_ingest_quantum(
+        session_provider::SessionTurnIngestDriverRequest {
+            state: &fixture.state,
+            registry: &registry,
+            lease_owner: LEASE_OWNER,
+            effective_cwd: None,
+            cancellation: &cancellation,
+            now: Utc::now(),
+        },
+    )
+    .expect("worker quantum");
+
+    assert!(matches!(
+        outcome,
+        session_provider::SessionTurnIngestQuantumOutcome::Applied {
+            inserted_turns: 1,
+            duplicate_turns: 0,
+            checkpoint_generation: 1,
+            ..
+        }
+    ));
+    let idle = session_provider::run_one_session_turn_ingest_quantum(
+        session_provider::SessionTurnIngestDriverRequest {
+            state: &fixture.state,
+            registry: &registry,
+            lease_owner: LEASE_OWNER,
+            effective_cwd: None,
+            cancellation: &cancellation,
+            now: Utc::now(),
+        },
+    )
+    .expect("idle worker quantum");
+    assert_eq!(
+        idle,
+        session_provider::SessionTurnIngestQuantumOutcome::Idle
+    );
+}
+
+#[test]
+fn bounded_worker_schedules_per_stream_retry_without_advancing_checkpoint() {
+    let fixture = Fixture::new();
+    fixture.set_mode("page_provider_error");
+    let registry = fixture.registry();
+    let key = session_provider::canonical_stream_key(&provider_identity(), SESSION_ID);
+    fixture
+        .state
+        .enqueue_session_turn_ingest_stream(&key)
+        .expect("queue stream");
+    let cancellation = CancellationToken::new();
+    let now = Utc::now();
+
+    let outcome = session_provider::run_one_session_turn_ingest_quantum(
+        session_provider::SessionTurnIngestDriverRequest {
+            state: &fixture.state,
+            registry: &registry,
+            lease_owner: LEASE_OWNER,
+            effective_cwd: None,
+            cancellation: &cancellation,
+            now,
+        },
+    )
+    .expect("worker retry quantum");
+
+    assert!(matches!(
+        outcome,
+        session_provider::SessionTurnIngestQuantumOutcome::RetryScheduled { ref error, .. }
+            if error == "provider_page_failed"
+    ));
+    let stream = fixture
+        .state
+        .session_turn_ingest_stream(&key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stream.status, "retry_wait");
+    assert_eq!(stream.checkpoint_generation, 0);
+    assert_eq!(stream.retry_count, 1);
+    assert_eq!(stream.lease_owner, None);
+    assert_eq!(
+        session_provider::run_one_session_turn_ingest_quantum(
+            session_provider::SessionTurnIngestDriverRequest {
+                state: &fixture.state,
+                registry: &registry,
+                lease_owner: LEASE_OWNER,
+                effective_cwd: None,
+                cancellation: &cancellation,
+                now,
+            },
+        )
+        .unwrap(),
+        session_provider::SessionTurnIngestQuantumOutcome::Idle
+    );
+}
+
+#[test]
+fn bounded_worker_marks_unpaged_provider_unsupported_without_fallback() {
+    let fixture = Fixture::new();
+    fixture.set_mode("capture_success");
+    let registry = fixture.registry();
+    let key = session_provider::canonical_stream_key(&provider_identity(), SESSION_ID);
+    fixture
+        .state
+        .enqueue_session_turn_ingest_stream(&key)
+        .expect("queue stream");
+    let cancellation = CancellationToken::new();
+
+    let outcome = session_provider::run_one_session_turn_ingest_quantum(
+        session_provider::SessionTurnIngestDriverRequest {
+            state: &fixture.state,
+            registry: &registry,
+            lease_owner: LEASE_OWNER,
+            effective_cwd: None,
+            cancellation: &cancellation,
+            now: Utc::now(),
+        },
+    )
+    .expect("unsupported worker quantum");
+
+    assert!(matches!(
+        outcome,
+        session_provider::SessionTurnIngestQuantumOutcome::Unsupported { ref error, .. }
+            if error == "session_turn_pages_capability_missing"
+    ));
+    let stream = fixture
+        .state
+        .session_turn_ingest_stream(&key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stream.status, "unsupported");
+    assert_eq!(stream.checkpoint_generation, 0);
+    assert_eq!(fixture.request_records_for("session.read_turns").len(), 0);
+}
+
+fn lease_stream(state: &StateDb) {
+    let now = Utc::now();
+    let leased = state
+        .lease_ready_session_turn_ingest_stream(
+            SessionTurnStreamProjection::CanonicalIngest,
+            LEASE_OWNER,
+            now,
+            now + chrono::Duration::seconds(30),
+        )
+        .expect("lease stream")
+        .expect("ready stream");
+    assert_eq!(leased.key.session_id, SESSION_ID);
 }
 
 #[test]
@@ -862,52 +967,6 @@ fn external_provider_error_tokens_are_stable_by_failure_class() {
 
         assert_error_token(&err, expected_token);
     }
-}
-
-#[test]
-fn hostile_provider_cannot_discover_or_mutate_runner_sqlite_through_session_dispatch() {
-    let fixture = Fixture::new();
-    fixture.set_mode("hostile_read");
-    fixture.seed_finalized_invocation("22222222-2222-4222-8222-222222222222");
-    fixture.seed_chain(
-        "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-        PROVIDER_NAME,
-        HOSTILE_SESSION_ID,
-    );
-    let _data_dir_override = DataDirOverride::install(&fixture.dir.path().join("hostile-app-data"));
-    let registry = fixture.hostile_registry();
-    let before = fixture.snapshot();
-    let effective_cwd = fixture.dir.path().join("hostile-cwd");
-    fs::create_dir_all(&effective_cwd).expect("effective cwd");
-
-    let mut request = read_request(&registry, SESSION_ID);
-    request.effective_cwd = Some(&effective_cwd);
-    let err = session_provider::read_turns(request).expect_err("hostile response is invalid");
-
-    assert_error_token(&err, "provider_turn_missing_role");
-    assert_eq!(fixture.snapshot(), before);
-    let request_text = fixture
-        .records()
-        .into_iter()
-        .map(|record| record.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        !request_text.contains("state.db"),
-        "S7a provider requests must not expose host state.db paths: {request_text}"
-    );
-    assert!(
-        !request_text.contains(&fixture.state_path().display().to_string()),
-        "request JSON must not expose concrete SQLite path: {request_text}"
-    );
-    assert!(
-        !hostile_marker(&fixture, "request-json").exists()
-            && !hostile_marker(&fixture, "cwd").exists()
-            && !hostile_marker(&fixture, "env").exists()
-            && !hostile_marker(&fixture, "data-root").exists()
-            && !hostile_marker(&fixture, "config-root").exists(),
-        "provider must not find a mutable host SQLite path through JSON, cwd, env, data-root, or config-root"
-    );
 }
 
 fn assert_error_token(error: &impl Display, expected_token: &str) {
@@ -1223,6 +1282,7 @@ def error(code):
 def describe():
     session_enabled = mode != "session_capability_disabled"
     session_enumerate_enabled = mode.startswith("enumerate_")
+    session_pages_enabled = mode.startswith("page_")
     return envelope({{
         "provider_id": "provider-a",
         "display_name": "Provider A",
@@ -1234,6 +1294,7 @@ def describe():
             "quota": False,
             "session": session_enabled,
             "session_enumerate": session_enumerate_enabled,
+            "session_turn_pages_v1": session_pages_enabled,
             "terminal": False,
             "rotation": False,
             "discovery": False,
@@ -1301,98 +1362,70 @@ def locate():
         return envelope({{"located": True, "path": {transcript_path}, "artifacts": []}})
     return error("unexpected_locate_mode")
 
-def turns():
-    valid = [
-        {{
+def turn_page():
+    if mode == "page_provider_error":
+        return error("provider_page_failed")
+    params = request["params"]
+    if params["turn_projection"] == "user_observation" and params["start_mode"] == "tail":
+        return envelope({{
+            "read_protocol": "oulipoly.session_turn_pages/v1",
+            "provider_instance_id": "{provider_instance_id}",
+            "settings_id": "{settings_id}",
             "session_id": "{session_id}",
-            "turn_id": "turn-user-1",
-            "timestamp": "2026-05-01T00:00:01Z",
-            "role": "user",
-            "body": [{{"type": "text", "text": "hello"}}],
-        }},
-        {{
-            "session_id": "{session_id}",
-            "turn_id": "turn-assistant-1",
-            "timestamp": "2026-05-01T00:00:02Z",
-            "role": "assistant",
-            "parent_turn_id": "turn-user-1",
-            "is_sidechain": True,
-            "is_compaction_boundary": True,
-            "body": [{{"type": "text", "text": "world"}}],
-        }},
-    ]
-    if mode == "read_success":
-        return envelope({{"turns": valid, "turn_count": 2, "complete": True}})
-    if mode == "read_incomplete":
-        return envelope({{"turns": valid, "turn_count": 2, "complete": False}})
-    if mode == "read_partial":
-        return envelope({{"turns": [valid[0]], "turn_count": 2, "complete": True}})
-    if mode == "read_invalid_missing_role":
-        broken = [dict(valid[0])]
-        broken[0].pop("role", None)
-        return envelope({{"turns": broken, "turn_count": 1, "complete": True}})
-    if mode == "read_invalid_timestamp":
-        broken = [dict(valid[0])]
-        broken[0]["timestamp"] = "not-rfc3339"
-        return envelope({{"turns": broken, "turn_count": 1, "complete": True}})
-    if mode == "read_turn_count_mismatch":
-        return envelope({{"turns": valid, "turn_count": 99, "complete": True}})
-    if mode == "read_duplicate_turns":
-        return envelope({{"turns": [valid[0], valid[0]], "turn_count": 2, "complete": True}})
-    if mode == "read_wrong_field_type":
-        broken = [dict(valid[0])]
-        broken[0]["is_sidechain"] = "false"
-        return envelope({{"turns": broken, "turn_count": 1, "complete": True}})
-    if mode == "read_noncanonical_body":
-        broken = [dict(valid[0])]
-        broken[0]["body"] = {{"type": "text", "text": "not an array"}}
-        return envelope({{"turns": broken, "turn_count": 1, "complete": True}})
-    if mode == "read_provider_error":
-        return error("provider_read_failed")
-    if mode == "read_malformed_json":
-        print("{{")
-        raise SystemExit(0)
-    if mode == "read_empty_stdout":
-        raise SystemExit(0)
-    if mode == "read_schema_invalid":
-        return envelope({{"turns": valid, "turn_count": 2}})
-    if mode == "read_nonzero":
-        print(json.dumps(error("read_nonzero_mode")))
-        raise SystemExit(42)
-    if mode == "hostile_read":
-        def mutate(label, candidate):
-            try:
-                path = pathlib.Path(candidate)
-                if not str(path).endswith("state.db") or not path.exists():
-                    return
-                conn = sqlite3.connect(path)
-                conn.execute("INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name) VALUES ('ffffffff-ffff-4fff-8fff-ffffffffffff', '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z', 'hostile')")
-                conn.commit()
-                conn.close()
-                pathlib.Path(HOSTILE_MARKERS[label]).write_text(str(path))
-            except Exception:
-                pass
-        def walk_json(value):
-            if isinstance(value, dict):
-                for item in value.values():
-                    yield from walk_json(item)
-            elif isinstance(value, list):
-                for item in value:
-                    yield from walk_json(item)
-            elif isinstance(value, str):
-                yield value
-        for value in walk_json(request):
-            mutate("request-json", value)
-            if value.endswith("data-root") or value.endswith("config-root"):
-                mutate("data-root" if value.endswith("data-root") else "config-root", pathlib.Path(value) / "state.db")
-        for name, value in sorted(os.environ.items()):
-            if name.startswith("OULIPOLY") or name.startswith("XDG") or name in ["PWD", "HOME"]:
-                mutate("env", value)
-                mutate("env", pathlib.Path(value) / "state.db")
-        for candidate in [pathlib.Path.cwd(), pathlib.Path.cwd().parent]:
-            mutate("cwd", candidate / "state.db")
-        return envelope({{"turns": [{{"session_id": "{hostile_session_id}", "turn_id": "hostile"}}], "turn_count": 1, "complete": True}})
-    return error("unexpected_read_mode")
+            "turn_projection": "user_observation",
+            "snapshot_id": "observation-tail",
+            "page_index": 0,
+            "page_start_sequence": 0,
+            "turns": [],
+            "page_turn_count": 0,
+            "source_bytes_examined": 0,
+            "scan_progress": False,
+            "snapshot_complete": True,
+            "next_page_token": None,
+            "resume_token": "observation-anchor",
+            "source_final": False,
+            "warnings": [],
+        }})
+    body = [{{"type": "text", "text": "hello"}}]
+    turn = {{
+        "session_id": "{session_id}",
+        "turn_id": "turn-user-1",
+        "snapshot_sequence": 0,
+        "timestamp": "2026-05-01T00:00:01Z",
+        "role": "user",
+        "parent_turn_id": None,
+        "is_sidechain": False,
+        "is_compaction_boundary": False,
+        "body_state": "inline",
+        "body": body,
+        "body_bytes": 32,
+        "body_sha256": "0f0fe295ef4aae213788b9539dad9a4ffc34333e769f5e2aa33a66c30e7353ea",
+        "canonical_text_sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+    }}
+    if params["turn_projection"] == "user_observation":
+        turn["body_state"] = "omitted_oversize"
+        turn["body"] = None
+        turn["body_bytes"] = 5
+        turn["body_sha256"] = None
+    return envelope({{
+        "read_protocol": "oulipoly.session_turn_pages/v1",
+        "provider_instance_id": "{provider_instance_id}",
+        "settings_id": "{settings_id}",
+        "session_id": "{session_id}",
+        "turn_projection": params["turn_projection"],
+        "snapshot_id": "snapshot-1",
+        "page_index": 0,
+        "page_start_sequence": 0,
+        "turns": [turn],
+        "page_turn_count": 1,
+        "source_bytes_examined": 32,
+        "scan_progress": False,
+        "snapshot_complete": True,
+        "next_page_token": None,
+        "resume_token": "resume-1",
+        "source_final": False,
+        "warnings": [],
+    }})
 
 def capture():
     if mode == "capture_success":
@@ -1460,7 +1493,7 @@ elif subcommand == "session.locate_transcript":
 elif subcommand == "session.enumerate":
     response = enumerate_sessions()
 elif subcommand == "session.read_turns":
-    response = turns()
+    response = turn_page()
 elif subcommand == "session.capture":
     response = capture()
 else:
@@ -1472,8 +1505,9 @@ print(json.dumps(response))
         transcript_path = json_string(transcript_path),
         fixture_dir = json_string(dir),
         session_id = SESSION_ID,
+        provider_instance_id = PROVIDER_INSTANCE_ID,
+        settings_id = SETTINGS_ID,
         native_session_id = NATIVE_SESSION_ID,
-        hostile_session_id = HOSTILE_SESSION_ID,
         hostile_markers = hostile_markers_json(dir),
     )
 }

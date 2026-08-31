@@ -72,6 +72,32 @@ pub(super) fn finalize_completed_attempt(
     if let Some(control) = handle_returned_artifacts_persist_failure(&mut input) {
         return control;
     }
+    if classification.success
+        && let Err(error) = input.result.persist_output_for_invocation(
+            &input.env.state,
+            input.invocation_row_id,
+            &input.invocation.id,
+        )
+    {
+        formatter::emit_stderr(&format!("failed to persist provider output: {error}"));
+        let _ = finalize_retained_outcome_with_contention_retry(
+            input
+                .agent_runtime_services
+                .invocation_lifecycle_service
+                .as_ref(),
+            mapper::completed_finalize_request(
+                &input.env.state,
+                input.invocation_row_id,
+                false,
+                1,
+                Some("output_persistence"),
+                Some("output_persistence_failed"),
+            ),
+        );
+        input.guard.mark_finalized();
+        mark_balanced_attempt_idle(&input, Some(1));
+        return BalancedLoopControl::Return(Ok(1));
+    }
 
     formatter::emit_unknown_diagnostic_if_settled_unknown(
         &input.env.state,
@@ -242,13 +268,35 @@ fn emit_completed_attempt_success(
     classification: &CompletedAttemptClassification,
 ) -> BalancedLoopControl {
     mark_balanced_successful_attempt_idle_and_recheck(input, input.result.exit_code);
-    formatter::emit_success_output(
+    if let Err(error) = formatter::emit_success_output(
         &input.invocation.id,
-        input.result.exit_code,
         classification.error_category.as_deref(),
-        input.result.terminal_reason.as_deref(),
-        &input.result.stdout,
-    );
+        input.result,
+    ) {
+        if let Err(state_error) = input.env.state.mark_invocation_output_delivery_failed(
+            input.invocation_row_id,
+            "payload_or_control",
+            &format!("{:?}", error.kind()),
+            None,
+        ) {
+            formatter::emit_stderr(&format!(
+                "failed to record provider output delivery failure: {state_error}"
+            ));
+        }
+        formatter::emit_stderr(&format!("failed to deliver provider output: {error}"));
+        return BalancedLoopControl::Return(Ok(1));
+    }
+    if input.result.output_spool.is_some()
+        && let Err(error) = input
+            .env
+            .state
+            .mark_invocation_output_delivered(input.invocation_row_id)
+    {
+        formatter::emit_stderr(&format!(
+            "failed to record provider output delivery: {error}"
+        ));
+        return BalancedLoopControl::Return(Ok(1));
+    }
     BalancedLoopControl::Return(Ok(if input.recovered_generic_nonzero {
         0
     } else {

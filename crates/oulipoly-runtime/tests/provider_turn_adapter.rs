@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use chrono::{TimeZone, Utc};
@@ -47,6 +47,8 @@ const SESSION: &str = "provider-session-a";
 const PARENT_UUID: &str = "11111111-1111-1111-1111-111111111111";
 const FIRST_UUID: &str = "22222222-2222-2222-2222-222222222222";
 const SECOND_UUID: &str = "33333333-3333-3333-3333-333333333333";
+
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 type AdapterTurn = TurnRequest<ProviderTurnLaunch, ProviderTurnCallerResult>;
 type AdapterSupervisor = SessionSupervisor<ProviderTurnLaunch, ProviderTurnCallerResult>;
@@ -365,6 +367,7 @@ fn execution_result(
     ExecutionResult {
         stdout: vec![b'r', b'a', b'w', 0, 255],
         stderr: "stderr-exact".to_string(),
+        output_spool: None,
         exit_code: 0,
         provider_index: 4,
         session_capture: SessionCaptureResult {
@@ -1292,6 +1295,13 @@ fn execution_status_does_not_overstate_unconfirmed_or_failure_evidence() {
 
 #[test]
 fn production_executors_preserve_cli_grammar_and_external_request_contracts() {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("fake-provider.sh");
     let args_path = dir.path().join("args.txt");

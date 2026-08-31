@@ -3197,6 +3197,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "toml 1.0.3+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "uuid",

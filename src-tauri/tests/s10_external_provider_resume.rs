@@ -1204,6 +1204,7 @@ fn external_provider_script(record_path: &Path, options: ProviderOptions) -> Str
     format!(
         r#"#!/usr/bin/env python3
 import base64
+import hashlib
 import json
 import os
 import pathlib
@@ -1246,6 +1247,7 @@ def describe():
         "preferred_contract": CONTRACT,
         "capabilities": {{
             "launch": True,
+            "launch_output_v1": True,
             "policy": True,
             "quota": False,
             "session": {session_capability},
@@ -1276,7 +1278,10 @@ def launch_payload():
     return request.get("params", {{}}).get("model", {{}}).get("inputs", {{}}).get("prompt", "")
 
 def launch_stdout_data(payload):
-    return base64.b64encode(("answer:" + payload + "\n").encode("utf-8")).decode("ascii")
+    return base64.b64encode(launch_stdout_bytes(payload)).decode("ascii")
+
+def launch_stdout_bytes(payload):
+    return ("answer:" + payload + "\n").encode("utf-8")
 
 def launch_stdout_event(seq, payload):
     return {{
@@ -1319,8 +1324,25 @@ def launch_exit_event(seq, terminal_signal):
         "session": launch_session_state(),
     }}
 
-def provider_error_exit_event():
-    return launch_exit_event(2, launch_terminal_signal("unknown", {incident_terminal_reason}, 2))
+def launch_output_complete_event(seq, payload):
+    stdout = launch_stdout_bytes(payload)
+    return {{
+        "contract": CONTRACT,
+        "request_id": request_id(),
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
+        "kind": "marker",
+        "name": "oulipoly.launch_output_complete/v1",
+        "value": {{
+            "protocol": "oulipoly.launch_output/v1",
+            "stdout": {{"bytes": len(stdout), "sha256": hashlib.sha256(stdout).hexdigest()}},
+            "stderr": {{"bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()}},
+            "data_event_count": 1,
+        }},
+    }}
+
+def provider_error_exit_event(seq):
+    return launch_exit_event(seq, launch_terminal_signal("unknown", {incident_terminal_reason}, seq))
 
 def clean_exit_event(seq):
     return launch_exit_event(seq, launch_terminal_signal("clean_exit", "fixture clean exit", seq))
@@ -1344,32 +1366,19 @@ def emit_long_launch_heartbeats():
         emit(launch_heartbeat_event(seq, detail))
 
 def launch():
-    emit(launch_stdout_event(1, launch_payload()))
+    payload = launch_payload()
+    emit(launch_stdout_event(1, payload))
     if launch_error_exit_requested():
-        emit(provider_error_exit_event())
+        emit(launch_output_complete_event(2, payload))
+        emit(provider_error_exit_event(3))
         return
-    exit_seq = 2
     if launch_long_stream_requested():
         emit_long_launch_heartbeats()
-        exit_seq = 702
-    emit(clean_exit_event(exit_seq))
-
-def read_turns():
-    params = request.get("params", {{}})
-    extra = params.get("extra", {{}})
-    session_id = params.get("session_id") or extra.get("start_bound_provider_session_id") or extra.get("pinned_target") or SESSION_ID
-    turn_id = "turn-" + extra.get("invocation_uuid", "fixture")[:8]
-    return envelope({{
-        "turns": [{{
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "role": "assistant",
-            "timestamp": "2026-06-01T00:00:00Z",
-            "body": [{{"type": "text", "text": "fixture turn"}}],
-        }}],
-        "turn_count": 1,
-        "complete": True,
-    }})
+        emit(launch_output_complete_event(702, payload))
+        emit(clean_exit_event(703))
+        return
+    emit(launch_output_complete_event(2, payload))
+    emit(clean_exit_event(3))
 
 def capture():
     params = request.get("params", {{}})
@@ -1386,8 +1395,6 @@ elif subcommand == "policy.evaluate":
     print(json.dumps(policy_evaluate()))
 elif subcommand == "launch":
     launch()
-elif subcommand == "session.read_turns":
-    print(json.dumps(read_turns()))
 elif subcommand == "session.capture":
     print(json.dumps(capture()))
 else:

@@ -35,6 +35,10 @@ pub fn run_tauri() {
     crate::wake_coordinator::start_wake_reclaim_maintenance_driver();
     let services = wiring::AgentRuntimeServices::production(runtime_paths)
         .expect(RUNTIME_SERVICES_INIT_EXPECT_MESSAGE);
+    let _session_turn_ingest_driver =
+        crate::session_turn_ingest_driver::start_session_turn_ingest_driver(
+            services.provider_registry_handle.clone(),
+        );
 
     let providers =
         app_paths::load_providers_for_models_dir_with(&models_dir, &*services.providers_config);

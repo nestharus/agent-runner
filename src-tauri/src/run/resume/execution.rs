@@ -102,8 +102,24 @@ pub(in crate::run) fn prepare_headless_resume_execution(
     )?;
     let parent_invocation_id = crate::dispatch::resolve_parent_invocation_id(&env.state);
     let max_attempts = headless_resume_retry_budget(&resolved);
+    if let Err(error) = wake::reconcile_pending_headless_delivery_observations(
+        agent_runtime_services,
+        &resolved,
+        &effective_spawn_cwd,
+    ) {
+        formatter::emit_stderr(&format!(
+            "Warning: Pending mailbox delivery observation recovery failed: {error}"
+        ));
+    }
     let mailbox_delivery =
         wake::prepare_headless_resume_delivery(&resolved, answer, Some(&env.models_dir))?;
+    if crate::wake_coordinator::is_auto_wake_invocation()
+        && mailbox_delivery.seqs.is_empty()
+        && mailbox_delivery.answer.is_none()
+    {
+        wake::release_current_auto_wake_claim(session_id);
+        return Ok(Err(0));
+    }
     Ok(Ok(mapper::prepared_headless_resume_execution(
         mailbox_delivery,
         env,

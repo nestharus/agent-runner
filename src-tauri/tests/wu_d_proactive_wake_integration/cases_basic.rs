@@ -5,7 +5,7 @@
 //! TEST: proactive wake integration orchestration cases (basic wake/resume flows).
 
 use crate::SESSION;
-use crate::fake_cli::{
+use crate::fake_provider::{
     delayed_agent_bash_provider_script, late_consumed_agent_bash_provider_script,
     mixed_consumed_agent_bash_provider_script, provider_script,
 };
@@ -33,7 +33,8 @@ pub(crate) fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once(
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.seed_outer_caller(OUTER_SESSION, OUTER_INVOCATION, OUTER_EVENT);
-    fixture.write_provider(&delayed_agent_bash_provider_script(&agent_bash_bin()));
+    let agent_bash = fixture.install_agent_bash(&agent_bash_bin());
+    fixture.write_provider(&delayed_agent_bash_provider_script(&agent_bash));
 
     let initial = fixture.run_agent("dispatch delayed nested work");
     assert_delayed_dispatch_exit_code_zero(&fixture, &initial);
@@ -61,7 +62,8 @@ pub(crate) fn polled_completion_after_enqueue_does_not_wake_parent() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.seed_outer_caller(OUTER_SESSION, OUTER_INVOCATION, OUTER_EVENT);
-    fixture.write_provider(&late_consumed_agent_bash_provider_script(&agent_bash_bin()));
+    let agent_bash = fixture.install_agent_bash(&agent_bash_bin());
+    fixture.write_provider(&late_consumed_agent_bash_provider_script(&agent_bash));
 
     let initial = fixture.run_agent("dispatch and poll fast nested work");
     assert_exit_code_zero(&initial);
@@ -76,7 +78,8 @@ pub(crate) fn consumed_completion_preserves_unpolled_completion_wake() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.seed_outer_caller(OUTER_SESSION, OUTER_INVOCATION, OUTER_EVENT);
-    fixture.write_provider(&mixed_consumed_agent_bash_provider_script(&agent_bash_bin()));
+    let agent_bash = fixture.install_agent_bash(&agent_bash_bin());
+    fixture.write_provider(&mixed_consumed_agent_bash_provider_script(&agent_bash));
 
     let initial = fixture.run_agent("dispatch consumed and unpolled nested work");
     assert_exit_code_zero(&initial);

@@ -315,7 +315,22 @@ mod tests {
         CapturedChildInvocation, ExecutionResult, SessionCaptureMethod, SessionCaptureResult,
         TerminalSignal,
     };
+    use std::path::Path;
     use std::time::SystemTime;
+
+    fn test_runtime_paths(root: &Path) -> crate::wiring::RuntimePaths {
+        let config_root = root.join("config");
+        let data_root = root.join("data");
+        crate::wiring::RuntimePaths {
+            models_dir: config_root.join("models"),
+            agents_dir: config_root.join("agents"),
+            state_db_path: data_root.join("state.db"),
+            lock_dir: data_root.join("locks"),
+            working_dir: root.join("working"),
+            config_root,
+            data_root,
+        }
+    }
 
     fn result_with_signal(kind: TerminalSignalKind, exit_code: i32) -> ExecutionResult {
         execution_result_with_signal(terminal_signal(kind), exit_code)
@@ -328,6 +343,7 @@ mod tests {
         ExecutionResult {
             stdout: Vec::new(),
             stderr: "ordinary provider failure".to_string(),
+            output_spool: None,
             exit_code,
             provider_index: 0,
             session_capture: SessionCaptureResult {
@@ -355,7 +371,10 @@ mod tests {
 
     #[test]
     fn resume_fallback_typed_signal_parity() {
-        let services = crate::wiring::AgentRuntimeServices::cli_defaults().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let services =
+            crate::wiring::AgentRuntimeServices::production(test_runtime_paths(dir.path()))
+                .unwrap();
         let models = HashMap::new();
 
         let quota = resume_result_error_category(

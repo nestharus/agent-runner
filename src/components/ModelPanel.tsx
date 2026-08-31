@@ -173,9 +173,18 @@ export default function ModelPanel(props: ModelPanelProps) {
 			} catch (err) {
 				setTestResult({
 					success: false,
-					stdout: "",
-					stderr: String(err),
 					exit_code: -1,
+					stdout_preview: "",
+					stdout_preview_truncated: false,
+					stdout_bytes: 0,
+					stdout_sha256: null,
+					stdout_content_type: "text/plain; charset=utf-8",
+					stderr_preview: String(err),
+					stderr_preview_truncated: false,
+					stderr_bytes: String(err).length,
+					stderr_sha256: null,
+					stderr_content_type: "text/plain; charset=utf-8",
+					output_artifact_token: null,
 				});
 			}
 			setTesting(false);
@@ -362,14 +371,16 @@ export default function ModelPanel(props: ModelPanelProps) {
 											{result().exit_code !== 0 &&
 												` (exit ${result().exit_code})`}
 										</div>
-										<Show when={result().stdout}>
+										<Show when={result().stdout_preview}>
 											<pre class="max-h-24 overflow-auto whitespace-pre-wrap font-mono text-[10px] opacity-80">
-												{result().stdout.slice(0, 500)}
+												{result().stdout_preview}
 											</pre>
 										</Show>
-										<Show when={result().stderr && !result().success}>
+										<Show
+											when={result().stderr_preview && !result().success}
+										>
 											<pre class="max-h-24 overflow-auto whitespace-pre-wrap font-mono text-[10px] opacity-80">
-												{result().stderr.slice(0, 500)}
+												{result().stderr_preview}
 											</pre>
 										</Show>
 									</div>

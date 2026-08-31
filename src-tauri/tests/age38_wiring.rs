@@ -6,10 +6,53 @@
 mod wiring;
 
 use oulipoly_runtime::services::{DiagnosticsServicePort, ExecutorServicePort, QuotaServicePort};
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use wiring::{AgentRuntimeServices, RuntimePaths};
+
+struct RuntimePathEnvGuard {
+    previous_data_dir: Option<OsString>,
+    previous_config_home: Option<OsString>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl RuntimePathEnvGuard {
+    fn set(root: &Path) -> Self {
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let lock = ENV_LOCK.lock().unwrap();
+        let previous_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
+        let previous_config_home = std::env::var_os("OULIPOLY_CONFIG_HOME");
+        // SAFETY: this test serializes both environment mutations through ENV_LOCK.
+        unsafe {
+            std::env::set_var("OULIPOLY_DATA_DIR", root.join("data"));
+            std::env::set_var("OULIPOLY_CONFIG_HOME", root.join("config"));
+        }
+        Self {
+            previous_data_dir,
+            previous_config_home,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for RuntimePathEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard still owns ENV_LOCK while restoring both values.
+        unsafe {
+            restore_env("OULIPOLY_DATA_DIR", self.previous_data_dir.take());
+            restore_env("OULIPOLY_CONFIG_HOME", self.previous_config_home.take());
+        }
+    }
+}
+
+unsafe fn restore_env(name: &str, value: Option<OsString>) {
+    match value {
+        Some(value) => unsafe { std::env::set_var(name, value) },
+        None => unsafe { std::env::remove_var(name) },
+    }
+}
 
 fn runtime_paths(root: &std::path::Path) -> RuntimePaths {
     RuntimePaths {
@@ -103,6 +146,7 @@ fn assert_service_port_fields(source: &str) {
 
 fn construct_runtime_services() {
     let dir = tempfile::tempdir().unwrap();
+    let _env = RuntimePathEnvGuard::set(dir.path());
     let _cli_services = AgentRuntimeServices::cli_defaults().expect("CLI services");
     let _production_services =
         AgentRuntimeServices::production(runtime_paths(dir.path())).expect("production services");

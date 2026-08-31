@@ -25,6 +25,7 @@ mod provider_artifact;
 #[path = "commands/provider_settings.rs"]
 pub mod provider_settings;
 mod run_tauri;
+mod session_turn_ingest_driver;
 pub mod setup;
 pub mod terminal_outcome_adapter;
 #[path = "commands/test_model/mod.rs"]

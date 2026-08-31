@@ -26,7 +26,7 @@
 
 use chrono::{Duration, Utc};
 use oulipoly_config::{
-    ModelConfig, ProviderConfig, ProviderEntry, ProvidersConfig, SessionsConfig, model::PromptMode,
+    ModelConfig, ProviderConfig, ProviderEntry, ProvidersConfig, model::PromptMode,
 };
 use oulipoly_runtime::balancer::{BalanceContext, select_provider};
 use oulipoly_runtime::quota::InFlight;
@@ -129,11 +129,9 @@ fn age162_transient_probe_429_does_not_exclude_provider_with_healthy_prior_cache
             ..ProviderEntry::default()
         },
     );
-    let sessions_cfg = SessionsConfig::default();
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 
@@ -209,11 +207,9 @@ fn age162_transient_probe_429_does_not_exclude_first_contact_provider_with_healt
             ..ProviderEntry::default()
         },
     );
-    let sessions_cfg = SessionsConfig::default();
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 

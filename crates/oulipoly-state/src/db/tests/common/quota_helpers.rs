@@ -127,6 +127,53 @@ pub(in crate::db::tests) fn insert_assistant_turns_after(
     let turns = assistant_turns_after(since, count, id_prefix);
     db.ingest_session_turns_batch(provider_name, &turns)
         .unwrap();
+    mark_provider_turn_count_caught_up(db, provider_name, id_prefix);
+}
+
+fn mark_provider_turn_count_caught_up(db: &StateDb, provider_name: &str, id_prefix: &str) {
+    let session_id = assistant_session_id(id_prefix);
+    if db
+        .canonical_session_turn_ingest_freshness(provider_name, &session_id)
+        .unwrap()
+        .is_caught_up()
+    {
+        return;
+    }
+    let key = crate::SessionTurnIngestStreamKey {
+        provider_name: provider_name.to_string(),
+        provider_instance_id: provider_name.to_string(),
+        settings_id: "quota-test-settings".to_string(),
+        session_id,
+        projection: crate::SessionTurnStreamProjection::CanonicalIngest,
+    };
+    db.enqueue_session_turn_ingest_stream(&key).unwrap();
+    let now = Utc::now();
+    let stream = db
+        .lease_ready_session_turn_ingest_stream(
+            crate::SessionTurnStreamProjection::CanonicalIngest,
+            "quota-test-worker",
+            now,
+            now + chrono::Duration::minutes(1),
+        )
+        .unwrap()
+        .unwrap();
+    db.apply_session_turn_page(&crate::SessionTurnPageApply {
+        key,
+        lease_owner: "quota-test-worker".to_string(),
+        expected_generation: stream.checkpoint_generation,
+        request_token_sha256: "1".repeat(64),
+        snapshot_id: format!("{provider_name}-snapshot"),
+        page_index: stream.expected_page_index,
+        page_start_sequence: stream.expected_turn_sequence,
+        page_turn_count: 0,
+        scan_progress: false,
+        snapshot_complete: true,
+        next_page_token: None,
+        resume_token: Some(format!("{provider_name}-resume")),
+        page_digest: "2".repeat(64),
+        turns: Vec::new(),
+    })
+    .unwrap();
 }
 
 fn assistant_turns_after(

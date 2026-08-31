@@ -44,6 +44,40 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 #[cfg(unix)]
+struct TestDataDirGuard {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl TestDataDirGuard {
+    fn set(path: &Path) -> Self {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("OULIPOLY_DATA_DIR");
+        // SAFETY: this test support serializes every mutation through ENV_LOCK.
+        unsafe { std::env::set_var("OULIPOLY_DATA_DIR", path) };
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TestDataDirGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard still owns ENV_LOCK while restoring the prior value.
+        unsafe {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var("OULIPOLY_DATA_DIR", value),
+                None => std::env::remove_var("OULIPOLY_DATA_DIR"),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 pub fn write_executable(path: &std::path::Path, body: &str) {
     std::fs::write(path, body).unwrap();
     let mut perms = std::fs::metadata(path).unwrap().permissions();
@@ -425,6 +459,7 @@ impl StubExecutorService {
             output: Mutex::new(Some(ExecutionResult {
                 stdout: stdout.to_vec(),
                 stderr: stderr.to_string(),
+                output_spool: None,
                 exit_code,
                 provider_index: 0,
                 session_capture: SessionCaptureResult {
@@ -532,6 +567,7 @@ impl ExecutorServicePort for PolicyRecordingExecutorService {
             result: ExecutionResult {
                 stdout: b"ok".to_vec(),
                 stderr: String::new(),
+                output_spool: None,
                 exit_code: 0,
                 provider_index: 0,
                 session_capture: SessionCaptureResult {
@@ -766,7 +802,10 @@ pub fn age38_test_model_success_routes_effective_request_through_stub_ports() {
 
     assert!(result.success);
     assert_eq!(result.exit_code, 0);
-    assert_eq!(result.stdout, String::from_utf8_lossy(stdout).into_owned());
+    assert_eq!(
+        result.stdout_preview,
+        String::from_utf8_lossy(stdout).into_owned()
+    );
     assert_eq!(opener.calls(), vec![db_path]);
     assert_eq!(providers.calls(), vec![dir.path().join("providers.toml")]);
     assert_eq!(routing.calls(), vec!["select:age38-model:true"]);
@@ -1248,7 +1287,7 @@ pub fn test_model_marks_provider_exhausted_on_quota_stderr() {
 
     assert!(!result.success);
     assert_eq!(result.exit_code, 7);
-    assert!(result.stderr.contains("typed quota signal"));
+    assert!(result.stderr_preview.contains("typed quota signal"));
     let db = StateDb::open(&db_path).unwrap();
     let quota = db.get_quota("quota-provider").unwrap().unwrap();
     assert!(quota.exhausted_at.is_some());
@@ -1257,6 +1296,7 @@ pub fn test_model_marks_provider_exhausted_on_quota_stderr() {
 #[cfg(unix)]
 pub fn test_model_migrated_provider_uses_providers_toml_effective_provider() {
     let dir = tempfile::tempdir().unwrap();
+    let _data_dir = TestDataDirGuard::set(dir.path());
     let models_dir = dir.path().join("models");
     std::fs::create_dir_all(&models_dir).unwrap();
     let argv_dump = dir.path().join("test-model-argv.txt");
@@ -1304,8 +1344,8 @@ prompt_mode = "arg"
     let result = test_model_for_test(models, models_dir.clone(), "test-model").unwrap();
 
     assert!(result.success);
-    assert_eq!(result.stdout, "test-model stdout\n");
-    assert_eq!(result.stderr, "test-model stderr\n");
+    assert_eq!(result.stdout_preview, "test-model stdout\n");
+    assert_eq!(result.stderr_preview, "test-model stderr\n");
     assert_eq!(result.exit_code, 0);
     assert_eq!(std::fs::read_to_string(&stdin_dump).unwrap(), "");
     let argv = std::fs::read_to_string(&argv_dump).unwrap();
@@ -1353,15 +1393,15 @@ prompt_mode = "arg"
     assert_eq!(quota_result.exit_code, 7);
     assert!(
         quota_result
-            .stderr
+            .stderr_preview
             .contains("quota exhausted from effective provider"),
         "{}",
-        quota_result.stderr
+        quota_result.stderr_preview
     );
     assert!(
-        !quota_result.stderr.contains("Empty command"),
+        !quota_result.stderr_preview.contains("Empty command"),
         "{}",
-        quota_result.stderr
+        quota_result.stderr_preview
     );
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
     // AGE-166: substring quota detection was removed in PR #126; this
@@ -1378,6 +1418,7 @@ prompt_mode = "arg"
 #[cfg(unix)]
 pub fn test_model_raw_sigterm_returns_unified_signal_exit_code() {
     let dir = tempfile::tempdir().unwrap();
+    let _data_dir = TestDataDirGuard::set(dir.path());
     let models_dir = dir.path().join("models");
     std::fs::create_dir_all(&models_dir).unwrap();
     let model = ModelConfig {

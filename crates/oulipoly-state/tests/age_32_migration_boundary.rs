@@ -107,7 +107,15 @@ fn schema_18_migration_installs_the_running_projection_index() {
     let mut connection = Connection::open(&db_path).unwrap();
     connection
         .execute_batch(
-            "DROP INDEX idx_invocations_parent_running_created;
+            "DROP INDEX idx_session_turns_canonical_text_sha256;
+             DROP TABLE session_turn_ingest_streams;
+             ALTER TABLE session_turns DROP COLUMN canonical_text_digest_verified;
+             ALTER TABLE session_turns DROP COLUMN canonical_text_sha256;
+             ALTER TABLE session_turns DROP COLUMN body_bytes;
+             ALTER TABLE session_turns DROP COLUMN body_sha256;
+             ALTER TABLE session_turns DROP COLUMN body_state;
+             ALTER TABLE session_turns DROP COLUMN ingest_digest;
+             DROP INDEX idx_invocations_parent_running_created;
              DROP INDEX idx_invocations_running_parent;
              PRAGMA user_version = 18;",
         )
@@ -293,9 +301,11 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             16,
             17,
             18,
+            19,
+            20,
             CURRENT_SCHEMA_VERSION,
         ],
-        "schema-4 DBs must take every ordered migration through running-projection schema 19"
+        "schema-4 DBs must take every ordered migration through the current schema"
     );
     assert_eq!(
         plan_ids(&plan),
@@ -315,6 +325,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0017_completion_registration_authority",
             "0018_invocation_completion_materialization_summary",
             "0019_invocation_running_projection_index",
+            "0020_session_turn_pages",
+            "0021_invocation_output_delivery",
         ]
     );
 }

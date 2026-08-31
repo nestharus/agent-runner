@@ -1410,7 +1410,7 @@ fn production_tui_pre_submission_fault_sends_no_provider_input() {
 }
 
 #[test]
-fn real_broker_confirmation_fault_recovers_from_transcript_without_retransmit() {
+fn real_broker_confirmation_fault_ignores_legacy_transcript_without_retransmit() {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("confirmation-fault-received.log");
     let script = fixture_provider_waiting_for_two_notifications(fixture.dir.path(), &received_log);
@@ -1434,7 +1434,7 @@ fn real_broker_confirmation_fault_recovers_from_transcript_without_retransmit() 
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
     fixture.associate_observed_completion_authority(&invocation_uuid);
-    let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+    let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
     let fault = Connection::open(fixture.sidecar_path()).unwrap();
     fault
         .execute_batch(
@@ -1551,17 +1551,10 @@ fn real_broker_confirmation_fault_recovers_from_transcript_without_retransmit() 
     assert_success(&confirmed);
     let confirmed_value = stdout_json(&confirmed);
     assert_eq!(
-        confirmed_value["pty_delivery"]["status"], "acked",
-        "unexpected transcript-confirmed diagnostic: {confirmed_value}"
+        confirmed_value["pty_delivery"]["status"], "submission_uncertain",
+        "legacy transcript content must not confirm delivery: {confirmed_value}"
     );
-    read_pty_until_file_occurrences(
-        pty.master.as_raw_fd(),
-        &received_log,
-        "[END OULIPOLY NOTIFICATIONS]",
-        2,
-        Duration::from_secs(5),
-    );
-    assert!(repl.wait().unwrap().success());
+    thread::sleep(Duration::from_millis(200));
 
     let received = fs::read_to_string(&received_log).unwrap();
     assert_eq!(
@@ -1570,8 +1563,8 @@ fn real_broker_confirmation_fault_recovers_from_transcript_without_retransmit() 
             .count(),
         1
     );
-    assert!(received.contains("handle: h-confirmation-fault-recovery"));
-    assert!(received.contains("handle: h-confirmation-fault-confirmed"));
+    assert!(!received.contains("handle: h-confirmation-fault-recovery"));
+    assert!(!received.contains("handle: h-confirmation-fault-confirmed"));
     assert_eq!(
         received
             .matches(&format!("[OULIPOLY-DELIVERY {attempt_id}]"))
@@ -1579,7 +1572,7 @@ fn real_broker_confirmation_fault_recovers_from_transcript_without_retransmit() 
         1
     );
     let mailbox = fixture.mailbox();
-    assert!(mailbox.list_pending(SESSION_A).unwrap().is_empty());
+    assert_eq!(mailbox.list_pending(SESSION_A).unwrap().len(), 3);
     let attempts: i64 = Connection::open(fixture.sidecar_path())
         .unwrap()
         .query_row(
@@ -1588,12 +1581,16 @@ fn real_broker_confirmation_fault_recovers_from_transcript_without_retransmit() 
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(attempts, 2);
+    assert_eq!(attempts, 1);
     assert_eq!(
         state_delivery_evidence_counts(&fixture, &attempt_id),
         (0, 0),
-        "transcript confirmation must not be mislabeled as PTY transport-ACK evidence"
+        "legacy transcript content must not be mislabeled as PTY transport-ACK evidence"
     );
+    unsafe {
+        libc::kill(child_identity.os_pid as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = repl.wait().unwrap();
     fixture.assert_default_user_paths_untouched();
 }
 

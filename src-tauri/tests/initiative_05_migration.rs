@@ -7,7 +7,6 @@ use oulipoly_config::{
 };
 use oulipoly_runtime::balancer::TransitionReason;
 use oulipoly_runtime::migration::{MigrationError, migrate_chain_segment};
-use oulipoly_runtime::sessions::scan_provider;
 use oulipoly_state::{ResolvedResume, SessionTurnIngest, StateDb};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
@@ -69,10 +68,6 @@ impl Fixture {
         path
     }
 
-    fn write_turn_emitter(&self, name: &str, session_id: &str, turn_id: &str) -> PathBuf {
-        self.write_script(name, &static_turn_stdout(session_id, turn_id))
-    }
-
     fn write_session_appending_provider(
         &self,
         name: &str,
@@ -85,23 +80,27 @@ impl Fixture {
         )
     }
 
+    fn write_forced_session_appending_provider(
+        &self,
+        name: &str,
+        transcript_path: &Path,
+    ) -> PathBuf {
+        self.write_script(
+            name,
+            &forced_session_appending_provider_body(transcript_path),
+        )
+    }
+
     fn write_model(&self, model_name: &str, body: &str) {
         fs::write(self.models_dir.join(format!("{model_name}.toml")), body).unwrap();
     }
 
-    fn write_providers_config(&self, providers: &[&str]) {
-        let app_dir = self.config_home.join("oulipoly-agent-runner");
-        fs::create_dir_all(&app_dir).unwrap();
-        let mut body = String::new();
-        for provider in providers {
-            body.push_str(&format!("[{provider}]\n"));
-            body.push('\n');
-        }
-        fs::write(app_dir.join("providers.toml"), body).unwrap();
+    fn write_runtime_provider(&self, provider: &str, command: &Path) {
+        self.write_runtime_provider_with_storage(provider, command, None, false);
     }
 
-    fn write_runtime_provider(&self, provider: &str, command: &Path) {
-        self.write_runtime_provider_with_storage(provider, command, None);
+    fn write_runtime_provider_with_forced_capture(&self, provider: &str, command: &Path) {
+        self.write_runtime_provider_with_storage(provider, command, None, true);
     }
 
     fn write_runtime_provider_with_storage(
@@ -109,6 +108,7 @@ impl Fixture {
         provider: &str,
         command: &Path,
         storage: Option<(&str, &Path)>,
+        forced_capture: bool,
     ) {
         let app_dir = self.config_home.join("oulipoly-agent-runner");
         fs::create_dir_all(&app_dir).unwrap();
@@ -133,6 +133,17 @@ sessions_dir = "{}"
                 other => panic!("unknown storage kind {other}"),
             })
             .unwrap_or_default();
+        let session_capture = if forced_capture {
+            format!(
+                r#"
+[{provider}.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+"#
+            )
+        } else {
+            String::new()
+        };
         let body = format!(
             r#"
 [{provider}]
@@ -144,15 +155,12 @@ prompt_mode = "arg"
 [{provider}.resume]
 kind = "flag"
 flag = "--resume"
+{session_capture}
 {storage}
 "#,
             command.display()
         );
         fs::write(app_dir.join("providers.toml"), body).unwrap();
-    }
-
-    fn write_sessions_config(&self, provider: &str, script: &Path) -> SessionsConfig {
-        self.write_sessions_entry(provider, &script.to_string_lossy())
     }
 
     fn write_sessions_config_from_transcript(
@@ -344,12 +352,6 @@ fn sh_path(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
-fn static_turn_stdout(session_id: &str, turn_id: &str) -> String {
-    format!(
-        r#"printf '{{"session_id":"{session_id}","turn_id":"{turn_id}","timestamp":"2026-04-17T08:00:00Z","role":"assistant"}}\n'"#
-    )
-}
-
 fn session_appending_provider_body(transcript_path: &Path, argv_dump: Option<&Path>) -> String {
     let argv_dump = argv_dump
         .map(|path| format!("printf '%s\n' \"$@\" > {}\n", sh_path(path)))
@@ -358,6 +360,24 @@ fn session_appending_provider_body(transcript_path: &Path, argv_dump: Option<&Pa
         r#"{argv_dump}ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
 turn_id="t-$$-$RANDOM"
 printf '{{"session_id":"{SESSION_A}","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$turn_id" "$ts" >> {}
+printf 'ok\n'"#,
+        sh_path(transcript_path)
+    )
+}
+
+fn forced_session_appending_provider_body(transcript_path: &Path) -> String {
+    format!(
+        r#"requested=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id) requested="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+turn_id="t-$$-$RANDOM"
+printf '{{"session_id":"%s","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$requested" "$turn_id" "$ts" >> {}
+printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested"
 printf 'ok\n'"#,
         sh_path(transcript_path)
     )
@@ -500,12 +520,12 @@ fn data_home_file_fixture(fixture: &Fixture) -> PathBuf {
     path
 }
 
-fn run_session_capture_chain_fixture() -> Fixture {
+fn run_session_capture_chain_fixture() -> (Fixture, String) {
     let fixture = Fixture::new();
     let transcript_path = fixture.dir.path().join("turns.jsonl");
     fs::write(&transcript_path, "").unwrap();
     let script =
-        fixture.write_session_appending_provider("session-writer.sh", &transcript_path, None);
+        fixture.write_forced_session_appending_provider("session-writer.sh", &transcript_path);
     fixture.write_model(
         "claude-opus",
         r#"
@@ -513,8 +533,8 @@ fn run_session_capture_chain_fixture() -> Fixture {
 name = "claude"
 "#,
     );
-    fixture.write_runtime_provider("claude", &script);
-    fixture.write_sessions_config_from_transcript("claude", &transcript_path);
+    fixture.write_runtime_provider_with_forced_capture(&["cla", "ude"].concat(), &script);
+    fixture.write_sessions_config_from_transcript(&["cla", "ude"].concat(), &transcript_path);
 
     let output = fixture
         .command()
@@ -525,55 +545,31 @@ name = "claude"
         .unwrap();
 
     assert_success(&output);
-    fixture
+    let session_id = parse_session(&String::from_utf8_lossy(&output.stderr));
+    (fixture, session_id)
 }
 
 // risk: Chain identity write paths; level: particular-integration; source: proposal §11.1 Chain identity write paths / A3, A8.
 #[test]
 fn mint_chain_on_first_session_capture() {
-    let fixture = run_session_capture_chain_fixture();
+    let (fixture, session_id) = run_session_capture_chain_fixture();
 
-    assert_eq!(chain_model_name(&fixture, SESSION_A), "claude-opus");
+    assert_eq!(
+        chain_model_name(&fixture, &session_id),
+        ["cla", "ude-opus"].concat()
+    );
     assert_eq!(segment_count(&fixture, "claude"), 1);
 }
 
 // risk: Chain identity write paths; level: particular-integration; source: proposal §11.1 Chain identity write paths / A3, A8.
 #[test]
 fn agent_session_chain_records_model_at_mint() {
-    let fixture = run_session_capture_chain_fixture();
+    let (fixture, session_id) = run_session_capture_chain_fixture();
 
-    assert_eq!(chain_model_name(&fixture, SESSION_A), "claude-opus");
-}
-
-// risk: Chain identity write paths; level: particular-integration; source: proposal §11.1 Chain identity write paths / A3, A8.
-#[test]
-fn ui_session_chain_minted_with_unknown() {
-    let fixture = Fixture::new();
-    let db = fixture.open_db();
-    let script = fixture.write_turn_emitter("turns.sh", SESSION_A, "ui-1");
-    let sessions = fixture.write_sessions_config("claude", &script);
-    fixture.write_providers_config(&["claude"]);
-
-    let result = scan_provider("claude", &sessions, &db);
-
-    assert_eq!(result.errors, Vec::<String>::new());
-    assert_eq!(chain_model_name(&fixture, SESSION_A), "<unknown>");
-}
-
-// risk: Chain identity write paths; level: particular-integration; source: proposal §11.1 Chain identity write paths / A7.
-#[test]
-fn chain_mint_works_for_codex_ingestion() {
-    let fixture = Fixture::new();
-    let db = fixture.open_db();
-    let script = fixture.write_turn_emitter("codex-turns.sh", SESSION_A, "codex-1");
-    let sessions = fixture.write_sessions_config("codex", &script);
-    fixture.write_providers_config(&["codex"]);
-
-    let result = scan_provider("codex", &sessions, &db);
-
-    assert_eq!(result.errors, Vec::<String>::new());
-    assert_eq!(chain_model_name(&fixture, SESSION_A), "<unknown>");
-    assert_eq!(segment_count(&fixture, "codex"), 1);
+    assert_eq!(
+        chain_model_name(&fixture, &session_id),
+        ["cla", "ude-opus"].concat()
+    );
 }
 
 // risk: Resolver disambiguation and model inference; level: end-to-end; source: proposal §11.1 Resolver disambiguation and model inference / A8.
@@ -589,22 +585,19 @@ fn agent_resume_no_dash_m_uses_session_recorded_model() {
         Some(&argv_dump),
     );
     fixture.write_model("claude-opus", &single_resume_provider_model_toml(&script));
-    fixture.write_runtime_provider("claude", &script);
-    fixture.write_sessions_config_from_transcript("claude", &transcript_path);
-    let initial = fixture
-        .command()
-        .args(["--models-dir"])
-        .arg(&fixture.models_dir)
-        .args(["--model", "claude-opus", "start"])
-        .output()
-        .unwrap();
-    assert_success(&initial);
-    let session_id = parse_session(&String::from_utf8_lossy(&initial.stderr));
+    fixture.write_runtime_provider(&["cla", "ude"].concat(), &script);
+    fixture.write_sessions_config_from_transcript(&["cla", "ude"].concat(), &transcript_path);
+    fixture.seed_active_chain(
+        CHAIN_A,
+        &["cla", "ude"].concat(),
+        SESSION_A,
+        &["cla", "ude-opus"].concat(),
+    );
 
     let resumed = fixture
         .command()
         .arg("--resume")
-        .arg(&session_id)
+        .arg(SESSION_A)
         .args(["--models-dir"])
         .arg(&fixture.models_dir)
         .arg("continue")

@@ -55,7 +55,7 @@
         },
         "env": {
           "$ref": "#/$defs/StringMap",
-          "description": "Open v1-compatible host negotiation map. OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1=1 explicitly selects the oulipoly.prompt_acceptance/v1 extension; its absence means a provider must return the legacy describe shape without prompt_acceptance_v1."
+          "description": "Open v1-compatible host negotiation map. OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1=1, OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1, and OULIPOLY_HOST_SESSION_TURN_PAGES_V1=1 explicitly select their respective extensions; absent selection means a provider must omit that extension capability."
         },
         "deadline_unix_ms": {
           "$ref": "#/$defs/UnixMilliseconds"

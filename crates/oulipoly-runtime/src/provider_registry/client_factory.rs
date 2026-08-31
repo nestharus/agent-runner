@@ -5,6 +5,7 @@ use oulipoly_provider::client::{
 };
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use oulipoly_provider::stream::LaunchEventObserver;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct ProviderClientFactory {
@@ -32,6 +33,21 @@ impl ProviderClientFactory {
             self.options
                 .clone()
                 .with_cancellation(Some(cancellation.clone())),
+        )
+    }
+
+    pub(crate) fn client_for_with_cancellation_and_timeout(
+        &self,
+        artifact: ProviderArtifactRef,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+    ) -> ProviderClient {
+        ProviderClient::new(
+            artifact,
+            self.options
+                .clone()
+                .with_cancellation(Some(cancellation.clone()))
+                .with_timeout(timeout),
         )
     }
 

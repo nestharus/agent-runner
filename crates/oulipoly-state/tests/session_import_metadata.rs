@@ -81,6 +81,12 @@ fn schema_v9_to_current_metadata_migration_is_additive() {
     let mut conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE preserved_rows (id INTEGER PRIMARY KEY, label TEXT NOT NULL);
+         CREATE TABLE session_turns (
+             provider_name TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             turn_id TEXT NOT NULL,
+             PRIMARY KEY (provider_name, session_id, turn_id)
+         );
          INSERT INTO preserved_rows (id, label) VALUES (1, 'keep-me');
          PRAGMA user_version = 9;",
     )

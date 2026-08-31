@@ -63,8 +63,18 @@ use oulipoly_runtime::executor::cli::{
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 fn argv_dump_script() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
     let dir = tempfile::tempdir().unwrap();
     let argv_dump = dir.path().join("argv.txt");
     let path = dir.path().join("argv-dump.sh");

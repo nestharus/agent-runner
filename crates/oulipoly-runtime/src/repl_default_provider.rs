@@ -785,11 +785,6 @@ interactive_args = ["ok"]
         .unwrap()
     }
 
-    fn single_string_column(db_path: &Path, sql: &str) -> String {
-        let conn = Connection::open(db_path).unwrap();
-        conn.query_row(sql, [], |row| row.get(0)).unwrap()
-    }
-
     #[cfg(unix)]
     fn toml_path(path: &Path) -> String {
         path.to_string_lossy()
@@ -871,6 +866,11 @@ exit 17"#,
 
     #[test]
     fn production_services_match_known_baseline_for_none_and_some_project() {
+        let config_home = tempfile::tempdir().unwrap();
+        let _env = crate::quota::marker_verification::test_support::EnvGuard::set(
+            oulipoly_state::paths::CONFIG_HOME_ENV,
+            config_home.path(),
+        );
         let without_project = RuntimeServices::production(None).unwrap();
 
         assert!(
@@ -1221,7 +1221,7 @@ unset_environment = ["OPENAI_API_KEY"]
 
     #[cfg(unix)]
     #[test]
-    fn registers_ingested_session_chain() {
+    fn legacy_turn_script_does_not_register_a_session_chain_synchronously() {
         const SESSION_ID: &str = "session-from-new-repl";
 
         let temp = tempfile::tempdir().unwrap();
@@ -1254,30 +1254,15 @@ turn_script = "{}"
 
         assert_eq!(code, 0);
         assert_eq!(table_count(&state_path, "invocations"), 1);
-        assert_eq!(table_count(&state_path, "session_chains"), 1);
-        assert_eq!(table_count(&state_path, "session_chain_segments"), 1);
+        assert_eq!(table_count(&state_path, "session_chains"), 0);
+        assert_eq!(table_count(&state_path, "session_chain_segments"), 0);
         let (model_name, provider_name, status, provider_session_id, capture_method) =
             invocation_row(&state_path);
         assert_eq!(model_name, "<unknown>");
         assert_eq!(provider_name, "generic");
         assert_eq!(status, "succeeded");
-        assert_eq!(provider_session_id.as_deref(), Some(SESSION_ID));
-        assert_eq!(capture_method.as_deref(), Some("turn_script"));
-        assert_eq!(
-            single_string_column(&state_path, "SELECT model_name FROM session_chains"),
-            "<unknown>"
-        );
-        assert_eq!(
-            single_string_column(
-                &state_path,
-                "SELECT provider_name FROM session_chain_segments"
-            ),
-            "generic"
-        );
-        assert_eq!(
-            single_string_column(&state_path, "SELECT session_id FROM session_chain_segments"),
-            SESSION_ID
-        );
+        assert_eq!(provider_session_id, None);
+        assert_eq!(capture_method, None);
     }
 
     #[test]

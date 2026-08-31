@@ -143,7 +143,7 @@ impl StateDb {
         terminal_reason: Option<&str>,
         finished_at: &str,
     ) -> sqlite::Result<usize> {
-        conn.execute(
+        let updated = conn.execute(
             "UPDATE invocations
              SET status = ?1,
                  success = ?2,
@@ -162,7 +162,14 @@ impl StateDb {
                 id,
                 InvocationStatus::Running.as_str(),
             ],
-        )
+        )?;
+        conn.execute(
+            "UPDATE invocation_output_deliveries
+             SET provider_outcome_state = 'settled', updated_at = ?2
+             WHERE invocation_id = ?1",
+            sqlite::params![id, finished_at],
+        )?;
+        Ok(updated)
     }
 
     pub(super) fn validate_invocation_final_row_updated(

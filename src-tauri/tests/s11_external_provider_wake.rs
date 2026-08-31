@@ -77,7 +77,6 @@ impl Fixture {
         cmd.env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
             .env("HOME", &self.home_dir)
-            .env_remove("OULIPOLY_CONFIG_HOME")
             .env("S11_WORK_DIR", &self.work_dir)
             .env(
                 "OULIPOLY_DATA_DIR",
@@ -481,7 +480,45 @@ fn prompt_acceptance_marker_requires_declared_capability() {
 }
 
 #[test]
-fn accepted_owner_session_consumes_detached_child_completion_despite_ingest_evidence_loss() {
+fn bounded_post_anchor_user_observation_confirms_mailbox_without_attestation_or_turn_script() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let resumed = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_READ_TURNS_DELAY_MS", "2500"),
+        ],
+    );
+
+    assert_eq!(resumed.status.code(), Some(1), "{resumed:?}");
+    let delivered = fixture.mailbox_row(notification.seq);
+    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
+    let evidence: (Option<String>, Option<String>, Option<String>) =
+        Connection::open(fixture.sidecar_path())
+            .unwrap()
+            .query_row(
+                "SELECT observation_anchor_token, observation_expected_sha256,
+                        observation_confirmed_turn_id
+                 FROM mailbox_delivery_attempts
+                 ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert!(evidence.0.is_some());
+    assert_eq!(evidence.1.as_deref().map(str::len), Some(64));
+    assert!(evidence.2.is_some());
+}
+
+#[test]
+fn accepted_owner_session_consumes_detached_child_completion_without_history_scan() {
     for provider in OPENCODE_PROVIDERS {
         assert_owner_session_consumes_detached_child_completion(provider);
     }
@@ -627,7 +664,7 @@ fn trusted_prompt_acceptance_settles_mailbox_delivery_when_final_exit_is_missing
 }
 
 #[test]
-fn absent_prompt_acceptance_retries_nonzero_and_missing_final_exit_delivery() {
+fn absent_prompt_acceptance_is_reconciled_before_nonzero_and_missing_exit_replay() {
     for (label, failure_environment) in [
         (
             "provider-nonzero",
@@ -670,18 +707,20 @@ fn absent_prompt_acceptance_retries_nonzero_and_missing_final_exit_delivery() {
         assert_eq!(delivered.delivery_attempts, 2, "{label}: {delivered:?}");
         let prompts = fixture.recorded_resume_prompts();
         assert_eq!(prompts.len(), 2, "{label}: {prompts:#?}");
-        assert!(
+        assert_eq!(
             prompts
                 .iter()
-                .all(|prompt| prompt.contains("age291-detached-child")),
-            "{label}: pending delivery must replay exactly once: {prompts:#?}"
+                .filter(|prompt| prompt.contains("age291-detached-child"))
+                .count(),
+            1,
+            "{label}: bounded observation must suppress duplicate delivery: {prompts:#?}"
         );
         fixture.assert_xdg_isolated();
     }
 }
 
 #[test]
-fn wrong_prompt_acceptance_session_and_nonce_retry_failed_delivery() {
+fn wrong_prompt_acceptance_session_and_nonce_are_reconciled_before_replay() {
     for (label, mismatch_environment, failure_environment) in [
         (
             "wrong-session-provider-nonzero",
@@ -740,12 +779,13 @@ fn wrong_prompt_acceptance_session_and_nonce_retry_failed_delivery() {
         assert_eq!(delivered.delivery_attempts, 2, "{label}: {delivered:?}");
         let prompts = fixture.recorded_resume_prompts();
         assert_eq!(prompts.len(), 2, "{label}: {prompts:#?}");
-        assert!(
+        assert_eq!(
             prompts
                 .iter()
-                .all(|prompt| prompt.contains("age291-detached-child")),
-            "{label}: mismatched acceptance must retain the exact delivery for replay: \
-             {prompts:#?}"
+                .filter(|prompt| prompt.contains("age291-detached-child"))
+                .count(),
+            1,
+            "{label}: bounded observation must suppress duplicate delivery: {prompts:#?}"
         );
         fixture.assert_xdg_isolated();
     }
@@ -872,10 +912,12 @@ fn ordinary_completion_survives_mailbox_projection_failure_without_replay() {
         "continue owning workflow",
         &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
     );
-    let first_result = result_envelope(&first);
-    let first_invocation_uuid = first_result["id"].as_str().unwrap();
-    assert_eq!(first_result["status"], "succeeded");
-    assert_eq!(first_result["exit_code"], 0);
+    assert_eq!(first.status.code(), Some(1), "{first:?}");
+    assert_eq!(
+        first.stdout,
+        b"owner consumed detached child result and continued\n"
+    );
+    let first_invocation_uuid = fixture.latest_invocation_uuid();
     let pending = fixture.mailbox_row(notification.seq);
     assert!(pending.delivered_at.is_none(), "{pending:?}");
     let durable = Connection::open(fixture.state_path())
@@ -889,7 +931,7 @@ fn ordinary_completion_survives_mailbox_projection_failure_without_replay() {
                     )
              FROM invocations
              WHERE invocation_uuid = ?1",
-            [first_invocation_uuid],
+            [first_invocation_uuid.as_str()],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -914,7 +956,7 @@ fn ordinary_completion_survives_mailbox_projection_failure_without_replay() {
     assert!(delivered.delivered_at.is_some(), "{delivered:?}");
     assert_eq!(
         delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(first_invocation_uuid)
+        Some(first_invocation_uuid.as_str())
     );
     let prompts = fixture.recorded_resume_prompts();
     assert_eq!(prompts.len(), 2, "{prompts:#?}");
@@ -955,16 +997,8 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
     let positive = Fixture::with_provider(provider);
     positive.write_external_provider();
     positive.remove_turn_script_fallback();
-    let owner = positive.run_agent_with_env(
-        "owner waits for detached child",
-        &[("S11_READ_TURNS_STDOUT_LIMIT", "1")],
-    );
+    let owner = positive.run_agent_with_env("owner waits for detached child", &[]);
     assert_success(&owner);
-    let owner_stderr = String::from_utf8_lossy(&owner.stderr);
-    assert!(
-        owner_stderr.contains("session.read_turns: stdout_limit_exceeded"),
-        "incident ingest condition missing from owning log:\n{owner_stderr}"
-    );
     let owner_invocation_uuid = positive.latest_invocation_uuid();
     let notification = positive.seed_detached_child_completion(&owner_invocation_uuid);
 
@@ -973,18 +1007,20 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
         &[
             ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1"),
-            ("S11_READ_TURNS_STDOUT_LIMIT", "1"),
         ],
     );
-    let resumed_result = result_envelope(&resumed);
-    let resumed_invocation_uuid = resumed_result["id"].as_str().unwrap();
+    assert_success(&resumed);
+    assert_eq!(
+        resumed.stdout,
+        b"owner consumed detached child result and continued\n"
+    );
+    let resumed_invocation_uuid = positive.latest_invocation_uuid();
     let resumed_stderr = String::from_utf8_lossy(&resumed.stderr);
     assert_eq!(
         positive.latest_resume_acceptance(),
         (None, None),
         "prompt acceptance and session-resume acceptance are distinct durable entities"
     );
-    assert_eq!(resumed_result["exit_code"], 0);
     let (provider_name, provider_session_id) = positive.latest_resumed_provider_identity();
     assert_eq!(provider_session_id, SESSION);
     assert_eq!(provider_name, provider);
@@ -997,9 +1033,9 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
     assert_eq!(delivered.delivery_attempts, 1);
     assert_eq!(
         delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(resumed_invocation_uuid)
+        Some(resumed_invocation_uuid.as_str())
     );
-    let trace = positive.run_trace(resumed_invocation_uuid);
+    let trace = positive.run_trace(&resumed_invocation_uuid);
     assert_success(&trace);
     let trace: Value = serde_json::from_slice(&trace.stdout).unwrap();
     assert_eq!(trace["root"]["session"]["transcript_state"], "no_locator");
@@ -1019,7 +1055,6 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
         &[
             ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_NO_ASSISTANT_RESULT", "1"),
-            ("S11_READ_TURNS_STDOUT_LIMIT", "1"),
         ],
     );
     let unconfirmed_result = result_envelope(&unconfirmed);
@@ -1061,9 +1096,6 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
         String::from_utf8_lossy(&resumed.stdout),
         resumed_stderr,
     );
-    assert_eq!(resumed_result["status"], "succeeded");
-    assert_eq!(resumed_result["success"], true);
-    assert!(resumed_result["error_category"].is_null());
 }
 
 #[test]
@@ -1099,6 +1131,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 CONTRACT = "oulipoly.provider/v1"
 PROMPT_ACCEPTANCE = "oulipoly.prompt_acceptance/v1"
@@ -1119,9 +1152,11 @@ def envelope(request, result):
 def describe(request):
     capabilities = {
         "launch": True,
+        "launch_output_v1": True,
         "policy": True,
         "quota": False,
         "session": True,
+        "session_turn_pages_v1": True,
         "terminal": False,
         "rotation": False,
         "discovery": False,
@@ -1230,6 +1265,29 @@ def produced_assistant_response_marker_event(request, seq):
         "value": True,
     }
 
+def launch_output_complete_event(request, seq, stdout_payloads):
+    stdout = "".join(stdout_payloads).encode("utf-8")
+    return {
+        "contract": CONTRACT,
+        "request_id": request_id(request),
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
+        "kind": "marker",
+        "name": "oulipoly.launch_output_complete/v1",
+        "value": {
+            "protocol": "oulipoly.launch_output/v1",
+            "stdout": {
+                "bytes": len(stdout),
+                "sha256": hashlib.sha256(stdout).hexdigest(),
+            },
+            "stderr": {
+                "bytes": 0,
+                "sha256": hashlib.sha256(b"").hexdigest(),
+            },
+            "data_event_count": len(stdout_payloads),
+        },
+    }
+
 def exit_event(request, seq, session_id):
     code = 29 if os.environ.get("S11_EXIT_NONZERO") == "1" else 0
     event = {
@@ -1261,6 +1319,7 @@ def launch(request):
         with prompt_log.open("a") as stream:
             stream.write(json.dumps(prompt, separators=(",", ":")) + "\n")
         seq = 1
+        stdout_payloads = []
         produced_assistant_response = False
         if os.environ.get("S11_NO_ASSISTANT_RESULT") != "1":
             text = "resumed\n"
@@ -1269,6 +1328,7 @@ def launch(request):
                 pathlib.Path(os.environ["S11_WORK_DIR"]).joinpath("affirmative-result").write_text(text)
                 produced_assistant_response = True
             emit(stdout_event(request, seq, text))
+            stdout_payloads.append(text)
             seq += 1
         if os.environ.get("S11_EMIT_PROMPT_ACCEPTANCE_MARKER") == "1":
             emit(prompt_acceptance_marker_event(request, seq, known, prompt))
@@ -1276,6 +1336,8 @@ def launch(request):
         if produced_assistant_response:
             emit(produced_assistant_response_marker_event(request, seq))
             seq += 1
+        emit(launch_output_complete_event(request, seq, stdout_payloads))
+        seq += 1
         if os.environ.get("S11_OMIT_EXIT_EVENT") != "1":
             emit(exit_event(request, seq, known))
         return
@@ -1284,7 +1346,10 @@ def launch(request):
     if session_id:
         emit(provider_session_marker_event(request, seq, session_id))
         seq += 1
-    emit(stdout_event(request, seq, "initial\n"))
+    initial = "initial\n"
+    emit(stdout_event(request, seq, initial))
+    seq += 1
+    emit(launch_output_complete_event(request, seq, [initial]))
     emit(exit_event(request, seq + 1, session_id))
 
 def session_id_from_request(request):
@@ -1292,28 +1357,73 @@ def session_id_from_request(request):
     extra = params.get("extra", {})
     return params.get("session_id") or extra.get("start_bound_provider_session_id") or SESSION
 
-def read_turns(request):
-    if os.environ.get("S11_READ_TURNS_STDOUT_LIMIT") == "1":
-        sys.stdout.write("x" * (2 * 1024 * 1024))
-        return None
-    session_id = session_id_from_request(request)
-    return envelope(request, {
-        "turns": [{
-            "session_id": session_id,
-            "turn_id": "turn-s11-external-runtime",
-            "role": "assistant",
-            "timestamp": "2026-06-06T00:00:00Z",
-            "body": [{"type": "text", "text": "fixture turn"}],
-        }],
-        "turn_count": 1,
-        "complete": True,
-    })
-
 def capture(request):
     return envelope(request, {
         "provider_session_id": session_id_from_request(request),
         "state": {"captured": True},
         "artifacts": [],
+    })
+
+def session_turn_page(request):
+    params = request.get("params", {})
+    projection = params.get("turn_projection")
+    start_mode = params.get("start_mode")
+    prompt_log = pathlib.Path(os.environ["S11_WORK_DIR"]).joinpath("resume-prompts.jsonl")
+    prompts = []
+    if prompt_log.exists():
+        prompts = [json.loads(line) for line in prompt_log.read_text().splitlines() if line]
+    provider_instance_id = request.get("provider_instance_id")
+    settings_id = params.get("settings_id")
+    if start_mode == "tail":
+        turns = []
+        resume_token = "s11-anchor:" + str(len(prompts))
+        snapshot_id = "s11-tail:" + str(len(prompts))
+    elif projection == "user_observation":
+        after_token = params.get("after_token") or "s11-anchor:0"
+        start = int(after_token.rsplit(":", 1)[1])
+        selected = prompts[start:start + params.get("max_turns", 1)]
+        turns = []
+        for offset, prompt in enumerate(selected):
+            normalized = prompt.replace("\r\n", "\n").replace("\r", "\n").strip()
+            turns.append({
+                "session_id": SESSION,
+                "turn_id": "s11-observed-user-" + str(start + offset + 1),
+                "snapshot_sequence": offset,
+                "timestamp": "2026-08-30T12:00:00Z",
+                "role": "user",
+                "parent_turn_id": None,
+                "is_sidechain": False,
+                "is_compaction_boundary": False,
+                "body_state": "omitted_oversize",
+                "body": None,
+                "body_bytes": len(normalized.encode("utf-8")),
+                "body_sha256": None,
+                "canonical_text_sha256": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+            })
+        resume_token = "s11-anchor:" + str(len(prompts))
+        snapshot_id = "s11-observation:" + str(len(prompts))
+    else:
+        turns = []
+        resume_token = "s11-canonical:" + str(len(prompts))
+        snapshot_id = "s11-canonical-snapshot:" + str(len(prompts))
+    return envelope(request, {
+        "read_protocol": "oulipoly.session_turn_pages/v1",
+        "provider_instance_id": provider_instance_id,
+        "settings_id": settings_id,
+        "session_id": SESSION,
+        "turn_projection": projection,
+        "snapshot_id": snapshot_id,
+        "page_index": 0,
+        "page_start_sequence": 0,
+        "turns": turns,
+        "page_turn_count": len(turns),
+        "source_bytes_examined": sum(len(json.dumps(turn)) for turn in turns),
+        "scan_progress": False,
+        "snapshot_complete": True,
+        "next_page_token": None,
+        "resume_token": resume_token,
+        "source_final": False,
+        "warnings": [],
     })
 
 def main():
@@ -1328,13 +1438,12 @@ def main():
     if subcommand == "launch":
         launch(request)
         return 0
-    if subcommand == "session.read_turns":
-        result = read_turns(request)
-        if result is not None:
-            print(json.dumps(result))
-        return 0
     if subcommand == "session.capture":
         print(json.dumps(capture(request)))
+        return 0
+    if subcommand == "session.read_turns":
+        time.sleep(int(os.environ.get("S11_READ_TURNS_DELAY_MS", "0")) / 1000)
+        print(json.dumps(session_turn_page(request)))
         return 0
     print(json.dumps({
         "contract": request.get("contract", CONTRACT),

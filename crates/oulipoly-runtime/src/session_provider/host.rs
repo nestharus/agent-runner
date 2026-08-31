@@ -1,5 +1,7 @@
 use crate::provider_registry::DescribeHostOptions;
-use oulipoly_provider::generated::HostContext;
+use oulipoly_provider::generated::{
+    HOST_SESSION_TURN_PAGES_V1_ENV, HOST_SESSION_TURN_PAGES_V1_ENV_VALUE, HostContext,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -34,7 +36,10 @@ fn host_context_with_home(
 }
 
 fn host_env(home: Option<String>) -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
+    let mut env = BTreeMap::from([(
+        HOST_SESSION_TURN_PAGES_V1_ENV.to_string(),
+        HOST_SESSION_TURN_PAGES_V1_ENV_VALUE.to_string(),
+    )]);
     if let Some(home) = home.filter(|value| !value.is_empty()) {
         env.insert("HOME".to_string(), home);
     }
@@ -67,7 +72,7 @@ mod tests {
         );
         assert_eq!(context.config_root.as_deref(), Some("/tmp/oulipoly-config"));
         assert_eq!(context.data_root.as_deref(), Some("/tmp/oulipoly-data"));
-        assert_eq!(context.env.len(), 1);
+        assert_eq!(context.env.len(), 2);
     }
 
     #[test]
@@ -76,12 +81,12 @@ mod tests {
         assert!(
             host_context_with_home(None, &host_options, Some(String::new()))
                 .env
-                .is_empty()
+                .contains_key(HOST_SESSION_TURN_PAGES_V1_ENV)
         );
         assert!(
             host_context_with_home(None, &host_options, None)
                 .env
-                .is_empty()
+                .contains_key(HOST_SESSION_TURN_PAGES_V1_ENV)
         );
     }
 }

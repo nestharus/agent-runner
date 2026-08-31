@@ -87,6 +87,14 @@ fn schema_registry_lookup_and_validation_helpers_cover_s2_matrix() {
     registry
         .validate_request("launch", launch_fixture(&fixtures, "request"))
         .unwrap_or_else(|err| panic!("launch request validation failed: {err}"));
+    let mut launch_without_output_delivery = launch_fixture(&fixtures, "request").clone();
+    launch_without_output_delivery["params"]
+        .as_object_mut()
+        .expect("launch params")
+        .remove("output_delivery");
+    registry
+        .validate_request("launch", &launch_without_output_delivery)
+        .expect("launch output delivery must remain capability-gated and optional");
 
     for row in LAUNCH_EVENT_ROWS {
         let schema = registry
@@ -98,4 +106,46 @@ fn schema_registry_lookup_and_validation_helpers_cover_s2_matrix() {
             .validate_launch_event(row.kind, launch_event_fixture(&fixtures, row.kind))
             .unwrap_or_else(|err| panic!("launch event validation failed for {}: {err}", row.kind));
     }
+}
+
+#[test]
+fn session_read_turns_schema_scopes_delivery_nonce_to_user_observation() {
+    let registry = SchemaRegistry::new();
+    let fixtures = fixtures();
+    let canonical = non_launch_fixture(&fixtures, "session.read_turns", "request");
+
+    let mut canonical_with_nonce = canonical.clone();
+    canonical_with_nonce["params"]["expected_delivery_nonce"] =
+        serde_json::Value::String("a".repeat(64));
+    assert!(
+        registry
+            .validate_request("session.read_turns", &canonical_with_nonce)
+            .is_err(),
+        "canonical ingestion must forbid mailbox delivery authorization"
+    );
+
+    let mut observation_without_nonce = canonical.clone();
+    observation_without_nonce["params"]["turn_projection"] =
+        serde_json::Value::String("user_observation".to_string());
+    assert!(
+        registry
+            .validate_request("session.read_turns", &observation_without_nonce)
+            .is_err(),
+        "user observation must require mailbox delivery authorization"
+    );
+
+    observation_without_nonce["params"]["expected_delivery_nonce"] =
+        serde_json::Value::String("a".repeat(64));
+    registry
+        .validate_request("session.read_turns", &observation_without_nonce)
+        .expect("lowercase 64-hex delivery nonce must authorize user observation");
+
+    observation_without_nonce["params"]["expected_delivery_nonce"] =
+        serde_json::Value::String("A".repeat(64));
+    assert!(
+        registry
+            .validate_request("session.read_turns", &observation_without_nonce)
+            .is_err(),
+        "uppercase delivery nonces must be rejected"
+    );
 }

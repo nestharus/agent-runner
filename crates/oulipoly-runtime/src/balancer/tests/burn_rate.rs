@@ -25,6 +25,7 @@ fn bootstrap_uses_sibling_pool_when_own_delta_absent() {
 
     db.upsert_quota_refresh("a", &one_window(0.20, 24 * 7))
         .unwrap();
+    mark_provider_turn_count_caught_up(&db, "a");
     seed_windows_with_deltas(&db, "b", &[(0.30, 24 * 7, 0.012, 24)]);
 
     let bootstrapped = bootstrap_burn_rate_for_test(&model, &db, 0, 0).unwrap();
@@ -41,6 +42,7 @@ fn bootstrap_uses_duration_ratio_when_pool_has_only_long_delta() {
 
     db.upsert_quota_refresh("a", &[quota_window(0.20, 24 * 7), quota_window(0.20, 5)])
         .unwrap();
+    mark_provider_turn_count_caught_up(&db, "a");
     seed_windows_with_deltas(&db, "b", &[(0.30, 24 * 7, 0.01, 22)]);
 
     let bootstrapped = bootstrap_burn_rate_for_test(&model, &db, 0, 1).unwrap();

@@ -99,6 +99,40 @@ fn launch_reader_retains_bounded_state_independent_of_stream_volume() {
 }
 
 #[test]
+fn semantic_markers_survive_generic_marker_retention_exhaustion() {
+    let semantic_value = json!({ "produced": true });
+    let semantic_marker = json!({
+        "contract": "oulipoly.provider/v1",
+        "request_id": REQUEST_ID,
+        "seq": 2,
+        "time_unix_ms": 1,
+        "kind": "marker",
+        "name": "oulipoly.produced_assistant_response",
+        "value": semantic_value,
+    });
+    let jsonl = [
+        json_line(&launch_marker_event(1)),
+        json_line(&semantic_marker),
+        json_line(&launch_exit_event(3, 0)),
+    ]
+    .join("");
+    let result = LaunchJsonlReader::new(REQUEST_ID)
+        .with_limits(LaunchStreamLimits {
+            retained_events: 1,
+            retained_event_bytes: 32,
+            retained_output_bytes: 1,
+            max_line_bytes: 4096,
+        })
+        .read(jsonl.as_bytes())
+        .expect("semantic markers should not depend on generic retention capacity");
+
+    assert_eq!(
+        result.retained_marker_value("oulipoly.produced_assistant_response"),
+        Some(&semantic_value)
+    );
+}
+
+#[test]
 fn launch_reader_rejects_malformed_line_unknown_kind_and_schema_invalid_event() {
     let cases = [
         ("malformed", "{not-json}\n".to_owned(), "malformed_line"),

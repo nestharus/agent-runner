@@ -13,7 +13,10 @@ use oulipoly_runtime::services::{
     SessionLifecycleOutput, SessionLifecycleRequest, SessionLifecycleServicePort,
     SessionServiceExternalProviderIdentity,
 };
-use oulipoly_state::{InvocationStart, SessionTurnIngest, StateDb};
+use oulipoly_state::{
+    InvocationStart, SessionTurnIngest, SessionTurnIngestStreamKey, SessionTurnStreamProjection,
+    StateDb,
+};
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -204,6 +207,23 @@ fn external_provider_identity() -> SessionServiceExternalProviderIdentity {
         provider_instance_id: Some(PROVIDER_A_INSTANCE.to_string()),
         settings_id: PROVIDER_A_SETTINGS.to_string(),
     }
+}
+
+fn assert_canonical_stream_queued(state: &StateDb, session_id: &str) {
+    let stream = state
+        .session_turn_ingest_stream(&SessionTurnIngestStreamKey {
+            provider_name: PROVIDER_A_ACCOUNT.to_string(),
+            provider_instance_id: PROVIDER_A_INSTANCE.to_string(),
+            settings_id: PROVIDER_A_SETTINGS.to_string(),
+            session_id: session_id.to_string(),
+            projection: SessionTurnStreamProjection::CanonicalIngest,
+        })
+        .unwrap()
+        .expect("canonical turn stream queued");
+    assert_eq!(stream.status, "ready");
+    assert_eq!(stream.checkpoint_generation, 0);
+    assert_eq!(stream.committed_page_count, 0);
+    assert_eq!(stream.committed_turn_count, 0);
 }
 
 #[test]
@@ -498,8 +518,8 @@ fn session_lifecycle_rejects_mismatched_invocation_identifiers() {
 }
 
 #[test]
-fn session_lifecycle_external_provider_read_and_capture_are_host_persisted() {
-    let provider = ProviderAFixture::new("read_and_capture");
+fn session_lifecycle_external_capture_persists_identity_and_queues_bounded_ingest() {
+    let provider = ProviderAFixture::new("capture_success");
     let invocation_uuid = "99999999-9999-4999-8999-999999999999";
     let effective_cwd = provider.fixture.path().join("workspace");
     std::fs::create_dir_all(&effective_cwd).unwrap();
@@ -544,22 +564,10 @@ fn session_lifecycle_external_provider_read_and_capture_are_host_persisted() {
         stderr.contains("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
         "{stderr}"
     );
-    assert_eq!(
-        provider.fixture.session_turn_rows(),
-        vec![
-            (
-                PROVIDER_A_ACCOUNT.to_string(),
-                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
-                "turn-provider-a-1".to_string(),
-                "user".to_string()
-            ),
-            (
-                PROVIDER_A_ACCOUNT.to_string(),
-                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
-                "turn-provider-a-2".to_string(),
-                "assistant".to_string()
-            ),
-        ]
+    assert!(provider.fixture.session_turn_rows().is_empty());
+    assert_canonical_stream_queued(
+        &provider.fixture.state,
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     );
     let row = provider
         .fixture
@@ -725,8 +733,8 @@ fn session_lifecycle_external_pinned_capture_preserves_resume_target_over_provid
 }
 
 #[test]
-fn provider_ref_lifecycle_resume_dispatches_read_capture_and_preserves_pinned_target() {
-    let provider = ProviderAFixture::new("read_and_capture");
+fn provider_ref_lifecycle_resume_captures_queues_and_preserves_pinned_target() {
+    let provider = ProviderAFixture::new("capture_success");
     let invocation_uuid = "cdcdcdcd-0000-4000-8000-000000000000";
     let pinned_session = "edededed-eded-4ede-8ede-edededededed";
     let provider_session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -779,23 +787,8 @@ fn provider_ref_lifecycle_resume_dispatches_read_capture_and_preserves_pinned_ta
         "provider-ref lifecycle must not run local sessions scan"
     );
     assert_eq!(output.session_id.as_deref(), Some(pinned_session));
-    assert_eq!(
-        provider.fixture.session_turn_rows(),
-        vec![
-            (
-                PROVIDER_A_ACCOUNT.to_string(),
-                provider_session.to_string(),
-                "turn-provider-a-1".to_string(),
-                "user".to_string()
-            ),
-            (
-                PROVIDER_A_ACCOUNT.to_string(),
-                provider_session.to_string(),
-                "turn-provider-a-2".to_string(),
-                "assistant".to_string()
-            ),
-        ]
-    );
+    assert!(provider.fixture.session_turn_rows().is_empty());
+    assert_canonical_stream_queued(&provider.fixture.state, pinned_session);
     let row = provider
         .fixture
         .state
@@ -932,12 +925,13 @@ fn provider_ref_lifecycle_empty_capture_then_window_match_uses_script_cwd() {
         None,
         None,
     );
-    assert_eq!(provider_lifecycle_subcommands(&records).len(), 3);
+    assert_eq!(provider_lifecycle_subcommands(&records).len(), 2);
+    assert_canonical_stream_queued(&provider.fixture.state, correct_session);
     let cwd_records = std::fs::read_to_string(&cwd_record).unwrap();
     assert!(
         cwd_records
             .lines()
-            .any(|line| line == format!("{correct_session}|3")),
+            .any(|line| line == format!("{correct_session}|2")),
         "cwd records: {cwd_records}"
     );
     assert!(
@@ -945,7 +939,7 @@ fn provider_ref_lifecycle_empty_capture_then_window_match_uses_script_cwd() {
         "wrong session appeared in cwd records: {cwd_records}"
     );
     assert!(
-        cwd_records.lines().all(|line| line.ends_with("|3")),
+        cwd_records.lines().all(|line| line.ends_with("|2")),
         "cwd ran before provider records were complete: {cwd_records}"
     );
 }
@@ -954,7 +948,7 @@ fn provider_ref_lifecycle_empty_capture_then_window_match_uses_script_cwd() {
 fn session_lifecycle_no_ref_registry_path_preserves_marker_warnings_and_state() {
     let baseline = seeded_no_ref_marker_fixture();
     let dispatch = seeded_no_ref_marker_fixture();
-    let unrelated_provider = ProviderAFixture::new("read_and_capture");
+    let unrelated_provider = ProviderAFixture::new("capture_success");
     let service = ProductionSessionLifecycleService::new();
     let registry_service = ProductionSessionLifecycleService::with_registry_handle(
         unrelated_provider.registry_handle(),
@@ -1078,7 +1072,7 @@ fn assert_provider_lifecycle_dispatch_shape(
 fn assert_provider_lifecycle_subcommands(records: &[serde_json::Value]) {
     assert_eq!(
         provider_lifecycle_subcommands(records),
-        vec!["describe", "session.read_turns", "session.capture"]
+        vec!["describe", "session.capture"]
     );
 }
 
@@ -1207,31 +1201,6 @@ def describe():
         }},
     }})
 
-def read_turns():
-    if mode in ["capture_conflict", "empty_capture"]:
-        return envelope({{"turns": [], "turn_count": 0, "complete": True}})
-    return envelope({{
-        "turns": [
-            {{
-                "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-                "turn_id": "turn-provider-a-1",
-                "timestamp": "2026-05-01T00:00:01Z",
-                "role": "user",
-                "body": [{{"type": "text", "text": "from provider"}}],
-            }},
-            {{
-                "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-                "turn_id": "turn-provider-a-2",
-                "timestamp": "2026-05-01T00:00:02Z",
-                "role": "assistant",
-                "parent_turn_id": "turn-provider-a-1",
-                "body": [{{"type": "text", "text": "captured by host"}}],
-            }},
-        ],
-        "turn_count": 2,
-        "complete": True,
-    }})
-
 def capture():
     if mode == "empty_capture":
         return envelope({{
@@ -1247,8 +1216,6 @@ def capture():
 
 if subcommand == "describe":
     response = describe()
-elif subcommand == "session.read_turns":
-    response = read_turns()
 elif subcommand == "session.capture":
     response = capture()
 else:

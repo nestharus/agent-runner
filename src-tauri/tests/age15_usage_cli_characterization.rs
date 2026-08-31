@@ -19,7 +19,10 @@
 use agent_runner_lib::usage::cli::Cli;
 use chrono::{TimeZone, Utc};
 use clap::{Parser, error::ErrorKind};
-use oulipoly_state::{QuotaWindowInput, StateDb};
+use oulipoly_state::{
+    QuotaWindowInput, SessionTurnIngestStreamKey, SessionTurnPageApply,
+    SessionTurnStreamProjection, StateDb,
+};
 use rusqlite::{Connection, params};
 use std::fs;
 use std::io::Write;
@@ -991,6 +994,15 @@ fn usage_refresh_writes_quota_cache_and_records_delta_learning_samples_per_windo
             )
             .unwrap();
     }
+    let provider_name = connection
+        .query_row(
+            "SELECT provider_name FROM provider_quotas LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    drop(connection);
+    mark_provider_turn_count_caught_up(&db, &provider_name, "s1");
     drop(db);
 
     let quota_script = fixture.write_quota_script(
@@ -1015,6 +1027,44 @@ fn usage_refresh_writes_quota_cache_and_records_delta_learning_samples_per_windo
     assert!((windows[0].used_percent - 0.35).abs() < 1e-6);
     assert!(windows[0].last_delta_percent.unwrap() > 0.20, "{windows:?}");
     assert_eq!(windows[0].last_delta_calls, Some(20));
+}
+
+fn mark_provider_turn_count_caught_up(db: &StateDb, provider_name: &str, session_id: &str) {
+    let key = SessionTurnIngestStreamKey {
+        provider_name: provider_name.to_string(),
+        provider_instance_id: provider_name.to_string(),
+        settings_id: "age15-settings".to_string(),
+        session_id: session_id.to_string(),
+        projection: SessionTurnStreamProjection::CanonicalIngest,
+    };
+    db.enqueue_session_turn_ingest_stream(&key).unwrap();
+    let now = Utc::now();
+    let stream = db
+        .lease_ready_session_turn_ingest_stream(
+            SessionTurnStreamProjection::CanonicalIngest,
+            "age15-worker",
+            now,
+            now + chrono::Duration::minutes(1),
+        )
+        .unwrap()
+        .unwrap();
+    db.apply_session_turn_page(&SessionTurnPageApply {
+        key,
+        lease_owner: "age15-worker".to_string(),
+        expected_generation: stream.checkpoint_generation,
+        request_token_sha256: "1".repeat(64),
+        snapshot_id: format!("{provider_name}-age15-snapshot"),
+        page_index: stream.expected_page_index,
+        page_start_sequence: stream.expected_turn_sequence,
+        page_turn_count: 0,
+        scan_progress: false,
+        snapshot_complete: true,
+        next_page_token: None,
+        resume_token: Some(format!("{provider_name}-age15-resume")),
+        page_digest: "2".repeat(64),
+        turns: Vec::new(),
+    })
+    .unwrap();
 }
 
 #[test]

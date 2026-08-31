@@ -24,12 +24,14 @@ const RESULT_PATH_ENV: &str = "WU_E_RESULT_PATH";
 #[test]
 fn broker_child_sees_tty_relays_io_preserves_exit_and_restores_raw_mode() {
     let dir = tempfile::tempdir().unwrap();
+    let app_data_dir = dir.path().join("app-data");
+    fs::create_dir_all(&app_data_dir).unwrap();
     let provider = fixture_provider_script(dir.path());
     let result_path = dir.path().join("result.txt");
     let pty = OuterPty::open(33, 100);
     let before = terminal_attrs(pty.slave.as_raw_fd()).unwrap();
 
-    let mut child = spawn_helper_under_pty(&pty, &provider, &result_path);
+    let mut child = spawn_helper_under_pty(&pty, &provider, &result_path, &app_data_dir);
     let output = read_until(
         pty.master.as_raw_fd(),
         "SIZE:33 100",
@@ -115,6 +117,7 @@ fn spawn_helper_under_pty(
     pty: &OuterPty,
     provider: &Path,
     result_path: &Path,
+    app_data_dir: &Path,
 ) -> std::process::Child {
     let stdin = pty.slave.try_clone().unwrap();
     let stdout = pty.slave.try_clone().unwrap();
@@ -127,6 +130,7 @@ fn spawn_helper_under_pty(
         .arg("--nocapture")
         .env(HELPER_ENV, "1")
         .env("OULIPOLY_INTERACTIVE_TUI", "0")
+        .env("OULIPOLY_DATA_DIR", app_data_dir)
         .env(PROVIDER_SCRIPT_ENV, provider)
         .env(RESULT_PATH_ENV, result_path)
         .stdin(Stdio::from(stdin))

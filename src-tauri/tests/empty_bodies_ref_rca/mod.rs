@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 pub mod rc1_schema_contract;
-pub mod rc2_ingest_body_payload;
 pub mod rc3_export_db_source;
 pub mod rc4_trace_inline_transcript;
 

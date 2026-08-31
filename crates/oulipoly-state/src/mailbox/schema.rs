@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 11;
+pub(super) const CURRENT_VERSION: i64 = 12;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -102,6 +102,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 11,
         owner: SidecarEntity::PayloadRetention,
         apply: ensure_terminal_payload_lookup_indexes,
+    },
+    MigrationStep {
+        target_version: 12,
+        owner: SidecarEntity::MailboxDelivery,
+        apply: ensure_mailbox_delivery_settlement_schema,
     },
 ];
 

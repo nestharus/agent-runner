@@ -145,6 +145,7 @@ mod schema_types;
 mod session_capture;
 mod session_lifecycle;
 mod session_markers;
+mod session_turn_pages;
 mod session_turns_ingest;
 mod session_turns_query;
 mod session_turns_replace;
@@ -165,6 +166,7 @@ pub use self::imported_session_display_metadata::{
     ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert,
 };
 pub use self::imported_session_list::ImportedSessionListRow;
+pub use self::invocation_artifacts::InvocationOutputArtifactPaths;
 pub use self::invocation_lifecycle_finalize::InvocationFinalizeError;
 pub use self::invocation_lifecycle_start::{
     COMPLETION_REGISTRATION_AUTHORITY_ENV, COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD,
@@ -233,6 +235,11 @@ pub use self::session_lifecycle::{
     TurnState,
 };
 pub use self::session_markers::SessionMarkerPayload;
+pub use self::session_turn_pages::{
+    SESSION_TURN_PAGES_PROTOCOL, SessionTurnIngestFreshness, SessionTurnIngestStream,
+    SessionTurnIngestStreamKey, SessionTurnPageApply, SessionTurnPageApplyOutcome,
+    SessionTurnPageBodyState, SessionTurnPageTurnIngest, SessionTurnStreamProjection,
+};
 #[allow(unused_imports)]
 pub use self::session_turns_ingest::SessionTurnRecord;
 pub use self::session_turns_ingest::{SessionTurnCounts, SessionTurnIngest};

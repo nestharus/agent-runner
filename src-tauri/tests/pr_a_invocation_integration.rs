@@ -208,6 +208,15 @@ fn assert_agent_bash_bin(path: &Path) {
     );
 }
 
+fn isolated_agent_bash_bin(fixture: &Fixture, source: &Path) -> PathBuf {
+    let target = fixture._dir.path().join("agent-bash");
+    fs::copy(source, &target).unwrap();
+    let mut permissions = fs::metadata(&target).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&target, permissions).unwrap();
+    target
+}
+
 fn parse_invocation(stderr: &str) -> CompositeInvocationId {
     let lines: Vec<&str> = stderr
         .lines()
@@ -358,8 +367,8 @@ fn resolves_parent_env_and_overwrites_child_subprocess_env() {
 
 #[test]
 fn nested_agent_bash_rejects_unattested_synthetic_completion_owner() {
-    let agent_bash_bin = agent_bash_bin_from_env();
     let fixture = Fixture::new();
+    let agent_bash_bin = isolated_agent_bash_bin(&fixture, &agent_bash_bin_from_env());
     let parent = CompositeInvocationId {
         source: "fixture-provider".to_string(),
         id: "aaaaaaaa-0000-4000-8000-000000000010".to_string(),

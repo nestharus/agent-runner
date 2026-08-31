@@ -25,26 +25,35 @@ pub(super) fn emit_stderr(message: &str) {
 
 pub(super) fn emit_resume_success_output(
     invocation_id: &str,
-    exit_code: i32,
     error_category: Option<&str>,
-    terminal_reason: Option<&str>,
-    stdout: &[u8],
-) {
-    let mut output = std::io::stdout().lock();
-    let _ = output.write_all(stdout);
-    if !stdout.is_empty() && !stdout.ends_with(b"\n") {
-        let _ = output.write_all(b"\n");
+    result: &oulipoly_runtime::executor::ExecutionResult,
+) -> std::io::Result<()> {
+    if result.output_spool.is_some() {
+        let mut stderr = std::io::stderr().lock();
+        result.write_stderr_to(&mut stderr)?;
+        stderr.flush()?;
     }
-    let _ = output.flush();
+    let mut output = std::io::stdout().lock();
+    result.write_stdout_to(&mut output)?;
+    if result.output_spool.is_none()
+        && !result.stdout_is_empty()?
+        && !result.stdout_ends_with_newline()
+    {
+        output.write_all(b"\n")?;
+    }
+    output.flush()?;
     drop(output);
-    emit_result_envelope(
-        invocation_id,
-        true,
-        exit_code,
-        error_category,
-        terminal_reason,
-        None,
-    );
+    if result.output_spool.is_none() {
+        emit_result_envelope(
+            invocation_id,
+            true,
+            result.exit_code,
+            error_category,
+            result.terminal_reason.as_deref(),
+            None,
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn emit_resume_failure_output(input: ResumeFailureOutputInput<'_>) {
@@ -63,14 +72,16 @@ pub(super) fn emit_resume_failure_output(input: ResumeFailureOutputInput<'_>) {
             }
         },
     };
-    emit_result_envelope(
+    if let Err(error) = emit_result_envelope(
         input.invocation_id,
         false,
         input.exit_code,
         input.error_category,
         input.terminal_reason,
         Some(&failure_identity),
-    );
+    ) {
+        emit_stderr(&format!("failed to deliver result envelope: {error}"));
+    }
     emit_stderr(input.stderr);
     if let Some(terminal_reason) = input.terminal_reason {
         emit_stderr(terminal_reason);

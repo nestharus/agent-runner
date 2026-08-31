@@ -54,6 +54,7 @@ pub type StateDbError = String;
 pub use crate::schema::{CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION};
 pub use chain_segments::ChainSegmentRow;
 pub use db::DbError;
+pub use db::InvocationOutputArtifactPaths;
 #[cfg(feature = "test-support")]
 pub use db::InvocationQueryProgressPause;
 pub use db::LegacyProviderNames;
@@ -102,6 +103,11 @@ pub use db::{
 };
 pub use db::{InvocationFinalizeError, InvocationRecord, InvocationStart, InvocationStatus};
 pub use db::{ProviderTurnEffectInput, ProviderTurnEffectWrite};
+pub use db::{
+    SESSION_TURN_PAGES_PROTOCOL, SessionTurnIngestFreshness, SessionTurnIngestStream,
+    SessionTurnIngestStreamKey, SessionTurnPageApply, SessionTurnPageApplyOutcome,
+    SessionTurnPageBodyState, SessionTurnPageTurnIngest, SessionTurnStreamProjection,
+};
 pub use db::{
     SessionTurnReplacement, SessionTurnRestoreRow, SessionTurnsReplacement, SessionTurnsRestore,
 };

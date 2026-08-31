@@ -6,6 +6,7 @@ use oulipoly_config::{
 };
 use oulipoly_state::{InvocationStart, ModelStore, ResolvedResume, StateDb};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,31 @@ pub struct MigrationFixture {
     pub target_projects: PathBuf,
     pub source_workspace: PathBuf,
     pub resume_workspace: PathBuf,
+}
+
+pub struct DataDirEnvGuard {
+    previous: Option<OsString>,
+}
+
+impl DataDirEnvGuard {
+    pub fn set(path: &Path) -> Self {
+        let previous = std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV);
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, path);
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for DataDirEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, previous),
+                None => std::env::remove_var(oulipoly_state::paths::DATA_DIR_ENV),
+            }
+        }
+    }
 }
 
 impl MigrationFixture {

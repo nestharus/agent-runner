@@ -441,7 +441,7 @@ fn outbound_observer_source(
     context: Result<ProviderSessionObservationContext, &'static str>,
 ) -> outbound_observer::OutboundObserverSource {
     match context {
-        Ok(context) => outbound_observer::OutboundObserverSource::Provider(
+        Ok(context) => outbound_observer::OutboundObserverSource::Provider(Box::new(
             outbound_observer::ProviderSessionTurnSource::new(
                 context.registry,
                 context.identity,
@@ -449,7 +449,7 @@ fn outbound_observer_source(
                 context.invocation_uuid,
                 context.effective_cwd,
             ),
-        ),
+        )),
         Err(detail) => outbound_observer::OutboundObserverSource::Unavailable(detail.to_string()),
     }
 }

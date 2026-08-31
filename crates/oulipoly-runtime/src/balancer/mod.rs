@@ -39,7 +39,6 @@
 //!     Domain: contextual-balancer-dependencies
 //!     Owns:
 //!       - ProvidersConfig quota refresh-source contract
-//!       - SessionsConfig session scan and adapter-derived refresh contract
 //!       - InFlight refresh deduplication carrier
 //!   - component: crates/oulipoly-runtime/src/balancer/refresh_inputs.rs::contextual_refresh_surface
 //!     role: intrinsic-surface
@@ -51,7 +50,7 @@
 //!       - refresh_provider projection refresh operation
 //!       - refresh_provider_for_routing route-selection refresh operation
 //!       - verify_or_clear_marker route-selection marker verification
-//!       - scan_provider session scan operation
+//!       - bounded session-ingestion freshness state
 //!   - component: crates/oulipoly-runtime/src/balancer/snapshot.rs::quota_snapshot_surface
 //!     role: intrinsic-surface
 //!     Domain: quota-cache-snapshot-access

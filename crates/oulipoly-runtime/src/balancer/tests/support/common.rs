@@ -76,25 +76,6 @@ pub(in crate::balancer::tests) fn providers_config_with_scripts(
     ProvidersConfig { entries }
 }
 
-pub(in crate::balancer::tests) fn sessions_config_with_scripts(
-    scripts: &[(&str, &str)],
-) -> SessionsConfig {
-    let entries = scripts
-        .iter()
-        .map(|(provider_name, script)| {
-            (
-                (*provider_name).to_string(),
-                SessionSourceEntry {
-                    turn_script: (*script).to_string(),
-                    transcript_locator: None,
-                    state_dir: None,
-                },
-            )
-        })
-        .collect();
-    SessionsConfig { entries }
-}
-
 pub(in crate::balancer::tests) fn file_backed_state(
     label: &str,
 ) -> (tempfile::TempDir, PathBuf, StateDb) {
@@ -165,6 +146,55 @@ pub(in crate::balancer::tests) fn seed_windows_with_deltas(
     let inputs = quota_window_inputs(windows);
     db.upsert_quota_refresh(provider_name, &inputs).unwrap();
     seed_window_deltas(db, provider_name, windows);
+    mark_provider_turn_count_caught_up(db, provider_name);
+}
+
+pub(in crate::balancer::tests) fn mark_provider_turn_count_caught_up(
+    db: &StateDb,
+    provider_name: &str,
+) {
+    if db
+        .canonical_provider_turn_ingest_freshness(provider_name)
+        .unwrap()
+        .is_caught_up()
+    {
+        return;
+    }
+    let key = oulipoly_state::SessionTurnIngestStreamKey {
+        provider_name: provider_name.to_string(),
+        provider_instance_id: provider_name.to_string(),
+        settings_id: "balancer-test-settings".to_string(),
+        session_id: format!("{provider_name}-session"),
+        projection: oulipoly_state::SessionTurnStreamProjection::CanonicalIngest,
+    };
+    db.enqueue_session_turn_ingest_stream(&key).unwrap();
+    let now = Utc::now();
+    let stream = db
+        .lease_ready_session_turn_ingest_stream(
+            oulipoly_state::SessionTurnStreamProjection::CanonicalIngest,
+            "balancer-test-worker",
+            now,
+            now + chrono::Duration::minutes(1),
+        )
+        .unwrap()
+        .unwrap();
+    db.apply_session_turn_page(&oulipoly_state::SessionTurnPageApply {
+        key,
+        lease_owner: "balancer-test-worker".to_string(),
+        expected_generation: stream.checkpoint_generation,
+        request_token_sha256: "1".repeat(64),
+        snapshot_id: format!("{provider_name}-snapshot"),
+        page_index: stream.expected_page_index,
+        page_start_sequence: stream.expected_turn_sequence,
+        page_turn_count: 0,
+        scan_progress: false,
+        snapshot_complete: true,
+        next_page_token: None,
+        resume_token: Some(format!("{provider_name}-resume")),
+        page_digest: "2".repeat(64),
+        turns: Vec::new(),
+    })
+    .unwrap();
 }
 
 pub(in crate::balancer::tests) fn quota_window_inputs(
@@ -244,6 +274,7 @@ pub(in crate::balancer::tests) fn seed_assistant_turns_since_refresh(
     let turns = assistant_turns_for_test(provider_name, count, refreshed_at);
     db.ingest_session_turns_batch(provider_name, &turns)
         .unwrap();
+    mark_provider_turn_count_caught_up(db, provider_name);
 }
 
 pub(in crate::balancer::tests) fn assistant_turns_for_test(

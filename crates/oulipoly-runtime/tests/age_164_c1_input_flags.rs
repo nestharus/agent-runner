@@ -44,6 +44,9 @@ use oulipoly_runtime::executor::cli::execute;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 struct ArgvFixture {
     _dir: tempfile::TempDir,
@@ -52,6 +55,13 @@ struct ArgvFixture {
 }
 
 fn argv_dump_fixture() -> ArgvFixture {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
     let dir = tempfile::tempdir().expect("tempdir");
     let argv_dump = dir.path().join("argv.txt");
     let script_path = dir.path().join("argv-dump.sh");

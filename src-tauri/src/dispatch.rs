@@ -125,6 +125,14 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     }
 
     let agent_runtime_services = wiring::AgentRuntimeServices::cli_defaults()?;
+    let _session_turn_ingest_driver =
+        session_turn_ingest_driver_enabled(&cli, &agent_runtime_services.provider_registry_handle)
+            .then(|| {
+                crate::session_turn_ingest_driver::start_session_turn_ingest_driver(
+                    agent_runtime_services.provider_registry_handle.clone(),
+                )
+            })
+            .flatten();
 
     if let Err(err) = recover_pending_provider_owned_session_replaces(&agent_runtime_services) {
         return Ok(handle_pending_session_replace_error(&err));
@@ -195,6 +203,23 @@ fn provider_launch_schedules_startup_wake_reclaim(cli: &Cli) -> bool {
         return false;
     }
     cli.command.is_none() || matches!(&cli.command, Some(Subcommands::Repl { resume: None, .. }))
+}
+
+fn session_turn_ingest_driver_enabled(
+    cli: &Cli,
+    registry: &oulipoly_runtime::provider_registry::ProviderRegistryHandle,
+) -> bool {
+    if cli.usage || registry.current().configured_artifact_keys().is_empty() {
+        return false;
+    }
+    matches!(
+        &cli.command,
+        None | Some(Subcommands::Repl { .. })
+            | Some(Subcommands::Resume { .. })
+            | Some(Subcommands::Session {
+                command: SessionSubcommands::Import { .. }
+            })
+    )
 }
 
 fn recover_pending_session_replaces() -> Result<(), session_replace::ReplaceError> {

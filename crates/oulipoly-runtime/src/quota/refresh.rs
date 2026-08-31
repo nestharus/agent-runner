@@ -12,7 +12,7 @@
 //!       - quota service port contract (`QuotaServicePort`, `QuotaServiceRequest`, `QuotaServiceOutput`, `QuotaServiceExternalProviderIdentity`, `ServiceError`)
 //!       - quota refresh primitive contract (`InFlight`, `RefreshOutcome`, `QuotaScriptWindow`, `parse_output`, `run_script`, `run_auth_refresh_command_coalesced`, `AuthRefreshAttempt`)
 //!       - quota state persistence contract (`StateDb`, `QuotaWindowInput`, `upsert_quota_refresh`, `get_windows`)
-//!       - provider/session config and external-provider registry contract (`ProvidersConfig`, `SessionsConfig`, `ProviderRegistryHandle`)
+//!       - provider config and external-provider registry contract (`ProvidersConfig`, `ProviderRegistryHandle`)
 //!       - in-file test harness contract (`EnvGuard`, `chrono::Utc`, `tempfile::TempDir`, `ProviderEntry`, in-memory `StateDb` fixtures)
 //! ```
 use super::{
@@ -24,7 +24,7 @@ use crate::services::{
     QuotaServiceExternalProviderIdentity, QuotaServiceOutput, QuotaServicePort,
     QuotaServiceRequest, ServiceError,
 };
-use oulipoly_config::{ProvidersConfig, SessionsConfig};
+use oulipoly_config::ProvidersConfig;
 use oulipoly_state::{QuotaWindowInput, StateDb};
 
 #[derive(Debug, Clone, Default)]
@@ -124,18 +124,14 @@ pub fn refresh_provider(
     )
 }
 
-/// Refresh a provider for routing. Prefer the explicit providers.toml
-/// `quota_script`; when legacy migrated configs only have provider/session
-/// storage adapters, derive the standard quota adapter from those roots.
+/// Refresh a provider for routing from its provider-owned quota source.
 pub fn refresh_provider_for_routing(
     provider_name: &str,
     providers_cfg: &ProvidersConfig,
-    sessions_cfg: &SessionsConfig,
     in_flight: &InFlight,
     state: &StateDb,
 ) -> RefreshOutcome {
-    let Some(source) = super::source::refresh_source(provider_name, providers_cfg, sessions_cfg)
-    else {
+    let Some(source) = super::source::refresh_source(provider_name, providers_cfg) else {
         return RefreshOutcome::NoScript;
     };
     refresh_provider_from_script(

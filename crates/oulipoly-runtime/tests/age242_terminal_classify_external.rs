@@ -18,10 +18,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const MODEL_NAME: &str = "neutral-external-terminal-model";
 const PROVIDER_NAME: &str = "neutral-external-provider";
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 struct ScriptFixture {
     _dir: tempfile::TempDir,
@@ -43,6 +44,13 @@ struct ExpectedTerminal {
 }
 
 fn fake_provider(options: FakeProviderOptions) -> ScriptFixture {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("neutral-provider.sh");
     let record = options
@@ -79,7 +87,7 @@ success_envelope() {{
 
 case "$subcommand" in
   describe)
-    success_envelope '{{"provider_id":"neutral-provider","display_name":"Neutral Provider","contract_versions":["oulipoly.provider/v1"],"preferred_contract":"oulipoly.provider/v1","capabilities":{{"launch":true,"policy":true,"quota":false,"session":false,"terminal":'"$terminal_capability"',"rotation":false,"discovery":false,"settings":false,"setup_brain":false,"setup":false,"migration":false}},"concurrency":{{"safe_for_parallel_invocation":true,"state_locking":"none"}}}}'
+    success_envelope '{{"provider_id":"neutral-provider","display_name":"Neutral Provider","contract_versions":["oulipoly.provider/v1"],"preferred_contract":"oulipoly.provider/v1","capabilities":{{"launch":true,"launch_output_v1":true,"policy":true,"quota":false,"session":false,"terminal":'"$terminal_capability"',"rotation":false,"discovery":false,"settings":false,"setup_brain":false,"setup":false,"migration":false}},"concurrency":{{"safe_for_parallel_invocation":true,"state_locking":"none"}}}}'
     ;;
   policy.evaluate)
     success_envelope '{{"accepted":true,"stdin":null,"prompt":null,"diagnostics":[],"markers":[]}}'
@@ -87,10 +95,11 @@ case "$subcommand" in
   launch)
     printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","seq":1,"time_unix_ms":1001,"kind":"stdout","data_base64":"cmF3AP9a"}}\n' "$request_id"
     printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","seq":2,"time_unix_ms":1002,"kind":"stderr","data_base64":"ZXJy"}}\n' "$request_id"
+    printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","seq":3,"time_unix_ms":1003,"kind":"marker","name":"oulipoly.launch_output_complete/v1","value":{{"protocol":"oulipoly.launch_output/v1","stdout":{{"bytes":6,"sha256":"007e39f0ae9498f1f2ac715977240ba901385a4cb20f8fc9d7865c5fd5b62292"}},"stderr":{{"bytes":3,"sha256":"d9eb253e06987fa74a5d3189f73d9f7a8104cca786fafbb52bc9555972f5477f"}},"data_event_count":2}}}}\n' "$request_id"
     if [ "$terminal_mode" = "cancelled" ]; then
-      printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","seq":3,"time_unix_ms":1003,"kind":"exit","status":{{"kind":"cancelled"}},"terminal_signal":{{"kind":"cancelled","evidence":"launch-cancelled","observed_at_unix_ms":1003}}}}\n' "$request_id"
+      printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","seq":4,"time_unix_ms":1004,"kind":"exit","status":{{"kind":"cancelled"}},"terminal_signal":{{"kind":"cancelled","evidence":"launch-cancelled","observed_at_unix_ms":1004}}}}\n' "$request_id"
     else
-      printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","seq":3,"time_unix_ms":1003,"kind":"exit","status":{{"kind":"exited","code":23}},"terminal_signal":{{"kind":"nonzero_exit","evidence":"launch-nonzero","observed_at_unix_ms":1003}}}}\n' "$request_id"
+      printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","seq":4,"time_unix_ms":1004,"kind":"exit","status":{{"kind":"exited","code":23}},"terminal_signal":{{"kind":"nonzero_exit","evidence":"launch-nonzero","observed_at_unix_ms":1004}}}}\n' "$request_id"
     fi
     ;;
   terminal.classify)

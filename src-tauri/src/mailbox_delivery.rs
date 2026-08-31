@@ -17,6 +17,7 @@ use oulipoly_state::mailbox::{
 use oulipoly_state::pid_identity::{ProcessIdentityObservation, observe_live_process_identity};
 use oulipoly_state::{DeliveryEvidence, DeliveryEvidenceKind, SessionLifecycleRepository, StateDb};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -31,7 +32,8 @@ use oulipoly_runtime::executor::cli::pty_broker::{
 const MAILBOX_PREFIX_MAX_BYTES: usize = 64 * 1024;
 const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
 const DELIVERY_NONCE_SUFFIX: &str = "]";
-const DELIVERY_NONCE_LENGTH_PLACEHOLDER: &str = "00000000-0000-4000-8000-000000000000";
+const DELIVERY_NONCE_LENGTH_PLACEHOLDER: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 pub(crate) struct PreparedMailboxDelivery {
     pub answer: Option<String>,
@@ -398,69 +400,14 @@ fn prepare_pty_mailbox_delivery_with_transcript_reconciliation(
 
 #[cfg(unix)]
 fn reconcile_transcript_confirmed_pty_attempt(
-    mailbox: &mut MailboxDb,
-    session_id: &str,
-    provider_name: &str,
-    attempt_id: &str,
+    _mailbox: &mut MailboxDb,
+    _session_id: &str,
+    _provider_name: &str,
+    _attempt_id: &str,
 ) -> Result<bool, String> {
-    let state = StateDb::open_default()?;
-    if !state.has_session_user_turn_containing(provider_name, session_id, attempt_id)? {
-        let sessions_path = oulipoly_state::paths::config_dir()?.join("sessions.toml");
-        let sessions = match oulipoly_config::SessionsConfig::load(&sessions_path) {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                tracing::warn!(
-                    session_id,
-                    provider_name,
-                    attempt_id,
-                    "Failed to load sessions config for uncertain PTY delivery: {error}"
-                );
-                return Ok(false);
-            }
-        };
-        let report = oulipoly_runtime::sessions::scan_provider_session(
-            provider_name,
-            &sessions,
-            &state,
-            session_id,
-        );
-        if !report.errors.is_empty() {
-            tracing::warn!(
-                session_id,
-                provider_name,
-                attempt_id,
-                errors = ?report.errors,
-                "Provider session scan could not fully reconcile uncertain PTY delivery"
-            );
-        }
-        if !state.has_session_user_turn_containing(provider_name, session_id, attempt_id)? {
-            return Ok(false);
-        }
-    }
-
-    let Some(window) = mailbox.delivery_attempt_window(attempt_id)? else {
-        return Ok(false);
-    };
-    if window.session_id != session_id
-        || window.submission_started_at.is_none()
-        || window.acknowledged_at.is_some()
-        || window.resolved_at.is_some()
-    {
-        return Ok(false);
-    }
-    let seqs = window.rows.iter().map(|row| row.seq).collect::<Vec<_>>();
-    if seqs.is_empty() {
-        return Ok(false);
-    }
-    mailbox.mark_delivered(session_id, None, &seqs, &window.delivery_invocation_uuid)?;
-    tracing::info!(
-        session_id,
-        provider_name,
-        attempt_id,
-        delivered = seqs.len(),
-        "Reconciled uncertain PTY mailbox delivery from an exact provider user turn"
-    );
-    Ok(true)
+    // Historical body substrings are not proof that this delivery attempt was
+    // accepted. Keep the attempt pending until bounded post-anchor evidence exists.
+    Ok(false)
 }
 
 #[cfg(unix)]
@@ -1309,22 +1256,27 @@ fn reconcile_confirmed_headless_deliveries_on(
     session_id: &str,
 ) -> Result<(), String> {
     for window in db.unresolved_delivery_attempt_windows(session_id)? {
-        let Some(acknowledgement) = state
-            .acknowledgement(&window.attempt_id)
-            .map_err(|error| error.to_string())?
-        else {
-            continue;
-        };
-        if acknowledgement.confirmed_at.is_none() {
-            continue;
-        }
-        if acknowledgement.session_id != window.session_id
-            || acknowledgement.turn_generation_id != window.delivery_invocation_uuid
-        {
-            return Err(format!(
-                "Confirmed delivery {} conflicts with its mailbox attempt identity",
-                window.attempt_id
-            ));
+        let observation_confirmed = db
+            .delivery_observation_confirmation(&window.attempt_id)?
+            .is_some();
+        if !observation_confirmed {
+            let Some(acknowledgement) = state
+                .acknowledgement(&window.attempt_id)
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            if acknowledgement.confirmed_at.is_none() {
+                continue;
+            }
+            if acknowledgement.session_id != window.session_id
+                || acknowledgement.turn_generation_id != window.delivery_invocation_uuid
+            {
+                return Err(format!(
+                    "Confirmed delivery {} conflicts with its mailbox attempt identity",
+                    window.attempt_id
+                ));
+            }
         }
         let seqs = window.rows.iter().map(|row| row.seq).collect::<Vec<_>>();
         let mut chain_ids = window
@@ -1586,7 +1538,7 @@ fn format_submitted_input(index: usize, row: &MailboxRow, payload: &str) -> Stri
 }
 
 fn new_delivery_nonce() -> String {
-    Uuid::new_v4().to_string()
+    format!("{:x}", Sha256::digest(Uuid::new_v4().as_bytes()))
 }
 
 fn compose_answer(prefix: String, answer: Option<String>) -> String {
@@ -1645,12 +1597,89 @@ mod tests {
     }
 
     #[test]
+    fn persisted_observation_confirmation_settles_headless_delivery_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&directory.path().join("state.db")).unwrap();
+        let mut mailbox = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let EnqueueResult::Inserted(row) = mailbox
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "observation-session",
+                handle: "observation-handle",
+                payload_json: "{}",
+                owner_invocation_uuid: Some("owner-invocation"),
+                matched_os_pid: Some(1),
+                matched_os_boot_id: Some("observation-boot"),
+                matched_os_pid_starttime_ticks: Some(1),
+                matched_chain_index: Some(0),
+                state_dir: "/tmp/state",
+                meta_path: "/tmp/meta",
+                log_path: "/tmp/log",
+                rc_path: "/tmp/rc",
+                rc: 0,
+            })
+            .unwrap()
+        else {
+            panic!("expected inserted mailbox row");
+        };
+        mailbox
+            .register_headless_delivery_attempt(
+                "observation-attempt",
+                "observation-session",
+                None,
+                "delivery-invocation",
+                &[row.seq],
+                0,
+            )
+            .unwrap();
+        mailbox
+            .record_delivery_observation_anchor(
+                "observation-attempt",
+                "observation-session",
+                &oulipoly_state::mailbox::MailboxDeliveryObservationAnchor {
+                    provider_name: "provider".to_string(),
+                    provider_instance_id: "provider-instance".to_string(),
+                    settings_id: "settings".to_string(),
+                    provider_session_id: "observation-session".to_string(),
+                    resume_token: "opaque-anchor".to_string(),
+                    expected_sha256: "a".repeat(64),
+                },
+            )
+            .unwrap();
+        mailbox
+            .record_delivery_observation_confirmation("observation-attempt", "user-turn")
+            .unwrap();
+
+        assert_eq!(
+            deliverable_pending_count_on(&mut mailbox, &state, "observation-session").unwrap(),
+            0
+        );
+        assert!(
+            mailbox
+                .list_pending("observation-session")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn notification_prefix_includes_delivery_nonce_near_end() {
         let prefix = render_mailbox_prefix(&[], 0, "nonce-123").unwrap();
 
         assert!(
             prefix.contains("[OULIPOLY-DELIVERY nonce-123]\n[END OULIPOLY NOTIFICATIONS]"),
             "{prefix}"
+        );
+    }
+
+    #[test]
+    fn generated_delivery_nonce_matches_observation_protocol_shape() {
+        let nonce = new_delivery_nonce();
+
+        assert_eq!(nonce.len(), 64);
+        assert!(
+            nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         );
     }
 

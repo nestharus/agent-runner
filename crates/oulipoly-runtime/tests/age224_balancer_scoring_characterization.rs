@@ -1,7 +1,10 @@
 use chrono::{Duration, Utc};
 use oulipoly_config::{ModelConfig, ProviderConfig, model::PromptMode};
 use oulipoly_runtime::balancer::select_provider;
-use oulipoly_state::{InvocationStart, QuotaWindowInput, StateDb};
+use oulipoly_state::{
+    InvocationStart, QuotaWindowInput, SessionTurnIngestStreamKey, SessionTurnPageApply,
+    SessionTurnStreamProjection, StateDb,
+};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{
@@ -25,6 +28,7 @@ fn cached_window_gate_ignores_ineligible_missing_window_provider() {
     for _ in 0..5 {
         record_invocation(&db, &model.name, "b", 1, true);
     }
+    mark_model_turn_counts_caught_up(&db, &model);
 
     let selected = select_provider(&model, &db, None).unwrap();
 
@@ -70,6 +74,7 @@ fn fanout_trace_emits_selected_provider_band_members_and_score() {
     let model = model_with("age224-fanout-trace", &["a", "b"]);
     seed_windows_with_deltas(&db, "a", &[(0.40, 100, 0.01, 22)]);
     seed_windows_with_deltas(&db, "b", &[(0.10, 40, 0.01, 22)]);
+    mark_model_turn_counts_caught_up(&db, &model);
 
     let (selected, events) = capture_trace_events(|| select_provider(&model, &db, None).unwrap());
     let event = trace_event_with_message(&events, "fanout selected");
@@ -134,6 +139,46 @@ fn seed_windows_with_deltas(db: &StateDb, provider_name: &str, windows: &[Learne
             *delta_percent,
             *delta_calls,
         )
+        .unwrap();
+    }
+}
+
+fn mark_model_turn_counts_caught_up(db: &StateDb, model: &ModelConfig) {
+    for provider in &model.providers {
+        let key = SessionTurnIngestStreamKey {
+            provider_name: provider.name.clone(),
+            provider_instance_id: provider.name.clone(),
+            settings_id: "age224-settings".to_string(),
+            session_id: format!("{}-age224", provider.name),
+            projection: SessionTurnStreamProjection::CanonicalIngest,
+        };
+        db.enqueue_session_turn_ingest_stream(&key).unwrap();
+        let now = Utc::now();
+        let stream = db
+            .lease_ready_session_turn_ingest_stream(
+                SessionTurnStreamProjection::CanonicalIngest,
+                "age224-worker",
+                now,
+                now + Duration::minutes(1),
+            )
+            .unwrap()
+            .unwrap();
+        db.apply_session_turn_page(&SessionTurnPageApply {
+            key,
+            lease_owner: "age224-worker".to_string(),
+            expected_generation: stream.checkpoint_generation,
+            request_token_sha256: "1".repeat(64),
+            snapshot_id: format!("{}-age224-snapshot", provider.name),
+            page_index: stream.expected_page_index,
+            page_start_sequence: stream.expected_turn_sequence,
+            page_turn_count: 0,
+            scan_progress: false,
+            snapshot_complete: true,
+            next_page_token: None,
+            resume_token: Some(format!("{}-age224-resume", provider.name)),
+            page_digest: "2".repeat(64),
+            turns: Vec::new(),
+        })
         .unwrap();
     }
 }

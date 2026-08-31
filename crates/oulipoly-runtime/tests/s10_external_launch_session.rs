@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -23,6 +25,13 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        TEST_DATA_DIR.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("test data dir");
+            unsafe {
+                std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+            }
+            dir
+        });
         let dir = tempfile::tempdir().expect("tempdir");
         let record_path = dir.path().join("provider-records.jsonl");
         fs::write(&record_path, "").expect("record file");
@@ -309,6 +318,7 @@ def describe():
         "preferred_contract": CONTRACT,
         "capabilities": {
             "launch": True,
+            "launch_output_v1": True,
             "policy": True,
             "quota": False,
             "session": False,
@@ -350,12 +360,32 @@ def launch():
         "request_id": rid,
         "seq": 2,
         "time_unix_ms": 1002,
+        "kind": "marker",
+        "name": "oulipoly.launch_output_complete/v1",
+        "value": {
+            "protocol": "oulipoly.launch_output/v1",
+            "stdout": {
+                "bytes": 3,
+                "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+            },
+            "stderr": {
+                "bytes": 0,
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            },
+            "data_event_count": 1,
+        },
+    })
+    emit_event({
+        "contract": CONTRACT,
+        "request_id": rid,
+        "seq": 3,
+        "time_unix_ms": 1003,
         "kind": "exit",
         "status": {"kind": "exited", "code": 0},
         "terminal_signal": {
             "kind": "clean_exit",
             "evidence": "fixture clean exit",
-            "observed_at_unix_ms": 1002,
+            "observed_at_unix_ms": 1003,
         },
         "session": {
             "provider_session_id": SESSION_ID,

@@ -9,6 +9,13 @@ pub const PROMPT_ACCEPTANCE_V1: &str = "oulipoly.prompt_acceptance/v1";
 pub const PROMPT_ACCEPTED_MARKER_V1: &str = "oulipoly.prompt_accepted/v1";
 pub const HOST_PROMPT_ACCEPTANCE_V1_ENV: &str = "OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1";
 pub const HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE: &str = "1";
+pub const LAUNCH_OUTPUT_V1: &str = "oulipoly.launch_output/v1";
+pub const LAUNCH_OUTPUT_COMPLETE_MARKER_V1: &str = "oulipoly.launch_output_complete/v1";
+pub const HOST_LAUNCH_OUTPUT_V1_ENV: &str = "OULIPOLY_HOST_LAUNCH_OUTPUT_V1";
+pub const HOST_LAUNCH_OUTPUT_V1_ENV_VALUE: &str = "1";
+pub const SESSION_TURN_PAGES_V1: &str = "oulipoly.session_turn_pages/v1";
+pub const HOST_SESSION_TURN_PAGES_V1_ENV: &str = "OULIPOLY_HOST_SESSION_TURN_PAGES_V1";
+pub const HOST_SESSION_TURN_PAGES_V1_ENV_VALUE: &str = "1";
 
 pub type JsonObject = BTreeMap<String, Value>;
 
@@ -40,6 +47,18 @@ pub fn host_requested_prompt_acceptance_v1(host: &HostContext) -> bool {
         .get(HOST_PROMPT_ACCEPTANCE_V1_ENV)
         .map(String::as_str)
         == Some(HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE)
+}
+
+pub fn host_requested_launch_output_v1(host: &HostContext) -> bool {
+    host.env.get(HOST_LAUNCH_OUTPUT_V1_ENV).map(String::as_str)
+        == Some(HOST_LAUNCH_OUTPUT_V1_ENV_VALUE)
+}
+
+pub fn host_requested_session_turn_pages_v1(host: &HostContext) -> bool {
+    host.env
+        .get(HOST_SESSION_TURN_PAGES_V1_ENV)
+        .map(String::as_str)
+        == Some(HOST_SESSION_TURN_PAGES_V1_ENV_VALUE)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -323,9 +342,13 @@ pub struct DescribeCapabilities {
     pub launch: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub prompt_acceptance_v1: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub launch_output_v1: bool,
     pub policy: bool,
     pub quota: bool,
     pub session: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub session_turn_pages_v1: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub session_enumerate: bool,
     pub terminal: bool,
@@ -508,6 +531,25 @@ pub struct PromptAcceptedMarkerValueV1 {
     pub message_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchOutputRequestV1 {
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchOutputChannelSummaryV1 {
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchOutputCompleteMarkerValueV1 {
+    pub protocol: String,
+    pub stdout: LaunchOutputChannelSummaryV1,
+    pub stderr: LaunchOutputChannelSummaryV1,
+    pub data_event_count: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LaunchParams {
     pub settings_id: String,
@@ -523,6 +565,8 @@ pub struct LaunchParams {
     pub session: Option<JsonObject>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_acceptance: Option<PromptAcceptanceRequestV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_delivery: Option<LaunchOutputRequestV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -646,6 +690,40 @@ pub struct SessionBaseParams {
     pub extra: JsonObject,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTurnPageProjection {
+    CanonicalIngest,
+    UserObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTurnPageStartMode {
+    Beginning,
+    Tail,
+    Continuation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionReadTurnsParams {
+    pub settings_id: String,
+    pub session_id: String,
+    pub read_protocol: SessionTurnPagesV1Protocol,
+    pub turn_projection: SessionTurnPageProjection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_delivery_nonce: Option<String>,
+    pub start_mode: SessionTurnPageStartMode,
+    pub after_token: Option<String>,
+    pub snapshot_id: Option<String>,
+    pub page_token: Option<String>,
+    pub max_turns: u64,
+    pub max_response_bytes: u64,
+    pub max_source_bytes: u64,
+    pub max_inline_body_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionLiveReport {
     pub provider_session_id: String,
@@ -678,11 +756,61 @@ pub struct SessionLocateTranscriptResult {
     pub require_existing_observed: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTurnBodyChunk {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: Option<String>,
+    #[serde(flatten)]
+    pub metadata: JsonObject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTurnBodyState {
+    Inline,
+    Absent,
+    OmittedOversize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTurnPageTurn {
+    pub session_id: String,
+    pub turn_id: String,
+    pub snapshot_sequence: u64,
+    pub timestamp: String,
+    pub role: String,
+    pub parent_turn_id: Option<String>,
+    pub is_sidechain: bool,
+    pub is_compaction_boundary: bool,
+    pub body_state: SessionTurnBodyState,
+    pub body: Option<Vec<SessionTurnBodyChunk>>,
+    pub body_bytes: Option<u64>,
+    pub body_sha256: Option<String>,
+    pub canonical_text_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionReadTurnsResult {
-    pub turns: Vec<Value>,
-    pub turn_count: u64,
-    pub complete: bool,
+    pub read_protocol: SessionTurnPagesV1Protocol,
+    pub provider_instance_id: String,
+    pub settings_id: String,
+    pub session_id: String,
+    pub turn_projection: SessionTurnPageProjection,
+    pub snapshot_id: String,
+    pub page_index: u64,
+    pub page_start_sequence: u64,
+    pub turns: Vec<SessionTurnPageTurn>,
+    pub page_turn_count: u64,
+    pub source_bytes_examined: u64,
+    pub scan_progress: bool,
+    pub snapshot_complete: bool,
+    pub next_page_token: Option<String>,
+    pub resume_token: Option<String>,
+    pub source_final: bool,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -982,6 +1110,7 @@ fixed_str_type!(LaunchStderrKind, "stderr");
 fixed_str_type!(LaunchMarkerKind, "marker");
 fixed_str_type!(LaunchHeartbeatKind, "heartbeat");
 fixed_str_type!(LaunchExitKind, "exit");
+fixed_str_type!(SessionTurnPagesV1Protocol, "oulipoly.session_turn_pages/v1");
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LaunchStdoutEvent {
@@ -1139,7 +1268,7 @@ pub type SessionEnumerateErrorResponse = ErrorResponseEnvelope;
 pub type SessionLocateTranscriptRequest = RequestEnvelope<SessionBaseParams>;
 pub type SessionLocateTranscriptResponse = SuccessResponseEnvelope<SessionLocateTranscriptResult>;
 pub type SessionLocateTranscriptErrorResponse = ErrorResponseEnvelope;
-pub type SessionReadTurnsRequest = RequestEnvelope<SessionBaseParams>;
+pub type SessionReadTurnsRequest = RequestEnvelope<SessionReadTurnsParams>;
 pub type SessionReadTurnsResponse = SuccessResponseEnvelope<SessionReadTurnsResult>;
 pub type SessionReadTurnsErrorResponse = ErrorResponseEnvelope;
 pub type SessionCaptureRequest = RequestEnvelope<SessionCaptureParams>;

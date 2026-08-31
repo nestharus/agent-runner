@@ -131,6 +131,21 @@ fn upsert_quota_refresh_empty_input_does_not_reset_calls_since_refresh_when_prio
 }
 
 #[test]
+fn quota_refresh_preserves_prior_call_evidence_while_turn_ingest_is_untracked() {
+    let db = test_db();
+    let provider = "p";
+    db.upsert_quota_refresh(provider, &[quota_input(0.20, "2026-04-22T00:00:00Z")])
+        .unwrap();
+    for _ in 0..7 {
+        db.increment_calls_since_refresh(provider).unwrap();
+    }
+
+    let prior = db.get_quota(provider).unwrap().unwrap();
+
+    assert_eq!(db.turns_between_quota_refreshes(provider, Some(&prior)), 7);
+}
+
+#[test]
 fn upsert_quota_refresh_writes_per_window_delta_for_matching_window_id() {
     let db = test_db();
     let provider = "p";

@@ -25,9 +25,11 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const LARGE_PROMPT_BYTES: usize = 200 * 1024;
 const PROMPT_INSTRUCTION_PREFIX: &str = "Follow the instructions in ";
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 struct FixtureScript {
     _dir: tempfile::TempDir,
@@ -35,6 +37,13 @@ struct FixtureScript {
 }
 
 fn fixture_script(body: &str) -> FixtureScript {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("provider.sh");
     let mut script = std::fs::File::create(&path).expect("create provider script");

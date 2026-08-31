@@ -4,6 +4,7 @@ use oulipoly_provider::client::{CancellationToken, ProviderClient};
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::DescribeResult;
 use serde_json::Value;
+use std::time::Duration;
 
 pub(super) fn session_client(
     registry: &ProviderRegistry,
@@ -50,6 +51,29 @@ pub(super) fn session_enumerate_client(
     enabled_provider_instance_client(registry, identity, None)
 }
 
+pub(super) fn session_page_client(
+    registry: &ProviderRegistry,
+    identity: &SessionProviderIdentity,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+) -> Result<ProviderClient, SessionProviderError> {
+    let describe = registry
+        .describe_model_provider_instance_with_cancellation(
+            &identity.model_name,
+            &identity.provider_name,
+            cancellation,
+        )
+        .map_err(map_registry_error)?;
+    require_session_capability(&describe)?;
+    require_session_turn_pages_capability(&describe)?;
+    let artifact = registry
+        .enabled_artifact_for_model_provider(&identity.model_name, &identity.provider_name)
+        .map_err(map_registry_error)?;
+    Ok(registry
+        .client_factory()
+        .client_for_with_cancellation_and_timeout(artifact, cancellation, timeout))
+}
+
 fn describe_session_provider(
     registry: &ProviderRegistry,
     identity: &SessionProviderIdentity,
@@ -79,6 +103,19 @@ fn require_session_enumerate_capability(
         Err(SessionProviderError::new(
             "session_enumerate_capability_missing",
             "provider describe did not advertise session.enumerate capability",
+        ))
+    }
+}
+
+fn require_session_turn_pages_capability(
+    describe: &DescribeResult,
+) -> Result<(), SessionProviderError> {
+    if describe.capabilities.session_turn_pages_v1 {
+        Ok(())
+    } else {
+        Err(SessionProviderError::new(
+            "session_turn_pages_capability_missing",
+            "provider describe did not advertise selected session_turn_pages_v1 capability",
         ))
     }
 }

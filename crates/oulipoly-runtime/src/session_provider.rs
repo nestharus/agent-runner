@@ -10,26 +10,32 @@
 mod dispatch;
 mod enumerate;
 mod host;
+mod ingest;
 mod lifecycle_proof;
 mod locate;
 mod provider_client;
 mod request;
 mod turns;
 mod types;
+mod worker;
 
 pub(crate) use dispatch::locate_transcript_with_raw_metadata_with_cancellation;
 pub use dispatch::{
     capture, capture_for_lifecycle, capture_live_report, enumerate_sessions, locate_transcript,
-    locate_transcript_with_raw_metadata, read_turns, read_turns_for_lifecycle,
-    read_user_turn_observations,
+    locate_transcript_with_raw_metadata, read_turn_page,
 };
+pub use ingest::{canonical_stream_key, ingest_one_canonical_turn_page};
 pub use lifecycle_proof::dispatch_aware_no_ref_lifecycle_proof;
-pub use turns::{assert_turn_count_diagnostic, ingest_owned_turns};
 pub use types::{
     NoRefProofOutput, NoRefProofRequest, S7A_NEUTRAL_SETTINGS_ID, SessionProviderCaptureRequest,
     SessionProviderCaptureResult, SessionProviderEnumerateEntry, SessionProviderEnumerateRequest,
     SessionProviderEnumerateResult, SessionProviderEnumerateSource, SessionProviderError,
     SessionProviderIdentity, SessionProviderLifecycleContext, SessionProviderLiveCaptureRequest,
-    SessionProviderLocateRequest, SessionProviderLocatedTranscript,
-    SessionProviderReadTurnsRequest, SessionProviderReadTurnsResult, SessionProviderTurn,
+    SessionProviderLocateRequest, SessionProviderLocatedTranscript, SessionProviderPageCursor,
+    SessionProviderPageTurn, SessionProviderReadPageRequest, SessionProviderReadPageResult,
+    SessionProviderTurnProjection, SessionTurnIngestQuantumRequest,
+};
+pub use worker::{
+    SessionTurnIngestDriverRequest, SessionTurnIngestQuantumOutcome,
+    run_one_session_turn_ingest_quantum, run_session_turn_ingest_quantum_for_key,
 };

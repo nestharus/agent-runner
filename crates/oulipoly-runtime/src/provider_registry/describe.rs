@@ -2,8 +2,10 @@ use super::{ProviderClientFactory, ProviderRegistryError};
 use oulipoly_provider::client::{CancellationToken, ProviderClient, ProviderEnv};
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
-    CONTRACT_VERSION, DescribeRequest, DescribeResult, EmptyParams, HOST_PROMPT_ACCEPTANCE_V1_ENV,
-    HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE, HostContext,
+    CONTRACT_VERSION, DescribeRequest, DescribeResult, EmptyParams, HOST_LAUNCH_OUTPUT_V1_ENV,
+    HOST_LAUNCH_OUTPUT_V1_ENV_VALUE, HOST_PROMPT_ACCEPTANCE_V1_ENV,
+    HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE, HOST_SESSION_TURN_PAGES_V1_ENV,
+    HOST_SESSION_TURN_PAGES_V1_ENV_VALUE, HostContext,
 };
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use serde_json::Value;
@@ -46,10 +48,20 @@ pub(crate) fn describe_provider_client(
 }
 
 fn describe_request(_host_options: &DescribeHostOptions) -> Result<Value, ProviderRegistryError> {
-    let env = BTreeMap::from([(
-        HOST_PROMPT_ACCEPTANCE_V1_ENV.to_string(),
-        HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE.to_string(),
-    )]);
+    let env = BTreeMap::from([
+        (
+            HOST_PROMPT_ACCEPTANCE_V1_ENV.to_string(),
+            HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE.to_string(),
+        ),
+        (
+            HOST_LAUNCH_OUTPUT_V1_ENV.to_string(),
+            HOST_LAUNCH_OUTPUT_V1_ENV_VALUE.to_string(),
+        ),
+        (
+            HOST_SESSION_TURN_PAGES_V1_ENV.to_string(),
+            HOST_SESSION_TURN_PAGES_V1_ENV_VALUE.to_string(),
+        ),
+    ]);
     serde_json::to_value(DescribeRequest {
         contract: CONTRACT_VERSION.to_string(),
         request_id: format!("provider-registry-{}", uuid::Uuid::new_v4()),

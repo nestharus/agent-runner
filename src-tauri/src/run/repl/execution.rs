@@ -72,7 +72,6 @@ pub(super) fn repl_balance_context<'a>(
 ) -> balancer::BalanceContext<'a> {
     balancer::BalanceContext {
         providers_cfg: &env.providers_cfg,
-        sessions_cfg: &env.sessions_cfg,
         in_flight,
     }
 }

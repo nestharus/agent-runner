@@ -46,8 +46,22 @@ use oulipoly_runtime::executor::cli::{classify_terminal_reason, execute};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+fn ensure_test_data_dir() {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
+}
 
 fn script(body: &str) -> (tempfile::TempDir, PathBuf) {
+    ensure_test_data_dir();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("script.sh");
     std::fs::write(&path, script_body(body)).unwrap();
@@ -62,6 +76,7 @@ fn script_body(body: &str) -> String {
 }
 
 fn model_for(path: &std::path::Path) -> ModelConfig {
+    ensure_test_data_dir();
     ModelConfig {
         name: "c3-model".to_string(),
         prompt_mode: PromptMode::Arg,
@@ -167,6 +182,7 @@ fn empty_command_rejected_with_canonical_error() {
 
 #[test]
 fn spawn_failure_error_prefix_is_failed_to_spawn() {
+    ensure_test_data_dir();
     // Use a definitely-nonexistent path. The supervisor maps to
     // `Failed to spawn '{provider_name}': {err}`.
     let provider = ProviderConfig::new(

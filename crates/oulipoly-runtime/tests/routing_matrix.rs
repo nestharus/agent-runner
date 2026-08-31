@@ -3,7 +3,10 @@ use oulipoly_config::{ModelConfig, ProviderConfig, model::PromptMode};
 use oulipoly_runtime::services::{
     ProductionRoutingService, RoutingServicePort, RoutingServiceRequest, ServiceError,
 };
-use oulipoly_state::{InvocationStart, QuotaWindowInput, SessionTurnIngest, StateDb};
+use oulipoly_state::{
+    InvocationStart, QuotaWindowInput, SessionTurnIngest, SessionTurnIngestStreamKey,
+    SessionTurnPageApply, SessionTurnStreamProjection, StateDb,
+};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -372,6 +375,7 @@ fn assert_route_winner(
     expected_provider_name: &str,
     case_label: &str,
 ) {
+    mark_model_turn_counts_caught_up(db, model, case_label);
     let output = ProductionRoutingService::new()
         .select_route(RoutingServiceRequest {
             model,
@@ -385,6 +389,47 @@ fn assert_route_winner(
         .map(|provider| provider.name.clone())
         .expect("select_route returned an out-of-range provider index");
     assert_eq!(winner_name, expected_provider_name, "case={case_label}");
+}
+
+fn mark_model_turn_counts_caught_up(db: &StateDb, model: &ModelConfig, case_label: &str) {
+    for provider in &model.providers {
+        let key = SessionTurnIngestStreamKey {
+            provider_name: provider.name.clone(),
+            provider_instance_id: provider.name.clone(),
+            settings_id: "routing-matrix-settings".to_string(),
+            session_id: format!("{}-routing-matrix", provider.name),
+            projection: SessionTurnStreamProjection::CanonicalIngest,
+        };
+        db.enqueue_session_turn_ingest_stream(&key)
+            .unwrap_or_else(|err| panic!("case={case_label}: failed to enqueue stream: {err}"));
+        let now = Utc::now();
+        let stream = db
+            .lease_ready_session_turn_ingest_stream(
+                SessionTurnStreamProjection::CanonicalIngest,
+                "routing-matrix-worker",
+                now,
+                now + Duration::minutes(1),
+            )
+            .unwrap_or_else(|err| panic!("case={case_label}: failed to lease stream: {err}"))
+            .unwrap_or_else(|| panic!("case={case_label}: stream must be leaseable"));
+        db.apply_session_turn_page(&SessionTurnPageApply {
+            key,
+            lease_owner: "routing-matrix-worker".to_string(),
+            expected_generation: stream.checkpoint_generation,
+            request_token_sha256: "1".repeat(64),
+            snapshot_id: format!("{}-routing-matrix-snapshot", provider.name),
+            page_index: stream.expected_page_index,
+            page_start_sequence: stream.expected_turn_sequence,
+            page_turn_count: 0,
+            scan_progress: false,
+            snapshot_complete: true,
+            next_page_token: None,
+            resume_token: Some(format!("{}-routing-matrix-resume", provider.name)),
+            page_digest: "2".repeat(64),
+            turns: Vec::new(),
+        })
+        .unwrap_or_else(|err| panic!("case={case_label}: failed to complete stream: {err}"));
+    }
 }
 
 macro_rules! route_test {

@@ -321,7 +321,9 @@ mod tests {
         ProviderRegistry, ProviderRegistryHandle, ProviderRegistryOptions,
     };
     use oulipoly_runtime::services::ProductionSessionLifecycleService;
-    use oulipoly_state::InvocationStart;
+    use oulipoly_state::{
+        InvocationStart, SessionTurnIngestStreamKey, SessionTurnStreamProjection,
+    };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -333,7 +335,7 @@ mod tests {
     const INVOCATION: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
     #[test]
-    fn production_lifecycle_ingest_routes_external_session_read_and_capture() {
+    fn production_lifecycle_ingest_captures_and_queues_bounded_turn_ingest() {
         let fixture = ProductionSessionFixture::new();
         let row_id = fixture.seed_finalized_invocation();
         let model = external_model(&fixture.provider_path);
@@ -366,13 +368,10 @@ mod tests {
         assert_eq!(output.session_id.as_deref(), Some(SESSION));
         assert_eq!(
             fixture.provider_subcommands(),
-            vec!["describe", "session.read_turns", "session.capture"]
+            vec!["describe", "session.capture"]
         );
-        assert_eq!(
-            fixture.session_request_settings_ids(),
-            vec![PROVIDER, PROVIDER]
-        );
-        assert_eq!(fixture.session_turn_count(), 1);
+        assert_eq!(fixture.session_request_settings_ids(), vec![PROVIDER]);
+        assert!(fixture.canonical_stream_is_queued());
     }
 
     #[test]
@@ -396,7 +395,6 @@ mod tests {
     struct ProductionSessionFixture {
         dir: tempfile::TempDir,
         state: StateDb,
-        state_path: PathBuf,
         provider_path: PathBuf,
         record_path: PathBuf,
     }
@@ -411,7 +409,6 @@ mod tests {
             Self {
                 dir,
                 state,
-                state_path,
                 provider_path,
                 record_path,
             }
@@ -435,17 +432,28 @@ mod tests {
         }
 
         fn services(&self, model: &ModelConfig) -> wiring::AgentRuntimeServices {
+            let config_root = self.dir.path().join("config-root");
+            let data_root = self.dir.path().join("data-root");
             let registry = Arc::new(
                 ProviderRegistry::from_model_configs(
                     std::slice::from_ref(model),
                     ProviderRegistryOptions::default()
-                        .with_config_root(self.dir.path().join("config-root"))
-                        .with_data_root(self.dir.path().join("data-root")),
+                        .with_config_root(config_root.clone())
+                        .with_data_root(data_root.clone()),
                 )
                 .expect("registry"),
             );
             let handle = ProviderRegistryHandle::new(registry.clone());
-            let mut services = wiring::AgentRuntimeServices::cli_defaults().unwrap();
+            let mut services = wiring::AgentRuntimeServices::production(wiring::RuntimePaths {
+                models_dir: config_root.join("models"),
+                agents_dir: config_root.join("agents"),
+                state_db_path: data_root.join("state.db"),
+                lock_dir: data_root.join("locks"),
+                working_dir: self.dir.path().join("working"),
+                config_root,
+                data_root,
+            })
+            .unwrap();
             services.provider_registry = registry;
             services.provider_registry_handle = handle.clone();
             services.session_lifecycle_service = Arc::new(
@@ -470,11 +478,17 @@ mod tests {
                 .collect()
         }
 
-        fn session_turn_count(&self) -> i64 {
-            rusqlite::Connection::open(&self.state_path)
-                .expect("sqlite")
-                .query_row("SELECT COUNT(*) FROM session_turns", [], |row| row.get(0))
-                .expect("turn count")
+        fn canonical_stream_is_queued(&self) -> bool {
+            self.state
+                .session_turn_ingest_stream(&SessionTurnIngestStreamKey {
+                    provider_name: PROVIDER.to_string(),
+                    provider_instance_id: "provider-a-instance".to_string(),
+                    settings_id: PROVIDER.to_string(),
+                    session_id: SESSION.to_string(),
+                    projection: SessionTurnStreamProjection::CanonicalIngest,
+                })
+                .expect("read canonical stream")
+                .is_some()
         }
     }
 
@@ -583,18 +597,6 @@ if subcommand == "describe":
             "migration": False,
         }},
         "settings_schema_id": "provider-a-test-settings",
-    }})
-elif subcommand == "session.read_turns":
-    response = envelope({{
-        "turns": [{{
-            "session_id": {session_id},
-            "turn_id": "turn-1",
-            "timestamp": "2026-05-01T00:00:00Z",
-            "role": "assistant",
-            "body": [{{"type": "text", "text": "ok"}}],
-        }}],
-        "turn_count": 1,
-        "complete": True,
     }})
 elif subcommand == "session.capture":
     response = envelope({{

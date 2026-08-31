@@ -24,9 +24,9 @@ use crate::provider_registry::DescribeHostOptions;
 use oulipoly_config::PromptMode;
 use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_provider::generated::{
-    BytePayload, CONTRACT_VERSION, HostContext, JsonObject, LaunchParams, LaunchRequest,
-    PROMPT_ACCEPTANCE_V1, PolicyEvaluateParams, PolicyEvaluateRequest, PromptAcceptanceRequestV1,
-    ProviderModelRequest,
+    BytePayload, CONTRACT_VERSION, HostContext, JsonObject, LAUNCH_OUTPUT_V1,
+    LaunchOutputRequestV1, LaunchParams, LaunchRequest, PROMPT_ACCEPTANCE_V1, PolicyEvaluateParams,
+    PolicyEvaluateRequest, PromptAcceptanceRequestV1, ProviderModelRequest,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -85,7 +85,7 @@ fn declared_launch_env(
     remove_configured_launch_env(&mut env, &context.provider.unset_environment);
     env.extend(context.provider.environment.clone());
     remove_runner_private_environment(&mut env);
-    insert_pinned_agent_data_dir(&mut env);
+    insert_pinned_agent_data_dir(&mut env)?;
     let mut completion_registration_authority = None;
     if let Some(parent) = provider_parent_invocation_env(context.parent_invocation_env.as_deref()) {
         let selected_is_current = context.parent_invocation_env.as_deref() == Some(parent.as_str());
@@ -133,16 +133,13 @@ fn inherited_launch_env() -> BTreeMap<String, String> {
         .collect()
 }
 
-fn insert_pinned_agent_data_dir(env: &mut BTreeMap<String, String>) {
-    if let Some(data_dir) = pinned_agent_data_dir() {
-        insert_launch_env(env, DATA_DIR_ENV, data_dir);
-    }
-}
-
-fn pinned_agent_data_dir() -> Option<String> {
-    oulipoly_state::paths::data_dir()
-        .ok()
-        .map(|data_dir| data_dir.display().to_string())
+fn insert_pinned_agent_data_dir(env: &mut BTreeMap<String, String>) -> Result<(), String> {
+    insert_launch_env(
+        env,
+        DATA_DIR_ENV,
+        oulipoly_state::paths::data_dir()?.display().to_string(),
+    );
+    Ok(())
 }
 
 fn insert_launch_env(env: &mut BTreeMap<String, String>, key: &str, value: String) {
@@ -174,6 +171,7 @@ pub(crate) fn build_launch_request(
     candidate: &LaunchCandidate,
     host_options: &DescribeHostOptions,
     include_prompt_acceptance_v1: bool,
+    include_launch_output_v1: bool,
 ) -> Result<Value, serde_json::Error> {
     let (argv, launch_stdin) = project_launch_carrier(context, candidate);
     let mut launch_env = candidate.env.clone();
@@ -213,6 +211,9 @@ pub(crate) fn build_launch_request(
             prompt_acceptance: include_prompt_acceptance_v1
                 .then(|| prompt_acceptance_request(candidate))
                 .flatten(),
+            output_delivery: include_launch_output_v1.then(|| LaunchOutputRequestV1 {
+                protocol: LAUNCH_OUTPUT_V1.to_string(),
+            }),
         },
     })
 }

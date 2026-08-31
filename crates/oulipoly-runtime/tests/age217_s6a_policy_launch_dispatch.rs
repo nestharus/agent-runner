@@ -36,6 +36,7 @@ const CHILD_CUSTODY_FAULT_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_FAULT";
 const CHILD_CUSTODY_READY_FILE_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE";
 const CHILD_PID_FILE_ENV: &str = "OULIPOLY_CHILD_PID_FILE";
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 fn auto_wake_environment_names() -> Vec<&'static str> {
     AutoWakeEnvironmentVariable::ALL
@@ -105,6 +106,7 @@ enum LaunchMode {
     CancelledFinal,
     UnknownTerminalWithQuotaText,
     HostCancelledBeforeFinal,
+    LargeOutput,
 }
 
 #[derive(Debug, Default)]
@@ -147,10 +149,23 @@ impl Drop for EnvScope {
 }
 
 fn env_lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
+    env_mutex().lock().unwrap_or_else(|err| err.into_inner())
+}
+
+fn env_mutex() -> &'static Mutex<()> {
+    ENV_LOCK.get_or_init(|| {
+        let data_dir = TEST_DATA_DIR.get_or_init(|| tempfile::tempdir().expect("test data dir"));
+        if std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV).is_none() {
+            unsafe {
+                std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, data_dir.path());
+            }
+        }
+        Mutex::new(())
+    })
+}
+
+fn ensure_test_data_dir() {
+    let _ = env_mutex();
 }
 
 fn set_env(key: &str, value: Option<&std::ffi::OsStr>) {
@@ -165,6 +180,7 @@ fn set_env(key: &str, value: Option<&std::ffi::OsStr>) {
 }
 
 fn fixture_script(body: &str) -> ScriptFixture {
+    ensure_test_data_dir();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("provider.sh");
     write_executable(
@@ -454,6 +470,7 @@ fn make_external_fixture(
     policy_mode: PolicyMode,
     launch_mode: LaunchMode,
 ) -> ExternalFixture {
+    ensure_test_data_dir();
     let dir = tempfile::tempdir().expect("tempdir");
     let order_path = dir.path().join("order.txt");
     let process_env_record_path = dir.path().join("process-env.jsonl");
@@ -598,6 +615,7 @@ fn launch_mode_wire(launch_mode: LaunchMode) -> &'static str {
         LaunchMode::CancelledFinal => "cancelled_final",
         LaunchMode::UnknownTerminalWithQuotaText => "unknown_terminal_with_quota_text",
         LaunchMode::HostCancelledBeforeFinal => "host_cancelled_before_final",
+        LaunchMode::LargeOutput => "large_output",
     }
 }
 
@@ -621,6 +639,8 @@ fn fake_provider_script_body(
     format!(
         r#"#!/usr/bin/env python3
 import json
+import base64
+import hashlib
 import os
 import pathlib
 import sys
@@ -685,6 +705,7 @@ def describe(request):
         "preferred_contract": CONTRACT,
         "capabilities": {{
             "launch": CAP_LAUNCH,
+            "launch_output_v1": True,
             "policy": CAP_POLICY,
             "quota": False,
             "session": False,
@@ -787,6 +808,24 @@ def exit_event(request, seq, code, signal):
         "session": {{"provider_session_id": "example-session"}}
     }}
 
+def output_completion_event(request, seq, stdout_chunks, stderr_chunks):
+    stdout = b"".join(base64.b64decode(chunk) for chunk in stdout_chunks)
+    stderr = b"".join(base64.b64decode(chunk) for chunk in stderr_chunks)
+    return {{
+        "contract": CONTRACT,
+        "request_id": request_id(request),
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
+        "kind": "marker",
+        "name": "oulipoly.launch_output_complete/v1",
+        "value": {{
+            "protocol": "oulipoly.launch_output/v1",
+            "stdout": {{"bytes": len(stdout), "sha256": hashlib.sha256(stdout).hexdigest()}},
+            "stderr": {{"bytes": len(stderr), "sha256": hashlib.sha256(stderr).hexdigest()}},
+            "data_event_count": len(stdout_chunks) + len(stderr_chunks),
+        }},
+    }}
+
 def launch(_request):
     append_order("launch")
     LAUNCH_RECORD.write_text(json.dumps(_request, sort_keys=True))
@@ -811,29 +850,39 @@ def launch(_request):
         return 8
     if LAUNCH_MODE == "cancelled_final":
         write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 1, "time_unix_ms": 1001, "kind": "stdout", "data_base64": "YQ=="}})
+        write_jsonl(output_completion_event(_request, 2, ["YQ=="], []))
         write_jsonl({{
             "contract": CONTRACT,
             "request_id": reqid,
-            "seq": 2,
-            "time_unix_ms": 1002,
+            "seq": 3,
+            "time_unix_ms": 1003,
             "kind": "exit",
             "status": {{"kind": "cancelled"}},
-            "terminal_signal": {{"kind": "cancelled", "evidence": "fake-provider cancellation", "observed_at_unix_ms": 1002}},
+            "terminal_signal": {{"kind": "cancelled", "evidence": "fake-provider cancellation", "observed_at_unix_ms": 1003}},
             "session": {{"provider_session_id": "example-session"}}
         }})
         return 0
     if LAUNCH_MODE == "unknown_terminal_with_quota_text":
         write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 1, "time_unix_ms": 1001, "kind": "stderr", "data_base64": "cXVvdGFfZXhoYXVzdGVkX2luYmFuZA=="}})
-        write_jsonl(exit_event(_request, 2, 0, "unknown"))
+        write_jsonl(output_completion_event(_request, 2, [], ["cXVvdGFfZXhoYXVzdGVkX2luYmFuZA=="]))
+        write_jsonl(exit_event(_request, 3, 0, "unknown"))
         return 0
     if LAUNCH_MODE == "host_cancelled_before_final":
         import time
         time.sleep(5)
         return 0
+    if LAUNCH_MODE == "large_output":
+        chunk = base64.b64encode(b"x" * 8192).decode()
+        for seq in range(1, 257):
+            write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": seq, "time_unix_ms": 1000 + seq, "kind": "stdout", "data_base64": chunk}})
+        write_jsonl(output_completion_event(_request, 257, [chunk] * 256, []))
+        write_jsonl(exit_event(_request, 258, 0, "clean_exit"))
+        return 0
     code = 9 if LAUNCH_MODE == "nonzero_final" else 0
     write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 1, "time_unix_ms": 1001, "kind": "stdout", "data_base64": "AAH/"}})
     write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 2, "time_unix_ms": 1002, "kind": "stderr", "data_base64": "ZXJy//4="}})
-    write_jsonl(exit_event(_request, 3, code, "nonzero_exit" if code else "clean_exit"))
+    write_jsonl(output_completion_event(_request, 3, ["AAH/"], ["ZXJy//4="]))
+    write_jsonl(exit_event(_request, 4, code, "nonzero_exit" if code else "clean_exit"))
     return 6 if LAUNCH_MODE == "provider_nonzero_after_final" else 0
 
 def main():
@@ -1238,6 +1287,10 @@ fn external_provider_launch_request_carries_selected_settings_id_and_effective_i
     assert_launch_argv_tail(&launch_argv);
     assert_effective_input_flags(&launch_argv);
     assert_no_arg_mode_stdin(&launch);
+    assert_eq!(
+        launch["params"]["output_delivery"]["protocol"],
+        "oulipoly.launch_output/v1"
+    );
 }
 
 fn explicit_working_dir(fixture: &ExternalFixture) -> PathBuf {
@@ -2392,7 +2445,38 @@ fn external_provider_launch_preserves_stdout_bytes_and_maps_stderr_boundary() {
         result.stderr, "err\u{fffd}\u{fffd}",
         "stderr bytes should cross the existing lossy String boundary deliberately"
     );
+    let output = result.output_spool.as_ref().expect("sealed output spool");
+    assert_eq!(output.stdout_bytes().expect("complete stdout"), [0, 1, 255]);
+    assert_eq!(
+        output.stderr_bytes().expect("complete stderr"),
+        [b'e', b'r', b'r', 0xff, 0xfe]
+    );
     assert_eq!(result.exit_code, 0);
+}
+
+#[test]
+fn external_provider_launch_spools_output_beyond_diagnostic_retention() {
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::LargeOutput,
+    );
+
+    let result = execute_external_fixture(&fixture).expect("large external launch should succeed");
+    let output = result.output_spool.as_ref().expect("sealed output spool");
+    let summary = output.summary().expect("output summary");
+
+    assert_eq!(summary.stdout_bytes, 2 * 1024 * 1024);
+    assert_eq!(summary.stderr_bytes, 0);
+    assert_eq!(summary.data_event_count, 256);
+    assert_eq!(result.stdout.len(), 1024 * 1024);
+    assert_eq!(
+        output.stdout_bytes().expect("complete stdout"),
+        vec![b'x'; 2 * 1024 * 1024]
+    );
 }
 
 #[test]
@@ -2515,7 +2599,7 @@ fn external_provider_launch_host_cancelled_before_final_uses_cancellation_fallba
     );
     let model = external_model(&fixture);
     let cancellation = oulipoly_provider::client::CancellationToken::new();
-    cancellation.cancel_after(Duration::from_millis(50));
+    cancellation.cancel_after(Duration::from_secs(2));
     let client_options = oulipoly_provider::client::ProviderClientOptions::default()
         .with_cancellation(Some(cancellation));
     let registry = dispatch_registry_for_models_with_options(

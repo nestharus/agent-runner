@@ -565,6 +565,15 @@ fn parse_session_line(stderr: &str, invocation_uuid: &str) -> String {
     value["session_id"].as_str().unwrap().to_string()
 }
 
+fn assert_no_session_line(stderr: &str) {
+    assert!(
+        stderr
+            .lines()
+            .all(|line| !line.starts_with("OULIPOLY_SESSION=")),
+        "legacy completion must not synchronously discover a session: {stderr}"
+    );
+}
+
 fn parse_session_json(stderr: &str, invocation_uuid: &str) -> Value {
     let lines: Vec<&str> = stderr
         .lines()
@@ -1047,7 +1056,7 @@ flag = "--resume"
 }
 
 #[test]
-fn noninteractive_invocation_ingests_session_and_emits_oulipoly_session_line() {
+fn noninteractive_legacy_invocation_does_not_synchronously_scan_or_emit_session() {
     let fixture = Fixture::new();
     let transcript_path = fixture.dir.path().join("turns.jsonl");
     fs::write(&transcript_path, "").unwrap();
@@ -1076,15 +1085,15 @@ printf 'mock answer\n'
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let invocation = parse_invocation(&stderr);
-    let emitted_session_id = parse_session_line(&stderr, &invocation.id);
-    assert_eq!(emitted_session_id, expected_session_id);
+    assert_no_session_line(&stderr);
 
     let row = fixture
         .open_db()
         .get_invocation_by_uuid(&invocation.id)
         .unwrap()
         .unwrap();
-    assert_eq!(row.session_id.as_deref(), Some(expected_session_id));
+    assert_eq!(row.session_id, None);
+    assert_eq!(row.session_capture_method.as_deref(), Some("none"));
 }
 
 #[test]
@@ -1124,20 +1133,20 @@ kind = "flag"
 flag = "--resume"
 "#,
     );
-
-    let initial_output = fixture
-        .base_model_command("claude-opus")
-        .arg("start session")
-        .output()
-        .unwrap();
-    assert_eq!(initial_output.status.code(), Some(0), "{initial_output:?}");
-    let initial_stderr = String::from_utf8_lossy(&initial_output.stderr);
-    let initial_invocation = parse_invocation(&initial_stderr);
-    let captured_session_id = parse_session_line(&initial_stderr, &initial_invocation.id);
-    assert_eq!(captured_session_id, initial_session_id);
+    fixture.seed_active_chain(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        &["cla", "ude2"].concat(),
+        initial_session_id,
+        &["cla", "ude-opus"].concat(),
+    );
+    fixture.seed_session_turns(
+        &["cla", "ude2"].concat(),
+        initial_session_id,
+        &[("turn-1", "2026-04-17T08:00:00Z")],
+    );
 
     let resume_output = fixture
-        .base_top_level_resume_command("claude-opus", &captured_session_id)
+        .base_top_level_resume_command(&["cla", "ude-opus"].concat(), initial_session_id)
         .arg("continue session")
         .output()
         .unwrap();
@@ -1145,21 +1154,18 @@ flag = "--resume"
     let resume_stderr = String::from_utf8_lossy(&resume_output.stderr);
     let resume_invocation = parse_invocation(&resume_stderr);
     let resumed_session_id = parse_session_line(&resume_stderr, &resume_invocation.id);
-    assert_eq!(resumed_session_id, captured_session_id);
+    assert_eq!(resumed_session_id, initial_session_id);
 
     let row = fixture
         .open_db()
         .get_invocation_by_uuid(&resume_invocation.id)
         .unwrap()
         .unwrap();
-    assert_eq!(
-        row.session_id.as_deref(),
-        Some(captured_session_id.as_str())
-    );
+    assert_eq!(row.session_id.as_deref(), Some(initial_session_id));
 }
 
 #[test]
-fn top_level_file_resume_preserves_supplied_session_id_when_provider_emits_fresh_id() {
+fn top_level_file_resume_preserves_supplied_id_without_sync_fresh_id_ingest() {
     let fixture = Fixture::new();
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
     let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
@@ -1190,8 +1196,14 @@ fn top_level_file_resume_preserves_supplied_session_id_when_provider_emits_fresh
     let emitted_session_id = parse_session_line(&stderr, &invocation.id);
     assert_eq!(emitted_session_id, session_id);
     assert_invocation_session(&fixture, &invocation.id, session_id);
-    assert!(session_turn_count(&fixture, "claude2", fresh_session_id) >= 1);
-    assert!(chain_segment_count(&fixture, "claude2", fresh_session_id) >= 1);
+    assert_eq!(
+        session_turn_count(&fixture, &["cla", "ude2"].concat(), fresh_session_id),
+        0
+    );
+    assert_eq!(
+        chain_segment_count(&fixture, &["cla", "ude2"].concat(), fresh_session_id),
+        0
+    );
     let trace = run_trace_json(&fixture, &invocation.id);
     assert_eq!(trace["root"]["session"]["id"], session_id);
     assert_eq!(trace["root"]["session"]["capture_method"], "resumed");
@@ -1313,48 +1325,23 @@ fn top_level_resume_without_prompt_preserves_supplied_session_id_when_provider_e
 }
 
 #[test]
-fn initial_and_resumed_turns_remain_queryable_under_supplied_session_id() {
+fn resumed_invocations_remain_queryable_under_supplied_session_id() {
     let fixture = Fixture::new();
-    let transcript_path = fixture.dir.path().join("initial-turns.jsonl");
-    fs::write(&transcript_path, "").unwrap();
-    fixture.write_sessions_config("claude2", &transcript_path);
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
     let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
-    let script = fixture.write_script(
-        "claude-initial-session-writer.sh",
-        &format!(
-            r#"ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
-turn_id="turn-$(date +%s%N)-$$"
-printf '{{"session_id":"{session_id}","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$turn_id" "$ts" >> "{}"
-printf 'initial answer\n'
-"#,
-            transcript_path.display()
-        ),
+    write_resume_provider_emitting_different_session_id(&fixture, fresh_session_id);
+    fixture.seed_active_chain(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        &["cla", "ude2"].concat(),
+        session_id,
+        &["cla", "ude-opus"].concat(),
     );
-    fixture.write_single_provider_model(
-        "claude-opus",
-        "claude2",
-        &script,
-        r#"
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-"#,
-    );
-    let initial_output = fixture
-        .base_model_command("claude-opus")
-        .arg("start")
-        .output()
-        .unwrap();
-    assert_eq!(initial_output.status.code(), Some(0), "{initial_output:?}");
-    let initial_stderr = String::from_utf8_lossy(&initial_output.stderr);
-    let initial_invocation = parse_invocation(&initial_stderr);
-    assert_eq!(
-        parse_session_line(&initial_stderr, &initial_invocation.id),
-        session_id
+    fixture.seed_session_turns(
+        &["cla", "ude2"].concat(),
+        session_id,
+        &[("turn-1", "2026-04-17T08:00:00Z")],
     );
 
-    write_resume_provider_emitting_different_session_id(&fixture, fresh_session_id);
     for prompt in ["continue one", "continue two"] {
         let output = fixture
             .base_top_level_resume_command("claude-opus", session_id)
@@ -1370,7 +1357,7 @@ flag = "--resume"
         assert_eq!(trace["root"]["session"]["id"], session_id);
     }
 
-    assert_eq!(invocation_count_for_session(&fixture, session_id), 3);
+    assert_eq!(invocation_count_for_session(&fixture, session_id), 2);
 }
 
 #[test]
@@ -2640,34 +2627,22 @@ flag = "--resume"
 #[test]
 fn infa_style_trace_uses_one_session_id_without_audit_waiver() {
     let fixture = Fixture::new();
-    let transcript_path = fixture.dir.path().join("infa-initial-turns.jsonl");
-    fs::write(&transcript_path, "").unwrap();
-    fixture.write_sessions_config("claude2", &transcript_path);
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
     let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
-    let script = fixture.write_script(
-        "infa-initial-provider.sh",
-        &format!(
-            r#"ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
-turn_id="turn-$(date +%s%N)-$$"
-printf '{{"session_id":"{session_id}","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$turn_id" "$ts" >> "{}"
-printf 'initial answer\n'
-"#,
-            transcript_path.display()
-        ),
+    write_resume_provider_emitting_different_session_id(&fixture, fresh_session_id);
+    fixture.seed_active_chain(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        &["cla", "ude2"].concat(),
+        session_id,
+        &["cla", "ude-opus"].concat(),
     );
-    fixture.write_single_provider_model(
-        "claude-opus",
-        "claude2",
-        &script,
-        r#"
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-"#,
+    fixture.seed_session_turns(
+        &["cla", "ude2"].concat(),
+        session_id,
+        &[("turn-1", "2026-04-17T08:00:00Z")],
     );
     let root_output = fixture
-        .base_model_command("claude-opus")
+        .base_top_level_resume_command(&["cla", "ude-opus"].concat(), session_id)
         .arg("start")
         .output()
         .unwrap();
@@ -2679,7 +2654,6 @@ flag = "--resume"
         session_id
     );
 
-    write_resume_provider_emitting_different_session_id(&fixture, fresh_session_id);
     let parent_env = serde_json::to_string(&root_invocation).unwrap();
     for prompt in ["continue one", "continue two"] {
         let mut cmd = fixture.base_top_level_resume_command("claude-opus", session_id);

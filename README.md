@@ -295,16 +295,36 @@ After the normal stale-refresh pass, balanced CLI routing also compares live quo
 
 Provider state is keyed by the provider's `name` field (the CLI account — e.g. `claude`, `claude2`) and is shared across every model routed through that account. This means two models pointing at the same provider share quota and error history.
 
-**Persistent state**: set `OULIPOLY_DATA_DIR` to the application data directory before running any command. The runner does not infer this location from XDG, HOME, the current directory, the executable location, or the build profile:
+**Runtime paths**: install the real runner binary outside a general-purpose `bin` directory and place `config.toml` beside it. For example:
+
+```text
+~/.config/oulipoly-agent-runner/runner/
+├── oulipoly-agent-runner
+└── config.toml
+
+~/.local/bin/agents -> ~/.config/oulipoly-agent-runner/runner/oulipoly-agent-runner
+~/.local/bin/oulipoly-agent-runner -> ~/.config/oulipoly-agent-runner/runner/oulipoly-agent-runner
+```
+
+The adjacent `config.toml` contains the runtime roots:
+
+```toml
+data_dir = "/home/example/.local/share/oulipoly-agent-runner"
+config_home = "/home/example/.config"
+```
+
+Both values must be absolute. The runner canonicalizes its executable path before looking for `config.toml`, so a symlink in `~/.local/bin` resolves configuration beside the real binary and no configuration file is needed in `bin`. When this file exists, it is the exclusive runtime-path source: unreadable, malformed, incomplete, or relative values are errors and do not fall through to process environment. Keeping the production file beside the canonical installed binary prevents development and test binaries elsewhere on disk from discovering production state.
+
+When the adjacent file is absent, provide runtime paths through the process environment:
 
 ```bash
 export OULIPOLY_DATA_DIR="$HOME/.local/share/oulipoly-agent-runner"
 export OULIPOLY_CONFIG_HOME="$HOME/.config"
 ```
 
-Invocation history, quota snapshots, and ingested session turns then live at `$OULIPOLY_DATA_DIR/state.db`; the PID-identity/mailbox sidecar, payload store, and application lock files use the same explicit root. An unset `OULIPOLY_DATA_DIR` is an error in installed, development, and test environments. No daemon or background process is required: state is shared through filesystem-level SQLite WAL locking, so multiple CLI invocations coordinate safely.
+Invocation history, quota snapshots, and ingested session turns live at `<data_dir>/state.db`; the PID-identity/mailbox sidecar, payload store, and application lock files use the same explicit root. Without an adjacent paths file, an unset `OULIPOLY_DATA_DIR` is an error in installed, development, and test environments. No daemon or background process is required: state is shared through filesystem-level SQLite WAL locking, so multiple CLI invocations coordinate safely.
 
-Application configuration lives under `$OULIPOLY_CONFIG_HOME/oulipoly-agent-runner`. An explicitly set `XDG_CONFIG_HOME` is accepted when `OULIPOLY_CONFIG_HOME` is absent, but the runner does not derive an application config location from HOME, the executable, or the current directory.
+Application configuration lives under `<config_home>/oulipoly-agent-runner`. When using the environment provider, an explicitly set `XDG_CONFIG_HOME` is accepted when `OULIPOLY_CONFIG_HOME` is absent. The runner does not derive either root from HOME, the current directory, or the build profile.
 
 ### `providers.toml`
 

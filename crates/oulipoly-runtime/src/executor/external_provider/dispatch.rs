@@ -25,16 +25,17 @@ use super::launch_result_mapper::{
     map_launch_result_with_terminal_classification, map_missing_final_exit_with_prompt_acceptance,
     marker_provider_session_id,
 };
+use super::output_spool_observer::observe_output;
 use super::policy_transform::apply_policy_transform;
 use super::request_builder::{build_launch_candidate, build_launch_request, build_policy_request};
 use super::terminal_classify_handoff::classify_after_launch_success;
-use crate::executor::ExecutionResult;
 use crate::executor::cli::spawn_identity::{
     RunningRuntimeGeneration, SpawnIdentityContext, SpawnRuntimeMode, backfill_captured_session_id,
     child_custody_test_fault, context_from_parent_invocation_env, mark_runtime_generation_exited,
     mark_runtime_generation_orderly_completed, mark_runtime_generation_spawn_failed,
     record_child_identity, register_runtime_generation_starting,
 };
+use crate::executor::{ExecutionOutputSpool, ExecutionResult};
 use crate::provider_registry::{ProviderRegistry, describe_provider_client};
 use crate::services::ServiceError;
 use oulipoly_provider::client::ProcessSpawnObserver;
@@ -127,12 +128,18 @@ fn attempt_account_dispatch(
     artifact: &ProviderArtifactRef,
     context: &ExternalProviderDispatchContext,
 ) -> Result<ExecutionResult, AccountAttemptError> {
+    let output_spool = ExecutionOutputSpool::new().map_err(|_| {
+        terminal_attempt_error(protocol_service_error("launch_output_spool_create_failed"))
+    })?;
     let spawn_identity = external_launch_spawn_identity_context(context);
     let recorded_generation = recorded_launch_generation();
     let spawn_observer =
         external_launch_spawn_observer(spawn_identity.as_ref(), Arc::clone(&recorded_generation));
-    let launch_event_observer =
-        external_launch_event_observer(spawn_identity.as_ref(), Arc::clone(&recorded_generation));
+    let launch_event_observer = external_launch_event_observer(
+        spawn_identity.as_ref(),
+        Arc::clone(&recorded_generation),
+        output_spool.clone(),
+    );
     let client = registry.client_factory().client_for_with_observers(
         artifact.clone(),
         spawn_observer,
@@ -142,6 +149,11 @@ fn attempt_account_dispatch(
         .map_err(|error| terminal_attempt_error(map_registry_error(error)))?;
     gate_required_capabilities(&describe)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
+    if !describe.capabilities.launch_output_v1 {
+        return Err(terminal_attempt_error(protocol_service_error(
+            "complete_launch_output_unsupported",
+        )));
+    }
     // Script path semantics require pathname re-resolution, so their executable
     // identity cannot remain pinned through exec.
     let provider_supports_prompt_acceptance_v1 = describe.capabilities.prompt_acceptance_v1
@@ -161,6 +173,7 @@ fn attempt_account_dispatch(
         &candidate,
         registry.host_options(),
         launch_prompt_acceptance_v1_enabled,
+        describe.capabilities.launch_output_v1,
     )
     .map_err(|_| terminal_attempt_error(protocol_service_error("schema_invalid_request")))?;
     register_runtime_generation_starting(spawn_identity.as_ref()).map_err(|_| {
@@ -221,6 +234,7 @@ fn attempt_account_dispatch(
         &context.provider.name,
         classification,
         launch_prompt_acceptance_v1_enabled,
+        output_spool,
     ))
 }
 
@@ -267,10 +281,15 @@ fn external_launch_spawn_observer(
 fn external_launch_event_observer(
     context: Option<&SpawnIdentityContext>,
     recorded_generation: RecordedLaunchGeneration,
+    output_spool: ExecutionOutputSpool,
 ) -> Option<LaunchEventObserver> {
-    let context = context.cloned()?;
+    let context = context.cloned();
     Some(LaunchEventObserver::new(move |event| {
-        backfill_external_launch_session_marker(&context, &recorded_generation, event);
+        observe_output(&output_spool, event)?;
+        if let Some(context) = &context {
+            backfill_external_launch_session_marker(context, &recorded_generation, event);
+        }
+        Ok(())
     }))
 }
 

@@ -64,6 +64,8 @@ fn ti_04_loader_level_idempotence_preserves_representative_rows() {
             "0017_completion_registration_authority",
             "0018_invocation_completion_materialization_summary",
             "0019_invocation_running_projection_index",
+            "0020_session_turn_pages",
+            "0021_invocation_output_delivery",
         ]
     );
 

@@ -2073,7 +2073,8 @@ mod tests {
         let declaration = "#[allow(dead_code)]\nmod output;";
         assert_eq!(source.matches(declaration).count(), 1);
         assert!(!source.contains("pub mod output"));
-        assert!(!source.contains("pub use self::output"));
+        assert!(!source.contains("pub use self::output::"));
+        assert!(!source.contains("pub use self::output;"));
         let below = source
             .split_once(declaration)
             .expect("private output declaration")

@@ -19,6 +19,9 @@
         "prompt_acceptance": {
           "description": "Present only when the host has one authoritative exact-prompt fact after policy evaluation. The host omits this property when policy changes argv, stdin, or prompt bytes.",
           "$ref": "#/$defs/PromptAcceptanceRequestV1"
+        },
+        "output_delivery": {
+          "$ref": "#/$defs/LaunchOutputRequestV1"
         }
       },
       "required": ["settings_id", "mode", "model", "argv", "working_directory"],
@@ -62,6 +65,34 @@
       "required": ["protocol", "provider_session_id", "prompt_sha256"],
       "additionalProperties": false
     },
+    "LaunchOutputRequestV1": {
+      "type": "object",
+      "properties": {
+        "protocol": { "const": "oulipoly.launch_output/v1" }
+      },
+      "required": ["protocol"],
+      "additionalProperties": false
+    },
+    "LaunchOutputChannelSummaryV1": {
+      "type": "object",
+      "properties": {
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      },
+      "required": ["bytes", "sha256"],
+      "additionalProperties": false
+    },
+    "LaunchOutputCompleteMarkerValueV1": {
+      "type": "object",
+      "properties": {
+        "protocol": { "const": "oulipoly.launch_output/v1" },
+        "stdout": { "$ref": "#/$defs/LaunchOutputChannelSummaryV1" },
+        "stderr": { "$ref": "#/$defs/LaunchOutputChannelSummaryV1" },
+        "data_event_count": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["protocol", "stdout", "stderr", "data_event_count"],
+      "additionalProperties": false
+    },
     "LaunchRequest": {
       "allOf": [
         { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
@@ -96,7 +127,7 @@
     },
     "LaunchMarkerEvent": {
       "type": "object",
-      "description": "Generic launch marker. The reserved name oulipoly.prompt_accepted/v1 has the strict PromptAcceptedMarkerValueV1 shape and exact-prompt acceptance semantics; all other names retain generic marker semantics.",
+      "description": "Generic launch marker. Reserved prompt-acceptance and launch-output-completion names have strict value shapes; all other names retain generic marker semantics.",
       "properties": {
         "contract": { "$ref": "common.schema.json#/$defs/ContractVersion" },
         "request_id": { "$ref": "common.schema.json#/$defs/RequestId" },
@@ -115,6 +146,15 @@
           },
           "then": {
             "properties": { "value": { "$ref": "#/$defs/PromptAcceptedMarkerValueV1" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "name": { "const": "oulipoly.launch_output_complete/v1" } },
+            "required": ["name"]
+          },
+          "then": {
+            "properties": { "value": { "$ref": "#/$defs/LaunchOutputCompleteMarkerValueV1" } }
           }
         }
       ],

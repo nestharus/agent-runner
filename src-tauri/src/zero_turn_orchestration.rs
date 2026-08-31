@@ -22,8 +22,15 @@
 //! ```
 
 use oulipoly_runtime::executor::terminal_signal::build_zero_turn_evidence;
-use oulipoly_runtime::sessions::AssistantCompletionRecord;
 use oulipoly_state::SessionTurnCounts;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssistantCompletionRecord {
+    pub session_id: String,
+    pub turn_id: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub completion_outcome: Option<String>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ZeroTurnConfirmationKey {
@@ -280,6 +287,7 @@ pub fn classify_accepted_provider_turn(
     Some(map_accepted_provider_turn_evidence(baseline, validated))
 }
 
+#[allow(dead_code)]
 pub fn is_incomplete_tool_boundary(
     baseline: &ZeroTurnBaseline,
     end_count: SessionTurnCounts,
@@ -422,13 +430,13 @@ fn next_action_for_maybe_quota(
 #[cfg(test)]
 mod tests {
     use super::{
-        HostObservedCompletion, ZeroTurnAction, ZeroTurnBaseline, ZeroTurnClassification,
-        ZeroTurnConfirmationKey, ZeroTurnConfirmationState, ZeroTurnEvidence,
-        classify_accepted_provider_turn, classify_completion, classify_completion_delta,
-        is_incomplete_tool_boundary, next_action, record_baseline, record_baseline_with_completion,
+        AssistantCompletionRecord, HostObservedCompletion, ZeroTurnAction, ZeroTurnBaseline,
+        ZeroTurnClassification, ZeroTurnConfirmationKey, ZeroTurnConfirmationState,
+        ZeroTurnEvidence, classify_accepted_provider_turn, classify_completion,
+        classify_completion_delta, is_incomplete_tool_boundary, next_action, record_baseline,
+        record_baseline_with_completion,
     };
     use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
-    use oulipoly_runtime::sessions::AssistantCompletionRecord;
     use oulipoly_state::SessionTurnCounts;
 
     fn counts(assistant: u64) -> SessionTurnCounts {

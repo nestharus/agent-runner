@@ -42,6 +42,7 @@ mod resume_cli;
 mod run;
 mod session_ingest_cli;
 mod session_metadata_cli;
+mod session_turn_ingest_driver;
 mod spawn_cwd;
 mod terminal_outcome_adapter;
 mod usage;

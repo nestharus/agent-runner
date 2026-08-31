@@ -145,7 +145,7 @@ fn run_with_balancing_environment(
     reservation: Option<&ReservedRun>,
 ) -> Result<i32, String> {
     let in_flight = oulipoly_runtime::quota::InFlight::new();
-    let ctx = super::mapper::balance_context(&env.providers_cfg, &env.sessions_cfg, &in_flight);
+    let ctx = super::mapper::balance_context(&env.providers_cfg, &in_flight);
     let state = &env.state;
     let parent_invocation_id = super::parent_invocation_row_id(
         crate::dispatch::resolve_parent_invocation_id(state),

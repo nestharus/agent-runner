@@ -523,8 +523,7 @@ fn idx_main_02_one_shot_emits_single_result_envelope_and_invocation_marker() {
 }
 
 #[test]
-fn age_35_one_shot_run_with_balancing_uses_balance_context_to_refresh_and_scan_all_model_providers()
-{
+fn age_35_one_shot_routing_refreshes_quota_without_scanning_session_history() {
     let fixture = CliFixture::new();
     fixture.write_model("age35", &["age35-a", "age35-b"]);
     fixture.write_providers(&["age35-a", "age35-b"], true);
@@ -542,8 +541,8 @@ fn age_35_one_shot_run_with_balancing_uses_balance_context_to_refresh_and_scan_a
         );
         assert_eq!(
             db.count_assistant_turns_since(provider, None).unwrap(),
-            1,
-            "one-shot routing should scan sessions before selecting {provider}"
+            0,
+            "one-shot routing must not scan session history for {provider}"
         );
     }
 }
@@ -721,7 +720,7 @@ fn age_81_one_shot_non_quota_failure_does_not_retry() {
 }
 
 #[test]
-fn age_35_non_resume_repl_uses_balance_context_to_refresh_and_scan_all_model_providers() {
+fn age_35_non_resume_repl_refreshes_quota_without_scanning_session_history() {
     let fixture = CliFixture::new();
     fixture.write_model("age35", &["age35-a", "age35-b"]);
     fixture.write_providers(&["age35-a", "age35-b"], true);
@@ -739,8 +738,8 @@ fn age_35_non_resume_repl_uses_balance_context_to_refresh_and_scan_all_model_pro
         );
         assert_eq!(
             db.count_assistant_turns_since(provider, None).unwrap(),
-            1,
-            "non-resume REPL routing should scan sessions before selecting {provider}"
+            0,
+            "non-resume REPL routing must not scan session history for {provider}"
         );
     }
 }

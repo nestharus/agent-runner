@@ -21,6 +21,7 @@ pub mod cli;
 mod external_provider;
 #[allow(dead_code)]
 mod output;
+mod output_spool;
 pub mod prompt_acceptance;
 mod provider_specific;
 pub mod providers;
@@ -39,6 +40,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+pub use self::output_spool::ExecutionOutputSpool;
 pub use self::providers::codex::Recognizer as CodexRecognizer;
 pub use self::providers::openai_compat::Recognizer as OpenAiCompatRecognizer;
 pub use self::providers::opencode::Recognizer as OpenCodeRecognizer;
@@ -64,6 +66,9 @@ pub use self::terminal_signal::TerminalSignalRecognizer;
 pub struct ExecutionResult {
     pub stdout: Vec<u8>,
     pub stderr: String,
+    /// Complete external-provider output. `stdout` and `stderr` remain bounded
+    /// diagnostic evidence when this spool is present.
+    pub output_spool: Option<ExecutionOutputSpool>,
     /// Numeric child-process exit code per `exit_code_from_status`.
     pub exit_code: i32,
     pub provider_index: usize,
@@ -78,6 +83,55 @@ pub struct ExecutionResult {
     pub prompt_acceptance_attestation: Option<PromptAcceptedMarkerValueV1>,
     pub captured_child_invocations: Vec<CapturedChildInvocation>,
     pub returned_artifacts: Vec<ReturnedArtifactRef>,
+}
+
+impl ExecutionResult {
+    pub fn persist_output_for_invocation(
+        &self,
+        state: &oulipoly_state::StateDb,
+        invocation_id: i64,
+        invocation_uuid: &str,
+    ) -> Result<(), String> {
+        match &self.output_spool {
+            Some(spool) => spool.persist_for_invocation(state, invocation_id, invocation_uuid),
+            None => Ok(()),
+        }
+    }
+
+    pub fn write_stdout_to(&self, writer: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match &self.output_spool {
+            Some(spool) => spool.write_stdout_to(writer),
+            None => writer.write_all(&self.stdout),
+        }
+    }
+
+    pub fn write_stderr_to(&self, writer: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match &self.output_spool {
+            Some(spool) => spool.write_stderr_to(writer),
+            None => writer.write_all(self.stderr.as_bytes()),
+        }
+    }
+
+    pub fn complete_stdout_bytes(&self) -> std::io::Result<Vec<u8>> {
+        match &self.output_spool {
+            Some(spool) => spool.stdout_bytes(),
+            None => Ok(self.stdout.clone()),
+        }
+    }
+
+    pub fn stdout_ends_with_newline(&self) -> bool {
+        match &self.output_spool {
+            Some(spool) => spool.stdout_ends_with_newline(),
+            None => self.stdout.ends_with(b"\n"),
+        }
+    }
+
+    pub fn stdout_is_empty(&self) -> std::io::Result<bool> {
+        match &self.output_spool {
+            Some(spool) => Ok(spool.summary()?.stdout_bytes == 0),
+            None => Ok(self.stdout.is_empty()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

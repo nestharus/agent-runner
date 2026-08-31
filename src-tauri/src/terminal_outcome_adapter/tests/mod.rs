@@ -14,6 +14,7 @@ fn result_with_signal(kind: Option<TerminalSignalKind>) -> ExecutionResult {
     ExecutionResult {
         stdout: Vec::new(),
         stderr: "legacy quota text".to_string(),
+        output_spool: None,
         exit_code: 1,
         provider_index: 0,
         session_capture: SessionCaptureResult {

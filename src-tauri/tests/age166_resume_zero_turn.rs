@@ -6,20 +6,17 @@
 //! `validator`, `orchestration`, `formatter`
 //!
 //! Drives `oulipoly-agent-runner --resume` flow through the Age153 fixture
-//! harness (orchestration). Asserts the first MaybeQuotaExhausted stays on
-//! the active provider with no exhausted_at write, the second MaybeQuotaExhausted
-//! migrates with mark_exhausted, and a productive retry clears the false-alarm
-//! confirmation state (validator). Provider scripts and capture-pool TOML
-//! produced inline (formatter).
+//! harness (orchestration). Asserts that a lagging canonical checkpoint cannot
+//! synthesize conclusive zero-turn evidence or exhaust/migrate a provider, and
+//! that a later productive resume still succeeds (validator). Provider scripts
+//! and capture-pool TOML are produced inline (formatter).
 
 mod age153_support;
 #[path = "pr_f_resume_integration.rs"]
 mod pr_f_resume_integration;
 
 use age153_support::{line_count, parse_valid_invocations, terminal_signal_lines, toml_string};
-use pr_f_resume_integration::{
-    Fixture, invocation_dual_id_columns, parse_invocation, session_turn_count,
-};
+use pr_f_resume_integration::{Fixture, parse_invocation, session_turn_count};
 use rusqlite::params;
 use std::fs;
 use std::path::Path;
@@ -137,7 +134,7 @@ fn output_text(output: &Output) -> (String, String) {
     )
 }
 
-fn assert_maybe_marker_with_session(stderr: &str) {
+fn assert_maybe_marker_with_session_but_without_zero_turn_evidence(stderr: &str) {
     let maybe_lines: Vec<_> = terminal_signal_lines(stderr)
         .into_iter()
         .filter(|line| line.contains("\"kind\":\"MaybeQuotaExhausted\""))
@@ -155,8 +152,8 @@ fn assert_maybe_marker_with_session(stderr: &str) {
     assert!(
         maybe_lines
             .iter()
-            .any(|line| line.contains("new_assistant_turns=0")),
-        "expected zero-turn evidence in marker:\n{stderr}"
+            .all(|line| !line.contains("new_assistant_turns=")),
+        "lagging ingestion must not produce zero-turn evidence:\n{stderr}"
     );
 }
 
@@ -214,17 +211,6 @@ fn invocation_count_for_provider_session(
         .unwrap()
 }
 
-fn provider_for_invocation(fixture: &Fixture, invocation_uuid: &str) -> String {
-    fixture
-        .conn()
-        .query_row(
-            "SELECT provider_name FROM invocations WHERE invocation_uuid = ?1",
-            params![invocation_uuid],
-            |row| row.get(0),
-        )
-        .unwrap()
-}
-
 fn provider_and_session_for_invocation(
     fixture: &Fixture,
     invocation_uuid: &str,
@@ -276,7 +262,7 @@ fn setup_migratable_fixture(
 }
 
 #[test]
-fn resume_zero_turn_then_zero_turn_confirms_quota() {
+fn resume_lagging_zero_turn_does_not_confirm_quota_or_migrate() {
     let fixture = Fixture::new();
     let active_transcript = fixture.dir.path().join("resume-confirm-a.jsonl");
     let sibling_transcript = fixture.dir.path().join("resume-confirm-b.jsonl");
@@ -300,7 +286,8 @@ fn resume_zero_turn_then_zero_turn_confirms_quota() {
         .output()
         .unwrap();
     let (_, first_stderr) = output_text(&first);
-    assert_maybe_marker_with_session(&first_stderr);
+    assert_maybe_marker_with_session_but_without_zero_turn_evidence(&first_stderr);
+    assert_eq!(first.status.code(), Some(1), "{first:?}");
     let first_invocation = parse_valid_invocations(&first_stderr)
         .into_iter()
         .find(|invocation| {
@@ -311,34 +298,25 @@ fn resume_zero_turn_then_zero_turn_confirms_quota() {
         provider_and_session_for_invocation(&fixture, &first_invocation.id);
     assert_eq!(first_provider, "claude-a");
     assert_eq!(first_provider_session_id.as_deref(), Some(SESSION_ID));
-    assert_eq!(exhausted_row_count(&fixture, "claude-a"), 1);
+    assert_eq!(exhausted_row_count(&fixture, &first_provider), 0);
     assert_eq!(
         failed_invocation_count(&fixture, "claude-a", "maybe_quota_exhausted"),
-        2
+        1
     );
     assert_eq!(
         invocation_count_for_provider_session(&fixture, "claude-a", SESSION_ID),
-        2
+        1
     );
-    assert_eq!(line_count(&active_marker), 2);
-    assert_eq!(line_count(&sibling_marker), 1);
+    assert_eq!(line_count(&active_marker), 1);
+    assert_eq!(line_count(&sibling_marker), 0);
     assert_eq!(
         fixture.active_segment(CHAIN_ID),
-        ("claude-b".to_string(), SESSION_ID.to_string())
+        (first_provider, SESSION_ID.to_string())
     );
-    let sibling_invocation = parse_valid_invocations(&first_stderr)
-        .into_iter()
-        .find(|invocation| provider_for_invocation(&fixture, &invocation.id) == "claude-b")
-        .expect("expected migrated sibling invocation");
-    let (provider_session_id, resume_input_id, capture_method) =
-        invocation_dual_id_columns(&fixture, &sibling_invocation.id);
-    assert_eq!(provider_session_id.as_deref(), Some(SESSION_ID));
-    assert_eq!(resume_input_id.as_deref(), Some(SESSION_ID));
-    assert_eq!(capture_method.as_deref(), Some("resumed"));
 }
 
 #[test]
-fn resume_zero_turn_then_turn_clears_false_alarm() {
+fn resume_lagging_failure_then_productive_turn_stays_on_active_provider() {
     let fixture = Fixture::new();
     let transcript = fixture.dir.path().join("resume-clears-a.jsonl");
     let sibling_transcript = fixture.dir.path().join("resume-clears-b.jsonl");
@@ -367,7 +345,8 @@ fn resume_zero_turn_then_turn_clears_false_alarm() {
         .output()
         .unwrap();
     let (_, first_stderr) = output_text(&first);
-    assert_maybe_marker_with_session(&first_stderr);
+    assert_maybe_marker_with_session_but_without_zero_turn_evidence(&first_stderr);
+    assert_eq!(first.status.code(), Some(1), "{first:?}");
     assert_eq!(exhausted_row_count(&fixture, "claude-a"), 0);
 
     let second = fixture
@@ -390,7 +369,11 @@ fn resume_zero_turn_then_turn_clears_false_alarm() {
         fixture.active_segment(CHAIN_ID),
         ("claude-a".to_string(), SESSION_ID.to_string())
     );
-    assert!(session_turn_count(&fixture, "claude-a", SESSION_ID) >= 2);
+    let active_provider = fixture.active_segment(CHAIN_ID).0;
+    assert_eq!(
+        session_turn_count(&fixture, &active_provider, SESSION_ID),
+        1
+    );
 }
 
 #[test]
@@ -428,7 +411,7 @@ flag = "--resume"
 
     assert_eq!(output.status.code(), Some(23), "{output:?}");
     let (_, stderr) = output_text(&output);
-    assert_maybe_marker_with_session(&stderr);
+    assert_maybe_marker_with_session_but_without_zero_turn_evidence(&stderr);
     let invocation = parse_invocation(&stderr);
     let row = fixture
         .open_db()

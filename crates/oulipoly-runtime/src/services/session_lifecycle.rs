@@ -17,7 +17,6 @@ use crate::session_provider::{self, SessionProviderIdentity, SessionProviderLife
 use oulipoly_state::{InvocationRecord, StateDb};
 use std::io::Write;
 
-const S7A_READ_TURNS_SUBCOMMAND: &str = "session.read_turns";
 const S7A_CAPTURE_SUBCOMMAND: &str = "session.capture";
 
 pub(super) fn ingest_session_with_registry(
@@ -26,7 +25,7 @@ pub(super) fn ingest_session_with_registry(
 ) -> Result<SessionLifecycleOutput, ServiceError> {
     let SessionLifecycleRequest {
         state,
-        sessions_cfg,
+        sessions_cfg: _,
         providers_cfg,
         provider_name,
         external_provider,
@@ -60,9 +59,8 @@ pub(super) fn ingest_session_with_registry(
         );
     };
 
-    let provider_capture_session_id = match external_provider {
-        Some(identity) => ingest_external_provider_session(ExternalSessionIngestRequest {
-            state,
+    let provider_capture_session_id = match external_provider.as_ref() {
+        Some(identity) => capture_external_provider_session(ExternalSessionIngestRequest {
             provider_registry,
             identity,
             invocation: &invocation,
@@ -71,11 +69,7 @@ pub(super) fn ingest_session_with_registry(
             effective_cwd,
             mode: &mode,
         })?,
-        None => {
-            let report = crate::sessions::scan_provider(provider_name, sessions_cfg, state);
-            emit_session_scan_errors(stderr, provider_name, report.errors)?;
-            None
-        }
+        None => None,
     };
     let matched_session_id = resolve_session_window_match(SessionWindowMatchRequest {
         state,
@@ -88,6 +82,15 @@ pub(super) fn ingest_session_with_registry(
         invocation_uuid,
     })?;
     let matched_session_id = provider_capture_session_id.or(matched_session_id);
+    enqueue_external_canonical_ingestion(
+        state,
+        stderr,
+        invocation_row_id,
+        &invocation,
+        external_provider.as_ref(),
+        matched_session_id.as_deref(),
+        &mode,
+    )?;
 
     emit_session_lifecycle_output(
         state,
@@ -101,9 +104,8 @@ pub(super) fn ingest_session_with_registry(
 }
 
 struct ExternalSessionIngestRequest<'a> {
-    state: &'a StateDb,
     provider_registry: Option<&'a ProviderRegistryHandle>,
-    identity: SessionServiceExternalProviderIdentity,
+    identity: &'a SessionServiceExternalProviderIdentity,
     invocation: &'a InvocationRecord,
     invocation_row_id: i64,
     invocation_uuid: &'a str,
@@ -111,7 +113,7 @@ struct ExternalSessionIngestRequest<'a> {
     mode: &'a SessionLifecycleIngestMode,
 }
 
-fn ingest_external_provider_session(
+fn capture_external_provider_session(
     request: ExternalSessionIngestRequest<'_>,
 ) -> Result<Option<String>, ServiceError> {
     let registry = request
@@ -119,13 +121,74 @@ fn ingest_external_provider_session(
         .ok_or_else(external_provider_registry_unavailable)?
         .current();
     let context = external_provider_context(&request, registry.as_ref());
-    let turns = session_provider::read_turns_for_lifecycle(&context)
-        .map_err(|error| external_provider_service_error(S7A_READ_TURNS_SUBCOMMAND, error))?;
-    session_provider::ingest_owned_turns(request.state, &request.identity.provider_name, &turns)
-        .map_err(|error| external_provider_service_error(S7A_READ_TURNS_SUBCOMMAND, error))?;
     let capture = session_provider::capture_for_lifecycle(&context)
         .map_err(|error| external_provider_service_error(S7A_CAPTURE_SUBCOMMAND, error))?;
     Ok(capture.provider_session_id)
+}
+
+fn enqueue_external_canonical_ingestion(
+    state: &StateDb,
+    stderr: &mut dyn Write,
+    invocation_row_id: i64,
+    invocation: &InvocationRecord,
+    identity: Option<&SessionServiceExternalProviderIdentity>,
+    matched_session_id: Option<&str>,
+    mode: &SessionLifecycleIngestMode,
+) -> Result<(), ServiceError> {
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+    let Some((session_id, capture_method)) =
+        canonical_ingest_identity(invocation, matched_session_id, mode)
+    else {
+        return Ok(());
+    };
+    if let Err(error) =
+        state.update_session_capture(invocation_row_id, Some(session_id), capture_method)
+    {
+        write_session_ingest_warning(
+            stderr,
+            &format!("Failed to persist session identity before canonical ingest enqueue: {error}"),
+        )?;
+        return Ok(());
+    }
+    let provider_identity = SessionProviderIdentity {
+        model_name: identity.model_name.clone(),
+        provider_name: identity.provider_name.clone(),
+        provider_instance_id: identity.provider_instance_id.clone(),
+        settings_id: identity.settings_id.clone(),
+    };
+    let key = session_provider::canonical_stream_key(&provider_identity, session_id);
+    if let Err(error) = state.enqueue_session_turn_ingest_stream(&key) {
+        write_session_ingest_warning(
+            stderr,
+            &format!("Failed to enqueue canonical session ingest: {error}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn canonical_ingest_identity<'a>(
+    invocation: &'a InvocationRecord,
+    matched_session_id: Option<&'a str>,
+    mode: &'a SessionLifecycleIngestMode,
+) -> Option<(&'a str, &'a str)> {
+    match mode {
+        SessionLifecycleIngestMode::Pinned { resume_target } => Some((resume_target, "resumed")),
+        SessionLifecycleIngestMode::Unpinned { capture_method } => invocation
+            .provider_session_id
+            .as_deref()
+            .map(|session_id| {
+                (
+                    session_id,
+                    invocation
+                        .provider_session_capture_method
+                        .as_deref()
+                        .unwrap_or(capture_method),
+                )
+            })
+            .or_else(|| matched_session_id.map(|session_id| (session_id, capture_method.as_str()))),
+    }
 }
 
 fn external_provider_context<'a>(
@@ -311,21 +374,6 @@ fn validate_session_ingest_invocation(
 
 fn invocation_finished_at(invocation: &InvocationRecord) -> Option<chrono::DateTime<chrono::Utc>> {
     invocation.finished_at
-}
-
-fn emit_session_scan_errors(
-    stderr: &mut dyn Write,
-    provider_name: &str,
-    errors: Vec<String>,
-) -> Result<(), ServiceError> {
-    for err in errors {
-        write_session_ingest_warning(stderr, &session_scan_error_warning(provider_name, &err))?;
-    }
-    Ok(())
-}
-
-fn session_scan_error_warning(provider_name: &str, error: &str) -> String {
-    format!("Session ingest failed for {provider_name}: {error}")
 }
 
 fn emit_session_lifecycle_output(

@@ -38,7 +38,14 @@ fn result_envelope_stdout_byte_shape_is_preserved_for_non_signal_success() {
         "fn emit_result_envelope_line(",
         &["emit_stdout_marker_line(\"OULIPOLY_RESULT\""],
     );
-    assert_signal_consumer_source_wired("fn emit_stdout_marker_line(", &["{marker}={json}"]);
+    assert_signal_consumer_source_wired(
+        "fn emit_stdout_marker_line(",
+        &[
+            "stdout.write_all(marker.as_bytes())",
+            "stdout.write_all(b\"=\")",
+            "stdout.write_all(json.as_bytes())",
+        ],
+    );
 }
 
 #[test]

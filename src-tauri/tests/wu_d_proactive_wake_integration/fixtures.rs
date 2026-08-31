@@ -67,7 +67,7 @@ impl Fixture {
 
     fn prepare_command(&self, cmd: &mut Command) {
         cmd.env("XDG_CONFIG_HOME", &self.config_home)
-            .env_remove("OULIPOLY_CONFIG_HOME")
+            .env("OULIPOLY_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
             .env("XDG_STATE_HOME", &self.state_home)
             .env("HOME", &self.home_dir)
@@ -82,6 +82,8 @@ impl Fixture {
             .env_remove("OULIPOLY_AUTO_WAKE_TOKEN")
             .env_remove("OULIPOLY_AUTO_WAKE_COUNT")
             .env_remove("OULIPOLY_PARENT_INVOCATION")
+            .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+            .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
             .current_dir(self.root());
     }
 
@@ -170,24 +172,62 @@ impl Fixture {
         cmd
     }
 
-    pub(crate) fn write_script(&self, name: &str, body: &str) -> PathBuf {
+    pub(crate) fn write_executable(&self, name: &str, body: &str) -> PathBuf {
         let path = self.root().join(name);
-        fs::write(
-            &path,
-            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
-        )
-        .unwrap();
+        fs::write(&path, body).unwrap();
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).unwrap();
         path
     }
+
+    pub(crate) fn install_agent_bash(&self, source: &std::path::Path) -> PathBuf {
+        let agent_bash_dir = self.root().join("agent-bash");
+        let runner_dir = self.root().join("runner");
+        fs::create_dir_all(&agent_bash_dir).unwrap();
+        fs::create_dir_all(&runner_dir).unwrap();
+
+        let agent_bash = agent_bash_dir.join("agent-bash");
+        fs::copy(source, &agent_bash).unwrap();
+        let runner = runner_dir.join("oulipoly-agent-runner");
+        link_or_copy(std::path::Path::new(crate::parse::runner_bin()), &runner);
+
+        fs::write(
+            agent_bash_dir.join("config.toml"),
+            format!(
+                "state_root = {:?}\nagent_runner_bin = {:?}\n",
+                self.state_home.join("agent-bash").display().to_string(),
+                runner.display().to_string(),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            runner_dir.join("config.toml"),
+            format!(
+                "data_dir = {:?}\nconfig_home = {:?}\n",
+                self.data_home
+                    .join("oulipoly-agent-runner")
+                    .display()
+                    .to_string(),
+                self.config_home.display().to_string(),
+            ),
+        )
+        .unwrap();
+        agent_bash
+    }
+
     pub(crate) fn prompt_file(&self, name: &str) -> PathBuf {
         self.work_dir.join(name)
     }
 
     fn root(&self) -> &std::path::Path {
         self.dir.as_ref().expect("fixture directory").path()
+    }
+}
+
+fn link_or_copy(source: &std::path::Path, destination: &std::path::Path) {
+    if fs::hard_link(source, destination).is_err() {
+        fs::copy(source, destination).unwrap();
     }
 }
 

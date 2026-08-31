@@ -57,6 +57,7 @@ impl Fixture {
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("OULIPOLY_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env("HOME", &self.data_home);
         cmd.env("PATH", self.path_with_scripts_first());
@@ -117,26 +118,10 @@ impl Fixture {
         path
     }
 
-    fn write_model(&self, name: &str, provider_script: &Path, providers: &[&str]) {
-        fs::write(
-            self.models_dir.join(format!("{name}.toml")),
-            model_config_toml(provider_script, providers),
-        )
-        .unwrap();
-    }
-
     fn write_model_without_provider_ref(&self, name: &str, providers: &[&str]) {
         fs::write(
             self.models_dir.join(format!("{name}.toml")),
             model_config_toml_without_provider_ref(providers),
-        )
-        .unwrap();
-    }
-
-    fn write_providers(&self, providers: &[&str]) {
-        fs::write(
-            self.app_config_dir.join("providers.toml"),
-            providers_config_toml(providers),
         )
         .unwrap();
     }
@@ -168,22 +153,54 @@ impl Fixture {
 }
 
 #[test]
-fn session_import_cli_imports_provider_native_sessions_backfills_turns_and_lists_them() {
+fn session_import_cli_backfills_provider_native_turns_synchronously_and_lists_metadata() {
     let fixture = Fixture::new();
     let provider_script = fixture.write_provider_script("fake-provider.py", true);
-    fixture.write_providers(&[PROVIDER_A]);
-    fixture.write_model(MODEL, &provider_script, &[PROVIDER_A]);
+    fixture.write_providers_with_commands(&[(PROVIDER_A, &provider_script)]);
+    fixture.write_model_without_provider_ref(MODEL, &[PROVIDER_A]);
 
     let output = fixture.run_session_import(&["--provider", PROVIDER_A, "--backfill-turns"]);
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(stderr(&output).is_empty(), "{output:?}");
     let stdout = stdout(&output);
-    assert!(stdout.contains("Session import report"), "{stdout}");
+    assert!(
+        stdout.contains("Session import report"),
+        "{stdout}; records={:?}",
+        fixture.read_records()
+    );
     assert!(stdout.contains("provider=provider-a"), "{stdout}");
     assert!(stdout.contains("status=succeeded"), "{stdout}");
     assert!(stdout.contains("imported=1"), "{stdout}");
-    assert!(stdout.contains("turns_backfilled=1"), "{stdout}");
+    assert!(stdout.contains("turns_backfilled=3"), "{stdout}");
+
+    let records = fixture.read_records();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["subcommand"] == "session.read_turns"),
+        "explicit backfill must read turns synchronously: {records:?}"
+    );
+    let connection = rusqlite::Connection::open(
+        fixture
+            .data_home
+            .join("oulipoly-agent-runner")
+            .join("state.db"),
+    )
+    .unwrap();
+    let stream: (String, String) = connection
+        .query_row(
+            "SELECT projection, status
+             FROM session_turn_ingest_streams
+             WHERE provider_name = ?1 AND session_id = ?2",
+            rusqlite::params![PROVIDER_A, "provider-a-native"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        stream,
+        ("canonical_ingest".to_string(), "caught_up".to_string())
+    );
 
     let list_output = fixture.run_session_list_json();
     assert_eq!(list_output.status.code(), Some(0), "{list_output:?}");
@@ -196,7 +213,7 @@ fn session_import_cli_imports_provider_native_sessions_backfills_turns_and_lists
     assert_eq!(row["active_provider"], PROVIDER_A);
     assert_eq!(row["title"], "Provider A native");
     assert_eq!(row["cwd"], fixture.workspace.display().to_string());
-    assert_eq!(row["turn_count"], 1);
+    assert_eq!(row["turn_count"], 3);
     assert_eq!(row["is_imported"], true);
 }
 
@@ -204,8 +221,11 @@ fn session_import_cli_imports_provider_native_sessions_backfills_turns_and_lists
 fn session_import_cli_json_filters_provider_and_forwards_enumeration_options() {
     let fixture = Fixture::new();
     let provider_script = fixture.write_provider_script("fake-provider.py", true);
-    fixture.write_providers(&[PROVIDER_A, PROVIDER_B]);
-    fixture.write_model(MODEL, &provider_script, &[PROVIDER_A, PROVIDER_B]);
+    fixture.write_providers_with_commands(&[
+        (PROVIDER_A, &provider_script),
+        (PROVIDER_B, &provider_script),
+    ]);
+    fixture.write_model_without_provider_ref(MODEL, &[PROVIDER_A, PROVIDER_B]);
 
     let output = fixture.run_session_import(&[
         "--provider",
@@ -244,8 +264,8 @@ fn session_import_cli_json_filters_provider_and_forwards_enumeration_options() {
 fn session_import_cli_reports_skipped_provider_when_enumerate_capability_is_missing() {
     let fixture = Fixture::new();
     let provider_script = fixture.write_provider_script("unsupported-provider.py", false);
-    fixture.write_providers(&[PROVIDER_UNSUPPORTED]);
-    fixture.write_model(UNSUPPORTED_MODEL, &provider_script, &[PROVIDER_UNSUPPORTED]);
+    fixture.write_providers_with_commands(&[(PROVIDER_UNSUPPORTED, &provider_script)]);
+    fixture.write_model_without_provider_ref(UNSUPPORTED_MODEL, &[PROVIDER_UNSUPPORTED]);
 
     let output = fixture.run_session_import(&["--provider", PROVIDER_UNSUPPORTED, "--json"]);
 
@@ -460,20 +480,6 @@ fn session_import_cli_empty_config_reports_no_targets() {
     assert!(stderr(&output).is_empty(), "{output:?}");
 }
 
-fn model_config_toml(provider_script: &Path, providers: &[&str]) -> String {
-    let mut body = format!(
-        "provider = {{ path = {} }}\nprompt_mode = \"arg\"\n",
-        toml_string(&provider_script.display().to_string())
-    );
-    for provider in providers {
-        body.push_str(&format!(
-            "\n[[providers]]\nname = {}\nargs = []\n",
-            toml_string(provider)
-        ));
-    }
-    body
-}
-
 fn model_config_toml_without_provider_ref(providers: &[&str]) -> String {
     let mut body = "prompt_mode = \"arg\"\n".to_string();
     append_model_providers(&mut body, providers);
@@ -487,19 +493,6 @@ fn append_model_providers(body: &mut String, providers: &[&str]) {
             toml_string(provider)
         ));
     }
-}
-
-fn providers_config_toml(providers: &[&str]) -> String {
-    providers
-        .iter()
-        .map(|provider| {
-            format!(
-                "[{}]\ncommand = \"native-provider\"\nargs = []\nprompt_mode = \"arg\"\n",
-                provider
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn providers_config_toml_with_commands(providers: &[(&str, &Path)]) -> String {
@@ -601,6 +594,7 @@ def describe():
             "quota": False,
             "session": True,
             "session_enumerate": ENUMERATE_CAPABILITY,
+            "session_turn_pages_v1": ENUMERATE_CAPABILITY,
             "terminal": False,
             "rotation": False,
             "discovery": False,
@@ -656,17 +650,47 @@ def enumerate_sessions():
     })
 
 def read_turns():
-    session_id = params.get("session_id") or "missing-session"
-    return envelope({
-        "turns": [{
+    session_id = params.get("session_id")
+    advertised = next(
+        (item["turn_count"] for item in sessions_for_settings()
+         if item["provider_session_id"] == session_id),
+        0,
+    )
+    turns = []
+    for sequence in range(advertised):
+        turns.append({
             "session_id": session_id,
-            "turn_id": "turn-" + session_id,
-            "role": "assistant",
-            "timestamp": "2026-06-01T00:00:00Z",
-            "body": [{"type": "text", "text": "turn for " + session_id}],
-        }],
-        "turn_count": 1,
-        "complete": True,
+            "turn_id": session_id + "-turn-" + str(sequence),
+            "snapshot_sequence": sequence,
+            "timestamp": "2026-06-21T00:00:00Z",
+            "role": "assistant" if sequence % 2 else "user",
+            "parent_turn_id": None,
+            "is_sidechain": False,
+            "is_compaction_boundary": False,
+            "body_state": "absent",
+            "body": None,
+            "body_bytes": None,
+            "body_sha256": None,
+            "canonical_text_sha256": None,
+        })
+    return envelope({
+        "read_protocol": "oulipoly.session_turn_pages/v1",
+        "provider_instance_id": request.get("provider_instance_id"),
+        "settings_id": settings_id,
+        "session_id": session_id,
+        "turn_projection": params.get("turn_projection"),
+        "snapshot_id": "session-import-snapshot:" + session_id,
+        "page_index": 0,
+        "page_start_sequence": 0,
+        "turns": turns,
+        "page_turn_count": len(turns),
+        "source_bytes_examined": 1,
+        "scan_progress": False,
+        "snapshot_complete": True,
+        "next_page_token": None,
+        "resume_token": "session-import-resume:" + session_id,
+        "source_final": True,
+        "warnings": [],
     })
 
 record_invocation()

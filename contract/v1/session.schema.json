@@ -8,18 +8,7 @@
       "type": "object",
       "properties": {
         "settings_id": { "type": "string", "minLength": 1 },
-        "session_id": { "type": "string" },
-        "turn_projection": {
-          "type": "string",
-          "enum": ["user_observation"],
-          "description": "Optional bounded projection for provider-neutral outbound user-turn observation."
-        },
-        "body_tail_limit": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 16,
-          "description": "Number of trailing projected user turns whose canonical bodies are included."
-        }
+        "session_id": { "type": "string" }
       },
       "required": ["settings_id"],
       "additionalProperties": true
@@ -130,23 +119,247 @@
       ]
     },
     "SessionLocateTranscriptErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SessionTurnPageToken": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "SessionTurnPageProjection": {
+      "type": "string",
+      "enum": ["canonical_ingest", "user_observation"]
+    },
+    "SessionReadTurnsParams": {
+      "type": "object",
+      "properties": {
+        "settings_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "session_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "read_protocol": { "const": "oulipoly.session_turn_pages/v1" },
+        "turn_projection": { "$ref": "#/$defs/SessionTurnPageProjection" },
+        "expected_delivery_nonce": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "start_mode": {
+          "type": "string",
+          "enum": ["beginning", "tail", "continuation"]
+        },
+        "after_token": { "$ref": "#/$defs/SessionTurnPageToken" },
+        "snapshot_id": { "$ref": "#/$defs/SessionTurnPageToken" },
+        "page_token": { "$ref": "#/$defs/SessionTurnPageToken" },
+        "max_turns": { "type": "integer", "minimum": 1, "maximum": 256 },
+        "max_response_bytes": { "type": "integer", "minimum": 1024, "maximum": 524288 },
+        "max_source_bytes": { "type": "integer", "minimum": 1, "maximum": 8388608 },
+        "max_inline_body_bytes": { "type": "integer", "minimum": 0, "maximum": 65536 }
+      },
+      "required": [
+        "settings_id",
+        "session_id",
+        "read_protocol",
+        "turn_projection",
+        "start_mode",
+        "after_token",
+        "snapshot_id",
+        "page_token",
+        "max_turns",
+        "max_response_bytes",
+        "max_source_bytes",
+        "max_inline_body_bytes"
+      ],
+      "oneOf": [
+        {
+          "properties": {
+            "start_mode": { "const": "beginning" },
+            "snapshot_id": { "const": null },
+            "page_token": { "const": null }
+          }
+        },
+        {
+          "properties": {
+            "start_mode": { "const": "tail" },
+            "turn_projection": { "const": "user_observation" },
+            "after_token": { "const": null },
+            "snapshot_id": { "const": null },
+            "page_token": { "const": null }
+          }
+        },
+        {
+          "properties": {
+            "start_mode": { "const": "continuation" },
+            "after_token": { "const": null },
+            "snapshot_id": { "type": "string", "minLength": 1, "maxLength": 4096 },
+            "page_token": { "type": "string", "minLength": 1, "maxLength": 4096 }
+          }
+        }
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": { "turn_projection": { "const": "user_observation" } },
+            "required": ["turn_projection"]
+          },
+          "then": { "required": ["expected_delivery_nonce"] },
+          "else": { "not": { "required": ["expected_delivery_nonce"] } }
+        }
+      ],
+      "additionalProperties": false
+    },
     "SessionReadTurnsRequest": {
       "allOf": [
         { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
-        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SessionBaseParams" } } }
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SessionReadTurnsParams" } } }
       ]
+    },
+    "SessionTurnBodyChunk": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "text": { "type": "string", "maxLength": 65536 }
+      },
+      "required": ["type"],
+      "additionalProperties": true
+    },
+    "SessionTurnPageTurn": {
+      "type": "object",
+      "properties": {
+        "session_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "turn_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "snapshot_sequence": { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "role": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "parent_turn_id": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "is_sidechain": { "type": "boolean" },
+        "is_compaction_boundary": { "type": "boolean" },
+        "body_state": { "type": "string", "enum": ["inline", "absent", "omitted_oversize"] },
+        "body": {
+          "oneOf": [
+            { "type": "array", "items": { "$ref": "#/$defs/SessionTurnBodyChunk" } },
+            { "type": "null" }
+          ]
+        },
+        "body_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "body_sha256": {
+          "oneOf": [
+            { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            { "type": "null" }
+          ]
+        },
+        "canonical_text_sha256": {
+          "oneOf": [
+            { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "required": [
+        "session_id",
+        "turn_id",
+        "snapshot_sequence",
+        "timestamp",
+        "role",
+        "parent_turn_id",
+        "is_sidechain",
+        "is_compaction_boundary",
+        "body_state",
+        "body",
+        "body_bytes",
+        "body_sha256",
+        "canonical_text_sha256"
+      ],
+      "oneOf": [
+        {
+          "properties": {
+            "body_state": { "const": "inline" },
+            "body": { "type": "array", "items": { "$ref": "#/$defs/SessionTurnBodyChunk" } },
+            "body_bytes": { "type": "integer", "minimum": 0 },
+            "body_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        },
+        {
+          "properties": {
+            "body_state": { "const": "absent" },
+            "body": { "const": null },
+            "body_bytes": { "const": null },
+            "body_sha256": { "const": null },
+            "canonical_text_sha256": { "const": null }
+          }
+        },
+        {
+          "properties": {
+            "body_state": { "const": "omitted_oversize" },
+            "body": { "const": null }
+          }
+        }
+      ],
+      "additionalProperties": false
     },
     "SessionReadTurnsResult": {
       "type": "object",
       "properties": {
+        "read_protocol": { "const": "oulipoly.session_turn_pages/v1" },
+        "provider_instance_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "settings_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "session_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "turn_projection": { "$ref": "#/$defs/SessionTurnPageProjection" },
+        "snapshot_id": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "page_index": { "type": "integer", "minimum": 0 },
+        "page_start_sequence": { "type": "integer", "minimum": 0 },
         "turns": {
           "type": "array",
-          "items": { "type": "object", "additionalProperties": true }
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/SessionTurnPageTurn" }
         },
-        "turn_count": { "type": "integer", "minimum": 0 },
-        "complete": { "type": "boolean" }
+        "page_turn_count": { "type": "integer", "minimum": 0, "maximum": 256 },
+        "source_bytes_examined": { "type": "integer", "minimum": 0, "maximum": 8388608 },
+        "scan_progress": { "type": "boolean" },
+        "snapshot_complete": { "type": "boolean" },
+        "next_page_token": { "$ref": "#/$defs/SessionTurnPageToken" },
+        "resume_token": { "$ref": "#/$defs/SessionTurnPageToken" },
+        "source_final": { "type": "boolean" },
+        "warnings": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "type": "string", "maxLength": 1024 }
+        }
       },
-      "required": ["turns", "turn_count", "complete"],
+      "required": [
+        "read_protocol",
+        "provider_instance_id",
+        "settings_id",
+        "session_id",
+        "turn_projection",
+        "snapshot_id",
+        "page_index",
+        "page_start_sequence",
+        "turns",
+        "page_turn_count",
+        "source_bytes_examined",
+        "scan_progress",
+        "snapshot_complete",
+        "next_page_token",
+        "resume_token",
+        "source_final",
+        "warnings"
+      ],
+      "oneOf": [
+        {
+          "properties": {
+            "snapshot_complete": { "const": false },
+            "next_page_token": { "type": "string", "minLength": 1, "maxLength": 4096 },
+            "resume_token": { "const": null }
+          }
+        },
+        {
+          "properties": {
+            "snapshot_complete": { "const": true },
+            "next_page_token": { "const": null },
+            "resume_token": { "type": "string", "minLength": 1, "maxLength": 4096 }
+          }
+        }
+      ],
       "additionalProperties": false
     },
     "SessionReadTurnsResponse": {

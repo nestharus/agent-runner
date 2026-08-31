@@ -169,6 +169,8 @@ fn schema_13_migrates_through_current_and_preserves_invocation_data() {
             (17, "0017_completion_registration_authority"),
             (18, "0018_invocation_completion_materialization_summary"),
             (19, "0019_invocation_running_projection_index"),
+            (20, "0020_session_turn_pages"),
+            (21, "0021_invocation_output_delivery"),
         ]
     );
 

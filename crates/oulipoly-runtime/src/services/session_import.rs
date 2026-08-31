@@ -9,10 +9,12 @@ use super::error::ServiceError;
 use crate::provider_registry::ProviderRegistryHandle;
 use crate::session_provider::{
     self, SessionProviderEnumerateEntry, SessionProviderEnumerateRequest, SessionProviderError,
-    SessionProviderIdentity, SessionProviderReadTurnsRequest,
+    SessionProviderIdentity, SessionTurnIngestDriverRequest, SessionTurnIngestQuantumOutcome,
+    run_session_turn_ingest_quantum_for_key,
 };
 use chrono::{DateTime, Utc};
-use oulipoly_state::ImportedSessionDisplayMetadataUpsert;
+use oulipoly_provider::client::CancellationToken;
+use oulipoly_state::{ImportedSessionDisplayMetadataUpsert, SessionTurnIngestStreamKey};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -21,6 +23,7 @@ const UNKNOWN_MODEL_NAME: &str = "<unknown>";
 const SESSION_ENUMERATE_CAPABILITY_MISSING: &str = "session_enumerate_capability_missing";
 const SESSION_CAPABILITY_MISSING: &str = "session_capability_missing";
 const SESSION_PROVIDER_DESCRIBE_UNAVAILABLE: &str = "session_provider_describe_unavailable";
+const MAX_SYNCHRONOUS_BACKFILL_PAGES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct EnumerateDedupKey {
@@ -203,50 +206,133 @@ fn import_enumerated_entry(
     let provider_session_id = validate_provider_session_id(&entry.provider_session_id)?;
     let provider_updated_at = normalize_entry_timestamp(&entry, request.observed_at, report)?;
     let cwd = normalize_cwd(entry.cwd.as_deref())?;
-    let existed = request
-        .state
-        .session_chain_segment_exists_for_provider_session(
-            &identity.provider_name,
-            provider_session_id,
-        )
-        .map_err(format_import_session_state_error)?;
-    if !existed {
-        request
-            .state
-            .mint_imported_chain_if_absent(
-                &identity.provider_name,
-                provider_session_id,
-                &provider_updated_at,
-                UNKNOWN_MODEL_NAME,
-            )
-            .map_err(format_import_session_state_error)?;
-    }
-    upsert_display_metadata(
+    let metadata = imported_display_metadata(
         request,
         identity,
         &entry,
         provider_session_id,
         cwd,
         provider_updated_at,
-    )?;
-    maybe_backfill_turns(request, registry, identity, report, provider_session_id);
+    );
+    let stream = session_provider::canonical_stream_key(identity, provider_session_id);
+    let imported = request
+        .state
+        .import_session_and_enqueue_turn_ingest(
+            &metadata,
+            &stream,
+            &provider_updated_at,
+            UNKNOWN_MODEL_NAME,
+        )
+        .map_err(format_import_session_state_error)?;
+    if request.backfill_turns {
+        backfill_enumerated_entry(request, registry, report, &stream);
+    }
 
-    if existed {
-        Ok(SessionImportEntryDisposition::Skipped)
-    } else {
+    if imported {
         Ok(SessionImportEntryDisposition::Imported)
+    } else {
+        Ok(SessionImportEntryDisposition::Skipped)
     }
 }
 
-fn upsert_display_metadata(
+fn backfill_enumerated_entry(
+    request: &SessionImportServiceRequest<'_>,
+    registry: &crate::provider_registry::ProviderRegistry,
+    report: &mut SessionImportProviderReport,
+    stream: &SessionTurnIngestStreamKey,
+) {
+    let cancellation = CancellationToken::new();
+    let lease_owner = format!(
+        "session-import-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
+    for _ in 0..MAX_SYNCHRONOUS_BACKFILL_PAGES {
+        let outcome = run_session_turn_ingest_quantum_for_key(
+            SessionTurnIngestDriverRequest {
+                state: request.state,
+                registry,
+                lease_owner: &lease_owner,
+                effective_cwd: request.effective_cwd,
+                cancellation: &cancellation,
+                now: Utc::now(),
+            },
+            stream,
+        );
+        match outcome {
+            Ok(SessionTurnIngestQuantumOutcome::Applied { inserted_turns, .. }) => {
+                report.turns_backfilled = report.turns_backfilled.saturating_add(inserted_turns);
+                if request
+                    .state
+                    .session_turn_ingest_stream(stream)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|stream| stream.status == "caught_up")
+                {
+                    return;
+                }
+            }
+            Ok(SessionTurnIngestQuantumOutcome::RetryScheduled { error, .. }) => {
+                report.warnings.push(format!(
+                    "canonical turn backfill is retryable for {}: {error}",
+                    stream.session_id
+                ));
+                return;
+            }
+            Ok(SessionTurnIngestQuantumOutcome::Unsupported { error, .. }) => {
+                report.warnings.push(format!(
+                    "canonical turn backfill is unsupported for {}: {error}",
+                    stream.session_id
+                ));
+                return;
+            }
+            Ok(SessionTurnIngestQuantumOutcome::Quarantined { error, .. }) => {
+                report.errors.push(format!(
+                    "canonical turn backfill quarantined for {}: {error}",
+                    stream.session_id
+                ));
+                return;
+            }
+            Ok(SessionTurnIngestQuantumOutcome::Idle) => {
+                let status = request
+                    .state
+                    .session_turn_ingest_stream(stream)
+                    .ok()
+                    .flatten()
+                    .map(|stream| stream.status)
+                    .unwrap_or_else(|| "missing".to_string());
+                if status != "caught_up" {
+                    report.warnings.push(format!(
+                        "canonical turn backfill is retryable for {}: stream status {status}",
+                        stream.session_id
+                    ));
+                }
+                return;
+            }
+            Err(error) => {
+                report.errors.push(format!(
+                    "canonical turn backfill failed for {}: {error}",
+                    stream.session_id
+                ));
+                return;
+            }
+        }
+    }
+    report.warnings.push(format!(
+        "canonical turn backfill is retryable for {}: synchronous page budget exhausted",
+        stream.session_id
+    ));
+}
+
+fn imported_display_metadata(
     request: &SessionImportServiceRequest<'_>,
     identity: &SessionProviderIdentity,
     entry: &SessionProviderEnumerateEntry,
     provider_session_id: &str,
     cwd: Option<String>,
     provider_updated_at: DateTime<Utc>,
-) -> Result<(), String> {
-    let metadata = ImportedSessionDisplayMetadataUpsert {
+) -> ImportedSessionDisplayMetadataUpsert {
+    ImportedSessionDisplayMetadataUpsert {
         provider_name: identity.provider_name.clone(),
         provider_session_id: provider_session_id.to_string(),
         title: entry.title.clone(),
@@ -254,44 +340,7 @@ fn upsert_display_metadata(
         turn_count: entry.turn_count,
         provider_updated_at: Some(provider_updated_at),
         seen_at: request.observed_at,
-    };
-    request
-        .state
-        .upsert_imported_session_display_metadata(&metadata)
-        .map_err(format_import_session_state_error)
-}
-
-fn maybe_backfill_turns(
-    request: &SessionImportServiceRequest<'_>,
-    registry: &crate::provider_registry::ProviderRegistry,
-    identity: &SessionProviderIdentity,
-    report: &mut SessionImportProviderReport,
-    provider_session_id: &str,
-) {
-    if !request.backfill_turns {
-        return;
     }
-    match read_and_ingest_turns(request, registry, identity, provider_session_id) {
-        Ok(inserted) => report.turns_backfilled += inserted,
-        Err(error) => report.warnings.push(format!(
-            "session.read_turns backfill failed for {provider_session_id}: {error}"
-        )),
-    }
-}
-
-fn read_and_ingest_turns(
-    request: &SessionImportServiceRequest<'_>,
-    registry: &crate::provider_registry::ProviderRegistry,
-    identity: &SessionProviderIdentity,
-    provider_session_id: &str,
-) -> Result<u64, SessionProviderError> {
-    let turns = session_provider::read_turns(SessionProviderReadTurnsRequest {
-        registry,
-        identity: identity.clone(),
-        session_id: provider_session_id,
-        effective_cwd: request.effective_cwd,
-    })?;
-    session_provider::ingest_owned_turns(request.state, &identity.provider_name, &turns)
 }
 
 fn validate_provider_session_id(provider_session_id: &str) -> Result<&str, String> {

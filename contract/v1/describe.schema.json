@@ -27,9 +27,17 @@
           "type": "boolean",
           "description": "Advertises support for the oulipoly.prompt_acceptance/v1 launch extension and oulipoly.prompt_accepted/v1 attestation marker. A provider must omit this property unless the describe request selected it with host.env.OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1=1. Omitted or false means the host must not trust prompt-acceptance markers from this provider."
         },
+        "launch_output_v1": {
+          "type": "boolean",
+          "description": "Advertises complete, duration-independent oulipoly.launch_output/v1 custody. A provider must omit this property unless selected with host.env.OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1."
+        },
         "policy": { "type": "boolean" },
         "quota": { "type": "boolean" },
         "session": { "type": "boolean" },
+        "session_turn_pages_v1": {
+          "type": "boolean",
+          "description": "Advertises bounded oulipoly.session_turn_pages/v1 support for session.read_turns. A provider must omit this property unless selected with host.env.OULIPOLY_HOST_SESSION_TURN_PAGES_V1=1."
+        },
         "session_enumerate": { "type": "boolean" },
         "terminal": { "type": "boolean" },
         "rotation": { "type": "boolean" },

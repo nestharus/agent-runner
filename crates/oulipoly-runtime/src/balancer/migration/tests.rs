@@ -102,6 +102,7 @@ fn provider_load_falls_back_to_zero_without_finite_window_projection() {
             },
         ],
         binding_score: Some(1.0),
+        turn_count_fresh: true,
         recent_error_count: 0,
     };
 

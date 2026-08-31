@@ -199,6 +199,10 @@ impl ByteTailAccumulator {
 
 pub(crate) trait StdoutDrainOutput: Default + Send + 'static {
     fn captured_bytes(&self) -> CapturedBytes;
+
+    fn processor_error(&self) -> Option<&ProviderClientError> {
+        None
+    }
 }
 
 impl StdoutDrainOutput for CapturedBytes {
@@ -210,8 +214,8 @@ impl StdoutDrainOutput for CapturedBytes {
 pub(crate) trait StdoutProcessor: Send + 'static {
     type Output: StdoutDrainOutput;
 
-    fn push(&mut self, chunk: &[u8]);
-    fn finish(self) -> Self::Output;
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderClientError>;
+    fn finish(self, error: Option<ProviderClientError>) -> Self::Output;
 }
 
 struct ByteCaptureProcessor {
@@ -229,11 +233,12 @@ impl ByteCaptureProcessor {
 impl StdoutProcessor for ByteCaptureProcessor {
     type Output = CapturedBytes;
 
-    fn push(&mut self, chunk: &[u8]) {
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderClientError> {
         self.accumulator.push(chunk);
+        Ok(())
     }
 
-    fn finish(self) -> Self::Output {
+    fn finish(self, _error: Option<ProviderClientError>) -> Self::Output {
         self.accumulator.finish()
     }
 }
@@ -421,12 +426,14 @@ struct ProcessThreads<T: StdoutDrainOutput> {
 struct PendingProcessEvents {
     latest_stdout_line: Option<Instant>,
     cancellation_requested: bool,
+    stdout_processor_failed: bool,
     worker_failed: bool,
 }
 
 struct ProcessEvents {
     latest_stdout_line: Option<Instant>,
     cancellation_requested: bool,
+    stdout_processor_failed: bool,
     worker_failed: bool,
 }
 
@@ -607,8 +614,12 @@ impl ProcessRunner {
 impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
     fn run(mut self) -> Result<ProcessOutcome<T>, ProviderClientError> {
         loop {
-            if self.record_pending_events() {
+            let events = self.record_pending_events();
+            if events.worker_failed {
                 return Err(self.terminate_and_collect(HostErrorKind::WaitFailed, false));
+            }
+            if events.stdout_processor_failed {
+                return Err(self.terminate_after_stdout_processor_failure());
             }
             if Instant::now() >= self.next_status_poll {
                 self.next_status_poll = Instant::now() + STATUS_POLL_INTERVAL;
@@ -640,7 +651,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         }
     }
 
-    fn record_pending_events(&mut self) -> bool {
+    fn record_pending_events(&mut self) -> ProcessEvents {
         let events = self.events.take_pending();
         if let Some(observed_at) = events.latest_stdout_line {
             self.last_stdout_line = observed_at;
@@ -648,7 +659,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         if events.cancellation_requested {
             self.begin_cancellation();
         }
-        events.worker_failed
+        events
     }
 
     fn next_wait(&self) -> Duration {
@@ -730,6 +741,43 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         };
         let diagnostics = map_termination_diagnostics(self.threads, terminated, true);
         termination_transport_error(HostErrorKind::Cancelled, &self.command, diagnostics)
+    }
+
+    fn terminate_after_stdout_processor_failure(mut self) -> ProviderClientError {
+        terminate_tree(&mut self.child);
+        let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
+        let status = terminated.status.map(process_status);
+        let joined = join_process_threads(self.threads);
+        let host_cancellation_requested =
+            self.cancellation_started.is_some() || cancellation_requested(self.limits);
+        if host_cancellation_requested {
+            let diagnostics = termination_diagnostics_from_joined(joined, terminated, true);
+            return termination_transport_error(
+                HostErrorKind::Cancelled,
+                &self.command,
+                diagnostics,
+            );
+        }
+        let processor_error = joined
+            .stdout
+            .as_ref()
+            .and_then(StdoutDrainOutput::processor_error)
+            .cloned()
+            .unwrap_or_else(|| {
+                ProviderClientError::host_transport(
+                    HostErrorKind::Other("stdout_processor_failed".to_string()),
+                    subcommand_for_error(&self.command),
+                    None,
+                    ProviderDiagnostics::default(),
+                )
+            });
+        processor_failure_with_process_context(
+            processor_error,
+            joined,
+            terminated,
+            host_cancellation_requested,
+            status,
+        )
     }
 }
 
@@ -883,11 +931,17 @@ fn start_process_threads<P: StdoutProcessor>(
         .expect("stderr pipe should be configured");
     let stdin = child.stdin.take().expect("stdin pipe should be configured");
     let stdout_events = process_events.clone();
+    let stdout_processor_events = process_events.clone();
     let stderr_events = process_events.clone();
     ProcessThreads {
         stdout: thread::spawn(move || {
             run_process_worker(stdout_events, || {
-                drain_reader_with_processor(stdout, stdout_line_activity, stdout_processor)
+                let output =
+                    drain_reader_with_processor(stdout, stdout_line_activity, stdout_processor);
+                if output.processor_error().is_some() {
+                    stdout_processor_events.publish_stdout_processor_failure();
+                }
+                output
             })
         }),
         stderr: thread::spawn(move || {
@@ -969,6 +1023,16 @@ fn map_completed_process_outcome<T: StdoutDrainOutput>(
             host_cancellation_requested,
         ));
     }
+    if let Some(error) = joined
+        .stdout
+        .as_ref()
+        .and_then(StdoutDrainOutput::processor_error)
+        .cloned()
+    {
+        let diagnostics =
+            completed_process_diagnostics(&joined, &process_status, host_cancellation_requested);
+        return Err(error.with_process_context(diagnostics, process_status));
+    }
     Ok(ProcessOutcome {
         status: process_status,
         stdout: joined.stdout.expect("validated stdout worker result"),
@@ -1035,6 +1099,17 @@ impl ProcessEventPublisher {
             wake.notify_one();
         }
     }
+
+    fn publish_stdout_processor_failure(&self) {
+        let (state, wake) = &*self.bus;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.stdout_processor_failed {
+            state.stdout_processor_failed = true;
+            wake.notify_one();
+        }
+    }
 }
 
 impl ProcessEventSubscriber {
@@ -1046,6 +1121,7 @@ impl ProcessEventSubscriber {
         ProcessEvents {
             latest_stdout_line: state.latest_stdout_line.take(),
             cancellation_requested: std::mem::take(&mut state.cancellation_requested),
+            stdout_processor_failed: std::mem::take(&mut state.stdout_processor_failed),
             worker_failed: std::mem::take(&mut state.worker_failed),
         }
     }
@@ -1057,6 +1133,7 @@ impl ProcessEventSubscriber {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.latest_stdout_line.is_none()
             && !state.cancellation_requested
+            && !state.stdout_processor_failed
             && !state.worker_failed
         {
             let _ = wake.wait_timeout(state, timeout);
@@ -1162,6 +1239,14 @@ fn map_termination_diagnostics<T: StdoutDrainOutput>(
     host_cancellation_requested: bool,
 ) -> ProviderDiagnostics {
     let joined = join_process_threads(threads);
+    termination_diagnostics_from_joined(joined, terminated, host_cancellation_requested)
+}
+
+fn termination_diagnostics_from_joined<T: StdoutDrainOutput>(
+    joined: JoinedProcessThreads<T>,
+    terminated: TerminatedProcess,
+    host_cancellation_requested: bool,
+) -> ProviderDiagnostics {
     let mut diagnostics = termination_diagnostics_from_parts(
         terminated,
         host_cancellation_requested,
@@ -1177,6 +1262,87 @@ fn map_termination_diagnostics<T: StdoutDrainOutput>(
         diagnostics.description = Some(worker_failure_description(&joined.failed_workers));
     }
     diagnostics
+}
+
+fn processor_failure_with_process_context<T: StdoutDrainOutput>(
+    error: ProviderClientError,
+    joined: JoinedProcessThreads<T>,
+    terminated: TerminatedProcess,
+    host_cancellation_requested: bool,
+    status: Option<ProcessStatus>,
+) -> ProviderClientError {
+    let description = error.diagnostics().description.clone();
+    let mut diagnostics =
+        termination_diagnostics_from_joined(joined, terminated, host_cancellation_requested);
+    diagnostics.description = description;
+    match status {
+        Some(status) => error.with_process_context(diagnostics, status),
+        None => replace_error_diagnostics(error, diagnostics),
+    }
+}
+
+fn replace_error_diagnostics(
+    error: ProviderClientError,
+    diagnostics: ProviderDiagnostics,
+) -> ProviderClientError {
+    match error {
+        ProviderClientError::Transport {
+            kind,
+            subcommand,
+            request_id,
+            description,
+            process_status,
+            ..
+        } => ProviderClientError::Transport {
+            kind,
+            subcommand,
+            request_id,
+            description,
+            diagnostics: Box::new(diagnostics),
+            process_status,
+        },
+        ProviderClientError::Protocol {
+            kind,
+            subcommand,
+            request_id,
+            description,
+            process_status,
+            launch_failure_evidence,
+            ..
+        } => ProviderClientError::Protocol {
+            kind,
+            subcommand,
+            request_id,
+            description,
+            diagnostics: Box::new(diagnostics),
+            process_status,
+            launch_failure_evidence,
+        },
+        ProviderClientError::ProviderCapability(error) => {
+            ProviderClientError::ProviderCapability(error)
+        }
+    }
+}
+
+fn completed_process_diagnostics<T: StdoutDrainOutput>(
+    joined: &JoinedProcessThreads<T>,
+    status: &ProcessStatus,
+    host_cancellation_requested: bool,
+) -> ProviderDiagnostics {
+    ProviderDiagnostics {
+        stdout: joined
+            .stdout
+            .as_ref()
+            .map(StdoutDrainOutput::captured_bytes)
+            .unwrap_or_default(),
+        stderr: joined.stderr.clone().unwrap_or_default(),
+        stdin_closed_early: joined.stdin_closed_early.unwrap_or_default(),
+        process_was_reaped: true,
+        provider_process_nonzero: process_nonzero(status),
+        provider_exit_code: exit_code(status),
+        host_cancellation_requested,
+        ..ProviderDiagnostics::default()
+    }
 }
 
 fn join_process_threads<T: StdoutDrainOutput>(
@@ -1315,19 +1481,23 @@ fn drain_reader_with_processor<P: StdoutProcessor>(
     mut processor: P,
 ) -> P::Output {
     let mut buffer = [0_u8; 8192];
+    let mut processor_error = None;
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => {
                 let chunk = &buffer[..read];
                 notify_stdout_line_activity(&stdout_line_activity, chunk);
-                processor.push(chunk);
+                if let Err(error) = processor.push(chunk) {
+                    processor_error = Some(error);
+                    break;
+                }
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
-    processor.finish()
+    processor.finish(processor_error)
 }
 
 fn notify_stdout_line_activity(activity: &Option<ProcessEventPublisher>, chunk: &[u8]) {
@@ -1510,7 +1680,7 @@ mod tests {
         ProcessRunner, ProcessSpawnObserver, STATUS_POLL_INTERVAL, StdoutProcessor,
         process_event_bus, write_stdin_bytes,
     };
-    use crate::error::CapturedBytes;
+    use crate::error::{CapturedBytes, ProviderClientError};
     use crate::testkit::{FakeProvider, FakeProviderMode, LeakProbe};
     use serde_json::json;
     use std::io::Write;
@@ -1912,11 +2082,11 @@ mod tests {
     impl StdoutProcessor for PanickingStdoutProcessor {
         type Output = CapturedBytes;
 
-        fn push(&mut self, _chunk: &[u8]) {
+        fn push(&mut self, _chunk: &[u8]) -> Result<(), ProviderClientError> {
             panic!("injected stdout worker panic");
         }
 
-        fn finish(self) -> Self::Output {
+        fn finish(self, _error: Option<ProviderClientError>) -> Self::Output {
             CapturedBytes::default()
         }
     }

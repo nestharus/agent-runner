@@ -108,7 +108,7 @@ fn topology_probe_should_refresh(
     live_window_count: usize,
     pool_expected_live_windows: usize,
 ) -> bool {
-    has_refresh_source(&provider.name, ctx.providers_cfg, ctx.sessions_cfg)
+    has_refresh_source(&provider.name, ctx.providers_cfg)
         && is_topology_probe_due(
             state,
             &provider.name,
@@ -132,13 +132,8 @@ fn record_topology_probe_and_refresh(
         probe.pool_expected_live_windows,
         probe.topology_peak_live_window_count,
     );
-    let _: RefreshOutcome = refresh_provider_for_routing(
-        &provider.name,
-        ctx.providers_cfg,
-        ctx.sessions_cfg,
-        ctx.in_flight,
-        state,
-    );
+    let _: RefreshOutcome =
+        refresh_provider_for_routing(&provider.name, ctx.providers_cfg, ctx.in_flight, state);
     snapshot.quotas[probe.provider_index] = cached_quota_record(state, &provider.name);
     snapshot.windows[probe.provider_index] = cached_quota_windows(state, &provider.name);
 }

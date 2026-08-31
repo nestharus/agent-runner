@@ -113,9 +113,11 @@ fn describe_result(provider_id: &str) -> DescribeResult {
         capabilities: DescribeCapabilities {
             launch: true,
             prompt_acceptance_v1: false,
+            launch_output_v1: false,
             policy: false,
             quota: false,
             session: false,
+            session_turn_pages_v1: false,
             session_enumerate: false,
             terminal: false,
             rotation: false,
@@ -1721,12 +1723,12 @@ fn assert_lifecycle_provider_registry_dispatch_terms(lifecycle_source: &str) {
     for expected in [
         "SessionServiceExternalProviderIdentity",
         "session_provider",
-        "session.read_turns",
         "session.capture",
+        "enqueue_session_turn_ingest_stream",
     ] {
         assert!(
             lifecycle_source.contains(expected),
-            "services/session_lifecycle.rs may reference provider registry only for AGE-243 S7a read/capture dispatch: {expected}"
+            "services/session_lifecycle.rs must retain bounded capture and ingest enqueue dispatch: {expected}"
         );
     }
 }

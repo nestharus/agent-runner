@@ -811,6 +811,64 @@ pub struct MailboxDeliveryWindow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxDeliveryObservationAnchor {
+    pub provider_name: String,
+    pub provider_instance_id: String,
+    pub settings_id: String,
+    pub provider_session_id: String,
+    pub resume_token: String,
+    pub expected_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMailboxDeliveryObservation {
+    pub attempt_id: String,
+    pub anchor: MailboxDeliveryObservationAnchor,
+}
+
+fn validate_delivery_observation_anchor(
+    session_id: &str,
+    anchor: &MailboxDeliveryObservationAnchor,
+) -> Result<(), String> {
+    for (name, value) in [
+        ("provider name", anchor.provider_name.as_str()),
+        ("provider instance id", anchor.provider_instance_id.as_str()),
+        ("settings id", anchor.settings_id.as_str()),
+        ("provider session id", anchor.provider_session_id.as_str()),
+    ] {
+        if value.is_empty() || value.len() > 1024 {
+            return Err(format!("invalid mailbox delivery observation {name}"));
+        }
+    }
+    if anchor.provider_session_id != session_id {
+        return Err("mailbox delivery observation session identity mismatch".to_string());
+    }
+    if anchor.resume_token.is_empty() || anchor.resume_token.len() > 4096 {
+        return Err("invalid mailbox delivery observation anchor token".to_string());
+    }
+    if anchor.expected_sha256.len() != 64
+        || !anchor
+            .expected_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("invalid mailbox delivery observation expected digest".to_string());
+    }
+    Ok(())
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxDeliveryEvidenceObligation {
     pub attempt_id: String,
     pub session_id: String,
@@ -3489,6 +3547,223 @@ impl MailboxDb {
             ));
         }
         Ok(())
+    }
+
+    pub fn record_delivery_observation_anchor(
+        &self,
+        attempt_id: &str,
+        session_id: &str,
+        anchor: &MailboxDeliveryObservationAnchor,
+    ) -> Result<(), String> {
+        validate_delivery_observation_anchor(session_id, anchor)?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts
+                 SET observation_provider_name = ?3,
+                     observation_provider_instance_id = ?4,
+                     observation_settings_id = ?5,
+                     observation_session_id = ?6,
+                     observation_anchor_token = ?7,
+                     observation_expected_sha256 = ?8,
+                     observation_error = NULL,
+                     observation_confirmed_turn_id = NULL,
+                     observation_confirmed_at = NULL
+                  WHERE attempt_id = ?1 AND session_id = ?2
+                    AND submission_started_at IS NULL AND resolved_at IS NULL
+                    AND observation_anchor_token IS NULL",
+                params![
+                    attempt_id,
+                    session_id,
+                    anchor.provider_name,
+                    anchor.provider_instance_id,
+                    anchor.settings_id,
+                    anchor.provider_session_id,
+                    anchor.resume_token,
+                    anchor.expected_sha256,
+                ],
+            )
+            .map_err(|err| {
+                format!("Failed to record mailbox delivery observation anchor: {err}")
+            })?;
+        if changed == 0 && self.delivery_observation_anchor(attempt_id)?.is_some() {
+            return Ok(());
+        }
+        if changed != 1 {
+            return Err(format!(
+                "Mailbox delivery attempt {attempt_id} is unavailable for observation anchoring"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn record_delivery_observation_anchor_failure(
+        &self,
+        attempt_id: &str,
+        session_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        let error = truncate_utf8(error, 1024);
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts
+                 SET observation_provider_name = NULL,
+                     observation_provider_instance_id = NULL,
+                     observation_settings_id = NULL,
+                     observation_session_id = NULL,
+                     observation_anchor_token = NULL,
+                     observation_expected_sha256 = NULL,
+                     observation_error = ?3,
+                     observation_confirmed_turn_id = NULL,
+                     observation_confirmed_at = NULL
+                  WHERE attempt_id = ?1 AND session_id = ?2
+                    AND submission_started_at IS NULL AND resolved_at IS NULL
+                    AND observation_anchor_token IS NULL",
+                params![attempt_id, session_id, error],
+            )
+            .map_err(|err| {
+                format!("Failed to record mailbox delivery observation anchor failure: {err}")
+            })?;
+        if changed == 0 && self.delivery_observation_anchor(attempt_id)?.is_some() {
+            return Ok(());
+        }
+        if changed != 1 {
+            return Err(format!(
+                "Mailbox delivery attempt {attempt_id} is unavailable for observation anchoring"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn delivery_observation_anchor(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<MailboxDeliveryObservationAnchor>, String> {
+        self.conn
+            .query_row(
+                "SELECT observation_provider_name, observation_provider_instance_id,
+                        observation_settings_id, observation_session_id,
+                        observation_anchor_token, observation_expected_sha256
+                 FROM mailbox_delivery_attempts
+                 WHERE attempt_id = ?1 AND resolved_at IS NULL
+                   AND observation_anchor_token IS NOT NULL",
+                params![attempt_id],
+                |row| {
+                    Ok(MailboxDeliveryObservationAnchor {
+                        provider_name: row.get(0)?,
+                        provider_instance_id: row.get(1)?,
+                        settings_id: row.get(2)?,
+                        provider_session_id: row.get(3)?,
+                        resume_token: row.get(4)?,
+                        expected_sha256: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| format!("Failed to read mailbox delivery observation anchor: {err}"))
+    }
+
+    pub fn pending_delivery_observations(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<PendingMailboxDeliveryObservation>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT attempts.attempt_id, attempts.observation_provider_name,
+                        attempts.observation_provider_instance_id,
+                        attempts.observation_settings_id, attempts.observation_session_id,
+                        attempts.observation_anchor_token,
+                        attempts.observation_expected_sha256
+                 FROM mailbox_delivery_attempts AS attempts
+                 WHERE attempts.session_id = ?1
+                   AND attempts.resolved_at IS NULL
+                   AND attempts.observation_anchor_token IS NOT NULL
+                   AND attempts.observation_confirmed_at IS NULL
+                   AND EXISTS (
+                       SELECT 1
+                       FROM mailbox_delivery_attempt_items AS items
+                       JOIN mailbox ON mailbox.seq = items.mailbox_seq
+                       WHERE items.attempt_id = attempts.attempt_id
+                         AND mailbox.delivered_at IS NULL
+                   )
+                 ORDER BY attempts.created_at, attempts.attempt_id
+                 LIMIT ?2",
+            )
+            .map_err(|err| {
+                format!("Failed to prepare pending delivery observation query: {err}")
+            })?;
+        let rows = stmt
+            .query_map(
+                params![session_id, bounded_mailbox_sql_limit(limit)],
+                |row| {
+                    Ok(PendingMailboxDeliveryObservation {
+                        attempt_id: row.get(0)?,
+                        anchor: MailboxDeliveryObservationAnchor {
+                            provider_name: row.get(1)?,
+                            provider_instance_id: row.get(2)?,
+                            settings_id: row.get(3)?,
+                            provider_session_id: row.get(4)?,
+                            resume_token: row.get(5)?,
+                            expected_sha256: row.get(6)?,
+                        },
+                    })
+                },
+            )
+            .map_err(|err| format!("Failed to query pending delivery observations: {err}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("Failed to read pending delivery observation: {err}"))
+    }
+
+    pub fn record_delivery_observation_confirmation(
+        &self,
+        attempt_id: &str,
+        turn_id: &str,
+    ) -> Result<(), String> {
+        if turn_id.is_empty() || turn_id.len() > 1024 {
+            return Err("invalid mailbox delivery observation turn id".to_string());
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts
+                 SET observation_confirmed_turn_id = ?2, observation_confirmed_at = ?3
+                 WHERE attempt_id = ?1 AND resolved_at IS NULL
+                   AND observation_anchor_token IS NOT NULL",
+                params![attempt_id, turn_id, now_rfc3339()],
+            )
+            .map_err(|err| {
+                format!("Failed to record mailbox delivery observation confirmation: {err}")
+            })?;
+        if changed != 1 {
+            return Err(format!(
+                "Mailbox delivery attempt {attempt_id} has no active observation anchor"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn delivery_observation_confirmation(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT observation_confirmed_turn_id
+                 FROM mailbox_delivery_attempts
+                 WHERE attempt_id = ?1 AND observation_confirmed_at IS NOT NULL",
+                params![attempt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| {
+                format!("Failed to read mailbox delivery observation confirmation: {err}")
+            })
     }
 
     pub fn register_or_reuse_delivery_attempt(
@@ -9036,7 +9311,16 @@ fn mailbox_schema_definition() -> &'static str {
             evidence_turn_generation_id   TEXT,
             evidence_observed_at           INTEGER,
             evidence_reconciled_at         TEXT,
-            evidence_disposition           TEXT
+            evidence_disposition           TEXT,
+            observation_provider_name      TEXT,
+            observation_provider_instance_id TEXT,
+            observation_settings_id        TEXT,
+            observation_session_id         TEXT,
+            observation_anchor_token       TEXT,
+            observation_expected_sha256    TEXT,
+            observation_error              TEXT,
+            observation_confirmed_turn_id  TEXT,
+            observation_confirmed_at       TEXT
         );
 
         CREATE TABLE IF NOT EXISTS mailbox_delivery_attempt_items (
@@ -10255,6 +10539,15 @@ fn ensure_mailbox_delivery_attempt_columns(conn: &Connection) -> Result<(), Stri
         ("evidence_observed_at", "INTEGER"),
         ("evidence_reconciled_at", "TEXT"),
         ("evidence_disposition", "TEXT"),
+        ("observation_provider_name", "TEXT"),
+        ("observation_provider_instance_id", "TEXT"),
+        ("observation_settings_id", "TEXT"),
+        ("observation_session_id", "TEXT"),
+        ("observation_anchor_token", "TEXT"),
+        ("observation_expected_sha256", "TEXT"),
+        ("observation_error", "TEXT"),
+        ("observation_confirmed_turn_id", "TEXT"),
+        ("observation_confirmed_at", "TEXT"),
     ] {
         if !columns.iter().any(|column| column == name) {
             add_sidecar_column(conn, "mailbox_delivery_attempts", name, definition)?;
@@ -11226,6 +11519,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index_count, 2);
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema::CURRENT_VERSION
+        );
+    }
+
+    #[test]
+    fn v11_upgrade_adds_delivery_observation_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_provider_name;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_provider_instance_id;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_settings_id;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_session_id;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_anchor_token;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_expected_sha256;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_error;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_confirmed_turn_id;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_confirmed_at;
+                 PRAGMA user_version = 11;",
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let connection = Connection::open(&sidecar_path).unwrap();
+        let columns = table_columns(
+            &connection,
+            "mailbox_delivery_attempts",
+            &format_table_columns_pragma("mailbox_delivery_attempts"),
+        )
+        .unwrap();
+        for column in [
+            "observation_provider_name",
+            "observation_provider_instance_id",
+            "observation_settings_id",
+            "observation_session_id",
+            "observation_anchor_token",
+            "observation_expected_sha256",
+            "observation_error",
+            "observation_confirmed_turn_id",
+            "observation_confirmed_at",
+        ] {
+            assert!(columns.iter().any(|candidate| candidate == column));
+        }
         assert_eq!(
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
@@ -13391,6 +13736,78 @@ mod tests {
                 .iter()
                 .take(3)
                 .all(|row| row.delivered_by_invocation_uuid.as_deref() == Some("invocation-a"))
+        );
+    }
+
+    #[test]
+    fn delivery_observation_anchor_and_confirmation_are_attempt_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle", "session-a")));
+        db.register_delivery_attempt(
+            "attempt-observation",
+            "session-a",
+            "invocation-a",
+            &[row.seq],
+            0,
+        )
+        .unwrap();
+        let anchor = MailboxDeliveryObservationAnchor {
+            provider_name: "provider-a".to_string(),
+            provider_instance_id: "provider-instance-a".to_string(),
+            settings_id: "settings-a".to_string(),
+            provider_session_id: "session-a".to_string(),
+            resume_token: "opaque-tail-anchor".to_string(),
+            expected_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+        };
+
+        db.record_delivery_observation_anchor("attempt-observation", "session-a", &anchor)
+            .unwrap();
+        assert_eq!(
+            db.delivery_observation_anchor("attempt-observation")
+                .unwrap(),
+            Some(anchor.clone())
+        );
+        let retry_anchor = MailboxDeliveryObservationAnchor {
+            resume_token: "later-retry-anchor".to_string(),
+            ..anchor.clone()
+        };
+        db.record_delivery_observation_anchor("attempt-observation", "session-a", &retry_anchor)
+            .unwrap();
+        assert_eq!(
+            db.delivery_observation_anchor("attempt-observation")
+                .unwrap(),
+            Some(anchor)
+        );
+        assert_eq!(
+            db.delivery_observation_confirmation("attempt-observation")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.pending_delivery_observations("session-a", 1).unwrap(),
+            vec![PendingMailboxDeliveryObservation {
+                attempt_id: "attempt-observation".to_string(),
+                anchor: db
+                    .delivery_observation_anchor("attempt-observation")
+                    .unwrap()
+                    .unwrap(),
+            }]
+        );
+
+        db.record_delivery_observation_confirmation("attempt-observation", "turn-new")
+            .unwrap();
+        assert_eq!(
+            db.delivery_observation_confirmation("attempt-observation")
+                .unwrap()
+                .as_deref(),
+            Some("turn-new")
+        );
+        assert!(
+            db.pending_delivery_observations("session-a", 1)
+                .unwrap()
+                .is_empty()
         );
     }
 

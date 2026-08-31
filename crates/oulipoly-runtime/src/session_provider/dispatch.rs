@@ -2,19 +2,19 @@ use super::enumerate;
 use super::locate;
 use super::provider_client::{
     invoke_session, provider_client, session_client, session_client_with_cancellation,
-    session_enumerate_client,
+    session_enumerate_client, session_page_client,
 };
 use super::request::{
     base_request, capture_extra, enumerate_request, lifecycle_extra, live_capture_extra,
-    locate_extra, read_session_id_for_lifecycle, user_observation_extra,
+    locate_extra, page_request,
 };
 use super::turns;
 use super::types::{
     SessionProviderCaptureRequest, SessionProviderCaptureResult, SessionProviderEnumerateRequest,
     SessionProviderEnumerateResult, SessionProviderError, SessionProviderIdentity,
     SessionProviderLifecycleContext, SessionProviderLiveCaptureRequest,
-    SessionProviderLocateRequest, SessionProviderLocatedTranscript,
-    SessionProviderReadTurnsRequest, SessionProviderReadTurnsResult,
+    SessionProviderLocateRequest, SessionProviderLocatedTranscript, SessionProviderReadPageRequest,
+    SessionProviderReadPageResult,
 };
 use crate::provider_registry::DescribeHostOptions;
 use crate::session_metadata::LocatedTranscript;
@@ -76,31 +76,24 @@ fn locate_transcript_with_client(
     locate::map_locate_result_with_raw_metadata(provider_result, request.lookup_mode)
 }
 
-pub fn read_turns(
-    request: SessionProviderReadTurnsRequest<'_>,
-) -> Result<SessionProviderReadTurnsResult, SessionProviderError> {
-    let client = provider_client(request.registry, &request.identity)?;
-    read_turns_with_client(
-        &client,
+pub fn read_turn_page(
+    request: SessionProviderReadPageRequest<'_>,
+) -> Result<SessionProviderReadPageResult, SessionProviderError> {
+    let client = session_page_client(
+        request.registry,
         &request.identity,
-        Some(request.session_id),
-        request.effective_cwd,
-        request.registry.host_options(),
-        JsonObject::new(),
-    )
-}
-
-pub fn read_user_turn_observations(
-    request: SessionProviderReadTurnsRequest<'_>,
-) -> Result<SessionProviderReadTurnsResult, SessionProviderError> {
-    let client = provider_client(request.registry, &request.identity)?;
-    read_turns_with_client(
-        &client,
-        &request.identity,
-        Some(request.session_id),
-        request.effective_cwd,
-        request.registry.host_options(),
-        user_observation_extra(),
+        request.cancellation,
+        request.timeout,
+    )?;
+    let built = page_request(&request)?;
+    let result =
+        invoke_session::<SessionReadTurnsResult>(&client, "session.read_turns", built.value)?;
+    let captured_response_bytes = client.last_diagnostics().stdout.captured_len;
+    turns::map_read_page_result(
+        result,
+        &request,
+        captured_response_bytes,
+        built.request_token_sha256,
     )
 }
 
@@ -142,20 +135,6 @@ pub fn enumerate_sessions(
     enumerate::map_enumerate_result(result)
 }
 
-pub fn read_turns_for_lifecycle(
-    context: &SessionProviderLifecycleContext<'_>,
-) -> Result<SessionProviderReadTurnsResult, SessionProviderError> {
-    let client = session_client(context.registry, &context.identity)?;
-    read_turns_with_client(
-        &client,
-        &context.identity,
-        read_session_id_for_lifecycle(context),
-        context.effective_cwd,
-        context.registry.host_options(),
-        lifecycle_extra(context),
-    )
-}
-
 pub fn capture_for_lifecycle(
     context: &SessionProviderLifecycleContext<'_>,
 ) -> Result<SessionProviderCaptureResult, SessionProviderError> {
@@ -167,29 +146,6 @@ pub fn capture_for_lifecycle(
         context.registry.host_options(),
         lifecycle_extra(context),
     )
-}
-
-fn read_turns_with_client(
-    client: &ProviderClient,
-    identity: &SessionProviderIdentity,
-    session_id: Option<&str>,
-    effective_cwd: Option<&Path>,
-    host_options: &DescribeHostOptions,
-    extra: JsonObject,
-) -> Result<SessionProviderReadTurnsResult, SessionProviderError> {
-    let result = invoke_session::<SessionReadTurnsResult>(
-        client,
-        "session.read_turns",
-        base_request(
-            identity,
-            session_id,
-            effective_cwd,
-            host_options,
-            extra,
-            "read-turns",
-        )?,
-    )?;
-    turns::map_read_turns_result(result)
 }
 
 fn capture_with_client(

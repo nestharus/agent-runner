@@ -5,20 +5,15 @@
 use super::*;
 
 #[test]
-fn select_provider_ignores_session_scan_errors_and_uses_stale_turn_counts() {
+fn select_provider_uses_cached_caught_up_turn_counts_without_session_scans() {
     let db = StateDb::open(Path::new(":memory:")).unwrap();
     let model = two_provider_model();
     seed_windows_with_deltas(&db, "a", &[(0.10, 24, 0.50, 1)]);
     seed_windows_with_deltas(&db, "b", &[(0.40, 24, 0.01, 1)]);
     let providers_cfg = ProvidersConfig::default();
-    let sessions_cfg = sessions_config_with_scripts(&[(
-        "a",
-        "printf '%s\n' '{\"session_id\":\"a-session\",\"turn_id\":\"turn-1\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"role\":\"assistant\"}'; exit 1",
-    )]);
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 
@@ -26,7 +21,7 @@ fn select_provider_ignores_session_scan_errors_and_uses_stale_turn_counts() {
 
     assert_eq!(
         selected, 0,
-        "failed session scans should leave provider a's stale zero-turn projection in place"
+        "caught-up cached counts should keep provider a's projection usable"
     );
     assert_eq!(db.count_assistant_turns_since("a", None).unwrap(), 0);
 }
@@ -76,11 +71,9 @@ fn select_provider_clears_stale_next_available_at_when_refresh_shows_healthy() {
             r#"echo '{"windows":[{"used_percent":4,"resets_at":"2099-01-01T00:00:00Z"}]}'"#,
         ),
     ]);
-    let sessions_cfg = SessionsConfig::default();
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 
@@ -130,11 +123,9 @@ fn select_provider_keeps_marker_when_refresh_shows_exhausted_window() {
             r#"echo '{"windows":[{"used_percent":2,"resets_at":"2099-01-01T00:00:00Z"}]}'"#,
         ),
     ]);
-    let sessions_cfg = SessionsConfig::default();
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 
@@ -193,11 +184,9 @@ fn topology_probe_skips_providers_without_refresh_source() {
     seed_windows_with_deltas(&db, "a", &[(0.02, 24 * 7, 0.01, 40)]);
     seed_windows_with_deltas(&db, "b", &[(0.66, 80, 0.01, 40), (0.16, 3, 0.01, 40)]);
     let providers_cfg = providers_config_with_scripts(&[("b", "printf '%s' '{\"windows\":[]}'")]);
-    let sessions_cfg = SessionsConfig::default();
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 

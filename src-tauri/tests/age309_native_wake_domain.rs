@@ -5,9 +5,11 @@
 //! TEST: native host-memory admission through detached proactive wake delivery.
 
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, SessionMetadataUpsert,
+    AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxDeliveryObservationAnchor,
+    SessionMetadataUpsert,
 };
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -81,8 +83,8 @@ impl Fixture {
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         command
-            .env("OULIPOLY_CONFIG_HOME", &self.config_home)
             .env("XDG_CONFIG_HOME", &self.config_home)
+            .env("OULIPOLY_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
             .env("HOME", &self.home_dir)
             .env(
@@ -206,6 +208,63 @@ impl Fixture {
             )
             .unwrap();
     }
+
+    fn seed_active_chain(&self) {
+        drop(oulipoly_state::StateDb::open(&self.state_path()).unwrap());
+        let connection = Connection::open(self.state_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                 VALUES ('age309-recovery-chain', '2026-08-30T12:00:00Z',
+                         '2026-08-30T12:00:00Z', ?1)",
+                [MODEL],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_chain_segments
+                    (chain_id, provider_name, session_id, started_at, transition_reason)
+                 VALUES ('age309-recovery-chain', ?1, ?2,
+                         '2026-08-30T12:00:00Z', 'initial')",
+                [PROVIDER, SESSION],
+            )
+            .unwrap();
+    }
+
+    fn seed_crashed_delivery_observation(&self, prompt: &str) {
+        fs::write(
+            &self.marker,
+            format!("{}\n", serde_json::to_string(prompt).unwrap()),
+        )
+        .unwrap();
+        let mut mailbox = MailboxDb::open(&self.sidecar_path()).unwrap();
+        let row = mailbox.list_mailbox(SESSION, true).unwrap().remove(0);
+        let attempt_id = "b".repeat(64);
+        mailbox
+            .register_headless_delivery_attempt(
+                &attempt_id,
+                SESSION,
+                Some("age309-recovery-chain"),
+                "age309-crashed-invocation",
+                &[row.seq],
+                0,
+            )
+            .unwrap();
+        mailbox
+            .record_delivery_observation_anchor(
+                &attempt_id,
+                SESSION,
+                &MailboxDeliveryObservationAnchor {
+                    provider_name: PROVIDER.to_string(),
+                    provider_instance_id: "age309-native-wake-fixture-instance".to_string(),
+                    settings_id: PROVIDER.to_string(),
+                    provider_session_id: SESSION.to_string(),
+                    resume_token: "age309-anchor:0".to_string(),
+                    expected_sha256: format!("{:x}", Sha256::digest(prompt.trim().as_bytes())),
+                },
+            )
+            .unwrap();
+    }
 }
 
 #[test]
@@ -213,7 +272,8 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
     let fixture = Fixture::new();
     let initial = fixture.run_initial();
     assert_success(&initial);
-    let owner_invocation_uuid = result_id(&initial);
+    assert_eq!(initial.stdout, b"native initial\n");
+    let owner_invocation_uuid = latest_invocation_uuid(&fixture.state_path());
     fixture.seed_pending_delivery(&owner_invocation_uuid);
 
     let sweep = fixture.start_startup_sweep();
@@ -313,16 +373,66 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
     assert_eq!(runtime_count, 6);
 }
 
-fn result_id(output: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let result = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
-        .expect("runner result envelope");
-    serde_json::from_str::<serde_json::Value>(result).unwrap()["id"]
-        .as_str()
+#[test]
+fn startup_recovery_settles_a_persisted_post_anchor_turn_without_relaunching() {
+    let fixture = Fixture::new();
+    fixture.seed_active_chain();
+    fixture.seed_pending_delivery("age309-recovery-owner");
+    fixture.seed_crashed_delivery_observation("persisted mailbox delivery");
+
+    let sweep = fixture.start_startup_sweep().wait_with_output().unwrap();
+    assert_success(&sweep);
+    assert!(
+        wait_until(|| {
+            let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+            mailbox
+                .list_mailbox(SESSION, true)
+                .unwrap()
+                .first()
+                .is_some_and(|row| row.delivered_at.is_some())
+                && mailbox
+                    .wake_session_reader()
+                    .wake_claim(SESSION)
+                    .unwrap()
+                    .is_none()
+        }),
+        "persisted post-anchor delivery was not recovered"
+    );
+
+    let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+    assert_eq!(
+        mailbox
+            .delivery_observation_confirmation(&"b".repeat(64))
+            .unwrap()
+            .as_deref(),
+        Some("age309-observed-user-1")
+    );
+    assert!(
+        mailbox
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.marker).unwrap().lines().count(),
+        1
+    );
+    assert!(
+        !fixture.provider_gate.exists(),
+        "recovery must settle before a provider launch waits on the fixture gate"
+    );
+}
+
+fn latest_invocation_uuid(state_path: &Path) -> String {
+    Connection::open(state_path)
         .unwrap()
-        .to_string()
+        .query_row(
+            "SELECT invocation_uuid FROM invocations ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 fn invocation_diagnostics(state_path: &Path) -> Vec<(String, Option<String>, Option<String>)> {
@@ -442,6 +552,14 @@ def event(request, seq, kind, **fields):
     value.update(fields)
     print(json.dumps(value, separators=(",", ":")), flush=True)
 
+def output_completion(request, seq, stdout):
+    event(request, seq, "marker", name="oulipoly.launch_output_complete/v1", value={
+        "protocol": "oulipoly.launch_output/v1",
+        "stdout": {"bytes": len(stdout), "sha256": hashlib.sha256(stdout).hexdigest()},
+        "stderr": {"bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()},
+        "data_event_count": 1,
+    })
+
 def launch(request):
     params = request.get("params", {})
     known = params.get("session", {}).get("known_provider_session_id")
@@ -455,7 +573,8 @@ def launch(request):
         deadline = time.monotonic() + 20
         while not gate.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
-        event(request, seq, "stdout", data_base64=base64.b64encode(b"native resumed\n").decode("ascii"))
+        stdout = b"native resumed\n"
+        event(request, seq, "stdout", data_base64=base64.b64encode(stdout).decode("ascii"))
         seq += 1
         acceptance = params.get("prompt_acceptance", {})
         acceptance_marker = {
@@ -475,9 +594,65 @@ def launch(request):
         known = SESSION
         event(request, seq, "marker", name="oulipoly.provider_session", value={"provider_session_id": known})
         seq += 1
-        event(request, seq, "stdout", data_base64=base64.b64encode(b"native initial\n").decode("ascii"))
+        stdout = b"native initial\n"
+        event(request, seq, "stdout", data_base64=base64.b64encode(stdout).decode("ascii"))
         seq += 1
+    output_completion(request, seq, stdout)
+    seq += 1
     event(request, seq, "exit", status={"kind": "exited", "code": 0}, terminal_signal={"kind": "clean_exit", "evidence": "native fixture clean exit", "observed_at_unix_ms": 1000 + seq}, session={"provider_session_id": known, "state": {"cursor": "native"}})
+
+def session_turn_page(request):
+    params = request.get("params", {})
+    marker = pathlib.Path(os.environ["AGE309_NATIVE_WAKE_MARKER"])
+    prompts = []
+    if marker.exists():
+        prompts = [json.loads(line) for line in marker.read_text().splitlines() if line]
+    projection = params.get("turn_projection")
+    if params.get("start_mode") == "tail":
+        selected = []
+    elif projection == "user_observation":
+        token = params.get("after_token") or "age309-anchor:0"
+        selected = prompts[int(token.rsplit(":", 1)[1]):]
+    else:
+        selected = []
+    turns = []
+    for offset, prompt in enumerate(selected[:params.get("max_turns", 1)]):
+        normalized = prompt.replace("\r\n", "\n").replace("\r", "\n").strip()
+        turns.append({
+            "session_id": SESSION,
+            "turn_id": "age309-observed-user-" + str(offset + 1),
+            "snapshot_sequence": offset,
+            "timestamp": "2026-08-30T12:00:00Z",
+            "role": "user",
+            "parent_turn_id": None,
+            "is_sidechain": False,
+            "is_compaction_boundary": False,
+            "body_state": "omitted_oversize",
+            "body": None,
+            "body_bytes": len(normalized.encode("utf-8")),
+            "body_sha256": None,
+            "canonical_text_sha256": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+        })
+    count = len(prompts)
+    return envelope(request, {
+        "read_protocol": "oulipoly.session_turn_pages/v1",
+        "provider_instance_id": request.get("provider_instance_id"),
+        "settings_id": params.get("settings_id"),
+        "session_id": SESSION,
+        "turn_projection": projection,
+        "snapshot_id": "age309-observation:" + str(count),
+        "page_index": 0,
+        "page_start_sequence": 0,
+        "turns": turns,
+        "page_turn_count": len(turns),
+        "source_bytes_examined": sum(len(json.dumps(turn)) for turn in turns),
+        "scan_progress": False,
+        "snapshot_complete": True,
+        "next_page_token": None,
+        "resume_token": "age309-anchor:" + str(count),
+        "source_final": False,
+        "warnings": [],
+    })
 
 request = json.loads(sys.stdin.read() or "{}")
 method = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -487,16 +662,16 @@ if method == "describe":
         "display_name": "AGE-309 Native Wake Fixture",
         "contract_versions": [CONTRACT],
         "preferred_contract": CONTRACT,
-        "capabilities": {"launch": True, "policy": True, "quota": False, "session": True, "terminal": False, "rotation": False, "discovery": False, "settings": False, "setup_brain": False, "setup": False, "migration": False, "prompt_acceptance_v1": True},
+        "capabilities": {"launch": True, "launch_output_v1": True, "policy": True, "quota": False, "session": True, "session_turn_pages_v1": True, "terminal": False, "rotation": False, "discovery": False, "settings": False, "setup_brain": False, "setup": False, "migration": False, "prompt_acceptance_v1": True},
     })))
 elif method == "policy.evaluate":
     print(json.dumps(envelope(request, {"accepted": True, "env": {}, "stdin": None, "prompt": None, "diagnostics": [], "markers": []})))
 elif method == "launch":
     launch(request)
-elif method == "session.read_turns":
-    print(json.dumps(envelope(request, {"turns": [{"session_id": SESSION, "turn_id": "native-turn", "role": "assistant", "timestamp": "2026-08-29T00:00:00Z", "body": [{"type": "text", "text": "native fixture turn"}]}], "turn_count": 1, "complete": True})))
 elif method == "session.capture":
     print(json.dumps(envelope(request, {"provider_session_id": SESSION, "state": {"captured": True}, "artifacts": []})))
+elif method == "session.read_turns":
+    print(json.dumps(session_turn_page(request)))
 else:
     print(json.dumps({"contract": CONTRACT, "request_id": request.get("request_id", "missing"), "ok": False, "error": {"category": "failed", "code": "unsupported_subcommand", "message": method, "retryable": False}}))
 "#

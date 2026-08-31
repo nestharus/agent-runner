@@ -2,7 +2,7 @@
 //!
 //! Relocated from `src-tauri/src/main.rs` by AGE-204 (map row H13). Output-preserving.
 //! These adapters wrap the pure classification core in `crate::zero_turn_orchestration`,
-//! adding the state-DB session scan, baseline capture, and `ExecutionResult` signal
+//! adding the state-DB bounded baseline capture and `ExecutionResult` signal
 //! mutation that the main-side balancing/resume orchestrators drive.
 //!
 //! ## Declared roles
@@ -10,7 +10,7 @@
 //! `orchestration`, `mapper`, `predicate`, `accessor`, `formatter`
 //!
 //! - `orchestration`: `zero_turn_record_baseline` / `classify_after_completion`
-//!   sequence execution, session scans, turn-count reads, and core classification.
+//!   sequence execution, cached turn-count reads, and core classification.
 //! - `mapper`: `apply_resume_completion_action` / `completion_classification` /
 //!   `zero_turn_classification_for_action` / `apply_zero_turn_classification_to_*`
 //!   project classifications onto assessment and executor fields.
@@ -18,7 +18,7 @@
 //!   `zero_turn_completion_can_replace_signal` /
 //!   `zero_turn_classification_is_non_productive` / `is_confirmed_zero_turn_exhaustion`.
 //! - `accessor`: `provider_has_no_session_source` / `has_session_source` /
-//!   `baseline_turn_count_from_scan` read session-source + turn-count state.
+//!   session-source checks read bounded configuration state.
 //! - `formatter`: `maybe_quota_exhausted_reason` builds the terminal-reason string.
 //!
 //! ## Adapter declarations
@@ -38,7 +38,7 @@
 //!       - executor-result-productivity-contract
 //!       - state-db-session-turn-count-contract
 //!       - sessions-config-contract
-//!       - provider-session-scan-contract
+//!       - bounded-session-ingestion-freshness-contract
 //! ```
 
 use oulipoly_runtime::executor;
@@ -48,8 +48,7 @@ use oulipoly_state::StateDb;
 use crate::zero_turn_orchestration::{
     HostObservedCompletion, ZeroTurnAction, ZeroTurnBaseline, ZeroTurnClassification,
     ZeroTurnEvidence, classify_accepted_provider_turn, classify_completion,
-    classify_completion_delta, is_incomplete_tool_boundary, record_baseline,
-    record_baseline_with_completion,
+    classify_completion_delta, record_baseline,
 };
 fn zero_turn_zero_counts() -> oulipoly_state::SessionTurnCounts {
     session_turn_counts(0, 0, 0)
@@ -78,27 +77,20 @@ fn has_session_source(sessions_cfg: &oulipoly_config::SessionsConfig, provider_n
     !provider_has_no_session_source(sessions_cfg, provider_name)
 }
 
-fn scan_report_has_errors(report: &oulipoly_runtime::sessions::ScanReport) -> bool {
-    !report.errors.is_empty()
-}
-
-fn baseline_turn_count_from_scan(
-    state: &StateDb,
-    provider_name: &str,
-    session_id: &str,
-    scan_failed: bool,
-) -> Option<oulipoly_state::SessionTurnCounts> {
-    if scan_failed {
-        None
-    } else {
-        state.count_session_turns(provider_name, session_id).ok()
-    }
-}
-
 fn turn_counts_or_scan_failed<E>(
     count_result: Result<oulipoly_state::SessionTurnCounts, E>,
 ) -> Option<oulipoly_state::SessionTurnCounts> {
     count_result.ok()
+}
+
+fn canonical_turn_ingest_is_caught_up(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+) -> bool {
+    state
+        .canonical_session_turn_ingest_freshness(provider_name, session_id)
+        .is_ok_and(|freshness| freshness.is_caught_up())
 }
 
 pub(crate) fn zero_turn_record_baseline(
@@ -113,23 +105,9 @@ pub(crate) fn zero_turn_record_baseline(
     if provider_has_no_session_source(sessions_cfg, provider_name) {
         return record_baseline(provider_name, Some(session_id), None, true);
     }
-    let report = oulipoly_runtime::sessions::scan_provider_session(
-        provider_name,
-        sessions_cfg,
-        state,
-        session_id,
-    );
-    let scan_failed = scan_report_has_errors(&report);
-    let baseline_count =
-        baseline_turn_count_from_scan(state, provider_name, session_id, scan_failed);
-    let baseline_completion = report.assistant_completions.get(session_id).cloned();
-    record_baseline_with_completion(
-        provider_name,
-        Some(session_id),
-        baseline_count,
-        baseline_completion,
-        scan_failed,
-    )
+    let cached_count = state.count_session_turns(provider_name, session_id).ok();
+    let caught_up = canonical_turn_ingest_is_caught_up(state, provider_name, session_id);
+    record_baseline(provider_name, Some(session_id), cached_count, !caught_up)
 }
 
 pub(crate) fn zero_turn_classify_after_completion(
@@ -201,19 +179,14 @@ fn classify_after_completion(
             false,
         );
     }
-    let report = oulipoly_runtime::sessions::scan_provider_session(
-        &baseline.provider_name,
-        sessions_cfg,
-        state,
-        session_id,
-    );
-    if scan_report_has_errors(&report) {
+    if !canonical_turn_ingest_is_caught_up(state, &baseline.provider_name, session_id) {
         return completion_classification(
-            ZeroTurnClassification::UnclassifiedScanFailed,
+            classify_completion(baseline, zero_turn_zero_counts(), host_observed),
             false,
             false,
         );
     }
+    let _ = sessions_cfg;
     let Some(counts) =
         turn_counts_or_scan_failed(state.count_session_turns(&baseline.provider_name, session_id))
     else {
@@ -223,21 +196,12 @@ fn classify_after_completion(
             false,
         );
     };
-    let current_completion = report.assistant_completions.get(session_id);
     let accepted_provider_turn =
-        classify_accepted_provider_turn(baseline, counts.clone(), false, current_completion)
-            .is_some();
-    let incomplete_tool_boundary = is_incomplete_tool_boundary(
-        baseline,
-        counts.clone(),
-        false,
-        current_completion,
-        report.assistant_tool_boundaries.get(session_id),
-    );
+        classify_accepted_provider_turn(baseline, counts.clone(), false, None).is_some();
     completion_classification(
         classify_completion(baseline, counts, host_observed),
         accepted_provider_turn,
-        incomplete_tool_boundary,
+        false,
     )
 }
 
@@ -451,7 +415,7 @@ pub(crate) fn zero_turn_late_bind_baseline(
         provider_name,
         Some(session_id),
         has_source.then(zero_turn_zero_counts),
-        !has_source,
+        true,
     )
 }
 
@@ -472,6 +436,7 @@ mod tests {
         ExecutionResult {
             stdout: Vec::new(),
             stderr: "physical provider error".to_string(),
+            output_spool: None,
             exit_code,
             provider_index: 0,
             session_capture: SessionCaptureResult {

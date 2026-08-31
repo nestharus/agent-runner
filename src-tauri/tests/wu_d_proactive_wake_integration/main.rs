@@ -31,7 +31,7 @@
 mod cases_basic;
 mod cases_batch_sweep;
 mod cases_wake_backlog;
-mod fake_cli;
+mod fake_provider;
 mod fixtures;
 mod liveness;
 mod model_config;

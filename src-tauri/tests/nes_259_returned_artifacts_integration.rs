@@ -734,7 +734,21 @@ fn test_model_ipc_result_source_shape_has_no_returned_artifacts_field() {
     }
     let struct_body = &source[struct_start..=brace_end.expect("TestModelResult closing brace")];
 
-    for field in ["success:", "stdout:", "stderr:", "exit_code:"] {
+    for field in [
+        "success:",
+        "exit_code:",
+        "stdout_preview:",
+        "stdout_preview_truncated:",
+        "stdout_bytes:",
+        "stdout_sha256:",
+        "stdout_content_type:",
+        "stderr_preview:",
+        "stderr_preview_truncated:",
+        "stderr_bytes:",
+        "stderr_sha256:",
+        "stderr_content_type:",
+        "output_artifact_token:",
+    ] {
         assert!(
             struct_body.contains(field),
             "missing existing field {field}"

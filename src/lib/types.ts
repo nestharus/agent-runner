@@ -108,9 +108,18 @@ export type SetupEvent =
 
 export interface TestModelResult {
 	success: boolean;
-	stdout: string;
-	stderr: string;
 	exit_code: number;
+	stdout_preview: string;
+	stdout_preview_truncated: boolean;
+	stdout_bytes: number;
+	stdout_sha256: string | null;
+	stdout_content_type: string;
+	stderr_preview: string;
+	stderr_preview_truncated: boolean;
+	stderr_bytes: number;
+	stderr_sha256: string | null;
+	stderr_content_type: string;
+	output_artifact_token: string | null;
 }
 
 export interface ProviderConfig {

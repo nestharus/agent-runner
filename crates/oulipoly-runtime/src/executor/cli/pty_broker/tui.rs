@@ -32,9 +32,11 @@
 use super::cancel::{
     CancelRequest, cancel_outcome_message, cancel_request_for_node, execute_cancel,
 };
+#[cfg(test)]
+use super::outbound_observer::ObservedUserTurn;
 use super::outbound_observer::{
-    ObservedUserTurn, OutboundObservation, OutboundObservationIdentity, OutboundObservationResult,
-    OutboundObserverSource, OutboundObserverWorker,
+    OutboundObservation, OutboundObservationIdentity, OutboundObservationPhase,
+    OutboundObservationResult, OutboundObserverSource, OutboundObserverWorker,
 };
 #[cfg(test)]
 use super::seed_test_mailbox_delivery;
@@ -71,7 +73,8 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -1273,8 +1276,12 @@ enum OutboundStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OutboundBaseline {
     identity: OutboundObservationIdentity,
-    generation: u64,
-    turn_ids: BTreeSet<String>,
+    _anchor: String,
+    expected_sha256: String,
+    latest_observation_generation: u64,
+    matching_turns: u64,
+    observed_turns: u64,
+    saw_unmatchable_turn: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1459,6 +1466,29 @@ impl OutboundQueue {
         })
     }
 
+    fn awaiting_tail_anchor(&self) -> bool {
+        self.next_sendable_id().is_some_and(|id| {
+            self.message(id)
+                .and_then(|message| message.detail.as_deref())
+                == Some("awaiting_tail_anchor")
+        })
+    }
+
+    fn awaiting_post_anchor_observation(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|message| message.status == OutboundStatus::Sent)
+    }
+
+    fn require_generation(&mut self, generation: u64) {
+        self.minimum_generation = self.minimum_generation.max(generation);
+        if let Some(id) = self.next_sendable_id()
+            && let Some(message) = self.message_mut(id)
+        {
+            message.minimum_generation = message.minimum_generation.max(generation);
+        }
+    }
+
     fn oldest_ambiguous_id(&self) -> Option<u64> {
         self.messages
             .iter()
@@ -1509,9 +1539,6 @@ fn apply_outbound_observation(
     let OutboundObservationResult::Available(observation) = result else {
         return false;
     };
-    if !observation.complete {
-        return false;
-    }
     let mut dirty = false;
     let sent_ids: Vec<u64> = outbound
         .messages
@@ -1536,62 +1563,61 @@ fn apply_outbound_observation_to_message(
     observation: &OutboundObservation,
     now: Instant,
 ) -> bool {
-    let Some(message) = outbound.message(id).cloned() else {
-        return false;
-    };
-    let Some(baseline) = message.baseline.as_ref() else {
-        return false;
-    };
-    if baseline.identity != observation.identity || observation.generation < baseline.generation {
+    if !matches!(observation.phase, OutboundObservationPhase::PostAnchorPage) {
         return false;
     }
-    let candidates = candidate_turns_after_baseline(observation, baseline);
-    if candidates.is_empty() {
-        return false;
-    }
-    let matches = exact_matching_turn_count(&message.body, candidates.iter().copied());
-    match matches {
-        1 => outbound.set_status(id, OutboundStatus::Consumed, now, None),
-        0 => {
-            let detail = if candidates.iter().any(|turn| turn.body.is_none()) {
-                "new_user_turn_unmatchable"
-            } else {
-                "new_user_turn_did_not_match"
-            };
-            outbound.set_status(id, OutboundStatus::Ambiguous, now, Some(detail.to_string()))
+    let resolution = {
+        let Some(message) = outbound.message_mut(id) else {
+            return false;
+        };
+        let Some(baseline) = message.baseline.as_mut() else {
+            return false;
+        };
+        if baseline.identity != observation.identity
+            || observation.generation <= baseline.latest_observation_generation
+        {
+            return false;
         }
-        _ => outbound.set_status(
-            id,
-            OutboundStatus::Ambiguous,
-            now,
-            Some("duplicate_matching_user_turns".to_string()),
-        ),
-    }
-}
-
-fn candidate_turns_after_baseline<'a>(
-    observation: &'a OutboundObservation,
-    baseline: &OutboundBaseline,
-) -> Vec<&'a ObservedUserTurn> {
-    observation
-        .user_turns
-        .iter()
-        .filter(|turn| !baseline.turn_ids.contains(&turn.turn_id))
-        .collect()
-}
-
-fn exact_matching_turn_count<'a>(
-    body: &str,
-    turns: impl Iterator<Item = &'a ObservedUserTurn>,
-) -> usize {
-    let wanted = normalize_message_body(body);
-    turns
-        .filter(|turn| {
-            turn.body
-                .as_deref()
-                .is_some_and(|body| normalize_message_body(body) == wanted)
-        })
-        .count()
+        baseline.latest_observation_generation = observation.generation;
+        for turn in &observation.user_turns {
+            baseline.observed_turns = baseline.observed_turns.saturating_add(1);
+            match turn.canonical_text_sha256.as_deref() {
+                Some(digest) if digest == baseline.expected_sha256 => {
+                    baseline.matching_turns = baseline.matching_turns.saturating_add(1);
+                }
+                Some(_) => {}
+                None => baseline.saw_unmatchable_turn = true,
+            }
+        }
+        if baseline.matching_turns > 1 {
+            Some((
+                OutboundStatus::Ambiguous,
+                Some("duplicate_matching_user_turns".to_string()),
+            ))
+        } else if !observation.snapshot_complete {
+            None
+        } else if baseline.matching_turns == 1 {
+            Some((OutboundStatus::Consumed, None))
+        } else if baseline.observed_turns > 0 {
+            Some((
+                OutboundStatus::Ambiguous,
+                Some(
+                    if baseline.saw_unmatchable_turn {
+                        "new_user_turn_unmatchable"
+                    } else {
+                        "new_user_turn_did_not_match"
+                    }
+                    .to_string(),
+                ),
+            ))
+        } else {
+            None
+        }
+    };
+    let Some((status, detail)) = resolution else {
+        return false;
+    };
+    outbound.set_status(id, status, now, detail)
 }
 
 fn normalize_message_body(body: &str) -> String {
@@ -1599,6 +1625,11 @@ fn normalize_message_body(body: &str) -> String {
         .replace('\r', "\n")
         .trim()
         .to_string()
+}
+
+fn normalized_message_sha256(body: &str) -> String {
+    let normalized = normalize_message_body(body);
+    format!("{:x}", Sha256::digest(normalized.as_bytes()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5377,6 +5408,13 @@ fn pump_outbound_queue_from_worker(
         latest.as_deref(),
         now,
     );
+    if pane.outbound.awaiting_tail_anchor() {
+        let generation_floor = worker.request_fresh_generation();
+        pane.outbound.require_generation(generation_floor);
+    }
+    if pane.outbound.awaiting_post_anchor_observation() {
+        worker.observe_after_anchor();
+    }
     let _ = worker.set_demand(pane.outbound.observation_needed());
     dirty
 }
@@ -5544,7 +5582,7 @@ fn start_next_outbound_message(
         .map(|message| message.minimum_generation)
         .unwrap_or_default()
         .max(outbound.minimum_generation);
-    let baseline = match observation_baseline(observation, minimum_generation) {
+    let baseline = match observation_baseline(observation, minimum_generation, &body) {
         Ok(baseline) => baseline,
         Err(detail) => {
             return outbound.set_status(
@@ -5573,6 +5611,7 @@ fn start_next_outbound_message(
 fn observation_baseline(
     result: Option<&OutboundObservationResult>,
     minimum_generation: u64,
+    body: &str,
 ) -> Result<OutboundBaseline, String> {
     match result {
         None => Err("awaiting_outbound_observation".to_string()),
@@ -5585,14 +5624,25 @@ fn observation_baseline(
         {
             Err("awaiting_fresh_observation".to_string())
         }
-        Some(OutboundObservationResult::Available(observation)) if !observation.complete => {
+        Some(OutboundObservationResult::Available(observation))
+            if !observation.snapshot_complete =>
+        {
             Err("awaiting_complete_observation".to_string())
         }
-        Some(OutboundObservationResult::Available(observation)) => Ok(OutboundBaseline {
-            identity: observation.identity.clone(),
-            generation: observation.generation,
-            turn_ids: observation.turn_ids.clone(),
-        }),
+        Some(OutboundObservationResult::Available(observation)) => {
+            let OutboundObservationPhase::TailAnchor { resume_token } = &observation.phase else {
+                return Err("awaiting_tail_anchor".to_string());
+            };
+            Ok(OutboundBaseline {
+                identity: observation.identity.clone(),
+                _anchor: resume_token.clone(),
+                expected_sha256: normalized_message_sha256(body),
+                latest_observation_generation: observation.generation,
+                matching_turns: 0,
+                observed_turns: 0,
+                saw_unmatchable_turn: false,
+            })
+        }
     }
 }
 
@@ -6786,16 +6836,9 @@ mod tests {
                 OutboundObservation {
                     identity: outbound_identity(),
                     generation: 1,
-                    complete: false,
-                    turn_count: 1,
-                    turn_ids: ["old".to_string()].into_iter().collect(),
-                    user_turns: vec![ObservedUserTurn {
-                        turn_id: "old".to_string(),
-                        timestamp: DateTime::parse_from_rfc3339("2026-05-01T00:00:01Z")
-                            .unwrap()
-                            .with_timezone(&Utc),
-                        body: Some("hello".to_string()),
-                    }],
+                    phase: OutboundObservationPhase::PostAnchorPage,
+                    snapshot_complete: false,
+                    user_turns: vec![],
                 },
             ))),
             Some(OutboundObservationResult::Unavailable {
@@ -7121,7 +7164,7 @@ mod tests {
         let mut pane = sent_pane("hello", ["old"], now);
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
-        let observed = available_observation(2, [("old", Some("hello")), ("new", Some("hello"))]);
+        let observed = available_observation(2, [("new", Some("hello"))]);
 
         assert!(pump_outbound_queue(
             &mut pane,
@@ -7136,19 +7179,32 @@ mod tests {
     }
 
     #[test]
+    fn matching_evidence_across_bounded_pages_settles_only_at_snapshot_completion() {
+        let now = Instant::now();
+        let mut pane = sent_pane("hello", [], now);
+
+        apply_outbound_observation(
+            &mut pane.outbound,
+            &post_anchor_observation(2, false, [("new", Some("hello"))]),
+            now,
+        );
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sent));
+
+        assert!(apply_outbound_observation(
+            &mut pane.outbound,
+            &post_anchor_observation(3, true, []),
+            now,
+        ));
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Consumed));
+    }
+
+    #[test]
     fn duplicate_or_transformed_turns_mark_sent_message_ambiguous() {
         let now = Instant::now();
         let mut duplicate = sent_pane("hello", ["old"], now);
         assert!(apply_outbound_observation(
             &mut duplicate.outbound,
-            &available_observation(
-                2,
-                [
-                    ("old", Some("hello")),
-                    ("new-1", Some("hello")),
-                    ("new-2", Some("hello")),
-                ],
-            ),
+            &available_observation(2, [("new-1", Some("hello")), ("new-2", Some("hello")),],),
             now,
         ));
         assert_eq!(
@@ -7159,7 +7215,7 @@ mod tests {
         let mut transformed = sent_pane("hello", ["old"], now);
         assert!(apply_outbound_observation(
             &mut transformed.outbound,
-            &available_observation(2, [("old", Some("hello")), ("new", Some("HELLO"))],),
+            &available_observation(2, [("new", Some("HELLO"))],),
             now,
         ));
         assert_eq!(
@@ -7168,14 +7224,7 @@ mod tests {
         );
         assert!(apply_outbound_observation(
             &mut transformed.outbound,
-            &available_observation(
-                3,
-                [
-                    ("old", Some("hello")),
-                    ("new", Some("HELLO")),
-                    ("late", Some("hello")),
-                ],
-            ),
+            &available_observation(3, [("late", Some("hello")),],),
             now,
         ));
         assert_eq!(
@@ -7315,7 +7364,7 @@ mod tests {
             &mut pending,
             &mut line_state,
             false,
-            Some(&available_observation(2, [("possibly-old", Some("first"))])),
+            Some(&available_observation(2, [])),
             now,
         );
         assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
@@ -7331,7 +7380,7 @@ mod tests {
         pane.outbound.enqueue("second".to_string());
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
-        let baseline = available_observation(1, [("old", Some("first"))]);
+        let baseline = available_observation(1, []);
 
         pump_outbound_queue(
             &mut pane,
@@ -7364,7 +7413,7 @@ mod tests {
         assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
         assert!(pending.is_empty());
 
-        let consumed = available_observation(2, [("old", Some("first")), ("new", Some("first"))]);
+        let consumed = available_observation(2, [("new", Some("first"))]);
         pump_outbound_queue(
             &mut pane,
             &mut pending,
@@ -7375,6 +7424,17 @@ mod tests {
         );
 
         assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Consumed));
+        assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
+        assert!(pending.is_empty());
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            Some(&available_observation(3, [])),
+            now,
+        );
         assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Sending));
     }
 
@@ -7386,7 +7446,7 @@ mod tests {
 
     fn sent_pane<const N: usize>(
         body: &str,
-        baseline_ids: [&str; N],
+        _baseline_ids: [&str; N],
         sent_at: Instant,
     ) -> MonitorPane {
         let mut pane = queued_pane(body, sent_at);
@@ -7394,8 +7454,12 @@ mod tests {
             1,
             OutboundBaseline {
                 identity: outbound_identity(),
-                generation: 1,
-                turn_ids: baseline_ids.into_iter().map(str::to_string).collect(),
+                _anchor: "anchor-1".to_string(),
+                expected_sha256: normalized_message_sha256(body),
+                latest_observation_generation: 1,
+                matching_turns: 0,
+                observed_turns: 0,
+                saw_unmatchable_turn: false,
             },
         );
         pane.outbound
@@ -7419,16 +7483,30 @@ mod tests {
         generation: u64,
         turns: [(&str, Option<&str>); N],
     ) -> OutboundObservationResult {
-        let turn_ids = turns
-            .iter()
-            .map(|(turn_id, _)| (*turn_id).to_string())
-            .collect();
+        if !turns.is_empty() {
+            return post_anchor_observation(generation, true, turns);
+        }
         OutboundObservationResult::Available(Box::new(OutboundObservation {
             identity: outbound_identity(),
             generation,
-            complete: true,
-            turn_count: turns.len() as u64,
-            turn_ids,
+            phase: OutboundObservationPhase::TailAnchor {
+                resume_token: format!("anchor-{generation}"),
+            },
+            snapshot_complete: true,
+            user_turns: Vec::new(),
+        }))
+    }
+
+    fn post_anchor_observation<const N: usize>(
+        generation: u64,
+        snapshot_complete: bool,
+        turns: [(&str, Option<&str>); N],
+    ) -> OutboundObservationResult {
+        OutboundObservationResult::Available(Box::new(OutboundObservation {
+            identity: outbound_identity(),
+            generation,
+            phase: OutboundObservationPhase::PostAnchorPage,
+            snapshot_complete,
             user_turns: turns
                 .into_iter()
                 .map(|(turn_id, body)| ObservedUserTurn {
@@ -7436,7 +7514,7 @@ mod tests {
                     timestamp: DateTime::parse_from_rfc3339("2026-05-01T00:00:01Z")
                         .unwrap()
                         .with_timezone(&Utc),
-                    body: body.map(str::to_string),
+                    canonical_text_sha256: body.map(normalized_message_sha256),
                 })
                 .collect(),
         }))

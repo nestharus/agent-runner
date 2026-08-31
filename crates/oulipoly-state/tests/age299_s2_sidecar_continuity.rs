@@ -562,7 +562,15 @@ fn schema_17_upgrade_backfills_only_an_exact_proven_materialization_summary() {
     let connection = rusqlite::Connection::open(&state_path).unwrap();
     connection
         .execute_batch(
-            "DROP TRIGGER trg_invocation_completion_materialization_summary_continuity_insert;
+            "DROP INDEX idx_session_turns_canonical_text_sha256;
+             DROP TABLE session_turn_ingest_streams;
+             ALTER TABLE session_turns DROP COLUMN canonical_text_digest_verified;
+             ALTER TABLE session_turns DROP COLUMN canonical_text_sha256;
+             ALTER TABLE session_turns DROP COLUMN body_bytes;
+             ALTER TABLE session_turns DROP COLUMN body_sha256;
+             ALTER TABLE session_turns DROP COLUMN body_state;
+             ALTER TABLE session_turns DROP COLUMN ingest_digest;
+             DROP TRIGGER trg_invocation_completion_materialization_summary_continuity_insert;
              DROP TABLE invocation_completion_materialization_summary;
              DROP INDEX idx_invocations_parent_running_created;
              DROP INDEX idx_invocations_running_parent;

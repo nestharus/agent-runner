@@ -6,7 +6,10 @@ use oulipoly_config::{
 };
 use oulipoly_runtime::balancer::{BalanceContext, select_provider};
 use oulipoly_runtime::quota::InFlight;
-use oulipoly_state::{InvocationStart, QuotaWindowInput, SessionTurnIngest, StateDb};
+use oulipoly_state::{
+    InvocationStart, QuotaWindowInput, SessionTurnIngest, SessionTurnIngestStreamKey,
+    SessionTurnPageApply, SessionTurnStreamProjection, StateDb,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use uuid::Uuid;
@@ -55,7 +58,46 @@ pub fn seed_learned_windows(
         max_delta_calls(final_windows),
     );
     ingest_quota_delta_turns(db, provider_name, &turns);
+    mark_provider_turn_count_caught_up(db, provider_name);
     upsert_final_quota_windows(db, provider_name, &final_quota_windows(final_windows));
+}
+
+fn mark_provider_turn_count_caught_up(db: &StateDb, provider_name: &str) {
+    let key = SessionTurnIngestStreamKey {
+        provider_name: provider_name.to_string(),
+        provider_instance_id: provider_name.to_string(),
+        settings_id: "routing-fanout-settings".to_string(),
+        session_id: quota_delta_session_id(provider_name),
+        projection: SessionTurnStreamProjection::CanonicalIngest,
+    };
+    db.enqueue_session_turn_ingest_stream(&key).unwrap();
+    let now = Utc::now();
+    let stream = db
+        .lease_ready_session_turn_ingest_stream(
+            SessionTurnStreamProjection::CanonicalIngest,
+            "routing-fanout-worker",
+            now,
+            now + Duration::minutes(1),
+        )
+        .unwrap()
+        .unwrap();
+    db.apply_session_turn_page(&SessionTurnPageApply {
+        key,
+        lease_owner: "routing-fanout-worker".to_string(),
+        expected_generation: stream.checkpoint_generation,
+        request_token_sha256: "1".repeat(64),
+        snapshot_id: format!("{provider_name}-routing-fanout-snapshot"),
+        page_index: stream.expected_page_index,
+        page_start_sequence: stream.expected_turn_sequence,
+        page_turn_count: 0,
+        scan_progress: false,
+        snapshot_complete: true,
+        next_page_token: None,
+        resume_token: Some(format!("{provider_name}-routing-fanout-resume")),
+        page_digest: "2".repeat(64),
+        turns: Vec::new(),
+    })
+    .unwrap();
 }
 
 pub fn provider_config_with_scripts(scripts: &[(&str, &str)]) -> ProvidersConfig {
@@ -190,12 +232,11 @@ pub fn select_provider_name_with_ctx(
 
 fn balance_context_for_test<'a>(
     providers_cfg: &'a ProvidersConfig,
-    sessions_cfg: &'a SessionsConfig,
+    _sessions_cfg: &'a SessionsConfig,
     in_flight: &'a InFlight,
 ) -> BalanceContext<'a> {
     BalanceContext {
         providers_cfg,
-        sessions_cfg,
         in_flight,
     }
 }

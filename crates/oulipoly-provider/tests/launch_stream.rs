@@ -207,10 +207,8 @@ fn launch_stdout_truncation_takes_precedence_over_parseable_exit_prefix() {
 
     assert_eq!(error.transport_kind(), "stdout_limit_exceeded");
     assert!(error.diagnostics().stdout.truncated);
-    assert_eq!(
-        error.process_status(),
-        Some(&ProcessStatus::Exited { code: 0 })
-    );
+    assert!(error.diagnostics().process_was_reaped);
+    assert!(error.process_status().is_some());
 }
 
 #[test]

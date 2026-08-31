@@ -36,19 +36,16 @@ struct PersistedInvocationOutcome {
 
 struct RecoveryFixture {
     base: Age153Fixture,
-    completion_marker: PathBuf,
+    turn_script_canary: PathBuf,
     diagnostics_marker: PathBuf,
 }
 
 impl RecoveryFixture {
-    fn new(turn_mode: &str) -> Self {
+    fn new() -> Self {
         let base = Age153Fixture::new();
-        let completion_marker = base.dir.path().join("completion-mode");
+        let turn_script_canary = base.dir.path().join("turn-script-ran");
         let diagnostics_marker = base.dir.path().join("diagnostics-ran");
-        let provider = base.write_script(
-            "recovery-provider.sh",
-            &provider_script(&completion_marker, turn_mode),
-        );
+        let provider = base.write_script("recovery-provider.sh", provider_script());
         let diagnostics = base.write_script(
             "recovery-diagnostics.sh",
             &format!(
@@ -56,14 +53,11 @@ impl RecoveryFixture {
                 shell_path(&diagnostics_marker)
             ),
         );
-        let turn_script = base.write_script(
-            "recovery-turns.sh",
-            &turn_script(&completion_marker, turn_mode),
-        );
+        let turn_script = base.write_script("recovery-turns.sh", &turn_script(&turn_script_canary));
         write_fixture_config(&base, &provider, &diagnostics, &turn_script);
         Self {
             base,
-            completion_marker,
+            turn_script_canary,
             diagnostics_marker,
         }
     }
@@ -73,10 +67,6 @@ impl RecoveryFixture {
             .map(|kind| vec![(FORCE_KIND, kind)])
             .unwrap_or_default();
         self.base.run_one_shot_with_env(MODEL, &envs)
-    }
-
-    fn run_resume(&self) -> Output {
-        self.base.run_resume(MODEL)
     }
 
     fn latest_invocation(&self) -> (String, i64, Option<String>) {
@@ -92,10 +82,6 @@ impl RecoveryFixture {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap()
-    }
-
-    fn latest_persisted_invocation(&self) -> PersistedInvocationOutcome {
-        latest_persisted_invocation(&self.base, PROVIDER)
     }
 }
 
@@ -120,8 +106,7 @@ impl ExternalRecoveryFixture {
             "recovery-legacy-poison.sh",
             &format!("printf poison > {}\nexit 97", shell_path(&poison_canary)),
         );
-        let turn_script = base.write_script("recovery-external-turns.sh", external_turn_script());
-        write_external_fixture_config(&base, &external_provider, &poison_provider, &turn_script);
+        write_external_fixture_config(&base, &external_provider, &poison_provider);
         Self {
             base,
             launch_canary,
@@ -158,140 +143,28 @@ impl ExternalRecoveryFixture {
 }
 
 #[test]
-fn same_session_new_stop_recovers_logically_and_retains_physical_failure() {
-    let fixture = RecoveryFixture::new("stop");
+fn automatic_legacy_turn_script_cannot_recover_a_nonzero_exit() {
+    let fixture = RecoveryFixture::new();
 
     let output = fixture.run(None);
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     let envelope = result_envelope(&output);
-    assert_eq!(envelope["success"], true);
+    assert_eq!(envelope["success"], false);
     assert_eq!(envelope["exit_code"], 1);
     assert_eq!(envelope["terminal_reason"], "exit_nonzero");
     assert_eq!(
         fixture.latest_invocation(),
-        ("succeeded".to_string(), 1, Some("exit_nonzero".to_string()))
+        ("failed".to_string(), 1, Some("exit_nonzero".to_string()))
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("\"kind\":\"NonzeroExit\""), "{stderr}");
     assert!(
-        !fixture.diagnostics_marker.exists(),
-        "recovered completion must bypass failure diagnostics"
+        fixture.diagnostics_marker.exists(),
+        "unrecovered failure must run diagnostics"
     );
-    assert!(fixture.completion_marker.exists());
-}
-
-#[test]
-fn resumed_clean_exit_after_new_tool_calls_boundary_is_non_success() {
-    let fixture = RecoveryFixture::new("clean-tool-calls");
-    fixture.base.seed_active_chain(PROVIDER, MODEL);
-
-    let output = fixture.run_resume();
-    let persisted = fixture.latest_persisted_invocation();
-    let envelope = optional_result_envelope(&output);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let observed = (
-        output.status.success(),
-        stderr.contains("incomplete_tool_boundary"),
-        envelope
-            .as_ref()
-            .and_then(|result| result["status"].as_str())
-            .map(str::to_string),
-        envelope
-            .as_ref()
-            .and_then(|result| result["success"].as_bool()),
-        envelope
-            .as_ref()
-            .and_then(|result| result["exit_code"].as_i64()),
-        envelope
-            .as_ref()
-            .and_then(|result| result["terminal_reason"].as_str())
-            .map(str::to_string),
-    );
-    let expected = (
-        false,
-        true,
-        Some("failed".to_string()),
-        Some(false),
-        Some(0),
-        Some("incomplete_tool_boundary".to_string()),
-    );
-
-    assert_eq!(
-        observed,
-        expected,
-        "stdout={}\nstderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        persisted,
-        PersistedInvocationOutcome {
-            invocation_uuid: persisted.invocation_uuid.clone(),
-            status: "failed".to_string(),
-            success: 0,
-            exit_code: 0,
-            error_category: Some("incomplete_tool_boundary".to_string()),
-            terminal_reason: Some("incomplete_tool_boundary".to_string()),
-            resume_acceptance_status: Some("rejected".to_string()),
-            resume_acceptance_evidence: Some("incomplete_tool_boundary".to_string()),
-            provider_session_id: Some(SESSION_ID.to_string()),
-        }
-    );
-
     assert!(
-        stderr.contains("earlier provider error evidence retained"),
-        "{stderr}"
+        !fixture.turn_script_canary.exists(),
+        "automatic terminal recovery must not invoke a legacy turn script"
     );
-    let envelope = single_result_envelope(&output);
-    assert_failure_envelope_matches(&envelope, &persisted, PROVIDER, SESSION_ID, CHAIN_ID);
-}
-
-#[test]
-fn resumed_clean_exit_after_loaded_tool_boundary_is_typed_incomplete() {
-    let fixture = ExternalRecoveryFixture::new("loaded-incomplete");
-    fixture
-        .base
-        .seed_active_chain(EXTERNAL_PROVIDER, EXTERNAL_MODEL);
-
-    let output = fixture.run_resume();
-    let persisted = fixture.latest_persisted_invocation();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert_eq!(persisted.status, "failed");
-    assert_eq!(persisted.success, 0);
-    assert_eq!(persisted.exit_code, 0);
-    assert_eq!(
-        persisted.error_category.as_deref(),
-        Some("incomplete_tool_boundary")
-    );
-    assert_eq!(
-        persisted.terminal_reason.as_deref(),
-        Some("incomplete_tool_boundary")
-    );
-    assert_eq!(
-        persisted.resume_acceptance_status.as_deref(),
-        Some("rejected")
-    );
-    assert_eq!(
-        persisted.resume_acceptance_evidence.as_deref(),
-        Some("incomplete_tool_boundary")
-    );
-    assert!(stderr.contains("incomplete_tool_boundary"), "{stderr}");
-    assert!(
-        !stderr.contains("resume_completion_unconfirmed"),
-        "{stderr}"
-    );
-    let envelope = single_result_envelope(&output);
-    assert_failure_envelope_matches(
-        &envelope,
-        &persisted,
-        EXTERNAL_PROVIDER,
-        SESSION_ID,
-        CHAIN_ID,
-    );
-    fixture.assert_local_external_provider_only();
 }
 
 #[test]
@@ -351,21 +224,15 @@ fn resumed_clean_exit_with_terminal_assistant_response_succeeds() {
 
     let output = fixture.run_resume();
     let persisted = fixture.latest_persisted_invocation();
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert!(
-        stdout.contains("fixture terminal assistant response"),
-        "{stdout}"
-    );
+    assert_eq!(output.stdout, b"fixture terminal assistant response\n");
     assert_eq!(persisted.status, "succeeded");
     assert_eq!(persisted.success, 1);
     assert_eq!(persisted.exit_code, 0);
     assert_eq!(persisted.error_category, None);
     assert_eq!(persisted.terminal_reason, None);
-    let envelope = single_result_envelope(&output);
-    assert_success_envelope_matches(&envelope, &persisted);
     assert!(
         !stderr.contains("resume_completion_unconfirmed"),
         "{stderr}"
@@ -375,29 +242,7 @@ fn resumed_clean_exit_with_terminal_assistant_response_succeeds() {
 }
 
 #[test]
-fn stale_missing_wrong_session_and_non_stop_completion_remain_failed() {
-    for mode in [
-        "stale",
-        "missing",
-        "partial",
-        "error",
-        "wrong-session",
-        "baseline-missing",
-        "degraded",
-        "new-stop-then-error",
-    ] {
-        let fixture = RecoveryFixture::new(mode);
-        let output = fixture.run(None);
-        assert_ne!(output.status.code(), Some(0), "mode={mode} {output:?}");
-        let envelope = result_envelope(&output);
-        assert_eq!(envelope["success"], false, "mode={mode}");
-        assert_eq!(envelope["exit_code"], 1, "mode={mode}");
-        assert_eq!(fixture.latest_invocation().0, "failed", "mode={mode}");
-    }
-}
-
-#[test]
-fn typed_terminal_failures_cannot_be_recovered_by_new_stop() {
+fn typed_terminal_failures_do_not_invoke_legacy_turn_scripts() {
     for kind in [
         "QuotaExhaustedInband",
         "RateLimited",
@@ -405,10 +250,11 @@ fn typed_terminal_failures_cannot_be_recovered_by_new_stop() {
         "SignalExit",
         "Unknown",
     ] {
-        let fixture = RecoveryFixture::new("stop");
+        let fixture = RecoveryFixture::new();
         let output = fixture.run(Some(kind));
         assert_ne!(output.status.code(), Some(0), "kind={kind} {output:?}");
         assert_eq!(fixture.latest_invocation().0, "failed", "kind={kind}");
+        assert!(!fixture.turn_script_canary.exists(), "kind={kind}");
     }
 }
 
@@ -448,7 +294,6 @@ fn write_external_fixture_config(
     fixture: &Age153Fixture,
     external_provider: &Path,
     poison_provider: &Path,
-    turn_script: &Path,
 ) {
     fs::write(
         fixture.models_dir.join(format!("{EXTERNAL_MODEL}.toml")),
@@ -476,14 +321,6 @@ prompt_mode = "arg"
         ),
     )
     .unwrap();
-    fs::write(
-        fixture.app_config_dir.join("sessions.toml"),
-        format!(
-            "[{EXTERNAL_PROVIDER}]\nturn_script = {}\n",
-            toml_string(&turn_script.display().to_string())
-        ),
-    )
-    .unwrap();
 }
 
 fn write_fixture_executable(fixture: &Age153Fixture, name: &str, body: &str) -> PathBuf {
@@ -493,17 +330,6 @@ fn write_fixture_executable(fixture: &Age153Fixture, name: &str, body: &str) -> 
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).unwrap();
     path
-}
-
-fn external_turn_script() -> &'static str {
-    r#"printf '{"session_id":"%s","turn_id":"old-stop","timestamp":"2026-07-21T00:00:00Z","role":"assistant","completion_outcome":"stop"}\n' "$SESSION_ID"
-if [ ! -f "${AGE270_EXTERNAL_LAUNCH_CANARY:-}" ]; then
-  exit 0
-fi
-if [ "${AGE270_EXTERNAL_MODE:-}" = "loaded-incomplete" ]; then
-  printf '{"session_id":"%s","turn_id":"new-tool-calls","timestamp":"2026-07-21T00:00:01Z","role":"assistant","completion_outcome":"tool-calls"}\n' "$SESSION_ID"
-  printf '{"session_id":"%s","turn_id":"new-outcome-less","timestamp":"2026-07-21T00:00:02Z","role":"assistant"}\n' "$SESSION_ID"
-fi"#
 }
 
 fn external_provider_script() -> &'static str {
@@ -555,6 +381,7 @@ def describe():
         "preferred_contract": CONTRACT,
         "capabilities": {
             "launch": True,
+            "launch_output_v1": True,
             "prompt_acceptance_v1": True,
             "policy": True,
             "quota": False,
@@ -628,11 +455,15 @@ def launch():
     prompt = params.get("model", {}).get("inputs", {}).get("prompt", "")
     session_id = params.get("session", {}).get("known_provider_session_id") or SESSION_ID
     mode = os.environ.get("AGE270_EXTERNAL_MODE", "unconfirmed")
+    stderr_output = b"fixture provider stderr retained\n"
+    stdout_output = b"fixture terminal assistant response\n" if mode == "confirmed" else b""
+    data_event_count = 1
     seq = 1
-    emit(stream_event(seq, "stderr", "fixture provider stderr retained\n"))
+    emit(stream_event(seq, "stderr", stderr_output.decode("utf-8")))
     seq += 1
     if mode == "confirmed":
-        emit(stream_event(seq, "stdout", "fixture terminal assistant response\n"))
+        emit(stream_event(seq, "stdout", stdout_output.decode("utf-8")))
+        data_event_count += 1
         seq += 1
     acceptance = params.get("prompt_acceptance", {})
     value = {
@@ -649,26 +480,25 @@ def launch():
     if mode == "confirmed":
         emit(marker_event(seq, "oulipoly.produced_assistant_response", True))
         seq += 1
+    emit(marker_event(seq, "oulipoly.launch_output_complete/v1", {
+        "protocol": "oulipoly.launch_output/v1",
+        "stdout": {
+            "bytes": len(stdout_output),
+            "sha256": hashlib.sha256(stdout_output).hexdigest(),
+        },
+        "stderr": {
+            "bytes": len(stderr_output),
+            "sha256": hashlib.sha256(stderr_output).hexdigest(),
+        },
+        "data_event_count": data_event_count,
+    }))
+    seq += 1
     emit(exit_event(seq, session_id))
 
 def session_id_from_request():
     params = request.get("params", {})
     extra = params.get("extra", {})
     return params.get("session_id") or extra.get("start_bound_provider_session_id") or SESSION_ID
-
-def read_turns():
-    session_id = session_id_from_request()
-    return envelope({
-        "turns": [{
-            "session_id": session_id,
-            "turn_id": "age270-session-read",
-            "role": "assistant",
-            "timestamp": "2026-07-21T00:00:02Z",
-            "body": [{"type": "text", "text": "fixture session turn"}],
-        }],
-        "turn_count": 1,
-        "complete": True,
-    })
 
 def capture():
     return envelope({
@@ -683,8 +513,6 @@ elif subcommand == "policy.evaluate":
     print(json.dumps(policy_evaluate()))
 elif subcommand == "launch":
     launch()
-elif subcommand == "session.read_turns":
-    print(json.dumps(read_turns()))
 elif subcommand == "session.capture":
     print(json.dumps(capture()))
 else:
@@ -749,14 +577,8 @@ prompt_mode = "arg"
     .unwrap();
 }
 
-fn provider_script(marker: &Path, turn_mode: &str) -> String {
-    let exit_code = if turn_mode == "clean-tool-calls" {
-        0
-    } else {
-        1
-    };
-    format!(
-        r#"session_id=""
+fn provider_script() -> &'static str {
+    r#"session_id=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--session-id" ] || [ "$1" = "--resume" ]; then
     session_id="$2"
@@ -765,66 +587,20 @@ while [ "$#" -gt 0 ]; do
     shift
   fi
 done
-printf '%s' {turn_mode:?} > {}
-printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$session_id"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$session_id"
 printf 'earlier provider error evidence retained\n' >&2
-exit {exit_code}"#,
-        shell_path(marker)
-    )
+exit 1"#
 }
 
-fn turn_script(marker: &Path, turn_mode: &str) -> String {
-    let baseline = if turn_mode == "baseline-missing" {
-        String::new()
-    } else {
-        r#"printf '{"session_id":"%s","turn_id":"old-stop","timestamp":"2026-07-21T00:00:00Z","role":"assistant","completion_outcome":"stop"}\n' "$SESSION_ID""#.to_string()
-    };
+fn turn_script(canary: &Path) -> String {
     format!(
-        r#"{baseline}
-if [ ! -f {} ]; then
-  exit 0
-fi
-mode="$(cat {})"
-case "$mode" in
-  stale) ;;
-  missing)
-    printf '{{"session_id":"%s","turn_id":"new-missing","timestamp":"2026-07-21T00:00:01Z","role":"assistant"}}\n' "$SESSION_ID"
-    ;;
-  partial|clean-tool-calls)
-    printf '{{"session_id":"%s","turn_id":"new-partial","timestamp":"2026-07-21T00:00:01Z","role":"assistant","completion_outcome":"tool-calls"}}\n' "$SESSION_ID"
-    ;;
-  error)
-    printf '{{"session_id":"%s","turn_id":"new-error","timestamp":"2026-07-21T00:00:01Z","role":"assistant","completion_outcome":"error"}}\n' "$SESSION_ID"
-    ;;
-  wrong-session)
-    printf '{{"session_id":"%s-other","turn_id":"new-stop","timestamp":"2026-07-21T00:00:01Z","role":"assistant","completion_outcome":"stop"}}\n' "$SESSION_ID"
-    ;;
-  degraded)
-    printf '{{"session_id":"%s","turn_id":"new-stop","timestamp":"2026-07-21T00:00:01Z","role":"assistant","completion_outcome":"stop"}}\n' "$SESSION_ID"
-    printf '{{"degraded":true,"count":2}}\n'
-    ;;
-  new-stop-then-error)
-    printf '{{"session_id":"%s","turn_id":"new-stop","timestamp":"2026-07-21T00:00:01Z","role":"assistant","completion_outcome":"stop"}}\n' "$SESSION_ID"
-    printf '{{"session_id":"%s","turn_id":"new-error","timestamp":"2026-07-21T00:00:02Z","role":"assistant","completion_outcome":"error"}}\n' "$SESSION_ID"
-    ;;
-  *)
-    printf '{{"session_id":"%s","turn_id":"new-stop","timestamp":"2026-07-21T00:00:01Z","role":"assistant","completion_outcome":"stop"}}\n' "$SESSION_ID"
-    ;;
-esac"#,
-        shell_path(marker),
-        shell_path(marker),
+        "printf ran > {}\nprintf '{{\"session_id\":\"%s\",\"turn_id\":\"legacy-stop\",\"timestamp\":\"2026-07-21T00:00:00Z\",\"role\":\"assistant\",\"completion_outcome\":\"stop\"}}\\n' \"$SESSION_ID\"",
+        shell_path(canary),
     )
 }
 
 fn result_envelope(output: &Output) -> Value {
     single_result_envelope(output)
-}
-
-fn optional_result_envelope(output: &Output) -> Option<Value> {
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
-        .map(|line| serde_json::from_str(line).unwrap())
 }
 
 fn single_result_envelope(output: &Output) -> Value {
@@ -876,26 +652,6 @@ fn assert_failure_envelope_matches(
         Some(provider_session_id)
     );
     assert_eq!(envelope["agent_runner_chain_id"].as_str(), Some(chain_id));
-}
-
-fn assert_success_envelope_matches(envelope: &Value, persisted: &PersistedInvocationOutcome) {
-    assert_eq!(envelope_keys(envelope), common_envelope_keys());
-    assert_eq!(envelope["status"].as_str(), Some(persisted.status.as_str()));
-    assert_eq!(envelope["success"].as_bool(), Some(true));
-    assert_eq!(envelope["success"].as_bool(), Some(persisted.success != 0));
-    assert_eq!(envelope["exit_code"].as_i64(), Some(persisted.exit_code));
-    assert_eq!(
-        envelope["error_category"].as_str(),
-        persisted.error_category.as_deref()
-    );
-    assert_eq!(
-        envelope["terminal_reason"].as_str(),
-        persisted.terminal_reason.as_deref()
-    );
-    assert_eq!(
-        envelope["id"].as_str(),
-        Some(persisted.invocation_uuid.as_str())
-    );
 }
 
 fn envelope_keys(envelope: &Value) -> BTreeSet<&str> {

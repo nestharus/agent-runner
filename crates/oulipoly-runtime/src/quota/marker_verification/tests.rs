@@ -22,7 +22,7 @@
 use super::test_support::EnvGuard;
 use super::*;
 use chrono::Duration;
-use oulipoly_config::{ProviderEntry, ProvidersConfig, SessionsConfig};
+use oulipoly_config::{ProviderEntry, ProvidersConfig};
 use oulipoly_state::QuotaWindowInput;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -210,9 +210,8 @@ fn shortened_cooldown_forces_stale_cache_refresh_instead_of_fresh_cache_bypass()
     seed_marker(&db, "p", marker_at);
 
     let providers = providers_with_script("p", &script);
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 
     assert_eq!(std::fs::read_to_string(&counter_path).unwrap().len(), 1);
     assert_marker_retained(&db, "p", marker_at);
@@ -228,9 +227,8 @@ fn marker_with_fresh_cache_and_empty_windows_is_kept() {
     seed_marker(&db, "p", marker_at);
 
     let providers = providers_with_script("p", "exit 1");
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 
     assert_marker_retained(&db, "p", marker_at);
 }
@@ -249,10 +247,9 @@ fn past_reset_exhausted_window_does_not_pin_but_future_exhausted_window_does() {
     seed_marker(&db, "future", future_marker_at);
 
     let providers = ProvidersConfig::default();
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "past", now);
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "future", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "past", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "future", now);
 
     assert_marker_cleared(&db, "past");
     assert_marker_retained(&db, "future", future_marker_at);
@@ -267,9 +264,8 @@ fn stale_marker_with_configured_provider_but_no_quota_script_keeps_marker_and_fa
     seed_marker(&db, "p", marker_at);
 
     let providers = providers_without_script("p");
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 
     assert_marker_retained(&db, "p", marker_at);
     let quota = db.get_quota("p").unwrap().expect("row exists");
@@ -285,9 +281,8 @@ fn stale_marker_with_failed_quota_script_keeps_marker_and_failure_class() {
     seed_marker(&db, "p", marker_at);
 
     let providers = providers_with_script("p", "exit 2");
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 
     assert_marker_retained(&db, "p", marker_at);
     let quota = db.get_quota("p").unwrap().expect("row exists");
@@ -358,9 +353,8 @@ fn marker_within_release_slack_is_cleared_without_refresh() {
     seed_marker(&db, "p", now + Duration::seconds(5));
 
     let providers = providers_with_script("p", "exit 1");
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 
     assert_marker_cleared(&db, "p");
 }
@@ -374,9 +368,8 @@ fn marker_with_fresh_cache_and_healthy_windows_is_cleared() {
     seed_marker(&db, "p", now + Duration::hours(1));
 
     let providers = providers_with_script("p", "exit 1");
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 
     assert_marker_cleared(&db, "p");
 }
@@ -402,9 +395,8 @@ fn clear_marker_failure_does_not_panic_and_leaves_marker_intact() {
         .unwrap();
 
     let providers = providers_with_script("p", "exit 1");
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 
     assert_marker_retained(&db, "p", marker_at);
 }
@@ -419,9 +411,8 @@ fn marker_with_fresh_cache_and_exhausted_window_is_kept() {
     seed_marker(&db, "p", marker_at);
 
     let providers = providers_with_script("p", "exit 1");
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 
     assert_marker_retained(&db, "p", marker_at);
 }
@@ -434,9 +425,8 @@ fn marker_with_stale_cache_runs_refresh_and_clears_when_healthy() {
     seed_marker(&db, "p", now + Duration::hours(1));
 
     let providers = providers_with_script("p", healthy_refresh_script());
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 
     assert_marker_cleared(&db, "p");
     let quota = db.get_quota("p").unwrap().expect("row exists");
@@ -452,9 +442,8 @@ fn marker_with_stale_cache_keeps_marker_when_refresh_shows_exhausted() {
     seed_marker(&db, "p", marker_at);
 
     let providers = providers_with_script("p", exhausted_refresh_script());
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 
     assert_marker_retained(&db, "p", marker_at);
 }
@@ -467,9 +456,8 @@ fn no_marker_no_action() {
     seed_window(&db, "p", 0.10, 5);
 
     let providers = providers_with_script("p", "exit 1");
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 }
 
 #[test]
@@ -493,9 +481,8 @@ fn lock_dir_create_failure_retains_marker() {
     seed_marker(&db, "p", marker_at);
 
     let providers = providers_with_script("p", healthy_refresh_script());
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 
     assert_marker_retained(&db, "p", marker_at);
 }
@@ -515,9 +502,8 @@ fn lock_file_open_failure_retains_marker() {
     seed_marker(&db, "p", marker_at);
 
     let providers = providers_with_script("p", healthy_refresh_script());
-    let sessions = SessionsConfig::default();
     let in_flight = InFlight::new();
-    verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+    verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
 
     assert_marker_retained(&db, "p", marker_at);
 }
@@ -561,7 +547,6 @@ fn spawn_refresh_workers(
 ) -> Vec<thread::JoinHandle<()>> {
     let in_flight = Arc::new(InFlight::new());
     let providers = Arc::new(providers);
-    let sessions = Arc::new(SessionsConfig::default());
     let barrier = Arc::new(Barrier::new(50));
     let mut handles = Vec::with_capacity(50);
     for _ in 0..50 {
@@ -569,7 +554,6 @@ fn spawn_refresh_workers(
         handles.push(spawn_refresh_worker(
             db,
             providers.clone(),
-            sessions.clone(),
             in_flight.clone(),
             attempts.clone(),
             barrier.clone(),
@@ -581,7 +565,6 @@ fn spawn_refresh_workers(
 fn spawn_refresh_worker(
     db: StateDb,
     providers: Arc<ProvidersConfig>,
-    sessions: Arc<SessionsConfig>,
     in_flight: Arc<InFlight>,
     attempts: Arc<AtomicUsize>,
     barrier: Arc<Barrier>,
@@ -589,7 +572,7 @@ fn spawn_refresh_worker(
     thread::spawn(move || {
         let now = Utc::now();
         barrier.wait();
-        verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
+        verify_or_clear_marker(&db, &providers, &in_flight, "p", now);
         attempts.fetch_add(1, Ordering::SeqCst);
     })
 }

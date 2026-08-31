@@ -4,7 +4,7 @@
 //!
 //! TEST: proactive wake integration orchestration cases (batch delivery and wake-sweep regressions).
 
-use crate::fake_cli::provider_script;
+use crate::fake_provider::provider_script;
 use crate::fixtures::Fixture;
 use crate::liveness::{
     assert_dead_owner_debris_retained, delivered_rows_without_pending_or_claim,
@@ -616,13 +616,14 @@ label=manual
 if [ "$index" -gt 1 ]; then
   label=$((index - 1))
 fi
-printf '%s|%s\n' "$label" "$PPID" >> {ledger}
+wake_pid="$(awk '{{print $4}}' "/proc/$PPID/stat")"
+printf '%s|%s\n' "$label" "$wake_pid" >> {ledger}
 if [ "$index" = 2 ]; then
-  printf '%s' "$PPID" > {count1_pid}
-  awk '{{print $22}}' "/proc/$PPID/stat" > {count1_start}
+  printf '%s' "$wake_pid" > {count1_pid}
+  awk '{{print $22}}' "/proc/$wake_pid/stat" > {count1_start}
 fi
 if [ "$index" = 3 ]; then
-  printf '%s' "$PPID" > {count2_pid}
+  printf '%s' "$wake_pid" > {count2_pid}
   : > {held}
   IFS= read -r _ < {fifo}
 fi"#,

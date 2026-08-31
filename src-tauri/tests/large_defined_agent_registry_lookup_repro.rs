@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -102,6 +103,7 @@ environment = { FIXTURE_LAUNCH_CONTEXT = "fixed-external-provider-context" }
             format!(
                 r#"#!/usr/bin/env python3
 import base64
+import hashlib
 import json
 import os
 import pathlib
@@ -134,6 +136,7 @@ def describe(request):
         "preferred_contract": CONTRACT,
         "capabilities": {{
             "launch": True,
+            "launch_output_v1": True,
             "policy": True,
             "quota": False,
             "session": False,
@@ -203,6 +206,7 @@ def launch(request):
 
     request_id = request["request_id"]
     session_id = f"fixture-session-{{case_name}}"
+    output = b"FIXTURE_OK\n"
     events = [
         {{
             "contract": CONTRACT,
@@ -210,7 +214,7 @@ def launch(request):
             "seq": 1,
             "time_unix_ms": 1001,
             "kind": "stdout",
-            "data_base64": base64.b64encode(b"FIXTURE_OK\n").decode("ascii"),
+            "data_base64": base64.b64encode(output).decode("ascii"),
         }},
         {{
             "contract": CONTRACT,
@@ -226,12 +230,32 @@ def launch(request):
             "request_id": request_id,
             "seq": 3,
             "time_unix_ms": 1003,
+            "kind": "marker",
+            "name": "oulipoly.launch_output_complete/v1",
+            "value": {{
+                "protocol": "oulipoly.launch_output/v1",
+                "stdout": {{
+                    "bytes": len(output),
+                    "sha256": hashlib.sha256(output).hexdigest(),
+                }},
+                "stderr": {{
+                    "bytes": 0,
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                }},
+                "data_event_count": 1,
+            }},
+        }},
+        {{
+            "contract": CONTRACT,
+            "request_id": request_id,
+            "seq": 4,
+            "time_unix_ms": 1004,
             "kind": "exit",
             "status": {{"kind": "exited", "code": 0}},
             "terminal_signal": {{
                 "kind": "clean_exit",
                 "evidence": "fixture external provider completed",
-                "observed_at_unix_ms": 1003,
+                "observed_at_unix_ms": 1004,
             }},
             "session": {{"provider_session_id": session_id}},
         }},
@@ -331,6 +355,12 @@ if __name__ == "__main__":
             .env_remove("OULIPOLY_PARENT_INVOCATION")
             .env_remove("OULIPOLY_RETURN_CHANNEL");
         let output = command.output().expect("run external provider fixture");
+        assert!(
+            output.status.success(),
+            "{name}: external provider process failed: stdout={:?}, stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         let policy = read_json(&self.observations_dir.join(format!("{name}.policy.json")));
         let launch = read_json(&self.observations_dir.join(format!("{name}.launch.json")));
@@ -372,15 +402,9 @@ if __name__ == "__main__":
             FIXED_PROVIDER_ARGV,
             "{name}: fixed OpenCode launch argv changed"
         );
-        assert!(
-            output.status.success(),
-            "{name}: external provider process failed: stdout={:?}, stderr={:?}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("FIXTURE_OK"),
-            "{name}: streamed provider stdout missing"
+        assert_eq!(
+            output.stdout, b"FIXTURE_OK\n",
+            "{name}: authoritative provider stdout changed"
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -390,9 +414,18 @@ if __name__ == "__main__":
                 )),
             "{name}: provider session projection missing: {stderr:?}"
         );
+        let invocation_succeeded: bool = Connection::open(self.data_home.join("state.db"))
+            .expect("open state DB")
+            .query_row(
+                "SELECT status = 'succeeded' AND success = 1
+                 FROM invocations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("latest invocation result evidence");
         assert!(
-            String::from_utf8_lossy(&output.stdout).contains("OULIPOLY_RESULT="),
-            "{name}: runner result evidence missing"
+            invocation_succeeded,
+            "{name}: durable result evidence missing"
         );
 
         CaseResult {

@@ -22,7 +22,6 @@ use oulipoly_runtime::quota::{
     InFlight, RefreshOutcome, has_refresh_source, refresh_provider, refresh_provider_for_routing,
 };
 use oulipoly_state::{QuotaWindowInput, StateDb};
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -210,10 +209,6 @@ fn shell_word(input: &str) -> String {
     format!("'{}'", input.replace('\'', r#"'\''"#))
 }
 
-fn double_quoted_shell_word(input: &str) -> String {
-    format!("\"{}\"", input.replace('\\', r"\\").replace('"', "\\\""))
-}
-
 fn script_quote(path: &Path) -> String {
     shell_word(&path.display().to_string())
 }
@@ -264,17 +259,12 @@ fn read_trimmed(path: &Path) -> String {
 
 #[test]
 fn refresh_provider_for_routing_is_publicly_importable_from_quota_facade() {
-    let _public_path: fn(
-        &str,
-        &ProvidersConfig,
-        &SessionsConfig,
-        &InFlight,
-        &StateDb,
-    ) -> RefreshOutcome = refresh_provider_for_routing;
+    let _public_path: fn(&str, &ProvidersConfig, &InFlight, &StateDb) -> RefreshOutcome =
+        refresh_provider_for_routing;
 }
 
 #[test]
-fn routing_refresh_prefers_explicit_non_empty_quota_script_over_provider_and_legacy_sources() {
+fn routing_refresh_prefers_explicit_non_empty_quota_script_over_provider_storage_source() {
     let _env_guard = env_lock();
     let dir = tempfile::tempdir().expect("tempdir");
     let bin_dir = dir.path().join("bin");
@@ -295,7 +285,7 @@ fn routing_refresh_prefers_explicit_non_empty_quota_script_over_provider_and_leg
         session_storage: Some(claude_storage(claude_projects)),
         ..ProviderEntry::default()
     });
-    let sessions = sessions_with_entries([(
+    let _sessions = sessions_with_entries([(
         "quota-provider",
         session_entry(format!(
             "codex-turns {}",
@@ -303,13 +293,8 @@ fn routing_refresh_prefers_explicit_non_empty_quota_script_over_provider_and_leg
         )),
     )]);
 
-    let outcome = refresh_provider_for_routing(
-        "quota-provider",
-        &providers,
-        &sessions,
-        &InFlight::new(),
-        &state(),
-    );
+    let outcome =
+        refresh_provider_for_routing("quota-provider", &providers, &InFlight::new(), &state());
 
     assert_updated_percent(outcome, 0.13);
     assert!(
@@ -340,13 +325,8 @@ fn whitespace_quota_script_falls_through_to_provider_session_storage_source() {
         ..ProviderEntry::default()
     });
 
-    let outcome = refresh_provider_for_routing(
-        "quota-provider",
-        &providers,
-        &SessionsConfig::default(),
-        &InFlight::new(),
-        &state(),
-    );
+    let outcome =
+        refresh_provider_for_routing("quota-provider", &providers, &InFlight::new(), &state());
 
     assert_updated_percent(outcome, 0.41);
     assert_eq!(
@@ -371,14 +351,14 @@ fn provider_session_storage_fallback_derives_and_executes_claude_and_codex_quota
     let codex_root = dir.path().join("codex-account");
     let providers = providers_with_entries([
         (
-            "claude-provider",
+            "provider-a",
             ProviderEntry {
                 session_storage: Some(claude_storage(claude_root.join("projects"))),
                 ..ProviderEntry::default()
             },
         ),
         (
-            "codex-provider",
+            "provider-b",
             ProviderEntry {
                 session_storage: Some(codex_storage(codex_root.join("sessions"))),
                 ..ProviderEntry::default()
@@ -387,23 +367,11 @@ fn provider_session_storage_fallback_derives_and_executes_claude_and_codex_quota
     ]);
 
     assert_updated_percent(
-        refresh_provider_for_routing(
-            "claude-provider",
-            &providers,
-            &SessionsConfig::default(),
-            &InFlight::new(),
-            &state(),
-        ),
+        refresh_provider_for_routing("provider-a", &providers, &InFlight::new(), &state()),
         0.12,
     );
     assert_updated_percent(
-        refresh_provider_for_routing(
-            "codex-provider",
-            &providers,
-            &SessionsConfig::default(),
-            &InFlight::new(),
-            &state(),
-        ),
+        refresh_provider_for_routing("provider-b", &providers, &InFlight::new(), &state()),
         0.34,
     );
     assert_eq!(
@@ -417,72 +385,7 @@ fn provider_session_storage_fallback_derives_and_executes_claude_and_codex_quota
 }
 
 #[test]
-fn legacy_sessions_fallback_derives_and_executes_claude_and_codex_quota_scripts() {
-    let _env_guard = env_lock();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let bin_dir = dir.path().join("bin");
-    fs::create_dir(&bin_dir).expect("bin dir");
-    let claude_log = dir.path().join("legacy-claude-arg.log");
-    let codex_log = dir.path().join("legacy-codex-arg.log");
-    install_usage_script(&bin_dir, "anthropic-usage", &claude_log, 22);
-    install_usage_script(&bin_dir, "chatgpt-usage", &codex_log, 44);
-    let _path = PathOverride::prepend(&bin_dir);
-
-    let claude_root = dir.path().join("legacy-claude");
-    let codex_root = dir.path().join("legacy-codex");
-    let providers = providers_with_entries([
-        ("claude-provider", ProviderEntry::default()),
-        ("codex-provider", ProviderEntry::default()),
-    ]);
-    let sessions = sessions_with_entries([
-        (
-            "claude-provider",
-            session_entry(format!(
-                "claude-code-turns {}",
-                shell_word(&claude_root.join("projects").display().to_string())
-            )),
-        ),
-        (
-            "codex-provider",
-            session_entry(format!(
-                "codex-cwd {}",
-                shell_word(&codex_root.join("sessions").display().to_string())
-            )),
-        ),
-    ]);
-
-    assert_updated_percent(
-        refresh_provider_for_routing(
-            "claude-provider",
-            &providers,
-            &sessions,
-            &InFlight::new(),
-            &state(),
-        ),
-        0.22,
-    );
-    assert_updated_percent(
-        refresh_provider_for_routing(
-            "codex-provider",
-            &providers,
-            &sessions,
-            &InFlight::new(),
-            &state(),
-        ),
-        0.44,
-    );
-    assert_eq!(
-        read_trimmed(&claude_log),
-        claude_root.join(".credentials.json").display().to_string()
-    );
-    assert_eq!(
-        read_trimmed(&codex_log),
-        codex_root.join("auth.json").display().to_string()
-    );
-}
-
-#[test]
-fn auth_refresh_command_is_preserved_for_explicit_provider_storage_and_legacy_sources() {
+fn auth_refresh_command_is_preserved_for_explicit_and_provider_storage_sources() {
     let _env_guard = env_lock();
     let _data_home = DataHomeOverride::set();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -496,9 +399,7 @@ fn auth_refresh_command_is_preserved_for_explicit_provider_storage_and_legacy_so
 
     let explicit_marker = dir.path().join("explicit-refresh");
     let storage_marker = dir.path().join("storage-refresh");
-    let legacy_marker = dir.path().join("legacy-refresh");
     let claude_root = dir.path().join("storage-claude");
-    let codex_root = dir.path().join("legacy-codex");
     let providers = providers_with_entries([
         (
             "explicit-provider",
@@ -516,31 +417,16 @@ fn auth_refresh_command_is_preserved_for_explicit_provider_storage_and_legacy_so
                 ..ProviderEntry::default()
             },
         ),
-        (
-            "legacy-provider",
-            ProviderEntry {
-                auth_refresh_command: Some(format!("touch {}", script_quote(&legacy_marker))),
-                ..ProviderEntry::default()
-            },
-        ),
     ]);
-    let sessions = sessions_with_entries([(
-        "legacy-provider",
-        session_entry(format!(
-            "codex-turns {}",
-            shell_word(&codex_root.join("sessions").display().to_string())
-        )),
-    )]);
     let state = state();
-    for provider in ["explicit-provider", "storage-provider", "legacy-provider"] {
+    for provider in ["explicit-provider", "storage-provider"] {
         seed_prior_windows(&state, provider);
     }
 
-    for provider in ["explicit-provider", "storage-provider", "legacy-provider"] {
+    for provider in ["explicit-provider", "storage-provider"] {
         assert_updated_empty(refresh_provider_for_routing(
             provider,
             &providers,
-            &sessions,
             &InFlight::new(),
             &state,
         ));
@@ -548,7 +434,6 @@ fn auth_refresh_command_is_preserved_for_explicit_provider_storage_and_legacy_so
 
     assert!(explicit_marker.exists());
     assert!(storage_marker.exists());
-    assert!(legacy_marker.exists());
 }
 
 #[test]
@@ -557,33 +442,13 @@ fn has_refresh_source_matrix_covers_explicit_derived_unsupported_missing_and_emp
         quota_script: Some("echo '{\"windows\":[]}'".to_string()),
         ..ProviderEntry::default()
     });
-    assert!(has_refresh_source(
-        "quota-provider",
-        &explicit,
-        &SessionsConfig::default()
-    ));
+    assert!(has_refresh_source("quota-provider", &explicit));
 
     let provider_derived = provider_with(ProviderEntry {
         session_storage: Some(claude_storage(PathBuf::from("/tmp/claude/projects"))),
         ..ProviderEntry::default()
     });
-    assert!(has_refresh_source(
-        "quota-provider",
-        &provider_derived,
-        &SessionsConfig::default()
-    ));
-
-    let legacy_derived = SessionsConfig {
-        entries: HashMap::from([(
-            "quota-provider".to_string(),
-            session_entry("codex-turns /tmp/codex/sessions".to_string()),
-        )]),
-    };
-    assert!(has_refresh_source(
-        "quota-provider",
-        &ProvidersConfig::default(),
-        &legacy_derived
-    ));
+    assert!(has_refresh_source("quota-provider", &provider_derived));
 
     let unsupported = provider_with(ProviderEntry {
         session_storage: Some(SessionStorage::Script {
@@ -593,31 +458,21 @@ fn has_refresh_source_matrix_covers_explicit_derived_unsupported_missing_and_emp
         }),
         ..ProviderEntry::default()
     });
-    assert!(!has_refresh_source(
-        "quota-provider",
-        &unsupported,
-        &SessionsConfig::default()
-    ));
+    assert!(!has_refresh_source("quota-provider", &unsupported));
 
     let whitespace_only = provider_with(ProviderEntry {
         quota_script: Some(" \n\t ".to_string()),
         ..ProviderEntry::default()
     });
-    assert!(!has_refresh_source(
-        "quota-provider",
-        &whitespace_only,
-        &SessionsConfig::default()
-    ));
+    assert!(!has_refresh_source("quota-provider", &whitespace_only));
 
     assert!(!has_refresh_source(
         "missing-provider",
-        &ProvidersConfig::default(),
-        &SessionsConfig::default()
+        &ProvidersConfig::default()
     ));
     assert!(!has_refresh_source(
         "quota-provider",
-        &ProvidersConfig::default(),
-        &SessionsConfig::default()
+        &ProvidersConfig::default()
     ));
 }
 
@@ -637,13 +492,8 @@ fn auth_refresh_command_failure_is_non_fatal_when_retried_quota_script_succeeds(
         ..ProviderEntry::default()
     });
 
-    let outcome = refresh_provider_for_routing(
-        "quota-provider",
-        &providers,
-        &SessionsConfig::default(),
-        &InFlight::new(),
-        &state(),
-    );
+    let outcome =
+        refresh_provider_for_routing("quota-provider", &providers, &InFlight::new(), &state());
 
     assert_updated_percent(outcome, 0.66);
 }
@@ -762,75 +612,4 @@ fn auth_refresh_combines_retry_and_refresh_errors_when_both_fail() {
         }
         other => panic!("expected Failed, got {other:?}"),
     }
-}
-
-#[test]
-fn derived_quota_paths_preserve_shell_splitting_and_shell_word_quoting_for_legacy_roots() {
-    let _env_guard = env_lock();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let bin_dir = dir.path().join("bin");
-    fs::create_dir(&bin_dir).expect("bin dir");
-    let claude_log = dir.path().join("quoted-claude-arg.log");
-    let codex_log = dir.path().join("quoted-codex-arg.log");
-    install_usage_script(&bin_dir, "anthropic-usage", &claude_log, 23);
-    install_usage_script(&bin_dir, "chatgpt-usage", &codex_log, 45);
-    let _path = PathOverride::prepend(&bin_dir);
-
-    let claude_root = dir.path().join("quoted claude account's root");
-    let codex_root = dir.path().join("quoted codex account's root");
-    let sessions = sessions_with_entries([
-        (
-            "quoted-claude",
-            session_entry(format!(
-                "\"/usr/local/bin/claude-code-cwd\" {}",
-                double_quoted_shell_word(
-                    &claude_root
-                        .join("projects with spaces")
-                        .display()
-                        .to_string()
-                )
-            )),
-        ),
-        (
-            "quoted-codex",
-            session_entry(format!(
-                "\"/usr/local/bin/codex-turns\" {}",
-                double_quoted_shell_word(
-                    &codex_root
-                        .join("sessions with spaces")
-                        .display()
-                        .to_string()
-                )
-            )),
-        ),
-    ]);
-
-    assert_updated_percent(
-        refresh_provider_for_routing(
-            "quoted-claude",
-            &ProvidersConfig::default(),
-            &sessions,
-            &InFlight::new(),
-            &state(),
-        ),
-        0.23,
-    );
-    assert_updated_percent(
-        refresh_provider_for_routing(
-            "quoted-codex",
-            &ProvidersConfig::default(),
-            &sessions,
-            &InFlight::new(),
-            &state(),
-        ),
-        0.45,
-    );
-    assert_eq!(
-        read_trimmed(&claude_log),
-        claude_root.join(".credentials.json").display().to_string()
-    );
-    assert_eq!(
-        read_trimmed(&codex_log),
-        codex_root.join("auth.json").display().to_string()
-    );
 }
