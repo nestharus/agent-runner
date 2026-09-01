@@ -131,7 +131,8 @@ fn parses_account_provider_implementation() {
 command = "opencode1"
 
 [opencode.implementation]
-path = "/opt/oulipoly/agent-runner-opencode"
+family = "opencode"
+executable = "/opt/oulipoly/agent-runner-opencode"
 "#,
     )
     .unwrap();
@@ -141,13 +142,10 @@ path = "/opt/oulipoly/agent-runner-opencode"
         .and_then(|entry| entry.implementation.as_ref())
         .expect("account implementation");
     assert_eq!(
-        implementation.path.as_deref(),
-        Some("/opt/oulipoly/agent-runner-opencode")
+        implementation.executable.as_str(),
+        "/opt/oulipoly/agent-runner-opencode"
     );
-    assert_eq!(
-        implementation.flavor().unwrap(),
-        crate::ProviderImplementationFlavor::Path
-    );
+    assert_eq!(implementation.family, "opencode");
 }
 
 #[test]
@@ -158,15 +156,15 @@ fn rejects_invalid_account_provider_implementation() {
 command = "opencode1"
 
 [opencode.implementation]
-path = "/opt/oulipoly/agent-runner-opencode"
-binary = "agent-runner-opencode"
+family = "opencode"
+executable = ""
 "#,
     )
     .unwrap_err();
 
     assert!(err.contains("providers.toml provider opencode"), "{err}");
     assert!(
-        err.contains("provider implementation reference has multiple flavors"),
+        err.contains("provider implementation executable must not be empty"),
         "{err}"
     );
 }

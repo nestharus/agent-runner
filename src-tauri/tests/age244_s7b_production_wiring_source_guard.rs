@@ -187,7 +187,7 @@ fn s7b_cli_defaults_builds_populated_default_path_provider_registry() {
 }
 
 #[test]
-fn s10_production_provider_registries_populate_path_entries_from_process_path() {
+fn production_provider_registries_use_only_account_configured_endpoint_authority() {
     let wiring = read_source("src-tauri/src/wiring.rs");
     let cli_defaults = source_between(
         &wiring,
@@ -204,26 +204,62 @@ fn s10_production_provider_registries_populate_path_entries_from_process_path() 
         ("wiring.rs::cli_defaults", cli_defaults),
         ("wiring.rs::production", production),
     ] {
-        assert_contains(context, source, ".with_path_entries_from_process_path()");
+        assert_not_contains(context, source, ".with_path_entries_from_process_path()");
     }
+
+    let production_registry = source_between(
+        &wiring,
+        "fn production_provider_registry(",
+        "fn load_registry_providers(",
+    );
+    assert_contains(
+        "wiring.rs::production_provider_registry",
+        production_registry,
+        "let providers = load_registry_providers(paths)?;",
+    );
+    assert_contains(
+        "wiring.rs::production_provider_registry",
+        production_registry,
+        "registry_from_configs(&models, &providers, options)",
+    );
+    assert_not_contains(
+        "wiring.rs::production_provider_registry",
+        production_registry,
+        "ProviderRegistry::from_model_configs(",
+    );
 
     let locate_export =
         read_source("src-tauri/src/commands/session_locate_export/orchestration.rs");
-    assert_contains(
+    assert_not_contains(
         "session_locate_export/orchestration.rs::build_session_locate_provider_registry",
         &locate_export,
         ".with_path_entries_from_process_path()",
     );
+    assert_contains(
+        "session_locate_export/orchestration.rs::build_session_locate_provider_registry",
+        &locate_export,
+        "ProviderRegistry::from_configs(",
+    );
 
     let app_state = read_source("src-tauri/src/app_state.rs");
-    assert_contains(
+    assert_not_contains(
         "app_state.rs::provider_registry_options",
         &app_state,
         ".with_path_entries_from_process_path()",
     );
+    assert_not_contains(
+        "app_state.rs::provider settings construction",
+        &app_state,
+        "ProviderSettingsHost::from_model_configs",
+    );
+    assert_not_contains(
+        "app_state.rs::provider settings construction",
+        &app_state,
+        "EMPTY_PROVIDER_SETTINGS_HOST_EXPECT_MESSAGE",
+    );
 
     let provider_settings = read_source("src-tauri/src/commands/provider_settings.rs");
-    assert_contains(
+    assert_not_contains(
         "provider_settings.rs::host_options",
         &provider_settings,
         ".with_path_entries_from_process_path()",

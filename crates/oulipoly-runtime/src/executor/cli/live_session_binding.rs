@@ -556,8 +556,8 @@ mod tests {
         register_runtime_generation_starting,
     };
     use crate::provider_registry::ProviderRegistryOptions;
-    use oulipoly_config::provider_implementation_ref::ProviderImplementationRef;
     use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
+    use oulipoly_config::{ProviderEndpointConfig, ProviderEntry, ProvidersConfig};
     use oulipoly_state::mailbox::MailboxDb;
     use oulipoly_state::pid_identity::PidIdentityDb;
     use oulipoly_state::{CompositeInvocationId, InvocationStart};
@@ -790,16 +790,27 @@ mod tests {
                 })
                 .unwrap();
             let provider = fake_provider(temp.path(), session_id);
+            let providers = ProvidersConfig {
+                entries: std::collections::HashMap::from([(
+                    PROVIDER_NAME.to_string(),
+                    ProviderEntry {
+                        implementation: Some(ProviderEndpointConfig {
+                            family: "fixture".to_string(),
+                            executable: provider.display().to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                )]),
+            };
             let registry = Arc::new(
-                ProviderRegistry::from_model_configs(
-                    &[fixture_model(&provider)],
+                ProviderRegistry::from_configs(
+                    &[fixture_model()],
+                    &providers,
                     ProviderRegistryOptions::default(),
                 )
                 .unwrap(),
             );
-            let endpoint = registry
-                .preflight_model_provider_instance(MODEL_NAME, PROVIDER_NAME)
-                .unwrap();
+            let endpoint = registry.preflight_account(PROVIDER_NAME).unwrap();
             let context = InteractiveLiveSessionBinding {
                 registry,
                 endpoint,
@@ -855,19 +866,13 @@ mod tests {
         }
     }
 
-    fn fixture_model(provider: &Path) -> ModelConfig {
+    fn fixture_model() -> ModelConfig {
         ModelConfig {
             name: MODEL_NAME.to_string(),
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::model_provider(PROVIDER_NAME, Vec::new())],
             inputs: Vec::new(),
-            provider: Some(ProviderImplementationRef {
-                path: Some(provider.display().to_string()),
-                crate_name: None,
-                version: None,
-                binary: None,
-                script: None,
-            }),
+            provider: None,
         }
     }
 

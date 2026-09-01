@@ -1,5 +1,5 @@
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry, ProvidersConfig,
 };
 use oulipoly_provider::generated::{
     CONTRACT_VERSION, SchemaResult, SettingsDeleteResult, SettingsGetResult, SettingsListResult,
@@ -7,7 +7,7 @@ use oulipoly_provider::generated::{
 };
 use oulipoly_runtime::provider_settings::{ProviderSettingsHost, ProviderSettingsHostOptions};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -243,12 +243,13 @@ fn expected_settings_values_json() -> Value {
 #[test]
 fn rebuild_replaces_registry_reflects_configured_artifact_changes_and_discards_settings_cache() {
     let fixture = RebuildFixture::new();
-    let mut host = ProviderSettingsHost::from_model_configs(
+    let host = ProviderSettingsHost::from_configs(
         &[model_with_provider_name(
             "example-model",
             "provider-a",
             &fixture.provider_a,
         )],
+        &providers("provider-a", &fixture.provider_a),
         fixture.options(),
     )
     .expect("initial settings host should build from configured provider artifact");
@@ -262,11 +263,15 @@ fn rebuild_replaces_registry_reflects_configured_artifact_changes_and_discards_s
     assert_eq!(first_target.provider_id, "provider-a");
     assert_eq!(first_schema.schema_id, "example.settings/a");
 
-    host.rebuild_from_model_configs(&[model_with_provider_name(
-        "example-model",
-        "provider-b",
-        &fixture.provider_b,
-    )])
+    host.rebuild_from_configs(
+        &[model_with_provider_name(
+            "example-model",
+            "provider-b",
+            &fixture.provider_b,
+        )],
+        &providers("provider-b", &fixture.provider_b),
+        fixture.options(),
+    )
     .expect("rebuild should replace configured registry/service");
 
     let rebuilt_target = host
@@ -373,19 +378,28 @@ fn model(path: &Path) -> ModelConfig {
     model_with_provider_name("example-model", "provider-a", path)
 }
 
-fn model_with_provider_name(name: &str, provider_name: &str, path: &Path) -> ModelConfig {
+fn model_with_provider_name(name: &str, provider_name: &str, _path: &Path) -> ModelConfig {
     ModelConfig {
         name: name.to_string(),
         prompt_mode: PromptMode::Arg,
         providers: vec![ProviderConfig::model_provider(provider_name, Vec::new())],
         inputs: Vec::new(),
-        provider: Some(ProviderImplementationRef {
-            path: Some(path.display().to_string()),
-            crate_name: None,
-            version: None,
-            binary: None,
-            script: None,
-        }),
+        provider: None,
+    }
+}
+
+fn providers(provider_name: &str, path: &Path) -> ProvidersConfig {
+    ProvidersConfig {
+        entries: HashMap::from([(
+            provider_name.to_string(),
+            ProviderEntry {
+                implementation: Some(ProviderEndpointConfig {
+                    family: "settings-fixture".to_string(),
+                    executable: path.display().to_string(),
+                }),
+                ..Default::default()
+            },
+        )]),
     }
 }
 
@@ -610,13 +624,14 @@ impl SettingsHostFixture {
     }
 
     fn host(&self) -> ProviderSettingsHost {
-        ProviderSettingsHost::from_model_configs(
+        ProviderSettingsHost::from_configs(
             &[model(&self.script)],
+            &providers("provider-a", &self.script),
             ProviderSettingsHostOptions::default()
                 .with_config_root(self.config_root.clone())
                 .with_data_root(self.data_root.clone()),
         )
-        .expect("settings host should build from configured model refs")
+        .expect("settings host should build from configured account endpoint")
     }
 
     fn recorded_calls(&self) -> Vec<RecordedCall> {

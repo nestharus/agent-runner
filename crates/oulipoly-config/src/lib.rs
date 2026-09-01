@@ -3,6 +3,7 @@ pub mod app;
 pub mod claude_tool_filter;
 pub mod managed_instructions;
 pub mod model;
+mod provider_endpoint;
 pub mod provider_implementation_ref;
 pub mod providers;
 pub mod repositories;
@@ -23,6 +24,7 @@ pub use model::{
     ToolRestrictionKind, ToolRestrictions, derive_provider_name, load_models,
     render_validated_model_toml,
 };
+pub use provider_endpoint::ProviderEndpointConfig;
 pub use provider_implementation_ref::{
     ProviderImplementationFlavor, ProviderImplementationRef, ProviderImplementationRefError,
 };

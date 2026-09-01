@@ -62,6 +62,7 @@ use crate::stream::{LaunchEventObserver, LaunchResult, LaunchStdoutDrain, Launch
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -133,6 +134,7 @@ pub struct ProviderClientOptions {
     pub timeout: Duration,
     pub cancellation: Option<CancellationToken>,
     pub resolver: ProviderResolveOptions,
+    pub provider_config_dir: Option<PathBuf>,
     pub environment_removals: Vec<OsString>,
     pub spawn_observer: Option<ProcessSpawnObserver>,
     pub launch_event_observer: Option<LaunchEventObserver>,
@@ -173,6 +175,7 @@ impl Default for ProviderClientOptions {
             output_limits: ProviderOutputLimits::default(),
             cancellation: None,
             resolver: ProviderResolveOptions::default(),
+            provider_config_dir: None,
             environment_removals: Vec::new(),
             spawn_observer: None,
             launch_event_observer: None,
@@ -264,6 +267,12 @@ impl ProviderClient {
             .lock()
             .expect("argv mutex should not be poisoned")
             .clone()
+    }
+
+    pub fn resolved_executable(&self) -> Option<&Path> {
+        self.resolved
+            .get()
+            .map(|resolved| resolved.executable.as_path())
     }
 
     pub fn invoke_typed<T, I>(
@@ -363,7 +372,7 @@ impl ProviderClient {
             return Ok(resolved.clone());
         }
         let resolved = ProviderResolver::new(self.options.resolver.clone())
-            .resolve(&self.artifact, None)
+            .resolve(&self.artifact, self.options.provider_config_dir.as_deref())
             .map_err(|error| {
                 ProviderClientError::host_transport(
                     HostErrorKind::Other(error.kind().to_owned()),
@@ -846,7 +855,7 @@ fn process_command_from_resolved(
     let program = argv.remove(0);
     argv.into_iter().fold(
         ProcessCommand::new(program)
-            .with_pinned_executable(resolved.pinned_executable())
+            .with_pinned_executable(Some(resolved.pinned_executable()))
             .with_script(resolved.is_script())
             .with_environment_removals(options.environment_removals.clone()),
         |command, arg| command.arg(arg),

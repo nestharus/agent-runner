@@ -1,5 +1,7 @@
-use crate::provider_registry::{ProviderRegistry, ProviderRegistryError, ProviderRegistryOptions};
-use oulipoly_config::ModelConfig;
+use crate::provider_registry::{
+    ProviderRegistry, ProviderRegistryError, ProviderRegistryHandle, ProviderRegistryOptions,
+};
+use oulipoly_config::{ModelConfig, ProvidersConfig};
 use oulipoly_provider::client::ProviderEnv;
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
@@ -13,12 +15,11 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub struct ProviderSettingsHost {
-    registry: ProviderRegistry,
-    options: ProviderSettingsHostOptions,
+    registry: ProviderRegistryHandle,
     target_cache: Mutex<HashMap<String, ProviderSettingsTarget>>,
 }
 
@@ -55,11 +56,6 @@ pub struct ProviderSettingsProcessStatus {
 }
 
 impl ProviderSettingsHostOptions {
-    pub fn with_path_entries_from_process_path(mut self) -> Self {
-        self.registry = self.registry.with_path_entries_from_process_path();
-        self
-    }
-
     pub fn with_config_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.registry = self.registry.with_config_root(root);
         self
@@ -72,24 +68,32 @@ impl ProviderSettingsHostOptions {
 }
 
 impl ProviderSettingsHost {
-    pub fn from_model_configs(
+    pub fn from_configs(
         models: &[ModelConfig],
+        providers: &ProvidersConfig,
         options: ProviderSettingsHostOptions,
     ) -> Result<Self, ProviderSettingsError> {
-        let registry = ProviderRegistry::from_model_configs(models, options.registry.clone())?;
-        Ok(Self {
-            registry,
-            options,
-            target_cache: Mutex::new(HashMap::new()),
-        })
+        let registry = ProviderRegistry::from_configs(models, providers, options.registry)?;
+        Ok(Self::with_registry_handle(ProviderRegistryHandle::new(
+            Arc::new(registry),
+        )))
     }
 
-    pub fn rebuild_from_model_configs(
-        &mut self,
+    pub fn with_registry_handle(registry: ProviderRegistryHandle) -> Self {
+        Self {
+            registry,
+            target_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn rebuild_from_configs(
+        &self,
         models: &[ModelConfig],
+        providers: &ProvidersConfig,
+        options: ProviderSettingsHostOptions,
     ) -> Result<(), ProviderSettingsError> {
-        self.registry =
-            ProviderRegistry::from_model_configs(models, self.options.registry.clone())?;
+        let registry = ProviderRegistry::from_configs(models, providers, options.registry)?;
+        self.registry.replace(Arc::new(registry));
         self.target_cache
             .lock()
             .expect("settings target cache should not be poisoned")
@@ -140,13 +144,14 @@ impl ProviderSettingsHost {
     }
 
     pub fn configured_model_names(&self) -> Vec<String> {
-        self.registry.configured_model_names()
+        self.registry.current().configured_model_names()
     }
 
     fn describe_provider(&self, model_name: &str) -> Result<DescribeResult, ProviderSettingsError> {
-        let artifact = self.registry.enabled_artifact_for_model(model_name)?;
-        let client = self.registry.client_factory().client_for(artifact);
-        let request = self.request(EmptyParams {})?;
+        let registry = self.registry.current();
+        let artifact = registry.enabled_artifact_for_model(model_name)?;
+        let client = registry.client_factory().client_for(artifact);
+        let request = self.request(registry.as_ref(), EmptyParams {})?;
         client
             .invoke_typed::<DescribeResult, _>("describe", request, NoProviderEnv)
             .map_err(ProviderSettingsError::from)
@@ -290,15 +295,20 @@ impl ProviderSettingsHost {
         R: serde::de::DeserializeOwned,
         Params: Serialize,
     {
-        let artifact = self.registry.enabled_artifact_for_model(model_name)?;
-        let client = self.registry.client_factory().client_for(artifact);
-        let request = self.request(params)?;
+        let registry = self.registry.current();
+        let artifact = registry.enabled_artifact_for_model(model_name)?;
+        let client = registry.client_factory().client_for(artifact);
+        let request = self.request(registry.as_ref(), params)?;
         client
             .invoke_typed::<R, _>(operation.as_provider_name(), request, NoProviderEnv)
             .map_err(ProviderSettingsError::from)
     }
 
-    fn request<Params>(&self, params: Params) -> Result<Value, ProviderSettingsError>
+    fn request<Params>(
+        &self,
+        registry: &ProviderRegistry,
+        params: Params,
+    ) -> Result<Value, ProviderSettingsError>
     where
         Params: Serialize,
     {
@@ -306,7 +316,7 @@ impl ProviderSettingsHost {
             contract: CONTRACT_VERSION.to_string(),
             request_id: provider_settings_request_id(),
             provider_instance_id: Some("provider-settings".to_string()),
-            host: host_context(self.registry.host_options()),
+            host: host_context(registry.host_options()),
             params,
         })
         .map_err(schema_request_error)?;

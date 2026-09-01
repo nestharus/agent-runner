@@ -23,35 +23,25 @@ fn assert_state_db_path(state: &AppState, expected: std::path::PathBuf) {
 }
 
 #[test]
-fn app_state_constructor_and_fallback_surface_remain_anchored() {
+fn app_state_constructors_share_the_account_authoritative_registry() {
     let raw_source = include_str!("../src/app_state.rs");
     let source = compact(raw_source);
-    assert_empty_provider_settings_message(raw_source);
-    assert_provider_settings_fallback(&source);
+    assert_no_provider_settings_fallback(raw_source);
     assert_constructor_common_fields(&source);
     assert_new_service_wiring(&source);
     assert_test_default_service_wiring(&source);
     assert_with_services_wiring(&source);
 }
 
-fn assert_empty_provider_settings_message(raw_source: &str) {
-    assert!(
-        raw_source.contains(
-            "const EMPTY_PROVIDER_SETTINGS_HOST_EXPECT_MESSAGE: &str =\n    \"empty provider settings host should build\";"
-        ),
-        "provider-settings empty-host panic payload must remain static and byte-preserving"
-    );
-}
-
-fn assert_provider_settings_fallback(source: &str) {
-    for required in [
-        "fnprovider_settings_host_for_models(models_dir:&Path,models:&HashMap<String,config::ModelConfig>,)->oulipoly_runtime::provider_settings::ProviderSettingsHost",
-        "provider_settings::build_host(models_dir,models).unwrap_or_else(|_|",
-        "ProviderSettingsHost::from_model_configs(&[],provider_settings::host_options(models_dir),).expect(EMPTY_PROVIDER_SETTINGS_HOST_EXPECT_MESSAGE)",
+fn assert_no_provider_settings_fallback(source: &str) {
+    for forbidden in [
+        "EMPTY_PROVIDER_SETTINGS_HOST_EXPECT_MESSAGE",
+        "provider_settings_host_for_models",
+        "ProviderSettingsHost::from_model_configs",
     ] {
         assert!(
-            source.contains(required),
-            "provider-settings fallback host construction must stay anchored: {required}"
+            !source.contains(forbidden),
+            "provider settings must not fall back to model or empty registry authority: {forbidden}"
         );
     }
 }
@@ -64,8 +54,8 @@ fn assert_constructor_common_fields(source: &str) {
     ] {
         let body = function_body(source, constructor);
         assert!(
-            body.contains("provider_settings_host_for_models(&models_dir,&models)"),
-            "{constructor} must initialize provider settings from the configured model map"
+            body.contains("ProviderSettingsHost::with_registry_handle("),
+            "{constructor} must initialize provider settings from the shared provider registry"
         );
         assert!(
             body.contains("quota_in_flight:oulipoly_runtime::quota::InFlight::new()"),

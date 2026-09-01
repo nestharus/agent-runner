@@ -3125,7 +3125,7 @@ mod tests {
     }
 
     fn provider_registry(models: &[ModelConfig]) -> ProviderRegistry {
-        ProviderRegistry::from_model_configs_with_provider_config(
+        ProviderRegistry::from_configs(
             models,
             &ProvidersConfig::default(),
             ProviderRegistryOptions::default(),

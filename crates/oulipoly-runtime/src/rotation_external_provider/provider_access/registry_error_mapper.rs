@@ -9,6 +9,9 @@ pub(super) fn map_registry_identity_error(error: ProviderRegistryError) -> Exter
         ProviderRegistryError::ModelProviderNotConfigured { model_name } => {
             error_formatter::missing_enabled_artifact(model_name)
         }
+        ProviderRegistryError::AccountImplementationNotConfigured { account_name } => {
+            error_formatter::missing_enabled_artifact(account_name)
+        }
         other => map_registry_dispatch_error(other),
     }
 }
@@ -29,6 +32,12 @@ pub(super) fn map_registry_dispatch_error(error: ProviderRegistryError) -> Exter
         }
         ProviderRegistryError::ModelProviderNotConfigured { model_name } => {
             error_formatter::missing_enabled_artifact(model_name)
+        }
+        ProviderRegistryError::AccountImplementationNotConfigured { account_name } => {
+            error_formatter::missing_enabled_artifact(account_name)
+        }
+        conflict @ ProviderRegistryError::FamilyImplementationConflict { .. } => {
+            error_formatter::malformed_external_identity(conflict.to_string())
         }
         ProviderRegistryError::InvalidImplementationRef { source } => {
             error_formatter::malformed_external_identity(source.to_string())

@@ -106,10 +106,11 @@ fn emit_session_locate_environment_error(
 fn load_session_locate_environment_result() -> Result<SessionLocateEnvironment, String> {
     let config_root = default_config_root()?;
     let state = open_default_locate_state()?;
-    let providers_cfg = load_default_locate_providers(&config_root);
+    let providers_cfg = load_default_locate_providers(&config_root)?;
     let models = load_default_locate_models(&providers_cfg)?;
     let sessions_cfg = load_default_locate_sessions(&config_root);
-    let provider_registry = build_session_locate_provider_registry(&models, config_root)?;
+    let provider_registry =
+        build_session_locate_provider_registry(&models, &providers_cfg, config_root)?;
     Ok(SessionLocateEnvironment::new(
         state,
         providers_cfg,
@@ -123,8 +124,9 @@ fn open_default_locate_state() -> Result<StateDb, String> {
     StateDb::open_default()
 }
 
-fn load_default_locate_providers(config_root: &std::path::Path) -> ProvidersConfig {
-    oulipoly_config::ProvidersConfig::load(&config_root.join("providers.toml")).unwrap_or_default()
+fn load_default_locate_providers(config_root: &std::path::Path) -> Result<ProvidersConfig, String> {
+    oulipoly_config::ProvidersConfig::load(&config_root.join("providers.toml"))
+        .map_err(|error| format!("Failed to load provider endpoint configuration: {error}"))
 }
 
 fn load_default_locate_models(
@@ -139,12 +141,13 @@ fn load_default_locate_sessions(config_root: &std::path::Path) -> oulipoly_confi
 
 fn build_session_locate_provider_registry(
     models: &HashMap<String, ModelConfig>,
+    providers: &ProvidersConfig,
     config_root: std::path::PathBuf,
 ) -> Result<ProviderRegistry, String> {
-    ProviderRegistry::from_model_configs(
+    ProviderRegistry::from_configs(
         &models.values().cloned().collect::<Vec<_>>(),
+        providers,
         ProviderRegistryOptions::default()
-            .with_path_entries_from_process_path()
             .with_config_root(config_root)
             .with_data_root(default_data_root()?),
     )

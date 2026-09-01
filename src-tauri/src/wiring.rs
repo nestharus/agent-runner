@@ -88,13 +88,12 @@ impl AgentRuntimeServices {
     pub fn cli_defaults() -> Result<Self, String> {
         let paths = default_cli_runtime_paths()?;
         let provider_registry_options = ProviderRegistryOptions::default()
-            .with_path_entries_from_process_path()
             .with_config_root(paths.config_root.clone())
             .with_data_root(paths.data_root.clone());
         let provider_registry = Arc::new(production_provider_registry(
             &paths,
             provider_registry_options.clone(),
-        ));
+        )?);
         let provider_registry_handle = ProviderRegistryHandle::new(provider_registry.clone());
         let session_lifecycle_service =
             Arc::new(ProductionSessionLifecycleService::with_registry_handle(
@@ -151,13 +150,12 @@ impl AgentRuntimeServices {
     pub fn production(paths: RuntimePaths) -> Result<Self, String> {
         prepare_runtime_directories(&paths)?;
         let registry_options = ProviderRegistryOptions::default()
-            .with_path_entries_from_process_path()
             .with_config_root(paths.config_root.clone())
             .with_data_root(paths.data_root.clone());
         let provider_registry = Arc::new(production_provider_registry(
             &paths,
             registry_options.clone(),
-        ));
+        )?);
         let provider_registry_handle = ProviderRegistryHandle::new(provider_registry.clone());
         let session_lifecycle_service =
             Arc::new(ProductionSessionLifecycleService::with_registry_handle(
@@ -233,41 +231,33 @@ fn default_cli_runtime_paths() -> Result<RuntimePaths, String> {
 fn production_provider_registry(
     paths: &RuntimePaths,
     options: ProviderRegistryOptions,
-) -> ProviderRegistry {
-    let fallback_options = options.clone();
-    let providers = load_registry_providers(paths);
-    let models = load_registry_models(paths, &providers);
-    registry_from_model_configs(&models, &providers, options)
-        .unwrap_or_else(|_| empty_provider_registry(fallback_options))
+) -> Result<ProviderRegistry, String> {
+    let providers = load_registry_providers(paths)?;
+    let models = load_registry_models(paths, &providers)?;
+    registry_from_configs(&models, &providers, options).map_err(|error| error.to_string())
 }
 
-fn load_registry_providers(paths: &RuntimePaths) -> config::ProvidersConfig {
-    FilesystemProvidersConfigRepository
-        .load_providers(&paths.config_root.join("providers.toml"))
-        .unwrap_or_default()
+fn load_registry_providers(paths: &RuntimePaths) -> Result<config::ProvidersConfig, String> {
+    FilesystemProvidersConfigRepository.load_providers(&paths.config_root.join("providers.toml"))
 }
 
 fn load_registry_models(
     paths: &RuntimePaths,
     providers: &config::ProvidersConfig,
-) -> std::collections::HashMap<String, config::ModelConfig> {
-    config::load_models(&paths.models_dir, Some(providers)).unwrap_or_default()
+) -> Result<std::collections::HashMap<String, config::ModelConfig>, String> {
+    config::load_models(&paths.models_dir, Some(providers)).map_err(|error| error.to_string())
 }
 
-pub(crate) fn registry_from_model_configs(
+pub(crate) fn registry_from_configs(
     models: &std::collections::HashMap<String, config::ModelConfig>,
     providers: &config::ProvidersConfig,
     options: ProviderRegistryOptions,
 ) -> Result<ProviderRegistry, oulipoly_runtime::provider_registry::ProviderRegistryError> {
-    ProviderRegistry::from_model_configs_with_provider_config(
+    ProviderRegistry::from_configs(
         &models.values().cloned().collect::<Vec<_>>(),
         providers,
         options,
     )
-}
-
-fn empty_provider_registry(options: ProviderRegistryOptions) -> ProviderRegistry {
-    ProviderRegistry::empty(options)
 }
 
 fn prepare_runtime_directories(paths: &RuntimePaths) -> Result<(), String> {
@@ -303,7 +293,9 @@ fn format_runtime_directory_error(label: &str, error: std::io::Error) -> String 
 mod tests {
     use super::*;
     use oulipoly_config::provider_implementation_ref::ProviderImplementationRef;
-    use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProviderEntry};
+    use oulipoly_config::{
+        ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    };
     use std::collections::HashMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -331,12 +323,9 @@ mod tests {
             entries: HashMap::from([(
                 "account".to_string(),
                 ProviderEntry {
-                    implementation: Some(ProviderImplementationRef {
-                        path: Some(inferred.display().to_string()),
-                        crate_name: None,
-                        version: None,
-                        binary: None,
-                        script: None,
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "fixture".to_string(),
+                        executable: inferred.display().to_string(),
                     }),
                     command: Some("fixture5".to_string()),
                     ..Default::default()
@@ -347,7 +336,7 @@ mod tests {
             (account_model.name.clone(), account_model),
             (explicit_model.name.clone(), explicit_model),
         ]);
-        let registry = registry_from_model_configs(
+        let registry = registry_from_configs(
             &models,
             &providers,
             ProviderRegistryOptions::default().with_path_entries([dir.path().to_path_buf()]),

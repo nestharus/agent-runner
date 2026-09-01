@@ -13,9 +13,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::executor::cli::InteractiveLiveSessionBinding;
-use crate::provider_registry::{
-    PinnedProviderEndpoint, ProviderRegistry, ProviderRegistryOptions,
-};
+use crate::provider_registry::{PinnedProviderEndpoint, ProviderRegistry, ProviderRegistryOptions};
 use crate::services::{
     LauncherServiceOutput, LauncherServicePort, LauncherServiceRequest, ServiceError,
 };
@@ -160,11 +158,10 @@ where
         .and_then(Path::parent)
         .unwrap_or(services.config_root.as_path());
     let provider_registry = Arc::new(
-        ProviderRegistry::from_model_configs_with_provider_config(
+        ProviderRegistry::from_configs(
             std::slice::from_ref(&carrier_model),
             &providers,
             ProviderRegistryOptions::default()
-                .with_path_entries_from_process_path()
                 .with_config_root(&services.config_root)
                 .with_data_root(registry_data_root),
         )
@@ -196,7 +193,7 @@ where
     let (provider, _prompt_mode) = providers.runtime_provider(member_name)?;
     let selected_provider_name = provider.name.clone();
     let provider_endpoint = provider_registry
-        .preflight_model_provider_instance(&carrier_model.name, &selected_provider_name)
+        .preflight_account(&selected_provider_name)
         .map_err(|error| {
             format!(
                 "provider account {selected_provider_name} implementation preflight failed: {error}"

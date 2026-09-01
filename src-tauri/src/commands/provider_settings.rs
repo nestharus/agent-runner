@@ -5,12 +5,11 @@ use oulipoly_provider::generated::{
     SettingsValues, SettingsWriteResult,
 };
 use oulipoly_runtime::provider_settings::{
-    ProviderSettingsError, ProviderSettingsHost, ProviderSettingsHostOptions,
-    ProviderSettingsProcessStatus, ProviderSettingsTarget as RuntimeProviderSettingsTarget,
+    ProviderSettingsError, ProviderSettingsHost, ProviderSettingsProcessStatus,
+    ProviderSettingsTarget as RuntimeProviderSettingsTarget,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
@@ -359,35 +358,13 @@ pub fn migrate_provider_settings_inner(
 }
 
 pub fn refresh_provider_settings_host(state: &AppState) -> Result<(), String> {
-    let models = state.models.lock().map_err(|error| error.to_string())?;
-    let fresh = build_host(&state.models_dir, &models)?;
+    let fresh = ProviderSettingsHost::with_registry_handle(state.provider_registry.clone());
     let mut host = state
         .provider_settings
         .lock()
         .map_err(|error| error.to_string())?;
     *host = fresh;
     Ok(())
-}
-
-pub fn build_host(
-    models_dir: &Path,
-    models: &HashMap<String, oulipoly_config::ModelConfig>,
-) -> Result<ProviderSettingsHost, String> {
-    let options = host_options(models_dir);
-    let model_values = models.values().cloned().collect::<Vec<_>>();
-    ProviderSettingsHost::from_model_configs(&model_values, options)
-        .map_err(|error| error.message().to_string())
-}
-
-pub fn host_options(models_dir: &Path) -> ProviderSettingsHostOptions {
-    let config_root = models_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| Path::new(".").to_path_buf());
-    ProviderSettingsHostOptions::default()
-        .with_path_entries_from_process_path()
-        .with_config_root(config_root.clone())
-        .with_data_root(config_root)
 }
 
 pub fn package_migration_legacy_payload(

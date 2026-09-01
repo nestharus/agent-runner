@@ -36,9 +36,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-const EMPTY_PROVIDER_SETTINGS_HOST_EXPECT_MESSAGE: &str =
-    "empty provider settings host should build";
-
 pub struct AppState {
     pub models: Mutex<HashMap<String, config::ModelConfig>>,
     pub models_dir: PathBuf,
@@ -72,14 +69,10 @@ impl AppState {
         let routing_service: Arc<dyn oulipoly_runtime::services::RoutingServicePort> =
             services.routing_service.clone();
         let provider_registry_options = services.provider_registry_options.clone();
-        refresh_provider_registry_handle_with_options(
-            &services.provider_registry_handle,
-            &models,
-            providers_config.as_ref(),
-            &provider_config_path(&models_dir),
-            provider_registry_options.clone(),
-        );
-        let provider_settings = provider_settings_host_for_models(&models_dir, &models);
+        let provider_settings =
+            oulipoly_runtime::provider_settings::ProviderSettingsHost::with_registry_handle(
+                services.provider_registry_handle.clone(),
+            );
         Self {
             models: Mutex::new(models),
             models_dir,
@@ -108,7 +101,10 @@ impl AppState {
             &provider_config_path(&models_dir),
             provider_registry_options.clone(),
         );
-        let provider_settings = provider_settings_host_for_models(&models_dir, &models);
+        let provider_settings =
+            oulipoly_runtime::provider_settings::ProviderSettingsHost::with_registry_handle(
+                provider_registry.clone(),
+            );
         Self {
             models: Mutex::new(models),
             models_dir,
@@ -161,7 +157,8 @@ fn test_provider_registry(
         providers_repository,
         providers_path,
         provider_registry_options,
-    );
+    )
+    .expect("test provider endpoint registry should build");
     provider_registry
 }
 
@@ -187,13 +184,16 @@ impl AppState {
         services: AppStateTestServices,
     ) -> AppState {
         let provider_registry_options = provider_registry_options(&models_dir);
-        let provider_settings = provider_settings_host_for_models(&models_dir, &models);
         let provider_registry = test_provider_registry(
             &models,
             services.providers_config.as_ref(),
             &provider_config_path(&models_dir),
             provider_registry_options.clone(),
         );
+        let provider_settings =
+            oulipoly_runtime::provider_settings::ProviderSettingsHost::with_registry_handle(
+                provider_registry.clone(),
+            );
         AppState {
             models: Mutex::new(models),
             models_dir,
@@ -214,19 +214,6 @@ impl AppState {
     }
 }
 
-fn provider_settings_host_for_models(
-    models_dir: &Path,
-    models: &HashMap<String, config::ModelConfig>,
-) -> oulipoly_runtime::provider_settings::ProviderSettingsHost {
-    provider_settings::build_host(models_dir, models).unwrap_or_else(|_| {
-        oulipoly_runtime::provider_settings::ProviderSettingsHost::from_model_configs(
-            &[],
-            provider_settings::host_options(models_dir),
-        )
-        .expect(EMPTY_PROVIDER_SETTINGS_HOST_EXPECT_MESSAGE)
-    })
-}
-
 pub(crate) fn refresh_provider_registry(state: &AppState) -> Result<(), String> {
     let models = state.models.lock().map_err(|error| error.to_string())?;
     refresh_provider_registry_handle_with_options(
@@ -235,7 +222,7 @@ pub(crate) fn refresh_provider_registry(state: &AppState) -> Result<(), String> 
         state.providers_config.as_ref(),
         &provider_config_path(&state.models_dir),
         state.provider_registry_options.clone(),
-    );
+    )?;
     Ok(())
 }
 
@@ -245,13 +232,14 @@ fn refresh_provider_registry_handle_with_options(
     providers_repository: &(dyn ProvidersConfigRepository + Send + Sync),
     providers_path: &Path,
     options: ProviderRegistryOptions,
-) {
+) -> Result<(), String> {
     let providers = providers_repository
         .load_providers(providers_path)
-        .unwrap_or_default();
-    let registry = wiring::registry_from_model_configs(models, &providers, options.clone())
-        .unwrap_or_else(|_| ProviderRegistry::empty(options));
+        .map_err(|error| format!("Failed to load provider endpoint configuration: {error}"))?;
+    let registry = wiring::registry_from_configs(models, &providers, options)
+        .map_err(|error| format!("Failed to build provider endpoint registry: {error}"))?;
     handle.replace(Arc::new(registry));
+    Ok(())
 }
 
 fn provider_config_path(models_dir: &Path) -> PathBuf {
@@ -264,7 +252,9 @@ fn provider_config_path(models_dir: &Path) -> PathBuf {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProviderEntry};
+    use oulipoly_config::{
+        ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -317,17 +307,13 @@ mod tests {
             entries: HashMap::from([(
                 "account".to_string(),
                 ProviderEntry {
-                    implementation: Some(ProviderImplementationRef {
-                        path: Some(
-                            dir.path()
-                                .join("agent-runner-fixture")
-                                .display()
-                                .to_string(),
-                        ),
-                        crate_name: None,
-                        version: None,
-                        binary: None,
-                        script: None,
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "fixture".to_string(),
+                        executable: dir
+                            .path()
+                            .join("agent-runner-fixture")
+                            .display()
+                            .to_string(),
                     }),
                     command: Some("fixture9".to_string()),
                     ..Default::default()
@@ -361,7 +347,8 @@ mod tests {
             &repository,
             &dir.path().join("providers.toml"),
             options,
-        );
+        )
+        .expect("refreshed provider endpoint registry");
         assert_eq!(
             handle
                 .current()
@@ -415,7 +402,6 @@ fn provider_registry_options(models_dir: &Path) -> ProviderRegistryOptions {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     ProviderRegistryOptions::default()
-        .with_path_entries_from_process_path()
         .with_config_root(root.clone())
         .with_data_root(root)
 }

@@ -165,7 +165,9 @@ fn map_registry_error(error: ProviderRegistryError) -> SessionProviderError {
         | ProviderRegistryError::ProviderProtocol { .. }
         | ProviderRegistryError::ProviderDescribeFailed { .. }
         | ProviderRegistryError::RuntimeDisabledArtifact { .. }
-        | ProviderRegistryError::ModelProviderNotConfigured { .. } => {
+        | ProviderRegistryError::ModelProviderNotConfigured { .. }
+        | ProviderRegistryError::AccountImplementationNotConfigured { .. }
+        | ProviderRegistryError::FamilyImplementationConflict { .. } => {
             "session_provider_describe_unavailable"
         }
         ProviderRegistryError::InvalidImplementationRef { .. } => "provider_registry_error",

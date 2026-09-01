@@ -102,7 +102,15 @@ impl ProviderResolver {
         is_script: bool,
     ) -> Result<ResolvedProviderCommand, ProviderResolveError> {
         let candidate = map_provider_path_candidate(path, config_dir);
-        ensure_executable(candidate, is_script)
+        if !path.is_absolute() {
+            let root = config_dir
+                .ok_or_else(|| ProviderResolveError::new(HostErrorKind::MissingArtifact))?;
+            ensure_candidate_within_root(root, &candidate)?;
+        }
+        let canonical_candidate = candidate
+            .canonicalize()
+            .map_err(|_| ProviderResolveError::new(HostErrorKind::MissingArtifact))?;
+        ensure_executable(canonical_candidate, is_script)
     }
 
     fn resolve_binary(
@@ -186,7 +194,10 @@ fn resolve_binary_in_root(
         return Ok(None);
     }
     ensure_candidate_within_root(root, &candidate)?;
-    ensure_executable(candidate, false).map(Some)
+    let canonical_candidate = candidate
+        .canonicalize()
+        .map_err(|_| ProviderResolveError::new(HostErrorKind::MissingArtifact))?;
+    ensure_executable(canonical_candidate, false).map(Some)
 }
 
 fn map_binary_candidate(root: &Path, name: &str) -> PathBuf {
@@ -213,26 +224,17 @@ fn ensure_candidate_within_root(root: &Path, candidate: &Path) -> Result<(), Pro
 
 #[derive(Debug, Clone)]
 pub struct ResolvedProviderCommand {
-    executable: PathBuf,
-    pinned_executable: Option<Arc<File>>,
+    pub(crate) executable: PathBuf,
+    pinned_executable: Arc<File>,
     is_script: bool,
     uses_shell_wrapper: bool,
 }
 
 impl ResolvedProviderCommand {
-    pub fn new(executable: impl Into<PathBuf>) -> Self {
-        Self {
-            executable: executable.into(),
-            pinned_executable: None,
-            is_script: false,
-            uses_shell_wrapper: false,
-        }
-    }
-
     fn pinned(executable: PathBuf, pinned_executable: File, is_script: bool) -> Self {
         Self {
             executable,
-            pinned_executable: Some(Arc::new(pinned_executable)),
+            pinned_executable: Arc::new(pinned_executable),
             is_script,
             uses_shell_wrapper: false,
         }
@@ -253,7 +255,7 @@ impl ResolvedProviderCommand {
         self.uses_shell_wrapper
     }
 
-    pub(crate) fn pinned_executable(&self) -> Option<Arc<File>> {
+    pub(crate) fn pinned_executable(&self) -> Arc<File> {
         self.pinned_executable.clone()
     }
 

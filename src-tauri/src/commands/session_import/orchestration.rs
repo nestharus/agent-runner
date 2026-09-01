@@ -88,11 +88,10 @@ fn build_session_import_provider_registry(
     providers_cfg: &ProvidersConfig,
     config_root: PathBuf,
 ) -> Result<ProviderRegistry, String> {
-    ProviderRegistry::from_model_configs_with_provider_config(
+    ProviderRegistry::from_configs(
         models,
         providers_cfg,
         ProviderRegistryOptions::default()
-            .with_path_entries_from_process_path()
             .with_config_root(config_root)
             .with_data_root(default_data_root()?),
     )

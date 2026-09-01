@@ -9,8 +9,18 @@ pub enum ProviderRegistryError {
     InvalidImplementationRef {
         source: ProviderImplementationRefError,
     },
-    #[error("model has no configured provider implementation ref: {model_name}")]
+    #[error("model has no configured provider endpoint: {model_name}")]
     ModelProviderNotConfigured { model_name: String },
+    #[error("provider account has no explicit implementation endpoint: {account_name}")]
+    AccountImplementationNotConfigured { account_name: String },
+    #[error(
+        "provider family {family} has conflicting executable authority from accounts {first_account} and {second_account}"
+    )]
+    FamilyImplementationConflict {
+        family: String,
+        first_account: String,
+        second_account: String,
+    },
     #[error("provider artifact is runtime-disabled: {kind}")]
     RuntimeDisabledArtifact {
         kind: String,

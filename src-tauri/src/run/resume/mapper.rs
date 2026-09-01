@@ -50,9 +50,10 @@ pub(super) fn prepared_headless_resume_execution(
 
 pub(super) fn resume_provider_registry(
     models: &[oulipoly_config::ModelConfig],
+    providers: &oulipoly_config::ProvidersConfig,
     options: oulipoly_runtime::provider_registry::ProviderRegistryOptions,
 ) -> Result<oulipoly_runtime::provider_registry::ProviderRegistry, String> {
-    oulipoly_runtime::provider_registry::ProviderRegistry::from_model_configs(models, options)
+    oulipoly_runtime::provider_registry::ProviderRegistry::from_configs(models, providers, options)
         .map_err(|error| error.to_string())
 }
 

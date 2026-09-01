@@ -25,19 +25,19 @@
 //!       - tool restriction duplicate detection for provider account command surfaces
 //! ```
 //!
+use crate::ProviderEndpointConfig;
 use crate::model::{
     InvocationMode, PromptMode, ProviderConfig, ResumeAcceptanceRules, ResumeStrategy,
     SessionCapture, SessionStorage, ToolRestrictionKind, ToolRestrictions,
 };
-use crate::provider_implementation_ref::ProviderImplementationRef;
 use std::collections::BTreeMap;
 
 /// One entry in `providers.toml`, keyed by the provider name.
 #[derive(Debug, Clone)]
 pub struct ProviderEntry {
-    /// Provider-contract implementation used for account-scoped runtime
-    /// operations. This is independent from the native CLI `command`.
-    pub implementation: Option<ProviderImplementationRef>,
+    /// Sole provider-contract implementation authority for this account.
+    /// This is independent from the native CLI `command`.
+    pub implementation: Option<ProviderEndpointConfig>,
     /// Shell command that prints JSON on stdout describing rolling-quota
     /// windows. Empty if the provider has no quota check wired up.
     pub quota_script: Option<String>,
@@ -93,7 +93,7 @@ impl ProviderEntry {
         if let Some(implementation) = &self.implementation {
             implementation
                 .validate()
-                .map_err(|error| format_provider_context_error(name, &error.to_string()))?;
+                .map_err(|error| format_provider_context_error(name, &error))?;
         }
         if let Some(resume) = &self.resume {
             resume
