@@ -18,6 +18,8 @@
 //!       - direct-SQLite-observation-schema-producer-contract
 //! ```
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Utc};
 use oulipoly_state::{
     CompositeInvocationId, InvocationStart, InvocationStatus, ProviderSessionBinding,
@@ -101,7 +103,9 @@ impl ContinuationFixture {
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format_continuation_providers_config(&resume_provider, &fresh_provider),
+            provider_authority_fixture::with_explicit_provider_authority(
+                &format_continuation_providers_config(&resume_provider, &fresh_provider),
+            ),
         )
         .unwrap();
         let fresh_session_state = dir.path().join("fresh-session-state");
@@ -290,12 +294,14 @@ impl LegacyResumeFixture {
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format_legacy_providers_config(
-                &first_provider,
-                &second_provider,
-                &interactive_provider,
-                &source_projects,
-                &target_projects,
+            provider_authority_fixture::with_explicit_provider_authority(
+                &format_legacy_providers_config(
+                    &first_provider,
+                    &second_provider,
+                    &interactive_provider,
+                    &source_projects,
+                    &target_projects,
+                ),
             ),
         )
         .unwrap();

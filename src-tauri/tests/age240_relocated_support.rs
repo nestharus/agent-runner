@@ -1550,6 +1550,15 @@ pub fn provider_settings_command_preserves_migration_diagnostics_from_real_host(
     );
     let models_dir = dir.path().join("models");
     std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(
+        dir.path().join("providers.toml"),
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            "[provider-a]\ncommand = \"example\"\nargs = []\nprompt_mode = \"arg\"\n",
+            "provider-settings",
+            &provider_path,
+        ),
+    )
+    .unwrap();
     let model = model_with_provider_artifact("example-model", "provider-a", &provider_path);
     let state = test_state(models_dir, HashMap::from([(model.name.clone(), model)]));
 
@@ -1593,9 +1602,18 @@ pub fn provider_settings_targets_skip_central_config_only_models() {
     );
     let models_dir = dir.path().join("models");
     std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(
+        dir.path().join("providers.toml"),
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            "[provider-a]\ncommand = \"example\"\nargs = []\nprompt_mode = \"arg\"\n",
+            "provider-settings",
+            &provider_path,
+        ),
+    )
+    .unwrap();
     let artifact_model =
         model_with_provider_artifact("artifact-model", "provider-a", &provider_path);
-    let central_model = make_model("central-only-model", &["provider-a"]);
+    let central_model = make_model("central-only-model", &["central-only-provider"]);
     let state = test_state(
         models_dir,
         HashMap::from([
@@ -1714,7 +1732,15 @@ args = ["--endpoint", "https://example.test"]
 prompt_mode = "arg"
 "#;
     std::fs::write(&model_path, model_toml).unwrap();
-    std::fs::write(&providers_path, providers_toml).unwrap();
+    std::fs::write(
+        &providers_path,
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            providers_toml,
+            "provider-settings",
+            &provider_path,
+        ),
+    )
+    .unwrap();
     let providers = load_providers_for_models_dir(&models_dir);
     let models = config::load_models(&models_dir, Some(&providers)).unwrap();
     let state = test_state(models_dir.clone(), models);
@@ -1872,3 +1898,5 @@ fn first_provider_settings_migration_record_line(text: &str) -> &str {
 fn parse_provider_settings_migration_record_line(line: &str) -> serde_json::Value {
     serde_json::from_str(line).expect("recorded request should parse")
 }
+#[path = "provider_authority_fixture.rs"]
+mod provider_authority_fixture;

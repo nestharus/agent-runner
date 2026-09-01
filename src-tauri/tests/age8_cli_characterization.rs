@@ -2,6 +2,8 @@
 
 // Characterization test for AGE-8 — pins current behavior of runner CLI seams touched by the agents binary refactor.
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use std::fs;
 use std::io::Write;
@@ -57,14 +59,14 @@ name = "fixture-provider"
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[fixture-provider]
 command = "{}"
 args = []
 prompt_mode = "arg"
 "#,
                 provider_script.display()
-            ),
+            )),
         )
         .unwrap();
 
@@ -209,7 +211,7 @@ name = "diagnostic-provider"
     .unwrap();
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"[failure-provider]
 command = "{}"
 args = []
@@ -222,7 +224,7 @@ prompt_mode = "stdin"
 "#,
             failure_script.display(),
             diag_script.display()
-        ),
+        )),
     )
     .unwrap();
     fs::write(
@@ -273,14 +275,14 @@ fn model_execution_reads_prompt_from_piped_stdin_when_no_file_or_positional_prom
     let fixture = Fixture::new();
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"[fixture-provider]
 command = "{}"
 args = []
 prompt_mode = "stdin"
 "#,
             fixture._dir.path().join("fixture-provider.sh").display()
-        ),
+        )),
     )
     .unwrap();
 

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_runtime::executor::cli::pty_broker::{
     inject_control_envelope, render_mailbox_notification_envelope,
 };
@@ -387,7 +389,7 @@ args = []
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[{provider_name}]
 command = {}
 args = []
@@ -399,7 +401,7 @@ kind = "flag"
 flag = "--resume"
 "#,
                 toml_string(&path_string(script))
-            ),
+            )),
         )
         .unwrap();
     }

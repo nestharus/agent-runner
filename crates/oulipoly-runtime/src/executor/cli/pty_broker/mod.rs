@@ -2865,9 +2865,10 @@ mod tests {
     use super::*;
     use crate::provider_registry::ProviderRegistryOptions;
     use oulipoly_config::{
-        ModelConfig, PromptMode, ProviderConfig, ProvidersConfig,
-        provider_implementation_ref::ProviderImplementationRef,
+        ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+        ProvidersConfig, provider_implementation_ref::ProviderImplementationRef,
     };
+    use std::collections::HashMap;
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::thread;
@@ -3108,7 +3109,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_default_identity_rejects_conflicting_account_artifacts() {
+    fn provider_default_identity_ignores_conflicting_model_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let first = write_session_describe_provider(temp.path(), "provider-a.py");
         let second = write_session_describe_provider(temp.path(), "provider-b.py");
@@ -3117,20 +3118,33 @@ mod tests {
             provider_model("b-model", "provider-account", &second),
         ]);
 
-        assert!(
-            provider_inspect_identity(&registry, "<provider-default>", "provider-account",)
-                .is_none(),
-            "provider-default identity must remain unavailable when the account maps to multiple artifacts"
-        );
+        let identity =
+            provider_inspect_identity(&registry, "<provider-default>", "provider-account")
+                .expect("explicit account authority must override conflicting model artifacts");
+        assert_eq!(identity.model_name, "a-model");
+        assert_eq!(identity.provider_name, "provider-account");
     }
 
     fn provider_registry(models: &[ModelConfig]) -> ProviderRegistry {
-        ProviderRegistry::from_configs(
-            models,
-            &ProvidersConfig::default(),
-            ProviderRegistryOptions::default(),
-        )
-        .unwrap()
+        let implementation = models
+            .first()
+            .and_then(|model| model.provider.as_ref())
+            .and_then(|provider| provider.path.as_ref())
+            .expect("fixture model path");
+        let providers = ProvidersConfig {
+            entries: HashMap::from([(
+                "provider-account".to_string(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "fixture".to_string(),
+                        executable: implementation.clone(),
+                    }),
+                    ..Default::default()
+                },
+            )]),
+        };
+        ProviderRegistry::from_configs(models, &providers, ProviderRegistryOptions::default())
+            .unwrap()
     }
 
     fn provider_model(name: &str, provider_name: &str, script: &Path) -> ModelConfig {

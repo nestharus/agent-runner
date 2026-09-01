@@ -37,6 +37,7 @@ fn export_cli_external_provider_model_reaches_session_export_dispatch() {
         false,
         None,
     );
+    fixture.set_provider_authority(EXTERNAL_PROVIDER, &provider_path);
     fixture.seed_active_chain(
         fixtures::initiative_06_export::CHAIN_A,
         EXTERNAL_PROVIDER,
@@ -246,6 +247,7 @@ fn external_replace_fixture(mode: &str) -> ExternalReplaceFixture {
         &cwd_script,
         &transcript_script,
     );
+    fixture.set_provider_authority(EXTERNAL_PROVIDER, &provider_path);
     fixture.write_sessions_with_locator_path(EXTERNAL_PROVIDER, &jsonl_path);
     fixture.seed_active_chain(
         REPLACE_CHAIN_A,
@@ -295,6 +297,7 @@ fn external_export_with_builtin_fallback_fixture(mode: &str) -> ExternalExportFa
         true,
         None,
     );
+    fixture.set_provider_authority(EXTERNAL_PROVIDER, &provider_path);
     fixture.write_sessions_with_locator_path(EXTERNAL_PROVIDER, &fallback_path);
     fixture.seed_active_chain(
         fixtures::initiative_06_export::CHAIN_A,

@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 mod age153_support;
+mod provider_authority_fixture;
 
 use age153_support::{Age153Fixture, CHAIN_ID, SESSION_ID, toml_string};
 use rusqlite::params;
@@ -311,13 +312,17 @@ args = []
     .unwrap();
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        format!(
-            r#"[{EXTERNAL_PROVIDER}]
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            &format!(
+                r#"[{EXTERNAL_PROVIDER}]
 command = {}
 args = []
 prompt_mode = "arg"
 "#,
-            toml_string(&poison_provider.display().to_string()),
+                toml_string(&poison_provider.display().to_string()),
+            ),
+            "age270-external",
+            external_provider,
         ),
     )
     .unwrap();
@@ -543,7 +548,7 @@ fn write_fixture_config(
     .unwrap();
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"[{PROVIDER}]
 command = {}
 args = []
@@ -564,7 +569,7 @@ prompt_mode = "arg"
 "#,
             toml_string(&provider.display().to_string()),
             toml_string(&diagnostics.display().to_string()),
-        ),
+        )),
     )
     .unwrap();
     fs::write(

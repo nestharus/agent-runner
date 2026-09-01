@@ -3,6 +3,8 @@
 //! ## Declared roles
 //! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Utc};
 use oulipoly_state::{ImportedSessionDisplayMetadataUpsert, StateDb};
 use rusqlite::{Connection, params};
@@ -437,7 +439,7 @@ command = "legacy-command"
 #[test]
 fn age134_migrate_config_turn_script_storage_maps_codex_quotes_paths_and_ignores_unknown() {
     let fixture = CliFixture::new();
-    fs::write(
+    provider_authority_fixture::write_with_explicit_provider_authority(
         fixture.providers_path(),
         r#"[codex]
 command = "codex"
@@ -449,8 +451,7 @@ command = "unknown"
 args = []
 prompt_mode = "arg"
 "#,
-    )
-    .unwrap();
+    );
     fs::write(
         fixture.sessions_path(),
         r#"[codex]

@@ -670,7 +670,8 @@ command = "printf"
 interactive_args = ["ok"]
 
 [{name}.implementation]
-path = "{implementation}"
+family = "historical-test-fixture"
+executable = "{implementation}"
 "#
         )
     }
@@ -1278,8 +1279,9 @@ interactive_args = ["ok"]
         )
         .expect_err("missing account implementation must fail before launch");
 
-        assert!(error.contains("provider account fixture implementation preflight failed"));
-        assert!(error.contains("<provider-family:fixture>/fixture"));
+        assert!(
+            error.contains("provider account has no explicit implementation endpoint: fixture")
+        );
         assert!(launcher.calls.borrow().is_empty());
     }
 
@@ -1300,7 +1302,8 @@ command = "printf"
 interactive_args = ["ok"]
 
 [fixture.implementation]
-path = "{}"
+family = "fixture"
+executable = "{}"
 "#,
                 toml_path(&implementation)
             ),
@@ -1336,7 +1339,8 @@ environment = {{ XDG_DATA_HOME = "/tmp/opencode-profile" }}
 unset_environment = ["OPENAI_API_KEY"]
 
 [opencode.implementation]
-path = "{}"
+family = "opencode"
+executable = "{}"
 "#,
                 repl_test_provider_path().display()
             ),

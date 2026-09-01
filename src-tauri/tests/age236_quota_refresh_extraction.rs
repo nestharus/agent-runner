@@ -2,6 +2,8 @@
 //!
 //! `validator`, `mapper`, `accessor`
 
+mod provider_authority_fixture;
+
 use agent_runner_lib::AppState;
 use agent_runner_lib::commands::quota_refresh::{
     QuotaRefreshEntry, QuotaRefreshWindow, refresh_quotas_inner,
@@ -29,7 +31,11 @@ fn make_model(name: &str, commands: &[&str]) -> ModelConfig {
 }
 
 fn write_providers(root: &Path, content: &str) {
-    std::fs::write(root.join("providers.toml"), content).unwrap();
+    std::fs::write(
+        root.join("providers.toml"),
+        provider_authority_fixture::with_explicit_provider_authority(content),
+    )
+    .unwrap();
 }
 
 fn provider_status<'a>(results: &'a [QuotaRefreshEntry], provider_name: &str) -> &'a str {
@@ -172,13 +178,14 @@ fn age38_refresh_quotas_wraps_db_open_error_before_quota_service() {
     let dir = tempfile::tempdir().unwrap();
     let not_a_directory = dir.path().join("not-a-directory");
     std::fs::write(&not_a_directory, "file").unwrap();
-    let state = test_state(
-        not_a_directory.join("models"),
+    let mut state = test_state(
+        dir.path().join("models"),
         HashMap::from([(
             "multi".to_string(),
             make_model("multi", &["age38-a", "age38-b"]),
         )]),
     );
+    state.models_dir = not_a_directory.join("models");
 
     let error = refresh_quotas_inner(&state).unwrap_err();
 

@@ -3,6 +3,7 @@
 //! Declared roles: formatter, parser, validator, orchestration, filter.
 
 mod age153_support;
+mod provider_authority_fixture;
 
 use age153_support::{Age153Fixture, FORCE_TERMINAL_SIGNAL_KIND, toml_string};
 use chrono::{Duration, Utc};
@@ -135,7 +136,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested"
     fixture.write_model("age182-success", &["fixture-age182-success"]);
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"[fixture-age182-success]
 command = {}
 args = []
@@ -148,7 +149,7 @@ flag = "--session-id"
 
 "#,
             toml_string(&command.display().to_string())
-        ),
+        )),
     )
     .unwrap();
     fixture.run_one_shot("age182-success")

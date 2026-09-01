@@ -16,6 +16,8 @@
 //!       - StateDb-CLI-observation-contract
 //! ```
 
+mod provider_authority_fixture;
+
 use agent_runner_lib::usage::cli::Cli;
 use chrono::{TimeZone, Utc};
 use clap::{Parser, error::ErrorKind};
@@ -109,7 +111,7 @@ impl Fixture {
     fn write_providers(&self, entries: &[ProviderFixture]) {
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            providers_toml(entries),
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml(entries)),
         )
         .unwrap();
     }

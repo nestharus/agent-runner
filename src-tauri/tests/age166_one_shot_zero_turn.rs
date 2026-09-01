@@ -12,6 +12,7 @@
 //! model/provider TOML (formatter).
 
 mod age153_support;
+mod provider_authority_fixture;
 
 use age153_support::{
     Age153Fixture, assert_no_terminal_marker_on_stdout, assert_result_envelope_shape, line_count,
@@ -72,7 +73,11 @@ prompt_mode = "arg"
     fs::write(fixture.models_dir.join(format!("{model_name}.toml")), model).unwrap();
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        providers_toml,
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            &providers_toml,
+            "age166-native",
+            &provider_path,
+        ),
     )
     .unwrap();
 }

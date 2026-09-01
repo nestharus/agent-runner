@@ -63,6 +63,46 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, perms).unwrap();
 }
 
+fn write_provider_endpoint(path: &Path) {
+    fs::write(
+        path,
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+request = json.load(sys.stdin)
+print(json.dumps({
+    "contract": request["contract"],
+    "request_id": request["request_id"],
+    "ok": True,
+    "result": {
+        "provider_id": "age33-default-provider-fixture",
+        "display_name": "AGE-33 Default Provider Fixture",
+        "contract_versions": [request["contract"]],
+        "preferred_contract": request["contract"],
+        "capabilities": {
+            "launch": False,
+            "policy": False,
+            "quota": False,
+            "session": True,
+            "terminal": False,
+            "rotation": False,
+            "discovery": False,
+            "settings": False,
+            "setup_brain": False,
+            "setup": False,
+            "migration": False,
+        },
+    },
+}))
+"#,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
 fn source_from<'a>(source: &'a str, start: &str) -> &'a str {
     let start_idx = source
         .find(start)
@@ -340,6 +380,8 @@ fn age_33_runtime_default_provider_none_state_path_uses_injected_default_opener(
 
     let marker = temp.path().join("launched.txt");
     let provider_script = temp.path().join("provider.sh");
+    let provider_endpoint = temp.path().join("provider-endpoint.py");
+    write_provider_endpoint(&provider_endpoint);
     write_executable(
         &provider_script,
         &format!("printf launched > {:?}\n", marker.to_string_lossy()),
@@ -351,8 +393,13 @@ fn age_33_runtime_default_provider_none_state_path_uses_injected_default_opener(
 command = {:?}
 interactive_args = ["interactive-launch"]
 prompt_mode = "arg"
+
+[fixture.implementation]
+family = "fixture"
+executable = {:?}
 "#,
-            provider_script.to_string_lossy()
+            provider_script.to_string_lossy(),
+            provider_endpoint.to_string_lossy(),
         ),
     )
     .unwrap();
@@ -396,6 +443,8 @@ fn age_33_runtime_default_provider_uses_explicit_state_db_path_when_supplied() {
 
     let marker = temp.path().join("launched.txt");
     let provider_script = temp.path().join("provider.sh");
+    let provider_endpoint = temp.path().join("provider-endpoint.py");
+    write_provider_endpoint(&provider_endpoint);
     write_executable(
         &provider_script,
         &format!(
@@ -416,8 +465,13 @@ command = {:?}
 args = ["one-shot-only"]
 interactive_args = ["interactive-launch"]
 prompt_mode = "arg"
+
+[fixture.implementation]
+family = "fixture"
+executable = {:?}
 "#,
-            provider_script.to_string_lossy()
+            provider_script.to_string_lossy(),
+            provider_endpoint.to_string_lossy(),
         ),
     )
     .unwrap();

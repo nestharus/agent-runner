@@ -4,6 +4,8 @@
 //!
 //! TEST: native host-memory admission through detached proactive wake delivery.
 
+mod provider_authority_fixture;
+
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxDeliveryObservationAnchor,
     SessionMetadataUpsert,
@@ -73,8 +75,12 @@ impl Fixture {
         .unwrap();
         fs::write(
             self.app_config.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority_at(
+                &format!(
                 "[{PROVIDER}]\ncommand = \"age309-native-fixture\"\nargs = []\nprompt_mode = \"arg\"\n"
+            ),
+                "age309-native-wake",
+                &wrapper,
             ),
         )
         .unwrap();

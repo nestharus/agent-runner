@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -37,7 +39,23 @@ impl TempXdgHome {
     }
 
     fn write_providers(&self, contents: &str) {
-        fs::write(self.app_config_dir.join("providers.toml"), contents).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(contents),
+        )
+        .unwrap();
+    }
+
+    fn write_providers_at(&self, contents: &str, executable: &Path) {
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority_at(
+                contents,
+                "age284-live",
+                executable,
+            ),
+        )
+        .unwrap();
     }
 
     fn write_script(&self, name: &str, body: &str) -> PathBuf {
@@ -156,7 +174,7 @@ esac"#,
         ),
     );
     fixture.write_config(r#"default_provider = "live""#);
-    fixture.write_providers(&provider_entry("live1", &script, "interactive"));
+    fixture.write_providers_at(&provider_entry("live1", &script, "interactive"), &script);
 
     let output = fixture.run_new();
 

@@ -22,6 +22,8 @@
 //!       - subordinate fixture setup for isolated config/data homes
 //! ```
 
+mod provider_authority_fixture;
+
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
@@ -118,7 +120,13 @@ impl Age181Fixture {
             &provider_script_body(&self.provider_marker),
         );
         fs::write(files.model_file, model_toml()).unwrap();
-        fs::write(files.providers_file, providers_toml(&files.provider_script)).unwrap();
+        fs::write(
+            files.providers_file,
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml(
+                &files.provider_script,
+            )),
+        )
+        .unwrap();
     }
 
     fn prepare(&self) {

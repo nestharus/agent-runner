@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Duration, Utc};
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, SessionTurnIngest, StateDb};
 use rusqlite::{Connection, params};
@@ -85,7 +87,11 @@ state_dir = '{}'
     fn write_providers_body(&self, body: &str) {
         let app_config_dir = self.config_home.join("oulipoly-agent-runner");
         fs::create_dir_all(&app_config_dir).unwrap();
-        fs::write(app_config_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(body),
+        )
+        .unwrap();
     }
 
     pub(crate) fn write_single_provider_model(

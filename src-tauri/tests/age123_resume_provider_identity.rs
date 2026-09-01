@@ -23,6 +23,8 @@
 
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, WakeClaimAcquireResult, WakeClaimRequest,
 };
@@ -191,7 +193,11 @@ prompt_mode = "stdin"
 "#,
             toml_string(&diagnostic_command.display().to_string())
         ));
-        fs::write(self.app_config_dir.join("providers.toml"), providers_toml).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml),
+        )
+        .unwrap();
     }
 
     fn provider_projects_dir(&self, provider: &str) -> PathBuf {

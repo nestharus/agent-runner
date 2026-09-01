@@ -28,6 +28,8 @@
 //! This test materialises the binaries as marker-writing shell scripts so
 //! the assertion can read which binary actually ran from disk.
 
+mod provider_authority_fixture;
+
 use rusqlite::{Connection, params};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -175,7 +177,11 @@ prompt_mode = "stdin"
             toml_string(&target_projects.display().to_string()),
             toml_string(&diagnostic_command.display().to_string()),
         );
-        fs::write(self.app_config_dir.join("providers.toml"), providers_toml).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml),
+        )
+        .unwrap();
     }
 
     /// Place a Claude-Code-style transcript file for the session owner.

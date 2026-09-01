@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Utc};
 use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionSourceEntry,
@@ -160,7 +162,11 @@ flag = "--resume"
 "#,
             command.display()
         );
-        fs::write(app_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            app_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
     }
 
     fn write_sessions_config_from_transcript(
@@ -1308,7 +1314,7 @@ printf 'ok\n'"#,
     fs::create_dir_all(&app_dir).unwrap();
     fs::write(
         app_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"
 [claude]
 command = "{}"
@@ -1342,7 +1348,7 @@ projects_dir = "{}"
             source_projects.display(),
             script.display(),
             target_projects.display()
-        ),
+        )),
     )
     .unwrap();
     fixture.write_sessions_config_from_transcript("claude2", &transcript_path);
@@ -1490,7 +1496,7 @@ fn manual_migrate_flag_overrides_best_score_via_cli() {
     fs::create_dir_all(&app_dir).unwrap();
     fs::write(
         app_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"
 [claude]
 command = "{}"
@@ -1524,7 +1530,7 @@ projects_dir = "{}"
             source_projects.display(),
             script.display(),
             target_projects.display()
-        ),
+        )),
     )
     .unwrap();
     fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "claude-opus");

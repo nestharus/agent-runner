@@ -33,6 +33,8 @@
 //!       - invocation session/outcome database assertions
 //! ```
 
+mod provider_authority_fixture;
+
 mod age153_support;
 
 use age153_support::assert_result_envelope_shape;
@@ -237,7 +239,11 @@ impl Fixture {
             .join("providers.toml");
         let mut providers = fs::read_to_string(&providers_path).unwrap();
         providers.push_str(&mismatched_provider_config_toml());
-        fs::write(providers_path, providers).unwrap();
+        fs::write(
+            providers_path,
+            provider_authority_fixture::with_explicit_provider_authority(&providers),
+        )
+        .unwrap();
     }
 
     fn provider_ref_transcript_dir(&self) -> PathBuf {
@@ -426,6 +432,7 @@ fn materialize_fixture(root: &Path, paths: &FixturePaths, options: ProviderOptio
     write_model_config(&paths.models_dir, &provider_path);
     write_providers_config(
         &paths.app_config_dir,
+        &provider_path,
         options
             .session_storage
             .then_some(paths.projects_dir.as_path()),
@@ -499,10 +506,18 @@ prompt_mode = "arg"
     )
 }
 
-fn write_providers_config(app_config_dir: &Path, storage_projects_dir: Option<&Path>) {
+fn write_providers_config(
+    app_config_dir: &Path,
+    provider_path: &Path,
+    storage_projects_dir: Option<&Path>,
+) {
     fs::write(
         app_config_dir.join("providers.toml"),
-        providers_config_toml(storage_projects_dir),
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            &providers_config_toml(storage_projects_dir),
+            "s10-external-provider",
+            provider_path,
+        ),
     )
     .unwrap();
 }

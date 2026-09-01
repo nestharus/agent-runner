@@ -29,12 +29,16 @@ args = []
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
-                r#"[{PROVIDER}]
+            crate::provider_authority_fixture::with_explicit_provider_authority_at(
+                &format!(
+                    r#"[{PROVIDER}]
 command = "wu-d-native-fixture"
 args = []
 prompt_mode = "arg"
 "#
+                ),
+                "wu-d-provider",
+                &provider,
             ),
         )
         .unwrap();

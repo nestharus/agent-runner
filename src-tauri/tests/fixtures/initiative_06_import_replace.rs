@@ -212,7 +212,26 @@ flag = "--resume"
 {storage_block}
 "#
         ));
-        fs::write(providers_path, body).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
+    }
+
+    pub fn set_provider_authority(&self, provider_name: &str, executable: &Path) {
+        let providers_path = self.app_config_dir.join("providers.toml");
+        let body = fs::read_to_string(&providers_path).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_account_authority_at(
+                &body,
+                provider_name,
+                "initiative-06-replace-external",
+                executable,
+            ),
+        )
+        .unwrap();
     }
 
     pub fn write_provider_with_storage_kind_text(
@@ -241,7 +260,11 @@ projects_dir = "{}"
 "#,
             storage_path.display()
         ));
-        fs::write(providers_path, body).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
     }
 
     pub fn write_provider_with_script_storage(
@@ -274,7 +297,11 @@ storage_type = "{storage_type}"
             cwd_script.display(),
             transcript_script.display()
         ));
-        fs::write(providers_path, body).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
     }
 
     pub fn write_sessions_with_locator_path(&self, provider_name: &str, transcript_path: &Path) {

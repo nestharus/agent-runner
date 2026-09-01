@@ -36,6 +36,8 @@ mod fixtures;
 mod liveness;
 mod model_config;
 mod parse;
+#[path = "../provider_authority_fixture.rs"]
+mod provider_authority_fixture;
 mod state_mailbox;
 mod test_guard;
 mod validators;

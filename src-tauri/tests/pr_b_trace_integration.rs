@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use chrono::{Duration, Utc};
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{InvocationStart, InvocationStatus, StateDb};
@@ -50,14 +52,14 @@ name = "fixture-provider"
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[fixture-provider]
 command = "{}"
 args = []
 prompt_mode = "arg"
 "#,
                 script_path.display()
-            ),
+            )),
         )
         .unwrap();
 

@@ -3,6 +3,8 @@
 //! Declared roles: accessor, formatter, mapper, parser, filter,
 //! orchestration, validator.
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use rusqlite::Connection;
 use std::fs;
@@ -116,7 +118,7 @@ name = "{PROVIDER}"
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[{PROVIDER}]
 command = "{}"
 args = []
@@ -128,7 +130,7 @@ kind = "flag"
 flag = "--resume"
 "#,
                 provider.display()
-            ),
+            )),
         )
         .unwrap();
     }

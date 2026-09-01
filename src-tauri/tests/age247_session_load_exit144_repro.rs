@@ -3,6 +3,8 @@
 //!
 //! `orchestration`, `mapper`, `formatter`, `validator`, `parser`, `accessor`, `predicate`
 
+mod provider_authority_fixture;
+
 use rusqlite::{Connection, Row, params};
 use serde_json::Value;
 use std::fs;
@@ -61,7 +63,9 @@ impl ScratchFixture {
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            providers_config_contents(&self.provider_script),
+            provider_authority_fixture::with_explicit_provider_authority(
+                &providers_config_contents(&self.provider_script),
+            ),
         )
         .unwrap();
         fs::write(

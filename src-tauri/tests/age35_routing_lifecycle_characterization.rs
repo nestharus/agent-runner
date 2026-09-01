@@ -3,6 +3,8 @@
 //! ## Declared roles
 //! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use std::collections::BTreeSet;
 use std::fs;
@@ -105,7 +107,9 @@ impl CliFixture {
         let entries = self.provider_entries(providers, include_quota_scripts);
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            provider_entries_toml(&entries),
+            provider_authority_fixture::with_explicit_provider_authority(&provider_entries_toml(
+                &entries,
+            )),
         )
         .unwrap();
     }
@@ -160,7 +164,9 @@ impl CliFixture {
         let entries = self.command_body_provider_entries(providers);
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            provider_entries_toml(&entries),
+            provider_authority_fixture::with_explicit_provider_authority(&provider_entries_toml(
+                &entries,
+            )),
         )
         .unwrap();
     }

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Utc};
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, SessionTurnIngest, StateDb};
 use std::fs;
@@ -62,7 +64,11 @@ impl Fixture {
     }
 
     fn write_providers(&self, body: &str) {
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(body),
+        )
+        .unwrap();
     }
 
     fn seed_session_turns(&self, provider_name: &str, session_id: &str) {

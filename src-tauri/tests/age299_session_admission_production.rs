@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use rusqlite::Connection;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -79,10 +81,10 @@ printf '%s\n' 'initial admission observed'
     .unwrap();
     fs::write(
         app_config.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             "[admission-provider]\ncommand = {}\nargs = []\nprompt_mode = \"arg\"\n",
             toml_string(&provider.display().to_string())
-        ),
+        )),
     )
     .unwrap();
 
@@ -132,10 +134,10 @@ fn pressure_keeps_initial_request_alive_and_visibly_queued() {
     .unwrap();
     fs::write(
         app_config.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             "[queued-provider]\ncommand = {}\nargs = []\nprompt_mode = \"arg\"\n",
             toml_string(&provider.display().to_string())
-        ),
+        )),
     )
     .unwrap();
 
@@ -236,10 +238,10 @@ fn invalid_admission_config_does_not_publish_a_fifo_owner() {
     .unwrap();
     fs::write(
         app_config.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             "[admission-provider]\ncommand = {}\nargs = []\nprompt_mode = \"arg\"\n",
             toml_string(&provider.display().to_string())
-        ),
+        )),
     )
     .unwrap();
 
@@ -381,10 +383,10 @@ esac
     .unwrap();
     fs::write(
         app_config.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             "[nested-provider]\ncommand = {}\nargs = []\nprompt_mode = \"arg\"\n",
             toml_string(&provider.display().to_string())
-        ),
+        )),
     )
     .unwrap();
 

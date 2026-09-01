@@ -1,6 +1,9 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
+#[path = "../provider_authority_fixture.rs"]
+mod provider_authority_fixture;
+
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value};
@@ -72,7 +75,11 @@ impl Age153Fixture {
     }
 
     fn write_providers_toml(&self, body: &str) {
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(body),
+        )
+        .unwrap();
     }
 
     fn write_provider_command_scripts<'a>(

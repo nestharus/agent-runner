@@ -29,6 +29,8 @@
 //!       - unix-process-fixture-recording-contract
 //! ```
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -87,7 +89,10 @@ impl Fixture {
         fs::write(self.models_dir.join(format!("{MODEL}.toml")), model_toml()).unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            providers_toml(&script, &self.workspace),
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml(
+                &script,
+                &self.workspace,
+            )),
         )
         .unwrap();
     }

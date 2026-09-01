@@ -310,6 +310,7 @@ fn external_provider_locate_fixture(mode: &str) -> ExternalLocateFixture {
         write_cli_provider_a_script(fixture.root(), mode, &record_path, &transcript_path);
     fixture.write_external_model(PROVIDER_A_MODEL, PROVIDER_A_ACCOUNT, &provider_path);
     fixture.write_provider(PROVIDER_A_ACCOUNT, StorageKind::None, false, None);
+    fixture.set_provider_authority(PROVIDER_A_ACCOUNT, &provider_path);
     fixture.seed_active_chain(
         CHAIN_A,
         PROVIDER_A_ACCOUNT,
@@ -345,6 +346,7 @@ fn historical_ref_locate_fixture(mode: &str) -> HistoricalLocateFixture {
         true,
         None,
     );
+    fixture.set_provider_authority(&provider_name, &provider_path);
     fixture.write_sessions_with_locator_path(&provider_name, &local_path);
     fixture.seed_active_chain(
         CHAIN_A,

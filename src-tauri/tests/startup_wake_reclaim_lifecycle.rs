@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
     AdvanceRuntimeGenerationDrain, AgentBashCompleteEnqueue, BindRuntimeGenerationRunning,
@@ -46,10 +48,10 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
     .unwrap();
     std::fs::write(
         app_config.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n\n[fixture-provider.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
             provider.display()
-        ),
+        )),
     )
     .unwrap();
 
@@ -253,10 +255,10 @@ fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
     .unwrap();
     std::fs::write(
         app_config.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n\n[fixture-provider.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
             provider.display()
-        ),
+        )),
     )
     .unwrap();
 

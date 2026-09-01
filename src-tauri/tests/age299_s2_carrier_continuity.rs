@@ -5,6 +5,8 @@
 //! ## Declared roles
 //! `orchestration`, `validator`
 
+mod provider_authority_fixture;
+
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::{InvocationStatus, ProviderSessionBinding, StateDb};
 use rusqlite::{Connection, params};
@@ -175,9 +177,13 @@ impl Fixture {
         .unwrap();
         fs::write(
             app_config.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority_at(
+                &format!(
                 "[{PROVIDER}]\ncommand = {:?}\nargs = []\ninteractive_args = []\nprompt_mode = \"arg\"\n\n[{PROVIDER}.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
                 script.display().to_string()
+            ),
+                "age299-s2",
+                &script,
             ),
         )
         .unwrap();

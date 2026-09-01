@@ -7,6 +7,8 @@
 //! TEST: external-provider runtime fixtures for session ingestion, prompt
 //! acceptance, and policy diagnostics.
 
+mod provider_authority_fixture;
+
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
@@ -147,12 +149,16 @@ args = []
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
-                r#"[{provider}]
+            provider_authority_fixture::with_explicit_provider_authority_at(
+                &format!(
+                    r#"[{provider}]
 command = "fixture-opencode"
 args = []
 prompt_mode = "arg"
 "#
+                ),
+                "s11-external-provider",
+                &provider_path,
             ),
         )
         .unwrap();

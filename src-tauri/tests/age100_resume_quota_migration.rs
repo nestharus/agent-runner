@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{InvocationStatus, StateDb};
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -97,7 +99,11 @@ impl Fixture {
         };
         let diagnostic_command = self.write_script("diagnostic-provider.sh", diagnostic_body);
         providers_toml.push_str(&diagnostic_provider_toml(&diagnostic_command));
-        fs::write(self.app_config_dir.join("providers.toml"), providers_toml).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml),
+        )
+        .unwrap();
     }
 
     fn provider_projects_dir(&self, provider: &str) -> PathBuf {

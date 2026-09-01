@@ -2,6 +2,8 @@
 
 //! Production-built, isolated runtime proof for OpenCode native resume ownership.
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{SessionTurnIngest, StateDb};
 use rusqlite::params;
 use serde_json::json;
@@ -167,14 +169,14 @@ impl Fixture {
         fs::write(models_dir.join(format!("{MODEL}.toml")), model_toml()).unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            providers_toml(
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml(
                 &stale_command,
                 &stale_base_dir,
                 &stale_export,
                 &current_command,
                 &current_base_dir,
                 &current_export,
-            ),
+            )),
         )
         .unwrap();
 

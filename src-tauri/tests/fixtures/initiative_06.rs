@@ -207,7 +207,26 @@ prompt_mode = "arg"
 {quota_script}{resume_block}{storage_block}
 "#
         ));
-        fs::write(providers_path, body).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
+    }
+
+    pub fn set_provider_authority(&self, provider_name: &str, executable: &Path) {
+        let providers_path = self.app_config_dir.join("providers.toml");
+        let body = fs::read_to_string(&providers_path).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_account_authority_at(
+                &body,
+                provider_name,
+                "initiative-06-external",
+                executable,
+            ),
+        )
+        .unwrap();
     }
 
     pub fn write_script_provider(
@@ -255,7 +274,11 @@ cwd_script = {cwd_script:?}
 {transcript_line}{storage_type_line}
 "#
         ));
-        fs::write(providers_path, body).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
     }
 
     pub fn write_sessions_with_locator_path(&self, provider_name: &str, transcript_path: &Path) {

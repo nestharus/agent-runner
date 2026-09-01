@@ -3,6 +3,8 @@
 //!
 //! `accessor`, `formatter`, `parser`, `mapper`, `validator`, `orchestration`
 
+mod provider_authority_fixture;
+
 use chrono::{TimeZone, Utc};
 use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, StoreAddress};
 use oulipoly_state::{
@@ -77,7 +79,7 @@ interactive_args = ["launch"]
             self.config_home
                 .join("oulipoly-agent-runner")
                 .join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[fixture-provider]
 command = "{}"
 args = []
@@ -89,7 +91,7 @@ kind = "flag"
 flag = "--resume"
 "#,
                 script_path.display()
-            ),
+            )),
         )
         .expect("write providers");
     }

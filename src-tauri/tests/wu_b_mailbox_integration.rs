@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Utc};
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, InboxTarget, InboxTargetKind,
@@ -435,7 +437,7 @@ args = ["one-shot-only"]
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[{provider}]
 command = {}
 args = []
@@ -447,7 +449,7 @@ kind = "flag"
 flag = "--resume"
 "#,
                 toml_string(&path_string(script))
-            ),
+            )),
         )
         .unwrap();
     }

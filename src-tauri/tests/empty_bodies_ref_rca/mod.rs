@@ -269,7 +269,9 @@ fn empty_body_model_toml() -> String {
 
 fn write_empty_body_provider_toml(app_config_dir: &Path, root: &Path) {
     let path = empty_body_provider_toml_path(app_config_dir);
-    let contents = empty_body_provider_toml(root);
+    let contents = crate::provider_authority_fixture::with_explicit_provider_authority(
+        &empty_body_provider_toml(root),
+    );
     write_text_file(&path, &contents);
 }
 
