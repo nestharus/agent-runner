@@ -144,6 +144,16 @@ pub(crate) fn run_direct_model_cli(
     dispatch_direct_model_balancing(agent_runtime_services, &context, model, &prompt)
 }
 
+pub(crate) fn validate_direct_model_cli_context(cli: &Cli, model_name: &str) -> Result<(), String> {
+    let providers_cfg = load_providers_config()?;
+    let context = load_direct_model_context(cli, model_name)?;
+    let model = load_direct_model(&context, model_name)?;
+    for provider in &model.providers {
+        providers_cfg.runtime_provider(&provider.name)?;
+    }
+    Ok(())
+}
+
 fn load_direct_model_context(cli: &Cli, model_name: &str) -> Result<CliExecutionContext, String> {
     load_cli_execution_context(cli).inspect_err(|err| {
         emit_direct_model_pre_invocation_failure(model_name, err);

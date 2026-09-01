@@ -3090,10 +3090,14 @@ mod tests {
     fn provider_default_identity_uses_unique_account_artifact() {
         let temp = tempfile::tempdir().unwrap();
         let script = write_session_describe_provider(temp.path(), "provider.py");
-        let registry = provider_registry(&[
-            provider_model("z-model", "provider-account", &script),
-            provider_model("a-model", "provider-account", &script),
-        ]);
+        let account = write_session_describe_provider(temp.path(), "account-provider.py");
+        let registry = provider_registry(
+            &[
+                provider_model("z-model", "provider-account", &script),
+                provider_model("a-model", "provider-account", &script),
+            ],
+            &account,
+        );
 
         let identity =
             provider_inspect_identity(&registry, "<provider-default>", "provider-account")
@@ -3109,42 +3113,48 @@ mod tests {
     }
 
     #[test]
-    fn provider_default_identity_ignores_conflicting_model_artifacts() {
+    fn provider_default_identity_rejects_conflicting_account_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let first = write_session_describe_provider(temp.path(), "provider-a.py");
         let second = write_session_describe_provider(temp.path(), "provider-b.py");
-        let registry = provider_registry(&[
-            provider_model("a-model", "provider-account", &first),
-            provider_model("b-model", "provider-account", &second),
-        ]);
+        let account = write_session_describe_provider(temp.path(), "account-provider.py");
+        let registry = provider_registry(
+            &[
+                provider_model("a-model", "provider-account", &first),
+                provider_model("b-model", "provider-account", &second),
+            ],
+            &account,
+        );
 
-        let identity =
-            provider_inspect_identity(&registry, "<provider-default>", "provider-account")
-                .expect("explicit account authority must override conflicting model artifacts");
-        assert_eq!(identity.model_name, "a-model");
-        assert_eq!(identity.provider_name, "provider-account");
+        assert!(
+            provider_inspect_identity(&registry, "<provider-default>", "provider-account",)
+                .is_none(),
+            "provider-default identity must remain unavailable when the account maps to multiple artifacts"
+        );
     }
 
-    fn provider_registry(models: &[ModelConfig]) -> ProviderRegistry {
-        let implementation = models
-            .first()
-            .and_then(|model| model.provider.as_ref())
-            .and_then(|provider| provider.path.as_ref())
-            .expect("fixture model path");
+    fn provider_registry(
+        models: &[ModelConfig],
+        account_implementation: &Path,
+    ) -> ProviderRegistry {
         let providers = ProvidersConfig {
             entries: HashMap::from([(
                 "provider-account".to_string(),
                 ProviderEntry {
                     implementation: Some(ProviderEndpointConfig {
                         family: "fixture".to_string(),
-                        executable: implementation.clone(),
+                        executable: account_implementation.display().to_string(),
                     }),
                     ..Default::default()
                 },
             )]),
         };
-        ProviderRegistry::from_configs(models, &providers, ProviderRegistryOptions::default())
-            .unwrap()
+        ProviderRegistry::from_configs_with_legacy_model_identity_fixture(
+            models,
+            &providers,
+            ProviderRegistryOptions::default(),
+        )
+        .unwrap()
     }
 
     fn provider_model(name: &str, provider_name: &str, script: &Path) -> ModelConfig {

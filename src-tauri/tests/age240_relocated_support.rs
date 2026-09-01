@@ -1613,7 +1613,7 @@ pub fn provider_settings_targets_skip_central_config_only_models() {
     .unwrap();
     let artifact_model =
         model_with_provider_artifact("artifact-model", "provider-a", &provider_path);
-    let central_model = make_model("central-only-model", &["central-only-provider"]);
+    let central_model = make_model("central-only-model", &["provider-a"]);
     let state = test_state(
         models_dir,
         HashMap::from([

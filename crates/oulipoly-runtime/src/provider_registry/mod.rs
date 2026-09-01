@@ -17,7 +17,7 @@ use oulipoly_config::{
 use oulipoly_provider::client::{CancellationToken, ProviderClient};
 use oulipoly_provider::generated::DescribeResult;
 use oulipoly_provider::resolver::ProviderArtifactRef;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -56,7 +56,9 @@ pub struct ProviderRegistry {
     account_families: HashMap<String, String>,
     family_artifacts: HashMap<String, FamilyArtifact>,
     model_artifacts: HashMap<String, ArtifactKey>,
+    settings_models: HashSet<String>,
     model_provider_artifacts: HashMap<ModelProviderKey, ArtifactKey>,
+    model_provider_identities: HashMap<ModelProviderKey, ModelProviderIdentity>,
     cache: DescribeCache,
     endpoint_cache: Mutex<HashMap<String, Arc<PinnedProviderEndpoint>>>,
     client_factory: ProviderClientFactory,
@@ -70,7 +72,9 @@ struct ArtifactInventory {
     account_families: HashMap<String, String>,
     family_artifacts: HashMap<String, FamilyArtifact>,
     model_artifacts: HashMap<String, ArtifactKey>,
+    settings_models: HashSet<String>,
     model_provider_artifacts: HashMap<ModelProviderKey, ArtifactKey>,
+    model_provider_identities: HashMap<ModelProviderKey, ModelProviderIdentity>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +84,12 @@ struct FamilyArtifact {
 }
 
 type ModelProviderKey = (String, String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelProviderIdentity {
+    AccountArtifact(ArtifactKey),
+    LegacyModelArtifact(ProviderImplementationRef),
+}
 
 #[derive(Debug)]
 pub struct PinnedProviderEndpoint {
@@ -137,6 +147,30 @@ impl ProviderRegistry {
         Ok(Self::from_inventory(inventory, options))
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_configs_with_legacy_model_identity_fixture(
+        models: &[ModelConfig],
+        providers: &ProvidersConfig,
+        options: ProviderRegistryOptions,
+    ) -> Result<Self, ProviderRegistryError> {
+        let mut registry = Self::from_configs(models, providers, options)?;
+        for model in models {
+            let Some(legacy_identity) = model.provider.clone() else {
+                continue;
+            };
+            for provider in &model.providers {
+                let key = model_provider_key(&model.name, &provider.name);
+                if registry.model_provider_identities.contains_key(&key) {
+                    registry.model_provider_identities.insert(
+                        key,
+                        ModelProviderIdentity::LegacyModelArtifact(legacy_identity.clone()),
+                    );
+                }
+            }
+        }
+        Ok(registry)
+    }
+
     fn from_inventory(inventory: ArtifactInventory, options: ProviderRegistryOptions) -> Self {
         Self {
             artifacts: inventory.artifacts,
@@ -144,7 +178,9 @@ impl ProviderRegistry {
             account_families: inventory.account_families,
             family_artifacts: inventory.family_artifacts,
             model_artifacts: inventory.model_artifacts,
+            settings_models: inventory.settings_models,
             model_provider_artifacts: inventory.model_provider_artifacts,
+            model_provider_identities: inventory.model_provider_identities,
             cache: DescribeCache::default(),
             endpoint_cache: Mutex::new(HashMap::new()),
             client_factory: ProviderClientFactory::new(options.client),
@@ -162,7 +198,9 @@ impl ProviderRegistry {
             account_families: HashMap::new(),
             family_artifacts: HashMap::new(),
             model_artifacts: HashMap::new(),
+            settings_models: HashSet::new(),
             model_provider_artifacts: HashMap::new(),
+            model_provider_identities: HashMap::new(),
             cache: DescribeCache::default(),
             endpoint_cache: Mutex::new(HashMap::new()),
             client_factory: ProviderClientFactory::new(options.client),
@@ -237,7 +275,7 @@ impl ProviderRegistry {
 
     pub fn resolve_model_name_for_provider(&self, provider_name: &str) -> Option<String> {
         let mut candidates = self
-            .model_provider_artifacts
+            .model_provider_identities
             .iter()
             .filter(|((_, candidate_provider), _)| candidate_provider == provider_name);
         let ((first_model, _), first_artifact) = candidates.next()?;
@@ -254,7 +292,7 @@ impl ProviderRegistry {
     }
 
     pub fn configured_model_names(&self) -> Vec<String> {
-        let mut names = self.model_artifacts.keys().cloned().collect::<Vec<_>>();
+        let mut names = self.settings_models.iter().cloned().collect::<Vec<_>>();
         names.sort();
         names
     }
@@ -502,13 +540,16 @@ fn artifact_inventory<'a>(
         model_artifacts.insert(model_name.to_string(), key);
     }
 
+    let settings_models = model_artifacts.keys().cloned().collect();
     Ok(ArtifactInventory {
         artifacts,
         account_artifacts: HashMap::new(),
         account_families: HashMap::new(),
         family_artifacts: HashMap::new(),
         model_artifacts,
+        settings_models,
         model_provider_artifacts: HashMap::new(),
+        model_provider_identities: HashMap::new(),
     })
 }
 
@@ -519,7 +560,9 @@ fn empty_artifact_inventory() -> ArtifactInventory {
         account_families: HashMap::new(),
         family_artifacts: HashMap::new(),
         model_artifacts: HashMap::new(),
+        settings_models: HashSet::new(),
         model_provider_artifacts: HashMap::new(),
+        model_provider_identities: HashMap::new(),
     }
 }
 
@@ -572,9 +615,17 @@ fn add_model_provider_artifact_keys(
     artifact_key: ArtifactKey,
 ) {
     for provider in &model.providers {
-        inventory.model_provider_artifacts.insert(
-            model_provider_key(&model.name, &provider.name),
-            artifact_key.clone(),
+        let key = model_provider_key(&model.name, &provider.name);
+        inventory
+            .model_provider_artifacts
+            .insert(key.clone(), artifact_key.clone());
+        inventory.model_provider_identities.insert(
+            key,
+            model
+                .provider
+                .clone()
+                .map(ModelProviderIdentity::LegacyModelArtifact)
+                .unwrap_or_else(|| ModelProviderIdentity::AccountArtifact(artifact_key.clone())),
         );
     }
 }
@@ -588,9 +639,14 @@ fn add_model_account_artifact_keys(inventory: &mut ArtifactInventory, models: &[
                 complete_model_mapping = false;
                 continue;
             };
+            let model_provider_key = model_provider_key(&model.name, &provider.name);
             inventory
                 .model_provider_artifacts
-                .insert(model_provider_key(&model.name, &provider.name), key.clone());
+                .insert(model_provider_key.clone(), key.clone());
+            inventory.model_provider_identities.insert(
+                model_provider_key,
+                ModelProviderIdentity::AccountArtifact(key.clone()),
+            );
             match shared_model_key.as_ref() {
                 None => shared_model_key = Some(key),
                 Some(existing) if existing == &key => {}
@@ -599,6 +655,9 @@ fn add_model_account_artifact_keys(inventory: &mut ArtifactInventory, models: &[
         }
         if complete_model_mapping && let Some(key) = shared_model_key {
             inventory.model_artifacts.insert(model.name.clone(), key);
+            if model.provider.is_some() {
+                inventory.settings_models.insert(model.name.clone());
+            }
         }
     }
 }
