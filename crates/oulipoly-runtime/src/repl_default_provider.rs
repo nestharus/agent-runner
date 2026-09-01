@@ -352,6 +352,7 @@ fn default_provider_live_session_binding<O: StateDbOpener>(
         state_db_path: state_db_path.to_path_buf(),
         invocation_row_id,
         invocation_uuid: invocation_uuid.to_string(),
+        expected_provider_session_id: None,
         effective_cwd: default_provider_effective_cwd(input.services.working_dir.as_deref()),
     })
 }

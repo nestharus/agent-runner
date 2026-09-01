@@ -204,7 +204,7 @@ use self::provider_quotas::{
 };
 pub use self::provider_quotas::{QuotaRecord, QuotaWindow, QuotaWindowInput};
 use self::provider_schema_migration::ProviderColumn;
-pub use self::provider_session_binding::ProviderSessionBinding;
+pub use self::provider_session_binding::{ProviderSessionAuthorityCommit, ProviderSessionBinding};
 pub use self::provider_turn_effects::{ProviderTurnEffectInput, ProviderTurnEffectWrite};
 pub use self::providers::ProviderRecord;
 pub use self::resume_types::{

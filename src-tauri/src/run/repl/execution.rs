@@ -167,6 +167,32 @@ pub(super) fn repl_interactive_effective_cwd(
         .unwrap_or_else(|| effective_spawn_cwd(working_dir))
 }
 
+pub(super) fn require_eager_pty_resume_observation(
+    registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
+    provider_name: &str,
+    resume_session_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(provider_session_id) = resume_session_id else {
+        return Ok(());
+    };
+    if !registry.has_account_endpoint(provider_name) {
+        return Ok(());
+    }
+    oulipoly_runtime::session_authority::verify_session_authority(
+        oulipoly_runtime::session_authority::SessionAuthorityExpectation {
+            account_name: provider_name,
+            provider_session_id: Some(provider_session_id),
+        },
+        None,
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        format!(
+            "pty_resume_identity_observer_unavailable: provider account {provider_name} cannot resume session {provider_session_id} without an eager authoritative observation: {error}"
+        )
+    })
+}
+
 pub(super) fn clear_repl_session_capture_for_unpinned(
     env: &ResumeExecutionEnvironment,
     invocation_row_id: i64,
@@ -318,4 +344,37 @@ fn record_repl_legacy_resume_input(
         invocation_row_id,
         resume.expect("resume checked before recording legacy input"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oulipoly_config::{ProviderEndpointConfig, ProviderEntry, ProvidersConfig};
+    use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
+
+    #[test]
+    fn endpoint_backed_pty_resume_fails_before_claiming_requested_id_as_proof() {
+        let providers = ProvidersConfig {
+            entries: std::collections::HashMap::from([(
+                "account-a".to_string(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "family-a".to_string(),
+                        executable: "/explicit/provider-endpoint".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let registry =
+            ProviderRegistry::from_configs(&[], &providers, ProviderRegistryOptions::default())
+                .unwrap();
+
+        let error =
+            require_eager_pty_resume_observation(&registry, "account-a", Some("requested-session"))
+                .unwrap_err();
+
+        assert!(error.starts_with("pty_resume_identity_observer_unavailable:"));
+        assert!(error.contains("requested-session"));
+    }
 }

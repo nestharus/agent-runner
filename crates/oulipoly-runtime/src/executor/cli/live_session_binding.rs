@@ -7,11 +7,16 @@ use super::spawn_identity::{
 use crate::provider_registry::{PinnedProviderEndpoint, ProviderRegistry};
 #[cfg(unix)]
 use crate::services::emit_live_session_marker;
+#[cfg(unix)]
+use crate::session_authority::{
+    AuthoritativeSessionObservation, SessionAuthorityCommitRequest, SessionAuthorityExpectation,
+    commit_session_authority,
+};
 use crate::session_provider::SessionProviderIdentity;
 #[cfg(unix)]
 use crate::session_provider::{SessionProviderLiveCaptureRequest, capture_live_report_with_client};
 #[cfg(unix)]
-use oulipoly_state::{InvocationStatus, ProviderSessionBinding, StateDb};
+use oulipoly_state::StateDb;
 #[cfg(unix)]
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -67,6 +72,7 @@ pub(crate) struct InteractiveLiveSessionBinding {
     pub state_db_path: PathBuf,
     pub invocation_row_id: i64,
     pub invocation_uuid: String,
+    pub expected_provider_session_id: Option<String>,
     pub effective_cwd: Option<PathBuf>,
 }
 
@@ -282,7 +288,24 @@ fn handle_live_session_report(
         ));
     }
     let state = StateDb::open(&context.state_db_path)?;
-    persist_live_binding(context, &state, &captured)?;
+    let resolved_workspace = live_session_resolved_workspace(context.effective_cwd.as_deref())?;
+    commit_session_authority(SessionAuthorityCommitRequest {
+        state: &state,
+        invocation_row_id: context.invocation_row_id,
+        invocation_uuid: &context.invocation_uuid,
+        expectation: SessionAuthorityExpectation {
+            account_name: &context.identity.provider_name,
+            provider_session_id: context.expected_provider_session_id.as_deref(),
+        },
+        observation: Some(AuthoritativeSessionObservation {
+            account_name: context.endpoint.account_name(),
+            provider_session_id: &captured,
+        }),
+        capture_method: PENDING_CAPTURE_METHOD,
+        resume_input_id: context.expected_provider_session_id.clone(),
+        provider_session_resolved_account: resolved_workspace,
+    })
+    .map_err(|error| error.to_string())?;
     backfill_captured_session_id(Some(spawn_context), Some(generation), &captured)?;
     set_shared_session(session_state, &captured)?;
     state.transition_invocation_provider_session_capture_method(
@@ -363,36 +386,6 @@ fn validate_report(
         return Err("Live-session report session ID is empty".to_string());
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn persist_live_binding(
-    context: &InteractiveLiveSessionBinding,
-    state: &StateDb,
-    provider_session_id: &str,
-) -> Result<(), String> {
-    let record = state
-        .get_invocation_by_uuid(&context.invocation_uuid)?
-        .ok_or_else(|| "Live-session invocation does not exist".to_string())?;
-    if record.id != context.invocation_row_id {
-        return Err("Live-session invocation row changed".to_string());
-    }
-    if record.provider_name.as_deref() != Some(context.identity.provider_name.as_str()) {
-        return Err("Live-session provider does not match the invocation".to_string());
-    }
-    if record.status != InvocationStatus::Running {
-        return Err("Live-session invocation is no longer running".to_string());
-    }
-    let resolved_workspace = live_session_resolved_workspace(context.effective_cwd.as_deref())?;
-    state.bind_invocation_provider_session_start(
-        context.invocation_row_id,
-        &ProviderSessionBinding {
-            provider_session_id: provider_session_id.to_string(),
-            capture_method: PENDING_CAPTURE_METHOD,
-            resume_input_id: None,
-            provider_session_resolved_account: resolved_workspace,
-        },
-    )
 }
 
 #[cfg(unix)]
@@ -714,6 +707,34 @@ mod tests {
     }
 
     #[test]
+    fn expected_live_session_mismatch_does_not_publish_a_binding() {
+        let fixture = LiveBindingFixture::new_with_expected_session_id(
+            SESSION_ID,
+            Some("different-expected-session"),
+        );
+
+        let error = report_live_session_binding(
+            &fixture.server.socket_path,
+            &fixture.server.token,
+            INVOCATION_UUID,
+            SESSION_ID,
+        )
+        .expect_err("expected and observed live sessions must match exactly");
+
+        assert!(
+            error.contains("authoritative provider session mismatch"),
+            "{error}"
+        );
+        let invocation = StateDb::open(&fixture.state_path)
+            .unwrap()
+            .get_invocation_by_uuid(INVOCATION_UUID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(invocation.provider_session_id, None);
+        assert_eq!(invocation.provider_session_capture_method, None);
+    }
+
+    #[test]
     fn multi_kilobyte_session_id_round_trips_without_truncation() {
         let session_id = format!("ses_{}", "x".repeat(4 * 1024));
         let fixture = LiveBindingFixture::new_with_session_id(&session_id);
@@ -777,6 +798,13 @@ mod tests {
         }
 
         fn new_with_session_id(session_id: &str) -> Self {
+            Self::new_with_expected_session_id(session_id, None)
+        }
+
+        fn new_with_expected_session_id(
+            session_id: &str,
+            expected_provider_session_id: Option<&str>,
+        ) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let state_path = temp.path().join("state.db");
             let state = StateDb::open(&state_path).unwrap();
@@ -823,6 +851,7 @@ mod tests {
                 state_db_path: state_path.clone(),
                 invocation_row_id,
                 invocation_uuid: INVOCATION_UUID.to_string(),
+                expected_provider_session_id: expected_provider_session_id.map(str::to_string),
                 effective_cwd: Some(temp.path().to_path_buf()),
             };
             let mut server = LiveSessionBindingServer::bind(context).unwrap();

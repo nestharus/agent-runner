@@ -45,6 +45,7 @@ pub mod rotation_external_provider;
 pub mod rotation_host_apply;
 pub mod rotation_journal;
 pub mod services;
+pub mod session_authority;
 pub mod session_export;
 pub mod session_external_provider;
 pub mod session_ingress;

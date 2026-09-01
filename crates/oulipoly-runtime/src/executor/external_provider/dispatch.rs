@@ -21,9 +21,8 @@ use super::error_mapper::{
     protocol_service_error, provider_client_error_is_rotatable, service_error,
 };
 use super::launch_result_mapper::{
-    PROVIDER_SESSION_MARKER, launch_provider_session_id,
-    map_launch_result_with_terminal_classification, map_missing_final_exit_with_prompt_acceptance,
-    marker_provider_session_id,
+    launch_provider_session_id, map_launch_result_with_terminal_classification,
+    map_missing_final_exit_with_prompt_acceptance,
 };
 use super::output_spool_observer::observe_output;
 use super::policy_transform::apply_policy_transform;
@@ -36,14 +35,17 @@ use crate::executor::cli::spawn_identity::{
     record_child_identity, register_runtime_generation_starting,
 };
 use crate::executor::{ExecutionOutputSpool, ExecutionResult};
-use crate::provider_registry::{ProviderRegistry, describe_provider_client};
+use crate::provider_registry::ProviderRegistry;
 use crate::services::ServiceError;
+use crate::session_authority::{
+    AuthoritativeSessionObservation, SessionAuthorityExpectation, VerifiedSessionAuthority,
+    verify_session_authority,
+};
 use oulipoly_provider::client::ProcessSpawnObserver;
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::ProcessStatus;
-use oulipoly_provider::resolver::ProviderArtifactRef;
+use oulipoly_provider::stream::LaunchEventObserver;
 use oulipoly_provider::stream::LaunchResult;
-use oulipoly_provider::stream::{DecodedLaunchEvent, LaunchEventObserver};
 use std::sync::{Arc, Mutex};
 
 type RecordedLaunchGeneration = Arc<Mutex<Option<Result<RunningRuntimeGeneration, String>>>>;
@@ -74,13 +76,6 @@ pub(crate) fn dispatch(
     registry: &ProviderRegistry,
     context: ExternalProviderDispatchContext,
 ) -> Result<ExecutionResult, ServiceError> {
-    // Artifact lookup is model-scoped: every account in the pool shares one
-    // configured provider artifact. Each account attempt negotiates capabilities
-    // through the same execution-bound client that performs policy and launch.
-    let artifact = registry
-        .enabled_artifact_for_model(&context.model.name)
-        .map_err(map_registry_error)?;
-
     // FIX #32: rotate over the pool on transport-timeout / account-unavailable
     // classes, terminal-failing only once every account has been tried. The
     // order is bounded by the pool size — the originally selected account first,
@@ -89,7 +84,7 @@ pub(crate) fn dispatch(
     let last_index = order.len().saturating_sub(1);
     for (position, account) in order.into_iter().enumerate() {
         let account_context = context.with_account(account);
-        match attempt_account_dispatch(registry, &artifact, &account_context) {
+        match attempt_account_dispatch(registry, &account_context) {
             Ok(result) => return Ok(result),
             Err(attempt) => {
                 if attempt.rotatable && position < last_index {
@@ -125,9 +120,11 @@ fn account_rotation_order(context: &ExternalProviderDispatchContext) -> Vec<Acco
 
 fn attempt_account_dispatch(
     registry: &ProviderRegistry,
-    artifact: &ProviderArtifactRef,
     context: &ExternalProviderDispatchContext,
 ) -> Result<ExecutionResult, AccountAttemptError> {
+    let endpoint = registry
+        .preflight_account(&context.provider.name)
+        .map_err(|error| terminal_attempt_error(map_registry_error(error)))?;
     let output_spool = ExecutionOutputSpool::new().map_err(|_| {
         terminal_attempt_error(protocol_service_error("launch_output_spool_create_failed"))
     })?;
@@ -135,18 +132,12 @@ fn attempt_account_dispatch(
     let recorded_generation = recorded_launch_generation();
     let spawn_observer =
         external_launch_spawn_observer(spawn_identity.as_ref(), Arc::clone(&recorded_generation));
-    let launch_event_observer = external_launch_event_observer(
-        spawn_identity.as_ref(),
-        Arc::clone(&recorded_generation),
-        output_spool.clone(),
-    );
-    let client = registry.client_factory().client_for_with_observers(
-        artifact.clone(),
-        spawn_observer,
-        launch_event_observer,
-    );
-    let describe = describe_provider_client(&client, registry.host_options())
-        .map_err(|error| terminal_attempt_error(map_registry_error(error)))?;
+    let launch_event_observer = external_launch_event_observer(output_spool.clone());
+    let client = registry
+        .client_factory()
+        .client_from_pinned_with_observers(endpoint.client(), spawn_observer, launch_event_observer)
+        .map_err(classify_provider_client_attempt_error)?;
+    let describe = endpoint.capabilities();
     gate_required_capabilities(&describe)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
     if !describe.capabilities.launch_output_v1 {
@@ -154,10 +145,7 @@ fn attempt_account_dispatch(
             "complete_launch_output_unsupported",
         )));
     }
-    // Script path semantics require pathname re-resolution, so their executable
-    // identity cannot remain pinned through exec.
-    let provider_supports_prompt_acceptance_v1 = describe.capabilities.prompt_acceptance_v1
-        && !matches!(artifact, ProviderArtifactRef::Script { .. });
+    let provider_supports_prompt_acceptance_v1 = describe.capabilities.prompt_acceptance_v1;
     let candidate = build_launch_candidate(context)
         .map_err(|message| terminal_attempt_error(invalid_provider_input_error(message)))?;
     let policy_request = build_policy_request(context, &candidate, registry.host_options())
@@ -171,6 +159,7 @@ fn attempt_account_dispatch(
     let launch_request = build_launch_request(
         context,
         &candidate,
+        endpoint.family(),
         registry.host_options(),
         launch_prompt_acceptance_v1_enabled,
         describe.capabilities.launch_output_v1,
@@ -196,6 +185,16 @@ fn attempt_account_dispatch(
             return Err(classify_provider_client_attempt_error(error));
         }
     };
+    let verified_session = match verify_launch_session_authority(context, &endpoint, &launch_result)
+    {
+        Ok(verified) => verified,
+        Err(error) => {
+            finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            return Err(terminal_attempt_error(protocol_service_error(
+                error.protocol_kind(),
+            )));
+        }
+    };
     if spawn_identity.is_some() {
         if require_recorded_external_generation(&recorded_generation).is_err() {
             finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
@@ -206,7 +205,7 @@ fn attempt_account_dispatch(
         if backfill_external_launch_session_id(
             spawn_identity.as_ref(),
             &recorded_generation,
-            &launch_result,
+            verified_session.as_ref(),
         )
         .is_err()
         {
@@ -226,7 +225,7 @@ fn attempt_account_dispatch(
         }
     }
     let classification =
-        classify_after_launch_success(registry, &client, &describe, context, &launch_result);
+        classify_after_launch_success(registry, &client, describe, context, &launch_result);
 
     Ok(map_launch_result_with_terminal_classification(
         launch_result,
@@ -279,39 +278,12 @@ fn external_launch_spawn_observer(
 }
 
 fn external_launch_event_observer(
-    context: Option<&SpawnIdentityContext>,
-    recorded_generation: RecordedLaunchGeneration,
     output_spool: ExecutionOutputSpool,
 ) -> Option<LaunchEventObserver> {
-    let context = context.cloned();
     Some(LaunchEventObserver::new(move |event| {
         observe_output(&output_spool, event)?;
-        if let Some(context) = &context {
-            backfill_external_launch_session_marker(context, &recorded_generation, event);
-        }
         Ok(())
     }))
-}
-
-fn backfill_external_launch_session_marker(
-    context: &SpawnIdentityContext,
-    recorded_generation: &RecordedLaunchGeneration,
-    event: &DecodedLaunchEvent,
-) {
-    let DecodedLaunchEvent::Marker { name, value, .. } = event else {
-        return;
-    };
-    if name != PROVIDER_SESSION_MARKER {
-        return;
-    }
-    let Some(session_id) = marker_provider_session_id(value) else {
-        return;
-    };
-    let generation = recorded_generation
-        .lock()
-        .ok()
-        .and_then(|generation| generation.as_ref()?.as_ref().ok().cloned());
-    let _ = backfill_captured_session_id(Some(context), generation.as_ref(), &session_id);
 }
 
 fn remember_recorded_launch_generation(
@@ -353,11 +325,31 @@ fn finalize_failed_external_launch(
 fn backfill_external_launch_session_id(
     context: Option<&SpawnIdentityContext>,
     recorded_generation: &RecordedLaunchGeneration,
-    result: &LaunchResult,
+    verified: Option<&VerifiedSessionAuthority>,
 ) -> Result<(), String> {
-    let Some(session_id) = launch_provider_session_id(result) else {
+    let Some(verified) = verified else {
         return Ok(());
     };
     let generation = require_recorded_external_generation(recorded_generation)?;
-    backfill_captured_session_id(context, Some(&generation), &session_id)
+    backfill_captured_session_id(context, Some(&generation), verified.provider_session_id())
+}
+
+fn verify_launch_session_authority(
+    context: &ExternalProviderDispatchContext,
+    endpoint: &crate::provider_registry::PinnedProviderEndpoint,
+    result: &LaunchResult,
+) -> Result<Option<VerifiedSessionAuthority>, crate::session_authority::SessionAuthorityError> {
+    let observed_session_id = launch_provider_session_id(result);
+    verify_session_authority(
+        SessionAuthorityExpectation {
+            account_name: &context.provider.name,
+            provider_session_id: context.start_known_provider_session_id.as_deref(),
+        },
+        observed_session_id
+            .as_deref()
+            .map(|provider_session_id| AuthoritativeSessionObservation {
+                account_name: endpoint.account_name(),
+                provider_session_id,
+            }),
+    )
 }

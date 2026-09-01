@@ -54,6 +54,11 @@ pub(crate) fn run_repl(
         return Ok(1);
     };
     validator::validate_provider_repl_capability(&provider)?;
+    execution::require_eager_pty_resume_observation(
+        &agent_runtime_services.provider_registry_handle.current(),
+        &provider.name,
+        resume_session_id.as_deref(),
+    )?;
 
     let mut attempt = start_repl_invocation(
         agent_runtime_services,

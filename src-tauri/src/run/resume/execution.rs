@@ -223,10 +223,10 @@ pub(super) fn prepare_resume_attempt_target(
 }
 
 pub(super) fn resume_attempt_strategy_for_target<'a>(
-    resolved: &oulipoly_state::ResolvedResume,
     provider: &'a oulipoly_config::ProviderConfig,
+    account_endpoint_configured: bool,
 ) -> Result<Option<&'a oulipoly_config::ResumeStrategy>, i32> {
-    if resolved_uses_provider_ref(resolved) {
+    if account_endpoint_configured {
         return Ok(None);
     }
     provider.resume.as_ref().map(Some).ok_or_else(|| {
@@ -243,7 +243,18 @@ pub(super) fn execute_resume_attempt_command(
     invocation_env: &str,
     strategy: Option<&oulipoly_config::ResumeStrategy>,
 ) -> Result<executor::ExecutionResult, String> {
-    if let Some(model) = eligible_provider_ref_resume_model(input.resolved) {
+    if input
+        .agent_runtime_services
+        .provider_registry_handle
+        .current()
+        .has_account_endpoint(&provider.name)
+    {
+        let model = input.resolved.model.as_ref().ok_or_else(|| {
+            format!(
+                "provider account {} resume requires a resolved model for endpoint launch",
+                provider.name
+            )
+        })?;
         let request = provider_ref_resume_executor_request(
             input,
             model,
@@ -274,15 +285,6 @@ pub(super) fn execute_resume_attempt_command(
         input.resolved.model_name.as_deref().unwrap_or("<unknown>"),
         Some(&input.env.models_dir),
     )
-}
-
-fn eligible_provider_ref_resume_model(
-    resolved: &oulipoly_state::ResolvedResume,
-) -> Option<&oulipoly_config::ModelConfig> {
-    resolved
-        .model
-        .as_ref()
-        .filter(|model| model.provider.is_some())
 }
 
 fn provider_ref_resume_executor_request(

@@ -16,6 +16,10 @@
 //! ```
 
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
+use oulipoly_runtime::session_authority::{
+    AuthoritativeSessionObservation, SessionAuthorityCommitRequest, SessionAuthorityExpectation,
+    commit_session_authority,
+};
 
 use super::finalization::{
     CompletedAttemptControl, CompletedAttemptInput, finalize_completed_attempt,
@@ -115,6 +119,14 @@ fn bind_resume_attempt_session(
     invocation_row_id: i64,
     provider_session_id: &str,
 ) -> Result<(), String> {
+    if input
+        .agent_runtime_services
+        .provider_registry_handle
+        .current()
+        .has_account_endpoint(&provider.name)
+    {
+        return Ok(());
+    }
     input.env.state.bind_invocation_provider_session_start(
         invocation_row_id,
         &mapper::resumed_provider_session_binding(
@@ -130,6 +142,71 @@ fn bind_resume_attempt_session(
             .record_legacy_resume_input_session_id(invocation_row_id, input.session_id)?;
     }
     Ok(())
+}
+
+pub(super) fn commit_resume_session_authority(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &ResumeInvocationAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    result: &oulipoly_runtime::executor::ExecutionResult,
+) -> Result<(), String> {
+    if !input
+        .agent_runtime_services
+        .provider_registry_handle
+        .current()
+        .has_account_endpoint(&provider.name)
+    {
+        return Ok(());
+    }
+    let observed_provider_name = result_provider_name(input, result)?;
+    let observed_session_id = match result.session_capture.method {
+        oulipoly_runtime::executor::SessionCaptureMethod::ExternalProviderLaunch => {
+            result.session_capture.session_id.as_deref()
+        }
+        _ => None,
+    };
+    commit_session_authority(SessionAuthorityCommitRequest {
+        state: &input.env.state,
+        invocation_row_id: attempt.invocation_row_id,
+        invocation_uuid: &attempt.invocation.id,
+        expectation: SessionAuthorityExpectation {
+            account_name: &provider.name,
+            provider_session_id: Some(&input.resolved.active_session_id),
+        },
+        observation: observed_session_id.map(|provider_session_id| {
+            AuthoritativeSessionObservation {
+                account_name: observed_provider_name,
+                provider_session_id,
+            }
+        }),
+        capture_method: result.session_capture.method.db_value(),
+        resume_input_id: Some(input.session_id.to_string()),
+        provider_session_resolved_account:
+            crate::migration_providers::provider_session_resolved_account(
+                provider,
+                &input.resolved.active_session_id,
+            ),
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn result_provider_name<'a>(
+    input: &'a ResumeAttemptInput<'_>,
+    result: &oulipoly_runtime::executor::ExecutionResult,
+) -> Result<&'a str, String> {
+    input
+        .resolved
+        .model
+        .as_ref()
+        .and_then(|model| model.providers.get(result.provider_index))
+        .map(|provider| provider.name.as_str())
+        .ok_or_else(|| {
+            format!(
+                "endpoint resume returned provider index {} outside the resolved model pool",
+                result.provider_index
+            )
+        })
 }
 
 fn should_record_legacy_resume_input(manual_migrate: Option<&str>) -> bool {

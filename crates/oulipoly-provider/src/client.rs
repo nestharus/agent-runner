@@ -275,6 +275,21 @@ impl ProviderClient {
             .map(|resolved| resolved.executable.as_path())
     }
 
+    /// Build another client for the exact executable already resolved and
+    /// pinned by this client. This changes operation-local options without
+    /// re-resolving a pathname or opening a replacement executable.
+    pub fn fork_from_pinned(
+        &self,
+        options: ProviderClientOptions,
+    ) -> Result<Self, ProviderClientError> {
+        let resolved = self.resolve("describe", None)?;
+        let fork = Self::new(self.artifact.clone(), options);
+        fork.resolved
+            .set(resolved)
+            .expect("new provider client cannot already contain a resolved command");
+        Ok(fork)
+    }
+
     pub fn invoke_typed<T, I>(
         &self,
         subcommand: &str,

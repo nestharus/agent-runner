@@ -241,8 +241,9 @@ impl ExecutorServicePort for RuntimeExecutorService {
         &self,
         request: ExecutorServiceRequest,
     ) -> Result<ExecutorServiceOutput, ServiceError> {
-        let result = if request_model_has_external_provider(&request) {
-            execute_external_provider(self.provider_registry.current(), request)
+        let registry = self.provider_registry.current();
+        let result = if request_has_account_endpoint(&registry, &request) {
+            execute_external_provider(registry, request)
         } else {
             execute_legacy(request)
         }?;
@@ -456,13 +457,28 @@ fn external_provider_context_from_request(
     })
 }
 
-fn request_model_has_external_provider(request: &ExecutorServiceRequest) -> bool {
+fn request_has_account_endpoint(
+    registry: &ProviderRegistry,
+    request: &ExecutorServiceRequest,
+) -> bool {
+    selected_request_account_name(request)
+        .is_some_and(|account_name| registry.has_account_endpoint(account_name))
+}
+
+fn selected_request_account_name(request: &ExecutorServiceRequest) -> Option<&str> {
     match request {
-        ExecutorServiceRequest::Facade { model, .. }
-        | ExecutorServiceRequest::Effective { model, .. }
-        | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId { model, .. }
-        | ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId { model, .. } => {
-            model.provider.is_some()
+        ExecutorServiceRequest::Facade {
+            model,
+            provider_index,
+            ..
+        } => model
+            .providers
+            .get(*provider_index)
+            .map(|provider| provider.name.as_str()),
+        ExecutorServiceRequest::Effective { provider, .. }
+        | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId { provider, .. }
+        | ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId { provider, .. } => {
+            Some(provider.name.as_str())
         }
     }
 }

@@ -19,7 +19,7 @@ use super::context::ExternalProviderDispatchContext;
 use crate::executor::cli::spawn_identity::{
     PARENT_INVOCATION_ENV, provider_parent_invocation_env, split_invocation_launch_environment,
 };
-use crate::executor::cli::{provider_name, resolve_input_flags, shell_split};
+use crate::executor::cli::{resolve_input_flags, shell_split};
 use crate::provider_registry::DescribeHostOptions;
 use oulipoly_config::PromptMode;
 use oulipoly_core::AutoWakeEnvironmentVariable;
@@ -32,7 +32,7 @@ use oulipoly_provider::generated::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const DATA_DIR_ENV: &str = oulipoly_state::paths::DATA_DIR_ENV;
 // This is the OpenCode external-provider positional-prompt boundary, not a
@@ -170,11 +170,12 @@ pub(crate) fn build_policy_request(
 pub(crate) fn build_launch_request(
     context: &ExternalProviderDispatchContext,
     candidate: &LaunchCandidate,
+    endpoint_family: &str,
     host_options: &DescribeHostOptions,
     include_prompt_acceptance_v1: bool,
     include_launch_output_v1: bool,
 ) -> Result<Value, serde_json::Error> {
-    let (argv, launch_stdin) = project_launch_carrier(context, candidate);
+    let (argv, launch_stdin) = project_launch_carrier(endpoint_family, candidate);
     let mut launch_env = candidate.env.clone();
     if let Some(authority) = &candidate.completion_registration_authority {
         launch_env.insert(
@@ -242,13 +243,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[allow(clippy::needless_as_bytes)] // Keep the provider contract's byte unit explicit.
 fn project_launch_carrier(
-    context: &ExternalProviderDispatchContext,
+    endpoint_family: &str,
     candidate: &LaunchCandidate,
 ) -> (Vec<String>, Option<String>) {
     let mut argv = candidate.argv.clone();
     let mut stdin = candidate.stdin.clone();
-    if context.model.provider.is_none()
-        || !is_opencode_provider(context)
+    if endpoint_family != "opencode"
         || !matches!(candidate.prompt_mode, PromptMode::Arg)
         || candidate.prompt.as_bytes().len()
             < OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES
@@ -275,19 +275,6 @@ fn project_launch_carrier(
     }
     argv.remove(prompt_index);
     (argv, stdin)
-}
-
-fn is_opencode_provider(context: &ExternalProviderDispatchContext) -> bool {
-    if context.provider.name.starts_with("opencode") {
-        return true;
-    }
-
-    let provider = provider_name(&context.provider.command);
-    Path::new(&provider)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(provider.as_str())
-        .starts_with("opencode")
 }
 
 fn provider_argv(context: &ExternalProviderDispatchContext, input_args: &[String]) -> Vec<String> {
@@ -527,7 +514,10 @@ fn request_id(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LaunchCandidate, PromptAcceptanceCandidate, prompt_acceptance_request};
+    use super::{
+        LaunchCandidate, OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES,
+        PromptAcceptanceCandidate, project_launch_carrier, prompt_acceptance_request,
+    };
     use crate::services::MailboxDeliveryCorrelation;
     use oulipoly_config::PromptMode;
     use std::collections::BTreeMap;
@@ -574,5 +564,20 @@ mod tests {
         candidate.prompt_acceptance = None;
 
         assert_eq!(prompt_acceptance_request(&candidate), None);
+    }
+
+    #[test]
+    fn long_prompt_carrier_uses_only_the_explicit_endpoint_family() {
+        let prompt = "x".repeat(OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES);
+        let mut candidate = launch_candidate(&prompt, None);
+        candidate.argv = vec!["run".to_string(), prompt.clone()];
+
+        let (opencode_argv, opencode_stdin) = project_launch_carrier("opencode", &candidate);
+        let (other_argv, other_stdin) = project_launch_carrier("other-family", &candidate);
+
+        assert_eq!(opencode_argv, ["run"]);
+        assert_eq!(opencode_stdin.as_deref(), Some(prompt.as_str()));
+        assert_eq!(other_argv, ["run", prompt.as_str()]);
+        assert_eq!(other_stdin, None);
     }
 }

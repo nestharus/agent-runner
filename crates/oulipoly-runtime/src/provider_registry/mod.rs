@@ -193,6 +193,10 @@ impl ProviderRegistry {
         self.account_artifacts.get(account_name).cloned()
     }
 
+    pub fn has_account_endpoint(&self, account_name: &str) -> bool {
+        self.account_artifacts.contains_key(account_name)
+    }
+
     pub fn configured_family_names(&self) -> Vec<String> {
         let mut names = self.family_artifacts.keys().cloned().collect::<Vec<_>>();
         names.sort();

@@ -238,7 +238,12 @@ fn run_resume_attempt(
     };
     let provider_index = target.provider_index;
     let provider = target.provider;
-    let strategy = match resolve_resume_attempt_strategy(input.resolved, &provider) {
+    let account_endpoint_configured = input
+        .agent_runtime_services
+        .provider_registry_handle
+        .current()
+        .has_account_endpoint(&provider.name);
+    let strategy = match resolve_resume_attempt_strategy(&provider, account_endpoint_configured) {
         Ok(strategy) => strategy,
         Err(exit_code) => return Ok(ResumeAttemptLoopControl::Return(exit_code)),
     };
@@ -271,6 +276,8 @@ fn run_resume_attempt(
         }
     };
 
+    lifecycle::commit_resume_session_authority(&input, &bound_attempt.attempt, &provider, &result)?;
+
     terminal::handle_resume_attempt_result(&mut input, &mut bound_attempt, &provider, &mut result)
 }
 
@@ -289,8 +296,8 @@ fn prepare_resume_attempt_target(
 }
 
 fn resolve_resume_attempt_strategy<'a>(
-    resolved: &oulipoly_state::ResolvedResume,
     provider: &'a oulipoly_config::ProviderConfig,
+    account_endpoint_configured: bool,
 ) -> Result<Option<&'a oulipoly_config::ResumeStrategy>, i32> {
-    execution::resume_attempt_strategy_for_target(resolved, provider)
+    execution::resume_attempt_strategy_for_target(provider, account_endpoint_configured)
 }

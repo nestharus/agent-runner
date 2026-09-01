@@ -38,6 +38,19 @@ pub struct ProviderSessionBinding {
     pub provider_session_resolved_account: Option<String>,
 }
 
+pub struct ProviderSessionAuthorityCommit<'a> {
+    pub invocation_uuid: &'a str,
+    pub provider_name: &'a str,
+    pub binding: &'a ProviderSessionBinding,
+}
+
+struct ExistingProviderSessionBinding {
+    invocation_uuid: String,
+    provider_name: Option<String>,
+    provider_session_id: Option<String>,
+    status: String,
+}
+
 struct InvocationChainMintRow {
     model_name: String,
     provider_name: String,
@@ -90,6 +103,82 @@ impl StateDb {
         }
         tx.commit()
             .map_err(Self::format_provider_session_binding_commit_error)
+    }
+
+    pub fn commit_invocation_provider_session_authority(
+        &self,
+        invocation_row_id: i64,
+        commit: &ProviderSessionAuthorityCommit<'_>,
+    ) -> Result<(), String> {
+        let tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(Self::format_provider_session_binding_begin_error)?;
+        let existing = Self::load_existing_provider_session_authority(&tx, invocation_row_id)?;
+        Self::validate_provider_session_authority(invocation_row_id, commit, &existing)?;
+        Self::validate_provider_session_rebind(
+            invocation_row_id,
+            commit.binding,
+            existing.provider_session_id.as_deref(),
+        )?;
+        Self::write_provider_session_binding(&tx, invocation_row_id, commit.binding)?;
+        if Self::provider_session_binding_should_mint_chain(commit.binding) {
+            Self::mint_chain_for_invocation_session_on(&tx, invocation_row_id)?;
+        }
+        tx.commit()
+            .map_err(Self::format_provider_session_binding_commit_error)
+    }
+
+    fn load_existing_provider_session_authority(
+        conn: &sqlite::Connection,
+        invocation_row_id: i64,
+    ) -> Result<ExistingProviderSessionBinding, String> {
+        conn.query_row(
+            "SELECT invocation_uuid, provider_name, provider_session_id, status
+             FROM invocations
+             WHERE id = ?1",
+            sqlite::params![invocation_row_id],
+            |row| {
+                Ok(ExistingProviderSessionBinding {
+                    invocation_uuid: row.get(0)?,
+                    provider_name: row.get(1)?,
+                    provider_session_id: row.get(2)?,
+                    status: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            format!("Failed to read invocation {invocation_row_id} session authority: {error}")
+        })?
+        .ok_or_else(|| {
+            Self::format_provider_session_binding_missing_invocation_error(invocation_row_id)
+        })
+    }
+
+    fn validate_provider_session_authority(
+        invocation_row_id: i64,
+        commit: &ProviderSessionAuthorityCommit<'_>,
+        existing: &ExistingProviderSessionBinding,
+    ) -> Result<(), String> {
+        if existing.invocation_uuid != commit.invocation_uuid {
+            return Err(format!(
+                "Invocation {invocation_row_id} UUID mismatch: expected {}, observed {}",
+                commit.invocation_uuid, existing.invocation_uuid
+            ));
+        }
+        if existing.provider_name.as_deref() != Some(commit.provider_name) {
+            return Err(format!(
+                "Invocation {invocation_row_id} provider mismatch: expected {}, observed {}",
+                commit.provider_name,
+                existing.provider_name.as_deref().unwrap_or("<none>")
+            ));
+        }
+        if existing.status != "running" {
+            return Err(format!(
+                "Invocation {invocation_row_id} is no longer running; refusing provider session authority"
+            ));
+        }
+        Ok(())
     }
 
     fn format_provider_session_binding_begin_error(e: sqlite::Error) -> String {

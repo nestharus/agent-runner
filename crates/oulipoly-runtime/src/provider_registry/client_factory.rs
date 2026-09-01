@@ -51,14 +51,13 @@ impl ProviderClientFactory {
         )
     }
 
-    pub(crate) fn client_for_with_observers(
+    pub(crate) fn client_from_pinned_with_observers(
         &self,
-        artifact: ProviderArtifactRef,
+        pinned: &ProviderClient,
         spawn_observer: Option<ProcessSpawnObserver>,
         launch_event_observer: Option<LaunchEventObserver>,
-    ) -> ProviderClient {
-        ProviderClient::new(
-            artifact,
+    ) -> Result<ProviderClient, oulipoly_provider::error::ProviderClientError> {
+        pinned.fork_from_pinned(
             self.options
                 .clone()
                 .with_spawn_observer(spawn_observer)

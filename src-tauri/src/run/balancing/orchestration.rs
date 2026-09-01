@@ -39,7 +39,9 @@ use super::predicate::{
     attempts_exhausted, confirmed_zero_turn_exhaustion, provider_selection_pool_exhausted,
     should_defer_generic_exit, should_late_bind_zero_turn_baseline,
 };
-use super::state_update::bind_start_known_provider_session_if_present;
+use super::state_update::{
+    bind_start_known_provider_session_if_present, commit_balanced_session_authority,
+};
 use crate::captured_child::emit_captured_child_marker_lines;
 use crate::error_emit::effective_model_for_execution;
 use crate::invocation::finalize::FinalizerGuard;
@@ -205,6 +207,23 @@ fn run_with_balancing_environment(
             extra_inputs,
             &mut attempt,
         )?;
+        if agent_runtime_services
+            .provider_registry_handle
+            .current()
+            .has_account_endpoint(provider_name)
+        {
+            let observed_provider_name = result_provider_name(model, &result)?;
+            commit_balanced_session_authority(
+                &env.state,
+                attempt.invocation_row_id,
+                &attempt.invocation.id,
+                provider_name,
+                observed_provider_name,
+                attempt.start_known_provider_session_id.as_deref(),
+                attempt.start_known_provider_session_mode,
+                &result,
+            )?;
+        }
         let zero_turn = classify_balanced_zero_turn_result(BalancedZeroTurnInput {
             env: &env,
             provider_name,
@@ -261,6 +280,22 @@ fn run_with_balancing_environment(
             BalancedLoopControl::Return(result) => return result,
         }
     }
+}
+
+fn result_provider_name<'a>(
+    model: &'a ModelConfig,
+    result: &executor::ExecutionResult,
+) -> Result<&'a str, String> {
+    model
+        .providers
+        .get(result.provider_index)
+        .map(|provider| provider.name.as_str())
+        .ok_or_else(|| {
+            format!(
+                "executor returned provider index {} outside model {} pool",
+                result.provider_index, model.name
+            )
+        })
 }
 
 struct BalancedAttemptProvider {
@@ -395,11 +430,17 @@ fn start_balanced_attempt<'state>(
     let guard = FinalizerGuard::new(&env.state, invocation_row_id);
     let start_known_provider_session =
         start_known_provider_session_for_attempt(provider, pending_verification)?;
-    bind_start_known_provider_session_if_present(
-        &env.state,
-        invocation_row_id,
-        start_known_provider_session.id.as_deref(),
-    );
+    if !agent_runtime_services
+        .provider_registry_handle
+        .current()
+        .has_account_endpoint(provider_name)
+    {
+        bind_start_known_provider_session_if_present(
+            &env.state,
+            invocation_row_id,
+            start_known_provider_session.id.as_deref(),
+        );
+    }
     let zero_turn_baseline = zero_turn_record_baseline(
         &env.state,
         &env.sessions_cfg,
