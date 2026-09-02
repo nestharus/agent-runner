@@ -15,7 +15,7 @@
 
 use super::capability_gate::gate_required_capabilities;
 use super::client_invoker::{invoke_provider_launch, invoke_provider_policy};
-use super::context::{AccountSelection, ExternalProviderDispatchContext};
+use super::context::ExternalProviderDispatchContext;
 use super::error_mapper::{
     invalid_provider_input_error, map_provider_client_error, map_registry_error,
     protocol_service_error, provider_client_error_is_rotatable, service_error,
@@ -76,46 +76,23 @@ pub(crate) fn dispatch(
     registry: &ProviderRegistry,
     context: ExternalProviderDispatchContext,
 ) -> Result<ExecutionResult, ServiceError> {
-    // FIX #32: rotate over the pool on transport-timeout / account-unavailable
-    // classes, terminal-failing only once every account has been tried. The
-    // order is bounded by the pool size — the originally selected account first,
-    // then the remaining accounts in declaration order.
-    let order = account_rotation_order(&context);
-    let last_index = order.len().saturating_sub(1);
-    for (position, account) in order.into_iter().enumerate() {
-        let account_context = context.with_account(account);
-        match attempt_account_dispatch(registry, &account_context) {
-            Ok(result) => return Ok(result),
-            Err(attempt) => {
-                if attempt.rotatable && position < last_index {
-                    continue;
-                }
-                return Err(attempt.service_error);
+    match attempt_account_dispatch(registry, &context) {
+        Ok(result) => Ok(result),
+        Err(attempt) => {
+            if attempt.rotatable && context.model.providers.len() > 1 {
+                return Err(account_lifecycle_transfer_unavailable());
             }
+            Err(attempt.service_error)
         }
     }
-
-    // `account_rotation_order` always yields at least the selected account, so
-    // the loop above always returns; this guards a degenerate empty pool.
-    Err(protocol_service_error("empty_provider_pool"))
 }
 
-fn account_rotation_order(context: &ExternalProviderDispatchContext) -> Vec<AccountSelection> {
-    // Selected account first, preserving the caller-provided (possibly
-    // canonicalized) provider config for that index.
-    let mut order = vec![AccountSelection {
-        provider: context.provider.clone(),
-        provider_index: context.provider_index,
-    }];
-    for (index, provider) in context.model.providers.iter().enumerate() {
-        if index != context.provider_index {
-            order.push(AccountSelection {
-                provider: provider.clone(),
-                provider_index: index,
-            });
-        }
+fn account_lifecycle_transfer_unavailable() -> ServiceError {
+    ServiceError::Unavailable {
+        message: "account lifecycle transfer is unavailable; sibling launch was not attempted"
+            .to_string(),
+        code: Some("account_lifecycle_transfer_unavailable".to_string()),
     }
-    order
 }
 
 fn attempt_account_dispatch(
@@ -125,6 +102,11 @@ fn attempt_account_dispatch(
     let endpoint = registry
         .preflight_account(&context.provider.name)
         .map_err(|error| terminal_attempt_error(map_registry_error(error)))?;
+    let settings_id = endpoint
+        .settings_id()
+        .map_err(|error| terminal_attempt_error(map_registry_error(error)))?;
+    let account_context = context.with_settings_id(settings_id);
+    let context = &account_context;
     let output_spool = ExecutionOutputSpool::new().map_err(|_| {
         terminal_attempt_error(protocol_service_error("launch_output_spool_create_failed"))
     })?;
@@ -138,7 +120,8 @@ fn attempt_account_dispatch(
         .client_from_pinned_with_observers(endpoint.client(), spawn_observer, launch_event_observer)
         .map_err(classify_provider_client_attempt_error)?;
     let describe = endpoint.capabilities();
-    gate_required_capabilities(&describe)
+    let provider_instance_id = format!("{}-instance", describe.provider_id);
+    gate_required_capabilities(describe)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
     if !describe.capabilities.launch_output_v1 {
         return Err(terminal_attempt_error(protocol_service_error(
@@ -148,8 +131,13 @@ fn attempt_account_dispatch(
     let provider_supports_prompt_acceptance_v1 = describe.capabilities.prompt_acceptance_v1;
     let candidate = build_launch_candidate(context)
         .map_err(|message| terminal_attempt_error(invalid_provider_input_error(message)))?;
-    let policy_request = build_policy_request(context, &candidate, registry.host_options())
-        .map_err(|_| terminal_attempt_error(protocol_service_error("schema_invalid_request")))?;
+    let policy_request = build_policy_request(
+        context,
+        &candidate,
+        &provider_instance_id,
+        registry.host_options(),
+    )
+    .map_err(|_| terminal_attempt_error(protocol_service_error("schema_invalid_request")))?;
     let policy_result = invoke_provider_policy(&client, policy_request)
         .map_err(classify_provider_client_attempt_error)?;
     let candidate = apply_policy_transform(candidate, policy_result)
@@ -159,6 +147,7 @@ fn attempt_account_dispatch(
     let launch_request = build_launch_request(
         context,
         &candidate,
+        &provider_instance_id,
         endpoint.family(),
         registry.host_options(),
         launch_prompt_acceptance_v1_enabled,
@@ -352,4 +341,20 @@ fn verify_launch_session_authority(
                 provider_session_id,
             }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::account_lifecycle_transfer_unavailable;
+    use crate::services::ServiceError;
+
+    #[test]
+    fn sibling_rotation_fails_closed_with_typed_lifecycle_outcome() {
+        assert!(matches!(
+            account_lifecycle_transfer_unavailable(),
+            ServiceError::Unavailable { message, code }
+                if message == "account lifecycle transfer is unavailable; sibling launch was not attempted"
+                    && code.as_deref() == Some("account_lifecycle_transfer_unavailable")
+        ));
+    }
 }

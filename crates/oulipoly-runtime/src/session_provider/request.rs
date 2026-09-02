@@ -37,7 +37,7 @@ pub(super) fn base_request(
         host_options,
         extra,
         request_id,
-    );
+    )?;
     serialize_session_request(envelope)
 }
 
@@ -52,15 +52,15 @@ fn session_request_envelope(
     host_options: &DescribeHostOptions,
     extra: JsonObject,
     request_id: String,
-) -> RequestEnvelope<SessionBaseParams> {
+) -> Result<RequestEnvelope<SessionBaseParams>, SessionProviderError> {
     let session_id = session_id_string(non_empty_session_id(session_id));
-    RequestEnvelope {
+    Ok(RequestEnvelope {
         contract: CONTRACT_VERSION.to_string(),
         request_id,
-        provider_instance_id: Some(provider_instance_id(identity)),
+        provider_instance_id: Some(provider_instance_id(identity)?.to_string()),
         host: host_context(effective_cwd, host_options),
         params: session_base_params(identity, session_id, extra),
-    }
+    })
 }
 
 fn serialize_session_request(
@@ -76,10 +76,12 @@ fn session_base_params(
     session_id: Option<String>,
     mut extra: JsonObject,
 ) -> SessionBaseParams {
-    extra.insert(
-        "model_name".to_string(),
-        Value::String(identity.model_name.clone()),
-    );
+    if !identity.model_name.is_empty() {
+        extra.insert(
+            "model_name".to_string(),
+            Value::String(identity.model_name.clone()),
+        );
+    }
     extra.insert(
         "provider_name".to_string(),
         Value::String(identity.provider_name.clone()),
@@ -158,7 +160,7 @@ pub(super) fn page_request(
     let envelope = RequestEnvelope {
         contract: CONTRACT_VERSION.to_string(),
         request_id: session_request_id("read-page"),
-        provider_instance_id: Some(provider_instance_id(&request.identity)),
+        provider_instance_id: Some(provider_instance_id(&request.identity)?.to_string()),
         host,
         params: SessionReadTurnsParams {
             settings_id: request.identity.settings_id.clone(),
@@ -296,7 +298,7 @@ pub(super) fn enumerate_request(
     let envelope = RequestEnvelope {
         contract: CONTRACT_VERSION.to_string(),
         request_id: session_request_id("enumerate"),
-        provider_instance_id: Some(provider_instance_id(&request.identity)),
+        provider_instance_id: Some(provider_instance_id(&request.identity)?.to_string()),
         host: host_context(request.effective_cwd, host_options),
         params: SessionEnumerateParams {
             settings_id: request.identity.settings_id.clone(),
@@ -346,11 +348,19 @@ fn insert_optional_usize(extra: &mut JsonObject, key: &str, value: Option<usize>
     }
 }
 
-pub(super) fn provider_instance_id(identity: &SessionProviderIdentity) -> String {
+pub(super) fn provider_instance_id(
+    identity: &SessionProviderIdentity,
+) -> Result<&str, SessionProviderError> {
     identity
         .provider_instance_id
-        .clone()
-        .unwrap_or_else(|| identity.provider_name.clone())
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            SessionProviderError::new(
+                "session_provider_instance_identity_missing",
+                "selected account endpoint did not supply an authenticated provider instance identity",
+            )
+        })
 }
 
 #[cfg(test)]

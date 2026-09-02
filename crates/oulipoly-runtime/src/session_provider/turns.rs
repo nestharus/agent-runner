@@ -91,7 +91,7 @@ fn validate_page_envelope(
     if captured_response_bytes > request.max_response_bytes as usize {
         return Err(page_error("provider_page_response_budget_exceeded"));
     }
-    if result.provider_instance_id != provider_instance_id(&request.identity)
+    if result.provider_instance_id != provider_instance_id(&request.identity)?
         || result.settings_id != request.identity.settings_id
         || result.session_id != request.session_id
         || map_projection(result.turn_projection) != request.projection

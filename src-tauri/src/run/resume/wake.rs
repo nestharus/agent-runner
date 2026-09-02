@@ -118,10 +118,9 @@ pub(super) fn reconcile_pending_headless_delivery_observations(
             provider_instance_id: provider_identity.provider_instance_id,
             settings_id: provider_identity.settings_id,
         };
-        let provider_instance_id = identity
-            .provider_instance_id
-            .as_deref()
-            .unwrap_or(identity.provider_name.as_str());
+        let Some(provider_instance_id) = identity.provider_instance_id.as_deref() else {
+            continue;
+        };
         if provider_instance_id != anchor.provider_instance_id
             || identity.settings_id != anchor.settings_id
             || anchor.provider_session_id != resolved.active_session_id
@@ -203,7 +202,7 @@ fn capture_pre_delivery_observation_anchor(
     let provider_instance_id = identity
         .provider_instance_id
         .clone()
-        .unwrap_or_else(|| identity.provider_name.clone());
+        .ok_or_else(|| "session_provider_instance_identity_missing".to_string())?;
     let registry = input
         .agent_runtime_services
         .provider_registry_handle
@@ -405,7 +404,7 @@ fn confirm_mailbox_delivery_from_anchor(
     let provider_instance_id = identity
         .provider_instance_id
         .clone()
-        .unwrap_or_else(|| identity.provider_name.clone());
+        .ok_or_else(|| "session_provider_instance_identity_missing".to_string())?;
     if provider_instance_id != anchor.provider_instance_id
         || identity.settings_id != anchor.settings_id
     {

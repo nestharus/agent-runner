@@ -129,6 +129,7 @@ fn parses_account_provider_implementation() {
         r#"
 [opencode]
 command = "opencode1"
+settings_id = "work"
 
 [opencode.implementation]
 family = "opencode"
@@ -146,6 +147,24 @@ executable = "/opt/oulipoly/agent-runner-opencode"
         "/opt/oulipoly/agent-runner-opencode"
     );
     assert_eq!(implementation.family, "opencode");
+    assert_eq!(
+        cfg.get("opencode").unwrap().settings_id.as_deref(),
+        Some("work")
+    );
+}
+
+#[test]
+fn rejects_blank_account_settings_identity() {
+    let err = load_inline_providers(
+        r#"
+[opencode]
+command = "opencode1"
+settings_id = ""
+"#,
+    )
+    .unwrap_err();
+
+    assert!(err.contains("settings_id must not be empty"), "{err}");
 }
 
 #[test]
@@ -1253,6 +1272,7 @@ fn apply_defaults_to_raw_providers_sets_headless_for_absent_mode() {
         "claude".to_string(),
         RawEntry {
             implementation: None,
+            settings_id: None,
             quota_script: None,
             auth_refresh_command: None,
             command: Some("claude".to_string()),

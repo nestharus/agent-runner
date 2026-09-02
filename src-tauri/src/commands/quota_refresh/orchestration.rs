@@ -60,9 +60,7 @@ pub fn refresh_quotas_inner(state: &AppState) -> Result<Vec<QuotaRefreshEntry>, 
 
     candidates
         .into_iter()
-        .map(|provider_name| {
-            refresh_entry_for_provider(state, &models, &providers_cfg, &db, provider_name)
-        })
+        .map(|provider_name| refresh_entry_for_provider(state, &providers_cfg, &db, provider_name))
         .collect()
 }
 
@@ -77,7 +75,6 @@ fn refresh_candidate_provider_names(models: &HashMap<String, ModelConfig>) -> Ve
 
 fn refresh_entry_for_provider(
     state: &AppState,
-    models: &HashMap<String, ModelConfig>,
     providers_cfg: &ProvidersConfig,
     db: &StateDb,
     provider_name: String,
@@ -86,8 +83,9 @@ fn refresh_entry_for_provider(
         return Ok(mapper::fresh_entry(provider_name));
     }
 
+    let registry = state.provider_registry.current();
     let external_identity =
-        match identity::quota_service_external_identity_for_provider(models, &provider_name) {
+        match identity::quota_service_external_identity_for_provider(&registry, &provider_name) {
             Ok(identity) => identity,
             Err(message) => return Ok(failed_refresh_entry(provider_name, message)),
         };

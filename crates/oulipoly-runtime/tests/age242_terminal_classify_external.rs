@@ -5,7 +5,8 @@
 #![cfg(unix)]
 
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    ProvidersConfig, provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_runtime::executor;
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
@@ -177,9 +178,23 @@ fn execution_request(model: ModelConfig) -> ExecutorServiceRequest {
     }
 }
 
-fn provider_registry(model: &ModelConfig) -> ProviderRegistry {
-    ProviderRegistry::from_model_configs(
+fn provider_registry(model: &ModelConfig, script: &ScriptFixture) -> ProviderRegistry {
+    let providers = ProvidersConfig {
+        entries: HashMap::from([(
+            PROVIDER_NAME.to_string(),
+            ProviderEntry {
+                implementation: Some(ProviderEndpointConfig {
+                    family: "neutral-terminal-family".to_string(),
+                    executable: script.path.display().to_string(),
+                }),
+                settings_id: Some("terminal-account-settings".to_string()),
+                ..ProviderEntry::default()
+            },
+        )]),
+    };
+    ProviderRegistry::from_configs(
         std::slice::from_ref(model),
+        &providers,
         ProviderRegistryOptions::default(),
     )
     .expect("provider registry")
@@ -187,7 +202,7 @@ fn provider_registry(model: &ModelConfig) -> ProviderRegistry {
 
 fn execute_with_provider(script: &ScriptFixture) -> executor::ExecutionResult {
     let model = external_model(script);
-    let registry = provider_registry(&model);
+    let registry = provider_registry(&model, script);
     let handle = ProviderRegistryHandle::new(Arc::new(registry));
     executor::RuntimeExecutorService::with_registry_handle(handle)
         .execute(execution_request(model))
@@ -222,6 +237,7 @@ fn parse_terminal_request_json(text: &str) -> Value {
 }
 
 fn assert_recorded_bytes(request: &Value) {
+    assert_eq!(request["provider_instance_id"], "neutral-provider-instance");
     assert_eq!(request["params"]["stdout_base64"], "cmF3AP9a");
     assert_eq!(request["params"]["stderr_base64"], "ZXJy");
 }

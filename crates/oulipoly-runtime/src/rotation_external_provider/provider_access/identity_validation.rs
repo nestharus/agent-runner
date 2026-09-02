@@ -10,11 +10,6 @@ pub(super) fn validate_external_model_identity(
     resolved: &ResolvedResume,
     target_provider: &str,
 ) -> Result<(), ExternalRotationError> {
-    if model.provider.is_none() {
-        return Err(error_formatter::malformed_external_identity(
-            "model does not declare an external provider",
-        ));
-    }
     if target_provider == resolved.active_provider {
         return Err(error_formatter::malformed_external_identity(
             "external rotation target matches active provider",

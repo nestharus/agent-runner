@@ -13,6 +13,10 @@ pub enum ProviderRegistryError {
     ModelProviderNotConfigured { model_name: String },
     #[error("provider account has no explicit implementation endpoint: {account_name}")]
     AccountImplementationNotConfigured { account_name: String },
+    #[error("provider account has no explicit settings identity: {account_name}")]
+    AccountSettingsNotConfigured { account_name: String },
+    #[error("provider family has no explicit bootstrap endpoint: {family}")]
+    FamilyImplementationNotConfigured { family: String },
     #[error(
         "provider family {family} has conflicting executable authority from accounts {first_account} and {second_account}"
     )]

@@ -13,12 +13,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn build_terminal_classify_request(
     request: &TerminalClassifyServiceRequest,
+    provider_instance_id: &str,
     host_options: &DescribeHostOptions,
 ) -> Result<Value, serde_json::Error> {
     serde_json::to_value(TerminalClassifyRequest {
         contract: CONTRACT_VERSION.to_string(),
         request_id: request_id(),
-        provider_instance_id: Some(request.provider_name.clone()),
+        provider_instance_id: Some(provider_instance_id.to_string()),
         host: host_context(host_options),
         params: TerminalClassifyParams {
             stdout_base64: encode_bytes(&request.stdout),

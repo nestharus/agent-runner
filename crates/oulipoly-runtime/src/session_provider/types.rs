@@ -9,8 +9,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const S7A_NEUTRAL_SETTINGS_ID: &str = "s7a-neutral-settings";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionProviderIdentity {
     pub model_name: String,

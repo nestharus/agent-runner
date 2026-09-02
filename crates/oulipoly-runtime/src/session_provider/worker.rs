@@ -89,27 +89,8 @@ fn run_leased_session_turn_ingest_quantum(
     request: SessionTurnIngestDriverRequest<'_>,
     stream: SessionTurnIngestStream,
 ) -> Result<SessionTurnIngestQuantumOutcome, SessionProviderError> {
-    let Some(model_name) = request
-        .registry
-        .resolve_model_name_for_provider(&stream.key.provider_name)
-    else {
-        let error = "session_turn_provider_model_unresolved";
-        request
-            .state
-            .mark_session_turn_ingest_unsupported(
-                &stream.key,
-                request.lease_owner,
-                stream.checkpoint_generation,
-                error,
-            )
-            .map_err(state_error)?;
-        return Ok(SessionTurnIngestQuantumOutcome::Unsupported {
-            key: stream.key,
-            error: error.to_string(),
-        });
-    };
     let identity = SessionProviderIdentity {
-        model_name,
+        model_name: String::new(),
         provider_name: stream.key.provider_name.clone(),
         provider_instance_id: Some(stream.key.provider_instance_id.clone()),
         settings_id: stream.key.settings_id.clone(),

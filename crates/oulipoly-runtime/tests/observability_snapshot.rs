@@ -3,8 +3,8 @@
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, SessionStorage,
-    provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    ProvidersConfig, SessionStorage, provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_core::CancellationToken;
 use oulipoly_runtime::observability::{
@@ -2012,8 +2012,22 @@ print(json.dumps(response))
 
 #[cfg(unix)]
 fn external_registry(provider_path: &Path) -> ProviderRegistry {
-    ProviderRegistry::from_model_configs(
+    let providers = ProvidersConfig {
+        entries: std::collections::HashMap::from([(
+            "provider-a".to_string(),
+            ProviderEntry {
+                implementation: Some(ProviderEndpointConfig {
+                    family: "provider-a-family".to_string(),
+                    executable: provider_path.display().to_string(),
+                }),
+                settings_id: Some("provider-a-settings".to_string()),
+                ..ProviderEntry::default()
+            },
+        )]),
+    };
+    ProviderRegistry::from_configs(
         &[external_model_config(provider_path)],
+        &providers,
         ProviderRegistryOptions::default(),
     )
     .expect("external registry")

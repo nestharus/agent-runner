@@ -56,17 +56,17 @@ impl Fixture {
                         family: "selected-family".to_string(),
                         executable: self.endpoint_path.display().to_string(),
                     }),
+                    settings_id: Some("selected-account-settings".to_string()),
                     ..Default::default()
                 },
             )]),
         };
-        let registry = ProviderRegistry::from_configs(
+        ProviderRegistry::from_configs(
             std::slice::from_ref(&model),
             &providers,
             ProviderRegistryOptions::default(),
         )
-        .unwrap();
-        registry
+        .unwrap()
     }
 
     fn order(&self) -> Vec<String> {

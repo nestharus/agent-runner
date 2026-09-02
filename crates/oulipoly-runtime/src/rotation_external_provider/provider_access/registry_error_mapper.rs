@@ -12,6 +12,14 @@ pub(super) fn map_registry_identity_error(error: ProviderRegistryError) -> Exter
         ProviderRegistryError::AccountImplementationNotConfigured { account_name } => {
             error_formatter::missing_enabled_artifact(account_name)
         }
+        ProviderRegistryError::AccountSettingsNotConfigured { account_name } => {
+            error_formatter::malformed_external_identity(format!(
+                "provider account has no explicit settings identity: {account_name}"
+            ))
+        }
+        ProviderRegistryError::FamilyImplementationNotConfigured { family } => {
+            error_formatter::missing_enabled_artifact(family)
+        }
         other => map_registry_dispatch_error(other),
     }
 }
@@ -35,6 +43,14 @@ pub(super) fn map_registry_dispatch_error(error: ProviderRegistryError) -> Exter
         }
         ProviderRegistryError::AccountImplementationNotConfigured { account_name } => {
             error_formatter::missing_enabled_artifact(account_name)
+        }
+        ProviderRegistryError::AccountSettingsNotConfigured { account_name } => {
+            error_formatter::malformed_external_identity(format!(
+                "provider account has no explicit settings identity: {account_name}"
+            ))
+        }
+        ProviderRegistryError::FamilyImplementationNotConfigured { family } => {
+            error_formatter::missing_enabled_artifact(family)
         }
         conflict @ ProviderRegistryError::FamilyImplementationConflict { .. } => {
             error_formatter::malformed_external_identity(conflict.to_string())

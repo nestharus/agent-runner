@@ -11,16 +11,18 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const ACCOUNT: &str = "provider-a";
+
 // risk: Provider diagnostics loss; level: runtime settings target; source: contract "Settings-capable and unsupported describe/target tests"
 #[test]
 fn describe_settings_target_reports_capability_and_schema_id() {
     let fixture = SettingsHostFixture::new();
     let target = fixture
         .host()
-        .describe_settings_target("example-model")
+        .describe_settings_target(ACCOUNT)
         .expect("settings-capable describe should produce a target");
 
-    assert_eq!(target.model_name, "example-model");
+    assert_eq!(target.model_name, ACCOUNT);
     assert_eq!(target.provider_id, "provider-a");
     assert!(target.settings_supported);
     assert_eq!(target.schema_id.as_deref(), Some("example.settings/v1"));
@@ -32,7 +34,7 @@ fn unsupported_settings_target_returns_structured_unsupported_error() {
     let fixture = SettingsHostFixture::unsupported();
     let target = fixture
         .host()
-        .describe_settings_target("example-model")
+        .describe_settings_target(ACCOUNT)
         .expect("describe should still return a target for providers without settings");
 
     assert!(!target.settings_supported);
@@ -40,7 +42,7 @@ fn unsupported_settings_target_returns_structured_unsupported_error() {
 
     let error = fixture
         .host()
-        .settings_list("example-model")
+        .settings_list(ACCOUNT)
         .expect_err("settings.list should reject unsupported settings capability");
     assert_eq!(error.category(), "unsupported");
     assert_eq!(error.code(), Some("settings_unsupported"));
@@ -76,51 +78,42 @@ fn settings_host_invokes_only_schema_and_settings_subcommands_with_typed_envelop
 }
 
 fn invoke_settings_schema(host: &ProviderSettingsHost) -> SchemaResult {
-    host.settings_schema("example-model", "example.settings/v1")
+    host.settings_schema(ACCOUNT, "example.settings/v1")
         .expect("schema should invoke provider schema subcommand")
 }
 
 fn invoke_settings_list(host: &ProviderSettingsHost) -> SettingsListResult {
-    host.settings_list("example-model")
+    host.settings_list(ACCOUNT)
         .expect("list should invoke provider settings.list subcommand")
 }
 
 fn invoke_settings_get(host: &ProviderSettingsHost) -> SettingsGetResult {
-    host.settings_get("example-model", "record")
+    host.settings_get(ACCOUNT, "record")
         .expect("get should invoke provider settings.get subcommand")
 }
 
 fn invoke_settings_create(host: &ProviderSettingsHost) -> SettingsWriteResult {
-    host.settings_create(
-        "example-model",
-        Some("Record".to_owned()),
-        settings_values(),
-    )
-    .expect("create should invoke provider settings.create subcommand")
+    host.settings_create(ACCOUNT, Some("Record".to_owned()), settings_values())
+        .expect("create should invoke provider settings.create subcommand")
 }
 
 fn invoke_settings_update(host: &ProviderSettingsHost) -> SettingsWriteResult {
-    host.settings_update(
-        "example-model",
-        "record",
-        "opaque-version",
-        settings_values(),
-    )
-    .expect("update should invoke provider settings.update subcommand")
+    host.settings_update(ACCOUNT, "record", "opaque-version", settings_values())
+        .expect("update should invoke provider settings.update subcommand")
 }
 
 fn invoke_settings_delete(host: &ProviderSettingsHost) -> SettingsDeleteResult {
-    host.settings_delete("example-model", "record", "opaque-version")
+    host.settings_delete(ACCOUNT, "record", "opaque-version")
         .expect("delete should invoke provider settings.delete subcommand")
 }
 
 fn invoke_settings_validate(host: &ProviderSettingsHost) -> SettingsValidateResult {
-    host.settings_validate("example-model", settings_values())
+    host.settings_validate(ACCOUNT, settings_values())
         .expect("validate should invoke provider settings.validate subcommand")
 }
 
 fn invoke_settings_migrate(host: &ProviderSettingsHost) -> SettingsMigrateResult {
-    host.settings_migrate("example-model", true, legacy_settings_config())
+    host.settings_migrate(ACCOUNT, true, legacy_settings_config())
         .expect("migrate should invoke provider settings.migrate subcommand")
 }
 
@@ -255,10 +248,10 @@ fn rebuild_replaces_registry_reflects_configured_artifact_changes_and_discards_s
     .expect("initial settings host should build from configured provider artifact");
 
     let first_target = host
-        .describe_settings_target("example-model")
+        .describe_settings_target("provider-a")
         .expect("initial provider should describe");
     let first_schema = host
-        .settings_schema("example-model", "example.settings/a")
+        .settings_schema("provider-a", "example.settings/a")
         .expect("initial provider should return schema");
     assert_eq!(first_target.provider_id, "provider-a");
     assert_eq!(first_schema.schema_id, "example.settings/a");
@@ -275,10 +268,10 @@ fn rebuild_replaces_registry_reflects_configured_artifact_changes_and_discards_s
     .expect("rebuild should replace configured registry/service");
 
     let rebuilt_target = host
-        .describe_settings_target("example-model")
+        .describe_settings_target("provider-b")
         .expect("rebuilt provider should describe");
     let rebuilt_schema = host
-        .settings_schema("example-model", "example.settings/b")
+        .settings_schema("provider-b", "example.settings/b")
         .expect("rebuilt provider should return schema from the new artifact");
 
     assert_eq!(rebuilt_target.provider_id, "provider-b");
@@ -313,12 +306,7 @@ fn settings_host_preserves_conflict_error_details_and_diagnostics() {
     let host = fixture.host();
 
     let error = host
-        .settings_update(
-            "example-model",
-            "record",
-            "stale-version",
-            settings_values(),
-        )
+        .settings_update(ACCOUNT, "record", "stale-version", settings_values())
         .expect_err("stale update should preserve provider conflict response");
 
     assert_eq!(error.category(), "conflict");
@@ -357,7 +345,7 @@ fn settings_migrate_forwards_legacy_payload_opaquely() {
         }
     });
 
-    host.settings_migrate("example-model", true, legacy.clone())
+    host.settings_migrate(ACCOUNT, true, legacy.clone())
         .expect("migration dry-run should invoke provider settings.migrate");
 
     let calls = fixture.recorded_calls();
@@ -453,16 +441,30 @@ fn assert_common_settings_call_envelopes(calls: &[RecordedCall], fixture: &Setti
             "request ids must be present and non-empty for {subcommand}",
             subcommand = call.subcommand
         );
-        assert_eq!(call.request["provider_instance_id"], "provider-settings");
-        assert_eq!(
-            call.request["host"]["config_root"],
-            fixture.config_root.display().to_string()
-        );
-        assert_eq!(
-            call.request["host"]["data_root"],
-            fixture.data_root.display().to_string()
-        );
-        assert_eq!(call.request["host"]["env"], json!({}));
+        let expected_instance = if call.subcommand == "describe" {
+            "provider-registry"
+        } else {
+            "provider-a-instance"
+        };
+        assert_eq!(call.request["provider_instance_id"], expected_instance);
+        if call.subcommand == "describe" {
+            assert!(call.request["host"]["config_root"].is_null());
+            assert!(call.request["host"]["data_root"].is_null());
+            assert_eq!(
+                call.request["host"]["env"]["OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1"],
+                "1"
+            );
+        } else {
+            assert_eq!(
+                call.request["host"]["config_root"],
+                fixture.config_root.display().to_string()
+            );
+            assert_eq!(
+                call.request["host"]["data_root"],
+                fixture.data_root.display().to_string()
+            );
+            assert_eq!(call.request["host"]["env"], json!({}));
+        }
     }
 }
 

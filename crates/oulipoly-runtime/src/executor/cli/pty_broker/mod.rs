@@ -459,19 +459,16 @@ fn provider_inspect_identity(
     model_name: &str,
     provider_name: &str,
 ) -> Option<SessionProviderIdentity> {
-    let model_name =
-        registry.resolve_model_name_for_provider_instance(model_name, provider_name)?;
-    let describe = registry
-        .describe_model_provider_instance(&model_name, provider_name)
-        .ok()?;
+    let endpoint = registry.preflight_account(provider_name).ok()?;
+    let describe = endpoint.capabilities();
     if !describe.capabilities.session {
         return None;
     }
     Some(SessionProviderIdentity {
-        model_name,
+        model_name: model_name.to_string(),
         provider_name: provider_name.to_string(),
         provider_instance_id: Some(format_provider_instance_id(&describe.provider_id)),
-        settings_id: provider_name.to_string(),
+        settings_id: endpoint.settings_id().ok()?.to_string(),
     })
 }
 
@@ -2865,9 +2862,10 @@ mod tests {
     use super::*;
     use crate::provider_registry::ProviderRegistryOptions;
     use oulipoly_config::{
-        ModelConfig, PromptMode, ProviderConfig, ProvidersConfig,
-        provider_implementation_ref::ProviderImplementationRef,
+        ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+        ProvidersConfig, provider_implementation_ref::ProviderImplementationRef,
     };
+    use std::collections::HashMap;
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::thread;
@@ -3086,66 +3084,90 @@ mod tests {
     }
 
     #[test]
-    fn provider_default_identity_uses_unique_account_artifact() {
+    fn provider_default_identity_preserves_explicit_model_and_uses_account_endpoint() {
         let temp = tempfile::tempdir().unwrap();
         let script = write_session_describe_provider(temp.path(), "provider.py");
-        let registry = provider_registry(&[
-            provider_model("z-model", "provider-account", &script),
-            provider_model("a-model", "provider-account", &script),
-        ]);
+        let registry = provider_registry(
+            &[
+                provider_model("z-model", "provider-account"),
+                provider_model("a-model", "provider-account"),
+            ],
+            "provider-account",
+            &script,
+        );
 
         let identity =
             provider_inspect_identity(&registry, "<provider-default>", "provider-account")
-                .expect("a unique account artifact should resolve provider-default identity");
+                .expect("the explicit account endpoint should resolve provider-default identity");
 
-        assert_eq!(identity.model_name, "a-model");
+        assert_eq!(identity.model_name, "<provider-default>");
         assert_eq!(identity.provider_name, "provider-account");
         assert_eq!(
             identity.provider_instance_id.as_deref(),
             Some("fixture-instance")
         );
-        assert_eq!(identity.settings_id, "provider-account");
+        assert_eq!(identity.settings_id, "provider-account-settings");
     }
 
     #[test]
-    fn provider_default_identity_rejects_conflicting_account_artifacts() {
+    fn provider_default_identity_ignores_conflicting_model_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let first = write_session_describe_provider(temp.path(), "provider-a.py");
         let second = write_session_describe_provider(temp.path(), "provider-b.py");
-        let registry = provider_registry(&[
-            provider_model("a-model", "provider-account", &first),
-            provider_model("b-model", "provider-account", &second),
-        ]);
+        let account = write_session_describe_provider(temp.path(), "provider-account.py");
+        let mut first_model = provider_model("a-model", "provider-account");
+        first_model.provider = Some(provider_ref(&first));
+        let mut second_model = provider_model("b-model", "provider-account");
+        second_model.provider = Some(provider_ref(&second));
+        let registry =
+            provider_registry(&[first_model, second_model], "provider-account", &account);
 
         assert!(
             provider_inspect_identity(&registry, "<provider-default>", "provider-account",)
-                .is_none(),
-            "provider-default identity must remain unavailable when the account maps to multiple artifacts"
+                .is_some(),
+            "model artifacts must not override the explicit account endpoint"
         );
     }
 
-    fn provider_registry(models: &[ModelConfig]) -> ProviderRegistry {
-        ProviderRegistry::from_configs(
-            models,
-            &ProvidersConfig::default(),
-            ProviderRegistryOptions::default(),
-        )
-        .unwrap()
+    fn provider_registry(
+        models: &[ModelConfig],
+        provider_name: &str,
+        script: &Path,
+    ) -> ProviderRegistry {
+        let providers = ProvidersConfig {
+            entries: HashMap::from([(
+                provider_name.to_string(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "provider-family".to_string(),
+                        executable: script.display().to_string(),
+                    }),
+                    settings_id: Some("provider-account-settings".to_string()),
+                    ..ProviderEntry::default()
+                },
+            )]),
+        };
+        ProviderRegistry::from_configs(models, &providers, ProviderRegistryOptions::default())
+            .unwrap()
     }
 
-    fn provider_model(name: &str, provider_name: &str, script: &Path) -> ModelConfig {
+    fn provider_model(name: &str, provider_name: &str) -> ModelConfig {
         ModelConfig {
             name: name.to_string(),
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::model_provider(provider_name, Vec::new())],
             inputs: Vec::new(),
-            provider: Some(ProviderImplementationRef {
-                path: Some(script.display().to_string()),
-                crate_name: None,
-                version: None,
-                binary: None,
-                script: None,
-            }),
+            provider: None,
+        }
+    }
+
+    fn provider_ref(script: &Path) -> ProviderImplementationRef {
+        ProviderImplementationRef {
+            path: Some(script.display().to_string()),
+            crate_name: None,
+            version: None,
+            binary: None,
+            script: None,
         }
     }
 

@@ -9,8 +9,8 @@
 //! predicates, assertion validators, and test orchestration.
 
 use oulipoly_config::{
-    InputDef, InputType, ModelConfig, PromptMode, ProviderConfig,
-    provider_implementation_ref::ProviderImplementationRef,
+    InputDef, InputType, ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig,
+    ProviderEntry, ProvidersConfig, provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_runtime::executor;
@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-const SELECTED_PROVIDER_SETTINGS_ID: &str = "provider-a-account";
+const SELECTED_PROVIDER_SETTINGS_ID: &str = "provider-a-settings-record";
 const GENERIC_PARENT_ENV_VALUE: &str = "unicode-\u{2603}";
 const OPENAI_KEY_VALUE: &str = "ambient-openai-secret-for-provider-policy";
 const OPENAI_BASE_URL_VALUE: &str = "https://ambient-openai.example.invalid";
@@ -207,26 +207,6 @@ fn provider_ref_path(path: &Path) -> ProviderImplementationRef {
     }
 }
 
-fn provider_ref_binary(name: &str) -> ProviderImplementationRef {
-    ProviderImplementationRef {
-        path: None,
-        crate_name: None,
-        version: None,
-        binary: Some(name.to_string()),
-        script: None,
-    }
-}
-
-fn provider_ref_script(path: &Path) -> ProviderImplementationRef {
-    ProviderImplementationRef {
-        path: None,
-        crate_name: None,
-        version: None,
-        binary: None,
-        script: Some(path.display().to_string()),
-    }
-}
-
 fn provider_ref_crate() -> ProviderImplementationRef {
     ProviderImplementationRef {
         path: None,
@@ -376,7 +356,32 @@ fn dispatch_registry_for_models_with_options(
     models: &[ModelConfig],
     options: ProviderRegistryOptions,
 ) -> ProviderRegistry {
-    ProviderRegistry::from_model_configs(models, options)
+    let providers = ProvidersConfig {
+        entries: models
+            .iter()
+            .filter_map(|model| {
+                let provider_ref = model.provider.as_ref()?;
+                let executable = provider_ref
+                    .path
+                    .as_ref()
+                    .or(provider_ref.binary.as_ref())
+                    .or(provider_ref.script.as_ref())?;
+                let account = model.providers.first()?.name.clone();
+                Some((
+                    account,
+                    ProviderEntry {
+                        implementation: Some(ProviderEndpointConfig {
+                            family: "provider-a-family".to_string(),
+                            executable: executable.clone(),
+                        }),
+                        settings_id: Some(SELECTED_PROVIDER_SETTINGS_ID.to_string()),
+                        ..ProviderEntry::default()
+                    },
+                ))
+            })
+            .collect(),
+    };
+    ProviderRegistry::from_configs(models, &providers, options)
         .expect("dispatch registry should construct from test models")
 }
 
@@ -789,7 +794,7 @@ def hybrid_policy_result(request):
     argv = launch.get("argv", [])
     prompt = model.get("inputs", {{}}).get("prompt")
     diagnostics = []
-    if params.get("settings_id") != request.get("provider_instance_id"):
+    if params.get("settings_id") != {selected_provider_settings_id}:
         diagnostics.append({{"severity": "error", "code": "unexpected_settings_id", "message": str(params.get("settings_id"))}})
     if argv[:len(expected_prefix)] != expected_prefix:
         diagnostics.append({{"severity": "error", "code": "unexpected_argv_prefix", "message": json.dumps(argv)}})
@@ -929,6 +934,8 @@ if __name__ == "__main__":
         policy_mode = serde_json::to_string(policy_mode).unwrap(),
         launch_mode = serde_json::to_string(launch_mode).unwrap(),
         runner_private_env_names = serde_json::to_string(&runner_private_env_names).unwrap(),
+        selected_provider_settings_id =
+            serde_json::to_string(SELECTED_PROVIDER_SETTINGS_ID).unwrap(),
     )
 }
 
@@ -1026,10 +1033,11 @@ fn runtime_executor_dispatch_no_ref_preserves_legacy_bytes_with_unrelated_regist
 printf 'err:%b:%s\n' '\376' "$1" >&2"#,
     );
     let unrelated = fixture_script("printf 'unrelated external provider should not run\\n'");
-    let unrelated_model = model_with_provider_ref(
+    let mut unrelated_model = model_with_provider_ref(
         "unused-provider-command",
         Some(provider_ref_path(&unrelated.path)),
     );
+    unrelated_model.providers[0].name = "unrelated-provider-account".to_string();
     let registry = dispatch_registry_for_models(&[unrelated_model]);
     assert_eq!(registry.configured_artifact_keys().len(), 1);
 
@@ -1079,8 +1087,9 @@ fn runtime_executor_dispatch_no_ref_does_not_construct_or_invoke_provider_client
         counter = shell_quote(counter.path()),
         json = "{\"contract\":\"oulipoly.provider/v1\",\"request_id\":\"request-example-001\",\"ok\":true,\"result\":{}}"
     ));
-    let unrelated_model =
+    let mut unrelated_model =
         model_with_provider_ref("unused", Some(provider_ref_path(&external.path)));
+    unrelated_model.providers[0].name = "unrelated-provider-account".to_string();
     let registry = dispatch_registry_for_models(&[unrelated_model]);
     assert_eq!(registry.configured_artifact_keys().len(), 1);
 
@@ -1115,14 +1124,14 @@ fn runtime_executor_dispatch_no_ref_does_not_construct_or_invoke_provider_client
 }
 
 #[test]
-fn external_provider_runtime_disabled_crate_fails_before_provider_call() {
+fn model_scoped_crate_reference_does_not_create_account_endpoint_authority() {
     let legacy = fixture_script("printf 'legacy fallback\\n'; exit 77");
     let model = crate_external_model(&legacy);
     let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
 
-    let error = execute_dispatch_aware_result(
-        registry,
-        ExecutorServiceRequest::Facade {
+    assert!(registry.configured_artifact_keys().is_empty());
+    let result = executor::RuntimeExecutorService::new(Arc::new(registry))
+        .execute(ExecutorServiceRequest::Facade {
             model,
             provider_index: 0,
             prompt: "prompt-value".to_string(),
@@ -1130,11 +1139,12 @@ fn external_provider_runtime_disabled_crate_fails_before_provider_call() {
             models_dir: None,
             extra_inputs: HashMap::new(),
             parent_invocation_env: None,
-        },
-    )
-    .expect_err("crate provider refs must fail before legacy fallback or provider invocation");
+        })
+        .expect("parse-only model reference must not create external endpoint authority")
+        .result;
 
-    assert!(error.to_string().contains("runtime-disabled"));
+    assert_eq!(result.exit_code, 77);
+    assert_eq!(result.stdout, b"legacy fallback\n");
 }
 
 #[test]
@@ -1271,10 +1281,7 @@ fn external_provider_policy_request_passes_hybrid_launch_shape() {
         policy["params"]["settings_id"],
         SELECTED_PROVIDER_SETTINGS_ID
     );
-    assert_eq!(
-        policy["provider_instance_id"],
-        SELECTED_PROVIDER_SETTINGS_ID
-    );
+    assert_eq!(policy["provider_instance_id"], "fake-provider-instance");
     assert_eq!(
         launch["command"],
         fixture.legacy_trap_path.display().to_string()
@@ -2325,8 +2332,11 @@ fn external_provider_policy_request_preserves_provider_owned_settings_id() {
     .expect("external dispatch should preserve the provider-owned settings identity");
 
     let request = read_json(&fixture.policy_record_path);
-    assert_eq!(request["provider_instance_id"], "opencode");
-    assert_eq!(request["params"]["settings_id"], "opencode");
+    assert_eq!(request["provider_instance_id"], "fake-provider-instance");
+    assert_eq!(
+        request["params"]["settings_id"],
+        SELECTED_PROVIDER_SETTINGS_ID
+    );
     assert_eq!(request["params"]["launch"]["command"], "opencode1");
     assert_eq!(
         request["params"]["launch"]["argv"][0],
@@ -2377,62 +2387,28 @@ fn external_provider_policy_transform_applies_once_and_no_legacy_double_policy()
 }
 
 #[test]
-fn external_provider_enabled_binary_and_script_refs_dispatch_without_legacy_fallback() {
-    for kind in ["binary", "script"] {
-        let fixture = make_external_fixture(
-            Capabilities {
-                policy: true,
-                launch: true,
-            },
-            PolicyMode::Accept,
-            LaunchMode::Success,
-        );
-        let provider_ref = match kind {
-            "binary" => provider_ref_binary(
-                fixture
-                    .provider_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .expect("provider path should have utf8 file name"),
-            ),
-            "script" => provider_ref_script(&fixture.provider_path),
-            _ => unreachable!("test only covers binary and script refs"),
-        };
-        let model = external_model_with_ref(&fixture, provider_ref);
-        let registry = dispatch_registry_for_models_with_options(
-            std::slice::from_ref(&model),
-            ProviderRegistryOptions::default().with_path_entries([fixture
-                .provider_path
-                .parent()
-                .expect("provider parent")
-                .to_path_buf()]),
-        );
+fn explicit_account_endpoint_dispatches_without_legacy_fallback() {
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let result = execute_external_fixture(&fixture)
+        .expect("explicit account endpoint should dispatch through provider");
 
-        let result = execute_dispatch_aware_result(
-            registry,
-            ExecutorServiceRequest::Facade {
-                model,
-                provider_index: 0,
-                prompt: "prompt-value".to_string(),
-                working_dir: None,
-                models_dir: None,
-                extra_inputs: HashMap::new(),
-                parent_invocation_env: None,
-            },
-        )
-        .expect("enabled binary/script refs should dispatch through provider");
-
-        assert_eq!(result.exit_code, 0);
-        assert_eq!(
-            order_lines(&fixture.order_path),
-            ["policy.evaluate", "launch"]
-        );
-        assert!(!fixture.legacy_record_path.exists());
-    }
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        ["policy.evaluate", "launch"]
+    );
+    assert!(!fixture.legacy_record_path.exists());
 }
 
 #[test]
-fn script_ref_does_not_receive_prompt_acceptance_authority() {
+fn explicit_account_endpoint_receives_negotiated_prompt_acceptance() {
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2442,7 +2418,7 @@ fn script_ref_does_not_receive_prompt_acceptance_authority() {
         LaunchMode::Success,
     );
     enable_prompt_acceptance_capability(&fixture);
-    let model = external_model_with_ref(&fixture, provider_ref_script(&fixture.provider_path));
+    let model = external_model(&fixture);
     let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
 
     let result = execute_dispatch_aware_result(
@@ -2461,8 +2437,8 @@ fn script_ref_does_not_receive_prompt_acceptance_authority() {
 
     assert_eq!(result.exit_code, 0);
     assert!(
-        read_json(&fixture.launch_record_path)["params"]["prompt_acceptance"].is_null(),
-        "a script path cannot receive prompt-acceptance authority because its executable identity is not pinned through exec"
+        read_json(&fixture.launch_record_path)["params"]["prompt_acceptance"].is_object(),
+        "the explicit account endpoint pins executable identity before prompt-acceptance negotiation"
     );
     assert!(!fixture.legacy_record_path.exists());
 }

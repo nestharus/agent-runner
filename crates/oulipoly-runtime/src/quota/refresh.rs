@@ -50,14 +50,25 @@ impl QuotaServicePort for RuntimeQuotaService {
         &self,
         request: QuotaServiceRequest<'_>,
     ) -> Result<QuotaServiceOutput, ServiceError> {
-        let outcome = match request.external_provider.clone() {
-            Some(identity) => self.refresh_external(request, identity),
-            None => refresh_provider(
+        let has_account_endpoint = self.provider_registry.as_ref().is_some_and(|registry| {
+            registry
+                .current()
+                .has_account_endpoint(&request.provider_name)
+        });
+        let outcome = if has_account_endpoint {
+            match request.external_provider.clone() {
+                Some(identity) => self.refresh_external(request, identity),
+                None => RefreshOutcome::Failed(
+                    "external provider quota identity is unavailable".to_string(),
+                ),
+            }
+        } else {
+            refresh_provider(
                 &request.provider_name,
                 request.providers_cfg,
                 request.in_flight,
                 request.state,
-            ),
+            )
         };
 
         Ok(QuotaServiceOutput { outcome })

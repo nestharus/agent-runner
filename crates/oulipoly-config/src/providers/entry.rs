@@ -38,6 +38,8 @@ pub struct ProviderEntry {
     /// Sole provider-contract implementation authority for this account.
     /// This is independent from the native CLI `command`.
     pub implementation: Option<ProviderEndpointConfig>,
+    /// Explicit provider-owned settings/profile identity for this account.
+    pub settings_id: Option<String>,
     /// Shell command that prints JSON on stdout describing rolling-quota
     /// windows. Empty if the provider has no quota check wired up.
     pub quota_script: Option<String>,
@@ -69,6 +71,7 @@ impl Default for ProviderEntry {
     fn default() -> Self {
         Self {
             implementation: None,
+            settings_id: None,
             quota_script: None,
             auth_refresh_command: None,
             command: None,
@@ -94,6 +97,16 @@ impl ProviderEntry {
             implementation
                 .validate()
                 .map_err(|error| format_provider_context_error(name, &error))?;
+        }
+        if self
+            .settings_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(format_provider_context_error(
+                name,
+                "settings_id must not be empty",
+            ));
         }
         if let Some(resume) = &self.resume {
             resume

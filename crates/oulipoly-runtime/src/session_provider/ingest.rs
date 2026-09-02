@@ -11,23 +11,30 @@ use oulipoly_state::{
 pub fn canonical_stream_key(
     identity: &SessionProviderIdentity,
     session_id: &str,
-) -> SessionTurnIngestStreamKey {
-    SessionTurnIngestStreamKey {
+) -> Result<SessionTurnIngestStreamKey, SessionProviderError> {
+    let provider_instance_id = identity
+        .provider_instance_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            SessionProviderError::new(
+                "session_provider_instance_identity_missing",
+                "canonical ingest requires an authenticated provider instance identity",
+            )
+        })?;
+    Ok(SessionTurnIngestStreamKey {
         provider_name: identity.provider_name.clone(),
-        provider_instance_id: identity
-            .provider_instance_id
-            .clone()
-            .unwrap_or_else(|| identity.provider_name.clone()),
+        provider_instance_id: provider_instance_id.to_string(),
         settings_id: identity.settings_id.clone(),
         session_id: session_id.to_string(),
         projection: SessionTurnStreamProjection::CanonicalIngest,
-    }
+    })
 }
 
 pub fn ingest_one_canonical_turn_page(
     request: SessionTurnIngestQuantumRequest<'_>,
 ) -> Result<SessionTurnPageApplyOutcome, SessionProviderError> {
-    let key = canonical_stream_key(&request.identity, request.session_id);
+    let key = canonical_stream_key(&request.identity, request.session_id)?;
     let stream = request
         .state
         .session_turn_ingest_stream(&key)

@@ -27,6 +27,13 @@ pub(crate) fn map_schema_invalid_request_error() -> ExternalSessionProviderError
     )
 }
 
+pub(crate) fn map_instance_identity_missing_error() -> ExternalSessionProviderError {
+    map_provider_error(
+        "session_provider_instance_identity_missing",
+        "selected account endpoint did not supply an authenticated provider instance identity",
+    )
+}
+
 pub(crate) fn map_invalid_canonical_format_error() -> ExternalSessionProviderError {
     map_provider_error("invalid_canonical_format", "unexpected canonical format")
 }

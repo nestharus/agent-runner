@@ -826,6 +826,7 @@ mod tests {
                             family: "fixture".to_string(),
                             executable: provider.display().to_string(),
                         }),
+                        settings_id: Some("live-binding-settings-record".to_string()),
                         ..Default::default()
                     },
                 )]),
@@ -845,8 +846,8 @@ mod tests {
                 identity: SessionProviderIdentity {
                     model_name: MODEL_NAME.to_string(),
                     provider_name: PROVIDER_NAME.to_string(),
-                    provider_instance_id: None,
-                    settings_id: PROVIDER_NAME.to_string(),
+                    provider_instance_id: Some("fixture-instance".to_string()),
+                    settings_id: "live-binding-settings-record".to_string(),
                 },
                 state_db_path: state_path.clone(),
                 invocation_row_id,

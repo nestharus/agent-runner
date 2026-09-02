@@ -142,83 +142,14 @@ pub(crate) fn session_external_provider_identity(
     model: Option<&ModelConfig>,
     provider_name: &str,
 ) -> Option<SessionServiceExternalProviderIdentity> {
-    let model = external_provider_model(model)?;
-    let describe = describe_external_provider_for_session(agent_runtime_services, &model.name)?;
-    Some(session_service_external_provider_identity(
-        model,
-        provider_name,
-        describe,
-    ))
-}
-
-struct ExternalProviderSessionDescribe {
-    provider_instance_id: Option<String>,
-}
-
-fn describe_external_provider_for_session(
-    agent_runtime_services: &wiring::AgentRuntimeServices,
-    model_name: &str,
-) -> Option<ExternalProviderSessionDescribe> {
-    let registry = session_provider_registry(agent_runtime_services);
-    require_external_provider_artifact(&registry, model_name)?;
-    let describe = describe_session_provider_model(&registry, model_name);
-    Some(external_provider_session_describe(describe.as_ref()))
-}
-
-fn session_provider_registry(
-    agent_runtime_services: &wiring::AgentRuntimeServices,
-) -> std::sync::Arc<oulipoly_runtime::provider_registry::ProviderRegistry> {
-    agent_runtime_services.provider_registry_handle.current()
-}
-
-fn require_external_provider_artifact(
-    registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
-    model_name: &str,
-) -> Option<()> {
-    registry.artifact_key_for_model(model_name)?;
-    Some(())
-}
-
-fn describe_session_provider_model(
-    registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
-    model_name: &str,
-) -> Option<oulipoly_provider::generated::DescribeResult> {
-    registry.describe_model_provider(model_name).ok()
-}
-
-fn external_provider_session_describe(
-    describe: Option<&oulipoly_provider::generated::DescribeResult>,
-) -> ExternalProviderSessionDescribe {
-    ExternalProviderSessionDescribe {
-        provider_instance_id: provider_instance_id_from_describe(describe),
-    }
-}
-
-fn provider_instance_id_from_describe(
-    describe: Option<&oulipoly_provider::generated::DescribeResult>,
-) -> Option<String> {
-    describe.map(|result| format_provider_instance_id(&result.provider_id))
-}
-
-fn format_provider_instance_id(provider_id: &str) -> String {
-    format!("{provider_id}-instance")
-}
-
-fn session_service_external_provider_identity(
-    model: &ModelConfig,
-    provider_name: &str,
-    describe: ExternalProviderSessionDescribe,
-) -> SessionServiceExternalProviderIdentity {
-    SessionServiceExternalProviderIdentity {
-        model_name: model.name.clone(),
+    let registry = agent_runtime_services.provider_registry_handle.current();
+    let endpoint = registry.preflight_account(provider_name).ok()?;
+    Some(SessionServiceExternalProviderIdentity {
+        model_name: model.map(|model| model.name.clone()).unwrap_or_default(),
         provider_name: provider_name.to_string(),
-        provider_instance_id: describe.provider_instance_id,
-        settings_id: provider_name.to_string(),
-    }
-}
-
-fn external_provider_model(model: Option<&ModelConfig>) -> Option<&ModelConfig> {
-    model.filter(|model| model.provider.is_some())
+        provider_instance_id: Some(format!("{}-instance", endpoint.capabilities().provider_id)),
+        settings_id: endpoint.settings_id().ok()?.to_string(),
+    })
 }
 
 fn session_lifecycle_ingest_mode(mode: ResumeIngestMode<'_>) -> SessionLifecycleIngestMode {
@@ -315,8 +246,10 @@ fn emit_known_session_chain_warning(err: &str) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use oulipoly_config::provider_implementation_ref::ProviderImplementationRef;
-    use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
+    use oulipoly_config::{
+        ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+        ProvidersConfig,
+    };
     use oulipoly_runtime::provider_registry::{
         ProviderRegistry, ProviderRegistryHandle, ProviderRegistryOptions,
     };
@@ -324,6 +257,7 @@ mod tests {
     use oulipoly_state::{
         InvocationStart, SessionTurnIngestStreamKey, SessionTurnStreamProjection,
     };
+    use std::collections::HashMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -338,7 +272,7 @@ mod tests {
     fn production_lifecycle_ingest_captures_and_queues_bounded_turn_ingest() {
         let fixture = ProductionSessionFixture::new();
         let row_id = fixture.seed_finalized_invocation();
-        let model = external_model(&fixture.provider_path);
+        let model = external_model();
         let services = fixture.services(&model);
         let sessions_cfg = oulipoly_config::SessionsConfig::default();
         let providers_cfg = ProvidersConfig::default();
@@ -375,9 +309,9 @@ mod tests {
     }
 
     #[test]
-    fn production_identity_is_none_for_builtin_models() {
+    fn production_identity_uses_the_selected_account_for_builtin_models() {
         let fixture = ProductionSessionFixture::new();
-        let services = fixture.services(&external_model(&fixture.provider_path));
+        let services = fixture.services(&external_model());
         let builtin = ModelConfig {
             name: "provider-a-builtin-model".to_string(),
             prompt_mode: PromptMode::Arg,
@@ -388,7 +322,12 @@ mod tests {
 
         assert_eq!(
             session_external_provider_identity(&services, Some(&builtin), PROVIDER),
-            None
+            Some(SessionServiceExternalProviderIdentity {
+                model_name: builtin.name,
+                provider_name: PROVIDER.to_string(),
+                provider_instance_id: Some("provider-a-instance".to_string()),
+                settings_id: PROVIDER.to_string(),
+            })
         );
     }
 
@@ -434,9 +373,23 @@ mod tests {
         fn services(&self, model: &ModelConfig) -> wiring::AgentRuntimeServices {
             let config_root = self.dir.path().join("config-root");
             let data_root = self.dir.path().join("data-root");
+            let providers = ProvidersConfig {
+                entries: HashMap::from([(
+                    PROVIDER.to_string(),
+                    ProviderEntry {
+                        implementation: Some(ProviderEndpointConfig {
+                            family: "provider-a-family".to_string(),
+                            executable: self.provider_path.display().to_string(),
+                        }),
+                        settings_id: Some(PROVIDER.to_string()),
+                        ..Default::default()
+                    },
+                )]),
+            };
             let registry = Arc::new(
-                ProviderRegistry::from_model_configs(
+                ProviderRegistry::from_configs(
                     std::slice::from_ref(model),
+                    &providers,
                     ProviderRegistryOptions::default()
                         .with_config_root(config_root.clone())
                         .with_data_root(data_root.clone()),
@@ -530,19 +483,13 @@ mod tests {
             .to_string()
     }
 
-    fn external_model(provider_path: &Path) -> ModelConfig {
+    fn external_model() -> ModelConfig {
         ModelConfig {
             name: MODEL.to_string(),
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::model_provider(PROVIDER, Vec::new())],
             inputs: Vec::new(),
-            provider: Some(ProviderImplementationRef {
-                path: Some(provider_path.display().to_string()),
-                crate_name: None,
-                version: None,
-                binary: None,
-                script: None,
-            }),
+            provider: None,
         }
     }
 

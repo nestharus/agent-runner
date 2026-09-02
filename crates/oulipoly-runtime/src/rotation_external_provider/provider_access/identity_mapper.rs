@@ -10,6 +10,7 @@ pub(super) fn map_external_rotation_identity(
     resolved: &ResolvedResume,
     target_provider: &str,
     describe: oulipoly_provider::generated::DescribeResult,
+    settings_id: &str,
 ) -> ExternalRotationIdentity {
     ExternalRotationIdentity {
         model_name: model.name.clone(),
@@ -17,6 +18,6 @@ pub(super) fn map_external_rotation_identity(
         source_session_id: resolved.active_session_id.clone(),
         target_provider: target_provider.to_string(),
         provider_instance_id: Some(format!("{}-instance", describe.provider_id)),
-        settings_id: target_provider.to_string(),
+        settings_id: settings_id.to_string(),
     }
 }

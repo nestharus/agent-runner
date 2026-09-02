@@ -15,7 +15,6 @@ use crate::session_provider::{
 use chrono::{DateTime, Utc};
 use oulipoly_provider::client::CancellationToken;
 use oulipoly_state::{ImportedSessionDisplayMetadataUpsert, SessionTurnIngestStreamKey};
-use std::collections::BTreeMap;
 use std::path::Path;
 
 const MAX_PROVIDER_SESSION_ID_BYTES: usize = 1024;
@@ -24,19 +23,6 @@ const SESSION_ENUMERATE_CAPABILITY_MISSING: &str = "session_enumerate_capability
 const SESSION_CAPABILITY_MISSING: &str = "session_capability_missing";
 const SESSION_PROVIDER_DESCRIBE_UNAVAILABLE: &str = "session_provider_describe_unavailable";
 const MAX_SYNCHRONOUS_BACKFILL_PAGES: usize = 4096;
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct EnumerateDedupKey {
-    artifact_key: String,
-    sessions: Vec<EnumeratedSessionSourceKey>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct EnumeratedSessionSourceKey {
-    provider_session_id: String,
-    source_kind: String,
-    source_detail: Option<String>,
-}
 
 pub(super) fn import_sessions_with_registry(
     request: SessionImportServiceRequest<'_>,
@@ -52,11 +38,8 @@ pub(super) fn import_sessions_with_registry(
             ..SessionImportTotals::default()
         },
     };
-    let mut seen_enumerations = BTreeMap::new();
-
     for target in request.providers {
-        let provider_report =
-            import_provider_sessions(&request, registry.as_ref(), target, &mut seen_enumerations);
+        let provider_report = import_provider_sessions(&request, registry.as_ref(), target);
         add_provider_report_to_totals(&mut report.totals, &provider_report);
         report.providers.push(provider_report);
     }
@@ -68,10 +51,21 @@ fn import_provider_sessions(
     request: &SessionImportServiceRequest<'_>,
     registry: &crate::provider_registry::ProviderRegistry,
     target: &SessionImportProviderTarget,
-    seen_enumerations: &mut BTreeMap<EnumerateDedupKey, String>,
 ) -> SessionImportProviderReport {
-    let identity = target_identity(target);
     let mut report = initial_provider_report(target);
+    let identity = match target_identity(registry, target) {
+        Ok(identity) => identity,
+        Err(error) => {
+            if missing_enumerate_capability(&error) {
+                report.status = SessionImportProviderStatus::Skipped {
+                    reason: error.to_string(),
+                };
+            } else {
+                report.errors.push(error.to_string());
+            }
+            return report;
+        }
+    };
     match session_provider::enumerate_sessions(enumerate_request(
         request,
         registry,
@@ -80,20 +74,6 @@ fn import_provider_sessions(
         Ok(result) => {
             report.discovered = result.sessions.len() as u64;
             report.warnings.extend(result.warnings);
-            if let Some(canonical_provider) = duplicate_enumeration_provider(
-                registry,
-                target,
-                &result.sessions,
-                seen_enumerations,
-            ) {
-                report.status = SessionImportProviderStatus::Skipped {
-                    reason: format!(
-                        "duplicate_enumerate_source: canonical_provider={canonical_provider}"
-                    ),
-                };
-                report.skipped = result.sessions.len() as u64;
-                return report;
-            }
             import_enumerated_entries(request, registry, &identity, &mut report, result.sessions);
             report.status = SessionImportProviderStatus::Succeeded;
         }
@@ -108,54 +88,6 @@ fn import_provider_sessions(
         }
     }
     report
-}
-
-fn duplicate_enumeration_provider(
-    registry: &crate::provider_registry::ProviderRegistry,
-    target: &SessionImportProviderTarget,
-    sessions: &[SessionProviderEnumerateEntry],
-    seen_enumerations: &mut BTreeMap<EnumerateDedupKey, String>,
-) -> Option<String> {
-    let key = enumerate_dedup_key(registry, target, sessions);
-    if let Some(canonical_provider) = seen_enumerations.get(&key) {
-        return Some(canonical_provider.clone());
-    }
-    seen_enumerations.insert(key, target.provider_name.clone());
-    None
-}
-
-fn enumerate_dedup_key(
-    registry: &crate::provider_registry::ProviderRegistry,
-    target: &SessionImportProviderTarget,
-    sessions: &[SessionProviderEnumerateEntry],
-) -> EnumerateDedupKey {
-    let artifact_key = registry
-        .artifact_key_for_model_provider(&target.model_name, &target.provider_name)
-        .unwrap_or_else(|| {
-            format!(
-                "unconfigured:{}/{}",
-                target.model_name, target.provider_name
-            )
-        });
-    let mut sessions = sessions
-        .iter()
-        .map(enumerated_session_source_key)
-        .collect::<Vec<_>>();
-    sessions.sort();
-    EnumerateDedupKey {
-        artifact_key,
-        sessions,
-    }
-}
-
-fn enumerated_session_source_key(
-    session: &SessionProviderEnumerateEntry,
-) -> EnumeratedSessionSourceKey {
-    EnumeratedSessionSourceKey {
-        provider_session_id: session.provider_session_id.clone(),
-        source_kind: session.source.kind.clone(),
-        source_detail: session.source.detail.clone(),
-    }
 }
 
 fn enumerate_request<'a>(
@@ -214,7 +146,8 @@ fn import_enumerated_entry(
         cwd,
         provider_updated_at,
     );
-    let stream = session_provider::canonical_stream_key(identity, provider_session_id);
+    let stream = session_provider::canonical_stream_key(identity, provider_session_id)
+        .map_err(|error| error.to_string())?;
     let imported = request
         .state
         .import_session_and_enqueue_turn_ingest(
@@ -391,13 +324,30 @@ fn normalize_cwd(cwd: Option<&Path>) -> Result<Option<String>, String> {
     .transpose()
 }
 
-fn target_identity(target: &SessionImportProviderTarget) -> SessionProviderIdentity {
-    SessionProviderIdentity {
+fn target_identity(
+    registry: &crate::provider_registry::ProviderRegistry,
+    target: &SessionImportProviderTarget,
+) -> Result<SessionProviderIdentity, SessionProviderError> {
+    let endpoint = registry
+        .preflight_account(&target.provider_name)
+        .map_err(|error| {
+            SessionProviderError::new(SESSION_PROVIDER_DESCRIBE_UNAVAILABLE, error.to_string())
+        })?;
+    let settings_id = endpoint.settings_id().map_err(|error| {
+        SessionProviderError::new(SESSION_PROVIDER_DESCRIBE_UNAVAILABLE, error.to_string())
+    })?;
+    if settings_id != target.settings_id {
+        return Err(SessionProviderError::new(
+            "session_provider_identity_mismatch",
+            "session import settings identity does not match the selected account endpoint",
+        ));
+    }
+    Ok(SessionProviderIdentity {
         model_name: target.model_name.clone(),
         provider_name: target.provider_name.clone(),
-        provider_instance_id: target.provider_instance_id.clone(),
-        settings_id: target.settings_id.clone(),
-    }
+        provider_instance_id: Some(format!("{}-instance", endpoint.capabilities().provider_id)),
+        settings_id: settings_id.to_string(),
+    })
 }
 
 fn initial_provider_report(target: &SessionImportProviderTarget) -> SessionImportProviderReport {

@@ -26,6 +26,8 @@ pub(crate) fn map_registry_error(error: ProviderRegistryError) -> ServiceError {
         ProviderRegistryError::InvalidImplementationRef { .. }
         | ProviderRegistryError::ModelProviderNotConfigured { .. }
         | ProviderRegistryError::AccountImplementationNotConfigured { .. }
+        | ProviderRegistryError::AccountSettingsNotConfigured { .. }
+        | ProviderRegistryError::FamilyImplementationNotConfigured { .. }
         | ProviderRegistryError::FamilyImplementationConflict { .. } => service_error(
             ExternalProviderDispatchError::provider_protocol_failure("registry_lookup"),
         ),

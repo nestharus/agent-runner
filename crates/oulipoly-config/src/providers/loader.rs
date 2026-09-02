@@ -121,6 +121,7 @@ fn invocation_mode_load_error(name: &str, value: &str) -> LoadError {
 pub(super) fn raw_entry_to_entry(raw: &RawEntry, invocation_mode: InvocationMode) -> ProviderEntry {
     ProviderEntry {
         implementation: raw.implementation.clone(),
+        settings_id: raw.settings_id.clone(),
         quota_script: raw.quota_script.clone(),
         auth_refresh_command: raw.auth_refresh_command.clone(),
         command: raw.command.clone(),

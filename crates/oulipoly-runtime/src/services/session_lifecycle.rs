@@ -158,7 +158,16 @@ fn enqueue_external_canonical_ingestion(
         provider_instance_id: identity.provider_instance_id.clone(),
         settings_id: identity.settings_id.clone(),
     };
-    let key = session_provider::canonical_stream_key(&provider_identity, session_id);
+    let key = match session_provider::canonical_stream_key(&provider_identity, session_id) {
+        Ok(key) => key,
+        Err(error) => {
+            write_session_ingest_warning(
+                stderr,
+                &format!("Failed to prepare canonical session ingest identity: {error}"),
+            )?;
+            return Ok(());
+        }
+    };
     if let Err(error) = state.enqueue_session_turn_ingest_stream(&key) {
         write_session_ingest_warning(
             stderr,

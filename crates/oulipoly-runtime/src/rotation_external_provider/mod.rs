@@ -30,9 +30,9 @@ pub fn assess_rotation(
     request: &MigrationServiceRequest<'_>,
 ) -> Result<RotationAssessResult, ExternalRotationError> {
     let registry = registry_handle.current();
-    let client = provider_access::load_provider_artifact_and_capabilities(
+    let endpoint = provider_access::load_provider_artifact_and_capabilities(
         registry_handle,
-        &identity.model_name,
+        &identity.target_provider,
         "rotation.assess",
     )?;
     let payload = request_mapper::rotation_request(
@@ -41,7 +41,7 @@ pub fn assess_rotation(
         registry.host_options(),
         "rotation.assess",
     )?;
-    provider_dispatch::invoke_provider_contract(&client, "rotation.assess", payload)
+    provider_dispatch::invoke_provider_contract(endpoint.client(), "rotation.assess", payload)
 }
 
 pub fn materialize_rotation(
@@ -81,13 +81,13 @@ pub fn plan_migration(
     request: &MigrationServiceRequest<'_>,
 ) -> Result<MigrationPlanResult, ExternalRotationError> {
     let registry = registry_handle.current();
-    let client = provider_access::load_provider_artifact_and_capabilities(
+    let endpoint = provider_access::load_provider_artifact_and_capabilities(
         registry_handle,
-        &identity.model_name,
+        &identity.target_provider,
         "migration.plan",
     )?;
     provider_dispatch::invoke_provider_contract(
-        &client,
+        endpoint.client(),
         "migration.plan",
         request_mapper::migration_request(
             &identity,
@@ -104,13 +104,13 @@ pub fn apply_migration(
     request: &MigrationServiceRequest<'_>,
 ) -> Result<MigrationApplyResult, ExternalRotationError> {
     let registry = registry_handle.current();
-    let client = provider_access::load_provider_artifact_and_capabilities(
+    let endpoint = provider_access::load_provider_artifact_and_capabilities(
         registry_handle,
-        &identity.model_name,
+        &identity.target_provider,
         "migration.apply",
     )?;
     provider_dispatch::invoke_provider_contract(
-        &client,
+        endpoint.client(),
         "migration.apply",
         request_mapper::migration_request(
             &identity,
@@ -127,9 +127,9 @@ fn invoke_rotation_materialize(
     request: &MigrationServiceRequest<'_>,
 ) -> Result<RotationMaterializeResult, ExternalRotationError> {
     let registry = registry_handle.current();
-    let client = provider_access::load_provider_artifact_and_capabilities(
+    let endpoint = provider_access::load_provider_artifact_and_capabilities(
         registry_handle,
-        &identity.model_name,
+        &identity.target_provider,
         "rotation.materialize",
     )?;
     let payload = request_mapper::rotation_request(
@@ -138,5 +138,5 @@ fn invoke_rotation_materialize(
         registry.host_options(),
         "rotation.materialize",
     )?;
-    provider_dispatch::invoke_provider_contract(&client, "rotation.materialize", payload)
+    provider_dispatch::invoke_provider_contract(endpoint.client(), "rotation.materialize", payload)
 }

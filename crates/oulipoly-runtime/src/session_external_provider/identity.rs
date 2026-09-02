@@ -34,9 +34,12 @@ pub(crate) fn map_described_identity(
     }
 }
 
-pub(crate) fn provider_instance_id(identity: &ExternalSessionIdentity) -> String {
+pub(crate) fn provider_instance_id(
+    identity: &ExternalSessionIdentity,
+) -> Result<&str, super::provider_error::ExternalSessionProviderError> {
     identity
         .provider_instance_id
-        .clone()
-        .unwrap_or_else(|| identity.provider_name.clone())
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(super::provider_error::map_instance_identity_missing_error)
 }

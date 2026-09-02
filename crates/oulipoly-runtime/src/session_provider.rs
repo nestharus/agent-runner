@@ -28,7 +28,7 @@ pub use dispatch::{
 pub use ingest::{canonical_stream_key, ingest_one_canonical_turn_page};
 pub use lifecycle_proof::dispatch_aware_no_ref_lifecycle_proof;
 pub use types::{
-    NoRefProofOutput, NoRefProofRequest, S7A_NEUTRAL_SETTINGS_ID, SessionProviderCaptureRequest,
+    NoRefProofOutput, NoRefProofRequest, SessionProviderCaptureRequest,
     SessionProviderCaptureResult, SessionProviderEnumerateEntry, SessionProviderEnumerateRequest,
     SessionProviderEnumerateResult, SessionProviderEnumerateSource, SessionProviderError,
     SessionProviderIdentity, SessionProviderLifecycleContext, SessionProviderLiveCaptureRequest,

@@ -204,6 +204,9 @@ where
             "provider account {selected_provider_name} implementation preflight failed: provider describe did not advertise session capability"
         ));
     }
+    provider_endpoint
+        .settings_id()
+        .map_err(|error| error.to_string())?;
     let launch_provider = ProviderConfig {
         name: carrier_model.name.clone(),
         ..provider
@@ -340,14 +343,18 @@ fn default_provider_live_session_binding<O: StateDbOpener>(
     invocation_uuid: &str,
 ) -> Option<InteractiveLiveSessionBinding> {
     let state_db_path = input.state_db_path?;
+    let settings_id = input.provider_endpoint.settings_id().ok()?;
     Some(InteractiveLiveSessionBinding {
         registry: Arc::clone(&input.provider_registry),
         endpoint: Arc::clone(&input.provider_endpoint),
         identity: SessionProviderIdentity {
             model_name: input.carrier_model.name.clone(),
             provider_name: input.provider_name.to_string(),
-            provider_instance_id: None,
-            settings_id: input.provider_name.to_string(),
+            provider_instance_id: Some(format!(
+                "{}-instance",
+                input.provider_endpoint.capabilities().provider_id
+            )),
+            settings_id: settings_id.to_string(),
         },
         state_db_path: state_db_path.to_path_buf(),
         invocation_row_id,

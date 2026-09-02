@@ -103,20 +103,20 @@ impl ProviderSettingsHost {
 
     pub fn describe_settings_target(
         &self,
-        model_name: &str,
+        account_name: &str,
     ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
-        match self.cached_settings_target(model_name) {
+        match self.cached_settings_target(account_name) {
             Some(target) => Ok(target),
-            None => self.describe_uncached_settings_target(model_name),
+            None => self.describe_uncached_settings_target(account_name),
         }
     }
 
     fn describe_uncached_settings_target(
         &self,
-        model_name: &str,
+        account_name: &str,
     ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
-        let target = self.load_settings_target(model_name)?;
-        self.cache_settings_target(model_name, &target);
+        let target = self.load_settings_target(account_name)?;
+        self.cache_settings_target(account_name, &target);
         Ok(target)
     }
 
@@ -130,10 +130,14 @@ impl ProviderSettingsHost {
 
     fn load_settings_target(
         &self,
-        model_name: &str,
+        account_name: &str,
     ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
-        let description = self.describe_provider(model_name)?;
-        Ok(settings_target_from_description(model_name, description))
+        let registry = self.registry.current();
+        let endpoint = registry.preflight_account(account_name)?;
+        Ok(settings_target_from_description(
+            account_name,
+            endpoint.capabilities().clone(),
+        ))
     }
 
     fn cache_settings_target(&self, model_name: &str, target: &ProviderSettingsTarget) {
@@ -144,17 +148,7 @@ impl ProviderSettingsHost {
     }
 
     pub fn configured_model_names(&self) -> Vec<String> {
-        self.registry.current().configured_model_names()
-    }
-
-    fn describe_provider(&self, model_name: &str) -> Result<DescribeResult, ProviderSettingsError> {
-        let registry = self.registry.current();
-        let artifact = registry.enabled_artifact_for_model(model_name)?;
-        let client = registry.client_factory().client_for(artifact);
-        let request = self.request(registry.as_ref(), EmptyParams {})?;
-        client
-            .invoke_typed::<DescribeResult, _>("describe", request, NoProviderEnv)
-            .map_err(ProviderSettingsError::from)
+        self.registry.current().configured_account_names()
     }
 
     pub fn settings_schema(
@@ -287,7 +281,7 @@ impl ProviderSettingsHost {
 
     fn call_provider<R, Params>(
         &self,
-        model_name: &str,
+        account_name: &str,
         operation: SettingsOperation,
         params: Params,
     ) -> Result<R, ProviderSettingsError>
@@ -296,10 +290,11 @@ impl ProviderSettingsHost {
         Params: Serialize,
     {
         let registry = self.registry.current();
-        let artifact = registry.enabled_artifact_for_model(model_name)?;
-        let client = registry.client_factory().client_for(artifact);
-        let request = self.request(registry.as_ref(), params)?;
-        client
+        let endpoint = registry.preflight_account(account_name)?;
+        let provider_instance_id = format!("{}-instance", endpoint.capabilities().provider_id);
+        let request = self.request(registry.as_ref(), &provider_instance_id, params)?;
+        endpoint
+            .client()
             .invoke_typed::<R, _>(operation.as_provider_name(), request, NoProviderEnv)
             .map_err(ProviderSettingsError::from)
     }
@@ -307,6 +302,7 @@ impl ProviderSettingsHost {
     fn request<Params>(
         &self,
         registry: &ProviderRegistry,
+        provider_instance_id: &str,
         params: Params,
     ) -> Result<Value, ProviderSettingsError>
     where
@@ -315,7 +311,7 @@ impl ProviderSettingsHost {
         let mut value = serde_json::to_value(RequestEnvelope {
             contract: CONTRACT_VERSION.to_string(),
             request_id: provider_settings_request_id(),
-            provider_instance_id: Some("provider-settings".to_string()),
+            provider_instance_id: Some(provider_instance_id.to_string()),
             host: host_context(registry.host_options()),
             params,
         })

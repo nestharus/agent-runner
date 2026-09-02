@@ -7,7 +7,6 @@ use oulipoly_config::{ModelConfig, ProvidersConfig, load_models};
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::services::{SessionImportProviderTarget, SessionImportServiceRequest};
 use oulipoly_state::StateDb;
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -24,7 +23,7 @@ pub(crate) fn run_session_import(
     agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
     let env = load_session_import_environment()?;
-    let targets = session_import_targets(&env.models, &env.provider_registry, args.provider);
+    let targets = session_import_targets(&env.models, &env.provider_registry, args.provider)?;
     agent_runtime_services
         .provider_registry_handle
         .replace(Arc::new(env.provider_registry));
@@ -109,37 +108,45 @@ pub(super) fn session_import_targets(
     models: &[ModelConfig],
     provider_registry: &ProviderRegistry,
     provider_filter: Option<&str>,
-) -> Vec<SessionImportProviderTarget> {
-    let mut seen = BTreeSet::new();
+) -> Result<Vec<SessionImportProviderTarget>, String> {
     let mut targets = Vec::new();
-    for model in models {
-        for provider in &model.providers {
-            if !provider_matches_filter(&model.name, &provider.name, provider_filter) {
-                continue;
-            }
-            let Some(artifact_key) =
-                provider_registry.artifact_key_for_model_provider(&model.name, &provider.name)
-            else {
-                continue;
-            };
-            let key = (artifact_key, provider.name.clone());
-            if !seen.insert(key) {
-                continue;
-            }
-            targets.push(SessionImportProviderTarget {
-                model_name: model.name.clone(),
-                provider_name: provider.name.clone(),
-                provider_instance_id: None,
-                settings_id: provider.name.clone(),
-            });
+    for provider_name in provider_registry.configured_account_names() {
+        let mut routed_models = models
+            .iter()
+            .filter(|model| {
+                model
+                    .providers
+                    .iter()
+                    .any(|provider| provider.name == provider_name)
+            })
+            .collect::<Vec<_>>();
+        routed_models.sort_by(|left, right| left.name.cmp(&right.name));
+        if !provider_matches_filter(&provider_name, &routed_models, provider_filter) {
+            continue;
         }
+        let settings_id = provider_registry
+            .account_settings_id(&provider_name)
+            .map_err(|error| error.to_string())?;
+        targets.push(SessionImportProviderTarget {
+            model_name: routed_models
+                .first()
+                .map(|model| model.name.clone())
+                .unwrap_or_default(),
+            provider_name: provider_name.clone(),
+            provider_instance_id: None,
+            settings_id: settings_id.to_string(),
+        });
     }
-    targets
+    Ok(targets)
 }
 
-fn provider_matches_filter(model_name: &str, provider_name: &str, filter: Option<&str>) -> bool {
+fn provider_matches_filter(
+    provider_name: &str,
+    models: &[&ModelConfig],
+    filter: Option<&str>,
+) -> bool {
     match filter.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(filter) => model_name == filter || provider_name == filter,
+        Some(filter) => provider_name == filter || models.iter().any(|model| model.name == filter),
         None => true,
     }
 }

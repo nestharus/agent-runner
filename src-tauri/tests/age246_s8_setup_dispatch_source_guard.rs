@@ -4,62 +4,42 @@ use std::process::{Command, Output};
 const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 4628;
 
 #[test]
-fn exactly_one_legacy_fallback_caller_exists_and_is_gated_by_missing_config() {
+fn setup_requires_the_configured_family_endpoint_without_legacy_fallback() {
     let flow = read_source("src-tauri/src/setup/flow.rs");
-    let fallback_wrapper = source_between(
-        &flow,
-        "async fn run_legacy_setup_brain_fallback(",
-        "pub async fn run_for_cli",
-    );
-    let fallback_call_count = flow.matches("run_legacy_setup_brain_fallback(").count()
-        - fallback_wrapper
-            .matches("run_legacy_setup_brain_fallback(")
-            .count();
-
-    assert_eq!(
-        fallback_call_count, 1,
-        "S8 must keep exactly one production legacy fallback caller"
-    );
     assert_eq!(
         flow.matches("SetupAgent::new(").count(),
-        1,
-        "S8 must keep exactly one hardcoded setup brain construction"
+        0,
+        "setup must not construct the legacy hardcoded brain"
     );
-    assert_contains(
-        "missing-config fallback boundary",
+    assert_not_contains(
+        "endpoint-authoritative setup flow",
         &flow,
         "run_missing_config_legacy_fallback",
     );
-
-    let selection = source_between(
+    assert_not_contains(
+        "endpoint-authoritative setup flow",
         &flow,
-        "fn select_setup_brain_source",
-        "fn execute_allowlisted",
+        "detection::detect_all()",
     );
-    assert_contains(
-        "setup brain source selection",
-        selection,
-        "SetupBrainConfig",
-    );
-    assert_contains(
-        "setup brain source selection",
-        selection,
-        "Option<SetupBrainConfig>",
-    );
-    assert_contains(
-        "setup brain source selection",
-        selection,
-        "SetupBrainSource::Fallback",
-    );
-    assert_contains(
-        "setup brain source selection",
-        selection,
-        "setup_fallback_unavailable",
-    );
-    assert_contains(
-        "configured setup brain selection",
+    assert_not_contains(
+        "endpoint-authoritative setup flow",
         &flow,
-        "try_run_configured_setup_brain(&system_prompt, &initial_message)",
+        "detection::detect_single_cli(",
+    );
+    assert_contains(
+        "missing-config fail-closed boundary",
+        &flow,
+        "fn require_setup_brain(",
+    );
+    assert_contains(
+        "missing-config fail-closed boundary",
+        &flow,
+        "setup_brain_not_configured",
+    );
+    assert_contains(
+        "configured setup brain dispatch",
+        &flow,
+        "try_run_configured_setup_brain(",
     );
 }
 
@@ -67,14 +47,11 @@ fn exactly_one_legacy_fallback_caller_exists_and_is_gated_by_missing_config() {
 fn configured_path_uses_provider_ref_adapter_and_does_not_call_legacy() {
     let host = read_source("src-tauri/src/setup/setup_brain_host.rs");
     let flow = read_source("src-tauri/src/setup/flow.rs");
-    let configured_branch = source_between(
-        &flow,
-        "SetupBrainSource::Configured",
-        "SetupBrainSource::Fallback",
-    );
+    let configured_branch = source_between(&flow, "Ok(setup_brain) =>", "Err(error) =>");
 
-    assert_contains("setup brain host", &host, "ProviderImplementationRef");
-    assert_contains("setup brain host", &host, "ProviderClient");
+    assert_contains("setup brain host", &host, "ProviderRegistry::convert_ref");
+    assert_contains("setup brain host", &host, "preflight_bootstrap_family");
+    assert_contains("setup brain host", &host, "PinnedFamilyEndpoint");
     assert_contains("setup brain host", &host, "build_setup_brain_turn_request");
     assert_contains("setup brain host", &host, "require_setup_brain_capability");
     assert_contains("setup brain host", &host, "decode_setup_brain_turn_result");

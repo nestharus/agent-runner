@@ -3,7 +3,8 @@
 
 use chrono::{DateTime, Utc};
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, SessionSourceEntry, SessionsConfig,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    ProvidersConfig, SessionSourceEntry, SessionsConfig,
     provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_provider::client::{CancellationToken, ProviderClientOptions};
@@ -102,8 +103,9 @@ impl Fixture {
     }
 
     fn registry(&self) -> ProviderRegistry {
-        ProviderRegistry::from_model_configs(
+        ProviderRegistry::from_configs(
             &[external_model(MODEL, &self.provider_path)],
+            &self.providers(),
             ProviderRegistryOptions::default()
                 .with_config_root(self.dir.path().join("config-root"))
                 .with_data_root(self.dir.path().join("data-root")),
@@ -112,8 +114,9 @@ impl Fixture {
     }
 
     fn hostile_registry(&self) -> ProviderRegistry {
-        ProviderRegistry::from_model_configs(
+        ProviderRegistry::from_configs(
             &[external_model(MODEL, &self.provider_path)],
+            &self.providers(),
             ProviderRegistryOptions::default()
                 .with_config_root(self.dir.path().join("hostile-config-root"))
                 .with_data_root(self.dir.path().join("hostile-data-root")),
@@ -122,8 +125,9 @@ impl Fixture {
     }
 
     fn timeout_registry(&self) -> ProviderRegistry {
-        ProviderRegistry::from_model_configs(
+        ProviderRegistry::from_configs(
             &[external_model(MODEL, &self.provider_path)],
+            &self.providers(),
             ProviderRegistryOptions::default().with_client_options(
                 ProviderClientOptions::default()
                     .with_timeout(Duration::from_millis(150))
@@ -134,13 +138,30 @@ impl Fixture {
     }
 
     fn unrelated_registry(&self) -> ProviderRegistry {
-        ProviderRegistry::from_model_configs(
+        ProviderRegistry::from_configs(
             &[external_model(UNRELATED_MODEL, &self.provider_path)],
+            &self.providers(),
             ProviderRegistryOptions::default()
                 .with_config_root(self.dir.path().join("config-root"))
                 .with_data_root(self.dir.path().join("data-root")),
         )
         .expect("registry")
+    }
+
+    fn providers(&self) -> ProvidersConfig {
+        ProvidersConfig {
+            entries: HashMap::from([(
+                PROVIDER_NAME.to_string(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "provider-a-family".to_string(),
+                        executable: self.provider_path.display().to_string(),
+                    }),
+                    settings_id: Some(SETTINGS_ID.to_string()),
+                    ..ProviderEntry::default()
+                },
+            )]),
+        }
     }
 
     fn records(&self) -> Vec<Value> {
@@ -600,7 +621,8 @@ fn one_page_quantum_commits_turn_and_checkpoint_once() {
     fixture.set_mode("page_success");
     let registry = fixture.registry();
     let identity = provider_identity();
-    let key = session_provider::canonical_stream_key(&identity, SESSION_ID);
+    let key = session_provider::canonical_stream_key(&identity, SESSION_ID)
+        .expect("provider identity should produce an ingest key");
     fixture
         .state
         .enqueue_session_turn_ingest_stream(&key)
@@ -652,7 +674,8 @@ fn provider_page_failure_leaves_checkpoint_unchanged() {
     fixture.set_mode("page_provider_error");
     let registry = fixture.registry();
     let identity = provider_identity();
-    let key = session_provider::canonical_stream_key(&identity, SESSION_ID);
+    let key = session_provider::canonical_stream_key(&identity, SESSION_ID)
+        .expect("provider identity should produce an ingest key");
     fixture
         .state
         .enqueue_session_turn_ingest_stream(&key)
@@ -700,7 +723,8 @@ fn bounded_worker_leases_and_applies_exactly_one_ready_page() {
     let fixture = Fixture::new();
     fixture.set_mode("page_success");
     let registry = fixture.registry();
-    let key = session_provider::canonical_stream_key(&provider_identity(), SESSION_ID);
+    let key = session_provider::canonical_stream_key(&provider_identity(), SESSION_ID)
+        .expect("provider identity should produce an ingest key");
     fixture
         .state
         .enqueue_session_turn_ingest_stream(&key)
@@ -750,7 +774,8 @@ fn bounded_worker_schedules_per_stream_retry_without_advancing_checkpoint() {
     let fixture = Fixture::new();
     fixture.set_mode("page_provider_error");
     let registry = fixture.registry();
-    let key = session_provider::canonical_stream_key(&provider_identity(), SESSION_ID);
+    let key = session_provider::canonical_stream_key(&provider_identity(), SESSION_ID)
+        .expect("provider identity should produce an ingest key");
     fixture
         .state
         .enqueue_session_turn_ingest_stream(&key)
@@ -805,7 +830,8 @@ fn bounded_worker_marks_unpaged_provider_unsupported_without_fallback() {
     let fixture = Fixture::new();
     fixture.set_mode("capture_success");
     let registry = fixture.registry();
-    let key = session_provider::canonical_stream_key(&provider_identity(), SESSION_ID);
+    let key = session_provider::canonical_stream_key(&provider_identity(), SESSION_ID)
+        .expect("provider identity should produce an ingest key");
     fixture
         .state
         .enqueue_session_turn_ingest_stream(&key)
@@ -899,10 +925,13 @@ fn external_provider_capture_provider_transport_and_schema_failures_do_not_mutat
         ("nonzero_no_envelope", "provider_process_nonzero"),
     ] {
         let fixture = Fixture::new();
-        fixture.set_mode(mode);
         let invocation_uuid = "12121212-1212-4212-8212-121212121212";
         fixture.seed_finalized_invocation(invocation_uuid);
         let registry = fixture.registry();
+        registry
+            .preflight_account(PROVIDER_NAME)
+            .expect("capture failure fixture endpoint should preflight");
+        fixture.set_mode(mode);
         let before = fixture.snapshot();
 
         let err =

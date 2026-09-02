@@ -2,8 +2,8 @@
 
 use chrono::{DateTime, Utc};
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, SessionsConfig,
-    provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    ProvidersConfig, SessionsConfig, provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_provider::generated::{
     MigrationApplyResult, MigrationPlanResult, RotationAssessResult,
@@ -20,6 +20,7 @@ use oulipoly_runtime::services::{
     MigrationServiceOutput, MigrationServiceRequest, ProductionMigrationService, ServiceError,
 };
 use oulipoly_state::{InvocationStart, ResolvedResume, SessionTurnIngest, StateDb};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -27,6 +28,8 @@ use std::sync::Arc;
 const MODEL: &str = "model-alpha";
 const SOURCE_PROVIDER: &str = "source-provider";
 const TARGET_PROVIDER: &str = "target-provider";
+const SOURCE_SETTINGS_ID: &str = "source-provider-settings-record";
+const TARGET_SETTINGS_ID: &str = "target-provider-settings-record";
 const SOURCE_SESSION: &str = "session-source";
 const TARGET_SESSION: &str = "session-target";
 const TURN_ID: &str = "turn-alpha";
@@ -89,9 +92,8 @@ fn s7c_external_rotation_dispatch_uses_registry_client_and_capability_gates() {
         assert_contains("rotation_external_provider/mod.rs", &module, needle);
     }
     for needle in [
-        "describe_model_provider",
-        "enabled_artifact_for_model",
-        "client_factory",
+        "preflight_account",
+        "PinnedProviderEndpoint",
         "supports_rotation_or_migration",
     ] {
         assert_contains(
@@ -109,6 +111,11 @@ fn s7c_external_rotation_dispatch_uses_registry_client_and_capability_gates() {
         "rotation_external_provider/mod.rs",
         &module,
         "migrate_chain_segment(",
+    );
+    assert_not_contains(
+        "rotation_external_provider/provider_access.rs",
+        &provider_access,
+        "enabled_artifact_for_model",
     );
 }
 
@@ -446,15 +453,15 @@ fn s7c_external_provider_matrix_executes_error_protocol_capability_and_no_mutati
     assert!(matches!(err, ServiceError::Dependency { .. }));
     assert_eq!(describe_failure.snapshot(), before);
 
-    let disabled_artifact = RuntimeFixture::new_disabled_artifact();
-    let before = disabled_artifact.snapshot();
+    let missing_endpoint = RuntimeFixture::new_missing_endpoint();
+    let before = missing_endpoint.snapshot();
     let service =
-        ProductionMigrationService::with_registry_handle(disabled_artifact.registry.clone());
+        ProductionMigrationService::with_registry_handle(missing_endpoint.registry.clone());
     let err = service
-        .migrate(disabled_artifact.request_manual(&mut Vec::new(), TARGET_PROVIDER))
-        .expect_err("runtime-disabled artifact must be a hard service dependency failure");
+        .migrate(missing_endpoint.request_manual(&mut Vec::new(), TARGET_PROVIDER))
+        .expect_err("missing account endpoint must be a hard service dependency failure");
     assert!(matches!(err, ServiceError::Dependency { .. }));
-    assert_eq!(disabled_artifact.snapshot(), before);
+    assert_eq!(missing_endpoint.snapshot(), before);
 
     let mismatch = RuntimeFixture::new("s7c-rotation-materialize-artifact-hash-mismatch");
     let before = mismatch.snapshot();
@@ -586,10 +593,10 @@ fn s7c_host_apply_transaction_rolls_back_when_open_segment_fails() {
 }
 
 #[test]
-fn s7c_external_rotation_identity_uses_target_account_as_settings_id() {
+fn s7c_external_rotation_identity_uses_explicit_target_settings_id() {
     let fixture = RuntimeFixture::new("s7c-rotation-materialize-success");
 
-    assert_eq!(fixture.identity().settings_id, TARGET_PROVIDER);
+    assert_eq!(fixture.identity().settings_id, TARGET_SETTINGS_ID);
 }
 
 #[test]
@@ -1007,7 +1014,8 @@ impl RuntimeFixture {
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
         let state = StateDb::open(&dir.path().join("state.db")).expect("state db");
-        let model = external_model_from_ref(path_provider_ref(&provider_wrapper(dir.path(), mode)));
+        let provider_path = provider_wrapper(dir.path(), mode);
+        let model = external_model_from_ref(path_provider_ref(&provider_path));
         let resolved = seed_chain(&state, &model);
         let artifact_path = workspace.join("session-target.jsonl");
         let record_path = dir.path().join("request-record.txt");
@@ -1025,8 +1033,9 @@ impl RuntimeFixture {
             &resolved.chain_id,
         );
         let registry = ProviderRegistryHandle::new(Arc::new(
-            ProviderRegistry::from_model_configs(
+            ProviderRegistry::from_configs(
                 std::slice::from_ref(&model),
+                &providers(&provider_path),
                 ProviderRegistryOptions::default(),
             )
             .expect("registry"),
@@ -1045,7 +1054,7 @@ impl RuntimeFixture {
         }
     }
 
-    fn new_disabled_artifact() -> Self {
+    fn new_missing_endpoint() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
@@ -1063,8 +1072,9 @@ impl RuntimeFixture {
         let count_path = dir.path().join("provider-count.txt");
         std::fs::write(&count_path, "0").expect("count seed");
         let registry = ProviderRegistryHandle::new(Arc::new(
-            ProviderRegistry::from_model_configs(
+            ProviderRegistry::from_configs(
                 std::slice::from_ref(&model),
+                &ProvidersConfig::default(),
                 ProviderRegistryOptions::default(),
             )
             .expect("registry"),
@@ -1260,7 +1270,7 @@ impl RuntimeFixture {
                 .expect("recorded provider stdin"),
         )
         .expect("recorded provider request JSON");
-        assert_eq!(request["params"]["settings_id"], TARGET_PROVIDER);
+        assert_eq!(request["params"]["settings_id"], TARGET_SETTINGS_ID);
         assert_eq!(request["params"]["transition_reason"], transition_reason);
         assert!(
             request["host"]["data_root"]
@@ -1454,6 +1464,33 @@ fn external_model_from_ref(provider: ProviderImplementationRef) -> ModelConfig {
         ],
         inputs: Vec::new(),
         provider: Some(provider),
+    }
+}
+
+fn providers(provider_path: &Path) -> ProvidersConfig {
+    let endpoint = ProviderEndpointConfig {
+        family: "rotation-fixture".to_string(),
+        executable: provider_path.display().to_string(),
+    };
+    ProvidersConfig {
+        entries: HashMap::from([
+            (
+                SOURCE_PROVIDER.to_string(),
+                ProviderEntry {
+                    implementation: Some(endpoint.clone()),
+                    settings_id: Some(SOURCE_SETTINGS_ID.to_string()),
+                    ..ProviderEntry::default()
+                },
+            ),
+            (
+                TARGET_PROVIDER.to_string(),
+                ProviderEntry {
+                    implementation: Some(endpoint),
+                    settings_id: Some(TARGET_SETTINGS_ID.to_string()),
+                    ..ProviderEntry::default()
+                },
+            ),
+        ]),
     }
 }
 

@@ -18,6 +18,13 @@ pub(crate) fn projection_error(_error: serde_json::Error) -> ServiceError {
     classify_error(TerminalClassifyError::projection())
 }
 
+pub(crate) fn settings_identity_mismatch() -> ServiceError {
+    ServiceError::Dependency {
+        message: "external provider terminal settings identity does not match the selected account endpoint"
+            .to_string(),
+    }
+}
+
 pub(crate) fn classify_error(error: TerminalClassifyError) -> ServiceError {
     ServiceError::Dependency {
         message: format_terminal_classify_error(&error),

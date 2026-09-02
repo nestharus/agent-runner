@@ -28,7 +28,6 @@ mod provider_error_formatter;
 mod provider_registry_accessor;
 mod registry_error_formatter;
 mod registry_handle_validator;
-mod registry_transport_mapper;
 mod replace_host_apply;
 mod replace_input_accessor;
 mod replace_input_formatter;
@@ -74,12 +73,16 @@ pub fn export_session(
         .map_err(service_error_mapper::export_adapter_error)?
         .current();
     let identity = identity::map_identity(identity);
-    let describe = provider_registry_accessor::describe_provider(registry.as_ref(), &identity)
+    let endpoint = provider_registry_accessor::preflight_provider(registry.as_ref(), &identity)
         .map_err(service_error_mapper::export_registry_error)?;
-    capability_gate::require_session_capability(&describe)
+    let describe = endpoint.capabilities();
+    capability_gate::require_session_capability(describe)
         .map_err(service_error_mapper::export_adapter_error)?;
     let provider_instance_id = identity_formatter::provider_instance_id(&describe.provider_id);
-    let settings_id = identity_formatter::settings_id(&describe, &identity.settings_id);
+    let settings_id = endpoint
+        .settings_id()
+        .map_err(service_error_mapper::export_registry_error)?
+        .to_string();
     let identity = identity::map_described_identity(identity, provider_instance_id, settings_id);
     let request_id = request_id_formatter::session_request_id("export");
     let request = request_builder::build_export_request(
@@ -89,11 +92,7 @@ pub fn export_session(
         request_id,
     )
     .map_err(service_error_mapper::export_adapter_error)?;
-    let client =
-        provider_registry_accessor::provider_client_for_model(registry.as_ref(), &identity)
-            .map_err(registry_transport_mapper::registry_error_as_transport)
-            .map_err(service_error_mapper::export_client_error)?;
-    let result = client_invoker::invoke_export(&client, request)
+    let result = client_invoker::invoke_export(endpoint.client(), request)
         .map_err(service_error_mapper::export_client_error)?;
     let bytes = export_result_parser::decode_base64(&result.data_base64)
         .map_err(service_error_mapper::export_adapter_error)?;
@@ -117,17 +116,18 @@ pub fn replace_session(
     let records = crate::session_replace::parse_provider_owned_canonical_input_for_session(
         session_id, &bytes,
     )?;
-    let describe = provider_registry_accessor::describe_provider(registry.as_ref(), &identity)
+    let endpoint = provider_registry_accessor::preflight_provider(registry.as_ref(), &identity)
         .map_err(service_error_mapper::replace_registry_error)?;
-    capability_gate::require_session_capability(&describe)
+    let describe = endpoint.capabilities();
+    capability_gate::require_session_capability(describe)
         .map_err(service_error_mapper::replace_adapter_error)?;
     let provider_instance_id = identity_formatter::provider_instance_id(&describe.provider_id);
-    let settings_id = identity_formatter::settings_id(&describe, &identity.settings_id);
+    let settings_id = endpoint
+        .settings_id()
+        .map_err(service_error_mapper::replace_registry_error)?
+        .to_string();
     let identity = identity::map_described_identity(identity, provider_instance_id, settings_id);
-    let client =
-        provider_registry_accessor::provider_client_for_model(registry.as_ref(), &identity)
-            .map_err(registry_transport_mapper::registry_error_as_transport)
-            .map_err(service_error_mapper::replace_client_error)?;
+    let client = endpoint.client();
     let data_root = provider_owned_data_root()?;
     let lock = provider_owned_session_lock(&data_root)?;
     let lease = ProviderOwnedReplaceLease::acquire(&lock, session_id, &identity.provider_name)?;
@@ -165,7 +165,7 @@ pub fn replace_session(
         }
     };
     pending_journal.require_current()?;
-    let result = match client_invoker::invoke_replace(&client, request) {
+    let result = match client_invoker::invoke_replace(client, request) {
         Ok(result) => result,
         Err(error) => {
             let indeterminate = error.is_host_transport_or_protocol();
@@ -231,7 +231,7 @@ pub fn replace_session(
     maybe_provider_owned_test_hook(TEST_STOP_AFTER_DB_APPLY_MARKER)?;
     if accepted.operation_state == "prepared" {
         send_provider_owned_recovery_action(
-            &client,
+            client,
             &identity,
             ProviderOwnedRecoveryJournalContext {
                 journal: &journal,
@@ -337,7 +337,7 @@ fn recover_provider_owned_journal(
     lease: &ProviderOwnedReplaceLease<'_>,
 ) -> Result<(), ReplaceError> {
     let identity = map_provider_owned_journal_identity(&journal);
-    let client = match provider_registry_accessor::provider_client_for_model(registry, &identity)
+    let endpoint = match provider_registry_accessor::preflight_provider(registry, &identity)
         .map_err(|error| ReplaceError::OperationalError {
             message: format!("provider_owned_recovery_unavailable: {error}"),
         }) {
@@ -377,7 +377,7 @@ fn recover_provider_owned_journal(
         }
     };
     lease.require_current_journal(path, &journal.operation_id)?;
-    let query_result = match client_invoker::invoke_replace(&client, query) {
+    let query_result = match client_invoker::invoke_replace(endpoint.client(), query) {
         Ok(result) => result,
         Err(error) => {
             let context = format!("provider_owned_recovery_unavailable: {error}");
@@ -485,7 +485,7 @@ fn recover_provider_owned_journal(
                     retain_provider_owned_failure(path, &journal, lease, format!("{error:?}"))
                 })?;
             send_provider_owned_recovery_action(
-                &client,
+                endpoint.client(),
                 &identity,
                 ProviderOwnedRecoveryJournalContext {
                     journal: &journal,
@@ -522,7 +522,7 @@ fn recover_provider_owned_journal(
                 retain_provider_owned_failure(path, &journal, lease, format!("{error:?}"))
             })?;
             send_provider_owned_recovery_action(
-                &client,
+                endpoint.client(),
                 &identity,
                 ProviderOwnedRecoveryJournalContext {
                     journal: &journal,
@@ -1097,6 +1097,12 @@ impl<'a> ProviderOwnedJournalPublication<'a> {
             String::new(),
         )?;
         let db_preimage = crate::session_replace::provider_replace_db_preimage(&db_target)?;
+        let provider_instance_id = identity.provider_instance_id.clone().ok_or_else(|| {
+            ReplaceError::OperationalError {
+                message: "selected account endpoint did not supply an authenticated provider instance identity"
+                    .to_string(),
+            }
+        })?;
         let journal = ProviderOwnedReplaceJournal {
             schema_version: 3,
             operation: PROVIDER_OWNED_JOURNAL_OPERATION.to_string(),
@@ -1105,7 +1111,7 @@ impl<'a> ProviderOwnedJournalPublication<'a> {
             settings_id: identity.settings_id.clone(),
             model_name: identity.model_name.clone(),
             provider_name: identity.provider_name.clone(),
-            provider_instance_id: identity::provider_instance_id(identity),
+            provider_instance_id,
             session_id: session_id.to_string(),
             chain_id: db_target.chain_id.clone(),
             active_segment_id: db_target.active_segment_id,

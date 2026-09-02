@@ -2,7 +2,8 @@
 
 use chrono::{DateTime, Utc};
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    ProvidersConfig, provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_provider::generated::CONTRACT_VERSION;
 use oulipoly_runtime::provider_registry::{
@@ -61,8 +62,9 @@ impl Fixture {
     }
 
     fn registry(&self) -> ProviderRegistry {
-        ProviderRegistry::from_model_configs(
+        ProviderRegistry::from_configs(
             &[model("model-a", "provider-a", &self.provider_path)],
+            &providers(&[("provider-a", &self.provider_path, SETTINGS_A)]),
             ProviderRegistryOptions::default()
                 .with_config_root(self.dir.path().join("config"))
                 .with_data_root(self.dir.path().join("data")),
@@ -117,8 +119,12 @@ fn duplicate_provider_session_owner_fixture() -> DuplicateProviderSessionOwnerFi
         .providers
         .push(ProviderConfig::model_provider("opencode", Vec::new()));
     let import_model = model("import-model", "opencode", &runtime.provider_path);
-    let registry = ProviderRegistry::from_model_configs(
+    let registry = ProviderRegistry::from_configs(
         &[owner_model.clone(), import_model],
+        &providers(&[
+            ("opencode3", &runtime.provider_path, "opencode3"),
+            ("opencode", &runtime.provider_path, "opencode"),
+        ]),
         ProviderRegistryOptions::default()
             .with_config_root(runtime.dir.path().join("config"))
             .with_data_root(runtime.dir.path().join("data")),
@@ -306,11 +312,15 @@ fn provider_error_or_missing_capability_does_not_abort_other_provider_import() {
             write_fake_provider_script(dir.path(), "bad-provider", &bad_mode_path, dir.path());
         let good_provider =
             write_fake_provider_script(dir.path(), "good-provider", &good_mode_path, dir.path());
-        let registry = ProviderRegistry::from_model_configs(
+        let registry = ProviderRegistry::from_configs(
             &[
                 model("model-a", "provider-a", &bad_provider),
                 model("model-b", "provider-b", &good_provider),
             ],
+            &providers(&[
+                ("provider-a", &bad_provider, SETTINGS_A),
+                ("provider-b", &good_provider, SETTINGS_B),
+            ]),
             ProviderRegistryOptions::default()
                 .with_config_root(dir.path().join("config"))
                 .with_data_root(dir.path().join("data")),
@@ -355,11 +365,15 @@ fn fake_provider_import_lists_sessions_and_resume_resolves_provider_native_id() 
     );
     let opencode_provider =
         write_fake_provider_script(dir.path(), "fake-opencode", &opencode_mode_path, dir.path());
-    let registry = ProviderRegistry::from_model_configs(
+    let registry = ProviderRegistry::from_configs(
         &[
             model("provider-a-model", &provider_a_name, &provider_a_binary),
             model("opencode-model", "opencode", &opencode_provider),
         ],
+        &providers(&[
+            (&provider_a_name, &provider_a_binary, SETTINGS_A),
+            ("opencode", &opencode_provider, SETTINGS_B),
+        ]),
         ProviderRegistryOptions::default()
             .with_config_root(dir.path().join("config"))
             .with_data_root(dir.path().join("data")),
@@ -451,6 +465,27 @@ fn model(name: &str, provider_name: &str, provider_path: &Path) -> ModelConfig {
             binary: None,
             script: None,
         }),
+    }
+}
+
+fn providers(entries: &[(&str, &Path, &str)]) -> ProvidersConfig {
+    ProvidersConfig {
+        entries: entries
+            .iter()
+            .map(|(provider_name, provider_path, settings_id)| {
+                (
+                    (*provider_name).to_string(),
+                    ProviderEntry {
+                        implementation: Some(ProviderEndpointConfig {
+                            family: (*provider_name).to_string(),
+                            executable: provider_path.display().to_string(),
+                        }),
+                        settings_id: Some((*settings_id).to_string()),
+                        ..ProviderEntry::default()
+                    },
+                )
+            })
+            .collect(),
     }
 }
 

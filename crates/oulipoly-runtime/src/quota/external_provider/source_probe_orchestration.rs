@@ -21,7 +21,6 @@ use crate::quota::{InFlightGuard, RefreshOutcome};
 use crate::services::{QuotaServiceExternalProviderIdentity, QuotaServiceRequest};
 use oulipoly_provider::client::ProviderClient;
 use oulipoly_provider::generated::{DescribeResult, QuotaProbeResult, QuotaSourceResult};
-use oulipoly_provider::resolver::ProviderArtifactRef;
 use oulipoly_state::QuotaWindowInput;
 use serde_json::Value;
 use std::sync::Arc;
@@ -29,26 +28,34 @@ use std::sync::Arc;
 pub(crate) fn refresh_external_provider_quota(
     registry_handle: &ProviderRegistryHandle,
     request: QuotaServiceRequest<'_>,
-    identity: QuotaServiceExternalProviderIdentity,
+    _identity: QuotaServiceExternalProviderIdentity,
 ) -> RefreshOutcome {
     let _guard = match claim_external_quota_refresh(request.in_flight, &request.provider_name) {
         Ok(guard) => guard,
         Err(outcome) => return outcome,
     };
     let registry = current_registry(registry_handle);
-    let artifact = match enabled_artifact_for_identity(&registry, &identity) {
-        Ok(artifact) => artifact,
+    let endpoint = match registry.preflight_account(&request.provider_name) {
+        Ok(endpoint) => endpoint,
         Err(error) => return registry_failure_outcome(error),
     };
-    let describe = match describe_identity_provider(&registry, &identity) {
-        Ok(describe) => describe,
-        Err(error) => return registry_failure_outcome(error),
-    };
-    if let Some(outcome) = invalid_capability_outcome(&describe) {
+    if let Some(outcome) = invalid_capability_outcome(endpoint.capabilities()) {
         return outcome;
     }
-    let client = client_for_artifact(&registry, artifact);
-    run_external_quota_sequence(&client, registry.host_options(), request, &identity)
+    let settings_id = match endpoint.settings_id() {
+        Ok(settings_id) => settings_id,
+        Err(error) => return registry_failure_outcome(error),
+    };
+    let identity = QuotaServiceExternalProviderIdentity {
+        provider_instance_id: format!("{}-instance", endpoint.capabilities().provider_id),
+        settings_id: settings_id.to_string(),
+    };
+    run_external_quota_sequence(
+        endpoint.client(),
+        registry.host_options(),
+        request,
+        &identity,
+    )
 }
 
 fn claim_external_quota_refresh<'a>(
@@ -64,20 +71,6 @@ fn current_registry(registry_handle: &ProviderRegistryHandle) -> Arc<ProviderReg
     registry_handle.current()
 }
 
-fn enabled_artifact_for_identity(
-    registry: &ProviderRegistry,
-    identity: &QuotaServiceExternalProviderIdentity,
-) -> Result<ProviderArtifactRef, ProviderRegistryError> {
-    registry.enabled_artifact_for_model(&identity.model_name)
-}
-
-fn describe_identity_provider(
-    registry: &ProviderRegistry,
-    identity: &QuotaServiceExternalProviderIdentity,
-) -> Result<DescribeResult, ProviderRegistryError> {
-    registry.describe_model_provider(&identity.model_name)
-}
-
 fn registry_failure_outcome(error: ProviderRegistryError) -> RefreshOutcome {
     failed_outcome(registry_error(error))
 }
@@ -86,13 +79,6 @@ fn invalid_capability_outcome(describe: &DescribeResult) -> Option<RefreshOutcom
     validate_quota_capability(describe)
         .err()
         .map(failed_outcome)
-}
-
-fn client_for_artifact(
-    registry: &ProviderRegistry,
-    artifact: ProviderArtifactRef,
-) -> ProviderClient {
-    registry.client_factory().client_for(artifact)
 }
 
 fn run_external_quota_sequence(

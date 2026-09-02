@@ -1,7 +1,8 @@
 #![cfg(unix)]
 
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    ProvidersConfig, provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_runtime::executor::RuntimeExecutorService;
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
@@ -44,8 +45,22 @@ impl Fixture {
     }
 
     fn registry(&self) -> ProviderRegistry {
-        ProviderRegistry::from_model_configs(
+        let providers = ProvidersConfig {
+            entries: HashMap::from([(
+                provider_name(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "external-session-family".to_string(),
+                        executable: self.provider_path.display().to_string(),
+                    }),
+                    settings_id: Some("external-session-settings-record".to_string()),
+                    ..ProviderEntry::default()
+                },
+            )]),
+        };
+        ProviderRegistry::from_configs(
             &[external_model(&self.provider_path)],
+            &providers,
             ProviderRegistryOptions::default(),
         )
         .expect("registry")

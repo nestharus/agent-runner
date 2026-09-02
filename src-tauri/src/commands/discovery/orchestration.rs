@@ -48,9 +48,10 @@ pub(crate) async fn discover_models_cmd(
 ) -> Result<Vec<DiscoveredModel>, String> {
     let db_path = accessor::state_db_path(&state);
     let state_db_opener = accessor::state_db_opener(&state);
+    let provider_registry = state.provider_registry.current();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let result = accessor::discover_models_for_cli(&cli_name)?;
+        let result = accessor::discover_models_for_family(&provider_registry, &cli_name)?;
         let db = accessor::open_state_db_at(&state_db_opener, &db_path)?;
         accessor::persist_discovery_result(&db, &cli_name, result)
     })

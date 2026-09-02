@@ -839,6 +839,7 @@ fn account_preflight_retains_one_canonical_executable_for_related_calls() {
                     family: "fixture-family".to_string(),
                     executable: "configured-provider".to_string(),
                 }),
+                settings_id: Some("fixture-settings".to_string()),
                 command: Some("must-not-select-an-implementation".to_string()),
                 ..Default::default()
             },
@@ -856,6 +857,7 @@ fn account_preflight_retains_one_canonical_executable_for_related_calls() {
     assert!(Arc::ptr_eq(&endpoint, &cached));
     assert_eq!(endpoint.account_name(), "provider-a");
     assert_eq!(endpoint.family(), "fixture-family");
+    assert_eq!(endpoint.settings_id().unwrap(), "fixture-settings");
     assert_eq!(
         endpoint.canonical_executable(),
         configured.canonicalize().unwrap()
@@ -934,7 +936,15 @@ fn registry_includes_unreferenced_accounts_and_keeps_shared_family_endpoints_acc
     let first = registry.preflight_account("provider-a").unwrap();
     let second = registry.preflight_account("unreferenced-account").unwrap();
     assert!(!Arc::ptr_eq(&first, &second));
-    assert_eq!(read_count(&count), 2);
+    let family = registry.preflight_family("shared-family").unwrap();
+    let cached_family = registry.preflight_family("shared-family").unwrap();
+    assert!(Arc::ptr_eq(&family, &cached_family));
+    assert_eq!(family.family(), "shared-family");
+    assert_eq!(
+        family.canonical_executable(),
+        executable.canonicalize().unwrap()
+    );
+    assert_eq!(read_count(&count), 3);
 }
 
 #[test]

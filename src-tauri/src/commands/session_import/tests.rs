@@ -24,14 +24,14 @@ fn target_resolution_deduplicates_provider_accounts_and_supports_provider_filter
         ],
     );
 
-    let all = session_import_targets(&models, &registry, None);
+    let all = session_import_targets(&models, &registry, None).unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].model_name, "model-a");
     assert_eq!(all[0].provider_name, "provider-a");
-    assert_eq!(all[0].settings_id, "provider-a");
+    assert_eq!(all[0].settings_id, "provider-a-settings");
     assert_eq!(all[1].provider_name, "provider-b");
 
-    let filtered = session_import_targets(&models, &registry, Some("provider-b"));
+    let filtered = session_import_targets(&models, &registry, Some("provider-b")).unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].provider_name, "provider-b");
 }
@@ -47,14 +47,14 @@ fn target_resolution_includes_models_without_top_level_provider_refs() {
         ],
     );
 
-    let all = session_import_targets(&models, &registry, None);
+    let all = session_import_targets(&models, &registry, None).unwrap();
 
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].model_name, "opencode-test");
     assert_eq!(all[0].provider_name, "opencode");
     assert_eq!(all[1].provider_name, "opencode2");
 
-    let filtered = session_import_targets(&models, &registry, Some("opencode"));
+    let filtered = session_import_targets(&models, &registry, Some("opencode")).unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].provider_name, "opencode");
 }
@@ -112,7 +112,7 @@ fn target_resolution_supports_model_filter() {
         ],
     );
 
-    let filtered = session_import_targets(&models, &registry, Some("model-b"));
+    let filtered = session_import_targets(&models, &registry, Some("model-b")).unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].model_name, "model-b");
     assert_eq!(filtered[0].provider_name, "provider-b");
@@ -192,6 +192,7 @@ fn providers_config(accounts: &[(&str, &str, &str)]) -> ProvidersConfig {
                         family: "session-import-fixture".to_string(),
                         executable: (*executable).to_string(),
                     }),
+                    settings_id: Some(format!("{name}-settings")),
                     command: Some((*command).to_string()),
                     ..Default::default()
                 };

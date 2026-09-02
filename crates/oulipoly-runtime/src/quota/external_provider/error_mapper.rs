@@ -26,6 +26,8 @@ pub(crate) fn registry_error(error: ProviderRegistryError) -> ExternalQuotaError
         ProviderRegistryError::InvalidImplementationRef { .. }
         | ProviderRegistryError::ModelProviderNotConfigured { .. }
         | ProviderRegistryError::AccountImplementationNotConfigured { .. }
+        | ProviderRegistryError::AccountSettingsNotConfigured { .. }
+        | ProviderRegistryError::FamilyImplementationNotConfigured { .. }
         | ProviderRegistryError::FamilyImplementationConflict { .. } => {
             ExternalQuotaError::registry_lookup()
         }

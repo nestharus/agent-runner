@@ -1,6 +1,7 @@
 use chrono::Utc;
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig,
+    provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_config::{
     ProviderEntry, ProvidersConfig, SessionSourceEntry, SessionStorage, SessionsConfig,
@@ -164,8 +165,22 @@ impl ProviderAFixture {
     }
 
     fn registry_handle(&self) -> ProviderRegistryHandle {
-        let registry = ProviderRegistry::from_model_configs(
+        let providers = ProvidersConfig {
+            entries: HashMap::from([(
+                PROVIDER_A_ACCOUNT.to_string(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "provider-a-family".to_string(),
+                        executable: self.provider_path.display().to_string(),
+                    }),
+                    settings_id: Some(PROVIDER_A_SETTINGS.to_string()),
+                    ..ProviderEntry::default()
+                },
+            )]),
+        };
+        let registry = ProviderRegistry::from_configs(
             &[provider_a_model(PROVIDER_A_MODEL, &self.provider_path)],
+            &providers,
             ProviderRegistryOptions::default(),
         )
         .unwrap();

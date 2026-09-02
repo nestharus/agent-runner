@@ -23,34 +23,6 @@ impl ProviderClientFactory {
         ProviderClient::new(artifact, self.options.clone())
     }
 
-    pub(crate) fn client_for_with_cancellation(
-        &self,
-        artifact: ProviderArtifactRef,
-        cancellation: &CancellationToken,
-    ) -> ProviderClient {
-        ProviderClient::new(
-            artifact,
-            self.options
-                .clone()
-                .with_cancellation(Some(cancellation.clone())),
-        )
-    }
-
-    pub(crate) fn client_for_with_cancellation_and_timeout(
-        &self,
-        artifact: ProviderArtifactRef,
-        cancellation: &CancellationToken,
-        timeout: Duration,
-    ) -> ProviderClient {
-        ProviderClient::new(
-            artifact,
-            self.options
-                .clone()
-                .with_cancellation(Some(cancellation.clone()))
-                .with_timeout(timeout),
-        )
-    }
-
     pub(crate) fn client_from_pinned_with_observers(
         &self,
         pinned: &ProviderClient,
@@ -62,6 +34,32 @@ impl ProviderClientFactory {
                 .clone()
                 .with_spawn_observer(spawn_observer)
                 .with_launch_event_observer(launch_event_observer),
+        )
+    }
+
+    pub(crate) fn client_from_pinned_with_cancellation(
+        &self,
+        pinned: &ProviderClient,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderClient, oulipoly_provider::error::ProviderClientError> {
+        pinned.fork_from_pinned(
+            self.options
+                .clone()
+                .with_cancellation(Some(cancellation.clone())),
+        )
+    }
+
+    pub(crate) fn client_from_pinned_with_cancellation_and_timeout(
+        &self,
+        pinned: &ProviderClient,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<ProviderClient, oulipoly_provider::error::ProviderClientError> {
+        pinned.fork_from_pinned(
+            self.options
+                .clone()
+                .with_cancellation(Some(cancellation.clone()))
+                .with_timeout(timeout),
         )
     }
 }

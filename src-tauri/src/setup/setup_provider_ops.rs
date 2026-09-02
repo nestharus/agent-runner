@@ -1,15 +1,17 @@
 use oulipoly_config::app::SetupBrainConfig;
-use oulipoly_provider::client::{ProviderClient, ProviderClientOptions};
+use oulipoly_provider::client::ProviderClient;
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
     CONTRACT_VERSION, DiscoveryAccountsResult, DiscoveryObject, ErrorCategory, HostContext,
     RequestEnvelope, SetupDetectResult, SetupInstallPlanResult, SetupObject, SetupSyncPlanResult,
 };
-use oulipoly_runtime::provider_registry::ProviderClientFactory;
+use oulipoly_runtime::provider_registry::PinnedFamilyEndpoint;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-use super::setup_brain_host::provider_artifact_from_ref;
+use std::sync::Arc;
+
+use super::setup_brain_host::setup_bootstrap_endpoint;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SetupProviderDiagnostic {
@@ -42,31 +44,25 @@ pub struct SetupProviderContext {
 }
 
 pub fn build_setup_provider_context(config: &SetupBrainConfig) -> SetupProviderContext {
+    let endpoint = match setup_bootstrap_endpoint(config) {
+        Ok(endpoint) => endpoint,
+        Err(_) => return failed_setup_provider_context(),
+    };
+    build_setup_provider_context_with_endpoint(config, endpoint)
+}
+
+pub fn build_setup_provider_context_with_endpoint(
+    config: &SetupBrainConfig,
+    endpoint: Arc<PinnedFamilyEndpoint>,
+) -> SetupProviderContext {
     let mut context = json!({});
     let mut diagnostics = Vec::new();
     let mut operation_calls = Vec::new();
 
-    let client = match provider_artifact_from_ref(&config.artifact) {
-        Ok(artifact) => {
-            ProviderClientFactory::new(ProviderClientOptions::default()).client_for(artifact)
-        }
-        Err(_) => {
-            for operation in SETUP_PROVIDER_OPERATIONS {
-                operation_calls.push(*operation);
-                diagnostics.push(setup_provider_error(operation));
-            }
-            return SetupProviderContext {
-                context,
-                diagnostics,
-                operation_calls,
-            };
-        }
-    };
-
     let settings_id = config.settings_id.as_deref();
     for operation in SETUP_PROVIDER_OPERATIONS {
         operation_calls.push(*operation);
-        match invoke_setup_provider_operation(&client, operation, settings_id) {
+        match invoke_setup_provider_operation(endpoint.client(), operation, settings_id) {
             Ok(addition) => merge_context(&mut context, addition),
             Err(diagnostic) => diagnostics.push(diagnostic),
         }
@@ -76,6 +72,17 @@ pub fn build_setup_provider_context(config: &SetupBrainConfig) -> SetupProviderC
         context,
         diagnostics,
         operation_calls,
+    }
+}
+
+fn failed_setup_provider_context() -> SetupProviderContext {
+    SetupProviderContext {
+        context: json!({}),
+        diagnostics: SETUP_PROVIDER_OPERATIONS
+            .iter()
+            .map(|operation| setup_provider_error(operation))
+            .collect(),
+        operation_calls: SETUP_PROVIDER_OPERATIONS.to_vec(),
     }
 }
 

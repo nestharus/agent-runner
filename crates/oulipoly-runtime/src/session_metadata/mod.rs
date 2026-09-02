@@ -271,7 +271,7 @@ fn locate_session_metadata_with_dispatch_policy(
     let parsed_input = parse_metadata_input(input)?;
     reject_recent_ambiguity_for_policy(state, input, ambiguity_policy)?;
     let resolved = resolve_metadata_session(state, models, input)?;
-    if !resolved_uses_external_provider(&resolved) {
+    if !resolved_uses_external_provider(registry, &resolved) {
         return locate_session_metadata_with_policy(
             state,
             models,
@@ -317,11 +317,11 @@ fn resolve_metadata_session(
         .map_err(map_resume_error)
 }
 
-fn resolved_uses_external_provider(resolved: &oulipoly_state::ResolvedResume) -> bool {
-    resolved
-        .model
-        .as_ref()
-        .is_some_and(|model| model.provider.is_some())
+fn resolved_uses_external_provider(
+    registry: &ProviderRegistry,
+    resolved: &oulipoly_state::ResolvedResume,
+) -> bool {
+    registry.has_account_endpoint(&resolved.active_provider)
 }
 
 fn locate_external_provider_session_metadata(
@@ -518,7 +518,7 @@ fn load_external_metadata_facts(
 ) -> Result<ExternalMetadataFacts, MetadataError> {
     let provider = effective_provider_for_resolved(resolved, providers_cfg)?;
     let provider_name = resolved.active_provider.clone();
-    let model_name = external_resolved_model_name(resolved)?;
+    let model_name = external_resolved_model_name(resolved);
     let active_segment_id = external_active_segment_id(state, resolved)?;
     let identity = external_locate_identity(registry, model_name, &provider_name)?;
     let located_transcript =
@@ -581,15 +581,8 @@ fn map_external_session_metadata(
     })
 }
 
-fn external_resolved_model_name(
-    resolved: &oulipoly_state::ResolvedResume,
-) -> Result<&str, MetadataError> {
-    resolved
-        .model_name
-        .as_deref()
-        .ok_or_else(|| MetadataError::Operational {
-            message: "session_provider_model_name_missing".to_string(),
-        })
+fn external_resolved_model_name(resolved: &oulipoly_state::ResolvedResume) -> &str {
+    resolved.model_name.as_deref().unwrap_or("")
 }
 
 fn external_active_segment_id(
@@ -624,21 +617,18 @@ fn external_locate_identity(
     model_name: &str,
     provider_name: &str,
 ) -> Result<SessionProviderIdentity, MetadataError> {
-    let describe = external_locate_describe(registry, model_name)?;
-    Ok(external_identity_from_describe(
+    let endpoint = registry
+        .preflight_account(provider_name)
+        .map_err(describe_model_provider_error)?;
+    let settings_id = endpoint
+        .settings_id()
+        .map_err(describe_model_provider_error)?;
+    Ok(external_identity_from_endpoint(
         model_name,
         provider_name,
-        describe,
+        endpoint.capabilities(),
+        settings_id,
     ))
-}
-
-fn external_locate_describe(
-    registry: &ProviderRegistry,
-    model_name: &str,
-) -> Result<oulipoly_provider::generated::DescribeResult, MetadataError> {
-    registry
-        .describe_model_provider(model_name)
-        .map_err(describe_model_provider_error)
 }
 
 fn describe_model_provider_error<E: std::fmt::Display>(error: E) -> MetadataError {
@@ -651,25 +641,22 @@ fn describe_model_provider_failed_message<E: std::fmt::Display>(error: E) -> Str
     format!("session_provider_describe_failed: {error}")
 }
 
-fn external_identity_from_describe(
+fn external_identity_from_endpoint(
     model_name: &str,
     provider_name: &str,
-    describe: oulipoly_provider::generated::DescribeResult,
+    describe: &oulipoly_provider::generated::DescribeResult,
+    settings_id: &str,
 ) -> SessionProviderIdentity {
     SessionProviderIdentity {
         model_name: model_name.to_string(),
         provider_name: provider_name.to_string(),
         provider_instance_id: Some(format_external_provider_instance_id(&describe.provider_id)),
-        settings_id: external_settings_id(describe.settings_schema_id),
+        settings_id: settings_id.to_string(),
     }
 }
 
 fn format_external_provider_instance_id(provider_id: &str) -> String {
     format!("{provider_id}-instance")
-}
-
-fn external_settings_id(settings_schema_id: Option<String>) -> String {
-    settings_schema_id.unwrap_or_else(|| session_provider::S7A_NEUTRAL_SETTINGS_ID.to_string())
 }
 
 fn external_workspace_root(
@@ -702,7 +689,10 @@ pub fn resolve_resume_workspace_root(
     resolved: &ResolvedResume,
 ) -> Result<PathBuf, MetadataError> {
     let provider = effective_provider_for_resolved(resolved, providers_cfg)?;
-    if resolved_uses_external_provider(resolved)
+    if providers_cfg
+        .get(&resolved.active_provider)
+        .and_then(|entry| entry.implementation.as_ref())
+        .is_some()
         && let Some(workspace_root) = stored_session_workspace_root(resolved)?
     {
         return Ok(workspace_root);

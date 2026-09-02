@@ -150,13 +150,14 @@ fn insert_launch_env(env: &mut BTreeMap<String, String>, key: &str, value: Strin
 pub(crate) fn build_policy_request(
     context: &ExternalProviderDispatchContext,
     candidate: &LaunchCandidate,
+    provider_instance_id: &str,
     host_options: &DescribeHostOptions,
 ) -> Result<Value, serde_json::Error> {
     let provider_args = model_provider_args(context);
     serde_json::to_value(PolicyEvaluateRequest {
         contract: CONTRACT_VERSION.to_string(),
         request_id: request_id("policy"),
-        provider_instance_id: Some(context.provider.name.clone()),
+        provider_instance_id: Some(provider_instance_id.to_string()),
         host: host_context(host_options, &candidate.working_directory),
         params: PolicyEvaluateParams {
             settings_id: context.settings_id.clone(),
@@ -170,6 +171,7 @@ pub(crate) fn build_policy_request(
 pub(crate) fn build_launch_request(
     context: &ExternalProviderDispatchContext,
     candidate: &LaunchCandidate,
+    provider_instance_id: &str,
     endpoint_family: &str,
     host_options: &DescribeHostOptions,
     include_prompt_acceptance_v1: bool,
@@ -195,7 +197,7 @@ pub(crate) fn build_launch_request(
     serde_json::to_value(LaunchRequest {
         contract: CONTRACT_VERSION.to_string(),
         request_id: request_id("launch"),
-        provider_instance_id: Some(context.provider.name.clone()),
+        provider_instance_id: Some(provider_instance_id.to_string()),
         host: launch_host_context(
             host_options,
             &candidate.working_directory,

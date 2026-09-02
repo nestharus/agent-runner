@@ -449,7 +449,6 @@ pub struct QuotaServiceRequest<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaServiceExternalProviderIdentity {
-    pub model_name: String,
     pub provider_instance_id: String,
     pub settings_id: String,
 }

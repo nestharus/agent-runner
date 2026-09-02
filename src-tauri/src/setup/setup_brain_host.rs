@@ -1,20 +1,20 @@
-use oulipoly_config::{ProviderImplementationRef, app::SetupBrainConfig};
-use oulipoly_provider::client::{ProviderClient, ProviderClientOptions};
+use oulipoly_config::app::SetupBrainConfig;
 use oulipoly_provider::error::{HostErrorKind, ProviderClientError};
 use oulipoly_provider::generated::{
-    CONTRACT_VERSION, DescribeResult, EmptyParams, HostContext, RequestEnvelope,
-    SetupBrainTurnResult, SetupObject,
+    CONTRACT_VERSION, DescribeResult, HostContext, RequestEnvelope, SetupBrainTurnResult,
+    SetupObject,
 };
-use oulipoly_runtime::provider_registry::ProviderClientFactory;
+use oulipoly_runtime::provider_registry::{
+    PinnedFamilyEndpoint, ProviderRegistry, ProviderRegistryOptions, RuntimeProviderArtifact,
+};
 use oulipoly_setup::actions::AgentTurnResult;
 use serde_json::Value;
 use std::collections::BTreeMap;
-
-pub(crate) use crate::provider_artifact::provider_artifact_from_ref;
+use std::sync::Arc;
 
 pub struct SetupBrainHost {
     config: SetupBrainConfig,
-    client: ProviderClient,
+    endpoint: Arc<PinnedFamilyEndpoint>,
     system_prompt: String,
     host_context: Value,
     conversation_id: Option<String>,
@@ -26,13 +26,20 @@ impl SetupBrainHost {
         system_prompt: String,
         host_context: Value,
     ) -> Result<Self, SetupBrainError> {
-        let artifact_ref: &ProviderImplementationRef = &config.artifact;
-        let artifact = provider_artifact_from_ref(artifact_ref)
-            .map_err(|error| setup_brain_protocol_error_for_operation("setup.brain", error))?;
+        let endpoint = setup_bootstrap_endpoint(&config)?;
+        Self::from_endpoint(config, endpoint, system_prompt, host_context)
+    }
+
+    pub fn from_endpoint(
+        config: SetupBrainConfig,
+        endpoint: Arc<PinnedFamilyEndpoint>,
+        system_prompt: String,
+        host_context: Value,
+    ) -> Result<Self, SetupBrainError> {
+        require_setup_brain_capability(endpoint.capabilities())?;
         Ok(Self {
             config,
-            client: ProviderClientFactory::new(ProviderClientOptions::default())
-                .client_for(artifact),
+            endpoint,
             system_prompt,
             host_context,
             conversation_id: None,
@@ -44,13 +51,6 @@ impl SetupBrainHost {
         user_message: &str,
         response_schema: &str,
     ) -> Result<AgentTurnResult, SetupBrainError> {
-        let describe_request = describe_request();
-        let describe = self
-            .client
-            .invoke_typed::<DescribeResult, _>("describe", describe_request, [])
-            .map_err(|error| map_provider_client_error_to_setup_brain_error("describe", error))?;
-        require_setup_brain_capability(&describe)?;
-
         let turn_request = build_setup_brain_turn_request(
             &self.system_prompt,
             user_message,
@@ -60,13 +60,42 @@ impl SetupBrainHost {
             self.host_context.clone(),
         )?;
         let result = self
-            .client
+            .endpoint
+            .client()
             .invoke_typed::<SetupBrainTurnResult, _>("setup_brain.turn", turn_request, [])
             .map_err(|error| {
                 map_provider_client_error_to_setup_brain_error("setup_brain.turn", error)
             })?;
         store_setup_brain_conversation_id(self, &result.conversation_id);
         decode_setup_brain_turn_result(result)
+    }
+}
+
+pub fn setup_bootstrap_endpoint(
+    config: &SetupBrainConfig,
+) -> Result<Arc<PinnedFamilyEndpoint>, SetupBrainError> {
+    let artifact = setup_bootstrap_artifact(config)?;
+    ProviderRegistry::preflight_bootstrap_family(
+        "configured-setup-bootstrap",
+        artifact,
+        ProviderRegistryOptions::default(),
+    )
+    .map_err(|error| setup_brain_protocol_error_for_operation("setup.bootstrap", error.to_string()))
+}
+
+fn setup_bootstrap_artifact(
+    config: &SetupBrainConfig,
+) -> Result<oulipoly_provider::resolver::ProviderArtifactRef, SetupBrainError> {
+    match ProviderRegistry::convert_ref(&config.artifact).map_err(|error| {
+        setup_brain_protocol_error_for_operation("setup.bootstrap", error.to_string())
+    })? {
+        RuntimeProviderArtifact::Enabled(artifact) => Ok(artifact),
+        RuntimeProviderArtifact::RuntimeDisabled(artifact) => {
+            Err(setup_brain_protocol_error_for_operation(
+                "setup.bootstrap",
+                format!("configured setup bootstrap artifact is runtime-disabled: {artifact:?}"),
+            ))
+        }
     }
 }
 
@@ -212,8 +241,8 @@ pub fn invalid_setup_brain_action_json() -> &'static str {
     "invalid_setup_brain_action_json"
 }
 
-pub fn setup_fallback_unavailable() -> &'static str {
-    "setup_fallback_unavailable"
+pub fn setup_brain_not_configured() -> &'static str {
+    "setup_brain_not_configured"
 }
 
 pub fn map_provider_client_error_to_setup_brain_error(
@@ -244,17 +273,6 @@ pub fn store_setup_brain_conversation_id(host: &mut SetupBrainHost, conversation
 
 pub fn next_setup_brain_conversation_id(host: &SetupBrainHost) -> Option<&str> {
     host.conversation_id.as_deref()
-}
-
-fn describe_request() -> Value {
-    serde_json::to_value(RequestEnvelope {
-        contract: CONTRACT_VERSION.to_string(),
-        request_id: "setup-brain-describe".to_string(),
-        provider_instance_id: None,
-        host: default_host_context(),
-        params: EmptyParams {},
-    })
-    .unwrap_or_else(|_| serde_json::json!({}))
 }
 
 fn default_host_context() -> HostContext {

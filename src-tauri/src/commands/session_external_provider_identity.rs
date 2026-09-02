@@ -6,27 +6,20 @@
 //! in the runtime service seam.
 
 use crate::cli::paths::{default_config_root, default_models_dir};
-use oulipoly_config::{ModelConfig, ProvidersConfig, load_models};
+use oulipoly_config::{ProvidersConfig, load_models};
 use oulipoly_runtime::services::SessionServiceExternalProviderIdentity;
-use oulipoly_runtime::session_provider::S7A_NEUTRAL_SETTINGS_ID;
 use oulipoly_state::{ResolvedResume, ResumeError, StateDb};
 
 pub(crate) fn resolve_session_external_provider_identity(
     session_id: &str,
 ) -> Result<Option<SessionServiceExternalProviderIdentity>, String> {
-    let Some(resolved) = access_resolved_session_for_external_identity(session_id)? else {
-        return Ok(None);
-    };
-    map_resolved_external_provider_identity(resolved)
-}
-
-fn access_resolved_session_for_external_identity(
-    session_id: &str,
-) -> Result<Option<ResolvedResume>, String> {
     let state = access_default_state_for_identity()?;
     let providers = access_default_providers_for_identity()?;
     let models = access_default_models_for_identity(&providers)?;
-    access_resolved_resume_for_identity(&state, &models, session_id)
+    let Some(resolved) = access_resolved_resume_for_identity(&state, &models, session_id)? else {
+        return Ok(None);
+    };
+    map_resolved_external_provider_identity(resolved, &providers)
 }
 
 fn access_default_state_for_identity() -> Result<StateDb, String> {
@@ -61,26 +54,35 @@ fn access_resolved_resume_for_identity(
 
 fn map_resolved_external_provider_identity(
     resolved: ResolvedResume,
+    providers: &ProvidersConfig,
 ) -> Result<Option<SessionServiceExternalProviderIdentity>, String> {
-    let Some(model) = resolved.model.as_ref() else {
-        return Ok(None);
-    };
-    map_external_model_identity(model, &resolved.active_provider)
+    map_external_model_identity(
+        resolved.model_name.as_deref().unwrap_or(""),
+        &resolved.active_provider,
+        providers,
+    )
 }
 
 fn map_external_model_identity(
-    model: &ModelConfig,
+    model_name: &str,
     provider_name: &str,
+    providers: &ProvidersConfig,
 ) -> Result<Option<SessionServiceExternalProviderIdentity>, String> {
-    if model.provider.is_none() {
+    validate_external_provider_name(provider_name)?;
+    let Some(provider) = providers.get(provider_name) else {
+        return Ok(None);
+    };
+    if provider.implementation.is_none() {
         return Ok(None);
     }
-    validate_external_provider_name(provider_name)?;
+    let settings_id = provider.settings_id.as_deref().ok_or_else(|| {
+        format!("provider account has no explicit settings identity: {provider_name}")
+    })?;
     Ok(Some(SessionServiceExternalProviderIdentity {
-        model_name: model.name.clone(),
+        model_name: model_name.to_string(),
         provider_name: provider_name.to_string(),
         provider_instance_id: None,
-        settings_id: default_settings_id(),
+        settings_id: settings_id.to_string(),
     }))
 }
 
@@ -91,6 +93,45 @@ fn validate_external_provider_name(provider_name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn default_settings_id() -> String {
-    S7A_NEUTRAL_SETTINGS_ID.to_string()
+#[cfg(test)]
+mod tests {
+    use super::map_external_model_identity;
+    use oulipoly_config::{ProviderEndpointConfig, ProviderEntry, ProvidersConfig};
+
+    #[test]
+    fn builtin_account_has_no_external_session_identity() {
+        let mut providers = ProvidersConfig::default();
+        providers
+            .entries
+            .insert("builtin".to_string(), ProviderEntry::default());
+
+        assert_eq!(
+            map_external_model_identity("model", "builtin", &providers).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn external_account_identity_uses_explicit_settings() {
+        let mut providers = ProvidersConfig::default();
+        providers.entries.insert(
+            "external".to_string(),
+            ProviderEntry {
+                implementation: Some(ProviderEndpointConfig {
+                    family: "external-family".to_string(),
+                    executable: "/provider".to_string(),
+                }),
+                settings_id: Some("external-settings".to_string()),
+                ..ProviderEntry::default()
+            },
+        );
+
+        let identity = map_external_model_identity("model", "external", &providers)
+            .unwrap()
+            .expect("explicit endpoint should select external session identity");
+        assert_eq!(identity.model_name, "model");
+        assert_eq!(identity.provider_name, "external");
+        assert_eq!(identity.provider_instance_id, None);
+        assert_eq!(identity.settings_id, "external-settings");
+    }
 }

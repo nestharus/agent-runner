@@ -1,9 +1,8 @@
 #![cfg(unix)]
 
-//! FIX #32: an external-provider transport timeout (and account-unavailable /
-//! auth-expired classes) must ROTATE to the next account in the model pool with
-//! the same bounded policy the in-tree path uses, terminal-failing only when the
-//! whole pool is exhausted.
+//! A sibling-account retry requires invocation lifecycle transfer authority.
+//! Until that authority exists, rotatable transport failures must fail closed
+//! without invoking or persisting a sibling account.
 //!
 //! The fake provider spawned here is the single shared artifact for every
 //! account in the model; it branches on `params.settings_id` (the per-account
@@ -11,7 +10,8 @@
 //! heartbeat gap while a sibling account answers immediately.
 
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    ProvidersConfig, provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_provider::client::ProviderClientOptions;
 use oulipoly_runtime::executor;
@@ -32,7 +32,6 @@ struct Fixture {
     _dir: tempfile::TempDir,
     provider_path: PathBuf,
     order_path: PathBuf,
-    launch_record_path: PathBuf,
 }
 
 fn write_executable(path: &Path, body: &str) {
@@ -76,7 +75,6 @@ fn make_fixture_with_launch_stalls(
         _dir: dir,
         provider_path,
         order_path,
-        launch_record_path,
     }
 }
 
@@ -86,10 +84,14 @@ fn py_set(values: &[&str]) -> String {
     }
     let items = values
         .iter()
-        .map(|value| serde_json::to_string(value).unwrap())
+        .map(|value| serde_json::to_string(&settings_id(value)).unwrap())
         .collect::<Vec<_>>()
         .join(",");
     format!("{{{items}}}")
+}
+
+fn settings_id(account: &str) -> String {
+    format!("{account}-settings-record")
 }
 
 fn fake_provider_body(
@@ -287,18 +289,40 @@ fn rotation_model(fixture: &Fixture, accounts: &[&str]) -> ModelConfig {
 
 fn registry_with_client_options(
     model: &ModelConfig,
+    fixture: &Fixture,
     client_options: ProviderClientOptions,
 ) -> ProviderRegistry {
     let options = ProviderRegistryOptions::default().with_client_options(client_options);
-    ProviderRegistry::from_model_configs(std::slice::from_ref(model), options)
+    let providers = ProvidersConfig {
+        entries: model
+            .providers
+            .iter()
+            .map(|provider| {
+                (
+                    provider.name.clone(),
+                    ProviderEntry {
+                        implementation: Some(ProviderEndpointConfig {
+                            family: "transport-rotation-family".to_string(),
+                            executable: fixture.provider_path.display().to_string(),
+                        }),
+                        settings_id: Some(settings_id(&provider.name)),
+                        ..ProviderEntry::default()
+                    },
+                )
+            })
+            .collect(),
+    };
+    ProviderRegistry::from_configs(std::slice::from_ref(model), &providers, options)
         .expect("registry should construct from rotation model")
 }
 
 fn execute(
+    fixture: &Fixture,
     model: ModelConfig,
     provider_index: usize,
 ) -> Result<executor::ExecutionResult, ServiceError> {
     execute_with_client_options(
+        fixture,
         model,
         provider_index,
         ProviderClientOptions::default().with_timeout(HANDSHAKE_TIMEOUT),
@@ -306,11 +330,12 @@ fn execute(
 }
 
 fn execute_with_client_options(
+    fixture: &Fixture,
     model: ModelConfig,
     provider_index: usize,
     client_options: ProviderClientOptions,
 ) -> Result<executor::ExecutionResult, ServiceError> {
-    let registry = registry_with_client_options(&model, client_options);
+    let registry = registry_with_client_options(&model, fixture, client_options);
     let service = executor::RuntimeExecutorService::new(Arc::new(registry));
     service
         .execute(ExecutorServiceRequest::Facade {
@@ -334,86 +359,79 @@ fn order_lines(path: &Path) -> Vec<String> {
 }
 
 #[test]
-fn external_transport_timeout_rotates_to_next_account_and_succeeds() {
+fn external_transport_timeout_fails_closed_before_sibling_account() {
     let fixture = make_fixture(&["slow-1"], &[]);
     let model = rotation_model(&fixture, &["slow-1", "fast-2"]);
 
-    let result = execute(model, 0)
-        .expect("a host handshake timeout on the first account must rotate, not terminal-fail");
+    let error = execute(&fixture, model, 0).expect_err("lifecycle transfer is unavailable");
 
-    assert_eq!(result.exit_code, 0);
-    assert_eq!(result.stdout, vec![0, 1, 255]);
+    assert_lifecycle_transfer_unavailable(error);
     assert_eq!(
         order_lines(&fixture.order_path),
-        ["policy:slow-1", "policy:fast-2", "launch:fast-2"],
-        "dispatch must rotate from the slow account to the next pool account"
-    );
-    let launch: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&fixture.launch_record_path).unwrap()).unwrap();
-    assert_eq!(
-        launch["params"]["settings_id"], "fast-2",
-        "the surviving account must be the one that launched"
+        [format!("policy:{}", settings_id("slow-1"))],
+        "dispatch must not invoke the sibling account"
     );
 }
 
 #[test]
-fn external_provider_unavailable_rotates_to_next_account_and_succeeds() {
+fn external_provider_unavailable_fails_closed_before_sibling_account() {
     let fixture = make_fixture(&[], &["unavail-1"]);
     let model = rotation_model(&fixture, &["unavail-1", "fast-2"]);
 
-    let result = execute(model, 0)
-        .expect("an account-unavailable (auth-expired) class must rotate, not terminal-fail");
+    let error = execute(&fixture, model, 0).expect_err("lifecycle transfer is unavailable");
 
-    assert_eq!(result.exit_code, 0);
+    assert_lifecycle_transfer_unavailable(error);
     assert_eq!(
         order_lines(&fixture.order_path),
-        ["policy:unavail-1", "policy:fast-2", "launch:fast-2"],
-        "an unavailable/auth-expired account must rotate to the next pool account"
+        [format!("policy:{}", settings_id("unavail-1"))],
+        "dispatch must not invoke the sibling account"
     );
 }
 
 #[test]
-fn external_launch_heartbeat_gap_timeout_rotates_to_next_account_and_succeeds() {
+fn external_launch_heartbeat_gap_timeout_fails_closed_before_sibling_account() {
     let fixture = make_fixture_with_launch_stalls(&[], &[], &["stall-1"]);
     let model = rotation_model(&fixture, &["stall-1", "fast-2"]);
 
     let result = execute_with_client_options(
+        &fixture,
         model,
         0,
         ProviderClientOptions::default().with_launch_heartbeat_gap(HANDSHAKE_TIMEOUT),
     )
-    .expect("a launch heartbeat-gap timeout on the first account must rotate");
+    .expect_err("lifecycle transfer is unavailable");
 
-    assert_eq!(result.exit_code, 0);
-    assert_eq!(result.stdout, vec![0, 1, 255]);
+    assert_lifecycle_transfer_unavailable(result);
     assert_eq!(
         order_lines(&fixture.order_path),
         [
-            "policy:stall-1",
-            "launch:stall-1",
-            "policy:fast-2",
-            "launch:fast-2",
+            format!("policy:{}", settings_id("stall-1")),
+            format!("launch:{}", settings_id("stall-1")),
         ],
-        "launch gap timeout must rotate to the next pool account"
+        "launch gap timeout must not invoke the sibling account"
     );
 }
 
 #[test]
-fn external_transport_all_slow_pool_is_bounded_terminal_failure_with_honest_category() {
+fn external_transport_pool_fails_closed_at_first_required_lifecycle_transfer() {
     let fixture = make_fixture(&["slow-1", "slow-2"], &[]);
     let model = rotation_model(&fixture, &["slow-1", "slow-2"]);
 
-    let error = execute(model, 0)
-        .expect_err("an all-slow pool must terminal-fail once every account is exhausted");
+    let error = execute(&fixture, model, 0).expect_err("lifecycle transfer is unavailable");
 
-    let message = error.to_string();
-    assert!(
-        message.contains("transport") && message.contains("host_timeout"),
-        "pool-exhausted failure must carry the honest transport category: {message:?}"
-    );
+    assert_lifecycle_transfer_unavailable(error);
     assert_eq!(
         order_lines(&fixture.order_path),
-        ["policy:slow-1", "policy:slow-2"],
-        "every account in the pool must be attempted before terminal failure"
+        [format!("policy:{}", settings_id("slow-1"))],
+        "the sibling must not be attempted without lifecycle transfer authority"
     );
+}
+
+fn assert_lifecycle_transfer_unavailable(error: ServiceError) {
+    assert!(matches!(
+        error,
+        ServiceError::Unavailable { ref code, ref message }
+            if code.as_deref() == Some("account_lifecycle_transfer_unavailable")
+                && message.contains("sibling launch was not attempted")
+    ));
 }
