@@ -35,6 +35,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 const DATA_DIR_ENV: &str = oulipoly_state::paths::DATA_DIR_ENV;
+pub(super) const RETURN_CHANNEL_ENV: &str = "OULIPOLY_RETURN_CHANNEL";
 // This is the OpenCode external-provider positional-prompt boundary, not a
 // universal provider or operating-system argv limit.
 const OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES: usize = 64 * 1024;
@@ -120,6 +121,7 @@ pub(crate) fn remove_runner_private_environment(env: &mut BTreeMap<String, Strin
     }
     env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
     env.remove(PARENT_INVOCATION_ENV);
+    env.remove(RETURN_CHANNEL_ENV);
 }
 
 fn remove_configured_launch_env(env: &mut BTreeMap<String, String>, names: &[String]) {

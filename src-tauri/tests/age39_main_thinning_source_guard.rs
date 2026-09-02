@@ -353,7 +353,15 @@ fn age_39_invocation_start_uses_lifecycle_service_in_repl_resume_and_one_shot() 
     for (name, body) in [
         ("run_repl", compact(repl_slice())),
         ("run_resume", compact(resume_slice())),
-        ("run_with_balancing", compact(one_shot_slice())),
+        (
+            "run_with_balancing",
+            compact(
+                one_shot_slice()
+                    .split("#[cfg(test)]")
+                    .next()
+                    .expect("one-shot production source"),
+            ),
+        ),
     ] {
         assert_contains(&body, "AgentRuntimeServices", name);
         assert_not_contains(&body, "state.start_invocation(", name);

@@ -150,6 +150,30 @@ pub fn execute_interactive_with_result_and_model_config(
     )
 }
 
+pub fn execute_interactive_with_result_and_model_config_and_live_session_binding(
+    provider: &ProviderConfig,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: Option<ResumePayload<'_>>,
+    model: &ModelConfig,
+    live_session_binding: InteractiveLiveSessionBinding,
+) -> Result<InteractiveExecutionResult, String> {
+    let state_db_path = live_session_binding.state_db_path.clone();
+    let provider_registry = Arc::clone(&live_session_binding.registry);
+    execute_interactive_with_result_and_monitor_context(
+        provider,
+        working_dir,
+        parent_invocation_env,
+        resume,
+        InteractiveMonitorContext {
+            model_name: Some(&model.name),
+            provider_registry: Some(provider_registry),
+            live_session_binding: Some(live_session_binding),
+            state_db_path: Some(&state_db_path),
+        },
+    )
+}
+
 struct InteractiveMonitorContext<'a> {
     model_name: Option<&'a str>,
     provider_registry: Option<Arc<ProviderRegistry>>,

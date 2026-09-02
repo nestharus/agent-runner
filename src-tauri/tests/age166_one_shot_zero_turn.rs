@@ -12,10 +12,11 @@
 //! model/provider TOML (formatter).
 
 mod age153_support;
+mod provider_authority_fixture;
 
 use age153_support::{
-    Age153Fixture, assert_no_terminal_marker_on_stdout, assert_result_envelope_shape, line_count,
-    parse_terminal_signal_line, success_body, terminal_signal_lines, toml_string,
+    Age153Fixture, assert_no_terminal_marker_on_stdout, line_count, parse_terminal_signal_line,
+    success_body, terminal_signal_lines, toml_string,
 };
 use rusqlite::params;
 use serde_json::Value;
@@ -72,7 +73,11 @@ prompt_mode = "arg"
     fs::write(fixture.models_dir.join(format!("{model_name}.toml")), model).unwrap();
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        providers_toml,
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            &providers_toml,
+            "age166-native",
+            &provider_path,
+        ),
     )
     .unwrap();
 }
@@ -713,9 +718,7 @@ fn one_shot_provider_without_session_id_does_not_emit_maybe_quota() {
     assert_no_terminal_marker_on_stdout(&output);
     let (stdout, stderr) = output_text(&output);
     assert_no_maybe_marker(&stderr);
-    let result = assert_result_envelope_shape(&stdout);
-    assert_eq!(result["success"], true);
-    assert!(result["terminal_reason"].is_null(), "{result}");
+    assert_eq!(stdout, "ordinary sessionless success\n");
     assert_eq!(fixture.exhausted_row_count("openai-compatible-age166"), 0);
     assert_eq!(
         fixture.successful_invocation_count_without_terminal_reason("openai-compatible-age166"),

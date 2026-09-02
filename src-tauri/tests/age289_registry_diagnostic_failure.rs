@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use serde_json::Value;
 use std::fs;
@@ -34,7 +36,14 @@ impl Fixture {
             "#!/usr/bin/env bash\nprintf 'primary provider failed before producing a report\\n' >&2\nexit 7\n",
         );
         write_models(&models_dir);
-        let providers = providers_toml(&primary);
+        let providers = provider_authority_fixture::with_explicit_account_authority_at(
+            &provider_authority_fixture::with_explicit_provider_authority(&providers_toml(
+                &primary,
+            )),
+            DIAGNOSTIC_PROVIDER,
+            "age289-missing-diagnostic",
+            Path::new("/synthetic/age289-diagnostic-provider"),
+        );
         fs::write(default_config_root.join("providers.toml"), &providers)
             .expect("default providers");
         fs::write(override_config_root.join("providers.toml"), providers)

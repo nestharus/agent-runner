@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{CompositeInvocationId, InvocationStart, InvocationStatus, StateDb};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -71,7 +73,7 @@ interactive_args = ["model-interactive"]
             self.config_home
                 .join("oulipoly-agent-runner")
                 .join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[{provider_name}]
 command = "{}"
 args = []
@@ -79,7 +81,7 @@ interactive_args = ["launch"]
 prompt_mode = "arg"
 "#,
                 script_path.display()
-            ),
+            )),
         )
         .unwrap();
     }
@@ -104,14 +106,14 @@ args = ["one-shot-only"]
             self.config_home
                 .join("oulipoly-agent-runner")
                 .join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[{provider_name}]
 command = "{}"
 args = []
 prompt_mode = "arg"
 "#,
                 script_path.display()
-            ),
+            )),
         )
         .unwrap();
     }

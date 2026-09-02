@@ -25,6 +25,9 @@ pub const TEST_HOOK_ENV: &str = "OULIPOLY_IMPORT_REPLACE_TEST_HOOK";
 pub const TEST_SLEEP_AFTER_LOCK_MS: &str = "sleep-after-lock-ms";
 pub const TEST_BLOCK_AFTER_RENAME: &str = "block-after-transcript-rename-before-db-commit";
 pub const TEST_FAIL_POSTIMAGE_VERIFY: &str = "fail-postimage-verification";
+pub const PROVIDER_OWNED_TEST_HOOK_ENV: &str = "OULIPOLY_PROVIDER_OWNED_REPLACE_TEST_HOOK";
+pub const TEST_STOP_AFTER_RECOVERY_ID: &str = "stop-after-recovery-id-journal-update";
+pub const TEST_SLEEP_BEFORE_DB_POSTIMAGE: &str = "sleep-before-db-postimage-ms:500";
 
 #[derive(Clone, Copy)]
 pub enum StorageKind<'a> {
@@ -212,7 +215,26 @@ flag = "--resume"
 {storage_block}
 "#
         ));
-        fs::write(providers_path, body).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
+    }
+
+    pub fn set_provider_authority(&self, provider_name: &str, executable: &Path) {
+        let providers_path = self.app_config_dir.join("providers.toml");
+        let body = fs::read_to_string(&providers_path).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_account_authority_at(
+                &body,
+                provider_name,
+                "initiative-06-replace-external",
+                executable,
+            ),
+        )
+        .unwrap();
     }
 
     pub fn write_provider_with_storage_kind_text(
@@ -241,7 +263,11 @@ projects_dir = "{}"
 "#,
             storage_path.display()
         ));
-        fs::write(providers_path, body).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
     }
 
     pub fn write_provider_with_script_storage(
@@ -274,7 +300,11 @@ storage_type = "{storage_type}"
             cwd_script.display(),
             transcript_script.display()
         ));
-        fs::write(providers_path, body).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
     }
 
     pub fn write_sessions_with_locator_path(&self, provider_name: &str, transcript_path: &Path) {
@@ -361,6 +391,12 @@ storage_type = "{storage_type}"
             params![chain_id, provider_name, session_id, last_used_at],
         )
         .unwrap();
+        super::provider_authority::bind_session_authority_with_cwd(
+            &conn,
+            provider_name,
+            session_id,
+            self.dir.path(),
+        );
     }
 
     pub fn seed_turns_with_metadata(

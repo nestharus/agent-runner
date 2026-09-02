@@ -18,6 +18,8 @@
 //!       - direct-SQLite-observation-schema-producer-contract
 //! ```
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Utc};
 use oulipoly_state::{
     CompositeInvocationId, InvocationStart, InvocationStatus, ProviderSessionBinding,
@@ -101,7 +103,10 @@ impl ContinuationFixture {
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format_continuation_providers_config(&resume_provider, &fresh_provider),
+            provider_authority_fixture::with_explicit_provider_authority_for_prompt_acceptance(
+                &format_continuation_providers_config(&resume_provider, &fresh_provider),
+                &["resume-provider"],
+            ),
         )
         .unwrap();
         let fresh_session_state = dir.path().join("fresh-session-state");
@@ -123,9 +128,11 @@ impl ContinuationFixture {
         bind_provider_session(
             &state,
             origin_row_id,
+            "resume-provider",
             ORIGIN_SESSION_ID,
             "external_provider_launch",
             None,
+            &worktree,
         );
         state
             .finalize_invocation(origin_row_id, true, 0, None, None)
@@ -290,12 +297,14 @@ impl LegacyResumeFixture {
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format_legacy_providers_config(
-                &first_provider,
-                &second_provider,
-                &interactive_provider,
-                &source_projects,
-                &target_projects,
+            provider_authority_fixture::with_explicit_provider_authority(
+                &format_legacy_providers_config(
+                    &first_provider,
+                    &second_provider,
+                    &interactive_provider,
+                    &source_projects,
+                    &target_projects,
+                ),
             ),
         )
         .unwrap();
@@ -321,9 +330,11 @@ impl LegacyResumeFixture {
         bind_provider_session(
             &state,
             interactive_origin_row_id,
+            "interactive-owner",
             FRESH_SESSION_ID,
             "external_provider_launch",
             None,
+            &project,
         );
         state
             .finalize_invocation(interactive_origin_row_id, true, 0, None, None)
@@ -341,6 +352,7 @@ impl LegacyResumeFixture {
             "legacy-headless",
             LEGACY_PROVIDER_A,
             ORIGIN_SESSION_ID,
+            &project,
         );
         let baseline_max_invocation_id = Connection::open(state_db_path(&data_home))
             .unwrap()
@@ -741,7 +753,8 @@ fn request_flag_runs_reserved_production_adapters_and_terminal_replay_does_not_r
     assert_eq!(resume.status, InvocationStatus::Failed);
     assert_eq!(resume.success, Some(false));
     assert_eq!(resume.exit_code, Some(0));
-    assert_eq!(resume.resume_acceptance_status.as_deref(), Some("accepted"));
+    assert_eq!(resume.resume_acceptance_status, None);
+    assert_eq!(resume.resume_acceptance_evidence, None);
     assert_eq!(
         resume.error_category.as_deref(),
         Some("resume_completion_unconfirmed")
@@ -1142,9 +1155,11 @@ fn start_invocation(
 fn bind_provider_session(
     state: &StateDb,
     row_id: i64,
+    provider_name: &str,
     session_id: &str,
     capture_method: &'static str,
     resume_input_id: Option<&str>,
+    cwd: &Path,
 ) {
     state
         .bind_invocation_provider_session_start(
@@ -1153,10 +1168,16 @@ fn bind_provider_session(
                 provider_session_id: session_id.to_string(),
                 capture_method,
                 resume_input_id: resume_input_id.map(str::to_string),
-                provider_session_resolved_account: None,
+                provider_session_resolved_account: Some(cwd.display().to_string()),
             },
         )
         .unwrap();
+    provider_authority_fixture::bind_session_authority_with_cwd(
+        &Connection::open(state.path()).unwrap(),
+        provider_name,
+        session_id,
+        cwd,
+    );
 }
 
 fn seed_session_turn(state: &StateDb, provider: &str, session_id: &str, turn_id: &str) {
@@ -1183,6 +1204,7 @@ fn seed_active_chain(
     model_name: &str,
     provider_name: &str,
     session_id: &str,
+    cwd: &Path,
 ) {
     let connection = Connection::open(db_path).unwrap();
     connection
@@ -1200,6 +1222,12 @@ fn seed_active_chain(
             params![chain_id, provider_name, session_id],
         )
         .unwrap();
+    provider_authority_fixture::bind_session_authority_with_cwd(
+        &connection,
+        provider_name,
+        session_id,
+        cwd,
+    );
 }
 
 fn write_evidence(planning_root: &Path, worktree: &Path) -> Vec<EvidenceIdentity> {

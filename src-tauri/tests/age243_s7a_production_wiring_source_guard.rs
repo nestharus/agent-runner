@@ -2,15 +2,15 @@
 fn s7a_production_ingest_callers_pass_external_provider_identity() {
     assert_source_contains(
         "src-tauri/src/run/balancing/mapper/session_ingest.rs",
-        "external_provider: crate::session_ingest_cli::session_external_provider_identity(",
+        "external_provider: crate::session_ingest_cli::configured_session_external_provider_identity(",
     );
     assert_source_contains(
         "src-tauri/src/run/resume/finalization.rs",
-        "external_provider: crate::session_ingest_cli::session_external_provider_identity(",
+        "external_provider:\n                crate::session_ingest_cli::configured_session_external_provider_identity(",
     );
     assert_source_contains(
         "src-tauri/src/run/repl/finalization.rs",
-        "external_provider: crate::session_ingest_cli::session_external_provider_identity(",
+        "external_provider:\n                crate::session_ingest_cli::configured_session_external_provider_identity(",
     );
     assert_source_contains(
         "src-tauri/src/session_ingest_cli.rs",

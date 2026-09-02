@@ -3,6 +3,8 @@
 //!
 //! `accessor`, `formatter`, `parser`, `mapper`, `validator`, `orchestration`
 
+mod provider_authority_fixture;
+
 use chrono::{TimeZone, Utc};
 use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, StoreAddress};
 use oulipoly_state::{
@@ -77,7 +79,7 @@ interactive_args = ["launch"]
             self.config_home
                 .join("oulipoly-agent-runner")
                 .join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[fixture-provider]
 command = "{}"
 args = []
@@ -89,7 +91,7 @@ kind = "flag"
 flag = "--resume"
 "#,
                 script_path.display()
-            ),
+            )),
         )
         .expect("write providers");
     }
@@ -152,6 +154,29 @@ flag = "--resume"
             "fixture.jsonl",
         )
         .expect("seed turn");
+        drop(db);
+        let connection = Connection::open(self.db_path()).expect("open fixture connection");
+        connection
+            .execute(
+                "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                 VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', 'fixture')",
+                [session_id],
+            )
+            .expect("seed chain");
+        connection
+            .execute(
+                "INSERT INTO session_chain_segments
+                    (chain_id, provider_name, session_id, started_at, transition_reason)
+                 VALUES (?1, ?2, ?1, '2026-04-17T08:00:00Z', 'initial')",
+                params![session_id, provider],
+            )
+            .expect("seed segment");
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &connection,
+            provider,
+            session_id,
+            self.dir.path(),
+        );
     }
 }
 
@@ -170,39 +195,8 @@ fn parse_invocation(stderr: &str) -> String {
 
 fn assert_resume_success_result(stdout: &[u8]) {
     let stdout = String::from_utf8_lossy(stdout);
-    assert!(
-        stdout.starts_with("resume stdout\nOULIPOLY_RESULT="),
-        "{stdout}"
-    );
-    let raw = stdout
-        .strip_prefix("resume stdout\nOULIPOLY_RESULT=")
-        .unwrap()
-        .trim();
-    let result: serde_json::Value = serde_json::from_str(raw).unwrap();
-    let mut keys = result
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    keys.sort();
-    assert_eq!(
-        keys,
-        [
-            "error_category",
-            "exit_code",
-            "finished_at",
-            "id",
-            "status",
-            "success",
-            "terminal_reason"
-        ]
-    );
-    assert_eq!(result["status"], "succeeded");
-    assert_eq!(result["success"], true);
-    assert_eq!(result["exit_code"], 0);
-    assert!(result["error_category"].is_null());
-    assert!(result["terminal_reason"].is_null());
+    assert_eq!(stdout, "resume stdout");
+    assert!(!stdout.contains("OULIPOLY_RESULT="), "{stdout}");
 }
 
 fn invocation_count(db: &StateDb) -> i64 {
@@ -282,16 +276,9 @@ printf 'provider stdout'"#,
     let output = fixture.run_one_shot();
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    // run_with_balancing now appends a single-line `OULIPOLY_RESULT={...}` envelope
-    // after the provider stdout; the spirit of "preserves stdout" is now "preserves
-    // the provider-stdout PREFIX."
+    assert_eq!(output.stdout, b"provider stdout", "{:?}", output.stdout);
     assert!(
-        output.stdout.starts_with(b"provider stdout"),
-        "{:?}",
-        output.stdout
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("OULIPOLY_RESULT="),
+        !String::from_utf8_lossy(&output.stdout).contains("OULIPOLY_RESULT="),
         "{:?}",
         output.stdout
     );
@@ -366,7 +353,10 @@ printf 'resume stdout'"#,
     let invocation_id = parse_invocation(&String::from_utf8_lossy(&output.stderr));
     let db = fixture.open_db();
     let row = db.get_invocation_by_uuid(&invocation_id).unwrap().unwrap();
-    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        row.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
     assert_eq!(returned_rows(db.connection(), row.id).len(), 1);
 }
 

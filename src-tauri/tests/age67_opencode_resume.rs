@@ -29,6 +29,8 @@
 //!       - unix-process-fixture-recording-contract
 //! ```
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -87,7 +89,10 @@ impl Fixture {
         fs::write(self.models_dir.join(format!("{MODEL}.toml")), model_toml()).unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            providers_toml(&script, &self.workspace),
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml(
+                &script,
+                &self.workspace,
+            )),
         )
         .unwrap();
     }
@@ -112,6 +117,14 @@ impl Fixture {
         db.bind_invocation_provider_session_start(row_id, &incident_provider_binding())
             .unwrap();
         db.finalize_invocation(row_id, true, 0, None, None).unwrap();
+        drop(db);
+        let connection = rusqlite::Connection::open(self.db_path()).unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &connection,
+            PROVIDER,
+            PROVIDER_SESSION_ID,
+            &self.workspace,
+        );
     }
 
     fn db_path(&self) -> PathBuf {

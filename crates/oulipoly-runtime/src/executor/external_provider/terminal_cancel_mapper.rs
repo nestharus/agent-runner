@@ -54,11 +54,10 @@ pub(crate) fn process_exit_code(status: &ProcessStatus) -> i32 {
 fn terminal_reason(status: &ProcessStatus, signal: &TerminalSignal) -> Option<String> {
     match status {
         ProcessStatus::Cancelled => Some("cancelled".to_string()),
-        ProcessStatus::SpawnError { reason } | ProcessStatus::ProlongedSilence { reason } => {
-            Some(reason.clone())
-        }
         ProcessStatus::Exited { .. }
         | ProcessStatus::SignalTerminated { .. }
+        | ProcessStatus::SpawnError { .. }
+        | ProcessStatus::ProlongedSilence { .. }
         | ProcessStatus::Unknown => {
             terminal_reason_from_signal_status(signal, Some(&terminal_status_evidence(status)))
         }
@@ -84,6 +83,9 @@ fn terminal_signal_kind(kind: &ProviderTerminalSignalKind) -> TerminalSignalKind
         ProviderTerminalSignalKind::NonzeroExit => TerminalSignalKind::NonzeroExit,
         ProviderTerminalSignalKind::SignalExit => TerminalSignalKind::SignalExit,
         ProviderTerminalSignalKind::SpawnError => TerminalSignalKind::SpawnError,
+        ProviderTerminalSignalKind::ProviderStorageContention => {
+            TerminalSignalKind::ProviderStorageContention
+        }
         ProviderTerminalSignalKind::ProlongedSilence => TerminalSignalKind::ProlongedSilence,
         ProviderTerminalSignalKind::Cancelled | ProviderTerminalSignalKind::Unknown => {
             TerminalSignalKind::Unknown
@@ -163,5 +165,26 @@ mod tests {
             .as_deref()
             .expect("provider error evidence should remain terminal_reason");
         assert!(reason.contains("Failed to execute statement"));
+    }
+
+    #[test]
+    fn spawn_error_uses_canonical_reason_and_preserves_detail_as_evidence() {
+        let outcome = map_terminal_cancel_outcome(
+            &ProcessStatus::SpawnError {
+                reason: "No such file or directory".to_string(),
+            },
+            &provider_signal(
+                ProviderTerminalSignalKind::SpawnError,
+                Some("No such file or directory"),
+            ),
+            "fixture-provider",
+        );
+
+        assert_eq!(outcome.exit_code, 1);
+        assert_eq!(outcome.terminal_reason.as_deref(), Some("spawn_error"));
+        assert_eq!(
+            outcome.terminal_signal.evidence,
+            "No such file or directory"
+        );
     }
 }

@@ -19,6 +19,9 @@ use crate::session_ingest_cli::{
 };
 use crate::wiring;
 
+const TERMINAL_PERSISTENCE_ERROR_CATEGORY: &str = "terminal_persistence";
+const TERMINAL_PERSISTENCE_TERMINAL_REASON: &str = "terminal_persistence_failed";
+
 pub(super) enum CompletedAttemptControl {
     Continue,
     Return(i32),
@@ -84,20 +87,34 @@ pub(super) fn finalize_completed_attempt(
         )
     {
         formatter::emit_stderr(&format!("failed to persist provider output: {error}"));
-        input
-            .agent_runtime_services
-            .invocation_lifecycle_service
-            .finalize_invocation(mapper::finalize_request(
+        let finalize_result = finalize_retained_outcome_with_contention_retry(
+            input
+                .agent_runtime_services
+                .invocation_lifecycle_service
+                .as_ref(),
+            mapper::finalize_request(
                 &input.env.state,
                 input.invocation_row_id,
                 false,
                 1,
-                Some("output_persistence"),
-                Some("output_persistence_failed"),
-            ))
-            .map(|_| ())
-            .unwrap_or_else(formatter::emit_finalize_invocation_warning);
-        input.guard.mark_finalized();
+                Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
+                Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
+            ),
+        );
+        match finalize_result {
+            Ok(_) => input.guard.mark_finalized(),
+            Err(error) => formatter::emit_finalize_invocation_warning(error),
+        }
+        formatter::emit_resume_failure_output(formatter::ResumeFailureOutputInput {
+            state: &input.env.state,
+            invocation_id: &input.invocation.id,
+            provider_name: input.provider_name,
+            provider_session_id: input.provider_session_id,
+            exit_code: 1,
+            error_category: Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
+            terminal_reason: Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
+            stderr: &input.result.stderr,
+        });
         return Ok(CompletedAttemptControl::Return(1));
     }
 
@@ -233,11 +250,12 @@ fn handle_completed_success(
             sessions_cfg: &input.env.sessions_cfg,
             providers_cfg: Some(&input.env.providers_cfg),
             provider_name: input.provider_name,
-            external_provider: crate::session_ingest_cli::session_external_provider_identity(
-                input.agent_runtime_services,
-                input.model,
-                input.provider_name,
-            ),
+            external_provider:
+                crate::session_ingest_cli::configured_session_external_provider_identity(
+                    input.agent_runtime_services,
+                    input.model,
+                    input.provider_name,
+                ),
             invocation_row_id: input.invocation_row_id,
             invocation_uuid: &input.invocation.id,
             effective_cwd: Some(input.effective_spawn_cwd),

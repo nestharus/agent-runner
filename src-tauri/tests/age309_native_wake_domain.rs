@@ -4,6 +4,8 @@
 //!
 //! TEST: native host-memory admission through detached proactive wake delivery.
 
+mod provider_authority_fixture;
+
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxDeliveryObservationAnchor,
     SessionMetadataUpsert,
@@ -20,6 +22,7 @@ use std::os::unix::fs::PermissionsExt;
 
 const MODEL: &str = "age309-native-wake-model";
 const PROVIDER: &str = "age309-native-wake-provider";
+const PROVIDER_INSTANCE_ID: &str = "age309-native-wake-fixture-instance";
 const SESSION: &str = "ses_age309_native_wake";
 
 struct Fixture {
@@ -65,16 +68,17 @@ impl Fixture {
         let wrapper = write_provider_wrapper(self.root.path(), &script);
         fs::write(
             self.models_dir.join(format!("{MODEL}.toml")),
-            format!(
-                "provider = {{ script = {} }}\nprompt_mode = \"arg\"\n\n[[providers]]\nname = \"{PROVIDER}\"\nargs = []\n",
-                toml_string(&path_string(&wrapper))
-            ),
+            format!("prompt_mode = \"arg\"\n\n[[providers]]\nname = \"{PROVIDER}\"\nargs = []\n"),
         )
         .unwrap();
         fs::write(
             self.app_config.join("providers.toml"),
-            format!(
-                "[{PROVIDER}]\ncommand = \"age309-native-fixture\"\nargs = []\nprompt_mode = \"arg\"\n"
+            provider_authority_fixture::with_explicit_provider_authority_at(
+                &format!(
+                "[{PROVIDER}]\ncommand = \"age309-native-fixture\"\nargs = []\nprompt_mode = \"arg\"\nsettings_id = \"{PROVIDER}\"\n"
+            ),
+                "age309-native-wake",
+                &wrapper,
             ),
         )
         .unwrap();
@@ -229,6 +233,14 @@ impl Fixture {
                 [PROVIDER, SESSION],
             )
             .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd_at(
+            &connection,
+            PROVIDER,
+            SESSION,
+            PROVIDER_INSTANCE_ID,
+            PROVIDER,
+            self.root.path(),
+        );
     }
 
     fn seed_crashed_delivery_observation(&self, prompt: &str) {
@@ -256,7 +268,7 @@ impl Fixture {
                 SESSION,
                 &MailboxDeliveryObservationAnchor {
                     provider_name: PROVIDER.to_string(),
-                    provider_instance_id: "age309-native-wake-fixture-instance".to_string(),
+                    provider_instance_id: PROVIDER_INSTANCE_ID.to_string(),
                     settings_id: PROVIDER.to_string(),
                     provider_session_id: SESSION.to_string(),
                     resume_token: "age309-anchor:0".to_string(),
@@ -279,7 +291,7 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
     let sweep = fixture.start_startup_sweep();
     assert!(
         wait_until(|| fixture.marker.exists()),
-        "native detached provider turn did not start\nmailbox={:?}\nruntime={:?}\nclaim={:?}",
+        "native detached provider turn did not start\nmailbox={:?}\nruntime={:?}\nclaim={:?}\ninvocations={:?}",
         MailboxDb::open(&fixture.sidecar_path())
             .unwrap()
             .list_mailbox(SESSION, true)
@@ -293,7 +305,8 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
             .unwrap()
             .wake_session_reader()
             .wake_claim(SESSION)
-            .unwrap()
+            .unwrap(),
+        invocation_diagnostics(&fixture.state_path())
     );
     let live_claim = MailboxDb::open(&fixture.sidecar_path())
         .unwrap()
@@ -354,8 +367,10 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
     let connection = Connection::open(fixture.state_path()).unwrap();
     let resumed: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM invocations WHERE session_capture_method = 'resumed'",
-            [],
+            "SELECT COUNT(*) FROM invocations
+             WHERE session_capture_method = 'provider_session_capture'
+               AND resume_input_id = ?1",
+            [SESSION],
             |row| row.get(0),
         )
         .unwrap();
@@ -526,10 +541,6 @@ fn shell_quote(path: &Path) -> String {
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
-}
-
-fn toml_string(value: &str) -> String {
-    serde_json::to_string(value).unwrap()
 }
 
 fn provider_script() -> &'static str {

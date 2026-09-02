@@ -22,7 +22,7 @@ fn describe_settings_target_reports_capability_and_schema_id() {
         .describe_settings_target(ACCOUNT)
         .expect("settings-capable describe should produce a target");
 
-    assert_eq!(target.model_name, ACCOUNT);
+    assert_eq!(target.account_name, ACCOUNT);
     assert_eq!(target.provider_id, "provider-a");
     assert!(target.settings_supported);
     assert_eq!(target.schema_id.as_deref(), Some("example.settings/v1"));

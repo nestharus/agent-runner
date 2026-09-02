@@ -43,7 +43,11 @@ pub(crate) fn run_session_import(
         .map_err(|error| error.to_string())?;
 
     super::formatter::render_session_import_report(&output.report, args.provider, args.json)?;
-    Ok(0)
+    Ok(if output.report.totals.providers_failed == 0 {
+        0
+    } else {
+        1
+    })
 }
 
 struct SessionImportEnvironment {

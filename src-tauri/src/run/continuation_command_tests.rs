@@ -177,7 +177,7 @@ fn execute(
                     Some("resume_completion_unconfirmed"),
                 )
                 .unwrap();
-            Ok(())
+            Ok(false)
         },
         |reserved: &ReservedRun, _: &ValidatedContinuation, _: &InvocationOutcome| {
             fresh_calls.set(fresh_calls.get() + 1);

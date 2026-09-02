@@ -2,7 +2,7 @@
 
 mod age153_support;
 
-use age153_support::{Age153Fixture, assert_result_envelope_shape};
+use age153_support::Age153Fixture;
 use oulipoly_state::InvocationStatus;
 use serde_json::Value;
 
@@ -110,11 +110,11 @@ fn opencode_error_event_followed_by_later_event_finalizes_one_shot_as_succeeded(
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let result = assert_result_envelope_shape(&stdout);
-    assert_eq!(result["status"], "succeeded");
-    assert_eq!(result["success"], true);
-    assert_eq!(result["exit_code"], 0);
-    assert!(result["terminal_reason"].is_null(), "{result}");
+    assert_eq!(
+        stdout,
+        format!("{INCIDENT_SQLITE_ERROR_EVENT}\n{RECOVERED_EVENT}\n")
+    );
+    assert!(!stdout.contains("OULIPOLY_RESULT="), "{stdout}");
     assert_invocation_row(&fixture, InvocationStatus::Succeeded, 1, 0, None);
 }
 

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Utc};
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, InboxTarget, InboxTargetKind,
@@ -435,7 +437,7 @@ args = ["one-shot-only"]
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[{provider}]
 command = {}
 args = []
@@ -447,7 +449,7 @@ kind = "flag"
 flag = "--resume"
 "#,
                 toml_string(&path_string(script))
-            ),
+            )),
         )
         .unwrap();
     }
@@ -505,6 +507,40 @@ turn_script = {}
             }],
         )
         .unwrap();
+        drop(db);
+
+        let conn = self.conn();
+        let has_segment = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM session_chain_segments
+                    WHERE provider_name = ?1 AND session_id = ?2
+                )",
+                params![provider, session_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        if !has_segment {
+            conn.execute(
+                "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                 VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', 'fixture-model')",
+                params![session_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_chain_segments
+                    (chain_id, provider_name, session_id, started_at, transition_reason)
+                 VALUES (?1, ?2, ?1, '2026-04-17T08:00:00Z', 'initial')",
+                params![session_id, provider],
+            )
+            .unwrap();
+        }
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            provider,
+            session_id,
+            self.dir.path(),
+        );
     }
 
     fn seed_active_chain(&self, chain_id: &str, provider: &str, session_id: &str, model: &str) {
@@ -522,6 +558,12 @@ turn_script = {}
             params![chain_id, provider, session_id],
         )
         .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            provider,
+            session_id,
+            self.dir.path(),
+        );
     }
 
     fn replace_active_chain_segment(&self, chain_id: &str, provider: &str, session_id: &str) {
@@ -540,6 +582,12 @@ turn_script = {}
             params![chain_id, provider, session_id],
         )
         .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            provider,
+            session_id,
+            self.dir.path(),
+        );
     }
 
     fn assert_default_user_paths_untouched(&self) {
@@ -1558,7 +1606,7 @@ fn chain_input_remains_reachable_after_active_segment_reselection() {
 }
 
 #[test]
-fn resume_without_mailbox_and_without_prompt_preserves_native_resume() {
+fn resume_without_mailbox_and_without_prompt_uses_endpoint_session_authority() {
     let fixture = Fixture::new();
     let argv_dump = fixture.dir.path().join("argv.txt");
     let script = fixture.write_script(
@@ -1573,7 +1621,25 @@ fn resume_without_mailbox_and_without_prompt_preserves_native_resume() {
     assert_unconfirmed_resume(&output, SESSION_A);
     assert_eq!(
         fs::read_to_string(&argv_dump).unwrap(),
-        format!("one-shot-only\n--resume\n{SESSION_A}\n")
+        format!("one-shot-only\n--resume\n{SESSION_A}\n"),
+        "the endpoint must translate structured resume intent before launching the fixture CLI"
+    );
+    let authority: (String, String, String) = fixture
+        .conn()
+        .query_row(
+            "SELECT provider_session_id, resume_input_id, provider_session_capture_method
+             FROM invocations ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        authority,
+        (
+            SESSION_A.to_string(),
+            SESSION_A.to_string(),
+            "external_provider_launch".to_string(),
+        )
     );
     assert!(fixture.mailbox_rows(SESSION_A, false).is_empty());
     fixture.assert_default_user_paths_untouched();

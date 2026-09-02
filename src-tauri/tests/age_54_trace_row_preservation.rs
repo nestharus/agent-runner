@@ -21,6 +21,7 @@
 //!       - oulipoly_state::schema::CURRENT_SCHEMA_VERSION
 //!       - oulipoly-agent-runner trace --json command harness
 
+mod provider_authority_fixture;
 #[path = "../../crates/oulipoly-state/tests/fixtures/mod.rs"]
 mod state_fixtures;
 
@@ -70,10 +71,10 @@ impl TraceFixture {
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 "[fixture-provider]\ncommand = {:?}\nargs = []\nprompt_mode = \"arg\"\n",
                 script.to_string_lossy()
-            ),
+            )),
         )
         .unwrap();
 

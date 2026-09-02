@@ -207,7 +207,26 @@ prompt_mode = "arg"
 {quota_script}{resume_block}{storage_block}
 "#
         ));
-        fs::write(providers_path, body).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
+    }
+
+    pub fn set_provider_authority(&self, provider_name: &str, executable: &Path) {
+        let providers_path = self.app_config_dir.join("providers.toml");
+        let body = fs::read_to_string(&providers_path).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_account_authority_at(
+                &body,
+                provider_name,
+                "initiative-06-external",
+                executable,
+            ),
+        )
+        .unwrap();
     }
 
     pub fn write_script_provider(
@@ -255,7 +274,11 @@ cwd_script = {cwd_script:?}
 {transcript_line}{storage_type_line}
 "#
         ));
-        fs::write(providers_path, body).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
     }
 
     pub fn write_sessions_with_locator_path(&self, provider_name: &str, transcript_path: &Path) {
@@ -322,6 +345,54 @@ cwd_script = {cwd_script:?}
     }
 
     pub fn seed_active_chain(
+        &self,
+        chain_id: &str,
+        provider_name: &str,
+        session_id: &str,
+        model_name: &str,
+        last_used_at: &str,
+    ) {
+        self.seed_active_chain_at(
+            chain_id,
+            provider_name,
+            session_id,
+            model_name,
+            last_used_at,
+            (
+                super::provider_authority::FIXTURE_PROVIDER_INSTANCE_ID,
+                provider_name,
+            ),
+        );
+    }
+
+    pub fn seed_active_chain_at(
+        &self,
+        chain_id: &str,
+        provider_name: &str,
+        session_id: &str,
+        model_name: &str,
+        last_used_at: &str,
+        authority: (&str, &str),
+    ) {
+        self.seed_active_chain_without_authority(
+            chain_id,
+            provider_name,
+            session_id,
+            model_name,
+            last_used_at,
+        );
+        let conn = self.conn();
+        super::provider_authority::bind_session_authority_with_cwd_at(
+            &conn,
+            provider_name,
+            session_id,
+            authority.0,
+            authority.1,
+            self.dir.path(),
+        );
+    }
+
+    pub fn seed_active_chain_without_authority(
         &self,
         chain_id: &str,
         provider_name: &str,
@@ -908,11 +979,33 @@ pub fn cli_no_storage_fixture(locator_present: bool) -> PreparedLocate {
 }
 
 pub fn cli_locator_failure_fixture() -> PreparedLocate {
-    let prepared = component_claude_success_fixture(CLAUDE_PROVIDER, true);
-    prepared
-        .fixture
-        .write_sessions_locator_errors(CLAUDE_PROVIDER);
-    prepared
+    let fixture = LocateFixture::new();
+    let workspace_root = fixture.root().join("workspace");
+    fs::create_dir_all(&workspace_root).unwrap();
+    fixture.write_model(MODEL, &[CLAUDE_PROVIDER]);
+    let storage_type = ["cla", "ude_code"].concat();
+    fixture.write_script_provider(
+        CLAUDE_PROVIDER,
+        "true",
+        Some("printf '%s\\n' 'locator failed' >&2; exit 42"),
+        Some(&storage_type),
+        true,
+    );
+    fixture.seed_active_chain(
+        CHAIN_A,
+        CLAUDE_PROVIDER,
+        SESSION_A,
+        MODEL,
+        "2026-04-17T08:00:00Z",
+    );
+    PreparedLocate {
+        fixture,
+        session_id: SESSION_A.to_string(),
+        chain_id: CHAIN_A.to_string(),
+        provider_name: CLAUDE_PROVIDER.to_string(),
+        workspace_root,
+        jsonl_path: PathBuf::new(),
+    }
 }
 
 pub fn cli_invalid_uuid_fixture() -> LocateFixture {

@@ -154,14 +154,14 @@ args = [{args}]
             .unwrap_or_default();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
+            fixtures::provider_authority::with_explicit_provider_authority(&format!(
                 r#"[{provider_name}]
 command = {:?}
 args = {args}
 {interactive}prompt_mode = "arg"
 "#,
                 script.to_string_lossy()
-            ),
+            )),
         )
         .unwrap();
     }
@@ -169,7 +169,7 @@ args = {args}
     fn write_claude_storage_provider(&self, provider_name: &str, projects_dir: &Path) {
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
+            fixtures::provider_authority::with_explicit_provider_authority(&format!(
                 r#"[{provider_name}]
 command = "provider-command-that-must-not-run"
 args = []
@@ -185,7 +185,7 @@ kind = "claude_code"
 projects_dir = {:?}
 "#,
                 projects_dir.to_string_lossy()
-            ),
+            )),
         )
         .unwrap();
     }
@@ -223,6 +223,12 @@ projects_dir = {:?}
             params![CHAIN_A, provider_name, session_id],
         )
         .unwrap();
+        fixtures::provider_authority::bind_session_authority_with_cwd(
+            &conn,
+            provider_name,
+            session_id,
+            self.root(),
+        );
     }
 
     fn seed_trace_row(&self) {
@@ -352,15 +358,14 @@ fn age_33_one_shot_loads_models_with_provider_aware_codex_overlap_validation() {
         "codex",
         &["-c", "sandbox_mode=danger-full-access"],
     );
-    fs::write(
+    fixtures::provider_authority::write_with_explicit_provider_authority(
         fixture.app_config_dir.join("providers.toml"),
         r#"[codex]
 command = "provider-command-that-must-not-run"
 args = ["-c", "sandbox_mode=danger-full-access"]
 prompt_mode = "arg"
 "#,
-    )
-    .unwrap();
+    );
 
     let output = fixture.run_direct_model("codex-overlap");
 
@@ -634,15 +639,14 @@ fn age_33_migrate_db_compaction_uses_provider_unaware_model_load_when_models_dir
         "codex",
         &["-c", "sandbox_mode=danger-full-access"],
     );
-    fs::write(
+    fixtures::provider_authority::write_with_explicit_provider_authority(
         fixture.app_config_dir.join("providers.toml"),
         r#"[codex]
 command = "codex"
 args = ["-c", "sandbox_mode=danger-full-access"]
 prompt_mode = "arg"
 "#,
-    )
-    .unwrap();
+    );
 
     let mut cmd = fixture.command();
     cmd.arg("migrate-db");
@@ -728,7 +732,7 @@ fn age_33_session_replace_strictly_rejects_malformed_providers_config() {
 }
 
 #[test]
-fn age_33_session_replace_strictly_rejects_malformed_sessions_config() {
+fn age_33_external_session_replace_ignores_unrelated_malformed_legacy_sessions_config() {
     let prepared = prepared_claude_replace_fixture();
     fs::write(prepared.fixture.sessions_path(), "not = [").unwrap();
     let input = canonical_jsonl(
@@ -742,16 +746,11 @@ fn age_33_session_replace_strictly_rejects_malformed_sessions_config() {
         .fixture
         .run_import_replace(&prepared.session_id, &input, &[]);
 
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    let json = stderr_json(&output);
-    assert_eq!(json["error"]["code"], "operational-error");
-    assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("TOML parse error"),
-        "{json}"
-    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["storage_type"], "external_provider");
+    assert_eq!(receipt["operation"], "import-replace");
 }
 
 #[test]
@@ -767,7 +766,7 @@ args = ["-c", "sandbox_mode=danger-full-access"]
     .unwrap();
     fs::write(
         prepared.fixture.providers_path(),
-        format!(
+        fixtures::provider_authority::with_explicit_provider_authority(&format!(
             r#"[codex]
 command = "provider-command-that-must-not-run"
 args = ["-c", "sandbox_mode=danger-full-access"]
@@ -787,7 +786,7 @@ sessions_dir = {:?}
                 .root()
                 .join("codex-sessions")
                 .to_string_lossy()
-        ),
+        )),
     )
     .unwrap();
     let input = canonical_jsonl(

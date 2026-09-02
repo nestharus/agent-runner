@@ -80,9 +80,10 @@ pub use db::{
     QuotaWindowInput,
 };
 pub use db::{
-    BackfillReport, ChainPreview, ModelStore, ProviderSessionAuthorityCommit,
-    ProviderSessionBinding, RESUME_INPUT_MAX_LEN, ResolvedResume, ResumeError, ResumeInputMatch,
-    ResumeNativeCandidate, SessionMarkerPayload, TurnPreview, WrongIdKindInput,
+    BackfillReport, ChainPreview, FinalizedProviderSessionAuthority, ModelStore,
+    ProviderSessionAuthorityCommit, ProviderSessionBinding, RESUME_INPUT_MAX_LEN, ResolvedResume,
+    ResumeError, ResumeInputMatch, ResumeNativeCandidate, SessionMarkerPayload,
+    StoredProviderSessionAuthority, TurnPreview, WrongIdKindInput,
 };
 pub use db::{
     COMPLETION_REGISTRATION_AUTHORITY_ENV, COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD,

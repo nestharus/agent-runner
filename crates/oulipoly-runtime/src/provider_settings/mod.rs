@@ -30,7 +30,7 @@ pub struct ProviderSettingsHostOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSettingsTarget {
-    pub model_name: String,
+    pub account_name: String,
     pub provider_id: String,
     pub display_name: String,
     pub settings_supported: bool,
@@ -120,11 +120,11 @@ impl ProviderSettingsHost {
         Ok(target)
     }
 
-    fn cached_settings_target(&self, model_name: &str) -> Option<ProviderSettingsTarget> {
+    fn cached_settings_target(&self, account_name: &str) -> Option<ProviderSettingsTarget> {
         self.target_cache
             .lock()
             .expect("settings target cache should not be poisoned")
-            .get(model_name)
+            .get(account_name)
             .cloned()
     }
 
@@ -140,25 +140,25 @@ impl ProviderSettingsHost {
         ))
     }
 
-    fn cache_settings_target(&self, model_name: &str, target: &ProviderSettingsTarget) {
+    fn cache_settings_target(&self, account_name: &str, target: &ProviderSettingsTarget) {
         self.target_cache
             .lock()
             .expect("settings target cache should not be poisoned")
-            .insert(model_name.to_string(), target.clone());
+            .insert(account_name.to_string(), target.clone());
     }
 
-    pub fn configured_model_names(&self) -> Vec<String> {
+    pub fn configured_account_names(&self) -> Vec<String> {
         self.registry.current().configured_account_names()
     }
 
     pub fn settings_schema(
         &self,
-        model_name: &str,
+        account_name: &str,
         schema_id: &str,
     ) -> Result<SchemaResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Schema,
             SchemaParams {
                 schema_id: schema_id.to_string(),
@@ -168,20 +168,20 @@ impl ProviderSettingsHost {
 
     pub fn settings_list(
         &self,
-        model_name: &str,
+        account_name: &str,
     ) -> Result<SettingsListResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
-        self.call_provider(model_name, SettingsOperation::List, EmptyParams {})
+        self.ensure_settings_supported(account_name)?;
+        self.call_provider(account_name, SettingsOperation::List, EmptyParams {})
     }
 
     pub fn settings_get(
         &self,
-        model_name: &str,
+        account_name: &str,
         id: &str,
     ) -> Result<SettingsGetResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Get,
             SettingsGetParams { id: id.to_string() },
         )
@@ -189,13 +189,13 @@ impl ProviderSettingsHost {
 
     pub fn settings_create(
         &self,
-        model_name: &str,
+        account_name: &str,
         display_name: Option<String>,
         values: SettingsValues,
     ) -> Result<SettingsWriteResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Create,
             SettingsCreateParams {
                 display_name,
@@ -206,14 +206,14 @@ impl ProviderSettingsHost {
 
     pub fn settings_update(
         &self,
-        model_name: &str,
+        account_name: &str,
         id: &str,
         version: &str,
         values: SettingsValues,
     ) -> Result<SettingsWriteResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Update,
             SettingsUpdateParams {
                 id: id.to_string(),
@@ -225,13 +225,13 @@ impl ProviderSettingsHost {
 
     pub fn settings_delete(
         &self,
-        model_name: &str,
+        account_name: &str,
         id: &str,
         version: &str,
     ) -> Result<SettingsDeleteResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Delete,
             SettingsDeleteParams {
                 id: id.to_string(),
@@ -242,12 +242,12 @@ impl ProviderSettingsHost {
 
     pub fn settings_validate(
         &self,
-        model_name: &str,
+        account_name: &str,
         values: SettingsValues,
     ) -> Result<SettingsValidateResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Validate,
             SettingsValidateParams { values },
         )
@@ -255,28 +255,28 @@ impl ProviderSettingsHost {
 
     pub fn settings_migrate(
         &self,
-        model_name: &str,
+        account_name: &str,
         dry_run: bool,
         legacy: Value,
     ) -> Result<SettingsMigrateResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Migrate,
             SettingsMigrateParams { dry_run, legacy },
         )
     }
 
-    fn ensure_settings_supported(&self, model_name: &str) -> Result<(), ProviderSettingsError> {
-        let target = self.settings_support_target(model_name)?;
+    fn ensure_settings_supported(&self, account_name: &str) -> Result<(), ProviderSettingsError> {
+        let target = self.settings_support_target(account_name)?;
         validate_settings_supported(&target)
     }
 
     fn settings_support_target(
         &self,
-        model_name: &str,
+        account_name: &str,
     ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
-        self.describe_settings_target(model_name)
+        self.describe_settings_target(account_name)
     }
 
     fn call_provider<R, Params>(
@@ -343,11 +343,11 @@ fn ensure_host_env_object(value: &mut Value) {
 }
 
 fn settings_target_from_description(
-    model_name: &str,
+    account_name: &str,
     description: DescribeResult,
 ) -> ProviderSettingsTarget {
     ProviderSettingsTarget {
-        model_name: model_name.to_string(),
+        account_name: account_name.to_string(),
         provider_id: description.provider_id,
         display_name: description.display_name,
         settings_supported: description.capabilities.settings,
@@ -418,7 +418,7 @@ impl ProviderSettingsError {
         Self {
             category: "unsupported".into(),
             code: Some("settings_unsupported".into()),
-            message: "provider settings are not supported for this model".into(),
+            message: "provider settings are not supported for this account".into(),
             retryable: Some(false),
             details: Box::new(Value::Object(Map::new())),
             diagnostics: Vec::new().into_boxed_slice(),

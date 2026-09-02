@@ -3,6 +3,8 @@
 //! ## Declared roles
 //! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
 
+mod provider_authority_fixture;
+
 use oulipoly_provider::generated::CONTRACT_VERSION;
 use serde_json::Value;
 use std::env;
@@ -127,19 +129,29 @@ impl Fixture {
     }
 
     fn write_providers_with_commands(&self, providers: &[(&str, &Path)]) {
-        fs::write(
-            self.app_config_dir.join("providers.toml"),
-            providers_config_toml_with_commands(providers),
-        )
-        .unwrap();
+        let mut body = providers_config_toml_with_commands(providers);
+        for (provider, executable) in providers {
+            body = provider_authority_fixture::with_explicit_account_authority_at(
+                &body,
+                provider,
+                "session-import-external",
+                executable,
+            );
+        }
+        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
     }
 
-    fn write_providers_with_command_names(&self, providers: &[(&str, &str)]) {
-        fs::write(
-            self.app_config_dir.join("providers.toml"),
-            providers_config_toml_with_command_names(providers),
-        )
-        .unwrap();
+    fn write_providers_with_command_names(&self, providers: &[(&str, &str)], executable: &Path) {
+        let mut body = providers_config_toml_with_command_names(providers);
+        for (provider, _) in providers {
+            body = provider_authority_fixture::with_explicit_account_authority_at(
+                &body,
+                provider,
+                "session-import-command-name",
+                executable,
+            );
+        }
+        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
     }
 
     fn read_records(&self) -> Vec<Value> {
@@ -336,9 +348,9 @@ fn session_import_cli_provider_filter_matches_provider_instance_without_top_leve
 #[test]
 fn session_import_cli_instance_slot_command_uses_provider_shim_binary() {
     let fixture = Fixture::new();
-    fixture.write_provider_script("agent-runner-opencode", true);
+    let provider_script = fixture.write_provider_script("agent-runner-opencode", true);
     fixture.write_empty_stdout_command("opencode1");
-    fixture.write_providers_with_command_names(&[("opencode", "opencode1")]);
+    fixture.write_providers_with_command_names(&[("opencode", "opencode1")], &provider_script);
     fixture.write_model_without_provider_ref("opencode-test", &["opencode"]);
 
     let output = fixture.run_session_import(&["--provider", "opencode", "--json"]);
@@ -354,29 +366,29 @@ fn session_import_cli_instance_slot_command_uses_provider_shim_binary() {
 }
 
 #[test]
-fn session_import_cli_skips_non_session_provider_when_describe_transport_is_unavailable() {
+fn session_import_cli_fails_when_selected_endpoint_describe_is_unavailable() {
     let fixture = Fixture::new();
-    fixture.write_empty_stdout_command("media-cli");
-    fixture.write_providers_with_command_names(&[("media", "media-cli")]);
+    let media_cli = fixture.write_empty_stdout_command("media-cli");
+    fixture.write_providers_with_command_names(&[("media", "media-cli")], &media_cli);
     fixture.write_model_without_provider_ref("media-model", &["media"]);
 
     let output = fixture.run_session_import(&["--json"]);
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(stderr(&output).is_empty(), "{output:?}");
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["providers"].as_array().unwrap().len(), 1);
     assert_eq!(report["providers"][0]["provider_name"], "media");
-    assert_eq!(report["providers"][0]["status"]["kind"], "skipped");
+    assert_eq!(report["providers"][0]["status"]["kind"], "failed");
     assert!(
-        report["providers"][0]["status"]["reason"]
+        report["providers"][0]["errors"][0]
             .as_str()
             .unwrap()
             .contains("session_provider_describe_unavailable"),
         "{report}"
     );
-    assert_eq!(report["totals"]["providers_skipped"], 1);
-    assert_eq!(report["totals"]["providers_failed"], 0);
+    assert_eq!(report["totals"]["providers_skipped"], 0);
+    assert_eq!(report["totals"]["providers_failed"], 1);
     assert!(
         fixture.read_records().is_empty(),
         "non-session provider should not be enumerated"
@@ -384,7 +396,7 @@ fn session_import_cli_skips_non_session_provider_when_describe_transport_is_unav
 }
 
 #[test]
-fn session_import_cli_deduplicates_aliases_with_same_enumerated_source() {
+fn session_import_cli_preserves_distinct_accounts_with_same_enumerated_source() {
     let fixture = Fixture::new();
     let provider_script = fixture.write_provider_script("shared-store-shim.py", true);
     fixture.write_providers_with_commands(&[
@@ -403,15 +415,9 @@ fn session_import_cli_deduplicates_aliases_with_same_enumerated_source() {
     assert_eq!(report["providers"][0]["status"]["kind"], "succeeded");
     assert_eq!(report["providers"][0]["imported"], 1);
     assert_eq!(report["providers"][1]["provider_name"], "shared-alias-b");
-    assert_eq!(report["providers"][1]["status"]["kind"], "skipped");
-    assert!(
-        report["providers"][1]["status"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("duplicate_enumerate_source"),
-        "{report}"
-    );
-    assert_eq!(report["totals"]["imported"], 1);
+    assert_eq!(report["providers"][1]["status"]["kind"], "succeeded");
+    assert_eq!(report["providers"][1]["imported"], 1);
+    assert_eq!(report["totals"]["imported"], 2);
 
     let list_output = fixture.run_session_list_json();
     assert_eq!(list_output.status.code(), Some(0), "{list_output:?}");
@@ -420,20 +426,29 @@ fn session_import_cli_deduplicates_aliases_with_same_enumerated_source() {
         .iter()
         .filter(|row| row["active_provider_session_id"] == "shared-native")
         .collect::<Vec<_>>();
-    assert_eq!(shared_rows.len(), 1, "{rows:?}");
-    assert_eq!(shared_rows[0]["active_provider"], "shared-alias-a");
+    assert_eq!(shared_rows.len(), 2, "{rows:?}");
+    assert!(
+        shared_rows
+            .iter()
+            .any(|row| row["active_provider"] == "shared-alias-a")
+    );
+    assert!(
+        shared_rows
+            .iter()
+            .any(|row| row["active_provider"] == "shared-alias-b")
+    );
 }
 
 #[test]
-fn session_import_cli_deduplicates_opencode_instance_aliases_through_shared_shim() {
+fn session_import_cli_preserves_opencode_accounts_through_shared_shim() {
     let fixture = Fixture::new();
-    fixture.write_provider_script("agent-runner-opencode", true);
+    let provider_script = fixture.write_provider_script("agent-runner-opencode", true);
     fixture.write_empty_stdout_command("opencode1");
     fixture.write_empty_stdout_command("opencode2");
-    fixture.write_providers_with_command_names(&[
-        ("opencode", "opencode1"),
-        ("opencode2", "opencode2"),
-    ]);
+    fixture.write_providers_with_command_names(
+        &[("opencode", "opencode1"), ("opencode2", "opencode2")],
+        &provider_script,
+    );
     fixture.write_model_without_provider_ref("opencode-test", &["opencode", "opencode2"]);
 
     let output = fixture.run_session_import(&["--json"]);
@@ -445,15 +460,9 @@ fn session_import_cli_deduplicates_opencode_instance_aliases_through_shared_shim
     assert_eq!(report["providers"][0]["provider_name"], "opencode");
     assert_eq!(report["providers"][0]["status"]["kind"], "succeeded");
     assert_eq!(report["providers"][1]["provider_name"], "opencode2");
-    assert_eq!(report["providers"][1]["status"]["kind"], "skipped");
-    assert!(
-        report["providers"][1]["status"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("duplicate_enumerate_source"),
-        "{report}"
-    );
-    assert_eq!(report["totals"]["imported"], 1);
+    assert_eq!(report["providers"][1]["status"]["kind"], "succeeded");
+    assert_eq!(report["providers"][1]["imported"], 1);
+    assert_eq!(report["totals"]["imported"], 2);
 
     let list_output = fixture.run_session_list_json();
     assert_eq!(list_output.status.code(), Some(0), "{list_output:?}");
@@ -462,8 +471,17 @@ fn session_import_cli_deduplicates_opencode_instance_aliases_through_shared_shim
         .iter()
         .filter(|row| row["active_provider_session_id"] == "opencode-shared-native")
         .collect::<Vec<_>>();
-    assert_eq!(opencode_rows.len(), 1, "{rows:?}");
-    assert_eq!(opencode_rows[0]["active_provider"], "opencode");
+    assert_eq!(opencode_rows.len(), 2, "{rows:?}");
+    assert!(
+        opencode_rows
+            .iter()
+            .any(|row| row["active_provider"] == "opencode")
+    );
+    assert!(
+        opencode_rows
+            .iter()
+            .any(|row| row["active_provider"] == "opencode2")
+    );
 }
 
 #[test]

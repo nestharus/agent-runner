@@ -16,7 +16,7 @@
 
 use oulipoly_runtime::fresh_continuation::{
     ContinuationBlock, ContinuationBlockKind, InvocationAction, InvocationOutcome,
-    ReservedInvocation, ResumeRunner, ValidatedContinuation,
+    ReservedInvocation, ResumeAcceptance, ResumeRunner, ValidatedContinuation,
 };
 use oulipoly_state::StateDb;
 
@@ -37,7 +37,7 @@ impl<'state, Execute> ContinuationResumeRunner<'state, Execute> {
 
 impl<Execute> ResumeRunner for ContinuationResumeRunner<'_, Execute>
 where
-    Execute: FnMut(&ReservedRun, &ValidatedContinuation) -> Result<(), ContinuationBlock>,
+    Execute: FnMut(&ReservedRun, &ValidatedContinuation) -> Result<bool, ContinuationBlock>,
 {
     fn run_or_observe(
         &mut self,
@@ -52,7 +52,7 @@ where
 
 impl<Execute> ContinuationResumeRunner<'_, Execute>
 where
-    Execute: FnMut(&ReservedRun, &ValidatedContinuation) -> Result<(), ContinuationBlock>,
+    Execute: FnMut(&ReservedRun, &ValidatedContinuation) -> Result<bool, ContinuationBlock>,
 {
     fn execute_or_observe(
         &mut self,
@@ -68,9 +68,16 @@ where
         let execution = (self.execute)(&reserved, context);
 
         match (execution, self.observe(reservation, context)) {
-            (_, Ok(outcome)) => Ok(outcome),
+            (Ok(provider_prompt_accepted), Ok(mut outcome)) => {
+                if provider_prompt_accepted && outcome.acceptance == ResumeAcceptance::NotApplicable
+                {
+                    outcome.acceptance = ResumeAcceptance::Accepted;
+                }
+                Ok(outcome)
+            }
+            (Err(_), Ok(outcome)) => Ok(outcome),
             (Err(error), Err(_)) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
         }
     }
 

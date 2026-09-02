@@ -152,6 +152,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn endpoint_backed_repl_uses_authenticated_live_session_binding() {
+        let terminal = include_str!("terminal.rs");
+        for required in [
+            "has_account_endpoint",
+            "preflight_account",
+            "InteractiveLiveSessionBinding",
+            "expected_provider_session_id: input.resume_session_id",
+            "execute_interactive_with_result_and_model_config_and_live_session_binding",
+        ] {
+            assert!(
+                terminal.contains(required),
+                "endpoint-backed REPL must retain live-session binding wiring: {required}"
+            );
+        }
+        assert!(
+            !orchestration_source().contains("pty_resume_identity_observer_unavailable"),
+            "REPL must not require provider observation before the live binding server exists"
+        );
+    }
+
     fn assert_typed_signal_disposition_marks_guard_after_finalize(
         function_name: &str,
         disposition: &str,

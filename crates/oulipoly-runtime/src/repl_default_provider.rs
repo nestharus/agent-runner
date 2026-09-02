@@ -13,7 +13,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::executor::cli::InteractiveLiveSessionBinding;
-use crate::provider_registry::{PinnedProviderEndpoint, ProviderRegistry, ProviderRegistryOptions};
+use crate::provider_registry::{
+    PinnedProviderEndpoint, ProviderRegistry, ProviderRegistryError, ProviderRegistryOptions,
+};
 use crate::services::{
     LauncherServiceOutput, LauncherServicePort, LauncherServiceRequest, ServiceError,
 };
@@ -165,7 +167,15 @@ where
                 .with_config_root(&services.config_root)
                 .with_data_root(registry_data_root),
         )
-        .map_err(|err| err.to_string())?,
+        .map_err(|error| match &error {
+            ProviderRegistryError::AccountImplementationNotConfigured { account_name } => {
+                format!(
+                    "provider account {account_name} implementation preflight failed for {}/{account_name}: {error}",
+                    carrier_model.name,
+                )
+            }
+            _ => error.to_string(),
+        })?,
     );
 
     let state = match services.state_db_path.as_ref() {
@@ -196,7 +206,8 @@ where
         .preflight_account(&selected_provider_name)
         .map_err(|error| {
             format!(
-                "provider account {selected_provider_name} implementation preflight failed: {error}"
+                "provider account {selected_provider_name} implementation preflight failed for {}/{selected_provider_name}: {error}",
+                carrier_model.name,
             )
         })?;
     if !provider_endpoint.capabilities().capabilities.session {
@@ -676,9 +687,11 @@ mod tests {
             r#"[{name}]
 command = "printf"
 interactive_args = ["ok"]
+settings_id = "{name}-settings"
 
 [{name}.implementation]
-path = "{implementation}"
+family = "historical-test-fixture"
+executable = "{implementation}"
 "#
         )
     }
@@ -1288,6 +1301,9 @@ interactive_args = ["ok"]
 
         assert!(error.contains("provider account fixture implementation preflight failed"));
         assert!(error.contains("<provider-family:fixture>/fixture"));
+        assert!(
+            error.contains("provider account has no explicit implementation endpoint: fixture")
+        );
         assert!(launcher.calls.borrow().is_empty());
     }
 
@@ -1306,9 +1322,11 @@ interactive_args = ["ok"]
                 r#"[fixture]
 command = "printf"
 interactive_args = ["ok"]
+settings_id = "fixture-settings"
 
 [fixture.implementation]
-path = "{}"
+family = "fixture"
+executable = "{}"
 "#,
                 toml_path(&implementation)
             ),
@@ -1342,9 +1360,11 @@ command = "printf"
 interactive_args = ["ok"]
 environment = {{ XDG_DATA_HOME = "/tmp/opencode-profile" }}
 unset_environment = ["OPENAI_API_KEY"]
+settings_id = "opencode-settings"
 
 [opencode.implementation]
-path = "{}"
+family = "opencode"
+executable = "{}"
 "#,
                 repl_test_provider_path().display()
             ),

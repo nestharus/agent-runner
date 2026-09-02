@@ -1444,22 +1444,22 @@ pub fn test_model_raw_sigterm_returns_unified_signal_exit_code() {
 pub fn provider_settings_command_args_deserialize_camel_case_ipc_payloads() {
     let schema_args: provider_settings::GetProviderSettingsSchemaArgs =
         serde_json::from_value(serde_json::json!({
-            "modelName": "example-model",
+            "accountName": "provider-a",
             "schemaId": "example.settings/v1",
         }))
         .expect("camelCase schema payload should deserialize for Tauri IPC");
-    assert_eq!(schema_args.model_name, "example-model");
+    assert_eq!(schema_args.account_name, "provider-a");
     assert_eq!(schema_args.schema_id, "example.settings/v1");
 
     let update_args: provider_settings::UpdateProviderSettingsArgs =
         serde_json::from_value(serde_json::json!({
-            "modelName": "example-model",
+            "accountName": "provider-a",
             "id": "record",
             "version": "opaque-version",
             "values": {"endpoint": "https://example.test", "enabled": true},
         }))
         .expect("camelCase update payload should deserialize for Tauri IPC");
-    assert_eq!(update_args.model_name, "example-model");
+    assert_eq!(update_args.account_name, "provider-a");
     assert_eq!(update_args.id, "record");
     assert_eq!(update_args.version, "opaque-version");
     assert_eq!(
@@ -1469,12 +1469,12 @@ pub fn provider_settings_command_args_deserialize_camel_case_ipc_payloads() {
 
     let migrate_args: provider_settings::MigrateProviderSettingsArgs =
         serde_json::from_value(serde_json::json!({
-            "modelName": "example-model",
+            "accountName": "provider-a",
             "dryRun": true,
             "legacy": {"providers": {"provider-a": {"command": "example"}}},
         }))
         .expect("camelCase migrate payload should deserialize for Tauri IPC");
-    assert_eq!(migrate_args.model_name, "example-model");
+    assert_eq!(migrate_args.account_name, "provider-a");
     assert!(migrate_args.dry_run);
     assert_eq!(
         migrate_args.legacy["providers"]["provider-a"]["command"],
@@ -1507,7 +1507,7 @@ pub fn provider_settings_command_preserves_structured_conflict_and_transport_err
     let conflict = provider_settings::update_provider_settings_inner(
         harness.state(),
         provider_settings::UpdateProviderSettingsArgs {
-            model_name: "example-model".to_string(),
+            account_name: "provider-a".to_string(),
             id: "record".to_string(),
             version: "stale-version".to_string(),
             values: serde_json::json!({"endpoint": "https://example.test"}),
@@ -1529,7 +1529,7 @@ pub fn provider_settings_command_preserves_structured_conflict_and_transport_err
     let transport = provider_settings::validate_provider_settings_inner(
         harness.state(),
         provider_settings::ValidateProviderSettingsArgs {
-            model_name: "example-model".to_string(),
+            account_name: "provider-a".to_string(),
             values: serde_json::json!({"endpoint": "https://example.test"}),
         },
     )
@@ -1550,13 +1550,22 @@ pub fn provider_settings_command_preserves_migration_diagnostics_from_real_host(
     );
     let models_dir = dir.path().join("models");
     std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(
+        dir.path().join("providers.toml"),
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            "[provider-a]\ncommand = \"example\"\nargs = []\nprompt_mode = \"arg\"\n",
+            "provider-settings",
+            &provider_path,
+        ),
+    )
+    .unwrap();
     let model = model_with_provider_artifact("example-model", "provider-a", &provider_path);
     let state = test_state(models_dir, HashMap::from([(model.name.clone(), model)]));
 
     let migrated = provider_settings::migrate_provider_settings_inner(
         &state,
         provider_settings::MigrateProviderSettingsArgs {
-            model_name: "example-model".to_string(),
+            account_name: "provider-a".to_string(),
             dry_run: true,
             legacy: serde_json::json!({"providers": {"provider-a": {"command": "example"}}}),
         },
@@ -1593,6 +1602,15 @@ pub fn provider_settings_targets_skip_central_config_only_models() {
     );
     let models_dir = dir.path().join("models");
     std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(
+        dir.path().join("providers.toml"),
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            "[provider-a]\ncommand = \"example\"\nargs = []\nprompt_mode = \"arg\"\n",
+            "provider-settings",
+            &provider_path,
+        ),
+    )
+    .unwrap();
     let artifact_model =
         model_with_provider_artifact("artifact-model", "provider-a", &provider_path);
     let central_model = make_model("central-only-model", &["provider-a"]);
@@ -1608,7 +1626,7 @@ pub fn provider_settings_targets_skip_central_config_only_models() {
         .expect("mixed central and artifact models should list configured targets");
 
     assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].model_name, "artifact-model");
+    assert_eq!(targets[0].account_name, "provider-a");
     assert_eq!(targets[0].provider_id, "provider-a");
 }
 
@@ -1714,14 +1732,22 @@ args = ["--endpoint", "https://example.test"]
 prompt_mode = "arg"
 "#;
     std::fs::write(&model_path, model_toml).unwrap();
-    std::fs::write(&providers_path, providers_toml).unwrap();
+    std::fs::write(
+        &providers_path,
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            providers_toml,
+            "provider-settings",
+            &provider_path,
+        ),
+    )
+    .unwrap();
     let providers = load_providers_for_models_dir(&models_dir);
     let models = config::load_models(&models_dir, Some(&providers)).unwrap();
     let state = test_state(models_dir.clone(), models);
     let before_model = std::fs::read_to_string(&model_path).unwrap();
     let before_providers = std::fs::read_to_string(&providers_path).unwrap();
 
-    let legacy = provider_settings::package_migration_legacy_payload(&state, "example-model")
+    let legacy = provider_settings::package_migration_legacy_payload(&state)
         .expect("migration legacy packaging should read central config");
 
     assert_eq!(
@@ -1750,7 +1776,7 @@ prompt_mode = "arg"
     let migrated = provider_settings::migrate_provider_settings_inner(
         &state,
         provider_settings::MigrateProviderSettingsArgs {
-            model_name: "example-model".to_string(),
+            account_name: "provider-a".to_string(),
             dry_run: false,
             legacy: serde_json::Value::Null,
         },
@@ -1872,3 +1898,5 @@ fn first_provider_settings_migration_record_line(text: &str) -> &str {
 fn parse_provider_settings_migration_record_line(line: &str) -> serde_json::Value {
     serde_json::from_str(line).expect("recorded request should parse")
 }
+#[path = "provider_authority_fixture.rs"]
+mod provider_authority_fixture;

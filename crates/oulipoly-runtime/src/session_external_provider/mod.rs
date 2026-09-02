@@ -1459,7 +1459,12 @@ fn map_provider_lock_error(error: LockError) -> ReplaceError {
             expires_at,
             token_hash,
         } => ReplaceError::SessionBusy {
-            token: token_hash.unwrap_or_default(),
+            token: token_hash
+                .as_deref()
+                .and_then(|value| value.strip_prefix("sha256:"))
+                .or(token_hash.as_deref())
+                .unwrap_or_default()
+                .to_string(),
             expires_at,
         },
         LockError::TokenInvalid | LockError::LockExpired => ReplaceError::OperationalError {

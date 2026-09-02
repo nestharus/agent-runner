@@ -53,4 +53,5 @@ windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win
 
 [lints.clippy]
 bool-assert-comparison = "allow"
+duplicate-mod = "allow"
 filter-map-bool-then = "allow"

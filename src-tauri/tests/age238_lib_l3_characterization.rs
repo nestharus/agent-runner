@@ -538,8 +538,9 @@ fn age238_discovery_command_keeps_gui_db_open_spawn_and_join_error_contracts() {
     for required in [
         "let db_path = accessor::state_db_path(&state);",
         "let state_db_opener = accessor::state_db_opener(&state);",
+        "let provider_registry = state.provider_registry.current();",
         "tauri::async_runtime::spawn_blocking(move ||",
-        "accessor::discover_models_for_cli(&cli_name)?",
+        "accessor::discover_models_for_family(&provider_registry, &cli_name)?",
         "accessor::open_state_db_at(&state_db_opener, &db_path)?",
         "accessor::persist_discovery_result(&db, &cli_name, result)",
         "formatter::discovery_join_error",

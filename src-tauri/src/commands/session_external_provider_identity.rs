@@ -8,18 +8,32 @@
 use crate::cli::paths::{default_config_root, default_models_dir};
 use oulipoly_config::{ProvidersConfig, load_models};
 use oulipoly_runtime::services::SessionServiceExternalProviderIdentity;
-use oulipoly_state::{ResolvedResume, ResumeError, StateDb};
+use oulipoly_state::{ResolvedResume, ResumeError, StateDb, StoredProviderSessionAuthority};
+
+pub(crate) enum SessionExternalProviderIdentityError {
+    AmbiguousSession { input: String },
+    Operational { message: String },
+}
 
 pub(crate) fn resolve_session_external_provider_identity(
     session_id: &str,
-) -> Result<Option<SessionServiceExternalProviderIdentity>, String> {
-    let state = access_default_state_for_identity()?;
-    let providers = access_default_providers_for_identity()?;
-    let models = access_default_models_for_identity(&providers)?;
+) -> Result<Option<SessionServiceExternalProviderIdentity>, SessionExternalProviderIdentityError> {
+    let state = access_default_state_for_identity().map_err(identity_operational_error)?;
+    let providers = access_default_providers_for_identity().map_err(identity_operational_error)?;
+    let models =
+        access_default_models_for_identity(&providers).map_err(identity_operational_error)?;
     let Some(resolved) = access_resolved_resume_for_identity(&state, &models, session_id)? else {
         return Ok(None);
     };
-    map_resolved_external_provider_identity(resolved, &providers)
+    let authority = state
+        .active_provider_session_authority(&resolved.chain_id)
+        .map_err(identity_operational_error)?;
+    map_resolved_external_provider_identity(resolved, &providers, authority.as_ref())
+        .map_err(identity_operational_error)
+}
+
+fn identity_operational_error(message: String) -> SessionExternalProviderIdentityError {
+    SessionExternalProviderIdentityError::Operational { message }
 }
 
 fn access_default_state_for_identity() -> Result<StateDb, String> {
@@ -42,24 +56,43 @@ fn access_resolved_resume_for_identity(
     state: &StateDb,
     models: &oulipoly_state::ModelStore,
     session_id: &str,
-) -> Result<Option<ResolvedResume>, String> {
+) -> Result<Option<ResolvedResume>, SessionExternalProviderIdentityError> {
+    let previews = state
+        .resume_previews(session_id)
+        .map_err(|message| SessionExternalProviderIdentityError::Operational { message })?;
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    if previews
+        .iter()
+        .filter(|preview| preview.last_used_at >= cutoff)
+        .count()
+        > 1
+    {
+        return Err(SessionExternalProviderIdentityError::AmbiguousSession {
+            input: session_id.to_string(),
+        });
+    }
     match state.resolve_resume(models, session_id, None) {
         Ok(resolved) => Ok(Some(resolved)),
-        Err(ResumeError::NoChainFound { .. })
-        | Err(ResumeError::WrongIdKind { .. })
-        | Err(ResumeError::Ambiguous { .. }) => Ok(None),
-        Err(error) => Err(format!("failed to resolve session: {error:?}")),
+        Err(ResumeError::NoChainFound { .. }) | Err(ResumeError::WrongIdKind { .. }) => Ok(None),
+        Err(ResumeError::Ambiguous { input, .. }) => {
+            Err(SessionExternalProviderIdentityError::AmbiguousSession { input })
+        }
+        Err(error) => Err(SessionExternalProviderIdentityError::Operational {
+            message: format!("failed to resolve session: {error:?}"),
+        }),
     }
 }
 
 fn map_resolved_external_provider_identity(
     resolved: ResolvedResume,
     providers: &ProvidersConfig,
+    authority: Option<&StoredProviderSessionAuthority>,
 ) -> Result<Option<SessionServiceExternalProviderIdentity>, String> {
     map_external_model_identity(
         resolved.model_name.as_deref().unwrap_or(""),
         &resolved.active_provider,
         providers,
+        authority,
     )
 }
 
@@ -67,6 +100,7 @@ fn map_external_model_identity(
     model_name: &str,
     provider_name: &str,
     providers: &ProvidersConfig,
+    authority: Option<&StoredProviderSessionAuthority>,
 ) -> Result<Option<SessionServiceExternalProviderIdentity>, String> {
     validate_external_provider_name(provider_name)?;
     let Some(provider) = providers.get(provider_name) else {
@@ -75,14 +109,14 @@ fn map_external_model_identity(
     if provider.implementation.is_none() {
         return Ok(None);
     }
-    let settings_id = provider.settings_id.as_deref().ok_or_else(|| {
-        format!("provider account has no explicit settings identity: {provider_name}")
+    let authority = authority.ok_or_else(|| {
+        format!("provider session has no persisted endpoint authority: {provider_name}")
     })?;
     Ok(Some(SessionServiceExternalProviderIdentity {
         model_name: model_name.to_string(),
         provider_name: provider_name.to_string(),
-        provider_instance_id: None,
-        settings_id: settings_id.to_string(),
+        provider_instance_id: Some(authority.provider_instance_id.clone()),
+        settings_id: authority.settings_id.clone(),
     }))
 }
 
@@ -97,6 +131,7 @@ fn validate_external_provider_name(provider_name: &str) -> Result<(), String> {
 mod tests {
     use super::map_external_model_identity;
     use oulipoly_config::{ProviderEndpointConfig, ProviderEntry, ProvidersConfig};
+    use oulipoly_state::StoredProviderSessionAuthority;
 
     #[test]
     fn builtin_account_has_no_external_session_identity() {
@@ -106,7 +141,7 @@ mod tests {
             .insert("builtin".to_string(), ProviderEntry::default());
 
         assert_eq!(
-            map_external_model_identity("model", "builtin", &providers).unwrap(),
+            map_external_model_identity("model", "builtin", &providers, None).unwrap(),
             None
         );
     }
@@ -126,12 +161,20 @@ mod tests {
             },
         );
 
-        let identity = map_external_model_identity("model", "external", &providers)
-            .unwrap()
-            .expect("explicit endpoint should select external session identity");
+        let authority = StoredProviderSessionAuthority {
+            provider_instance_id: "external-family-instance".to_string(),
+            settings_id: "historical-settings".to_string(),
+        };
+        let identity =
+            map_external_model_identity("model", "external", &providers, Some(&authority))
+                .unwrap()
+                .expect("explicit endpoint should select external session identity");
         assert_eq!(identity.model_name, "model");
         assert_eq!(identity.provider_name, "external");
-        assert_eq!(identity.provider_instance_id, None);
-        assert_eq!(identity.settings_id, "external-settings");
+        assert_eq!(
+            identity.provider_instance_id.as_deref(),
+            Some("external-family-instance")
+        );
+        assert_eq!(identity.settings_id, "historical-settings");
     }
 }

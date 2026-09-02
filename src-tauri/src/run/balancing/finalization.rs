@@ -80,7 +80,7 @@ pub(super) fn finalize_completed_attempt(
         )
     {
         formatter::emit_stderr(&format!("failed to persist provider output: {error}"));
-        let _ = finalize_retained_outcome_with_contention_retry(
+        let finalize_result = finalize_retained_outcome_with_contention_retry(
             input
                 .agent_runtime_services
                 .invocation_lifecycle_service
@@ -90,11 +90,15 @@ pub(super) fn finalize_completed_attempt(
                 input.invocation_row_id,
                 false,
                 1,
-                Some("output_persistence"),
-                Some("output_persistence_failed"),
+                Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
+                Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
             ),
         );
-        input.guard.mark_finalized();
+        match finalize_result {
+            Ok(_) => input.guard.mark_finalized(),
+            Err(err) => formatter::emit_finalize_invocation_warning(err),
+        }
+        emit_terminal_persistence_failure_result(&input);
         mark_balanced_attempt_idle(&input, Some(1));
         return BalancedLoopControl::Return(Ok(1));
     }
@@ -238,6 +242,11 @@ fn emit_completed_attempt_finalize_failure(
     err: impl std::fmt::Display,
 ) {
     formatter::emit_finalize_invocation_warning(err);
+    emit_terminal_persistence_failure_result(input);
+    mark_balanced_attempt_idle(input, Some(1));
+}
+
+fn emit_terminal_persistence_failure_result(input: &CompletedAttemptInput<'_, '_, '_>) {
     formatter::emit_failure_result_envelope(mapper::failure_result_envelope_input(
         &input.env.state,
         &input.invocation.id,
@@ -247,7 +256,6 @@ fn emit_completed_attempt_finalize_failure(
         Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
         Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
     ));
-    mark_balanced_attempt_idle(input, Some(1));
 }
 
 fn completed_attempt_result_control(

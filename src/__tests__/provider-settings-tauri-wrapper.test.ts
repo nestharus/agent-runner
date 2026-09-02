@@ -27,31 +27,31 @@ describe("provider settings Tauri wrappers", () => {
 
 		await wrapper("listProviderSettingsTargets")();
 		await wrapper("getProviderSettingsSchema")(
-			"example-model",
+			"provider-a",
 			"example.settings/v1",
 		);
-		await wrapper("listProviderSettings")("example-model");
-		await wrapper("getProviderSettings")("example-model", "record");
-		await wrapper("createProviderSettings")("example-model", "Record", {
+		await wrapper("listProviderSettings")("provider-a");
+		await wrapper("getProviderSettings")("provider-a", "record");
+		await wrapper("createProviderSettings")("provider-a", "Record", {
 			endpoint: "https://example.test",
 			enabled: true,
 			limit: 3,
 		});
 		await wrapper("updateProviderSettings")(
-			"example-model",
+			"provider-a",
 			"record",
 			"opaque-version",
 			{ endpoint: "https://example.test/updated" },
 		);
 		await wrapper("deleteProviderSettings")(
-			"example-model",
+			"provider-a",
 			"record",
 			"opaque-version",
 		);
-		await wrapper("validateProviderSettings")("example-model", {
+		await wrapper("validateProviderSettings")("provider-a", {
 			endpoint: "https://example.test",
 		});
-		await wrapper("migrateProviderSettings")("example-model", true, {
+		await wrapper("migrateProviderSettings")("provider-a", true, {
 			models: { "example-model": { provider: { script: "opaque" } } },
 		});
 
@@ -60,22 +60,22 @@ describe("provider settings Tauri wrappers", () => {
 			{
 				command: "get_provider_settings_schema",
 				args: {
-					modelName: "example-model",
+					accountName: "provider-a",
 					schemaId: "example.settings/v1",
 				},
 			},
 			{
 				command: "list_provider_settings",
-				args: { modelName: "example-model" },
+				args: { accountName: "provider-a" },
 			},
 			{
 				command: "get_provider_settings",
-				args: { modelName: "example-model", id: "record" },
+				args: { accountName: "provider-a", id: "record" },
 			},
 			{
 				command: "create_provider_settings",
 				args: {
-					modelName: "example-model",
+					accountName: "provider-a",
 					displayName: "Record",
 					values: {
 						endpoint: "https://example.test",
@@ -87,7 +87,7 @@ describe("provider settings Tauri wrappers", () => {
 			{
 				command: "update_provider_settings",
 				args: {
-					modelName: "example-model",
+					accountName: "provider-a",
 					id: "record",
 					version: "opaque-version",
 					values: { endpoint: "https://example.test/updated" },
@@ -96,7 +96,7 @@ describe("provider settings Tauri wrappers", () => {
 			{
 				command: "delete_provider_settings",
 				args: {
-					modelName: "example-model",
+					accountName: "provider-a",
 					id: "record",
 					version: "opaque-version",
 				},
@@ -104,14 +104,14 @@ describe("provider settings Tauri wrappers", () => {
 			{
 				command: "validate_provider_settings",
 				args: {
-					modelName: "example-model",
+					accountName: "provider-a",
 					values: { endpoint: "https://example.test" },
 				},
 			},
 			{
 				command: "migrate_provider_settings",
 				args: {
-					modelName: "example-model",
+					accountName: "provider-a",
 					dryRun: true,
 					legacy: {
 						models: { "example-model": { provider: { script: "opaque" } } },
@@ -142,7 +142,7 @@ describe("provider settings Tauri wrappers", () => {
 		setHandler("update_provider_settings", () => Promise.reject(conflict));
 
 		await expect(
-			wrapper("updateProviderSettings")("example-model", "record", "stale", {
+			wrapper("updateProviderSettings")("provider-a", "record", "stale", {
 				endpoint: "https://example.test",
 			}),
 		).rejects.toMatchObject(conflict);
@@ -182,8 +182,8 @@ function successFor(command: string): unknown {
 	if (command === "list_provider_settings_targets") {
 		return [
 			{
-				modelName: "example-model",
-				displayName: "Example Model",
+				accountName: "provider-a",
+				displayName: "Provider A",
 				settingsSupported: true,
 				schemaId: "example.settings/v1",
 			},

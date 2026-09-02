@@ -312,6 +312,7 @@ fn assert_schema5_current_plan(plan: &[&migrations::Migration]) {
             "0019_invocation_running_projection_index",
             "0020_session_turn_pages",
             "0021_invocation_output_delivery",
+            "0022_provider_session_authority",
         ]
     );
 }

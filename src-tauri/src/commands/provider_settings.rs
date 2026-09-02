@@ -15,27 +15,27 @@ use std::path::Path;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetProviderSettingsSchemaArgs {
-    pub model_name: String,
+    pub account_name: String,
     pub schema_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ModelProviderSettingsArgs {
-    pub model_name: String,
+pub struct AccountProviderSettingsArgs {
+    pub account_name: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetProviderSettingsArgs {
-    pub model_name: String,
+    pub account_name: String,
     pub id: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateProviderSettingsArgs {
-    pub model_name: String,
+    pub account_name: String,
     #[serde(rename = "displayName")]
     pub display_name: Option<String>,
     pub values: Value,
@@ -44,7 +44,7 @@ pub struct CreateProviderSettingsArgs {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateProviderSettingsArgs {
-    pub model_name: String,
+    pub account_name: String,
     pub id: String,
     pub version: String,
     pub values: Value,
@@ -53,7 +53,7 @@ pub struct UpdateProviderSettingsArgs {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteProviderSettingsArgs {
-    pub model_name: String,
+    pub account_name: String,
     pub id: String,
     pub version: String,
 }
@@ -61,14 +61,14 @@ pub struct DeleteProviderSettingsArgs {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidateProviderSettingsArgs {
-    pub model_name: String,
+    pub account_name: String,
     pub values: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrateProviderSettingsArgs {
-    pub model_name: String,
+    pub account_name: String,
     pub dry_run: bool,
     pub legacy: Value,
 }
@@ -76,7 +76,7 @@ pub struct MigrateProviderSettingsArgs {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSettingsTarget {
-    pub model_name: String,
+    pub account_name: String,
     #[serde(rename = "displayName")]
     pub display_name: String,
     pub provider_id: String,
@@ -206,7 +206,7 @@ pub fn get_provider_settings_schema(
 #[tauri::command]
 pub fn list_provider_settings(
     state: tauri::State<AppState>,
-    args: ModelProviderSettingsArgs,
+    args: AccountProviderSettingsArgs,
 ) -> ProviderSettingsCommandResult<ProviderSettingsListDto> {
     list_provider_settings_inner(&state, args)
 }
@@ -262,7 +262,7 @@ pub fn migrate_provider_settings(
 pub fn list_provider_settings_targets_inner(
     state: &AppState,
 ) -> ProviderSettingsCommandResult<Vec<ProviderSettingsTarget>> {
-    let names = with_host(state, |host| Ok(host.configured_model_names()))?;
+    let names = with_host(state, |host| Ok(host.configured_account_names()))?;
     names
         .into_iter()
         .map(|name| with_host(state, |host| host.describe_settings_target(&name)).map(map_target))
@@ -274,23 +274,26 @@ pub fn get_provider_settings_schema_inner(
     args: GetProviderSettingsSchemaArgs,
 ) -> ProviderSettingsCommandResult<ProviderSettingsSchema> {
     with_host(state, |host| {
-        host.settings_schema(&args.model_name, &args.schema_id)
+        host.settings_schema(&args.account_name, &args.schema_id)
     })
     .map(map_schema)
 }
 
 pub fn list_provider_settings_inner(
     state: &AppState,
-    args: ModelProviderSettingsArgs,
+    args: AccountProviderSettingsArgs,
 ) -> ProviderSettingsCommandResult<ProviderSettingsListDto> {
-    with_host(state, |host| host.settings_list(&args.model_name)).map(map_list)
+    with_host(state, |host| host.settings_list(&args.account_name)).map(map_list)
 }
 
 pub fn get_provider_settings_inner(
     state: &AppState,
     args: GetProviderSettingsArgs,
 ) -> ProviderSettingsCommandResult<ProviderSettingsGetDto> {
-    with_host(state, |host| host.settings_get(&args.model_name, &args.id)).map(map_get)
+    with_host(state, |host| {
+        host.settings_get(&args.account_name, &args.id)
+    })
+    .map(map_get)
 }
 
 pub fn create_provider_settings_inner(
@@ -299,7 +302,7 @@ pub fn create_provider_settings_inner(
 ) -> ProviderSettingsCommandResult<ProviderSettingsWriteDto> {
     let values = settings_values(args.values)?;
     with_host(state, |host| {
-        host.settings_create(&args.model_name, args.display_name.clone(), values)
+        host.settings_create(&args.account_name, args.display_name.clone(), values)
     })
     .map(map_write)
 }
@@ -313,7 +316,7 @@ pub fn update_provider_settings_inner(
     }
     let values = settings_values(args.values)?;
     with_host(state, |host| {
-        host.settings_update(&args.model_name, &args.id, &args.version, values)
+        host.settings_update(&args.account_name, &args.id, &args.version, values)
     })
     .map(map_write)
 }
@@ -323,7 +326,7 @@ pub fn delete_provider_settings_inner(
     args: DeleteProviderSettingsArgs,
 ) -> ProviderSettingsCommandResult<ProviderSettingsDeleteDto> {
     with_host(state, |host| {
-        host.settings_delete(&args.model_name, &args.id, &args.version)
+        host.settings_delete(&args.account_name, &args.id, &args.version)
     })
     .map(map_delete)
 }
@@ -337,7 +340,7 @@ pub fn validate_provider_settings_inner(
     }
     let values = settings_values(args.values)?;
     with_host(state, |host| {
-        host.settings_validate(&args.model_name, values)
+        host.settings_validate(&args.account_name, values)
     })
     .map(map_validate)
 }
@@ -347,12 +350,12 @@ pub fn migrate_provider_settings_inner(
     args: MigrateProviderSettingsArgs,
 ) -> ProviderSettingsCommandResult<ProviderSettingsMigrateDto> {
     let legacy = if args.legacy.is_null() {
-        package_migration_legacy_payload(state, &args.model_name)?
+        package_migration_legacy_payload(state)?
     } else {
         args.legacy.clone()
     };
     with_host(state, |host| {
-        host.settings_migrate(&args.model_name, args.dry_run, legacy)
+        host.settings_migrate(&args.account_name, args.dry_run, legacy)
     })
     .map(map_migrate)
 }
@@ -367,27 +370,34 @@ pub fn refresh_provider_settings_host(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
-pub fn package_migration_legacy_payload(
-    state: &AppState,
-    model_name: &str,
-) -> ProviderSettingsCommandResult<Value> {
+pub fn package_migration_legacy_payload(state: &AppState) -> ProviderSettingsCommandResult<Value> {
     let mut root = Map::new();
-    root.insert(
-        "models".to_string(),
-        packaged_model_block(state, model_name)?,
-    );
+    root.insert("models".to_string(), packaged_model_blocks(state)?);
     root.insert("providers".to_string(), packaged_provider_blocks(state)?);
     Ok(Value::Object(root))
 }
 
-fn packaged_model_block(
-    state: &AppState,
-    model_name: &str,
-) -> ProviderSettingsCommandResult<Value> {
-    let path = state.models_dir.join(format!("{model_name}.toml"));
-    let value = read_toml_json(&path)?;
+fn packaged_model_blocks(state: &AppState) -> ProviderSettingsCommandResult<Value> {
+    let entries =
+        std::fs::read_dir(&state.models_dir).map_err(|error| simple_error("unavailable", error))?;
+    let mut paths = entries
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| simple_error("unavailable", error))?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "toml")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
     let mut models = Map::new();
-    models.insert(model_name.to_string(), value);
+    for path in paths {
+        let Some(model_name) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        models.insert(model_name.to_string(), read_toml_json(&path)?);
+    }
     Ok(Value::Object(models))
 }
 
@@ -487,7 +497,7 @@ fn settings_values(value: Value) -> ProviderSettingsCommandResult<SettingsValues
 
 fn map_target(target: RuntimeProviderSettingsTarget) -> ProviderSettingsTarget {
     ProviderSettingsTarget {
-        model_name: target.model_name,
+        account_name: target.account_name,
         display_name: target.display_name,
         provider_id: target.provider_id,
         settings_supported: target.settings_supported,

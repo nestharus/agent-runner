@@ -130,6 +130,7 @@ mod provider_quota_window_writes;
 mod provider_quotas;
 mod provider_schema_migration;
 mod provider_schema_validation;
+mod provider_session_authority;
 mod provider_session_binding;
 mod provider_turn_effects;
 mod providers;
@@ -204,6 +205,9 @@ use self::provider_quotas::{
 };
 pub use self::provider_quotas::{QuotaRecord, QuotaWindow, QuotaWindowInput};
 use self::provider_schema_migration::ProviderColumn;
+pub use self::provider_session_authority::{
+    FinalizedProviderSessionAuthority, StoredProviderSessionAuthority,
+};
 pub use self::provider_session_binding::{ProviderSessionAuthorityCommit, ProviderSessionBinding};
 pub use self::provider_turn_effects::{ProviderTurnEffectInput, ProviderTurnEffectWrite};
 pub use self::providers::ProviderRecord;

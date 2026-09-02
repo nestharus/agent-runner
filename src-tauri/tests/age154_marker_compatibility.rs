@@ -173,6 +173,12 @@ fn assert_result_stdout_contract(path: &str, output: &Output) -> Value {
     payload
 }
 
+fn assert_spooled_success_stdout_contract(output: &Output) {
+    let stdout = stdout_text(output);
+    assert_eq!(stdout, "age154 success stdout\n");
+    assert!(result_marker_lines(&stdout).is_empty());
+}
+
 fn success_output() -> Output {
     let fixture = Age153Fixture::new();
     let marker = fixture.dir.path().join("age154-result-success.txt");
@@ -243,8 +249,8 @@ fn age154_oulipoly_result_stdout_key_set_matches_every_named_producer_path() {
     // assumption-register: AGE-151 cleaned main.rs is the marker-compatibility baseline.
     // residual-risk-not-verified: this proves structural ABI, not semantic equivalence
     // of every status/error-category value beyond these captured producer paths.
+    assert_spooled_success_stdout_contract(&success_output());
     let cases = vec![
-        ("existing success path", success_output()),
         ("non-quota failure call site", non_quota_failure_output()),
         (
             "balanced one-shot spawn-error call site",

@@ -182,7 +182,26 @@ prompt_mode = "arg"
 {quota_script}{resume_block}{storage_block}
 "#
         ));
-        fs::write(providers_path, body).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
+    }
+
+    pub fn set_provider_authority(&self, provider_name: &str, executable: &Path) {
+        let providers_path = self.app_config_dir.join("providers.toml");
+        let body = fs::read_to_string(&providers_path).unwrap();
+        fs::write(
+            providers_path,
+            super::provider_authority::with_explicit_account_authority_at(
+                &body,
+                provider_name,
+                "initiative-06-export-external",
+                executable,
+            ),
+        )
+        .unwrap();
     }
 
     pub fn write_sessions_with_locator_path(&self, provider_name: &str, transcript_path: &Path) {
@@ -265,6 +284,12 @@ prompt_mode = "arg"
             params![chain_id, provider_name, session_id, last_used_at],
         )
         .unwrap();
+        super::provider_authority::bind_session_authority_with_cwd(
+            &conn,
+            provider_name,
+            session_id,
+            self.dir.path(),
+        );
     }
 
     pub fn seed_provider_quota_exhausted(&self, provider_name: &str) {
@@ -388,15 +413,17 @@ pub fn cli_codex_export_fixture() -> PreparedExport {
     let workspace_root = fixture.root().join("workspace");
     fs::create_dir_all(&sessions_dir).unwrap();
     fs::create_dir_all(&workspace_root).unwrap();
-    let jsonl_path = fixture.stage_jsonl(
-        "rollout-2026-04-17.jsonl",
-        &format!(
+    let jsonl_path = sessions_dir.join("rollout-2026-04-17.jsonl");
+    fs::write(
+        &jsonl_path,
+        format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION_A}\",\"cwd\":\"{}\"}}}}\n\
              {{\"type\":\"response_item\",\"timestamp\":\"2026-04-17T08:00:00Z\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"codex user\"}}]}}}}\n\
              {{\"type\":\"response_item\",\"timestamp\":\"2026-04-17T08:00:01Z\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"codex assistant\"}}]}}}}\n",
             workspace_root.display()
         ),
-    );
+    )
+    .unwrap();
     fixture.write_model(MODEL, &[CODEX_PROVIDER]);
     fixture.write_provider(
         CODEX_PROVIDER,

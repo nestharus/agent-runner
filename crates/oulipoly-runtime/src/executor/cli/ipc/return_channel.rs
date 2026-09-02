@@ -29,18 +29,28 @@ use super::return_channel_warnings::{
 use crate::executor::ReturnedArtifactRef;
 use std::path::{Path, PathBuf};
 
-pub(in crate::executor::cli) struct ReturnChannel {
-    pub(in crate::executor::cli) path: PathBuf,
-    pub(in crate::executor::cli) dir: PathBuf,
+pub(crate) struct ReturnChannel {
+    path: PathBuf,
+    dir: PathBuf,
 }
 
 impl ReturnChannel {
-    pub(super) fn cleanup(&self) {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cleanup(&self) {
         cleanup_return_channel(&self.path, &self.dir);
     }
 }
 
-pub(in crate::executor::cli) fn prepare_return_channel(
+impl Drop for ReturnChannel {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+pub(crate) fn prepare_return_channel(
     parent_invocation_env: Option<&str>,
 ) -> Result<Option<ReturnChannel>, String> {
     let Some(parent_invocation_env) = parent_invocation_env else {
@@ -68,17 +78,13 @@ fn create_return_channel_file(path: &Path) -> Result<(), String> {
         .map_err(|err| create_return_channel_file_error(path, &err))
 }
 
-pub(in crate::executor::cli) fn read_and_cleanup_return_channel(
-    return_channel: &Option<ReturnChannel>,
+pub(crate) fn read_and_cleanup_return_channel(
+    return_channel: Option<ReturnChannel>,
 ) -> Vec<ReturnedArtifactRef> {
-    let returned_artifacts = return_channel
+    return_channel
         .as_ref()
         .map(read_return_channel)
-        .unwrap_or_default();
-    if let Some(channel) = return_channel {
-        channel.cleanup();
-    }
-    returned_artifacts
+        .unwrap_or_default()
 }
 
 fn read_return_channel(channel: &ReturnChannel) -> Vec<ReturnedArtifactRef> {

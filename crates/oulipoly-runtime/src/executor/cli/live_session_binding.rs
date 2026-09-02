@@ -65,7 +65,7 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
-pub(crate) struct InteractiveLiveSessionBinding {
+pub struct InteractiveLiveSessionBinding {
     pub registry: Arc<ProviderRegistry>,
     pub endpoint: Arc<PinnedProviderEndpoint>,
     pub identity: SessionProviderIdentity,

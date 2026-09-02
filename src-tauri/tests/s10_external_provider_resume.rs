@@ -33,6 +33,8 @@
 //!       - invocation session/outcome database assertions
 //! ```
 
+mod provider_authority_fixture;
+
 mod age153_support;
 
 use age153_support::assert_result_envelope_shape;
@@ -237,7 +239,11 @@ impl Fixture {
             .join("providers.toml");
         let mut providers = fs::read_to_string(&providers_path).unwrap();
         providers.push_str(&mismatched_provider_config_toml());
-        fs::write(providers_path, providers).unwrap();
+        fs::write(
+            providers_path,
+            provider_authority_fixture::with_explicit_provider_authority(&providers),
+        )
+        .unwrap();
     }
 
     fn provider_ref_transcript_dir(&self) -> PathBuf {
@@ -426,6 +432,7 @@ fn materialize_fixture(root: &Path, paths: &FixturePaths, options: ProviderOptio
     write_model_config(&paths.models_dir, &provider_path);
     write_providers_config(
         &paths.app_config_dir,
+        &provider_path,
         options
             .session_storage
             .then_some(paths.projects_dir.as_path()),
@@ -499,10 +506,18 @@ prompt_mode = "arg"
     )
 }
 
-fn write_providers_config(app_config_dir: &Path, storage_projects_dir: Option<&Path>) {
+fn write_providers_config(
+    app_config_dir: &Path,
+    provider_path: &Path,
+    storage_projects_dir: Option<&Path>,
+) {
     fs::write(
         app_config_dir.join("providers.toml"),
-        providers_config_toml(storage_projects_dir),
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            &providers_config_toml(storage_projects_dir),
+            "s10-external-provider",
+            provider_path,
+        ),
     )
     .unwrap();
 }
@@ -1022,7 +1037,7 @@ fn external_launch_session_id_alias_persists_external_capture_method_without_ses
 
     let rows = fixture.invocation_session_rows();
     assert_eq!(rows.len(), 1, "rows: {rows:?}");
-    assert_external_launch_session_capture_row(&rows[0]);
+    assert_external_launch_session_capture_row(&rows[0], "external_provider_launch");
 }
 
 #[test]
@@ -1060,30 +1075,36 @@ fn external_provider_launch_stream_over_capture_limit_finalizes_succeeded() {
 
 fn assert_external_launch_session_capture_rows(rows: &[InvocationSessionRow]) {
     assert_eq!(rows.len(), 2, "rows: {rows:?}");
-    assert_external_launch_session_capture_row(&rows[0]);
+    assert_external_launch_session_capture_row(&rows[0], "provider_session_capture");
 
     let resume = &rows[1];
     assert_eq!(resume.session_id.as_deref(), Some(SESSION_ID));
-    assert_eq!(resume.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        resume.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
     assert_eq!(resume.provider_session_id.as_deref(), Some(SESSION_ID));
     assert_eq!(resume.resume_input_id.as_deref(), Some(SESSION_ID));
     assert_eq!(
         resume.provider_session_capture_method.as_deref(),
-        Some("resumed")
+        Some("external_provider_launch")
     );
 }
 
-fn assert_external_launch_session_capture_row(launch: &InvocationSessionRow) {
+fn assert_external_launch_session_capture_row(
+    launch: &InvocationSessionRow,
+    expected_capture_method: &str,
+) {
     assert_eq!(launch.session_id.as_deref(), Some(SESSION_ID));
     assert_eq!(
         launch.session_capture_method.as_deref(),
-        Some("external_provider_launch")
+        Some(expected_capture_method)
     );
     assert_eq!(launch.provider_session_id.as_deref(), Some(SESSION_ID));
     assert_eq!(launch.resume_input_id.as_deref(), None);
     assert_eq!(
         launch.provider_session_capture_method.as_deref(),
-        Some("external_provider_launch")
+        Some(expected_capture_method)
     );
 }
 

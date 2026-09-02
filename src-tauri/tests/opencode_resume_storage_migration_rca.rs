@@ -2,6 +2,8 @@
 
 //! Production-built, isolated runtime proof for OpenCode native resume ownership.
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{SessionTurnIngest, StateDb};
 use rusqlite::params;
 use serde_json::json;
@@ -167,14 +169,14 @@ impl Fixture {
         fs::write(models_dir.join(format!("{MODEL}.toml")), model_toml()).unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            providers_toml(
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml(
                 &stale_command,
                 &stale_base_dir,
                 &stale_export,
                 &current_command,
                 &current_base_dir,
                 &current_export,
-            ),
+            )),
         )
         .unwrap();
 
@@ -192,11 +194,16 @@ impl Fixture {
             stale_export_record,
             current_export_record,
         };
-        fixture.seed_runner_state(chains);
+        fixture.seed_runner_state(chains, stale_storage_state, current_storage_state);
         fixture
     }
 
-    fn seed_runner_state(&self, chains: &[ChainSeed]) {
+    fn seed_runner_state(
+        &self,
+        chains: &[ChainSeed],
+        stale_storage_state: StorageState,
+        current_storage_state: StorageState,
+    ) {
         let db_path = self
             .data_home
             .join("oulipoly-agent-runner")
@@ -225,6 +232,30 @@ impl Fixture {
                     ],
                 )
                 .unwrap();
+            let storage_state = if chain.provider == STALE_PROVIDER {
+                stale_storage_state
+            } else {
+                current_storage_state
+            };
+            match storage_state {
+                StorageState::OwnedUsable => {
+                    provider_authority_fixture::bind_session_authority_with_cwd(
+                        &connection,
+                        chain.provider,
+                        SESSION_ID,
+                        &self.original_cwd,
+                    );
+                }
+                StorageState::OwnedUnusable
+                | StorageState::Miss
+                | StorageState::IndeterminateExport => {
+                    provider_authority_fixture::bind_session_authority(
+                        &connection,
+                        chain.provider,
+                        SESSION_ID,
+                    );
+                }
+            }
             if chain.turn_count > 0 {
                 state
                     .ingest_session_turns_batch(
@@ -536,6 +567,24 @@ fn assert_rejected_without_launch(evidence: &RunEvidence, diagnostic: &str) {
     assert!(evidence.provider_records.is_empty(), "{context}");
 }
 
+fn assert_workspace_root_rejected_without_provider_launch(evidence: &RunEvidence) {
+    let context = evidence.context();
+    assert_eq!(evidence.output.status.code(), Some(1), "{context}");
+    assert!(
+        evidence
+            .stderr
+            .contains(&format!("[resume] -> {CURRENT_PROVIDER}")),
+        "{context}"
+    );
+    assert!(
+        evidence
+            .stderr
+            .contains("session_provider_workspace_root_unavailable"),
+        "{context}"
+    );
+    assert!(evidence.provider_records.is_empty(), "{context}");
+}
+
 #[test]
 fn native_resume_uses_the_opencode_storage_that_owns_the_session() {
     let fixture = Fixture::new(
@@ -545,7 +594,7 @@ fn native_resume_uses_the_opencode_storage_that_owns_the_session() {
     );
     let evidence = fixture.run_resume(SESSION_ID);
     assert_owner_launch(&fixture, &evidence);
-    fixture.assert_export_calls(1, 2);
+    fixture.assert_export_calls(1, 1);
 }
 
 #[test]
@@ -604,12 +653,12 @@ fn native_resume_ownership_ignores_state_ordering_signals() {
             evidence.context()
         );
         assert_owner_launch(&fixture, &evidence);
-        fixture.assert_export_calls(1, 2);
+        fixture.assert_export_calls(1, 1);
     }
 }
 
 #[test]
-fn native_resume_keeps_storage_owner_when_owned_cwd_is_unusable() {
+fn native_resume_fails_closed_when_owned_cwd_is_unavailable() {
     let fixture = Fixture::new(
         &[
             ChainSeed {
@@ -623,43 +672,8 @@ fn native_resume_keeps_storage_owner_when_owned_cwd_is_unusable() {
         StorageState::OwnedUnusable,
     );
     let evidence = fixture.run_resume(SESSION_ID);
-    let context = evidence.context();
-    assert_eq!(evidence.output.status.code(), Some(0), "{context}");
-    let selection = evidence
-        .stderr
-        .find(&format!("[resume] -> {CURRENT_PROVIDER}"))
-        .expect(&context);
-    let warning = evidence
-        .stderr
-        .find("could not resolve original cwd")
-        .expect(&context);
-    assert!(selection < warning, "{context}");
-    assert!(
-        evidence.stderr[warning..].contains(CURRENT_PROVIDER),
-        "owner-named warning required: {context}"
-    );
-    assert!(
-        evidence
-            .stderr
-            .contains(&fixture.caller_cwd.display().to_string()),
-        "{context}"
-    );
-    for rejected in [
-        "storage-owner-not-found",
-        "storage-ownership-ambiguous",
-        "storage-ownership-indeterminate",
-    ] {
-        assert!(!evidence.stderr.contains(rejected), "{context}");
-    }
-    assert_eq!(
-        evidence.provider_records,
-        format!(
-            "{CURRENT_PROVIDER}|{}|run --session {SESSION_ID}\n",
-            fixture.caller_cwd.display()
-        ),
-        "{context}"
-    );
-    fixture.assert_export_calls(1, 2);
+    assert_workspace_root_rejected_without_provider_launch(&evidence);
+    fixture.assert_export_calls(1, 1);
 }
 
 #[test]
@@ -747,36 +761,17 @@ fn exact_chain_resume_preserves_explicit_chain_compatibility() {
     );
     let evidence = fixture.run_resume(CURRENT_CHAIN);
     assert_owner_launch(&fixture, &evidence);
-    fixture.assert_export_calls(0, 1);
+    fixture.assert_export_calls(0, 0);
 }
 
 #[test]
-fn single_candidate_native_resume_preserves_state_only_compatibility() {
+fn single_candidate_native_resume_without_authoritative_cwd_fails_closed() {
     let fixture = Fixture::new(
         &[ChainSeed::current()],
         StorageState::Miss,
         StorageState::Miss,
     );
     let evidence = fixture.run_resume(SESSION_ID);
-    let context = evidence.context();
-    assert_eq!(evidence.output.status.code(), Some(0), "{context}");
-    assert!(
-        evidence
-            .stderr
-            .contains(&format!("[resume] -> {CURRENT_PROVIDER}")),
-        "{context}"
-    );
-    assert!(
-        evidence.stderr.contains("could not resolve original cwd"),
-        "{context}"
-    );
-    assert_eq!(
-        evidence.provider_records,
-        format!(
-            "{CURRENT_PROVIDER}|{}|run --session {SESSION_ID}\n",
-            fixture.caller_cwd.display()
-        ),
-        "{context}"
-    );
-    fixture.assert_export_calls(0, 1);
+    assert_workspace_root_rejected_without_provider_launch(&evidence);
+    fixture.assert_export_calls(0, 0);
 }

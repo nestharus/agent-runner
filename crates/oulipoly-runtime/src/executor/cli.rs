@@ -94,9 +94,13 @@ pub(crate) use interactive::execute_interactive_with_result_and_state_db_path;
 pub use interactive::{
     InteractiveExecutionResult, execute_interactive, execute_interactive_with_result,
     execute_interactive_with_result_and_model_config,
+    execute_interactive_with_result_and_model_config_and_live_session_binding,
     execute_interactive_with_result_and_model_identity,
 };
-pub(crate) use live_session_binding::InteractiveLiveSessionBinding;
+pub(crate) use ipc::{
+    captured_child_invocations_from_stderr, prepare_return_channel, read_and_cleanup_return_channel,
+};
+pub use live_session_binding::InteractiveLiveSessionBinding;
 pub use live_session_binding::PENDING_CAPTURE_METHOD as PENDING_LIVE_SESSION_CAPTURE_METHOD;
 pub use live_session_binding::report_live_session_binding_from_env;
 pub use provider_identity::{provider_name, shell_split};

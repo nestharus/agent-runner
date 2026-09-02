@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use chrono::{Duration, Utc};
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{InvocationStart, InvocationStatus, StateDb};
@@ -50,14 +52,14 @@ name = "fixture-provider"
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[fixture-provider]
 command = "{}"
 args = []
 prompt_mode = "arg"
 "#,
                 script_path.display()
-            ),
+            )),
         )
         .unwrap();
 
@@ -410,8 +412,8 @@ fn default_cli_flow_still_runs_without_subcommand() {
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("fixture-response\n"), "{stdout}");
-    assert!(stdout.contains("OULIPOLY_RESULT="), "{stdout}");
+    assert_eq!(stdout, "fixture-response\n");
+    assert!(!stdout.contains("OULIPOLY_RESULT="), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("OULIPOLY_INVOCATION="), "{stderr}");
 }

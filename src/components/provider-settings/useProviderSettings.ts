@@ -46,13 +46,13 @@ export function useProviderSettings() {
 	async function chooseTarget(nextTarget: ProviderSettingsTarget) {
 		resetTargetState(nextTarget);
 		const loadedSchema = await loadSchema(nextTarget);
-		const listed = await listProviderSettings(nextTarget.modelName);
+		const listed = await listProviderSettings(nextTarget.accountName);
 		setRecords(listed.records);
 		await chooseInitialRecord(nextTarget, loadedSchema, listed.records);
 	}
 
-	async function loadRecord(modelName: string, id: string) {
-		const loaded = await getProviderSettings(modelName, id);
+	async function loadRecord(accountName: string, id: string) {
+		const loaded = await getProviderSettings(accountName, id);
 		replaceRecord(loaded.record);
 	}
 
@@ -60,7 +60,7 @@ export function useProviderSettings() {
 		const current = target();
 		if (!current) return;
 		const result = await createProviderSettings(
-			current.modelName,
+			current.accountName,
 			"Record",
 			draft(),
 		);
@@ -74,7 +74,7 @@ export function useProviderSettings() {
 		const localDraft = { ...draft() };
 		try {
 			const result = await updateProviderSettings(
-				current.modelName,
+				current.accountName,
 				currentRecord.id,
 				versionOverride ?? currentRecord.version,
 				localDraft,
@@ -84,7 +84,7 @@ export function useProviderSettings() {
 		} catch (error) {
 			await resolveSaveError(
 				error,
-				current.modelName,
+				current.accountName,
 				currentRecord.id,
 				localDraft,
 			);
@@ -96,7 +96,7 @@ export function useProviderSettings() {
 		const currentRecord = record();
 		if (!current || !currentRecord) return;
 		await deleteProviderSettings(
-			current.modelName,
+			current.accountName,
 			currentRecord.id,
 			currentRecord.version,
 		);
@@ -106,14 +106,16 @@ export function useProviderSettings() {
 	async function validateDraft() {
 		const current = target();
 		if (!current) return;
-		const result = await validateProviderSettings(current.modelName, draft());
+		const result = await validateProviderSettings(current.accountName, draft());
 		setDiagnostics(result.diagnostics);
 	}
 
 	async function runMigration() {
 		const current = target();
 		if (!current) return;
-		setMigration(await migrateProviderSettings(current.modelName, true, null));
+		setMigration(
+			await migrateProviderSettings(current.accountName, true, null),
+		);
 	}
 
 	function toggleMigration() {
@@ -164,7 +166,7 @@ export function useProviderSettings() {
 	async function loadSchema(nextTarget: ProviderSettingsTarget) {
 		if (!nextTarget.schemaId) return null;
 		const loaded = await getProviderSettingsSchema(
-			nextTarget.modelName,
+			nextTarget.accountName,
 			nextTarget.schemaId,
 		);
 		setSchema(loaded);
@@ -178,14 +180,14 @@ export function useProviderSettings() {
 	) {
 		const first = summaries[0];
 		if (first) {
-			await loadInitialRecord(nextTarget.modelName, first.id);
+			await loadInitialRecord(nextTarget.accountName, first.id);
 			return;
 		}
 		setDraft(defaultDraft(loadedSchema));
 	}
 
-	async function loadInitialRecord(modelName: string, id: string) {
-		const loaded = await getProviderSettings(modelName, id);
+	async function loadInitialRecord(accountName: string, id: string) {
+		const loaded = await getProviderSettings(accountName, id);
 		setRecord(loaded.record);
 		if (isDraftEmpty()) setDraft({ ...loaded.record.values });
 	}
@@ -195,27 +197,27 @@ export function useProviderSettings() {
 		if (currentRecord) return currentRecord;
 		const current = target();
 		if (!current) return null;
-		const first = await firstAvailableRecord(current.modelName);
+		const first = await firstAvailableRecord(current.accountName);
 		if (!first) return null;
-		const loaded = await getProviderSettings(current.modelName, first.id);
+		const loaded = await getProviderSettings(current.accountName, first.id);
 		setRecord(loaded.record);
 		return loaded.record;
 	}
 
-	async function firstAvailableRecord(modelName: string) {
+	async function firstAvailableRecord(accountName: string) {
 		const known = records()[0];
 		if (known) return known;
-		const listed = await listProviderSettings(modelName);
+		const listed = await listProviderSettings(accountName);
 		setRecords(listed.records);
 		return listed.records[0] ?? null;
 	}
 
 	async function reloadAfterDelete(current: ProviderSettingsTarget) {
-		const listed = await listProviderSettings(current.modelName);
+		const listed = await listProviderSettings(current.accountName);
 		setRecords(listed.records);
 		const first = listed.records[0];
 		if (first) {
-			await loadRecord(current.modelName, first.id);
+			await loadRecord(current.accountName, first.id);
 			return;
 		}
 		setRecord(null);
@@ -247,12 +249,12 @@ export function useProviderSettings() {
 
 	async function resolveSaveError(
 		error: unknown,
-		modelName: string,
+		accountName: string,
 		recordId: string,
 		localDraft: Record<string, any>,
 	) {
 		if (!isConflictError(error)) throw error;
-		const remote = await getProviderSettings(modelName, recordId);
+		const remote = await getProviderSettings(accountName, recordId);
 		setDraft(localDraft);
 		setConflict(remote.record);
 		setDiagnostics(error.diagnostics ?? []);

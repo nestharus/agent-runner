@@ -211,7 +211,7 @@ export type JsonValue =
 	| { [key: string]: JsonValue };
 
 export interface ProviderSettingsTarget {
-	modelName: string;
+	accountName: string;
 	displayName: string;
 	providerId?: string;
 	settingsSupported: boolean;

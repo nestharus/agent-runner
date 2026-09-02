@@ -7,8 +7,12 @@ use oulipoly_runtime::session_authority::{
     commit_session_authority,
 };
 use oulipoly_state::StateDb;
+use std::path::Path;
 
-use super::accessor::{BalancedExecutionEnvironment, session_capture_failure_reason};
+use super::accessor::{
+    BalancedExecutionEnvironment, completed_session_ingest_effective_cwd,
+    session_capture_failure_reason,
+};
 use super::formatter;
 use super::mapper::provider_session_binding;
 use super::predicate::has_provider_session_id;
@@ -39,16 +43,30 @@ pub(super) fn update_session_capture(
         .unwrap_or_else(formatter::emit_session_capture_update_warning);
 }
 
+pub(super) struct BalancedSessionAuthorityCommitRequest<'a> {
+    pub(super) state: &'a StateDb,
+    pub(super) invocation_row_id: i64,
+    pub(super) invocation_uuid: &'a str,
+    pub(super) expectation: SessionAuthorityExpectation<'a>,
+    pub(super) observed_provider_name: &'a str,
+    pub(super) start_mode: Option<ProviderSessionStartMode>,
+    pub(super) working_dir: Option<&'a Path>,
+    pub(super) result: &'a executor::ExecutionResult,
+}
+
 pub(super) fn commit_balanced_session_authority(
-    state: &StateDb,
-    invocation_row_id: i64,
-    invocation_uuid: &str,
-    expected_provider_name: &str,
-    observed_provider_name: &str,
-    expected_provider_session_id: Option<&str>,
-    start_mode: Option<ProviderSessionStartMode>,
-    result: &executor::ExecutionResult,
+    request: BalancedSessionAuthorityCommitRequest<'_>,
 ) -> Result<(), String> {
+    let BalancedSessionAuthorityCommitRequest {
+        state,
+        invocation_row_id,
+        invocation_uuid,
+        expectation,
+        observed_provider_name,
+        start_mode,
+        working_dir,
+        result,
+    } = request;
     let observed_session_id = match result.session_capture.method {
         executor::SessionCaptureMethod::ExternalProviderLaunch => {
             result.session_capture.session_id.as_deref()
@@ -59,10 +77,10 @@ pub(super) fn commit_balanced_session_authority(
         state,
         invocation_row_id,
         invocation_uuid,
-        expectation: SessionAuthorityExpectation {
-            account_name: expected_provider_name,
-            provider_session_id: expected_provider_session_id,
-        },
+        resume_input_id: matches!(start_mode, Some(ProviderSessionStartMode::Resume))
+            .then(|| expectation.provider_session_id.map(str::to_string))
+            .flatten(),
+        expectation,
         observation: observed_session_id.map(|provider_session_id| {
             AuthoritativeSessionObservation {
                 account_name: observed_provider_name,
@@ -70,10 +88,11 @@ pub(super) fn commit_balanced_session_authority(
             }
         }),
         capture_method: result.session_capture.method.db_value(),
-        resume_input_id: matches!(start_mode, Some(ProviderSessionStartMode::Resume))
-            .then(|| expected_provider_session_id.map(str::to_string))
-            .flatten(),
-        provider_session_resolved_account: None,
+        provider_session_resolved_account: Some(
+            completed_session_ingest_effective_cwd(working_dir)?
+                .to_string_lossy()
+                .into_owned(),
+        ),
     })
     .map(|_| ())
     .map_err(|error| error.to_string())
@@ -133,16 +152,19 @@ mod tests {
             })
             .unwrap();
 
-        commit_balanced_session_authority(
-            &state,
-            row_id,
-            INVOCATION_UUID,
-            "account-a",
-            "account-a",
-            Some("session-a"),
-            Some(ProviderSessionStartMode::Resume),
-            &external_result("session-a"),
-        )
+        commit_balanced_session_authority(BalancedSessionAuthorityCommitRequest {
+            state: &state,
+            invocation_row_id: row_id,
+            invocation_uuid: INVOCATION_UUID,
+            expectation: SessionAuthorityExpectation {
+                account_name: "account-a",
+                provider_session_id: Some("session-a"),
+            },
+            observed_provider_name: "account-a",
+            start_mode: Some(ProviderSessionStartMode::Resume),
+            working_dir: Some(temp.path()),
+            result: &external_result("session-a"),
+        })
         .unwrap();
 
         let row = state
@@ -171,16 +193,19 @@ mod tests {
             })
             .unwrap();
 
-        let error = commit_balanced_session_authority(
-            &state,
-            row_id,
-            INVOCATION_UUID,
-            "account-a",
-            "account-b",
-            None,
-            None,
-            &external_result("session-b"),
-        )
+        let error = commit_balanced_session_authority(BalancedSessionAuthorityCommitRequest {
+            state: &state,
+            invocation_row_id: row_id,
+            invocation_uuid: INVOCATION_UUID,
+            expectation: SessionAuthorityExpectation {
+                account_name: "account-a",
+                provider_session_id: None,
+            },
+            observed_provider_name: "account-b",
+            start_mode: None,
+            working_dir: Some(temp.path()),
+            result: &external_result("session-b"),
+        })
         .unwrap_err();
 
         assert!(error.contains("session account mismatch"), "{error}");

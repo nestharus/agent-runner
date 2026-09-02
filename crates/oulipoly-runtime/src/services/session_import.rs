@@ -368,9 +368,7 @@ fn initial_provider_report(target: &SessionImportProviderTarget) -> SessionImpor
 fn missing_enumerate_capability(error: &SessionProviderError) -> bool {
     matches!(
         error.token(),
-        SESSION_ENUMERATE_CAPABILITY_MISSING
-            | SESSION_CAPABILITY_MISSING
-            | SESSION_PROVIDER_DESCRIBE_UNAVAILABLE
+        SESSION_ENUMERATE_CAPABILITY_MISSING | SESSION_CAPABILITY_MISSING
     )
 }
 

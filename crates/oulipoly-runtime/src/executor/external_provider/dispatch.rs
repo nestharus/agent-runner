@@ -21,12 +21,15 @@ use super::error_mapper::{
     protocol_service_error, provider_client_error_is_rotatable, service_error,
 };
 use super::launch_result_mapper::{
-    launch_provider_session_id, map_launch_result_with_terminal_classification,
-    map_missing_final_exit_with_prompt_acceptance,
+    PROVIDER_SESSION_MARKER, launch_failure_provider_session_id, launch_provider_session_id,
+    map_launch_result_with_terminal_classification, map_missing_final_exit_with_prompt_acceptance,
+    marker_provider_session_id,
 };
 use super::output_spool_observer::observe_output;
 use super::policy_transform::apply_policy_transform;
-use super::request_builder::{build_launch_candidate, build_launch_request, build_policy_request};
+use super::request_builder::{
+    RETURN_CHANNEL_ENV, build_launch_candidate, build_launch_request, build_policy_request,
+};
 use super::terminal_classify_handoff::classify_after_launch_success;
 use crate::executor::cli::spawn_identity::{
     RunningRuntimeGeneration, SpawnIdentityContext, SpawnRuntimeMode, backfill_captured_session_id,
@@ -34,6 +37,7 @@ use crate::executor::cli::spawn_identity::{
     mark_runtime_generation_orderly_completed, mark_runtime_generation_spawn_failed,
     record_child_identity, register_runtime_generation_starting,
 };
+use crate::executor::cli::{prepare_return_channel, read_and_cleanup_return_channel};
 use crate::executor::{ExecutionOutputSpool, ExecutionResult};
 use crate::provider_registry::ProviderRegistry;
 use crate::services::ServiceError;
@@ -44,8 +48,7 @@ use crate::session_authority::{
 use oulipoly_provider::client::ProcessSpawnObserver;
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::ProcessStatus;
-use oulipoly_provider::stream::LaunchEventObserver;
-use oulipoly_provider::stream::LaunchResult;
+use oulipoly_provider::stream::{DecodedLaunchEvent, LaunchEventObserver, LaunchResult};
 use std::sync::{Arc, Mutex};
 
 type RecordedLaunchGeneration = Arc<Mutex<Option<Result<RunningRuntimeGeneration, String>>>>;
@@ -114,7 +117,14 @@ fn attempt_account_dispatch(
     let recorded_generation = recorded_launch_generation();
     let spawn_observer =
         external_launch_spawn_observer(spawn_identity.as_ref(), Arc::clone(&recorded_generation));
-    let launch_event_observer = external_launch_event_observer(output_spool.clone());
+    let launch_event_observer = external_launch_event_observer(
+        output_spool.clone(),
+        spawn_identity.clone(),
+        Arc::clone(&recorded_generation),
+        context.provider.name.clone(),
+        context.start_known_provider_session_id.clone(),
+        endpoint.account_name().to_string(),
+    );
     let client = registry
         .client_factory()
         .client_from_pinned_with_observers(endpoint.client(), spawn_observer, launch_event_observer)
@@ -140,8 +150,18 @@ fn attempt_account_dispatch(
     .map_err(|_| terminal_attempt_error(protocol_service_error("schema_invalid_request")))?;
     let policy_result = invoke_provider_policy(&client, policy_request)
         .map_err(classify_provider_client_attempt_error)?;
-    let candidate = apply_policy_transform(candidate, policy_result)
+    let mut candidate = apply_policy_transform(candidate, policy_result)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
+    let return_channel =
+        prepare_return_channel(context.parent_invocation_env.as_deref()).map_err(|_| {
+            terminal_attempt_error(protocol_service_error("return_channel_create_failed"))
+        })?;
+    if let Some(return_channel) = return_channel.as_ref() {
+        candidate.env.insert(
+            RETURN_CHANNEL_ENV.to_string(),
+            return_channel.path().display().to_string(),
+        );
+    }
     let launch_prompt_acceptance_v1_enabled =
         provider_supports_prompt_acceptance_v1 && candidate.prompt_acceptance.is_some();
     let launch_request = build_launch_request(
@@ -159,15 +179,31 @@ fn attempt_account_dispatch(
             "runtime_generation_registration_failed",
         ))
     })?;
-    let launch_result = match invoke_provider_launch(&client, launch_request) {
+    let launch_outcome = invoke_provider_launch(&client, launch_request);
+    let returned_artifacts = read_and_cleanup_return_channel(return_channel);
+    let launch_result = match launch_outcome {
         Ok(result) => result,
         Err(error) => {
             finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            let verified_failure_session = match verify_optional_failure_session(
+                context,
+                &endpoint,
+                launch_failure_provider_session_id(&error).as_deref(),
+            ) {
+                Ok(verified) => verified,
+                Err(error) => {
+                    return Err(terminal_attempt_error(protocol_service_error(
+                        error.protocol_kind(),
+                    )));
+                }
+            };
             if let Some(result) = map_missing_final_exit_with_prompt_acceptance(
                 &error,
+                verified_failure_session.as_ref(),
                 context.provider_index,
                 &context.provider.name,
                 launch_prompt_acceptance_v1_enabled,
+                returned_artifacts,
             ) {
                 return Ok(result);
             }
@@ -223,6 +259,7 @@ fn attempt_account_dispatch(
         classification,
         launch_prompt_acceptance_v1_enabled,
         output_spool,
+        returned_artifacts,
     ))
 }
 
@@ -268,11 +305,59 @@ fn external_launch_spawn_observer(
 
 fn external_launch_event_observer(
     output_spool: ExecutionOutputSpool,
+    spawn_identity: Option<SpawnIdentityContext>,
+    recorded_generation: RecordedLaunchGeneration,
+    account_name: String,
+    expected_provider_session_id: Option<String>,
+    observed_account_name: String,
 ) -> Option<LaunchEventObserver> {
     Some(LaunchEventObserver::new(move |event| {
         observe_output(&output_spool, event)?;
-        Ok(())
+        bind_external_launch_session_from_event(
+            spawn_identity.as_ref(),
+            &recorded_generation,
+            &account_name,
+            expected_provider_session_id.as_deref(),
+            &observed_account_name,
+            event,
+        )
     }))
+}
+
+fn bind_external_launch_session_from_event(
+    context: Option<&SpawnIdentityContext>,
+    recorded_generation: &RecordedLaunchGeneration,
+    account_name: &str,
+    expected_provider_session_id: Option<&str>,
+    observed_account_name: &str,
+    event: &DecodedLaunchEvent,
+) -> Result<(), String> {
+    let Some(provider_session_id) = provider_session_id_from_launch_event(event) else {
+        return Ok(());
+    };
+    let verified = verify_session_authority(
+        SessionAuthorityExpectation {
+            account_name,
+            provider_session_id: expected_provider_session_id,
+        },
+        Some(AuthoritativeSessionObservation {
+            account_name: observed_account_name,
+            provider_session_id: &provider_session_id,
+        }),
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "provider session marker produced no verified authority".to_string())?;
+    let generation = require_recorded_external_generation(recorded_generation)?;
+    backfill_captured_session_id(context, Some(&generation), verified.provider_session_id())
+}
+
+fn provider_session_id_from_launch_event(event: &DecodedLaunchEvent) -> Option<String> {
+    let DecodedLaunchEvent::Marker { name, value, .. } = event else {
+        return None;
+    };
+    (name == PROVIDER_SESSION_MARKER)
+        .then(|| marker_provider_session_id(value))
+        .flatten()
 }
 
 fn remember_recorded_launch_generation(
@@ -340,6 +425,26 @@ fn verify_launch_session_authority(
                 account_name: endpoint.account_name(),
                 provider_session_id,
             }),
+    )
+}
+
+fn verify_optional_failure_session(
+    context: &ExternalProviderDispatchContext,
+    endpoint: &crate::provider_registry::PinnedProviderEndpoint,
+    observed_session_id: Option<&str>,
+) -> Result<Option<VerifiedSessionAuthority>, crate::session_authority::SessionAuthorityError> {
+    let Some(observed_session_id) = observed_session_id else {
+        return Ok(None);
+    };
+    verify_session_authority(
+        SessionAuthorityExpectation {
+            account_name: &context.provider.name,
+            provider_session_id: context.start_known_provider_session_id.as_deref(),
+        },
+        Some(AuthoritativeSessionObservation {
+            account_name: endpoint.account_name(),
+            provider_session_id: observed_session_id,
+        }),
     )
 }
 

@@ -29,7 +29,7 @@ mod return_channel_path;
 mod return_channel_predicates;
 mod return_channel_warnings;
 
-pub(in crate::executor::cli) use captured_child_marker::captured_child_invocations_from_stderr;
-pub(in crate::executor::cli) use return_channel::{
+pub(crate) use captured_child_marker::captured_child_invocations_from_stderr;
+pub(crate) use return_channel::{
     ReturnChannel, prepare_return_channel, read_and_cleanup_return_channel,
 };

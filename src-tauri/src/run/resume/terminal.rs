@@ -103,6 +103,9 @@ pub(super) fn handle_resume_attempt_result(
     );
     let prompt_acceptance_confirmation =
         wake::validated_prompt_acceptance_for_resume(input, result);
+    if prompt_acceptance_confirmation.is_some() {
+        *input.provider_prompt_accepted = true;
+    }
     let confirmed_prompt_acceptance_failure = classify_confirmed_prompt_acceptance_failure(
         result.exit_code,
         prompt_acceptance_confirmation.as_ref(),

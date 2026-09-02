@@ -9,7 +9,10 @@ use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry, ResumeKind,
     ResumeStrategy, SessionSourceEntry, provider_implementation_ref::ProviderImplementationRef,
 };
-use oulipoly_state::{InvocationStart, ProviderSessionBinding};
+use oulipoly_state::{
+    FinalizedProviderSessionAuthority, ImportedSessionDisplayMetadataUpsert, InvocationStart,
+    ProviderSessionBinding,
+};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::OnceLock;
@@ -119,6 +122,16 @@ fn state_with_model_session(model: &ModelConfig, provider_name: &str, session_id
     db.update_session_capture(invocation_id, Some(session_id), "fixture")
         .unwrap();
     db.mint_chain_for_invocation_session(invocation_id).unwrap();
+    db.commit_finalized_provider_session_authority(
+        invocation_id,
+        &FinalizedProviderSessionAuthority {
+            provider_session_id: session_id,
+            capture_method: "provider_session_capture",
+            provider_instance_id: &provider_fixture_instance_id(),
+            settings_id: &provider_fixture_settings_id(),
+        },
+    )
+    .unwrap();
     db
 }
 
@@ -745,6 +758,16 @@ fn account_endpoint_metadata_lookup_dispatches_provider_locate_not_builtin_reade
     let model = legacy_builtin_model(model_name);
     let models = model_store_with(model.clone());
     let db = state_with_model_session(&model, &provider_name, session_id);
+    db.upsert_imported_session_display_metadata(&ImportedSessionDisplayMetadataUpsert {
+        provider_name: provider_name.clone(),
+        provider_session_id: session_id.to_string(),
+        title: None,
+        cwd: Some(workspace.display().to_string()),
+        turn_count: None,
+        provider_updated_at: None,
+        seen_at: Utc::now(),
+    })
+    .unwrap();
     let mut providers = providers_cfg_with_builtin_storage(&provider_name, projects_dir);
     providers
         .entries

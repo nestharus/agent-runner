@@ -24,6 +24,7 @@ use oulipoly_runtime::executor;
 use oulipoly_runtime::services::{
     InvocationLifecycleServicePort, ProviderSessionStartMode, RoutingServicePort,
 };
+use oulipoly_runtime::session_authority::SessionAuthorityExpectation;
 use oulipoly_state::CompositeInvocationId;
 use oulipoly_state::repositories::StateDbOpener;
 
@@ -40,7 +41,8 @@ use super::predicate::{
     should_defer_generic_exit, should_late_bind_zero_turn_baseline,
 };
 use super::state_update::{
-    bind_start_known_provider_session_if_present, commit_balanced_session_authority,
+    BalancedSessionAuthorityCommitRequest, bind_start_known_provider_session_if_present,
+    commit_balanced_session_authority,
 };
 use crate::captured_child::emit_captured_child_marker_lines;
 use crate::error_emit::effective_model_for_execution;
@@ -213,16 +215,19 @@ fn run_with_balancing_environment(
             .has_account_endpoint(provider_name)
         {
             let observed_provider_name = result_provider_name(model, &result)?;
-            commit_balanced_session_authority(
-                &env.state,
-                attempt.invocation_row_id,
-                &attempt.invocation.id,
-                provider_name,
+            commit_balanced_session_authority(BalancedSessionAuthorityCommitRequest {
+                state: &env.state,
+                invocation_row_id: attempt.invocation_row_id,
+                invocation_uuid: &attempt.invocation.id,
+                expectation: SessionAuthorityExpectation {
+                    account_name: provider_name,
+                    provider_session_id: attempt.start_known_provider_session_id.as_deref(),
+                },
                 observed_provider_name,
-                attempt.start_known_provider_session_id.as_deref(),
-                attempt.start_known_provider_session_mode,
-                &result,
-            )?;
+                start_mode: attempt.start_known_provider_session_mode,
+                working_dir,
+                result: &result,
+            })?;
         }
         let zero_turn = classify_balanced_zero_turn_result(BalancedZeroTurnInput {
             env: &env,

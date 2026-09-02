@@ -169,6 +169,8 @@ fn tracked_diff_output(root: &Path) -> Output {
             ":(exclude)planning/opencode-contract/**",
             ":(exclude)planning/s10-moveout/**",
             ":(exclude)planning/code-quality-sweep/**",
+            ":(exclude)src-tauri/tests/provider_authority_fixture.rs",
+            ":(exclude)src-tauri/tests/fixtures/provider-authority-endpoint.py",
         ])
         .output()
         .expect("git diff must run")
@@ -248,6 +250,8 @@ fn is_ignored_source_guard_path(relative: &str) -> bool {
         || relative.starts_with("planning/opencode-contract/")
         || relative.starts_with("planning/s10-moveout/")
         || relative.starts_with("planning/code-quality-sweep/")
+        || relative == "src-tauri/tests/provider_authority_fixture.rs"
+        || relative == "src-tauri/tests/fixtures/provider-authority-endpoint.py"
 }
 
 fn is_planning_gate_artifact(relative: &str) -> bool {

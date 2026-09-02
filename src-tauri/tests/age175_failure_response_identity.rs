@@ -4,6 +4,7 @@
 //! orchestration, validator.
 
 mod age153_support;
+mod provider_authority_fixture;
 
 use age153_support::{
     Age153Fixture, FORCE_TERMINAL_SIGNAL_KIND, nonzero_exit_with_non_quota_error_body, toml_string,
@@ -154,7 +155,7 @@ fn write_forced_capture_provider_with_command(
     fixture.write_model(model_name, &[provider_name]);
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"[{provider_name}]
 command = {}
 args = []
@@ -167,7 +168,7 @@ flag = "--session-id"
 
 "#,
             toml_string(&command.display().to_string())
-        ),
+        )),
     )
     .unwrap();
 }
@@ -182,7 +183,7 @@ fn write_stdout_json_capture_provider(
     fixture.write_model(model_name, &[provider_name]);
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"[{provider_name}]
 command = {}
 args = []
@@ -198,7 +199,7 @@ event_id_path = "thread_id"
 
 "#,
             toml_string(&command.display().to_string())
-        ),
+        )),
     )
     .unwrap();
 }
@@ -513,7 +514,7 @@ exit 12"#,
     .unwrap();
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"[fixture-age175-unknown-{suffix}]
 command = {}
 args = []
@@ -529,7 +530,7 @@ prompt_mode = "stdin"
 "#,
             toml_string(&main_command.display().to_string()),
             toml_string(&diagnostic_command.display().to_string())
-        ),
+        )),
     )
     .unwrap();
 
@@ -974,7 +975,7 @@ exit 7"#,
 }
 
 #[test]
-fn failure_identity_chain_id_uses_existing_segment_and_null_when_no_segment_exists() {
+fn failure_identity_chain_id_uses_existing_or_newly_persisted_segment() {
     let chain_fixture = Age153Fixture::new();
     let provider_name = "fixture-age175-chain";
     let marker = chain_fixture.dir.path().join("age175-chain-sessions.txt");
@@ -1029,10 +1030,15 @@ fn failure_identity_chain_id_uses_existing_segment_and_null_when_no_segment_exis
     let absent_output = absent_fixture.run_one_shot("age175-chain-absent");
     assert_ne!(absent_output.status.code(), Some(0), "{absent_output:?}");
     let absent_payload = result_payload(&absent_output);
+    let absent_db = absent_fixture.open_db();
+    let absent_chain = absent_db
+        .chain_id_for_segment(absent_provider, FIXED_SESSION_ID)
+        .unwrap()
+        .expect("authoritative provider session must create a chain segment before finalization");
     assert_failure_identity(
         &absent_payload,
         absent_provider,
         Some(FIXED_SESSION_ID),
-        None,
+        Some(&absent_chain),
     );
 }

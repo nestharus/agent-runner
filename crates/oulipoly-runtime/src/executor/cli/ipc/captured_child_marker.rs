@@ -22,9 +22,7 @@ use super::captured_child_dedupe::mark_captured_child_seen;
 use crate::executor::CapturedChildInvocation;
 use oulipoly_state::CompositeInvocationId;
 
-pub(in crate::executor::cli) fn captured_child_invocations_from_stderr(
-    stderr: &str,
-) -> Vec<CapturedChildInvocation> {
+pub(crate) fn captured_child_invocations_from_stderr(stderr: &str) -> Vec<CapturedChildInvocation> {
     let mut captured = Vec::new();
     let mut seen = std::collections::HashSet::new();
 

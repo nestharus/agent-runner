@@ -48,6 +48,13 @@ pub(in crate::run) struct PreparedHeadlessResumeExecution {
     pub(super) effective_spawn_cwd: PathBuf,
     pub(super) parent_invocation_id: Option<i64>,
     pub(super) max_attempts: usize,
+    pub(super) provider_prompt_accepted: bool,
+}
+
+impl PreparedHeadlessResumeExecution {
+    pub(in crate::run) fn provider_prompt_accepted(&self) -> bool {
+        self.provider_prompt_accepted
+    }
 }
 
 pub(super) fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
@@ -222,10 +229,10 @@ pub(super) fn prepare_resume_attempt_target(
     Ok(Ok(target))
 }
 
-pub(super) fn resume_attempt_strategy_for_target<'a>(
-    provider: &'a oulipoly_config::ProviderConfig,
+pub(super) fn resume_attempt_strategy_for_target(
+    provider: &oulipoly_config::ProviderConfig,
     account_endpoint_configured: bool,
-) -> Result<Option<&'a oulipoly_config::ResumeStrategy>, i32> {
+) -> Result<Option<&oulipoly_config::ResumeStrategy>, i32> {
     if account_endpoint_configured {
         return Ok(None);
     }
@@ -249,12 +256,13 @@ pub(super) fn execute_resume_attempt_command(
         .current()
         .has_account_endpoint(&provider.name)
     {
-        let model = input.resolved.model.as_ref().ok_or_else(|| {
-            format!(
-                "provider account {} resume requires a resolved model for endpoint launch",
-                provider.name
-            )
-        })?;
+        let fallback_model;
+        let (model, provider_index) = if let Some(model) = input.resolved.model.as_ref() {
+            (model, provider_index)
+        } else {
+            fallback_model = provider_only_resume_model(input, provider, prompt_mode);
+            (&fallback_model, 0)
+        };
         let request = provider_ref_resume_executor_request(
             input,
             model,
@@ -285,6 +293,27 @@ pub(super) fn execute_resume_attempt_command(
         input.resolved.model_name.as_deref().unwrap_or("<unknown>"),
         Some(&input.env.models_dir),
     )
+}
+
+fn provider_only_resume_model(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    prompt_mode: oulipoly_config::PromptMode,
+) -> oulipoly_config::ModelConfig {
+    oulipoly_config::ModelConfig {
+        name: input
+            .resolved
+            .model_name
+            .clone()
+            .unwrap_or_else(|| "<unknown>".to_string()),
+        prompt_mode,
+        providers: vec![oulipoly_config::ProviderConfig::model_provider(
+            &provider.name,
+            Vec::new(),
+        )],
+        inputs: Vec::new(),
+        provider: None,
+    }
 }
 
 fn provider_ref_resume_executor_request(
@@ -415,14 +444,30 @@ fn prepare_initial_headless_resume_target(
     if crate::dispatch::should_emit_resume_short_line(stderr_is_terminal) {
         formatter::emit_resume_short_line(&resolved.active_provider);
     }
-    validate_headless_resume_target(resolved, &target, &resolved.active_provider)
+    let selected_provider = &resolved.active_provider;
+    let account_endpoint_configured = providers_cfg
+        .entries
+        .get(selected_provider)
+        .and_then(|provider| provider.implementation.as_ref())
+        .is_some();
+    validate_headless_resume_target(
+        resolved,
+        &target,
+        selected_provider,
+        account_endpoint_configured,
+    )
 }
 
 fn validate_headless_resume_target(
     resolved: &oulipoly_state::ResolvedResume,
     target: &ResumeExecutionTarget,
     selected_provider: &str,
+    account_endpoint_configured: bool,
 ) -> Result<(), i32> {
+    if account_endpoint_configured {
+        return validate_selected_provider_resume_target(resolved, target, selected_provider)
+            .map_err(|message| provider_ref_resume_block_exit_code(&message));
+    }
     if resolved_uses_provider_ref(resolved) {
         return validate_provider_ref_headless_resume_target(resolved, target, selected_provider)
             .map_err(|message| provider_ref_resume_block_exit_code(&message));
@@ -448,20 +493,30 @@ pub(super) fn validate_provider_ref_headless_resume_target(
             "provider-ref resume target {selected_provider} has no provider implementation"
         ));
     }
-    let target_member_name = model
-        .providers
-        .get(target.provider_index)
-        .map(|provider| provider.name.as_str())
-        .ok_or_else(|| {
-            format!(
-                "provider-ref resume target {selected_provider} has invalid provider index {}",
-                target.provider_index
-            )
-        })?;
-    if target_member_name != selected_provider {
-        return Err(format!(
-            "provider-ref resume target {selected_provider} resolved provider {target_member_name}"
-        ));
+    validate_selected_provider_resume_target(resolved, target, selected_provider)
+}
+
+fn validate_selected_provider_resume_target(
+    resolved: &oulipoly_state::ResolvedResume,
+    target: &ResumeExecutionTarget,
+    selected_provider: &str,
+) -> Result<(), String> {
+    if let Some(model) = resolved.model.as_ref() {
+        let target_member_name = model
+            .providers
+            .get(target.provider_index)
+            .map(|provider| provider.name.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "provider-ref resume target {selected_provider} has invalid provider index {}",
+                    target.provider_index
+                )
+            })?;
+        if target_member_name != selected_provider {
+            return Err(format!(
+                "provider-ref resume target {selected_provider} resolved provider {target_member_name}"
+            ));
+        }
     }
     if target.provider.name != selected_provider {
         return Err(format!(

@@ -65,7 +65,7 @@ fn observe_returns_exact_terminal_outcome_without_executing() {
         &fixture.state,
         |_: &super::reservation::ReservedRun, _: &ValidatedContinuation| {
             execute_calls.set(execute_calls.get() + 1);
-            Ok(())
+            Ok(false)
         },
     );
 
@@ -96,7 +96,7 @@ fn run_executes_exact_reserved_plan_once_then_observes_it() {
             assert_eq!(plan.max_attempts(), 1);
             assert_eq!(context.request().origin_session_id, ORIGIN_SESSION_ID);
             seed_terminal_resume(state, plan.invocation_id(), parent_row_id);
-            Ok(())
+            Ok(false)
         },
     );
 
@@ -110,6 +110,36 @@ fn run_executes_exact_reserved_plan_once_then_observes_it() {
 
     assert_eq!(outcome, expected_outcome());
     assert_eq!(execute_calls.get(), 1);
+}
+
+#[test]
+fn validated_provider_prompt_acceptance_is_scoped_to_the_continuation_outcome() {
+    let fixture = ResumeFixture::new();
+    let state = &fixture.state;
+    let parent_row_id = fixture.parent_row_id;
+    let mut runner = super::continuation_resume::ContinuationResumeRunner::new(
+        state,
+        |plan: &super::reservation::ReservedRun, _: &ValidatedContinuation| {
+            seed_terminal_resume_with_acceptance(state, plan.invocation_id(), parent_row_id, false);
+            Ok(true)
+        },
+    );
+
+    let outcome = runner
+        .run_or_observe(
+            InvocationAction::Run,
+            &fixture.reservation,
+            &fixture.context,
+        )
+        .unwrap();
+
+    assert_eq!(outcome, expected_outcome());
+    let invocation = state
+        .get_invocation_by_uuid(RESERVED_UUID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(invocation.resume_acceptance_status, None);
+    assert_eq!(invocation.resume_acceptance_evidence, None);
 }
 
 #[test]
@@ -188,7 +218,7 @@ fn reservation_parent_mismatch_conflicts_before_execution_or_observation() {
         &fixture.state,
         |_: &super::reservation::ReservedRun, _: &ValidatedContinuation| {
             execute_calls.set(execute_calls.get() + 1);
-            Ok(())
+            Ok(false)
         },
     );
 
@@ -217,6 +247,15 @@ fn start_invocation(state: &StateDb, invocation_uuid: &str, parent: Option<i64>)
 }
 
 fn seed_terminal_resume(state: &StateDb, invocation_uuid: &str, parent_row_id: i64) {
+    seed_terminal_resume_with_acceptance(state, invocation_uuid, parent_row_id, true);
+}
+
+fn seed_terminal_resume_with_acceptance(
+    state: &StateDb,
+    invocation_uuid: &str,
+    parent_row_id: i64,
+    record_resume_acceptance: bool,
+) {
     let row_id = start_invocation(state, invocation_uuid, Some(parent_row_id));
     state
         .bind_invocation_provider_session_start(
@@ -229,9 +268,11 @@ fn seed_terminal_resume(state: &StateDb, invocation_uuid: &str, parent_row_id: i
             },
         )
         .unwrap();
-    state
-        .update_resume_acceptance(row_id, "accepted", Some("matched origin session"))
-        .unwrap();
+    if record_resume_acceptance {
+        state
+            .update_resume_acceptance(row_id, "accepted", Some("matched origin session"))
+            .unwrap();
+    }
     state
         .finalize_invocation(row_id, false, 0, Some(UNCONFIRMED), Some(UNCONFIRMED))
         .unwrap();

@@ -4,14 +4,11 @@ mod age153_support;
 
 use age153_support::{
     Age153Fixture, FORCE_TERMINAL_SIGNAL_KIND, assert_no_terminal_marker_on_stdout,
-    assert_normalized_result_stdout_matches_golden, assert_result_envelope_shape,
     assert_signal_consumer_source_wired, quota_body, success_body,
 };
 
-const NORMALIZED_NON_SIGNAL_SUCCESS_GOLDEN: &str = "result-compatible stdout\nOULIPOLY_RESULT={\"error_category\":null,\"exit_code\":0,\"finished_at\":\"<ts>\",\"id\":\"<uuid>\",\"status\":\"succeeded\",\"success\":true,\"terminal_reason\":null}\n";
-
 #[test]
-fn result_envelope_stdout_byte_shape_is_preserved_for_non_signal_success() {
+fn authoritative_spooled_success_omits_result_envelope() {
     let fixture = Age153Fixture::new();
     let marker = fixture.dir.path().join("result-success.txt");
     fixture.write_model("age153-result", &["claude-age153-result"]);
@@ -25,15 +22,7 @@ fn result_envelope_stdout_byte_shape_is_preserved_for_non_signal_success() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_no_terminal_marker_on_stdout(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.starts_with("result-compatible stdout\nOULIPOLY_RESULT="),
-        "{stdout}"
-    );
-    let envelope = assert_result_envelope_shape(&stdout);
-    assert_eq!(envelope["status"], "succeeded");
-    assert_eq!(envelope["success"], true);
-    assert_eq!(envelope["exit_code"], 0);
-    assert_normalized_result_stdout_matches_golden(&stdout, NORMALIZED_NON_SIGNAL_SUCCESS_GOLDEN);
+    assert_eq!(stdout, "result-compatible stdout\n");
     assert_signal_consumer_source_wired(
         "fn emit_result_envelope_line(",
         &["emit_stdout_marker_line(\"OULIPOLY_RESULT\""],
@@ -49,7 +38,7 @@ fn result_envelope_stdout_byte_shape_is_preserved_for_non_signal_success() {
 }
 
 #[test]
-fn terminal_signal_marker_never_moves_oulipoly_result_off_stdout() {
+fn terminal_signal_marker_stays_on_stderr_when_spooled_success_omits_result() {
     let fixture = Age153Fixture::new();
     let first_marker = fixture.dir.path().join("result-quota-a.txt");
     let sibling_marker = fixture.dir.path().join("result-quota-b.txt");
@@ -73,7 +62,7 @@ fn terminal_signal_marker_never_moves_oulipoly_result_off_stdout() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_no_terminal_marker_on_stdout(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("OULIPOLY_RESULT="), "{stdout}");
+    assert_eq!(stdout, "result sibling stdout\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("OULIPOLY_TERMINAL_SIGNAL="), "{stderr}");
 }

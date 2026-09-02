@@ -109,6 +109,15 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     if let Err(err) = recover_pending_session_replaces() {
         return Ok(handle_pending_session_replace_error(&err));
     }
+
+    // Config and database migration own their loading and error semantics. Do
+    // not preflight the runtime provider registry before they can inspect or
+    // repair malformed historical configuration.
+    if let Some(command) = cli.command.clone()
+        && let Some(result) = dispatch_registry_independent_subcommand(command)
+    {
+        return result;
+    }
     let _startup_wake_reclaim_guard = if startup_wake_reclaim_sweep_enabled(&cli) {
         if provider_launch_schedules_startup_wake_reclaim(&cli) {
             crate::wake_coordinator::start_startup_wake_reclaim_sweep()
@@ -124,7 +133,10 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
         return run_default_provider_repl(&cli);
     }
 
-    let agent_runtime_services = wiring::AgentRuntimeServices::cli_defaults()?;
+    let agent_runtime_services = match wiring::AgentRuntimeServices::cli_defaults() {
+        Ok(services) => services,
+        Err(error) => return handle_runtime_service_initialization_error(&cli, error),
+    };
     let _session_turn_ingest_driver =
         session_turn_ingest_driver_enabled(&cli, &agent_runtime_services.provider_registry_handle)
             .then(|| {
@@ -159,6 +171,34 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     }
 
     crate::commands::direct_model::run_agent_cli(&cli, &agent_runtime_services)
+}
+
+fn dispatch_registry_independent_subcommand(command: Subcommands) -> Option<Result<i32, String>> {
+    match command {
+        Subcommands::MigrateDb => Some(commands::migrate::run_migrate_db()),
+        Subcommands::Migrate { rebuild } => Some(commands::migrate::run_migrate(rebuild)),
+        Subcommands::MigrateConfig { models_dir } => Some(
+            commands::config_migration::run_migrate_config(models_dir.as_deref()),
+        ),
+        _ => None,
+    }
+}
+
+fn handle_runtime_service_initialization_error(cli: &Cli, error: String) -> Result<i32, String> {
+    if let Some(model_name) = cli.model.as_deref() {
+        crate::commands::direct_model::validate_direct_model_cli_context(cli, model_name)?;
+    }
+    if matches!(
+        cli.command,
+        Some(Subcommands::Session {
+            command: SessionSubcommands::ImportReplace { .. }
+        })
+    ) {
+        return crate::commands::session_import_replace::render_import_replace_output(Err(
+            session_replace::ReplaceError::OperationalError { message: error },
+        ));
+    }
+    Err(error)
 }
 
 fn dispatch_inspection_only_session(command: &SessionSubcommands) -> Option<Result<i32, String>> {

@@ -152,6 +152,26 @@ pub(crate) fn session_external_provider_identity(
     })
 }
 
+pub(crate) fn configured_session_external_provider_identity(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model: Option<&ModelConfig>,
+    provider_name: &str,
+) -> Option<SessionServiceExternalProviderIdentity> {
+    let registry = agent_runtime_services.provider_registry_handle.current();
+    if !registry.has_account_endpoint(provider_name) {
+        return None;
+    }
+    Some(SessionServiceExternalProviderIdentity {
+        model_name: model.map(|model| model.name.clone()).unwrap_or_default(),
+        provider_name: provider_name.to_string(),
+        provider_instance_id: None,
+        settings_id: registry
+            .account_settings_id(provider_name)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
 fn session_lifecycle_ingest_mode(mode: ResumeIngestMode<'_>) -> SessionLifecycleIngestMode {
     match mode {
         ResumeIngestMode::Unpinned { capture_method } => SessionLifecycleIngestMode::Unpinned {
@@ -284,7 +304,7 @@ mod tests {
                 sessions_cfg: &sessions_cfg,
                 providers_cfg: Some(&providers_cfg),
                 provider_name: PROVIDER,
-                external_provider: session_external_provider_identity(
+                external_provider: configured_session_external_provider_identity(
                     &services,
                     Some(&model),
                     PROVIDER,

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 pub(super) fn return_channel_dir(invocation: &CompositeInvocationId) -> PathBuf {
     std::env::temp_dir()
         .join("oulipoly-return-channels")
-        .join(&invocation.id)
+        .join(format!("{}-{}", invocation.id, uuid::Uuid::new_v4()))
 }
 
 pub(super) fn return_channel_path(dir: &Path) -> PathBuf {

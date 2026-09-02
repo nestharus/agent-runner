@@ -110,7 +110,11 @@ prompt_mode = "arg"
 "#
             ));
         }
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
     }
 
     pub fn seed_active_chain(

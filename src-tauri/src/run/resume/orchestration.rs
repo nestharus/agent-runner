@@ -197,6 +197,7 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
             ),
             effective_spawn_cwd: &input.prepared.effective_spawn_cwd,
             zero_turn_confirmation: &mut zero_turn_confirmation,
+            provider_prompt_accepted: &mut input.prepared.provider_prompt_accepted,
         })? {
             ResumeAttemptLoopControl::Continue(exit_code) => last_exit_code = exit_code,
             ResumeAttemptLoopControl::Return(exit_code) => return Ok(exit_code),
@@ -222,6 +223,7 @@ pub(super) struct ResumeAttemptInput<'a> {
     pub(super) parent_invocation_id: Option<i64>,
     pub(super) effective_spawn_cwd: &'a Path,
     pub(super) zero_turn_confirmation: &'a mut ZeroTurnConfirmationState,
+    pub(super) provider_prompt_accepted: &'a mut bool,
 }
 
 pub(super) enum ResumeAttemptLoopControl {
@@ -295,9 +297,9 @@ fn prepare_resume_attempt_target(
     execution::prepare_resume_attempt_target(input)
 }
 
-fn resolve_resume_attempt_strategy<'a>(
-    provider: &'a oulipoly_config::ProviderConfig,
+fn resolve_resume_attempt_strategy(
+    provider: &oulipoly_config::ProviderConfig,
     account_endpoint_configured: bool,
-) -> Result<Option<&'a oulipoly_config::ResumeStrategy>, i32> {
+) -> Result<Option<&oulipoly_config::ResumeStrategy>, i32> {
     execution::resume_attempt_strategy_for_target(provider, account_endpoint_configured)
 }

@@ -84,7 +84,7 @@ use mutability::is_metadata_mutable;
 use oulipoly_config::{
     ModelConfig, ProvidersConfig, ScriptSessionStorageType, SessionStorage, SessionsConfig,
 };
-use oulipoly_state::{ModelStore, ResolvedResume, StateDb};
+use oulipoly_state::{ModelStore, ResolvedResume, StateDb, StoredProviderSessionAuthority};
 use resume::{
     active_segment_id_to_metadata_error_or_value, effective_provider_for_resolved,
     fetch_active_segment_id, fetch_resume_previews, rebase_resolved_to_resumable_segment,
@@ -520,14 +520,11 @@ fn load_external_metadata_facts(
     let provider_name = resolved.active_provider.clone();
     let model_name = external_resolved_model_name(resolved);
     let active_segment_id = external_active_segment_id(state, resolved)?;
-    let identity = external_locate_identity(registry, model_name, &provider_name)?;
+    let authority = require_external_session_authority(state, resolved)?;
+    let identity = external_locate_identity(model_name, &provider_name, &authority);
     let located_transcript =
         locate_external_provider_transcript(registry, identity, &resolved.active_session_id)?;
-    let workspace_root = external_workspace_root(
-        provider.session_storage.as_ref(),
-        &provider_name,
-        &resolved.active_session_id,
-    );
+    let workspace_root = external_workspace_root(state, resolved, &authority)?;
     Ok(external_metadata_facts(
         provider,
         provider_name,
@@ -600,6 +597,7 @@ fn locate_external_provider_transcript(
     identity: SessionProviderIdentity,
     session_id: &str,
 ) -> Result<LocatedTranscript, MetadataError> {
+    let provider_name = identity.provider_name.clone();
     session_provider::locate_transcript(SessionProviderLocateRequest {
         registry,
         identity,
@@ -609,75 +607,82 @@ fn locate_external_provider_transcript(
         purpose: None,
         tail_bytes_hint: None,
     })
-    .map_err(session_provider_metadata_error)
+    .map_err(|error| session_provider_metadata_error(error, &provider_name))
 }
 
 fn external_locate_identity(
-    registry: &ProviderRegistry,
     model_name: &str,
     provider_name: &str,
-) -> Result<SessionProviderIdentity, MetadataError> {
-    let endpoint = registry
-        .preflight_account(provider_name)
-        .map_err(describe_model_provider_error)?;
-    let settings_id = endpoint
-        .settings_id()
-        .map_err(describe_model_provider_error)?;
-    Ok(external_identity_from_endpoint(
-        model_name,
-        provider_name,
-        endpoint.capabilities(),
-        settings_id,
-    ))
-}
-
-fn describe_model_provider_error<E: std::fmt::Display>(error: E) -> MetadataError {
-    MetadataError::Operational {
-        message: describe_model_provider_failed_message(error),
-    }
-}
-
-fn describe_model_provider_failed_message<E: std::fmt::Display>(error: E) -> String {
-    format!("session_provider_describe_failed: {error}")
-}
-
-fn external_identity_from_endpoint(
-    model_name: &str,
-    provider_name: &str,
-    describe: &oulipoly_provider::generated::DescribeResult,
-    settings_id: &str,
+    authority: &StoredProviderSessionAuthority,
 ) -> SessionProviderIdentity {
     SessionProviderIdentity {
         model_name: model_name.to_string(),
         provider_name: provider_name.to_string(),
-        provider_instance_id: Some(format_external_provider_instance_id(&describe.provider_id)),
-        settings_id: settings_id.to_string(),
+        provider_instance_id: Some(authority.provider_instance_id.clone()),
+        settings_id: authority.settings_id.clone(),
     }
-}
-
-fn format_external_provider_instance_id(provider_id: &str) -> String {
-    format!("{provider_id}-instance")
 }
 
 fn external_workspace_root(
-    session_storage: Option<&SessionStorage>,
+    state: &StateDb,
+    resolved: &ResolvedResume,
+    authority: &StoredProviderSessionAuthority,
+) -> Result<PathBuf, MetadataError> {
+    let imported = metadata_db_result(state.imported_session_cwd_for_authority(
+        &resolved.active_provider,
+        &resolved.active_session_id,
+        authority,
+    ))?;
+    if let Some(workspace_root) = imported {
+        return validate_stored_workspace_root(workspace_root, "provider_session_enumerate_cwd");
+    }
+    let invocation = metadata_db_result(
+        state.latest_provider_session_resolved_account_for_authority(
+            &resolved.active_provider,
+            &resolved.active_session_id,
+            authority,
+        ),
+    )?;
+    invocation
+        .map(|workspace_root| {
+            validate_stored_workspace_root(workspace_root, "provider_session_invocation_cwd")
+        })
+        .transpose()?
+        .ok_or_else(|| MetadataError::Operational {
+            message: format!(
+                "session_provider_workspace_root_unavailable: {}/{}",
+                resolved.active_provider, resolved.active_session_id
+            ),
+        })
+}
+
+fn require_external_session_authority(
+    state: &StateDb,
+    resolved: &ResolvedResume,
+) -> Result<StoredProviderSessionAuthority, MetadataError> {
+    metadata_db_result(state.active_provider_session_authority(&resolved.chain_id))?.ok_or_else(
+        || MetadataError::Operational {
+            message: format!(
+                "session_provider_authority_unavailable: {}/{}",
+                resolved.active_provider, resolved.active_session_id
+            ),
+        },
+    )
+}
+
+fn session_provider_metadata_error(
+    error: session_provider::SessionProviderError,
     provider_name: &str,
-    session_id: &str,
-) -> PathBuf {
-    match resolve_cwd_from_session_storage(session_storage, provider_name, session_id) {
-        Ok(workspace_root) => workspace_root,
-        Err(_) => ambient_workspace_root(),
+) -> MetadataError {
+    if matches!(
+        error.token(),
+        "unsupported_storage" | "unsupported_operation"
+    ) {
+        return MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason: error.to_string(),
+        };
     }
-}
-
-fn ambient_workspace_root() -> PathBuf {
-    match std::env::current_dir() {
-        Ok(workspace_root) => workspace_root,
-        Err(_) => PathBuf::from("."),
-    }
-}
-
-fn session_provider_metadata_error(error: session_provider::SessionProviderError) -> MetadataError {
     MetadataError::Operational {
         message: error.to_string(),
     }
@@ -693,9 +698,9 @@ pub fn resolve_resume_workspace_root(
         .get(&resolved.active_provider)
         .and_then(|entry| entry.implementation.as_ref())
         .is_some()
-        && let Some(workspace_root) = stored_session_workspace_root(resolved)?
     {
-        return Ok(workspace_root);
+        let authority = require_external_session_authority(state, resolved)?;
+        return external_workspace_root(state, resolved, &authority);
     }
     // Script-storage imports can leave stale mailbox/runtime cwd rows behind.
     // The invocation-bound account cwd was captured with the provider session

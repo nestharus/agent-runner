@@ -376,9 +376,7 @@ export default function ModelPanel(props: ModelPanelProps) {
 												{result().stdout_preview}
 											</pre>
 										</Show>
-										<Show
-											when={result().stderr_preview && !result().success}
-										>
+										<Show when={result().stderr_preview && !result().success}>
 											<pre class="max-h-24 overflow-auto whitespace-pre-wrap font-mono text-[10px] opacity-80">
 												{result().stderr_preview}
 											</pre>

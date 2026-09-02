@@ -178,8 +178,11 @@ fn map_registry_error(error: ProviderRegistryError) -> SessionProviderError {
 }
 
 fn map_client_error(error: ProviderClientError) -> SessionProviderError {
-    match error.provider_error_code() {
-        Some(code) => SessionProviderError::new(code.to_string(), error.to_string()),
-        None => SessionProviderError::new(error.transport_kind().to_string(), error.to_string()),
+    match &error {
+        ProviderClientError::ProviderCapability(capability) => SessionProviderError::new(
+            capability.error().code.clone(),
+            capability.error().message.clone(),
+        ),
+        _ => SessionProviderError::new(error.transport_kind().to_string(), error.to_string()),
     }
 }

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{InvocationStatus, StateDb};
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -97,7 +99,11 @@ impl Fixture {
         };
         let diagnostic_command = self.write_script("diagnostic-provider.sh", diagnostic_body);
         providers_toml.push_str(&diagnostic_provider_toml(&diagnostic_command));
-        fs::write(self.app_config_dir.join("providers.toml"), providers_toml).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml),
+        )
+        .unwrap();
     }
 
     fn provider_projects_dir(&self, provider: &str) -> PathBuf {
@@ -131,6 +137,12 @@ impl Fixture {
             params![CHAIN_ID, provider, SESSION_ID],
         )
         .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            provider,
+            SESSION_ID,
+            self.dir.path(),
+        );
     }
 
     fn run_resume(&self, model_name: &str) -> Output {
@@ -342,35 +354,8 @@ fn single_result(output: &Output) -> Value {
 
 fn assert_success_result(output: &Output, provider_stdout: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.starts_with(&format!("{provider_stdout}\nOULIPOLY_RESULT=")),
-        "{stdout}"
-    );
-    let result = single_result(output);
-    let mut keys = result
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    keys.sort();
-    assert_eq!(
-        keys,
-        [
-            "error_category",
-            "exit_code",
-            "finished_at",
-            "id",
-            "status",
-            "success",
-            "terminal_reason"
-        ]
-    );
-    assert_eq!(result["status"], "succeeded");
-    assert_eq!(result["success"], true);
-    assert_eq!(result["exit_code"], 0);
-    assert!(result["error_category"].is_null());
-    assert!(result["terminal_reason"].is_null());
+    assert_eq!(stdout, format!("{provider_stdout}\n"));
+    assert!(!stdout.contains("OULIPOLY_RESULT="), "{stdout}");
 }
 
 fn assert_nonzero_failure_result(output: &Output) {

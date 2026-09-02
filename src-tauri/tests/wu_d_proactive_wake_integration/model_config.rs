@@ -16,25 +16,28 @@ impl Fixture {
         fs::write(
             self.models_dir.join(format!("{MODEL}.toml")),
             format!(
-                r#"provider = {{ path = {} }}
-prompt_mode = "arg"
+                r#"prompt_mode = "arg"
 
 [[providers]]
 name = "{PROVIDER}"
 args = []
 "#,
-                toml_string(&path_string(&provider)),
             ),
         )
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
-                r#"[{PROVIDER}]
+            crate::provider_authority_fixture::with_explicit_provider_authority_at(
+                &format!(
+                    r#"[{PROVIDER}]
 command = "wu-d-native-fixture"
 args = []
 prompt_mode = "arg"
+settings_id = "{PROVIDER}"
 "#
+                ),
+                "wu-d-provider",
+                &provider,
             ),
         )
         .unwrap();
@@ -43,8 +46,4 @@ prompt_mode = "arg"
 
 pub(crate) fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
-}
-
-pub(crate) fn toml_string(value: &str) -> String {
-    serde_json::to_string(value).unwrap()
 }

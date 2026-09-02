@@ -7,6 +7,8 @@
 //! TEST: external-provider runtime fixtures for session ingestion, prompt
 //! acceptance, and policy diagnostics.
 
+mod provider_authority_fixture;
+
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
@@ -147,12 +149,16 @@ args = []
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
-                r#"[{provider}]
+            provider_authority_fixture::with_explicit_provider_authority_at(
+                &format!(
+                    r#"[{provider}]
 command = "fixture-opencode"
 args = []
 prompt_mode = "arg"
 "#
+                ),
+                "s11-external-provider",
+                &provider_path,
             ),
         )
         .unwrap();
@@ -263,7 +269,7 @@ turn_script = {}
             .query_row(
                 "SELECT resume_acceptance_status, resume_acceptance_evidence
                  FROM invocations
-                 WHERE session_capture_method = 'resumed'
+                 WHERE resume_input_id IS NOT NULL
                  ORDER BY id DESC
                  LIMIT 1",
                 [],
@@ -280,7 +286,7 @@ turn_script = {}
             .query_row(
                 "SELECT provider_name, provider_session_id
                  FROM invocations
-                 WHERE session_capture_method = 'resumed'
+                 WHERE resume_input_id IS NOT NULL
                  ORDER BY id DESC
                  LIMIT 1",
                 [],
@@ -1319,6 +1325,8 @@ def launch(request):
         with prompt_log.open("a") as stream:
             stream.write(json.dumps(prompt, separators=(",", ":")) + "\n")
         seq = 1
+        emit(provider_session_marker_event(request, seq, known))
+        seq += 1
         stdout_payloads = []
         produced_assistant_response = False
         if os.environ.get("S11_NO_ASSISTANT_RESULT") != "1":

@@ -37,12 +37,16 @@
 
 use super::terminal_cancel_mapper::{map_terminal_cancel_outcome, process_exit_code};
 use crate::executor::assistant_response::launch_result_produced_assistant_response;
-use crate::executor::cli::terminal_exit_code_from_signal;
+use crate::executor::cli::{
+    captured_child_invocations_from_stderr, terminal_exit_code_from_signal,
+};
 use crate::executor::terminal_signal::{TerminalSignal, TerminalSignalKind};
 use crate::executor::{
-    ExecutionOutputSpool, ExecutionResult, SessionCaptureMethod, SessionCaptureResult,
+    ExecutionOutputSpool, ExecutionResult, ReturnedArtifactRef, SessionCaptureMethod,
+    SessionCaptureResult,
 };
 use crate::services::TerminalClassification;
+use crate::session_authority::VerifiedSessionAuthority;
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
     PROMPT_ACCEPTANCE_V1, PROMPT_ACCEPTED_MARKER_V1, ProcessStatus, PromptAcceptedMarkerValueV1,
@@ -60,6 +64,7 @@ pub(crate) fn map_launch_result_with_terminal_classification(
     classification: Option<TerminalClassification>,
     retain_prompt_acceptance_attestation_v1: bool,
     output_spool: ExecutionOutputSpool,
+    returned_artifacts: Vec<ReturnedArtifactRef>,
 ) -> ExecutionResult {
     let stdout = result.stdout_bytes();
     let stderr = String::from_utf8_lossy(&result.stderr_bytes()).into_owned();
@@ -74,6 +79,7 @@ pub(crate) fn map_launch_result_with_terminal_classification(
         terminal_signal: terminal.terminal_signal,
     });
     let produced_assistant_response = launch_result_produced_assistant_response(&result);
+    let captured_child_invocations = captured_child_invocations_from_stderr(&stderr);
     ExecutionResult {
         stdout,
         stderr,
@@ -89,8 +95,8 @@ pub(crate) fn map_launch_result_with_terminal_classification(
             &result,
             retain_prompt_acceptance_attestation_v1,
         ),
-        captured_child_invocations: Vec::new(),
-        returned_artifacts: Vec::new(),
+        captured_child_invocations,
+        returned_artifacts,
     }
 }
 
@@ -115,16 +121,23 @@ pub(crate) fn parse_prompt_acceptance_attestation_marker(
 
 pub(crate) fn map_missing_final_exit_with_prompt_acceptance(
     error: &ProviderClientError,
+    verified_session: Option<&VerifiedSessionAuthority>,
     provider_index: usize,
     provider_name: &str,
     retain_prompt_acceptance_attestation_v1: bool,
+    returned_artifacts: Vec<ReturnedArtifactRef>,
 ) -> Option<ExecutionResult> {
-    if !retain_prompt_acceptance_attestation_v1 || error.transport_kind() != "missing_final_exit" {
+    if error.transport_kind() != "missing_final_exit" {
         return None;
     }
-    let prompt_acceptance_attestation = error
-        .retained_launch_marker_value(PROMPT_ACCEPTED_MARKER_V1)
-        .and_then(parse_prompt_acceptance_attestation_marker)?;
+    let verified_session = verified_session?;
+    let prompt_acceptance_attestation = retain_prompt_acceptance_attestation_v1
+        .then(|| error.retained_launch_marker_value(PROMPT_ACCEPTED_MARKER_V1))
+        .flatten()
+        .and_then(parse_prompt_acceptance_attestation_marker)
+        .filter(|attestation| {
+            attestation.provider_session_id == verified_session.provider_session_id()
+        });
     let provider_status = error.process_status();
     let signal = TerminalSignal {
         kind: TerminalSignalKind::Unknown,
@@ -142,6 +155,7 @@ pub(crate) fn map_missing_final_exit_with_prompt_acceptance(
         stderr.push('\n');
         stderr.push_str(&provider_stderr);
     }
+    let captured_child_invocations = captured_child_invocations_from_stderr(&stderr);
     Some(ExecutionResult {
         stdout: Vec::new(),
         stderr,
@@ -149,17 +163,23 @@ pub(crate) fn map_missing_final_exit_with_prompt_acceptance(
         exit_code,
         provider_index,
         session_capture: SessionCaptureResult {
-            session_id: None,
-            method: SessionCaptureMethod::None,
+            session_id: Some(verified_session.provider_session_id().to_string()),
+            method: SessionCaptureMethod::ExternalProviderLaunch,
         },
         resume_acceptance: None,
         terminal_reason: Some("external_provider_missing_final_exit".to_string()),
         terminal_signal: Some(signal),
         produced_assistant_response: false,
-        prompt_acceptance_attestation: Some(prompt_acceptance_attestation),
-        captured_child_invocations: Vec::new(),
-        returned_artifacts: Vec::new(),
+        prompt_acceptance_attestation,
+        captured_child_invocations,
+        returned_artifacts,
     })
+}
+
+pub(crate) fn launch_failure_provider_session_id(error: &ProviderClientError) -> Option<String> {
+    error
+        .retained_launch_marker_value(PROVIDER_SESSION_MARKER)
+        .and_then(marker_provider_session_id)
 }
 
 fn missing_final_exit_evidence(status: Option<&ProcessStatus>) -> String {

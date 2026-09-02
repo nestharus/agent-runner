@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_runtime::executor::cli::pty_broker::{
     inject_control_envelope, render_mailbox_notification_envelope,
 };
@@ -387,19 +389,20 @@ args = []
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[{provider_name}]
 command = {}
 args = []
 interactive_args = []
 prompt_mode = "arg"
+settings_id = "{provider_name}"
 
 [{provider_name}.resume]
 kind = "flag"
 flag = "--resume"
 "#,
                 toml_string(&path_string(script))
-            ),
+            )),
         )
         .unwrap();
     }
@@ -419,6 +422,12 @@ flag = "--resume"
             params![chain_id, provider, session_id],
         )
         .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            provider,
+            session_id,
+            self.dir.path(),
+        );
     }
 
     fn ingest_turn(&self, provider: &str, session_id: &str, turn_id: &str, role: &str, body: &str) {

@@ -175,7 +175,12 @@ pub(crate) fn run_session_export(
             session_id,
         ) {
             Ok(identity) => identity,
-            Err(message) => return Ok(handle_export_error(&ExportError::Operational { message })),
+            Err(crate::commands::session_external_provider_identity::SessionExternalProviderIdentityError::AmbiguousSession { input }) => {
+                return Ok(handle_export_error(&ExportError::AmbiguousSession { input }));
+            }
+            Err(crate::commands::session_external_provider_identity::SessionExternalProviderIdentityError::Operational { message }) => {
+                return Ok(handle_export_error(&ExportError::Operational { message }));
+            }
         };
 
     let service_output = agent_runtime_services

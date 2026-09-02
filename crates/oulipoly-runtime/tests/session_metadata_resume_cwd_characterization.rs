@@ -2,11 +2,14 @@
 
 use oulipoly_config::provider_implementation_ref::ProviderImplementationRef;
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ProvidersConfig, SessionStorage,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    ProvidersConfig, SessionStorage,
 };
 use oulipoly_runtime::session_metadata::resolve_resume_workspace_root;
 use oulipoly_state::mailbox::{MailboxDb, SessionMetadataUpsert};
-use oulipoly_state::{InvocationStart, ModelStore, ProviderSessionBinding, StateDb};
+use oulipoly_state::{
+    FinalizedProviderSessionAuthority, InvocationStart, ModelStore, ProviderSessionBinding, StateDb,
+};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -237,7 +240,7 @@ fn imported_script_session_cwd_precedes_stale_mailbox_and_failing_script() {
 }
 
 #[test]
-fn external_provider_runtime_cwd_precedes_recorded_script_session_cwd() {
+fn external_provider_uses_authority_bound_invocation_cwd_not_mailbox_or_script() {
     let fixture = Fixture::new();
     let marker = fixture.root.join("fail-script-touched");
     let script = fixture.root.join("fail-cwd.sh");
@@ -260,8 +263,8 @@ fn external_provider_runtime_cwd_precedes_recorded_script_session_cwd() {
         &recorded_cwd,
         MODEL_REF,
     );
-    let models = model_store(vec![model_config(MODEL_REF, true)]);
-    let providers = providers_config(&script);
+    let models = model_store(vec![model_config(MODEL_REF, false)]);
+    let providers = external_providers_config(&script);
     let mut mailbox = MailboxDb::open_default().unwrap();
     let live_runtime_cwd_text = live_runtime_cwd.display().to_string();
     mailbox
@@ -284,8 +287,8 @@ fn external_provider_runtime_cwd_precedes_recorded_script_session_cwd() {
     let actual =
         resolve_resume_workspace_root(&state, &providers, &resolved).expect("live runtime cwd");
 
-    assert_eq!(actual, live_runtime_cwd);
-    assert_ne!(actual, recorded_cwd);
+    assert_eq!(actual, recorded_cwd);
+    assert_ne!(actual, live_runtime_cwd);
     assert!(!marker.exists());
 }
 
@@ -399,6 +402,17 @@ fn seed_provider_session_resolved_account_for_model(
             },
         )
         .unwrap();
+    state
+        .commit_finalized_provider_session_authority(
+            invocation_row_id,
+            &FinalizedProviderSessionAuthority {
+                provider_session_id: session_id,
+                capture_method: "provider_session_capture",
+                provider_instance_id: "session-metadata-cwd-fixture-instance",
+                settings_id: PROVIDER,
+            },
+        )
+        .unwrap();
 }
 
 fn model_config(name: &str, has_ref: bool) -> ModelConfig {
@@ -443,6 +457,17 @@ fn providers_config(cwd_script: &Path) -> ProvidersConfig {
             },
         )]),
     }
+}
+
+fn external_providers_config(cwd_script: &Path) -> ProvidersConfig {
+    let mut providers = providers_config(cwd_script);
+    let provider = providers.entries.get_mut(PROVIDER).unwrap();
+    provider.implementation = Some(ProviderEndpointConfig {
+        family: "session-metadata-cwd-fixture".to_string(),
+        executable: cwd_script.display().to_string(),
+    });
+    provider.settings_id = Some(PROVIDER.to_string());
+    providers
 }
 
 fn direct_storage_providers_config(projects_dir: &Path) -> ProvidersConfig {

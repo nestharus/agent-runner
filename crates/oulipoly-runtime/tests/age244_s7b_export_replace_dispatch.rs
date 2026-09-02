@@ -4,7 +4,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry, ProvidersConfig,
 };
 use oulipoly_runtime::provider_registry::{
     ProviderRegistry, ProviderRegistryHandle, ProviderRegistryOptions,
@@ -23,7 +23,7 @@ use oulipoly_state::StateDb;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -343,6 +343,11 @@ command = "provider-alpha-command-that-must-not-run"
 args = []
 interactive_args = []
 prompt_mode = "arg"
+settings_id = "{SETTINGS_ID}"
+
+[{PROVIDER_NAME}.implementation]
+family = "age244-fixture"
+executable = {provider_executable:?}
 
 [{PROVIDER_NAME}.resume]
 kind = "flag"
@@ -354,7 +359,8 @@ cwd_script = {cwd_script:?}
 transcript_script = {transcript_script:?}
 storage_type = "{storage_type}"
 "#,
-                storage_type = builtin_storage_type()
+                storage_type = builtin_storage_type(),
+                provider_executable = self.provider_path.display().to_string(),
             ),
         )
         .expect("provider file");
@@ -418,41 +424,48 @@ storage_type = "{storage_type}"
     }
 
     fn registry_handle(&self) -> ProviderRegistryHandle {
-        ProviderRegistryHandle::new(Arc::new(
-            ProviderRegistry::from_model_configs(
-                &[external_model(MODEL, &self.provider_path)],
-                ProviderRegistryOptions::default()
-                    .with_config_root(self.config_root.clone())
-                    .with_data_root(self.data_root.clone()),
-            )
-            .expect("registry"),
-        ))
+        self.registry_handle_for(MODEL, &self.provider_path, "registry")
     }
 
     fn unrelated_registry_handle(&self) -> ProviderRegistryHandle {
-        ProviderRegistryHandle::new(Arc::new(
-            ProviderRegistry::from_model_configs(
-                &[external_model(UNRELATED_MODEL, &self.provider_path)],
-                ProviderRegistryOptions::default()
-                    .with_config_root(self.config_root.clone())
-                    .with_data_root(self.data_root.clone()),
-            )
-            .expect("unrelated registry"),
-        ))
+        self.registry_handle_for(UNRELATED_MODEL, &self.provider_path, "unrelated registry")
     }
 
     fn missing_provider_registry_handle(&self) -> ProviderRegistryHandle {
         let missing_path = self
             .provider_path
             .with_file_name("missing-provider-alpha-session");
+        self.registry_handle_for(MODEL, &missing_path, "missing provider registry")
+    }
+
+    fn registry_handle_for(
+        &self,
+        model_name: &str,
+        executable: &Path,
+        expectation: &str,
+    ) -> ProviderRegistryHandle {
+        let providers = ProvidersConfig {
+            entries: HashMap::from([(
+                PROVIDER_NAME.to_string(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "age244-fixture".to_string(),
+                        executable: executable.display().to_string(),
+                    }),
+                    settings_id: Some(SETTINGS_ID.to_string()),
+                    ..ProviderEntry::default()
+                },
+            )]),
+        };
         ProviderRegistryHandle::new(Arc::new(
-            ProviderRegistry::from_model_configs(
-                &[external_model(MODEL, &missing_path)],
+            ProviderRegistry::from_configs(
+                &[external_model(model_name)],
+                &providers,
                 ProviderRegistryOptions::default()
                     .with_config_root(self.config_root.clone())
                     .with_data_root(self.data_root.clone()),
             )
-            .expect("missing provider registry"),
+            .expect(expectation),
         ))
     }
 
@@ -833,19 +846,13 @@ fn shell_double_quoted(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn external_model(name: &str, provider_path: &Path) -> ModelConfig {
+fn external_model(name: &str) -> ModelConfig {
     ModelConfig {
         name: name.to_string(),
         prompt_mode: PromptMode::Arg,
         providers: vec![ProviderConfig::model_provider(PROVIDER_NAME, Vec::new())],
         inputs: Vec::new(),
-        provider: Some(ProviderImplementationRef {
-            path: Some(provider_path.display().to_string()),
-            crate_name: None,
-            version: None,
-            binary: None,
-            script: None,
-        }),
+        provider: None,
     }
 }
 
@@ -3168,6 +3175,7 @@ fn grep_scope_args(base_ref: Option<&'static str>, include_untracked: bool) -> V
         ":(exclude)planning/s10-moveout/**",
         ":(exclude)planning/wu-e/**",
         ":(exclude)planning/opencode-contract/**",
+        ":(exclude)src-tauri/tests/fixtures/provider-authority-endpoint.py",
     ]);
     args
 }

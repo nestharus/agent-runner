@@ -10,6 +10,8 @@ use oulipoly_runtime::session_replace::{
 use oulipoly_state::CURRENT_SCHEMA_VERSION;
 use rusqlite::Connection;
 use std::fs;
+use std::thread;
+use std::time::Duration;
 
 /// Risk: T1 — valid Claude stdin replacement may write canonical bytes instead of provider-native bytes.
 /// Level: CLI integration.
@@ -36,7 +38,7 @@ fn t1_valid_replace_claude_stdin_emits_receipt_and_provider_native_transcript() 
         &receipt,
         &prepared.session_id,
         &prepared.provider_name,
-        "claude_code",
+        "external_provider",
         &prepared.jsonl_path,
     );
     let transcript = String::from_utf8(fs::read(&prepared.jsonl_path).unwrap()).unwrap();
@@ -58,7 +60,7 @@ fn t1_valid_replace_claude_stdin_emits_receipt_and_provider_native_transcript() 
 /// Risk: T2 — Codex rendering may be accidentally treated as unsupported or written in Claude shape.
 /// Level: CLI integration.
 /// Source: contract §7 T-codex-replace; proposal §9.1 Postimage round-trip; A3, A5.
-/// Observable: exit 0; receipt storage_type is codex_session; transcript contains Codex rollout records.
+/// Observable: exit 0; provider-owned receipt names external_provider; transcript contains Codex rollout records.
 /// Residual: does not cover Codex compaction records.
 #[test]
 fn t2_codex_replace_writes_codex_rollout_jsonl() {
@@ -79,7 +81,7 @@ fn t2_codex_replace_writes_codex_rollout_jsonl() {
         &receipt,
         &prepared.session_id,
         &prepared.provider_name,
-        "codex_session",
+        "external_provider",
         &prepared.jsonl_path,
     );
     let transcript = String::from_utf8(fs::read(&prepared.jsonl_path).unwrap()).unwrap();
@@ -121,7 +123,7 @@ fn t3_from_file_is_equivalent_to_stdin_after_bytes_are_loaded() {
         &receipt,
         &prepared.session_id,
         &prepared.provider_name,
-        "claude_code",
+        "external_provider",
         &prepared.jsonl_path,
     );
     assert_export_semantics_match_canonical(&prepared.fixture, &prepared.session_id, &input);
@@ -238,8 +240,8 @@ fn t4_preimage_match_succeeds_with_current_canonical_export_hash() {
 /// Risk: T5 — preimage mismatch may mutate the transcript before refusing stale input.
 /// Level: CLI integration.
 /// Source: contract §7 T-preimage-mismatch; proposal §5 exit 15; A4, A8.
-/// Observable: exit 15 preimage-mismatch; transcript and DB rows are unchanged; recovery artifacts remain.
-/// Residual: journal content schema is checked by recovery tests, not fully decoded here.
+/// Observable: exit 15 preimage-mismatch; transcript and DB rows are unchanged; the initial provider-owned journal retires after the provider's definitive pre-mutation rejection.
+/// Residual: indeterminate post-mutation failures are covered separately by T11.
 #[test]
 fn t5_preimage_mismatch_exits_15_without_transcript_or_db_mutation() {
     let prepared = prepared_claude_replace_fixture();
@@ -273,18 +275,7 @@ fn t5_preimage_mismatch_exits_15_without_transcript_or_db_mutation() {
     );
     assert_eq!(after.transcript_bytes, before.transcript_bytes);
     assert_eq!(after.turn_rows, before.turn_rows);
-    assert!(
-        prepared
-            .fixture
-            .pending_journal_path(&prepared.session_id)
-            .exists()
-    );
-    assert!(
-        prepared
-            .fixture
-            .canonical_records_path(&prepared.session_id)
-            .exists()
-    );
+    assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
 }
 
 /// Risk: T6 — import-replace may ignore an existing pause-handshake-compatible lease.
@@ -317,8 +308,8 @@ fn t6_busy_lock_exits_13_and_does_not_publish_session_journal() {
 /// Risk: T7 — a crash after transcript rename but before DB commit may leave derived state stale forever.
 /// Level: subprocess crash-recovery integration.
 /// Source: contract §7 T-recovery-rename-only; proposal §6 Startup recovery; A8.
-/// Observable: SIGKILL after the after-rename test hook; the next import-replace command first rebuilds session_turns from canonical_records_path and deletes journal files.
-/// Residual: relies on the Step 6c test hook documented in the fixture rather than a real power loss.
+/// Observable: interruption after recovery identity publication leaves the provider-owned journal; the next command queries committed provider evidence, rebuilds session_turns, and retires the journal.
+/// Residual: relies on the provider-owned journal test hook rather than a real power loss.
 #[test]
 fn t7_recovery_rename_only_rebuilds_db_from_journal_attached_canonical_records() {
     let prepared = prepared_claude_replace_fixture();
@@ -328,29 +319,31 @@ fn t7_recovery_rename_only_rebuilds_db_from_journal_attached_canonical_records()
         &prepared.jsonl_path,
         "recover",
     );
-    let child = prepared.fixture.spawn_import_replace(
-        &prepared.session_id,
-        &input,
-        &[],
-        &[(TEST_HOOK_ENV, TEST_BLOCK_AFTER_RENAME)],
-    );
+    let interrupted = prepared
+        .fixture
+        .spawn_import_replace(
+            &prepared.session_id,
+            &input,
+            &[],
+            &[(PROVIDER_OWNED_TEST_HOOK_ENV, TEST_STOP_AFTER_RECOVERY_ID)],
+        )
+        .wait_with_output()
+        .unwrap();
 
-    let killed = kill_after_test_hook(child, TEST_BLOCK_AFTER_RENAME);
-    assert_ne!(killed.status.code(), Some(0), "{killed:?}");
+    assert_eq!(interrupted.status.code(), Some(1), "{interrupted:?}");
+    assert_json_error(&interrupted, "operational-error");
     assert!(
         prepared
             .fixture
             .pending_journal_path(&prepared.session_id)
             .exists()
     );
-    assert_eq!(
-        fs::read_to_string(
-            prepared
-                .fixture
-                .canonical_records_path(&prepared.session_id)
-        )
-        .unwrap(),
-        input
+    assert!(
+        !prepared
+            .fixture
+            .canonical_records_path(&prepared.session_id)
+            .exists(),
+        "provider-owned recovery evidence must not be copied into a host transcript journal"
     );
 
     let recovery_trigger =
@@ -379,13 +372,13 @@ fn t7_recovery_rename_only_rebuilds_db_from_journal_attached_canonical_records()
     assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
 }
 
-/// Risk: T8 — recovery may silently accept an ambiguous transcript hash after a crash.
-/// Level: subprocess crash-recovery integration.
-/// Source: contract §7 T-recovery-ambiguous-hash; proposal §6 Startup recovery ambiguous case; A8.
-/// Observable: after SIGKILL and manual transcript corruption, startup moves journal to quarantine and leaves DB unchanged.
-/// Residual: log wording is not asserted beyond filesystem quarantine.
+/// Risk: T8 — provider-owned recovery may silently accept transcript bytes that no longer match the committed postimage.
+/// Level: subprocess recovery integration.
+/// Source: provider-owned replacement recovery contract; A8.
+/// Observable: after interruption and manual transcript corruption, startup fails closed, retains the provider-owned journal, and leaves DB state unchanged.
+/// Residual: operator-directed reconciliation of the retained journal is covered by provider-owned runtime tests.
 #[test]
-fn t8_recovery_ambiguous_hash_quarantines_journal_and_leaves_db_unchanged() {
+fn t8_provider_owned_recovery_ambiguous_hash_retains_journal_and_db() {
     let prepared = prepared_claude_replace_fixture();
     let input = canonical_jsonl(
         &prepared.session_id,
@@ -396,40 +389,39 @@ fn t8_recovery_ambiguous_hash_quarantines_journal_and_leaves_db_unchanged() {
     let before_rows = prepared
         .fixture
         .turn_rows(&prepared.provider_name, &prepared.session_id);
-    let child = prepared.fixture.spawn_import_replace(
-        &prepared.session_id,
-        &input,
-        &[],
-        &[(TEST_HOOK_ENV, TEST_BLOCK_AFTER_RENAME)],
-    );
-    let _ = kill_after_test_hook(child, TEST_BLOCK_AFTER_RENAME);
+    let interrupted = prepared
+        .fixture
+        .spawn_import_replace(
+            &prepared.session_id,
+            &input,
+            &[],
+            &[(PROVIDER_OWNED_TEST_HOOK_ENV, TEST_STOP_AFTER_RECOVERY_ID)],
+        )
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(interrupted.status.code(), Some(1), "{interrupted:?}");
     fs::write(&prepared.jsonl_path, b"{\"corrupt\":\"manual edit\"}\n").unwrap();
 
-    let _ = prepared.fixture.run_recovery_trigger();
+    let recovery = prepared.fixture.run_recovery_trigger();
 
     assert!(
-        !prepared
+        prepared
             .fixture
             .pending_journal_path(&prepared.session_id)
-            .exists()
+            .exists(),
+        "{recovery:?}"
     );
     let quarantine_files = fs::read_dir(prepared.fixture.quarantine_dir())
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();
+    assert!(quarantine_files.is_empty(), "{quarantine_files:?}");
     assert!(
-        quarantine_files.iter().any(|path| path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .contains(&prepared.session_id)),
-        "{quarantine_files:?}"
-    );
-    assert!(
-        prepared
+        !prepared
             .fixture
             .canonical_records_path(&prepared.session_id)
-            .exists()
+            .exists(),
+        "provider-owned recovery must not publish host canonical transcript artifacts"
     );
     let after_rows = prepared
         .fixture
@@ -544,13 +536,19 @@ fn t9_concurrent_import_replace_allows_exactly_one_winner() {
         &prepared.jsonl_path,
         "winner-b",
     );
-    let mut first = prepared.fixture.spawn_import_replace(
+    let first = prepared.fixture.spawn_import_replace(
         &prepared.session_id,
         &input_a,
         &[],
-        &[(TEST_HOOK_ENV, TEST_SLEEP_AFTER_LOCK_MS)],
+        &[(PROVIDER_OWNED_TEST_HOOK_ENV, TEST_SLEEP_BEFORE_DB_POSTIMAGE)],
     );
-    wait_for_test_hook_line(&mut first, TEST_SLEEP_AFTER_LOCK_MS);
+    for _ in 0..100 {
+        if prepared.fixture.lock_path(&prepared.session_id).exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(prepared.fixture.lock_path(&prepared.session_id).exists());
     let second = prepared
         .fixture
         .spawn_import_replace(&prepared.session_id, &input_b, &[], &[]);
@@ -631,7 +629,7 @@ fn t10_readonly_on_error_keeps_transcript_and_db_unchanged() {
 /// Risk: T11 — verification failures may delete the only durable recovery signal.
 /// Level: CLI integration with fault injection.
 /// Source: contract §7 T-no-deletion-before-verify; proposal §4 success flow steps 10-11; A8.
-/// Observable: injected postimage verification failure exits 1 and leaves pending journal plus canonical_records_path.
+/// Observable: an indeterminate endpoint failure after native mutation exits 16 with operator-recovery-required and retains the provider-owned pending journal without creating a host canonical transcript copy.
 /// Residual: exact stderr message is intentionally less stable than the exit code and artifact contract.
 #[test]
 fn t11_no_deletion_before_verify_leaves_recovery_artifacts_on_postimage_failure() {
@@ -654,8 +652,8 @@ fn t11_no_deletion_before_verify_leaves_recovery_artifacts_on_postimage_failure(
         .wait_with_output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert_json_error(&output, "operational-error");
+    assert_eq!(output.status.code(), Some(16), "{output:?}");
+    assert_json_error(&output, "operator-recovery-required");
     assert!(
         prepared
             .fixture
@@ -663,10 +661,11 @@ fn t11_no_deletion_before_verify_leaves_recovery_artifacts_on_postimage_failure(
             .exists()
     );
     assert!(
-        prepared
+        !prepared
             .fixture
             .canonical_records_path(&prepared.session_id)
-            .exists()
+            .exists(),
+        "provider-owned recovery evidence must remain provider-owned"
     );
     let rows = prepared
         .fixture

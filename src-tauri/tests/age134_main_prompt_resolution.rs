@@ -3,6 +3,8 @@
 //! Declared roles: accessor, formatter, mapper, parser, filter,
 //! orchestration, validator.
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use rusqlite::Connection;
 use std::fs;
@@ -116,7 +118,7 @@ name = "{PROVIDER}"
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[{PROVIDER}]
 command = "{}"
 args = []
@@ -128,7 +130,7 @@ kind = "flag"
 flag = "--resume"
 "#,
                 provider.display()
-            ),
+            )),
         )
         .unwrap();
     }
@@ -158,6 +160,12 @@ flag = "--resume"
             rusqlite::params![CHAIN_ID, PROVIDER, SESSION_ID],
         )
         .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            PROVIDER,
+            SESSION_ID,
+            self.dir.path(),
+        );
     }
 
     fn run_with_stdin(&self, args: &[&str], stdin: &[u8]) -> Output {
@@ -440,7 +448,7 @@ printf 'resume-ok\n'
 }
 
 #[test]
-fn age134_resume_mismatch_persists_rejected_acceptance_and_diagnostic_category() {
+fn age134_endpoint_resume_ignores_legacy_mismatch_text() {
     let fixture = CliFixture::new();
     fixture.seed_active_chain();
     fixture.write_resume_provider(
@@ -480,8 +488,9 @@ exit 9
         err.contains("No conversation found with session ID"),
         "{err}"
     );
+    assert!(err.contains("exit_nonzero"), "{err}");
     assert!(
-        err.contains("[diagnostics: resume_session_mismatch]"),
+        !err.contains("[diagnostics: resume_session_mismatch]"),
         "{err}"
     );
     let invocation = parse_invocations(&err);
@@ -494,16 +503,7 @@ exit 9
         .unwrap();
     assert_eq!(row.status, InvocationStatus::Failed);
     assert_eq!(row.exit_code, Some(9));
-    assert_eq!(
-        row.error_category.as_deref(),
-        Some("resume_session_mismatch")
-    );
-    assert_eq!(row.resume_acceptance_status.as_deref(), Some("rejected"));
-    assert!(
-        row.resume_acceptance_evidence
-            .as_deref()
-            .unwrap_or_default()
-            .contains("resume_session_mismatch"),
-        "{row:?}"
-    );
+    assert_eq!(row.error_category, None);
+    assert_eq!(row.resume_acceptance_status, None);
+    assert_eq!(row.resume_acceptance_evidence, None);
 }

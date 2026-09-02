@@ -1016,8 +1016,13 @@ pub(crate) fn parse_provider_owned_canonical_input_for_session(
         })?;
     let records = parse_canonical_jsonl(input_text)?;
     if records.iter().any(|record| record.session_id != session_id) {
-        return Err(ReplaceError::OperationalError {
-            message: "canonical_session_id_mismatch".to_string(),
+        return Err(ReplaceError::InvalidInputTranscript {
+            reason: "canonical_session_id_mismatch: canonical record session/provider does not match target"
+                .to_string(),
+            line: records
+                .iter()
+                .position(|record| record.session_id != session_id)
+                .map(|index| index as u64 + 1),
         });
     }
     Ok(records)
@@ -1350,7 +1355,8 @@ fn validate_records_match_metadata(
             || record.provider_name != metadata.provider_name
         {
             return Err(ReplaceError::InvalidInputTranscript {
-                reason: "canonical record session/provider does not match target".to_string(),
+                reason: "canonical_session_id_mismatch: canonical record session/provider does not match target"
+                    .to_string(),
                 line: Some(idx as u64 + 1),
             });
         }

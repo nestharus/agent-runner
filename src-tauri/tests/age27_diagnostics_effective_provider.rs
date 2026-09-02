@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Utc};
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, SessionTurnIngest, StateDb};
 use std::fs;
@@ -62,10 +64,14 @@ impl Fixture {
     }
 
     fn write_providers(&self, body: &str) {
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(body),
+        )
+        .unwrap();
     }
 
-    fn seed_session_turns(&self, provider_name: &str, session_id: &str) {
+    fn seed_session_turns(&self, provider_name: &str, session_id: &str, model_name: &str) {
         let db = self.open_db();
         let turns = vec![SessionTurnIngest {
             session_id: session_id.to_string(),
@@ -79,6 +85,29 @@ impl Fixture {
         }];
         db.ingest_session_turns_batch(provider_name, &turns)
             .unwrap();
+        drop(db);
+        let connection = rusqlite::Connection::open(self.db_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                 VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', ?2)",
+                rusqlite::params![session_id, model_name],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_chain_segments
+                    (chain_id, provider_name, session_id, started_at, transition_reason)
+                 VALUES (?1, ?2, ?3, '2026-04-17T08:00:00Z', 'initial')",
+                rusqlite::params![session_id, provider_name, session_id],
+            )
+            .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &connection,
+            provider_name,
+            session_id,
+            self._dir.path(),
+        );
     }
 }
 
@@ -355,7 +384,7 @@ prompt_mode = "stdin"
         toml_command(&fixture_script("resume-provider.sh").display().to_string()),
         diagnostic_command(&prompt_dump, "network_error", "resume diagnostic")
     ));
-    fixture.seed_session_turns("resume-provider", session_id);
+    fixture.seed_session_turns("resume-provider", session_id, "resumable");
 
     let output = fixture
         .command()
@@ -397,7 +426,10 @@ prompt_mode = "stdin"
     assert_eq!(row.status, InvocationStatus::Failed);
     assert_eq!(row.exit_code, Some(7));
     assert_eq!(row.error_category.as_deref(), Some("network_error"));
-    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        row.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
     assert!(
         db.get_quota("resume-provider").unwrap().is_none(),
         "resume failure diagnostics must not create a one-shot quota marker"

@@ -62,6 +62,9 @@ fn runtime_kind(kind: &ProviderTerminalSignalKind) -> TerminalSignalKind {
         }
         ProviderTerminalSignalKind::MaybeQuotaExhausted => TerminalSignalKind::MaybeQuotaExhausted,
         ProviderTerminalSignalKind::RateLimited => TerminalSignalKind::RateLimited,
+        ProviderTerminalSignalKind::ProviderStorageContention => {
+            TerminalSignalKind::ProviderStorageContention
+        }
         ProviderTerminalSignalKind::ProlongedSilence => TerminalSignalKind::ProlongedSilence,
         ProviderTerminalSignalKind::Cancelled | ProviderTerminalSignalKind::Unknown => {
             TerminalSignalKind::Unknown

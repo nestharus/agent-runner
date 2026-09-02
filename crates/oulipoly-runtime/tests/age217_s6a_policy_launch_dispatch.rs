@@ -1357,7 +1357,11 @@ fn effective_extra_inputs() -> HashMap<String, Vec<String>> {
 }
 
 fn parent_invocation_env() -> String {
-    "parent-provider-a-invocation".to_string()
+    serde_json::json!({
+        "source": "parent-provider-a",
+        "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    })
+    .to_string()
 }
 
 struct TestTempPath {

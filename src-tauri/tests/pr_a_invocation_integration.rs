@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{
     CompositeInvocationId, InvocationStart, InvocationStatus, ProviderSessionBinding, StateDb,
 };
@@ -61,7 +63,7 @@ name = "fixture-provider"
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[fixture-provider]
 command = "{}"
 args = []
@@ -72,7 +74,7 @@ kind = "forced_flag_verified"
 flag = "--session-id"
 "#,
                 script_path.display()
-            ),
+            )),
         )
         .unwrap();
 
@@ -518,14 +520,14 @@ fn direct_provider_spawn_error_finalizes_failed_row_with_spawn_error_reason() {
             .config_home
             .join("oulipoly-agent-runner")
             .join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"[fixture-provider]
 command = "{}"
 args = []
 prompt_mode = "arg"
 "#,
             missing_command.display()
-        ),
+        )),
     )
     .unwrap();
 
@@ -541,7 +543,7 @@ prompt_mode = "arg"
 
     assert_eq!(row.status, InvocationStatus::Failed);
     assert_eq!(row.success, Some(false));
-    assert_eq!(row.exit_code, Some(-1));
+    assert_eq!(row.exit_code, Some(1));
     assert_eq!(row.error_category.as_deref(), Some("spawn_error"));
     assert_eq!(row.terminal_reason.as_deref(), Some("spawn_error"));
     assert!(row.finished_at.is_some());

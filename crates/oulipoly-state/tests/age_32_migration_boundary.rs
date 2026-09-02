@@ -303,6 +303,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             18,
             19,
             20,
+            21,
             CURRENT_SCHEMA_VERSION,
         ],
         "schema-4 DBs must take every ordered migration through the current schema"
@@ -327,6 +328,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0019_invocation_running_projection_index",
             "0020_session_turn_pages",
             "0021_invocation_output_delivery",
+            "0022_provider_session_authority",
         ]
     );
 }

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Utc};
 use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionSourceEntry,
@@ -160,7 +162,11 @@ flag = "--resume"
 "#,
             command.display()
         );
-        fs::write(app_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            app_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
     }
 
     fn write_sessions_config_from_transcript(
@@ -251,6 +257,12 @@ flag = "--resume"
             params![chain_id, provider, session_id],
         )
         .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            provider,
+            session_id,
+            self.dir.path(),
+        );
     }
 
     fn seed_turns(&self, provider: &str, session_id: &str, boundaries: &[&str]) {
@@ -1279,7 +1291,7 @@ fn top_level_resume_without_model_succeeds_when_chain_exists() {
 }
 
 #[test]
-fn top_level_resume_with_migration_preserves_raw_supplied_session_id() {
+fn top_level_resume_with_migration_preserves_resume_input_without_unverified_marker() {
     let fixture = Fixture::new();
     let source_projects = fixture.dir.path().join("source-projects");
     let target_projects = fixture.dir.path().join("target-projects");
@@ -1308,7 +1320,7 @@ printf 'ok\n'"#,
     fs::create_dir_all(&app_dir).unwrap();
     fs::write(
         app_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"
 [claude]
 command = "{}"
@@ -1342,7 +1354,7 @@ projects_dir = "{}"
             source_projects.display(),
             script.display(),
             target_projects.display()
-        ),
+        )),
     )
     .unwrap();
     fixture.write_sessions_config_from_transcript("claude2", &transcript_path);
@@ -1366,7 +1378,12 @@ projects_dir = "{}"
     assert!(argv.contains("--resume\n"), "{argv}");
     assert!(argv.contains(&format!("{SESSION_A}\n")), "{argv}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(parse_session(&stderr), CHAIN_A);
+    assert!(
+        !stderr
+            .lines()
+            .any(|line| line.starts_with("OULIPOLY_SESSION=")),
+        "{stderr}"
+    );
     let recorded_session_id: String = fixture
         .conn()
         .query_row(
@@ -1375,7 +1392,7 @@ projects_dir = "{}"
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(recorded_session_id, CHAIN_A);
+    assert_eq!(recorded_session_id, SESSION_A);
 }
 
 // risk: CLI surface; level: end-to-end; source: proposal §11.1 CLI surface / A8.
@@ -1490,7 +1507,7 @@ fn manual_migrate_flag_overrides_best_score_via_cli() {
     fs::create_dir_all(&app_dir).unwrap();
     fs::write(
         app_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"
 [claude]
 command = "{}"
@@ -1524,7 +1541,7 @@ projects_dir = "{}"
             source_projects.display(),
             script.display(),
             target_projects.display()
-        ),
+        )),
     )
     .unwrap();
     fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "claude-opus");

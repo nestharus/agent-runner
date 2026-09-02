@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::StateDb;
 use serde_json::Value;
 use std::fs;
@@ -89,15 +91,15 @@ command = {command}
 args = []
 prompt_mode = "arg"
 
-[{provider}.implementation]
-family = "{provider}"
-executable = {command}
-
 "#,
                 command = toml_string(&command.display().to_string()),
             ));
         }
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
     }
 
     fn run_one_shot(&self, model_name: &str) -> Output {

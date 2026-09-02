@@ -3,6 +3,7 @@
 //! Declared roles: formatter, parser, validator, orchestration, filter.
 
 mod age153_support;
+mod provider_authority_fixture;
 
 use age153_support::{Age153Fixture, FORCE_TERMINAL_SIGNAL_KIND, toml_string};
 use chrono::{Duration, Utc};
@@ -16,7 +17,6 @@ const INVOCATION_ID_PLACEHOLDER: &str = "<INVOCATION_ID>";
 const PROVIDER_SELECTION_FAILURE_GOLDEN: &str = "OULIPOLY_FAILURE={\"agent_runner_chain_id\":null,\"agent_runner_invocation_id\":null,\"detail\":{\"attempted_providers\":[],\"model_name\":\"age175-provider-selection\",\"provider_index\":null,\"reason\":\"all providers in pool age175-provider-selection are quota-exhausted: fixture-age175-selection-a, fixture-age175-selection-b\"},\"error_category\":null,\"exit_code\":null,\"failure_kind\":\"pre_invocation\",\"finished_at\":\"<FINISHED_AT>\",\"message\":\"provider_selection: all providers in pool age175-provider-selection are quota-exhausted: fixture-age175-selection-a, fixture-age175-selection-b\",\"provider_name\":null,\"provider_session_id\":null,\"stage\":\"provider_selection\",\"status\":\"failed\",\"success\":false,\"terminal_reason\":\"pre_invocation_failure\"}";
 const PROVIDER_RESOLUTION_FAILURE_GOLDEN: &str = "OULIPOLY_FAILURE={\"agent_runner_chain_id\":null,\"agent_runner_invocation_id\":null,\"detail\":{\"attempted_providers\":[\"fixture-age175-missing\"],\"model_name\":\"age175-provider-resolution\",\"provider_index\":0,\"reason\":\"provider fixture-age175-missing is missing from providers.toml\"},\"error_category\":null,\"exit_code\":null,\"failure_kind\":\"pre_invocation\",\"finished_at\":\"<FINISHED_AT>\",\"message\":\"provider_resolution: provider fixture-age175-missing is missing from providers.toml\",\"provider_name\":null,\"provider_session_id\":null,\"stage\":\"provider_resolution\",\"status\":\"failed\",\"success\":false,\"terminal_reason\":\"pre_invocation_failure\"}";
 const POOL_EXHAUSTED_FAILURE_GOLDEN: &str = "OULIPOLY_FAILURE={\"agent_runner_chain_id\":null,\"agent_runner_invocation_id\":null,\"detail\":{\"attempted_providers\":[\"fixture-age175-pool-a\",\"fixture-age175-pool-b\"],\"model_name\":\"age175-pool\",\"provider_index\":null,\"reason\":\"all providers in pool age175-pool are quota-exhausted: fixture-age175-pool-a, fixture-age175-pool-b\"},\"error_category\":null,\"exit_code\":null,\"failure_kind\":\"pre_invocation\",\"finished_at\":\"<FINISHED_AT>\",\"message\":\"pool_exhausted: all providers in pool age175-pool are quota-exhausted: fixture-age175-pool-a, fixture-age175-pool-b\",\"provider_name\":null,\"provider_session_id\":null,\"stage\":\"pool_exhausted\",\"status\":\"failed\",\"success\":false,\"terminal_reason\":\"pre_invocation_failure\"}";
-const SUCCESS_RESULT_GOLDEN: &str = "OULIPOLY_RESULT={\"error_category\":null,\"exit_code\":0,\"finished_at\":\"<FINISHED_AT>\",\"id\":\"<INVOCATION_ID>\",\"status\":\"succeeded\",\"success\":true,\"terminal_reason\":null}";
 const SUCCESS_SESSION_GOLDEN: &str = "OULIPOLY_SESSION={\"agent_runner_chain_id\":\"<CHAIN_ID>\",\"agent_runner_invocation_id\":\"<INVOCATION_ID>\",\"id\":\"<INVOCATION_ID>\",\"provider_name\":\"fixture-age182-success\",\"provider_session_id\":\"<SESSION_ID>\",\"resume_input_id\":null,\"session_id\":\"<SESSION_ID>\"}";
 
 #[test]
@@ -44,11 +44,13 @@ fn pre_invocation_failure_marker_bytes_are_characterized() {
 }
 
 #[test]
-fn success_marker_bytes_are_characterized() {
+fn spooled_success_omits_result_and_preserves_session_marker_bytes() {
     let output = success_with_session_output();
 
     assert_success_exit(&output);
-    assert_eq!(normalized_result_line(&output), SUCCESS_RESULT_GOLDEN);
+    assert!(
+        prefixed_lines(&String::from_utf8_lossy(&output.stdout), "OULIPOLY_RESULT=").is_empty()
+    );
     assert_eq!(normalized_session_line(&output), SUCCESS_SESSION_GOLDEN);
 }
 
@@ -135,7 +137,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested"
     fixture.write_model("age182-success", &["fixture-age182-success"]);
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"[fixture-age182-success]
 command = {}
 args = []
@@ -148,7 +150,7 @@ flag = "--session-id"
 
 "#,
             toml_string(&command.display().to_string())
-        ),
+        )),
     )
     .unwrap();
     fixture.run_one_shot("age182-success")
@@ -159,16 +161,6 @@ fn normalized_failure_line(output: &Output) -> String {
         &single_prefixed_line(&output.stdout, "OULIPOLY_FAILURE="),
         |value| {
             value["finished_at"] = Value::String(FINISHED_AT_PLACEHOLDER.to_string());
-        },
-    )
-}
-
-fn normalized_result_line(output: &Output) -> String {
-    normalize_line(
-        &single_prefixed_line(&output.stdout, "OULIPOLY_RESULT="),
-        |value| {
-            value["finished_at"] = Value::String(FINISHED_AT_PLACEHOLDER.to_string());
-            value["id"] = Value::String(INVOCATION_ID_PLACEHOLDER.to_string());
         },
     )
 }

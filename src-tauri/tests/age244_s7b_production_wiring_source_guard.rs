@@ -48,31 +48,33 @@ fn s7b_production_export_and_import_replace_use_external_provider_identity_resol
 }
 
 #[test]
-fn s7b_shared_identity_resolver_selects_only_explicit_account_endpoints() {
+fn s7b_shared_identity_resolver_requires_persisted_explicit_account_authority() {
     let source = read_source("src-tauri/src/commands/session_external_provider_identity.rs");
 
     for needle in [
         "pub(crate) fn resolve_session_external_provider_identity(",
         "Result<Option<SessionServiceExternalProviderIdentity>, String>",
-        "access_default_state_for_identity()?",
+        "access_default_state_for_identity().map_err(identity_operational_error)?",
         "StateDb::open_default().map_err(",
         "ProvidersConfig::load(&default_config_root()?.join(\"providers.toml\"))",
         "load_models(&default_models_dir()?, Some(providers))\n        .map_err(",
         "match state.resolve_resume(models, session_id, None)",
         "Err(ResumeError::NoChainFound { .. })",
         "Err(ResumeError::WrongIdKind { .. })",
-        "Err(ResumeError::Ambiguous { .. }) => Ok(None)",
-        "Err(error) => Err(format!(\"failed to resolve session: {error:?}\"))",
+        "Err(ResumeError::Ambiguous { input, .. })",
+        "SessionExternalProviderIdentityError::AmbiguousSession { input }",
+        "Err(error) => Err(SessionExternalProviderIdentityError::Operational",
         "validate_external_provider_name(provider_name)?",
+        "active_provider_session_authority(&resolved.chain_id)",
+        "authority.as_ref()",
         "let Some(provider) = providers.get(provider_name)",
         "if provider.implementation.is_none()",
-        "let settings_id = provider",
-        ".settings_id",
-        ".as_deref()",
+        "let authority = authority.ok_or_else(",
+        "provider session has no persisted endpoint authority",
         "SessionServiceExternalProviderIdentity {",
         "provider_name: provider_name.to_string()",
-        "provider_instance_id: None",
-        "settings_id: settings_id.to_string()",
+        "provider_instance_id: Some(authority.provider_instance_id.clone())",
+        "settings_id: authority.settings_id.clone()",
     ] {
         assert_contains("session_external_provider_identity.rs", &source, needle);
     }
@@ -137,7 +139,8 @@ fn s7b_command_surfaces_preserve_builtin_output_and_error_rendering() {
         "fn unwrap_export_output",
     );
     for needle in [
-        "Err(message) => return Ok(handle_export_error(&ExportError::Operational { message }))",
+        "SessionExternalProviderIdentityError::AmbiguousSession { input }",
+        "SessionExternalProviderIdentityError::Operational { message }",
         "unwrap_export_output(service_output.result)",
         "write_session_export_output(&output)",
     ] {

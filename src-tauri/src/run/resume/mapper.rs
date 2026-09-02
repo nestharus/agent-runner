@@ -45,6 +45,7 @@ pub(super) fn prepared_headless_resume_execution(
         effective_spawn_cwd,
         parent_invocation_id,
         max_attempts,
+        provider_prompt_accepted: false,
     }
 }
 

@@ -356,7 +356,7 @@ impl StateDb {
         Self::mint_chain_for_invocation_session_on(&self.conn, invocation_row_id)
     }
 
-    fn mint_chain_for_invocation_session_on(
+    pub(super) fn mint_chain_for_invocation_session_on(
         conn: &sqlite::Connection,
         invocation_row_id: i64,
     ) -> Result<(), DbError> {

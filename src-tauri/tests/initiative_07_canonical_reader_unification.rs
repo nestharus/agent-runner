@@ -192,7 +192,8 @@ fn prepared_codex_fixture_with_transcript(body: &str) -> PreparedReplace {
     let fixture = ImportReplaceFixture::new();
     let sessions_dir = fixture.root().join("codex-sessions");
     fs::create_dir_all(&sessions_dir).unwrap();
-    let jsonl_path = fixture.stage_jsonl("rollout-2026-04-17.jsonl", body);
+    let jsonl_path = sessions_dir.join("rollout-2026-04-17.jsonl");
+    fs::write(&jsonl_path, body).unwrap();
     fixture.write_model(MODEL, &[CODEX_PROVIDER]);
     fixture.write_provider(
         CODEX_PROVIDER,

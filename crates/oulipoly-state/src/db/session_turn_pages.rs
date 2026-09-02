@@ -404,6 +404,13 @@ impl StateDb {
         if !existed {
             mint_imported_chain_on(&tx, key, started_at, model_name)?;
         }
+        StateDb::bind_session_provider_authority_on(
+            &tx,
+            &key.provider_name,
+            &key.session_id,
+            &key.provider_instance_id,
+            &key.settings_id,
+        )?;
         upsert_import_metadata_on(&tx, metadata, turn_count)?;
         upsert_stream_on(&tx, key, &metadata.seen_at.to_rfc3339())?;
         tx.commit()

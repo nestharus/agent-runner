@@ -293,12 +293,7 @@ fn provider_error_or_missing_capability_does_not_abort_other_provider_import() {
                 reason: "session_enumerate_capability_missing: provider describe did not advertise session.enumerate capability".to_string(),
             },
         ),
-        (
-            "describe-non-session",
-            SessionImportProviderStatus::Skipped {
-                reason: "session_provider_describe_unavailable: provider transport failed: provider_process_nonzero".to_string(),
-            },
-        ),
+        ("describe-non-session", SessionImportProviderStatus::Failed),
         ("enumerate-error", SessionImportProviderStatus::Failed),
     ] {
         let dir = tempfile::tempdir().unwrap();

@@ -69,11 +69,12 @@ fn ingest_successful_repl_session(input: &CompletedReplAttemptInput<'_, '_>) {
             sessions_cfg: &input.env.sessions_cfg,
             providers_cfg: Some(&input.env.providers_cfg),
             provider_name: input.provider_name,
-            external_provider: crate::session_ingest_cli::session_external_provider_identity(
-                input.agent_runtime_services,
-                Some(input.model),
-                input.provider_name,
-            ),
+            external_provider:
+                crate::session_ingest_cli::configured_session_external_provider_identity(
+                    input.agent_runtime_services,
+                    Some(input.model),
+                    input.provider_name,
+                ),
             invocation_row_id: input.invocation_row_id,
             invocation_uuid: &input.invocation.id,
             effective_cwd: Some(input.interactive_effective_cwd),

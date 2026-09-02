@@ -433,6 +433,7 @@
         "quota_exhausted_inband",
         "maybe_quota_exhausted",
         "rate_limited",
+        "provider_storage_contention",
         "prolonged_silence",
         "cancelled",
         "unknown"

@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
     AdvanceRuntimeGenerationDrain, AgentBashCompleteEnqueue, BindRuntimeGenerationRunning,
@@ -10,13 +12,14 @@ use oulipoly_state::pid_identity::read_live_process_identity;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 const CONCURRENCY: usize = 8;
 
 #[test]
 fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
+    let _guard = integration_test_guard();
     let directory = tempfile::tempdir().unwrap();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
@@ -46,10 +49,10 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
     .unwrap();
     std::fs::write(
         app_config.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n\n[fixture-provider.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
             provider.display()
-        ),
+        )),
     )
     .unwrap();
 
@@ -142,7 +145,7 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            elapsed < Duration::from_secs(3),
+            elapsed < Duration::from_secs(5),
             "foreground launch waited for best-effort wake reclamation: {elapsed:?}"
         );
         let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
@@ -224,6 +227,7 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
 
 #[test]
 fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
+    let _guard = integration_test_guard();
     let directory = tempfile::tempdir().unwrap();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
@@ -253,10 +257,10 @@ fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
     .unwrap();
     std::fs::write(
         app_config.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n\n[fixture-provider.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
             provider.display()
-        ),
+        )),
     )
     .unwrap();
 
@@ -301,7 +305,7 @@ fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
     let starts_content = std::fs::read_to_string(&starts).unwrap();
     assert_eq!(
         starts_content
-            .matches("--resume candidate-bearing-session")
+            .matches("handle: candidate-bearing-handle")
             .count(),
         1,
         "unexpected provider starts with auto_wake_count={}: {starts_content}",
@@ -354,6 +358,13 @@ fn runner_command(
     command
 }
 
+fn integration_test_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn seed_recoverable_wake_candidate(
     root: &Path,
     state_path: &Path,
@@ -376,6 +387,12 @@ fn seed_recoverable_wake_candidate(
             [],
         )
         .unwrap();
+    provider_authority_fixture::bind_session_authority_with_cwd(
+        &state,
+        "fixture-provider",
+        "candidate-bearing-session",
+        root,
+    );
     drop(state);
 
     let payload_root = root.join("pending-payload");

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;
@@ -84,12 +86,16 @@ args = ["-m", "openai/gpt-5.5", "--variant", "high"]
             self.config_home
                 .join("oulipoly-agent-runner")
                 .join("providers.toml"),
-            r#"[fixture-opencode]
+            provider_authority_fixture::with_explicit_provider_authority_at(
+                r#"[fixture-opencode]
 command = "opencode-fixture"
 args = ["--pure", "run", "--dangerously-skip-permissions", "--format", "json"]
 prompt_mode = "arg"
 environment = { FIXTURE_LAUNCH_CONTEXT = "fixed-external-provider-context" }
 "#,
+                "opencode",
+                &provider,
+            ),
         )
         .expect("provider config");
     }
@@ -368,7 +374,10 @@ if __name__ == "__main__":
             .expect("carrier observation");
         assert_eq!(policy["contract"], "oulipoly.provider/v1", "{name}");
         assert_eq!(launch["contract"], "oulipoly.provider/v1", "{name}");
-        assert_eq!(launch["provider_instance_id"], "fixture-opencode", "{name}");
+        assert_eq!(
+            launch["provider_instance_id"], "fixture-opencode-provider-instance",
+            "{name}"
+        );
         assert_eq!(
             launch["params"]["settings_id"], "fixture-opencode",
             "{name}"

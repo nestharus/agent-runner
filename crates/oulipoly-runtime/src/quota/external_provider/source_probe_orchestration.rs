@@ -78,7 +78,7 @@ fn registry_failure_outcome(error: ProviderRegistryError) -> RefreshOutcome {
 fn invalid_capability_outcome(describe: &DescribeResult) -> Option<RefreshOutcome> {
     validate_quota_capability(describe)
         .err()
-        .map(failed_outcome)
+        .map(|_| source_result_without_source())
 }
 
 fn run_external_quota_sequence(

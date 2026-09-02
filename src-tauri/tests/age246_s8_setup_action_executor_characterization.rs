@@ -476,7 +476,7 @@ fn action_executor_preserves_events_feedback_memory_and_terminal_outcomes() {
     let flow = read_source("src-tauri/src/setup/flow.rs");
     let flow_body = source_between(
         &flow,
-        "async fn run_agent_loop(&mut self, system_prompt: String, initial_message: &str)",
+        "async fn run_configured_agent_loop(",
         "fn execute_allowlisted(",
     );
     let executor_body = source_between(
@@ -529,7 +529,7 @@ fn action_executor_preserves_events_feedback_memory_and_terminal_outcomes() {
     assert_ordered(
         flow_body,
         &[
-            "let result = match agent.send_turn(",
+            "let result = match host.send_turn(",
             "process_agent_turn_result(&result, turn_number, &next_message)",
             "if result.done",
             "next_message = feedback",
@@ -552,7 +552,7 @@ fn action_executor_preserves_cancel_resume_denials_and_max_turns() {
     let flow = read_source("src-tauri/src/setup/flow.rs");
     let flow_body = source_between(
         &flow,
-        "async fn run_agent_loop(&mut self, system_prompt: String, initial_message: &str)",
+        "async fn run_configured_agent_loop(",
         "fn execute_allowlisted(",
     );
     let executor_body = source_between(
@@ -565,11 +565,7 @@ fn action_executor_preserves_cancel_resume_denials_and_max_turns() {
         "fn execute_allowlisted(command: &str, args: &[String])",
         "fn validate_and_write(",
     );
-    let write_body = source_between(
-        &flow,
-        "fn validate_and_write(",
-        "fn get_install_instructions()",
-    );
+    let write_body = source_between(&flow, "fn validate_and_write(", "fn truncate(");
 
     for expected in [
         "if turn_number > MAX_AGENT_TURNS",

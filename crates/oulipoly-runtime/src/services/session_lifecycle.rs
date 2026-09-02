@@ -14,10 +14,11 @@ use super::session_warning::write_session_ingest_warning;
 use super::session_window::find_session_for_invocation_window;
 use crate::provider_registry::ProviderRegistryHandle;
 use crate::session_provider::{self, SessionProviderIdentity, SessionProviderLifecycleContext};
-use oulipoly_state::{InvocationRecord, StateDb};
+use oulipoly_state::{FinalizedProviderSessionAuthority, InvocationRecord, StateDb};
 use std::io::Write;
 
 const S7A_CAPTURE_SUBCOMMAND: &str = "session.capture";
+const EXTERNAL_PROVIDER_CAPTURE_METHOD: &str = "provider_session_capture";
 
 pub(super) fn ingest_session_with_registry(
     request: SessionLifecycleRequest<'_>,
@@ -36,60 +37,70 @@ pub(super) fn ingest_session_with_registry(
         stderr,
     } = request;
 
+    let external_provider_selected = external_provider.is_some();
     let Some(invocation) =
         load_or_warn_for_session_ingest(state, stderr, invocation_row_id, invocation_uuid, &mode)?
     else {
-        return emit_pinned_session_id_for_service(
+        return emit_fallback_session_id_for_service(
             state,
             stderr,
             invocation_row_id,
             invocation_uuid,
             mode,
+            external_provider_selected,
         );
     };
     validate_session_ingest_invocation(&invocation, invocation_row_id, invocation_uuid)?;
     let Some(finished_at) = invocation_finished_at(&invocation) else {
         write_unfinalized_invocation_warning(stderr, invocation_uuid)?;
-        return emit_pinned_session_id_for_service(
+        return emit_fallback_session_id_for_service(
             state,
             stderr,
             invocation_row_id,
             invocation_uuid,
             mode,
+            external_provider_selected,
         );
     };
 
-    let provider_capture_session_id = match external_provider.as_ref() {
-        Some(identity) => capture_external_provider_session(ExternalSessionIngestRequest {
-            provider_registry,
-            identity,
-            invocation: &invocation,
-            invocation_row_id,
-            invocation_uuid,
-            effective_cwd,
-            mode: &mode,
-        })?,
-        None => None,
+    let (session_match, authenticated_provider) = match external_provider.as_ref() {
+        Some(identity) => {
+            let capture = capture_external_provider_session(ExternalSessionIngestRequest {
+                provider_registry,
+                identity,
+                invocation: &invocation,
+                invocation_row_id,
+                invocation_uuid,
+                effective_cwd,
+                mode: &mode,
+            })?;
+            (
+                SessionLifecycleMatch::External(capture.provider_session_id),
+                Some(capture.identity),
+            )
+        }
+        None => (
+            SessionLifecycleMatch::Native(resolve_session_window_match(
+                SessionWindowMatchRequest {
+                    state,
+                    providers_cfg,
+                    provider_name,
+                    invocation: &invocation,
+                    finished_at: &finished_at,
+                    effective_cwd,
+                    stderr,
+                    invocation_uuid,
+                },
+            )?),
+            None,
+        ),
     };
-    let matched_session_id = resolve_session_window_match(SessionWindowMatchRequest {
-        state,
-        providers_cfg,
-        provider_name,
-        invocation: &invocation,
-        finished_at: &finished_at,
-        effective_cwd,
-        stderr,
-        invocation_uuid,
-    })?;
-    let matched_session_id = provider_capture_session_id.or(matched_session_id);
     enqueue_external_canonical_ingestion(
         state,
         stderr,
         invocation_row_id,
-        &invocation,
-        external_provider.as_ref(),
-        matched_session_id.as_deref(),
-        &mode,
+        authenticated_provider.as_ref(),
+        session_match.session_id(),
     )?;
 
     emit_session_lifecycle_output(
@@ -98,9 +109,23 @@ pub(super) fn ingest_session_with_registry(
         invocation_row_id,
         invocation_uuid,
         &invocation,
-        matched_session_id,
+        session_match,
         mode,
     )
+}
+
+fn emit_fallback_session_id_for_service(
+    state: &StateDb,
+    stderr: &mut dyn Write,
+    invocation_row_id: i64,
+    invocation_uuid: &str,
+    mode: SessionLifecycleIngestMode,
+    external_provider_selected: bool,
+) -> Result<SessionLifecycleOutput, ServiceError> {
+    if external_provider_selected {
+        return Ok(empty_session_lifecycle_output());
+    }
+    emit_pinned_session_id_for_service(state, stderr, invocation_row_id, invocation_uuid, mode)
 }
 
 struct ExternalSessionIngestRequest<'a> {
@@ -113,52 +138,70 @@ struct ExternalSessionIngestRequest<'a> {
     mode: &'a SessionLifecycleIngestMode,
 }
 
+struct ExternalProviderCapture {
+    provider_session_id: Option<String>,
+    identity: SessionProviderIdentity,
+}
+
+enum SessionLifecycleMatch {
+    External(Option<String>),
+    Native(Option<String>),
+}
+
+impl SessionLifecycleMatch {
+    fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::External(session_id) | Self::Native(session_id) => session_id.as_deref(),
+        }
+    }
+}
+
 fn capture_external_provider_session(
     request: ExternalSessionIngestRequest<'_>,
-) -> Result<Option<String>, ServiceError> {
+) -> Result<ExternalProviderCapture, ServiceError> {
     let registry = request
         .provider_registry
         .ok_or_else(external_provider_registry_unavailable)?
         .current();
-    let context = external_provider_context(&request, registry.as_ref());
+    let identity = authenticated_external_provider_identity(registry.as_ref(), request.identity)?;
+    let context = external_provider_context(&request, registry.as_ref(), identity.clone());
     let capture = session_provider::capture_for_lifecycle(&context)
         .map_err(|error| external_provider_service_error(S7A_CAPTURE_SUBCOMMAND, error))?;
-    Ok(capture.provider_session_id)
+    Ok(ExternalProviderCapture {
+        provider_session_id: capture.provider_session_id,
+        identity,
+    })
 }
 
 fn enqueue_external_canonical_ingestion(
     state: &StateDb,
     stderr: &mut dyn Write,
     invocation_row_id: i64,
-    invocation: &InvocationRecord,
-    identity: Option<&SessionServiceExternalProviderIdentity>,
+    identity: Option<&SessionProviderIdentity>,
     matched_session_id: Option<&str>,
-    mode: &SessionLifecycleIngestMode,
 ) -> Result<(), ServiceError> {
     let Some(identity) = identity else {
         return Ok(());
     };
-    let Some((session_id, capture_method)) =
-        canonical_ingest_identity(invocation, matched_session_id, mode)
-    else {
+    let Some(session_id) = matched_session_id else {
         return Ok(());
     };
-    if let Err(error) =
-        state.update_session_capture(invocation_row_id, Some(session_id), capture_method)
-    {
-        write_session_ingest_warning(
-            stderr,
-            &format!("Failed to persist session identity before canonical ingest enqueue: {error}"),
-        )?;
-        return Ok(());
-    }
-    let provider_identity = SessionProviderIdentity {
-        model_name: identity.model_name.clone(),
-        provider_name: identity.provider_name.clone(),
-        provider_instance_id: identity.provider_instance_id.clone(),
-        settings_id: identity.settings_id.clone(),
-    };
-    let key = match session_provider::canonical_stream_key(&provider_identity, session_id) {
+    let provider_instance_id = identity
+        .provider_instance_id
+        .as_deref()
+        .ok_or_else(external_provider_instance_identity_unavailable)?;
+    state
+        .commit_finalized_provider_session_authority(
+            invocation_row_id,
+            &FinalizedProviderSessionAuthority {
+                provider_session_id: session_id,
+                capture_method: EXTERNAL_PROVIDER_CAPTURE_METHOD,
+                provider_instance_id,
+                settings_id: &identity.settings_id,
+            },
+        )
+        .map_err(external_provider_authority_persist_error)?;
+    let key = match session_provider::canonical_stream_key(identity, session_id) {
         Ok(key) => key,
         Err(error) => {
             write_session_ingest_warning(
@@ -177,46 +220,64 @@ fn enqueue_external_canonical_ingestion(
     Ok(())
 }
 
-fn canonical_ingest_identity<'a>(
-    invocation: &'a InvocationRecord,
-    matched_session_id: Option<&'a str>,
-    mode: &'a SessionLifecycleIngestMode,
-) -> Option<(&'a str, &'a str)> {
-    match mode {
-        SessionLifecycleIngestMode::Pinned { resume_target } => Some((resume_target, "resumed")),
-        SessionLifecycleIngestMode::Unpinned { capture_method } => invocation
-            .provider_session_id
-            .as_deref()
-            .map(|session_id| {
-                (
-                    session_id,
-                    invocation
-                        .provider_session_capture_method
-                        .as_deref()
-                        .unwrap_or(capture_method),
-                )
-            })
-            .or_else(|| matched_session_id.map(|session_id| (session_id, capture_method.as_str()))),
-    }
-}
-
 fn external_provider_context<'a>(
     request: &'a ExternalSessionIngestRequest<'a>,
     registry: &'a crate::provider_registry::ProviderRegistry,
+    identity: SessionProviderIdentity,
 ) -> SessionProviderLifecycleContext<'a> {
     SessionProviderLifecycleContext {
         registry,
-        identity: SessionProviderIdentity {
-            model_name: request.identity.model_name.clone(),
-            provider_name: request.identity.provider_name.clone(),
-            provider_instance_id: request.identity.provider_instance_id.clone(),
-            settings_id: request.identity.settings_id.clone(),
-        },
+        identity,
         invocation_uuid: request.invocation_uuid,
         invocation_row_id: request.invocation_row_id,
         effective_cwd: request.effective_cwd,
         pinned_target: pinned_target(request.mode),
         start_bound_provider_session_id: request.invocation.provider_session_id.as_deref(),
+    }
+}
+
+fn authenticated_external_provider_identity(
+    registry: &crate::provider_registry::ProviderRegistry,
+    requested: &SessionServiceExternalProviderIdentity,
+) -> Result<SessionProviderIdentity, ServiceError> {
+    let endpoint = registry
+        .preflight_account(&requested.provider_name)
+        .map_err(|error| external_provider_registry_error(error.to_string()))?;
+    let settings_id = endpoint
+        .settings_id()
+        .map_err(|error| external_provider_registry_error(error.to_string()))?;
+    if requested.settings_id != settings_id {
+        return Err(ServiceError::Unavailable {
+            message: "session settings identity does not match the selected account endpoint"
+                .to_string(),
+            code: Some("session_provider_settings_identity_mismatch".to_string()),
+        });
+    }
+    Ok(SessionProviderIdentity {
+        model_name: requested.model_name.clone(),
+        provider_name: requested.provider_name.clone(),
+        provider_instance_id: Some(format!("{}-instance", endpoint.capabilities().provider_id)),
+        settings_id: settings_id.to_string(),
+    })
+}
+
+fn external_provider_registry_error(message: String) -> ServiceError {
+    ServiceError::Unavailable {
+        message,
+        code: Some("session_provider_describe_unavailable".to_string()),
+    }
+}
+
+fn external_provider_instance_identity_unavailable() -> ServiceError {
+    ServiceError::Unavailable {
+        message: "authenticated session provider instance identity is unavailable".to_string(),
+        code: Some("session_provider_instance_identity_missing".to_string()),
+    }
+}
+
+fn external_provider_authority_persist_error(message: String) -> ServiceError {
+    ServiceError::Dependency {
+        message: format!("Failed to persist provider session authority: {message}"),
     }
 }
 
@@ -391,9 +452,25 @@ fn emit_session_lifecycle_output(
     invocation_row_id: i64,
     invocation_uuid: &str,
     invocation: &InvocationRecord,
-    matched_session_id: Option<String>,
+    session_match: SessionLifecycleMatch,
     mode: SessionLifecycleIngestMode,
 ) -> Result<SessionLifecycleOutput, ServiceError> {
+    let matched_session_id = match session_match {
+        SessionLifecycleMatch::External(matched_session_id) => {
+            return match matched_session_id {
+                Some(session_id) => emit_known_session_id_for_service(
+                    state,
+                    stderr,
+                    invocation_row_id,
+                    invocation_uuid,
+                    &session_id,
+                    EXTERNAL_PROVIDER_CAPTURE_METHOD,
+                ),
+                None => Ok(empty_session_lifecycle_output()),
+            };
+        }
+        SessionLifecycleMatch::Native(matched_session_id) => matched_session_id,
+    };
     match mode {
         SessionLifecycleIngestMode::Unpinned { capture_method } => emit_unpinned_session_output(
             state,

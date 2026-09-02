@@ -83,7 +83,7 @@ impl ResumeExecution<'_> {
         &self,
         reserved: &ReservedRun,
         _context: &ValidatedContinuation,
-    ) -> Result<(), ContinuationBlock> {
+    ) -> Result<bool, ContinuationBlock> {
         let mut prepared = self.prepare()?;
         run_prepared_resume(
             self.agent_runtime_services,
@@ -93,8 +93,8 @@ impl ResumeExecution<'_> {
             self.session_id,
             Some(self.working_dir),
         )
-        .map(|_| ())
-        .map_err(invocation_failed)
+        .map_err(invocation_failed)?;
+        Ok(prepared.provider_prompt_accepted())
     }
 
     fn prepare(&self) -> Result<super::resume::PreparedHeadlessResumeExecution, ContinuationBlock> {
@@ -162,7 +162,10 @@ pub(in crate::run) fn execute_with_callbacks(
     request: FreshContinuationRequest,
     store_state: StateDb,
     observation_state: &StateDb,
-    resume_execution: impl FnMut(&ReservedRun, &ValidatedContinuation) -> Result<(), ContinuationBlock>,
+    resume_execution: impl FnMut(
+        &ReservedRun,
+        &ValidatedContinuation,
+    ) -> Result<bool, ContinuationBlock>,
     fresh_execution: impl FnMut(
         &ReservedRun,
         &ValidatedContinuation,

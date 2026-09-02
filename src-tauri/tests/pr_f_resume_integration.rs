@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Duration, Utc};
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, SessionTurnIngest, StateDb};
 use rusqlite::{Connection, params};
@@ -85,7 +87,11 @@ state_dir = '{}'
     fn write_providers_body(&self, body: &str) {
         let app_config_dir = self.config_home.join("oulipoly-agent-runner");
         fs::create_dir_all(&app_config_dir).unwrap();
-        fs::write(app_config_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(body),
+        )
+        .unwrap();
     }
 
     pub(crate) fn write_single_provider_model(
@@ -310,6 +316,12 @@ sessions_dir = "{}"
             params![chain_id, provider, session_id],
         )
         .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            provider,
+            session_id,
+            self.dir.path(),
+        );
     }
 
     pub(crate) fn seed_quota_window(&self, provider: &str, used_percent: f64) {
@@ -393,6 +405,12 @@ sessions_dir = "{}"
             .collect();
         db.ingest_session_turns_batch(provider_name, &turns)
             .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &self.conn(),
+            provider_name,
+            session_id,
+            self.dir.path(),
+        );
     }
 
     fn base_repl_command(&self, model_name: &str, resume: Option<&str>) -> Command {
@@ -570,7 +588,7 @@ fn assert_no_session_line(stderr: &str) {
         stderr
             .lines()
             .all(|line| !line.starts_with("OULIPOLY_SESSION=")),
-        "legacy completion must not synchronously discover a session: {stderr}"
+        "completion must not emit a session without authoritative capture: {stderr}"
     );
 }
 
@@ -661,7 +679,7 @@ fn assert_resume_dual_id_row(
         invocation_dual_id_columns(fixture, invocation_uuid);
     assert_eq!(provider.as_deref(), Some(provider_session_id));
     assert_eq!(resume_input.as_deref(), Some(resume_input_id));
-    assert_eq!(capture_method.as_deref(), Some("resumed"));
+    assert_eq!(capture_method.as_deref(), Some("external_provider_launch"));
 }
 
 fn write_resume_provider_emitting_different_session_id(fixture: &Fixture, fresh_session_id: &str) {
@@ -705,14 +723,22 @@ fn run_trace_json(fixture: &Fixture, invocation_uuid: &str) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn assert_invocation_session(fixture: &Fixture, invocation_uuid: &str, expected_session_id: &str) {
+fn assert_invocation_session(
+    fixture: &Fixture,
+    invocation_uuid: &str,
+    expected_session_id: &str,
+    expected_capture_method: &str,
+) {
     let row = fixture
         .open_db()
         .get_invocation_by_uuid(invocation_uuid)
         .unwrap()
         .unwrap();
     assert_eq!(row.session_id.as_deref(), Some(expected_session_id));
-    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        row.session_capture_method.as_deref(),
+        Some(expected_capture_method)
+    );
 }
 
 pub(crate) fn session_turn_count(fixture: &Fixture, provider: &str, session_id: &str) -> i64 {
@@ -880,7 +906,7 @@ flag = "--session"
         invocation_dual_id_columns(&fixture, &invocation.id);
     assert_eq!(provider_session_id.as_deref(), Some("ses_fixture"));
     assert_eq!(resume_input_id, None);
-    assert_eq!(capture_method.as_deref(), Some("stdout_json_event"));
+    assert_eq!(capture_method.as_deref(), Some("external_provider_launch"));
 }
 
 #[test]
@@ -957,7 +983,7 @@ subcommand = ["resume"]
 }
 
 #[test]
-fn headless_resume_requires_provider_resume_block() {
+fn headless_endpoint_resume_does_not_require_legacy_resume_block() {
     let fixture = Fixture::new();
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
     let script = fixture.write_script("claude.sh", "exit 0");
@@ -972,14 +998,18 @@ fn headless_resume_requires_provider_resume_block() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "[resume] -> claude2\nprovider claude2 has no [providers.resume] block; cannot resume\n"
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("has no [providers.resume] block"),
+        "{stderr}"
     );
+    let invocation = parse_invocation(&stderr);
+    assert_unconfirmed_resume_result(&output, &invocation, &["cla", "ude2"].concat(), session_id);
+    assert_resume_dual_id_row(&fixture, &invocation.id, session_id, session_id);
 }
 
 #[test]
-fn headless_resume_persists_resume_acceptance_status_and_evidence() {
+fn headless_endpoint_resume_does_not_use_legacy_output_pattern_acceptance() {
     let fixture = Fixture::new();
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
     let script = fixture.write_script(
@@ -1016,15 +1046,14 @@ rejected_output_patterns = ["resume rejected"]
         .get_invocation_by_uuid(&invocation.id)
         .unwrap()
         .unwrap();
-    assert_eq!(row.resume_acceptance_status.as_deref(), Some("accepted"));
-    assert_eq!(
-        row.resume_acceptance_evidence.as_deref(),
-        Some("matched accept pattern: resume accepted for {session_id}")
-    );
+    assert_eq!(row.resume_acceptance_status, None);
+    assert_eq!(row.resume_acceptance_evidence, None);
+    let (_, _, capture_method) = invocation_dual_id_columns(&fixture, &invocation.id);
+    assert_eq!(capture_method.as_deref(), Some("external_provider_launch"));
 }
 
 #[test]
-fn resume_pinned_ingest_emits_supplied_target_without_new_match() {
+fn resume_pinned_ingest_does_not_emit_without_external_capture() {
     let fixture = Fixture::new();
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
     let script = fixture.write_script("claude-no-turn.sh", "printf 'mock resumed answer\\n'");
@@ -1050,8 +1079,13 @@ flag = "--resume"
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let invocation = parse_invocation(&stderr);
-    assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
-    assert_invocation_session(&fixture, &invocation.id, session_id);
+    assert_no_session_line(&stderr);
+    assert_invocation_session(
+        &fixture,
+        &invocation.id,
+        session_id,
+        "external_provider_launch",
+    );
     assert_eq!(session_turn_count(&fixture, "claude2", session_id), 1);
 }
 
@@ -1097,7 +1131,7 @@ printf 'mock answer\n'
 }
 
 #[test]
-fn resume_invocation_re_emits_session_line_with_resumed_session_id() {
+fn resume_invocation_does_not_re_emit_without_external_capture() {
     let fixture = Fixture::new();
     let transcript_path = fixture.dir.path().join("resume-turns.jsonl");
     fs::write(&transcript_path, "").unwrap();
@@ -1153,8 +1187,7 @@ flag = "--resume"
     assert_eq!(resume_output.status.code(), Some(0), "{resume_output:?}");
     let resume_stderr = String::from_utf8_lossy(&resume_output.stderr);
     let resume_invocation = parse_invocation(&resume_stderr);
-    let resumed_session_id = parse_session_line(&resume_stderr, &resume_invocation.id);
-    assert_eq!(resumed_session_id, initial_session_id);
+    assert_no_session_line(&resume_stderr);
 
     let row = fixture
         .open_db()
@@ -1165,7 +1198,7 @@ flag = "--resume"
 }
 
 #[test]
-fn top_level_file_resume_preserves_supplied_id_without_sync_fresh_id_ingest() {
+fn top_level_file_resume_ignores_fresh_legacy_transcript_without_external_capture() {
     let fixture = Fixture::new();
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
     let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
@@ -1183,19 +1216,17 @@ fn top_level_file_resume_preserves_supplied_id_without_sync_fresh_id_ingest() {
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let result_lines = stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
-        .collect::<Vec<_>>();
-    assert_eq!(result_lines.len(), 1, "{stdout}");
-    let result = serde_json::from_str::<Value>(result_lines[0]).unwrap();
-    assert_eq!(result["status"], "succeeded");
-    assert_eq!(result["success"], true);
+    assert_eq!(stdout, "mock resumed answer\n");
+    assert!(!stdout.contains("OULIPOLY_RESULT="), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let invocation = parse_invocation(&stderr);
-    let emitted_session_id = parse_session_line(&stderr, &invocation.id);
-    assert_eq!(emitted_session_id, session_id);
-    assert_invocation_session(&fixture, &invocation.id, session_id);
+    assert_no_session_line(&stderr);
+    assert_invocation_session(
+        &fixture,
+        &invocation.id,
+        session_id,
+        "external_provider_launch",
+    );
     assert_eq!(
         session_turn_count(&fixture, &["cla", "ude2"].concat(), fresh_session_id),
         0
@@ -1206,11 +1237,14 @@ fn top_level_file_resume_preserves_supplied_id_without_sync_fresh_id_ingest() {
     );
     let trace = run_trace_json(&fixture, &invocation.id);
     assert_eq!(trace["root"]["session"]["id"], session_id);
-    assert_eq!(trace["root"]["session"]["capture_method"], "resumed");
+    assert_eq!(
+        trace["root"]["session"]["capture_method"],
+        "external_provider_launch"
+    );
 }
 
 #[test]
-fn resume_subcommand_file_prompt_preserves_supplied_session_id_when_provider_emits_fresh_id() {
+fn resume_subcommand_file_prompt_ignores_fresh_legacy_transcript_without_external_capture() {
     let fixture = Fixture::new();
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
     let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
@@ -1229,8 +1263,13 @@ fn resume_subcommand_file_prompt_preserves_supplied_session_id_when_provider_emi
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let invocation = parse_invocation(&stderr);
-    assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
-    assert_invocation_session(&fixture, &invocation.id, session_id);
+    assert_no_session_line(&stderr);
+    assert_invocation_session(
+        &fixture,
+        &invocation.id,
+        session_id,
+        "external_provider_launch",
+    );
     let trace = run_trace_json(&fixture, &invocation.id);
     assert_eq!(trace["root"]["session"]["id"], session_id);
 }
@@ -1280,11 +1319,14 @@ subcommand = ["resume"]
         .unwrap()
         .unwrap();
     assert_eq!(row.session_id.as_deref(), Some(session_id));
-    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        row.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
 }
 
 #[test]
-fn repl_resume_preserves_supplied_session_id_when_provider_emits_fresh_id() {
+fn repl_resume_ignores_fresh_legacy_transcript_without_external_capture() {
     let fixture = Fixture::new();
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
     let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
@@ -1296,14 +1338,14 @@ fn repl_resume_preserves_supplied_session_id_when_provider_emits_fresh_id() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let invocation = parse_invocation(&stderr);
-    assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
-    assert_invocation_session(&fixture, &invocation.id, session_id);
+    assert_no_session_line(&stderr);
+    assert_invocation_session(&fixture, &invocation.id, session_id, "resumed");
     let trace = run_trace_json(&fixture, &invocation.id);
     assert_eq!(trace["root"]["session"]["id"], session_id);
 }
 
 #[test]
-fn top_level_resume_without_prompt_preserves_supplied_session_id_when_provider_emits_fresh_id() {
+fn top_level_resume_without_prompt_ignores_legacy_transcript_without_external_capture() {
     let fixture = Fixture::new();
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
     let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
@@ -1318,8 +1360,8 @@ fn top_level_resume_without_prompt_preserves_supplied_session_id_when_provider_e
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let invocation = parse_invocation(&stderr);
-    assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
-    assert_invocation_session(&fixture, &invocation.id, session_id);
+    assert_no_session_line(&stderr);
+    assert_invocation_session(&fixture, &invocation.id, session_id, "resumed");
     let trace = run_trace_json(&fixture, &invocation.id);
     assert_eq!(trace["root"]["session"]["id"], session_id);
 }
@@ -1351,8 +1393,13 @@ fn resumed_invocations_remain_queryable_under_supplied_session_id() {
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         let invocation = parse_invocation(&stderr);
-        assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
-        assert_invocation_session(&fixture, &invocation.id, session_id);
+        assert_no_session_line(&stderr);
+        assert_invocation_session(
+            &fixture,
+            &invocation.id,
+            session_id,
+            "external_provider_launch",
+        );
         let trace = run_trace_json(&fixture, &invocation.id);
         assert_eq!(trace["root"]["session"]["id"], session_id);
     }
@@ -1361,7 +1408,7 @@ fn resumed_invocations_remain_queryable_under_supplied_session_id() {
 }
 
 #[test]
-fn resumed_child_keeps_parent_link_while_session_id_is_pinned() {
+fn resumed_child_keeps_parent_link_without_external_session_emission() {
     let fixture = Fixture::new();
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
     let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
@@ -1390,7 +1437,7 @@ fn resumed_child_keeps_parent_link_while_session_id_is_pinned() {
     assert_eq!(child_output.status.code(), Some(0), "{child_output:?}");
     let child_stderr = String::from_utf8_lossy(&child_output.stderr);
     let child = parse_invocation(&child_stderr);
-    assert_eq!(parse_session_line(&child_stderr, &child.id), session_id);
+    assert_no_session_line(&child_stderr);
     let child_row = fixture
         .open_db()
         .get_invocation_by_uuid(&child.id)
@@ -1518,7 +1565,10 @@ flag = "--resume"
         .unwrap()
         .unwrap();
     assert_eq!(row.session_id.as_deref(), Some(session_id));
-    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        row.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
 }
 
 #[test]
@@ -1571,7 +1621,10 @@ flag = "--resume"
         .unwrap()
         .unwrap();
     assert_eq!(row.session_id.as_deref(), Some(session_id));
-    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        row.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
 }
 
 #[test]
@@ -1637,7 +1690,10 @@ flag = "--resume"
         .unwrap()
         .unwrap();
     assert_eq!(row.session_id.as_deref(), Some(session_id));
-    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        row.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
 }
 
 #[test]
@@ -1744,7 +1800,10 @@ flag = "--resume"
     assert_eq!(row.exit_code, Some(7));
     assert_eq!(row.terminal_reason.as_deref(), Some("exit_nonzero"));
     assert_eq!(row.session_id.as_deref(), Some(session_id));
-    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        row.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
     assert!(row.finished_at.is_some());
 }
 
@@ -1777,9 +1836,8 @@ flag = "--resume"
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("resume launch failed:"), "{stderr}");
-    assert!(stderr.contains("Failed to spawn"), "{stderr}");
     assert!(stderr.contains("No such file or directory"), "{stderr}");
+    assert!(stderr.contains(r#""kind":"SpawnError""#), "{stderr}");
     let invocation = parse_invocation(&stderr);
     let row = fixture
         .open_db()
@@ -1793,7 +1851,10 @@ flag = "--resume"
     assert_eq!(row.error_category.as_deref(), Some("spawn_error"));
     assert_eq!(row.terminal_reason.as_deref(), Some("spawn_error"));
     assert_eq!(row.session_id.as_deref(), Some(session_id));
-    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        row.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
     assert!(row.finished_at.is_some());
 }
 
@@ -2391,7 +2452,10 @@ flag = "--resume"
     assert_eq!(row.success, Some(false));
     assert_eq!(row.exit_code, Some(143));
     assert_eq!(row.terminal_reason.as_deref(), Some("signal:SIGTERM"));
-    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        row.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
 
     let trace = run_trace_json(&fixture, &invocation.id);
     assert_eq!(trace["root"]["invocation"]["exit_code"], 143);
@@ -2453,7 +2517,7 @@ subcommand = ["resume"]
 }
 
 #[test]
-fn codex_repl_resume_preserves_supplied_session_id_when_provider_emits_fresh_id() {
+fn provider_repl_resume_ignores_fresh_legacy_transcript_without_external_capture() {
     let fixture = Fixture::new();
     let transcript_path = fixture.dir.path().join("codex-fresh-turns.jsonl");
     fs::write(&transcript_path, "").unwrap();
@@ -2488,8 +2552,8 @@ subcommand = ["resume"]
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let invocation = parse_invocation(&stderr);
-    assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
-    assert_invocation_session(&fixture, &invocation.id, session_id);
+    assert_no_session_line(&stderr);
+    assert_invocation_session(&fixture, &invocation.id, session_id, "resumed");
 }
 
 #[test]
@@ -2540,11 +2604,13 @@ flag = "--resume"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     let invocation = parse_invocation(&stderr);
-    assert_eq!(
-        parse_session_line(&stderr, &invocation.id),
-        active_session_id
+    assert_no_session_line(&stderr);
+    assert_invocation_session(
+        &fixture,
+        &invocation.id,
+        active_session_id,
+        "external_provider_launch",
     );
-    assert_invocation_session(&fixture, &invocation.id, active_session_id);
     assert_resume_dual_id_row(&fixture, &invocation.id, active_session_id, chain_id);
     let trace = run_trace_json(&fixture, &invocation.id);
     assert_trace_dual_id_state(
@@ -2590,7 +2656,7 @@ flag = "--resume"
     assert_eq!(invocation_row_count(&fixture), before_count + 1);
     assert_eq!(provider_session_id.as_deref(), Some(active_session_id));
     assert_eq!(resume_input_id.as_deref(), Some(chain_id));
-    assert_eq!(capture_method.as_deref(), Some("resumed"));
+    assert_eq!(capture_method.as_deref(), Some("external_provider_launch"));
 }
 
 #[test]
@@ -2653,10 +2719,7 @@ fn infa_style_trace_uses_one_session_id_without_audit_waiver() {
     assert_eq!(root_output.status.code(), Some(0), "{root_output:?}");
     let root_stderr = String::from_utf8_lossy(&root_output.stderr);
     let root_invocation = parse_invocation(&root_stderr);
-    assert_eq!(
-        parse_session_line(&root_stderr, &root_invocation.id),
-        session_id
-    );
+    assert_no_session_line(&root_stderr);
 
     let parent_env = serde_json::to_string(&root_invocation).unwrap();
     for prompt in ["continue one", "continue two"] {
@@ -2666,8 +2729,8 @@ fn infa_style_trace_uses_one_session_id_without_audit_waiver() {
         let output = cmd.output().unwrap();
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let invocation = parse_invocation(&stderr);
-        assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
+        let _ = parse_invocation(&stderr);
+        assert_no_session_line(&stderr);
     }
 
     let trace = run_trace_json(&fixture, &root_invocation.id);

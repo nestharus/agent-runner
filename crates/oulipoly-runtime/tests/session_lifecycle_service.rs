@@ -609,7 +609,7 @@ fn session_lifecycle_external_capture_persists_identity_and_queues_bounded_inges
 }
 
 #[test]
-fn session_lifecycle_external_capture_preserves_start_bound_session_over_provider_fact() {
+fn session_lifecycle_external_capture_replaces_start_bound_session_with_provider_fact() {
     let provider = ProviderAFixture::new("capture_conflict");
     let invocation_uuid = "aaaaaaaa-0000-4000-8000-000000000000";
     let invocation_row_id = provider
@@ -653,17 +653,21 @@ fn session_lifecycle_external_capture_preserves_start_bound_session_over_provide
 
     assert_eq!(
         output.session_id.as_deref(),
-        Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
     );
     let stderr = stderr_text(stderr);
     assert!(stderr.contains("OULIPOLY_SESSION="), "{stderr}");
     assert!(
-        stderr.contains("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+        stderr.contains("\"provider_session_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\""),
         "{stderr}"
     );
     assert!(
-        !stderr.contains("\"provider_session_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\""),
-        "provider capture fact must not override start-bound session: {stderr}"
+        !stderr.contains("\"provider_session_id\":\"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\""),
+        "start-bound session must not override provider capture fact: {stderr}"
+    );
+    assert_canonical_stream_queued(
+        &provider.fixture.state,
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     );
     assert_provider_lifecycle_dispatch_shape(
         provider.records(),
@@ -676,7 +680,7 @@ fn session_lifecycle_external_capture_preserves_start_bound_session_over_provide
 }
 
 #[test]
-fn session_lifecycle_external_pinned_capture_preserves_resume_target_over_provider_fact() {
+fn session_lifecycle_external_pinned_capture_uses_provider_fact_in_provider_request() {
     let provider = ProviderAFixture::new("capture_conflict");
     let invocation_uuid = "abababab-0000-4000-8000-000000000000";
     let pinned_session = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -711,13 +715,12 @@ fn session_lifecycle_external_pinned_capture_preserves_resume_target_over_provid
         })
         .expect("external pinned lifecycle dispatch");
 
-    assert_eq!(output.session_id.as_deref(), Some(pinned_session));
+    assert_eq!(output.session_id.as_deref(), Some(provider_session));
     let stderr = stderr_text(stderr);
     assert!(stderr.contains("OULIPOLY_SESSION="), "{stderr}");
-    assert!(stderr.contains(pinned_session), "{stderr}");
     assert!(
-        !stderr.contains(provider_session),
-        "provider capture fact must not override pinned marker bytes: {stderr}"
+        stderr.contains(&format!("\"provider_session_id\":\"{provider_session}\"")),
+        "pinned target must not override provider capture fact: {stderr}"
     );
     let row = provider
         .fixture
@@ -725,9 +728,10 @@ fn session_lifecycle_external_pinned_capture_preserves_resume_target_over_provid
         .get_invocation_by_uuid(invocation_uuid)
         .unwrap()
         .unwrap();
-    assert_eq!(row.session_id.as_deref(), Some(pinned_session));
-    assert_eq!(row.resume_input_id.as_deref(), Some(pinned_session));
-    assert_ne!(row.provider_session_id.as_deref(), Some(provider_session));
+    assert_eq!(row.session_id.as_deref(), Some(provider_session));
+    assert_eq!(row.resume_input_id, None);
+    assert_eq!(row.provider_session_id.as_deref(), Some(provider_session));
+    assert_canonical_stream_queued(&provider.fixture.state, provider_session);
     let subcommands = provider
         .records()
         .iter()
@@ -735,7 +739,7 @@ fn session_lifecycle_external_pinned_capture_preserves_resume_target_over_provid
         .collect::<Vec<_>>();
     assert!(
         subcommands.contains(&"session.capture".to_string()),
-        "external pinned lifecycle must prove precedence over provider capture facts: {subcommands:?}"
+        "external pinned lifecycle must capture the provider session fact: {subcommands:?}"
     );
     assert_provider_lifecycle_dispatch_shape(
         provider.records(),
@@ -748,7 +752,7 @@ fn session_lifecycle_external_pinned_capture_preserves_resume_target_over_provid
 }
 
 #[test]
-fn provider_ref_lifecycle_resume_captures_queues_and_preserves_pinned_target() {
+fn provider_ref_lifecycle_resume_captures_queues_and_uses_provider_fact() {
     let provider = ProviderAFixture::new("capture_success");
     let invocation_uuid = "cdcdcdcd-0000-4000-8000-000000000000";
     let pinned_session = "edededed-eded-4ede-8ede-edededededed";
@@ -801,22 +805,24 @@ fn provider_ref_lifecycle_resume_captures_queues_and_preserves_pinned_target() {
         !scan_record_path.exists(),
         "provider-ref lifecycle must not run local sessions scan"
     );
-    assert_eq!(output.session_id.as_deref(), Some(pinned_session));
+    assert_eq!(output.session_id.as_deref(), Some(provider_session));
     assert!(provider.fixture.session_turn_rows().is_empty());
-    assert_canonical_stream_queued(&provider.fixture.state, pinned_session);
+    assert_canonical_stream_queued(&provider.fixture.state, provider_session);
     let row = provider
         .fixture
         .state
         .get_invocation_by_uuid(invocation_uuid)
         .unwrap()
         .unwrap();
-    assert_eq!(row.session_id.as_deref(), Some(pinned_session));
-    assert_eq!(row.resume_input_id.as_deref(), Some(pinned_session));
-    assert_ne!(row.provider_session_id.as_deref(), Some(provider_session));
+    assert_eq!(row.session_id.as_deref(), Some(provider_session));
+    assert_eq!(row.resume_input_id, None);
+    assert_eq!(row.provider_session_id.as_deref(), Some(provider_session));
     let stderr = stderr_text(stderr);
     assert!(stderr.contains("OULIPOLY_SESSION="), "{stderr}");
-    assert!(stderr.contains(pinned_session), "{stderr}");
-    assert!(!stderr.contains(provider_session), "{stderr}");
+    assert!(
+        stderr.contains(&format!("\"provider_session_id\":\"{provider_session}\"")),
+        "{stderr}"
+    );
     assert_provider_lifecycle_dispatch_shape(
         provider.records(),
         invocation_uuid,
@@ -828,7 +834,7 @@ fn provider_ref_lifecycle_resume_captures_queues_and_preserves_pinned_target() {
 }
 
 #[test]
-fn provider_ref_lifecycle_empty_capture_then_window_match_uses_script_cwd() {
+fn provider_ref_lifecycle_empty_capture_does_not_use_native_window_or_script_cwd() {
     let provider = ProviderAFixture::new("empty_capture");
     let invocation_uuid = "34343434-3434-4434-8434-343434343434";
     let correct_session = "45454545-4545-4454-8454-454545454545";
@@ -927,9 +933,15 @@ fn provider_ref_lifecycle_empty_capture_then_window_match_uses_script_cwd() {
         })
         .expect("external lifecycle dispatch with window match");
 
-    assert_eq!(output.session_id.as_deref(), Some(correct_session));
+    assert_eq!(
+        output,
+        SessionLifecycleOutput {
+            emitted: false,
+            session_id: None,
+        }
+    );
     let stderr = stderr_text(stderr);
-    assert!(stderr.contains(correct_session), "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
     assert!(!stderr.contains(wrong_session), "{stderr}");
     let records = provider.records();
     assert_provider_lifecycle_dispatch_shape(
@@ -941,22 +953,22 @@ fn provider_ref_lifecycle_empty_capture_then_window_match_uses_script_cwd() {
         None,
     );
     assert_eq!(provider_lifecycle_subcommands(&records).len(), 2);
-    assert_canonical_stream_queued(&provider.fixture.state, correct_session);
-    let cwd_records = std::fs::read_to_string(&cwd_record).unwrap();
     assert!(
-        cwd_records
-            .lines()
-            .any(|line| line == format!("{correct_session}|2")),
-        "cwd records: {cwd_records}"
+        !cwd_record.exists(),
+        "external capture must not consult the native cwd script"
     );
-    assert!(
-        !cwd_records.contains(wrong_session),
-        "wrong session appeared in cwd records: {cwd_records}"
-    );
-    assert!(
-        cwd_records.lines().all(|line| line.ends_with("|2")),
-        "cwd ran before provider records were complete: {cwd_records}"
-    );
+    let stream = provider
+        .fixture
+        .state
+        .session_turn_ingest_stream(&SessionTurnIngestStreamKey {
+            provider_name: PROVIDER_A_ACCOUNT.to_string(),
+            provider_instance_id: PROVIDER_A_INSTANCE.to_string(),
+            settings_id: PROVIDER_A_SETTINGS.to_string(),
+            session_id: correct_session.to_string(),
+            projection: SessionTurnStreamProjection::CanonicalIngest,
+        })
+        .unwrap();
+    assert_eq!(stream, None);
 }
 
 #[test]

@@ -195,11 +195,12 @@ fn result_provider_name<'a>(
     input: &'a ResumeAttemptInput<'_>,
     result: &oulipoly_runtime::executor::ExecutionResult,
 ) -> Result<&'a str, String> {
-    input
-        .resolved
-        .model
-        .as_ref()
-        .and_then(|model| model.providers.get(result.provider_index))
+    let Some(model) = input.resolved.model.as_ref() else {
+        return Ok(&input.resolved.active_provider);
+    };
+    model
+        .providers
+        .get(result.provider_index)
         .map(|provider| provider.name.as_str())
         .ok_or_else(|| {
             format!(

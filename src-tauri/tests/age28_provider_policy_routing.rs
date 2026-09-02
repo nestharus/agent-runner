@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Utc};
 use oulipoly_state::{SessionTurnIngest, StateDb};
 use std::fs;
@@ -82,10 +84,14 @@ impl Fixture {
     }
 
     fn write_providers(&self, body: &str) {
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(body),
+        )
+        .unwrap();
     }
 
-    fn seed_session_turn(&self, provider_name: &str, session_id: &str) {
+    fn seed_session_turn(&self, provider_name: &str, session_id: &str, model_name: &str) {
         let db = self.open_db();
         db.ingest_session_turns_batch(
             provider_name,
@@ -101,6 +107,29 @@ impl Fixture {
             }],
         )
         .unwrap();
+        drop(db);
+        let connection = rusqlite::Connection::open(self.db_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                 VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', ?2)",
+                rusqlite::params![session_id, model_name],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_chain_segments
+                    (chain_id, provider_name, session_id, started_at, transition_reason)
+                 VALUES (?1, ?2, ?3, '2026-04-17T08:00:00Z', 'initial')",
+                rusqlite::params![session_id, provider_name, session_id],
+            )
+            .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &connection,
+            provider_name,
+            session_id,
+            self.dir.path(),
+        );
     }
 }
 
@@ -291,7 +320,7 @@ disallowed_tools = ["Task"]
         toml_string(&script.display().to_string())
     ));
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
-    fixture.seed_session_turn("claude", session_id);
+    fixture.seed_session_turn(&primary_policy_token(), session_id, "resumable");
 
     let output = fixture
         .command()

@@ -20,6 +20,8 @@ use rusqlite::Connection;
 use std::fs;
 use std::path::PathBuf;
 
+const PROVIDER_INSTANCE_ID: &str = "wu-d-native-fixture-instance";
+
 struct SeedMailboxArtifacts {
     state_dir: PathBuf,
     meta: PathBuf,
@@ -191,6 +193,42 @@ impl Fixture {
             }],
         )
         .unwrap();
+        drop(db);
+
+        let conn = Connection::open(self.state_path()).unwrap();
+        let has_segment = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM session_chain_segments
+                    WHERE provider_name = ?1 AND session_id = ?2
+                )",
+                rusqlite::params![provider_name, session_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        if !has_segment {
+            conn.execute(
+                "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                 VALUES (?1, '2026-06-04T12:00:00Z', '2026-06-04T12:00:00Z', ?2)",
+                rusqlite::params![session_id, MODEL],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_chain_segments
+                    (chain_id, provider_name, session_id, started_at, transition_reason)
+                 VALUES (?1, ?2, ?3, '2026-06-04T12:00:00Z', 'initial')",
+                rusqlite::params![session_id, provider_name, session_id],
+            )
+            .unwrap();
+        }
+        crate::provider_authority_fixture::bind_session_authority_with_cwd_at(
+            &conn,
+            provider_name,
+            session_id,
+            PROVIDER_INSTANCE_ID,
+            provider_name,
+            &self.work_dir,
+        );
     }
 
     pub(crate) fn seed_consumed_notification_turn(&self, handle: &str) {
@@ -295,6 +333,14 @@ impl Fixture {
             rusqlite::params![chain_id, provider_name, session_id],
         )
         .unwrap();
+        crate::provider_authority_fixture::bind_session_authority_with_cwd_at(
+            &conn,
+            provider_name,
+            session_id,
+            PROVIDER_INSTANCE_ID,
+            provider_name,
+            &self.work_dir,
+        );
     }
 
     pub(crate) fn seed_mailbox(&self, session_id: &str, handle: &str) {

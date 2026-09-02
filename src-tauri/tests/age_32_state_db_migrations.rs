@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
 #[path = "../../crates/oulipoly-state/tests/fixtures/mod.rs"]
 mod state_fixtures;
 
@@ -91,10 +92,10 @@ impl CliFixture {
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 "[fixture-provider]\ncommand = {:?}\nargs = []\nprompt_mode = \"arg\"\n",
                 script.to_string_lossy()
-            ),
+            )),
         )
         .unwrap();
         marker

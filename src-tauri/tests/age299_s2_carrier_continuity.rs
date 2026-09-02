@@ -5,6 +5,8 @@
 //! ## Declared roles
 //! `orchestration`, `validator`
 
+mod provider_authority_fixture;
+
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::{InvocationStatus, ProviderSessionBinding, StateDb};
 use rusqlite::{Connection, params};
@@ -175,10 +177,10 @@ impl Fixture {
         .unwrap();
         fs::write(
             app_config.join("providers.toml"),
-            format!(
-                "[{PROVIDER}]\ncommand = {:?}\nargs = []\ninteractive_args = []\nprompt_mode = \"arg\"\n\n[{PROVIDER}.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
+                "[{PROVIDER}]\ncommand = {:?}\nargs = []\ninteractive_args = []\nprompt_mode = \"arg\"\n\n[{PROVIDER}.resume]\nkind = \"flag\"\nflag = \"--resume\"\n\n[{PROVIDER}.session_capture]\nkind = \"stdout_json_event\"\njson_args = [\"--age299-json\"]\nevent_type = \"age299_session\"\nevent_id_path = \"session_id\"\n",
                 script.display().to_string()
-            ),
+            )),
         )
         .unwrap();
         fs::write(
@@ -238,6 +240,12 @@ impl Fixture {
                 params![CHAIN_ID, PROVIDER, SESSION_ID],
             )
             .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &connection,
+            PROVIDER,
+            SESSION_ID,
+            self.root.path(),
+        );
     }
 
     fn spawn(&self, carrier: Carrier) -> CarrierChild {
@@ -700,6 +708,7 @@ while [ ! -f {bind:?} ]; do sleep 0.01; done
 touch {registered:?}
 while [ ! -f {release:?} ]; do sleep 0.01; done
 printf '%s\n' 'retained provider stdout'
+printf '%s\n' '{{"type":"age299_session","session_id":"age299-s2-live-session"}}'
 exit 0
 "#,
     )
