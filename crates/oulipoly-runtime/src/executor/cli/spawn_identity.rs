@@ -7,7 +7,6 @@
 //! - mapper: derives sidecar metadata from the existing parent-invocation env
 //!   payload threaded through executor launches.
 
-use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_state::CompositeInvocationId;
 use oulipoly_state::mailbox::{
     AdvanceRuntimeGenerationDrain, AttachRuntimeGenerationSession, BindRuntimeGenerationRunning,
@@ -101,12 +100,9 @@ pub(crate) fn context_from_parent_invocation_env(
 }
 
 pub(crate) fn provider_parent_invocation_env(current: Option<&str>) -> Option<String> {
-    let auto_wake = std::env::var(AutoWakeEnvironmentVariable::MARKER.name())
-        .ok()
-        .as_deref()
-        == Some("1");
-    let inherited = std::env::var(PARENT_INVOCATION_ENV).ok();
-    provider_parent_invocation_env_for(current, auto_wake, inherited.as_deref())
+    // The provider process is the immediate capability caller. Durable invocation
+    // parentage, rather than inherited process state, records wake ancestry.
+    current.map(str::to_string)
 }
 
 pub(crate) fn split_invocation_launch_environment(
@@ -143,20 +139,6 @@ pub(crate) fn split_invocation_launch_environment(
         value.to_string()
     };
     Ok((identity, authority))
-}
-
-fn provider_parent_invocation_env_for(
-    current: Option<&str>,
-    auto_wake: bool,
-    inherited: Option<&str>,
-) -> Option<String> {
-    if auto_wake
-        && let Some(inherited) = inherited
-        && CompositeInvocationId::parse_env_value(inherited).is_ok()
-    {
-        return Some(inherited.to_string());
-    }
-    current.map(str::to_string)
 }
 
 fn parse_parent_invocation_env(
@@ -732,30 +714,18 @@ mod tests {
     use super::*;
 
     const CURRENT: &str = r#"{"source":"opencode3","id":"11111111-1111-4111-8111-111111111111"}"#;
-    const OWNER: &str = r#"{"source":"opencode3","id":"22222222-2222-4222-8222-222222222222"}"#;
 
     #[test]
-    fn auto_wake_provider_keeps_inherited_semantic_owner() {
+    fn provider_launch_uses_current_capability_owner() {
         assert_eq!(
-            provider_parent_invocation_env_for(Some(CURRENT), true, Some(OWNER)).as_deref(),
-            Some(OWNER)
-        );
-    }
-
-    #[test]
-    fn ordinary_provider_uses_current_invocation() {
-        assert_eq!(
-            provider_parent_invocation_env_for(Some(CURRENT), false, Some(OWNER)).as_deref(),
+            provider_parent_invocation_env(Some(CURRENT)).as_deref(),
             Some(CURRENT)
         );
     }
 
     #[test]
-    fn auto_wake_rejects_malformed_inherited_owner() {
-        assert_eq!(
-            provider_parent_invocation_env_for(Some(CURRENT), true, Some("not-json")).as_deref(),
-            Some(CURRENT)
-        );
+    fn provider_without_current_invocation_has_no_capability_owner() {
+        assert_eq!(provider_parent_invocation_env(None), None);
     }
 
     #[test]
