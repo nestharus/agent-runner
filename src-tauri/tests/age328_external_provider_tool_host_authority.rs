@@ -3,6 +3,25 @@
 //! AGE-328 reproduction at the real external-provider/native OpenCode/Bash-tool boundary.
 //!
 //! Declared roles: fixture, orchestration, validator.
+//!
+//! Set `OULIPOLY_AGE328_HOST_FIXTURE=1` to enable the host-bound path. Pinned
+//! source and binary identities can be overridden with:
+//!
+//! - `OULIPOLY_AGE328_PROVIDER_SOURCE`
+//! - `OULIPOLY_AGE328_PROVIDER_SOURCE_HEAD`
+//! - `OULIPOLY_AGE328_PROVIDER_BIN`
+//! - `OULIPOLY_AGE328_PROVIDER_SHA256`
+//! - `OULIPOLY_AGE328_NATIVE_OPENCODE_BIN`
+//! - `OULIPOLY_AGE328_NATIVE_OPENCODE_VERSION`
+//! - `OULIPOLY_AGE328_NATIVE_OPENCODE_SHA256`
+//! - `OULIPOLY_AGE328_BUN_BIN`
+//! - `OULIPOLY_AGE328_BUN_SHA256`
+//! - `OULIPOLY_AGE328_AGENT_BASH_SOURCE`
+//! - `OULIPOLY_AGE328_AGENT_BASH_SOURCE_HEAD`
+//! - `OULIPOLY_AGE328_AGENT_BASH_BIN`
+//! - `OULIPOLY_AGE328_AGENT_BASH_SHA256`
+//! - `OULIPOLY_AGE328_BASH_ADAPTER_SOURCE`
+//! - `OULIPOLY_AGE328_BASH_ADAPTER_SHA256`
 
 mod provider_authority_fixture;
 
@@ -1419,6 +1438,16 @@ fn serve_responses(
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
+                if stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .is_err()
+                    || stream
+                        .set_write_timeout(Some(Duration::from_secs(30)))
+                        .is_err()
+                {
+                    record_protocol_error(&requests);
+                    continue;
+                }
                 respond(stream, &marker, &requests);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
