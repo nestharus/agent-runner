@@ -21,9 +21,10 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const MODEL: &str = "gpt-low";
 const PROVIDER: &str = "opencode";
@@ -592,7 +593,12 @@ impl Fixture {
             .unwrap();
     }
 
-    fn observe_carrier(&self, carrier: Carrier, output: &Output) -> CarrierObservation {
+    fn observe_carrier(
+        &self,
+        carrier: Carrier,
+        output: &Output,
+        agent_bash_state_entries_before: usize,
+    ) -> CarrierObservation {
         let invocation_uuid = parse_current_invocation(output)
             .unwrap_or_else(|reason| panic!("BLOCKED:{}-{reason}", carrier.marker()));
         assert_ne!(
@@ -712,7 +718,8 @@ impl Fixture {
             exact_owner_obligation_count,
             workload_count,
             child_parent_matches_current,
-            agent_bash_state_entries: descendant_file_count(&self.state_home.join("agent-bash")),
+            agent_bash_state_entries: descendant_file_count(&self.state_home.join("agent-bash"))
+                .saturating_sub(agent_bash_state_entries_before),
         };
         observation.report();
         observation
@@ -731,11 +738,14 @@ fn contextual_fresh_and_resume_deliver_current_authority_to_real_bash_host() {
     let bootstrap = fixture.run_bootstrap();
     let resume_identity = fixture.bootstrap_resume_identity(&bootstrap);
 
+    let fresh_state_entries = descendant_file_count(&fixture.state_home.join("agent-bash"));
     let fresh = fixture.run_fresh();
-    let fresh_observation = fixture.observe_carrier(Carrier::Fresh, &fresh);
+    let fresh_observation = fixture.observe_carrier(Carrier::Fresh, &fresh, fresh_state_entries);
 
+    let resume_state_entries = descendant_file_count(&fixture.state_home.join("agent-bash"));
     let resumed = fixture.run_resume(&resume_identity.chain_id);
-    let resume_observation = fixture.observe_carrier(Carrier::Resume, &resumed);
+    let resume_observation =
+        fixture.observe_carrier(Carrier::Resume, &resumed, resume_state_entries);
 
     if resume_observation.classification() == "green" {
         assert_eq!(
@@ -1324,6 +1334,8 @@ fn write_opencode_config(config_home: &Path, base_url: &str) {
 struct MockResponsesServer {
     base_url: String,
     requests: Arc<Mutex<Vec<RequestObservation>>>,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl MockResponsesServer {
@@ -1333,10 +1345,15 @@ impl MockResponsesServer {
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&requests);
-        thread::spawn(move || serve_responses(listener, marker, recorded));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let thread =
+            thread::spawn(move || serve_responses(listener, marker, recorded, server_shutdown));
         Self {
             base_url: format!("http://{address}/v1"),
             requests,
+            shutdown,
+            thread: Some(thread),
         }
     }
 
@@ -1384,18 +1401,24 @@ impl MockResponsesServer {
     }
 }
 
+impl Drop for MockResponsesServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 fn serve_responses(
     listener: TcpListener,
     marker: PathBuf,
     requests: Arc<Mutex<Vec<RequestObservation>>>,
+    shutdown: Arc<AtomicBool>,
 ) {
-    const CONNECTION_BUDGET: usize = 12;
-    let started = Instant::now();
-    let mut response_count = 0_usize;
-    while response_count < CONNECTION_BUDGET && started.elapsed() < Duration::from_secs(90) {
+    while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
-                response_count += 1;
                 respond(stream, &marker, &requests);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1407,10 +1430,6 @@ fn serve_responses(
             }
         }
     }
-    eprintln!(
-        "AGE328_FIXTURE_SERVER_EXHAUSTED connections={response_count} elapsed_ms={}",
-        started.elapsed().as_millis()
-    );
 }
 
 fn respond(mut stream: TcpStream, marker: &Path, requests: &Arc<Mutex<Vec<RequestObservation>>>) {
@@ -1419,7 +1438,8 @@ fn respond(mut stream: TcpStream, marker: &Path, requests: &Arc<Mutex<Vec<Reques
         return;
     };
     let mut reader = BufReader::new(cloned);
-    let mut content_length = 0_usize;
+    let mut content_length = None;
+    let mut chunked = false;
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -1433,9 +1453,29 @@ fn respond(mut stream: TcpStream, marker: &Path, requests: &Arc<Mutex<Vec<Reques
         }
         let lowercase = line.to_ascii_lowercase();
         if let Some(value) = lowercase.strip_prefix("content-length:") {
-            content_length = value.trim().parse().unwrap_or(0);
+            let Ok(length) = value.trim().parse() else {
+                eprintln!("AGE328_FIXTURE_INVALID_CONTENT_LENGTH");
+                record_protocol_error(requests);
+                return;
+            };
+            content_length = Some(length);
+        }
+        if let Some(value) = lowercase.strip_prefix("transfer-encoding:") {
+            chunked = value
+                .split(',')
+                .any(|encoding| encoding.trim() == "chunked");
         }
     }
+    if chunked {
+        eprintln!("AGE328_FIXTURE_UNSUPPORTED_REQUEST_FRAMING encoding=chunked");
+        record_protocol_error(requests);
+        return;
+    }
+    let Some(content_length) = content_length else {
+        eprintln!("AGE328_FIXTURE_UNSUPPORTED_REQUEST_FRAMING content_length=missing");
+        record_protocol_error(requests);
+        return;
+    };
     let mut request_body = vec![0_u8; content_length];
     if reader.read_exact(&mut request_body).is_err() {
         record_protocol_error(requests);
