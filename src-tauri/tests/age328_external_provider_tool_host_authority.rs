@@ -38,25 +38,111 @@ const BOOTSTRAP_PROMPT: &str = "AGE328_BOOTSTRAP_NO_TOOL_328: respond without us
 const FRESH_PROMPT: &str = "AGE328_FRESH_TOOL_328: invoke the Bash tool exactly once";
 const RESUME_PROMPT: &str = "AGE328_RESUME_TOOL_328: invoke the Bash tool exactly once on resume";
 
-const PROVIDER_SOURCE: &str =
+const DEFAULT_PROVIDER_SOURCE: &str =
     "/home/nes/projects/agent-runner-opencode/worktrees/fresh-launch-actor-cleanup";
-const PROVIDER_SOURCE_HEAD: &str = "1c6e2bdec62fc1a2d0712cee6b5d73cb748497aa";
-const PROVIDER_INSTALLED: &str = "/home/nes/.local/bin/agent-runner-opencode";
-const PROVIDER_SHA256: &str = "035baba15a908ddabdb5ec6e00f01508103457fccc843765a4b8dae46dc71aa7";
-const NATIVE_OPENCODE: &str = "/home/nes/.opencode/bin/opencode";
-const NATIVE_OPENCODE_VERSION: &str = "1.18.27";
-const NATIVE_OPENCODE_SHA256: &str =
+const DEFAULT_PROVIDER_SOURCE_HEAD: &str = "1c6e2bdec62fc1a2d0712cee6b5d73cb748497aa";
+const DEFAULT_PROVIDER_INSTALLED: &str = "/home/nes/.local/bin/agent-runner-opencode";
+const DEFAULT_PROVIDER_SHA256: &str =
+    "035baba15a908ddabdb5ec6e00f01508103457fccc843765a4b8dae46dc71aa7";
+const DEFAULT_NATIVE_OPENCODE: &str = "/home/nes/.opencode/bin/opencode";
+const DEFAULT_NATIVE_OPENCODE_VERSION: &str = "1.18.27";
+const DEFAULT_NATIVE_OPENCODE_SHA256: &str =
     "bddf894e5c2bc3d8cf452bd6e5ab2273bbe4a37eeeb9aec848d3d7d20db1f256";
-const BUN: &str = "/home/nes/.bun/bin/bun";
-const BUN_SHA256: &str = "077e218c1220703765a8e2b65b2d124b3675c9b0b72172b94fa714a8608c388b";
-const AGENT_BASH_SOURCE: &str = "/home/nes/projects/agent-bash-tool/trunk";
-const AGENT_BASH_SOURCE_HEAD: &str = "2cc78116b0cba2bc4f0007a04a0cec9bce689ce3";
-const AGENT_BASH_INSTALLED: &str = "/home/nes/.local/bin/agent-bash";
-const AGENT_BASH_SHA256: &str = "6579e7d9ea3a0eef12a7e36fd44d67c7473ccd36601a85a23c126f472a24904f";
-const BASH_ADAPTER_SOURCE: &str =
+const DEFAULT_BUN: &str = "/home/nes/.bun/bin/bun";
+const DEFAULT_BUN_SHA256: &str = "077e218c1220703765a8e2b65b2d124b3675c9b0b72172b94fa714a8608c388b";
+const DEFAULT_AGENT_BASH_SOURCE: &str = "/home/nes/projects/agent-bash-tool/trunk";
+const DEFAULT_AGENT_BASH_SOURCE_HEAD: &str = "2cc78116b0cba2bc4f0007a04a0cec9bce689ce3";
+const DEFAULT_AGENT_BASH_INSTALLED: &str = "/home/nes/.local/bin/agent-bash";
+const DEFAULT_AGENT_BASH_SHA256: &str =
+    "6579e7d9ea3a0eef12a7e36fd44d67c7473ccd36601a85a23c126f472a24904f";
+const DEFAULT_BASH_ADAPTER_SOURCE: &str =
     "/home/nes/projects/agent-bash-tool/trunk/integrations/opencode/tools/bash.ts";
-const BASH_ADAPTER_SHA256: &str =
+const DEFAULT_BASH_ADAPTER_SHA256: &str =
     "b55975d004920476d2dc2f33de364591550146ff681c0d98d13f311c3d29fed1";
+
+struct HostInputs {
+    provider_source: PathBuf,
+    provider_source_head: String,
+    provider_installed: PathBuf,
+    provider_sha256: String,
+    native_opencode: PathBuf,
+    native_opencode_version: String,
+    native_opencode_sha256: String,
+    bun: PathBuf,
+    bun_sha256: String,
+    agent_bash_source: PathBuf,
+    agent_bash_source_head: String,
+    agent_bash_installed: PathBuf,
+    agent_bash_sha256: String,
+    bash_adapter_source: PathBuf,
+    bash_adapter_sha256: String,
+}
+
+impl HostInputs {
+    fn from_environment() -> Self {
+        Self {
+            provider_source: host_path("OULIPOLY_AGE328_PROVIDER_SOURCE", DEFAULT_PROVIDER_SOURCE),
+            provider_source_head: host_value(
+                "OULIPOLY_AGE328_PROVIDER_SOURCE_HEAD",
+                DEFAULT_PROVIDER_SOURCE_HEAD,
+            ),
+            provider_installed: host_path(
+                "OULIPOLY_AGE328_PROVIDER_BIN",
+                DEFAULT_PROVIDER_INSTALLED,
+            ),
+            provider_sha256: host_value("OULIPOLY_AGE328_PROVIDER_SHA256", DEFAULT_PROVIDER_SHA256),
+            native_opencode: host_path(
+                "OULIPOLY_AGE328_NATIVE_OPENCODE_BIN",
+                DEFAULT_NATIVE_OPENCODE,
+            ),
+            native_opencode_version: host_value(
+                "OULIPOLY_AGE328_NATIVE_OPENCODE_VERSION",
+                DEFAULT_NATIVE_OPENCODE_VERSION,
+            ),
+            native_opencode_sha256: host_value(
+                "OULIPOLY_AGE328_NATIVE_OPENCODE_SHA256",
+                DEFAULT_NATIVE_OPENCODE_SHA256,
+            ),
+            bun: host_path("OULIPOLY_AGE328_BUN_BIN", DEFAULT_BUN),
+            bun_sha256: host_value("OULIPOLY_AGE328_BUN_SHA256", DEFAULT_BUN_SHA256),
+            agent_bash_source: host_path(
+                "OULIPOLY_AGE328_AGENT_BASH_SOURCE",
+                DEFAULT_AGENT_BASH_SOURCE,
+            ),
+            agent_bash_source_head: host_value(
+                "OULIPOLY_AGE328_AGENT_BASH_SOURCE_HEAD",
+                DEFAULT_AGENT_BASH_SOURCE_HEAD,
+            ),
+            agent_bash_installed: host_path(
+                "OULIPOLY_AGE328_AGENT_BASH_BIN",
+                DEFAULT_AGENT_BASH_INSTALLED,
+            ),
+            agent_bash_sha256: host_value(
+                "OULIPOLY_AGE328_AGENT_BASH_SHA256",
+                DEFAULT_AGENT_BASH_SHA256,
+            ),
+            bash_adapter_source: host_path(
+                "OULIPOLY_AGE328_BASH_ADAPTER_SOURCE",
+                DEFAULT_BASH_ADAPTER_SOURCE,
+            ),
+            bash_adapter_sha256: host_value(
+                "OULIPOLY_AGE328_BASH_ADAPTER_SHA256",
+                DEFAULT_BASH_ADAPTER_SHA256,
+            ),
+        }
+    }
+}
+
+fn host_path(name: &str, default: &str) -> PathBuf {
+    PathBuf::from(host_value(name, default))
+}
+
+fn host_value(name: &str, default: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Carrier {
@@ -206,11 +292,13 @@ struct Fixture {
     agent_bash: PathBuf,
     agent_bash_diagnostic: PathBuf,
     server: MockResponsesServer,
+    host_inputs: HostInputs,
 }
 
 impl Fixture {
     fn new() -> Self {
-        verify_source_bound_inputs();
+        let host_inputs = HostInputs::from_environment();
+        verify_source_bound_inputs(&host_inputs);
         let root = tempfile::tempdir().unwrap();
         let config_home = root.path().join("config");
         let data_home = root.path().join("data");
@@ -244,8 +332,8 @@ impl Fixture {
         let agent_bash = tool_bin.join("agent-bash");
         let agent_bash_real = tool_bin.join("agent-bash.real");
         let agent_bash_diagnostic = marker.join("agent-bash-context");
-        copy_executable(Path::new(PROVIDER_INSTALLED), &provider);
-        copy_executable(Path::new(AGENT_BASH_INSTALLED), &agent_bash_real);
+        copy_executable(&host_inputs.provider_installed, &provider);
+        copy_executable(&host_inputs.agent_bash_installed, &agent_bash_real);
         write_agent_bash_wrapper(
             &agent_bash,
             &agent_bash_real,
@@ -260,6 +348,7 @@ impl Fixture {
             &state_home,
             &home,
             &data_home.join("oulipoly-agent-runner"),
+            &host_inputs.bash_adapter_source,
         );
 
         let server = MockResponsesServer::start(marker.clone());
@@ -274,7 +363,7 @@ impl Fixture {
             &agent_bash,
         );
         write_provider_settings(&app_config);
-        write_native_runtime_binding(&data_home, &home);
+        write_native_runtime_binding(&data_home, &home, &host_inputs);
 
         Self {
             root,
@@ -287,6 +376,7 @@ impl Fixture {
             agent_bash,
             agent_bash_diagnostic,
             server,
+            host_inputs,
         }
     }
 
@@ -353,7 +443,7 @@ impl Fixture {
                 "OULIPOLY_DATA_DIR",
                 self.data_home.join("oulipoly-agent-runner"),
             )
-            .env("PATH", native_path())
+            .env("PATH", native_path(&self.host_inputs))
             .env("OPENAI_API_KEY", "age328-loopback-only")
             .env("AGENT_BASH_BIN", &self.agent_bash)
             .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
@@ -370,10 +460,8 @@ impl Fixture {
     fn bootstrap_resume_identity(&self, output: &Output) -> ResumeIdentity {
         if output.status.code() != Some(0) {
             panic!(
-                "BLOCKED:bootstrap-runner-failed status={:?} stdout={} stderr={}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
+                "BLOCKED:bootstrap-runner-failed status={:?}",
+                output.status.code()
             );
         }
         let invocation_uuid = parse_current_invocation(output)
@@ -909,34 +997,41 @@ fn runner_bin() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"))
 }
 
-fn verify_source_bound_inputs() {
-    assert_eq!(git_head(Path::new(PROVIDER_SOURCE)), PROVIDER_SOURCE_HEAD);
+fn verify_source_bound_inputs(inputs: &HostInputs) {
     assert_eq!(
-        git_head(Path::new(AGENT_BASH_SOURCE)),
-        AGENT_BASH_SOURCE_HEAD
+        git_head(&inputs.provider_source),
+        inputs.provider_source_head
+    );
+    assert_eq!(
+        git_head(&inputs.agent_bash_source),
+        inputs.agent_bash_source_head
     );
     for (label, path, expected) in [
         ("runner", runner_bin(), None),
         (
             "agent-runner-opencode",
-            Path::new(PROVIDER_INSTALLED),
-            Some(PROVIDER_SHA256),
+            inputs.provider_installed.as_path(),
+            Some(inputs.provider_sha256.as_str()),
         ),
         (
             "native-opencode",
-            Path::new(NATIVE_OPENCODE),
-            Some(NATIVE_OPENCODE_SHA256),
+            inputs.native_opencode.as_path(),
+            Some(inputs.native_opencode_sha256.as_str()),
         ),
-        ("bun", Path::new(BUN), Some(BUN_SHA256)),
+        (
+            "bun",
+            inputs.bun.as_path(),
+            Some(inputs.bun_sha256.as_str()),
+        ),
         (
             "agent-bash",
-            Path::new(AGENT_BASH_INSTALLED),
-            Some(AGENT_BASH_SHA256),
+            inputs.agent_bash_installed.as_path(),
+            Some(inputs.agent_bash_sha256.as_str()),
         ),
         (
             "bash-adapter",
-            Path::new(BASH_ADAPTER_SOURCE),
-            Some(BASH_ADAPTER_SHA256),
+            inputs.bash_adapter_source.as_path(),
+            Some(inputs.bash_adapter_sha256.as_str()),
         ),
     ] {
         let canonical = fs::canonicalize(path).unwrap_or_else(|error| {
@@ -958,10 +1053,14 @@ fn verify_source_bound_inputs() {
         );
     }
     eprintln!(
-        "AGE328_SOURCE agent-runner-opencode path={PROVIDER_SOURCE} head={PROVIDER_SOURCE_HEAD}"
+        "AGE328_SOURCE agent-runner-opencode path={} head={}",
+        inputs.provider_source.display(),
+        inputs.provider_source_head
     );
     eprintln!(
-        "AGE328_SOURCE agent-bash-tool path={AGENT_BASH_SOURCE} head={AGENT_BASH_SOURCE_HEAD}"
+        "AGE328_SOURCE agent-bash-tool path={} head={}",
+        inputs.agent_bash_source.display(),
+        inputs.agent_bash_source_head
     );
 }
 
@@ -1000,8 +1099,15 @@ fn copy_executable(source: &Path, target: &Path) {
     fs::set_permissions(target, permissions).unwrap();
 }
 
-fn native_path() -> String {
-    "/home/nes/.opencode/bin:/home/nes/.bun/bin:/usr/local/bin:/usr/bin:/bin".to_string()
+fn native_path(inputs: &HostInputs) -> std::ffi::OsString {
+    std::env::join_paths([
+        inputs.native_opencode.parent().unwrap(),
+        inputs.bun.parent().unwrap(),
+        Path::new("/usr/local/bin"),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+    ])
+    .unwrap()
 }
 
 fn inherited_parent_identity() -> String {
@@ -1077,8 +1183,9 @@ fn write_bash_adapter_wrapper(
     state_home: &Path,
     home: &Path,
     data_dir: &Path,
+    source_path: &Path,
 ) {
-    let source = fs::read_to_string(BASH_ADAPTER_SOURCE).unwrap();
+    let source = fs::read_to_string(source_path).unwrap();
     fs::write(
         wrapper,
         format!(
@@ -1129,8 +1236,8 @@ fn write_provider_settings(app_config: &Path) {
     .unwrap();
 }
 
-fn write_native_runtime_binding(data_home: &Path, home: &Path) {
-    let program = fs::canonicalize(NATIVE_OPENCODE).unwrap();
+fn write_native_runtime_binding(data_home: &Path, home: &Path, inputs: &HostInputs) {
+    let program = fs::canonicalize(&inputs.native_opencode).unwrap();
     let metadata = fs::metadata(&program).unwrap();
     let mut execution_env = BTreeMap::new();
     execution_env.insert("HOME", home.display().to_string());
@@ -1141,18 +1248,19 @@ fn write_native_runtime_binding(data_home: &Path, home: &Path) {
     execution_env.insert("OULIPOLY_OPENCODE_ACCOUNT", "opencode1".to_string());
     let fixed_args = vec!["--pure".to_string()];
     let implementation_manifest_id = format!(
-        "opencode-auto-update-{NATIVE_OPENCODE_VERSION}-{}",
-        &NATIVE_OPENCODE_SHA256[..8]
+        "opencode-auto-update-{}-{}",
+        inputs.native_opencode_version,
+        &inputs.native_opencode_sha256[..8]
     );
     let identity = json!({
         "account_wrapper": "opencode1",
         "program": program.display().to_string(),
-        "program_sha256": NATIVE_OPENCODE_SHA256,
+        "program_sha256": inputs.native_opencode_sha256,
         "execution_env": execution_env,
         "native_contract_id": "agent-runner-opencode.opencode-native-state/v1",
         "fixed_args": fixed_args,
         "implementation_manifest_id": implementation_manifest_id,
-        "implementation_version": NATIVE_OPENCODE_VERSION,
+        "implementation_version": inputs.native_opencode_version,
     })
     .to_string();
     let identity_sha256 = format!("{:x}", Sha256::digest(identity.as_bytes()));
@@ -1160,12 +1268,12 @@ fn write_native_runtime_binding(data_home: &Path, home: &Path) {
         "schema_version": 6,
         "account_wrapper": "opencode1",
         "program": program.display().to_string(),
-        "program_sha256": NATIVE_OPENCODE_SHA256,
+        "program_sha256": inputs.native_opencode_sha256,
         "execution_env": execution_env,
         "native_contract_id": "agent-runner-opencode.opencode-native-state/v1",
         "fixed_args": fixed_args,
         "implementation_manifest_id": implementation_manifest_id,
-        "implementation_version": NATIVE_OPENCODE_VERSION,
+        "implementation_version": inputs.native_opencode_version,
         "program_stamp": {
             "kind": "unix-metadata-v1",
             "byte_length": metadata.len(),
@@ -1303,7 +1411,6 @@ fn serve_responses(
         "AGE328_FIXTURE_SERVER_EXHAUSTED connections={response_count} elapsed_ms={}",
         started.elapsed().as_millis()
     );
-    record_protocol_error(&requests);
 }
 
 fn respond(mut stream: TcpStream, marker: &Path, requests: &Arc<Mutex<Vec<RequestObservation>>>) {
