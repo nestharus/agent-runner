@@ -724,6 +724,39 @@ mod tests {
     }
 
     #[test]
+    fn provider_launch_preserves_current_authority_for_private_transport() {
+        let invocation = CompositeInvocationId {
+            source: "opencode3".to_string(),
+            id: "11111111-1111-4111-8111-111111111111".to_string(),
+        };
+        let authority =
+            oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+                "ab".repeat(32),
+            )
+            .unwrap();
+        let current = authority
+            .invocation_launch_environment(&invocation)
+            .unwrap();
+
+        let selected = provider_parent_invocation_env(Some(&current)).unwrap();
+        let (observable_identity, transported_authority) =
+            split_invocation_launch_environment(&selected).unwrap();
+
+        assert_eq!(
+            CompositeInvocationId::parse_env_value(&observable_identity).unwrap(),
+            invocation
+        );
+        assert!(
+            !observable_identity
+                .contains(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD)
+        );
+        assert_eq!(
+            transported_authority.as_deref(),
+            Some(authority.process_environment_value())
+        );
+    }
+
+    #[test]
     fn provider_without_current_invocation_has_no_capability_owner() {
         assert_eq!(provider_parent_invocation_env(None), None);
     }

@@ -195,6 +195,7 @@ enum RequestObservationKind {
     NoToolResponse,
     ToolCallIssued,
     ToolResult(ToolResultClass),
+    Unmatched,
     ProtocolError,
 }
 
@@ -1589,7 +1590,7 @@ fn request_observation(request_body: &[u8]) -> RequestObservation {
             RequestObservationKind::ToolCallIssued
         }
         Some(Carrier::Fresh | Carrier::Resume) => RequestObservationKind::NoToolResponse,
-        None => RequestObservationKind::ProtocolError,
+        None => RequestObservationKind::Unmatched,
     };
     let call_id = matches!(kind, RequestObservationKind::ToolCallIssued)
         .then(|| expected_call_id(carrier.expect("tool request carrier")));
