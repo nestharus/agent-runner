@@ -4,8 +4,11 @@
 //!
 //! Declared roles: fixture, orchestration, validator.
 //!
-//! Set `OULIPOLY_AGE328_HOST_FIXTURE=1` to enable the host-bound path. Pinned
-//! source and binary identities can be overridden with:
+//! This is a manual production-host canary, not a hermetic CI test: generic CI
+//! does not have its audited external binaries and source checkouts. Set
+//! `OULIPOLY_AGE328_HOST_FIXTURE=1` to enable the host-bound path. Defaults
+//! intentionally bind the audited production host; override every affected path,
+//! version, commit, and digest together to re-pin another trusted host:
 //!
 //! - `OULIPOLY_AGE328_PROVIDER_SOURCE`
 //! - `OULIPOLY_AGE328_PROVIDER_SOURCE_HEAD`
@@ -555,6 +558,11 @@ impl Fixture {
             0,
             "BLOCKED:bootstrap-issued-tool-call"
         );
+        assert_eq!(
+            self.server.protocol_error_count(),
+            0,
+            "BLOCKED:bootstrap-fixture-protocol-error"
+        );
         eprintln!(
             "AGE328_BOOTSTRAP invocation={invocation_uuid} provider={provider_name} provider_session={provider_session_id} chain={chain_id} status=ready"
         );
@@ -617,6 +625,7 @@ impl Fixture {
         carrier: Carrier,
         output: &Output,
         agent_bash_state_entries_before: usize,
+        protocol_errors_before: usize,
     ) -> CarrierObservation {
         let invocation_uuid = parse_current_invocation(output)
             .unwrap_or_else(|reason| panic!("BLOCKED:{}-{reason}", carrier.marker()));
@@ -730,7 +739,10 @@ impl Fixture {
                 .map(str::to_string),
             issued_call_ids,
             result_call_ids,
-            fixture_protocol_errors: self.server.protocol_error_count(),
+            fixture_protocol_errors: self
+                .server
+                .protocol_error_count()
+                .saturating_sub(protocol_errors_before),
             missing_authority_results,
             other_tool_results,
             obligation_count,
@@ -758,13 +770,24 @@ fn contextual_fresh_and_resume_deliver_current_authority_to_real_bash_host() {
     let resume_identity = fixture.bootstrap_resume_identity(&bootstrap);
 
     let fresh_state_entries = descendant_file_count(&fixture.state_home.join("agent-bash"));
+    let fresh_protocol_errors = fixture.server.protocol_error_count();
     let fresh = fixture.run_fresh();
-    let fresh_observation = fixture.observe_carrier(Carrier::Fresh, &fresh, fresh_state_entries);
+    let fresh_observation = fixture.observe_carrier(
+        Carrier::Fresh,
+        &fresh,
+        fresh_state_entries,
+        fresh_protocol_errors,
+    );
 
     let resume_state_entries = descendant_file_count(&fixture.state_home.join("agent-bash"));
+    let resume_protocol_errors = fixture.server.protocol_error_count();
     let resumed = fixture.run_resume(&resume_identity.chain_id);
-    let resume_observation =
-        fixture.observe_carrier(Carrier::Resume, &resumed, resume_state_entries);
+    let resume_observation = fixture.observe_carrier(
+        Carrier::Resume,
+        &resumed,
+        resume_state_entries,
+        resume_protocol_errors,
+    );
 
     if resume_observation.classification() == "green" {
         assert_eq!(
