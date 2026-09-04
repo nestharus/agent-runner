@@ -845,8 +845,11 @@ fn configure_provider_process(process: &mut Command, command: &ProcessCommand) {
 fn provider_execution_path(command: &ProcessCommand) -> PathBuf {
     use std::os::fd::AsRawFd;
 
-    // Keep script-visible path semantics while it still names the selected inode.
-    if command.is_script && script_path_still_names_pinned_executable(command) {
+    // Apple cannot execute the pinned descriptor through /dev/fd, so use the
+    // visible path only while it still names the selected inode.
+    if (command.is_script || cfg!(target_vendor = "apple"))
+        && program_path_still_names_pinned_executable(command)
+    {
         return command.program.clone();
     }
     command
@@ -862,7 +865,7 @@ fn provider_execution_path(command: &ProcessCommand) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn script_path_still_names_pinned_executable(command: &ProcessCommand) -> bool {
+fn program_path_still_names_pinned_executable(command: &ProcessCommand) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     let Some(executable) = command.pinned_executable.as_ref() else {
@@ -1675,6 +1678,8 @@ pub(crate) fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_vendor = "apple")]
+    use super::provider_execution_path;
     use super::{
         ByteAccumulator, ByteLimit, CancellationToken, ProcessCommand, ProcessLimits,
         ProcessRunner, ProcessSpawnObserver, STATUS_POLL_INTERVAL, StdoutProcessor,
@@ -1687,6 +1692,32 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apple_native_provider_uses_verified_program_path_and_rejects_replacement() {
+        use std::fs::{self, File};
+
+        let directory = std::env::temp_dir().join(format!(
+            "oulipoly-provider-apple-pinned-path-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let program = directory.join("provider");
+        let replacement = directory.join("replacement");
+        fs::write(&program, b"selected").expect("write selected provider");
+        fs::write(&replacement, b"replacement").expect("write replacement provider");
+        let pinned = Arc::new(File::open(&program).expect("open selected provider"));
+        let command = ProcessCommand::new(&program).with_pinned_executable(Some(pinned));
+
+        assert_eq!(provider_execution_path(&command), program);
+
+        fs::rename(&replacement, &program).expect("replace configured provider");
+        let replacement_path = provider_execution_path(&command);
+        assert_ne!(replacement_path, program);
+        assert!(replacement_path.starts_with("/dev/fd"));
+        fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
 
     #[test]
     fn process_writes_one_json_object_closes_stdin_and_drains_stderr() {
