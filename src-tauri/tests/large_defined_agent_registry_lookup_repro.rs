@@ -416,6 +416,11 @@ if __name__ == "__main__":
             "{name}: authoritative provider stdout changed"
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches("OULIPOLY_RESULT=").count(),
+            1,
+            "{name}: expected exactly one result envelope: {stderr}"
+        );
         assert!(
             stderr.contains("OULIPOLY_SESSION=")
                 && stderr.contains(&format!(
@@ -509,7 +514,7 @@ impl CaseResult {
                     "\"provider_session_id\":\"fixture-session-{}\"",
                     self.name
                 )),
-            String::from_utf8_lossy(&self.output.stdout).contains("OULIPOLY_RESULT="),
+            String::from_utf8_lossy(&self.output.stderr).contains("OULIPOLY_RESULT="),
         )
     }
 }

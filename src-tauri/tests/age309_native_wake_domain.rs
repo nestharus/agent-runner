@@ -285,6 +285,8 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
     let initial = fixture.run_initial();
     assert_success(&initial);
     assert_eq!(initial.stdout, b"native initial\n");
+    let stderr = String::from_utf8_lossy(&initial.stderr);
+    assert_eq!(stderr.matches("OULIPOLY_RESULT=").count(), 1, "{stderr}");
     let owner_invocation_uuid = latest_invocation_uuid(&fixture.state_path());
     fixture.seed_pending_delivery(&owner_invocation_uuid);
 

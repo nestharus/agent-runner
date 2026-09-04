@@ -647,6 +647,7 @@ fn one_shot_clean_exit_with_turn_preserves_status_zero_no_terminal_reason() {
         stdout, expected_stdout,
         "authoritative provider output must remain byte-clean"
     );
+    assert_eq!(stderr.matches("OULIPOLY_RESULT=").count(), 1, "{stderr}");
     assert_eq!(
         latest_invocation_terminal_reason(&fixture, "claude-age166-clean"),
         None
@@ -719,6 +720,7 @@ fn one_shot_provider_without_session_id_does_not_emit_maybe_quota() {
     let (stdout, stderr) = output_text(&output);
     assert_no_maybe_marker(&stderr);
     assert_eq!(stdout, "ordinary sessionless success\n");
+    assert_eq!(stderr.matches("OULIPOLY_RESULT=").count(), 1, "{stderr}");
     assert_eq!(fixture.exhausted_row_count("openai-compatible-age166"), 0);
     assert_eq!(
         fixture.successful_invocation_count_without_terminal_reason("openai-compatible-age166"),

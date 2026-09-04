@@ -44,10 +44,14 @@ fn pre_invocation_failure_marker_bytes_are_characterized() {
 }
 
 #[test]
-fn spooled_success_omits_result_and_preserves_session_marker_bytes() {
+fn spooled_success_emits_stderr_result_and_preserves_session_marker_bytes() {
     let output = success_with_session_output();
 
     assert_success_exit(&output);
+    assert_eq!(
+        prefixed_lines(&String::from_utf8_lossy(&output.stderr), "OULIPOLY_RESULT=").len(),
+        1
+    );
     assert!(
         prefixed_lines(&String::from_utf8_lossy(&output.stdout), "OULIPOLY_RESULT=").is_empty()
     );

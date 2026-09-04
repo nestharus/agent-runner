@@ -1057,7 +1057,7 @@ fn external_provider_resume_terminal_error_exit_zero_finalizes_as_failed() {
 
     let output = fixture.run_resume_with_env(&[("S10_PROVIDER_ERROR_EXIT_ZERO", "1")]);
 
-    assert_failed_terminal_error_process(&output);
+    assert_failed_terminal_error_output(&output);
     assert_latest_invocation_failed_with_terminal_error(&fixture);
 }
 
@@ -1138,12 +1138,41 @@ fn combined_output(output: &Output) -> String {
 
 fn assert_failed_terminal_error_output(output: &Output) {
     assert_failed_terminal_error_process(output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation_id = single_invocation_id(&stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let result = assert_result_envelope_shape(&stdout);
+    assert_eq!(result["id"], invocation_id);
+    assert_eq!(result["agent_runner_invocation_id"], invocation_id);
     assert_eq!(result["status"], "failed");
     assert_eq!(result["success"], false);
     assert_eq!(result["exit_code"], -1);
+    assert_eq!(result["error_category"], INCIDENT_TERMINAL_REASON);
     assert_eq!(result["terminal_reason"], INCIDENT_TERMINAL_REASON);
+    assert_eq!(result["provider_name"], PROVIDER);
+    assert_eq!(result["provider_session_id"], SESSION_ID);
+    assert!(
+        result["agent_runner_chain_id"].as_str().is_some(),
+        "{result}"
+    );
+    assert!(result["finished_at"].as_str().is_some(), "{result}");
+}
+
+fn single_invocation_id(stderr: &str) -> String {
+    let lines: Vec<_> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_INVOCATION="))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "terminal-error execution must emit one invocation identity:\n{stderr}"
+    );
+    let value: Value = serde_json::from_str(lines[0]).expect("parse invocation identity");
+    value["id"]
+        .as_str()
+        .expect("invocation identity id")
+        .to_string()
 }
 
 fn assert_failed_terminal_error_process(output: &Output) {

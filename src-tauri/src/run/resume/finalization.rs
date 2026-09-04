@@ -268,31 +268,18 @@ fn handle_completed_success(
             },
         },
     );
-    if let Err(error) =
-        formatter::emit_resume_success_output(&input.invocation.id, error_category, input.result)
-    {
-        if let Err(state_error) = input.env.state.mark_invocation_output_delivery_failed(
-            input.invocation_row_id,
-            "payload_or_control",
-            &format!("{:?}", error.kind()),
-            None,
-        ) {
-            formatter::emit_stderr(&format!(
-                "failed to record provider output delivery failure: {state_error}"
-            ));
-        }
-        formatter::emit_stderr(&format!("failed to deliver provider output: {error}"));
-        return CompletedAttemptControl::Return(1);
-    }
-    if input.result.output_spool.is_some()
-        && let Err(error) = input
-            .env
-            .state
-            .mark_invocation_output_delivered(input.invocation_row_id)
-    {
-        formatter::emit_stderr(&format!(
-            "failed to record provider output delivery: {error}"
-        ));
+    if !crate::run::spooled_success_delivery::settle(
+        &input.env.state,
+        input.invocation_row_id,
+        input.result.output_spool.is_some(),
+        || {
+            formatter::emit_resume_success_output(
+                &input.invocation.id,
+                error_category,
+                input.result,
+            )
+        },
+    ) {
         return CompletedAttemptControl::Return(1);
     }
     CompletedAttemptControl::Return(if input.recovered_generic_nonzero {

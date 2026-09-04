@@ -114,8 +114,20 @@ fn opencode_error_event_followed_by_later_event_finalizes_one_shot_as_succeeded(
         stdout,
         format!("{INCIDENT_SQLITE_ERROR_EVENT}\n{RECOVERED_EVENT}\n")
     );
-    assert!(!stdout.contains("OULIPOLY_RESULT="), "{stdout}");
+    let result = success_result_envelope(&String::from_utf8_lossy(&output.stderr));
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(result["success"], true);
+    assert_eq!(result["exit_code"], 0);
     assert_invocation_row(&fixture, InvocationStatus::Succeeded, 1, 0, None);
+}
+
+fn success_result_envelope(stream: &str) -> Value {
+    let lines = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{stream}");
+    serde_json::from_str(lines[0]).expect("parse result envelope")
 }
 
 #[test]

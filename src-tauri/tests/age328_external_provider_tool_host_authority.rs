@@ -651,7 +651,7 @@ impl Fixture {
                 .unwrap(),
             _ => None,
         };
-        let result = parse_single_marker(&output.stdout, "OULIPOLY_RESULT=")
+        let result = parse_single_marker(&output.stderr, "OULIPOLY_RESULT=")
             .unwrap_or_else(|reason| panic!("BLOCKED:{}-result-{reason}", carrier.marker()));
         let result_success = result
             .as_ref()

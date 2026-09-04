@@ -193,10 +193,10 @@ fn parse_invocation(stderr: &str) -> String {
         .to_string()
 }
 
-fn assert_resume_success_result(stdout: &[u8]) {
-    let stdout = String::from_utf8_lossy(stdout);
-    assert_eq!(stdout, "resume stdout");
-    assert!(!stdout.contains("OULIPOLY_RESULT="), "{stdout}");
+fn assert_resume_success_result(output: &Output) {
+    assert_eq!(output.stdout, b"resume stdout");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("OULIPOLY_RESULT=").count(), 1, "{stderr}");
 }
 
 fn invocation_count(db: &StateDb) -> i64 {
@@ -277,12 +277,9 @@ printf 'provider stdout'"#,
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(output.stdout, b"provider stdout", "{:?}", output.stdout);
-    assert!(
-        !String::from_utf8_lossy(&output.stdout).contains("OULIPOLY_RESULT="),
-        "{:?}",
-        output.stdout
-    );
-    let invocation_id = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("OULIPOLY_RESULT=").count(), 1, "{stderr}");
+    let invocation_id = parse_invocation(&stderr);
     let db = fixture.open_db();
     let row = db.get_invocation_by_uuid(&invocation_id).unwrap().unwrap();
     assert_eq!(row.status, InvocationStatus::Succeeded);
@@ -349,7 +346,7 @@ printf 'resume stdout'"#,
     let output = fixture.run_headless_resume(session_id);
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert_resume_success_result(&output.stdout);
+    assert_resume_success_result(&output);
     let invocation_id = parse_invocation(&String::from_utf8_lossy(&output.stderr));
     let db = fixture.open_db();
     let row = db.get_invocation_by_uuid(&invocation_id).unwrap().unwrap();

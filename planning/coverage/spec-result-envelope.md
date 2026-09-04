@@ -4,13 +4,18 @@
 
 - `crates/oulipoly-state/src/result_envelope.rs`
 - `crates/oulipoly-state/src/db.rs`
+- `crates/oulipoly-runtime/src/executor/output_spool.rs`
 - `src-tauri/src/dispatch.rs`
+- `src-tauri/src/invocation/result_envelope.rs`
+- `src-tauri/src/run/spooled_success_delivery.rs`
+- `src-tauri/src/run/balancing/formatter.rs`
+- `src-tauri/src/run/resume/formatter.rs`
 
 ## Preconditions
 
 - A balanced CLI invocation has reached either a committed invocation row or
   a pre-invocation fast-fail stage before the row exists.
-- For committed invocations: the stdout emitter and raw `.result`
+- For committed invocations: the stream emitter and raw `.result`
   artifact writer both build `OULIPOLY_RESULT` payloads through the shared
   result-envelope DTO/builder in `oulipoly-state`.
 - For failure identity: provider account, provider session, and chain
@@ -20,7 +25,8 @@
 
 | Input situation | Expected output |
 |-----------------|-----------------|
-| Successful committed invocation. | stdout emits exactly one `OULIPOLY_RESULT=` payload with the frozen seven-key success ABI: `error_category`, `exit_code`, `finished_at`, `id`, `status`, `success`, `terminal_reason`; no failure identity fields are present. |
+| Successful committed non-spooled invocation. | stdout emits exactly one `OULIPOLY_RESULT=` payload with the frozen seven-key success ABI: `error_category`, `exit_code`, `finished_at`, `id`, `status`, `success`, `terminal_reason`; no failure identity fields are present. |
+| Successful committed external-provider spool. | stdout contains only the byte-exact provider payload, including its exact trailing-newline state, and provider stderr is replayed unchanged. After complete spool delivery and a successful stdout flush, the runner emits its `OULIPOLY_RESULT=` payload on stderr with the same frozen success ABI and terminal outcome as the raw result artifact. A stderr-owned separator keeps the runner record line-anchored and ordered after the payload in `2>&1 | tee` output without changing stdout. Provider bytes may contain shape-valid matching-UUID result lines; after successful process exit, a merged-capture consumer ignores those earlier lines and treats only the final shape-valid record matching the invocation as authoritative. Delivery is successful only after both payload and control-record writes succeed. |
 | Failed committed invocation. | stdout emits exactly one `OULIPOLY_RESULT=` payload with the seven common keys plus `agent_runner_invocation_id`, `provider_name`, `provider_session_id`, `agent_runner_chain_id`; raw `<uuid>.result` uses the same key set and identity nullability. |
 | Failure identity is assembled for a committed invocation. | `agent_runner_invocation_id == id`; provider and session fields reflect best in-scope values; unavailable values are JSON `null`. |
 | Provider session has an existing chain. | `agent_runner_chain_id` is populated from `StateDb::chain_id_for_segment(provider_name, provider_session_id)`. |
@@ -32,7 +38,7 @@
 
 ## Edge cases
 
-- `finished_at` may differ between stdout emission time and raw artifact
+- `finished_at` may differ between stream emission time and raw artifact
   finalize time; key set and failure identity nullability must stay in
   lockstep across the two producers.
 - Start-known provider session identity must survive spawn/setup failure
@@ -44,6 +50,11 @@
   include at most four non-empty lines, and respect UTF-8 boundaries.
 - Strict result recognizers accept success exact-seven and failure
   exact-eleven shapes only; unrelated extra keys remain rejected.
+- Provider stdout and stderr may each contain anchored, shape-valid
+  `OULIPOLY_RESULT` lines for the current invocation. They remain byte-exact
+  provider data. In a successful merged external-provider capture, only the
+  final shape-valid matching-`id` record has runner provenance because the
+  runner writes it after complete spool delivery and stdout flush.
 
 ## Error conditions
 
@@ -76,7 +87,8 @@
 ## Declared test patterns
 
 Per `~/ai/conventions/testing.md`: shared-builder shape tests,
-stdout/raw artifact lockstep tests, every failure emit-site fixture,
+stream/raw artifact lockstep tests, byte-exact spooled stdout/stderr tests,
+hostile matching-marker fresh/resume tests, every failure emit-site fixture,
 pre-invocation marker fixtures, unknown diagnostic redaction/truncation,
 and strict recognizer compatibility.
 

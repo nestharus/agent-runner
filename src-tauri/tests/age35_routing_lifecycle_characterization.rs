@@ -434,14 +434,11 @@ fn assert_result_envelope_contract(
         0,
         "no parent marker should be emitted when no parent env is supplied: {stderr}"
     );
-    if expected_success {
-        assert!(
-            result_envelope_lines(&stdout).is_empty(),
-            "successful spooled output must not append a result envelope: {stdout}"
-        );
-        return;
-    }
-    let envelope = result_envelope(&stdout);
+    let envelope = if expected_success {
+        result_envelope(&stderr)
+    } else {
+        result_envelope(&stdout)
+    };
     let keys: BTreeSet<&str> = envelope
         .as_object()
         .unwrap()
@@ -457,15 +454,22 @@ fn assert_result_envelope_contract(
         "success",
         "terminal_reason",
     ]);
-    let mut expected = base_keys;
-    expected.extend([
-        "agent_runner_invocation_id",
-        "provider_name",
-        "provider_session_id",
-        "agent_runner_chain_id",
-    ]);
+    let expected = if expected_success {
+        base_keys
+    } else {
+        let mut expected = base_keys;
+        expected.extend([
+            "agent_runner_invocation_id",
+            "provider_name",
+            "provider_session_id",
+            "agent_runner_chain_id",
+        ]);
+        expected
+    };
     assert_eq!(keys, expected);
-    assert_eq!(envelope["agent_runner_invocation_id"], envelope["id"]);
+    if !expected_success {
+        assert_eq!(envelope["agent_runner_invocation_id"], envelope["id"]);
+    }
     assert_eq!(envelope["status"], expected_status);
     assert_eq!(envelope["success"], expected_success);
     assert_eq!(envelope["exit_code"], expected_exit_code);
@@ -578,9 +582,10 @@ fn age_81_one_shot_retries_first_quota_exhausted_provider_then_succeeds() {
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("age81-b executed\n"), "{stdout}");
-    assert!(!stdout.contains("OULIPOLY_RESULT="), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.starts_with("age81-b executed\n"), "{stdout}");
+    assert!(result_envelope_lines(&stdout).is_empty(), "{stdout}");
+    assert_eq!(result_envelope_lines(&stderr).len(), 1, "{stderr}");
     assert!(
         stderr.contains("age81-a") && stderr.contains("rotating to another provider"),
         "{stderr}"
@@ -630,9 +635,10 @@ fn age_81_one_shot_retries_n_minus_one_quota_exhausted_providers_then_succeeds()
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("age81-c executed\n"), "{stdout}");
-    assert!(!stdout.contains("OULIPOLY_RESULT="), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.starts_with("age81-c executed\n"), "{stdout}");
+    assert!(result_envelope_lines(&stdout).is_empty(), "{stdout}");
+    assert_eq!(result_envelope_lines(&stderr).len(), 1, "{stderr}");
     assert_eq!(
         stderr.matches("rotating to another provider").count(),
         2,
