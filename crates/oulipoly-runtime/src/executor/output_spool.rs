@@ -356,10 +356,7 @@ impl SpooledStream {
         destination.flush()?;
         destination.sync_all()?;
         drop(destination);
-        std::fs::rename(&tmp_path, final_path)?;
-        if let Some(parent) = final_path.parent() {
-            File::open(parent)?.sync_all()?;
-        }
+        publish_output_file(&tmp_path, final_path)?;
         self.file = OpenOptions::new().read(true).write(true).open(final_path)?;
         self.file.seek(SeekFrom::End(0))?;
         self.persisted_path = Some(final_path.to_path_buf());
@@ -390,6 +387,43 @@ impl SpooledStream {
             .map(|byte| format!("{byte:02x}"))
             .collect()
     }
+}
+
+#[cfg(not(windows))]
+fn publish_output_file(tmp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp_path, final_path)?;
+    if let Some(parent) = final_path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn publish_output_file(tmp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let source = tmp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = final_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
