@@ -408,9 +408,10 @@ fn delivery_state_write_failure_leaves_retained_output_failed_without_provider_r
         );
         assert_eq!(fs::read(delivery.stdout_path).unwrap(), carrier.stdout());
         assert_eq!(fs::read(delivery.stderr_path).unwrap(), carrier.stderr());
+        let provider_launches = fs::read_to_string(&fixture.provider_started).unwrap();
         assert_eq!(
-            fs::read_to_string(&fixture.provider_started).unwrap(),
-            "delivery-state\n",
+            provider_launches.lines().collect::<Vec<_>>(),
+            ["delivery-state"],
             "{carrier:?}: provider launch must not be redispatched"
         );
     }
