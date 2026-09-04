@@ -411,10 +411,17 @@ fn default_cli_flow_still_runs_without_subcommand() {
     let output = fixture.run_default_execution();
 
     assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout, "fixture-response\n");
-    assert!(!stdout.contains("OULIPOLY_RESULT="), "{stdout}");
+    assert_eq!(output.stdout, b"fixture-response\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{stderr}");
+    let result: Value = serde_json::from_str(lines[0]).expect("parse result envelope");
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(result["success"], true);
+    assert_eq!(result["exit_code"], 0);
     assert!(stderr.contains("OULIPOLY_INVOCATION="), "{stderr}");
 }
 

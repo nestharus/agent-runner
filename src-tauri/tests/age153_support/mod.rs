@@ -373,6 +373,10 @@ impl Age153Fixture {
         self.stage_active_provider_session_jsonl(provider);
     }
 
+    pub fn stage_active_session_jsonl(&self, provider: &str) {
+        self.stage_active_provider_session_jsonl(provider);
+    }
+
     pub fn seed_active_chain(&self, provider: &str, model: &str) {
         let conn = self.conn();
         conn.execute(
@@ -451,6 +455,7 @@ impl Age153Fixture {
             self.data_home.join("oulipoly-agent-runner"),
         );
         cmd.env("HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_CONFIG_HOME");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
     }
@@ -772,25 +777,25 @@ pub fn assert_no_terminal_marker_on_stdout(output: &Output) {
     );
 }
 
-pub fn assert_result_envelope_shape(stdout: &str) -> Value {
-    let line = single_result_envelope_line(stdout);
+pub fn assert_result_envelope_shape(stream: &str) -> Value {
+    let line = single_result_envelope_line(stream);
     let value = parse_result_envelope_line(line);
     assert_result_envelope_value_shape(&value);
     value
 }
 
-fn single_result_envelope_line(stdout: &str) -> &str {
-    let lines = result_envelope_lines(stdout);
+fn single_result_envelope_line(stream: &str) -> &str {
+    let lines = result_envelope_lines(stream);
     assert_eq!(
         lines.len(),
         1,
-        "stdout must contain one result envelope:\n{stdout}"
+        "stream must contain one result envelope:\n{stream}"
     );
     lines[0]
 }
 
-fn result_envelope_lines(stdout: &str) -> Vec<&str> {
-    stdout
+fn result_envelope_lines(stream: &str) -> Vec<&str> {
+    stream
         .lines()
         .filter(|line| line.starts_with("OULIPOLY_RESULT="))
         .collect()

@@ -106,7 +106,7 @@ pub(super) fn emit_routing_retry(provider_name: &str) {
 }
 
 pub(super) fn emit_stderr(stderr: &str) {
-    eprintln!("{stderr}");
+    let _ = writeln!(std::io::stderr().lock(), "{stderr}");
 }
 
 pub(super) fn emit_success_output(
@@ -114,26 +114,28 @@ pub(super) fn emit_success_output(
     error_category: Option<&str>,
     result: &executor::ExecutionResult,
 ) -> std::io::Result<()> {
-    if result.output_spool.is_some() {
-        let mut stderr = std::io::stderr().lock();
-        result.write_stderr_to(&mut stderr)?;
-        stderr.flush()?;
+    if let Some(spool) = &result.output_spool {
+        return crate::run::spooled_success_delivery::deliver(
+            spool,
+            invocation_id,
+            result.exit_code,
+            error_category,
+            result.terminal_reason.as_deref(),
+        );
     }
+
     let mut stdout = std::io::stdout().lock();
     result.write_stdout_to(&mut stdout)?;
     stdout.flush()?;
     drop(stdout);
-    if result.output_spool.is_none() {
-        emit_result_envelope(
-            invocation_id,
-            true,
-            result.exit_code,
-            error_category,
-            result.terminal_reason.as_deref(),
-            None,
-        )?;
-    }
-    Ok(())
+    emit_result_envelope(
+        invocation_id,
+        true,
+        result.exit_code,
+        error_category,
+        result.terminal_reason.as_deref(),
+        None,
+    )
 }
 
 pub(super) fn emit_failure_output(input: FailureResultEnvelopeInput<'_>, stderr: &str) {

@@ -222,14 +222,12 @@ def launch():
 
     seq = 1
     data_event_count = 0
-    if stdout:
-        event(seq, "stdout", data_base64=base64.b64encode(stdout).decode("ascii"))
-        seq += 1
-        data_event_count += 1
-    if stderr:
-        event(seq, "stderr", data_base64=base64.b64encode(stderr).decode("ascii"))
-        seq += 1
-        data_event_count += 1
+    for kind, data in (("stdout", stdout), ("stderr", stderr)):
+        for offset in range(0, len(data), 256 * 1024):
+            chunk = data[offset:offset + 256 * 1024]
+            event(seq, kind, data_base64=base64.b64encode(chunk).decode("ascii"))
+            seq += 1
+            data_event_count += 1
 
     if stdout and spawn_succeeded:
         event(seq, "marker", name="oulipoly.produced_assistant_response", value=True)

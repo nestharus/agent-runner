@@ -344,18 +344,23 @@ fn count_lines(content: Option<&str>) -> usize {
 
 fn single_result(output: &Output) -> Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let results = stdout
         .lines()
+        .chain(stderr.lines())
         .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
         .collect::<Vec<_>>();
-    assert_eq!(results.len(), 1, "{stdout}");
+    assert_eq!(results.len(), 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     serde_json::from_str(results[0]).unwrap()
 }
 
 fn assert_success_result(output: &Output, provider_stdout: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout, format!("{provider_stdout}\n"));
-    assert!(!stdout.contains("OULIPOLY_RESULT="), "{stdout}");
+    let result = single_result(output);
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(result["success"], true);
+    assert_eq!(result["exit_code"], 0);
 }
 
 fn assert_nonzero_failure_result(output: &Output) {

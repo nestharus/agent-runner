@@ -229,6 +229,14 @@ fn resumed_clean_exit_with_terminal_assistant_response_succeeds() {
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(output.stdout, b"fixture terminal assistant response\n");
+    let envelope = single_result_envelope(&output);
+    assert_eq!(envelope_keys(&envelope), common_envelope_keys());
+    assert_eq!(envelope["id"], persisted.invocation_uuid);
+    assert_eq!(envelope["status"], "succeeded");
+    assert_eq!(envelope["success"], true);
+    assert_eq!(envelope["exit_code"], 0);
+    assert!(envelope["error_category"].is_null());
+    assert!(envelope["terminal_reason"].is_null());
     assert_eq!(persisted.status, "succeeded");
     assert_eq!(persisted.success, 1);
     assert_eq!(persisted.exit_code, 0);
@@ -610,14 +618,16 @@ fn result_envelope(output: &Output) -> Value {
 
 fn single_result_envelope(output: &Output) -> Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let lines = stdout
         .lines()
+        .chain(stderr.lines())
         .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
         .collect::<Vec<_>>();
     assert_eq!(
         lines.len(),
         1,
-        "expected exactly one OULIPOLY_RESULT line in stdout:\n{stdout}"
+        "expected exactly one OULIPOLY_RESULT line:\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     serde_json::from_str(lines[0]).unwrap()
 }

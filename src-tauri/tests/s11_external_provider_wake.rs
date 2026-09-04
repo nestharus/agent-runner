@@ -919,9 +919,9 @@ fn ordinary_completion_survives_mailbox_projection_failure_without_replay() {
         &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
     );
     assert_eq!(first.status.code(), Some(1), "{first:?}");
-    assert_eq!(
-        first.stdout,
-        b"owner consumed detached child result and continued\n"
+    assert_payload_then_success_envelope(
+        &first,
+        "owner consumed detached child result and continued\n",
     );
     let first_invocation_uuid = fixture.latest_invocation_uuid();
     let pending = fixture.mailbox_row(notification.seq);
@@ -1016,9 +1016,9 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
         ],
     );
     assert_success(&resumed);
-    assert_eq!(
-        resumed.stdout,
-        b"owner consumed detached child result and continued\n"
+    assert_payload_then_success_envelope(
+        &resumed,
+        "owner consumed detached child result and continued\n",
     );
     let resumed_invocation_uuid = positive.latest_invocation_uuid();
     let resumed_stderr = String::from_utf8_lossy(&resumed.stderr);
@@ -1498,8 +1498,10 @@ fn assert_success(output: &Output) {
 
 fn result_envelope(output: &Output) -> Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let lines = stdout
         .lines()
+        .chain(stderr.lines())
         .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -1508,9 +1510,21 @@ fn result_envelope(output: &Output) -> Value {
         "expected one result envelope: status={:?}\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
         stdout,
-        String::from_utf8_lossy(&output.stderr)
+        stderr
     );
     serde_json::from_str(lines[0]).unwrap()
+}
+
+fn assert_payload_then_success_envelope(output: &Output, payload: &str) {
+    assert!(
+        payload.ends_with('\n'),
+        "payload fixture must end with a newline"
+    );
+    assert_eq!(output.stdout, payload.as_bytes());
+    let envelope = result_envelope(output);
+    assert_eq!(envelope["status"], "succeeded");
+    assert_eq!(envelope["success"], true);
+    assert_eq!(envelope["exit_code"], 0);
 }
 
 fn terminal_signal_marker(stderr: &str) -> Value {

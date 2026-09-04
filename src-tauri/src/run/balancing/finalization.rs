@@ -276,33 +276,16 @@ fn emit_completed_attempt_success(
     classification: &CompletedAttemptClassification,
 ) -> BalancedLoopControl {
     mark_balanced_successful_attempt_idle_and_recheck(input, input.result.exit_code);
-    if let Err(error) = formatter::emit_success_output(
-        &input.invocation.id,
-        classification.error_category.as_deref(),
-        input.result,
+    if !crate::run::spooled_success_delivery::settle(
+        &input.env.state,
+        input.invocation_row_id,
+        input.result.output_spool.is_some(),
+        formatter::emit_success_output(
+            &input.invocation.id,
+            classification.error_category.as_deref(),
+            input.result,
+        ),
     ) {
-        if let Err(state_error) = input.env.state.mark_invocation_output_delivery_failed(
-            input.invocation_row_id,
-            "payload_or_control",
-            &format!("{:?}", error.kind()),
-            None,
-        ) {
-            formatter::emit_stderr(&format!(
-                "failed to record provider output delivery failure: {state_error}"
-            ));
-        }
-        formatter::emit_stderr(&format!("failed to deliver provider output: {error}"));
-        return BalancedLoopControl::Return(Ok(1));
-    }
-    if input.result.output_spool.is_some()
-        && let Err(error) = input
-            .env
-            .state
-            .mark_invocation_output_delivered(input.invocation_row_id)
-    {
-        formatter::emit_stderr(&format!(
-            "failed to record provider output delivery: {error}"
-        ));
         return BalancedLoopControl::Return(Ok(1));
     }
     BalancedLoopControl::Return(Ok(if input.recovered_generic_nonzero {

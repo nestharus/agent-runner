@@ -163,6 +163,13 @@ impl ExecutionOutputSpool {
             .is_some_and(|state| state.summary.is_some() && state.stdout.last_byte == Some(b'\n'))
     }
 
+    pub fn stderr_ends_with_newline(&self) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .is_some_and(|state| state.summary.is_some() && state.stderr.last_byte == Some(b'\n'))
+    }
+
     fn with_sealed_state<T>(
         &self,
         operation: impl FnOnce(&mut ExecutionOutputSpoolState) -> std::io::Result<T>,

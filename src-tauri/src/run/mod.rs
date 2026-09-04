@@ -27,6 +27,7 @@ pub(crate) mod continuation_resume;
 pub(crate) mod repl;
 pub(crate) mod reservation;
 pub(crate) mod resume;
+mod spooled_success_delivery;
 
 #[cfg(test)]
 mod continuation_command_tests;

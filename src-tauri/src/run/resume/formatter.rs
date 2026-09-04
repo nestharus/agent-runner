@@ -20,7 +20,7 @@ pub(super) struct ResumeFailureOutputInput<'a> {
 }
 
 pub(super) fn emit_stderr(message: &str) {
-    eprintln!("{message}");
+    let _ = writeln!(std::io::stderr().lock(), "{message}");
 }
 
 pub(super) fn emit_resume_success_output(
@@ -28,32 +28,31 @@ pub(super) fn emit_resume_success_output(
     error_category: Option<&str>,
     result: &oulipoly_runtime::executor::ExecutionResult,
 ) -> std::io::Result<()> {
-    if result.output_spool.is_some() {
-        let mut stderr = std::io::stderr().lock();
-        result.write_stderr_to(&mut stderr)?;
-        stderr.flush()?;
+    if let Some(spool) = &result.output_spool {
+        return crate::run::spooled_success_delivery::deliver(
+            spool,
+            invocation_id,
+            result.exit_code,
+            error_category,
+            result.terminal_reason.as_deref(),
+        );
     }
+
     let mut output = std::io::stdout().lock();
     result.write_stdout_to(&mut output)?;
-    if result.output_spool.is_none()
-        && !result.stdout_is_empty()?
-        && !result.stdout_ends_with_newline()
-    {
+    if !result.stdout_is_empty()? && !result.stdout_ends_with_newline() {
         output.write_all(b"\n")?;
     }
     output.flush()?;
     drop(output);
-    if result.output_spool.is_none() {
-        emit_result_envelope(
-            invocation_id,
-            true,
-            result.exit_code,
-            error_category,
-            result.terminal_reason.as_deref(),
-            None,
-        )?;
-    }
-    Ok(())
+    emit_result_envelope(
+        invocation_id,
+        true,
+        result.exit_code,
+        error_category,
+        result.terminal_reason.as_deref(),
+        None,
+    )
 }
 
 pub(super) fn emit_resume_failure_output(input: ResumeFailureOutputInput<'_>) {

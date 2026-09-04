@@ -549,10 +549,23 @@ Every invocation that reaches provider dispatch emits a stable identifier on
 OULIPOLY_INVOCATION={"source":"claude2","id":"9e69e8cc-616d-4640-bf1d-96f5391b1a2e"}
 ```
 
-Provider `stdout` bytes are forwarded unchanged, so image/video model output
-remains binary-safe. After terminal completion the runner appends one structured
-`OULIPOLY_RESULT=<json>` line on stdout. Successful results keep the compact
-terminal shape; failed results also include:
+External-provider spooled `stdout` bytes are forwarded unchanged, so binary
+model output remains safe. After the spool payload has been copied and stdout
+has been flushed, the runner writes one structured
+`OULIPOLY_RESULT=<json>` line to stderr. When stdout lacks a trailing newline,
+the runner writes the framing newline to stderr so `2>&1 | tee` still records
+an anchored, ordered result line without changing redirected provider stdout.
+Provider stdout and stderr are arbitrary replayed bytes and may themselves
+contain shape-valid `OULIPOLY_RESULT` lines, including lines with the current
+invocation UUID. For a successful merged external-provider capture, consumers
+must ignore earlier matching lines and accept only the final shape-valid
+`OULIPOLY_RESULT` whose `id` matches the invocation, after the runner process
+exits successfully. The runner's write-after-complete-spool ordering is the
+provenance boundary for that final record.
+The complete payload-and-control delivery must succeed before delivery is
+recorded as successful. Non-spooled and failed committed invocations retain
+their stdout result marker for compatibility.
+Successful results keep the compact terminal shape; failed results also include:
 
 - `agent_runner_invocation_id` — the same UUID as `id`
 - `provider_name` — the selected provider/account, or `null`
@@ -1051,7 +1064,10 @@ and passes them as CLI flags to the underlying command.
 - Inputs with defaults are passed automatically when not overridden
 - Unknown inputs pass through as `--key value`
 
-**Stdout is raw bytes** — commands can output binary data (images, videos) and it passes through unmodified. Pipe to a file to save: `agents -m seedream-t2i "A cat" > cat.jpeg`
+**External-provider spooled stdout is raw bytes** — commands can output binary
+data (images, videos), and it passes through unmodified while the terminal
+result is emitted on stderr. Pipe to a file to save:
+`agents -m seedream-t2i "A cat" > cat.jpeg`.
 
 ### Adding an Agent
 
