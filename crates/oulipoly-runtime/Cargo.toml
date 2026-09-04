@@ -37,3 +37,6 @@ oulipoly-core = { path = "../oulipoly-core", features = ["test-support"] }
 oulipoly-state = { path = "../oulipoly-state", features = ["test-support"] }
 proc-macro2 = "1"
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
