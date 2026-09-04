@@ -280,11 +280,13 @@ fn emit_completed_attempt_success(
         &input.env.state,
         input.invocation_row_id,
         input.result.output_spool.is_some(),
-        formatter::emit_success_output(
-            &input.invocation.id,
-            classification.error_category.as_deref(),
-            input.result,
-        ),
+        || {
+            formatter::emit_success_output(
+                &input.invocation.id,
+                classification.error_category.as_deref(),
+                input.result,
+            )
+        },
     ) {
         return BalancedLoopControl::Return(Ok(1));
     }

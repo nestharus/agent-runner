@@ -49,12 +49,28 @@ pub(super) fn deliver(
     )
 }
 
-pub(super) fn settle(
-    state: &StateDb,
-    invocation_row_id: i64,
-    spooled: bool,
-    delivery: std::io::Result<()>,
-) -> bool {
+pub(super) fn settle<F>(state: &StateDb, invocation_row_id: i64, spooled: bool, delivery: F) -> bool
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    // Persist the conservative terminal state before any bytes escape. If the
+    // post-control delivered write fails, retained output stays explicitly failed
+    // without a settled/pending row contradicting the nonzero process exit.
+    if spooled
+        && let Err(error) = state.mark_invocation_output_delivery_failed(
+            invocation_row_id,
+            "delivery_confirmation",
+            "unconfirmed",
+            None,
+        )
+    {
+        emit_diagnostic(&format!(
+            "failed to reserve provider output delivery failure: {error}"
+        ));
+        return false;
+    }
+
+    let delivery = delivery();
     if let Err(error) = delivery {
         if let Err(state_error) = state.mark_invocation_output_delivery_failed(
             invocation_row_id,

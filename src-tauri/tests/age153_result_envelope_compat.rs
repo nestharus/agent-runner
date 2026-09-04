@@ -358,13 +358,13 @@ fn fresh_payload_write_failure_marks_output_delivery_failed() {
 #[cfg(target_os = "linux")]
 #[test]
 fn fresh_control_record_write_failure_marks_output_delivery_failed() {
-    assert_control_write_remains_pending_then_fails(false);
+    assert_control_write_stays_failed_until_delivery_is_confirmed(false);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn resume_control_record_write_failure_marks_output_delivery_failed() {
-    assert_control_write_remains_pending_then_fails(true);
+    assert_control_write_stays_failed_until_delivery_is_confirmed(true);
 }
 
 #[cfg(target_os = "linux")]
@@ -408,7 +408,7 @@ fn resume_payload_write_failure_marks_output_delivery_failed() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn shared_fresh_and_resume_delivery_owner_keeps_state_pending_while_payload_write_is_blocked() {
+fn shared_fresh_and_resume_delivery_owner_fails_closed_while_payload_write_is_blocked() {
     let fixture = Age153Fixture::new();
     let marker = fixture.dir.path().join("result-blocked-delivery.txt");
     let (mut stdout, stdout_sink, pipe_capacity) = stdout_pipe();
@@ -444,12 +444,23 @@ fn shared_fresh_and_resume_delivery_owner_keeps_state_pending_while_payload_writ
         "runner must remain blocked in the deliberately undrained provider payload write"
     );
 
-    let pending = latest_output_delivery(&fixture);
-    assert_eq!(pending.provider_outcome_state, "settled", "{pending:?}");
-    assert_eq!(pending.delivery_state, "pending", "{pending:?}");
-    assert_eq!(pending.delivered_at, None, "{pending:?}");
-    assert_eq!(pending.delivery_failure_stage, None, "{pending:?}");
-    assert_eq!(pending.delivery_failure_kind, None, "{pending:?}");
+    let unconfirmed = latest_output_delivery(&fixture);
+    assert_eq!(
+        unconfirmed.provider_outcome_state, "settled",
+        "{unconfirmed:?}"
+    );
+    assert_eq!(unconfirmed.delivery_state, "failed", "{unconfirmed:?}");
+    assert_eq!(unconfirmed.delivered_at, None, "{unconfirmed:?}");
+    assert_eq!(
+        unconfirmed.delivery_failure_stage.as_deref(),
+        Some("delivery_confirmation"),
+        "{unconfirmed:?}"
+    );
+    assert_eq!(
+        unconfirmed.delivery_failure_kind.as_deref(),
+        Some("unconfirmed"),
+        "{unconfirmed:?}"
+    );
     assert_shared_spooled_delivery_owner_for_fresh_and_resume();
 
     let mut provider_stdout = first_provider_byte.to_vec();
@@ -470,7 +481,7 @@ fn shared_fresh_and_resume_delivery_owner_keeps_state_pending_while_payload_writ
     let result = assert_success_result_envelope(&String::from_utf8(stderr).expect("stderr utf8"));
     assert_canonical_result_and_trace_agree(&fixture, &result);
     let delivered = latest_output_delivery(&fixture);
-    assert_eq!(delivered.invocation_id, pending.invocation_id);
+    assert_eq!(delivered.invocation_id, unconfirmed.invocation_id);
     assert_eq!(delivered.provider_outcome_state, "settled", "{delivered:?}");
     assert_eq!(delivered.delivery_state, "delivered", "{delivered:?}");
     assert!(delivered.delivered_at.is_some(), "{delivered:?}");
@@ -879,7 +890,7 @@ fn assert_genuine_runner_success(result: &Value) {
 }
 
 #[cfg(target_os = "linux")]
-fn assert_control_write_remains_pending_then_fails(is_resume: bool) {
+fn assert_control_write_stays_failed_until_delivery_is_confirmed(is_resume: bool) {
     const MODEL: &str = "age153-result-control-failure";
     const RESULT_MARKER: &[u8] = b"OULIPOLY_RESULT";
     const BOUND: Duration = Duration::from_secs(10);
@@ -958,12 +969,23 @@ fn assert_control_write_remains_pending_then_fails(is_resume: bool) {
         0,
         "complete provider stdout must be drained before inspecting the control write"
     );
-    let pending = output_delivery_for_invocation(&fixture, &invocation_id);
-    assert_eq!(pending.provider_outcome_state, "settled", "{pending:?}");
-    assert_eq!(pending.delivery_state, "pending", "{pending:?}");
-    assert_eq!(pending.delivered_at, None, "{pending:?}");
-    assert_eq!(pending.delivery_failure_stage, None, "{pending:?}");
-    assert_eq!(pending.delivery_failure_kind, None, "{pending:?}");
+    let unconfirmed = output_delivery_for_invocation(&fixture, &invocation_id);
+    assert_eq!(
+        unconfirmed.provider_outcome_state, "settled",
+        "{unconfirmed:?}"
+    );
+    assert_eq!(unconfirmed.delivery_state, "failed", "{unconfirmed:?}");
+    assert_eq!(unconfirmed.delivered_at, None, "{unconfirmed:?}");
+    assert_eq!(
+        unconfirmed.delivery_failure_stage.as_deref(),
+        Some("delivery_confirmation"),
+        "{unconfirmed:?}"
+    );
+    assert_eq!(
+        unconfirmed.delivery_failure_kind.as_deref(),
+        Some("unconfirmed"),
+        "{unconfirmed:?}"
+    );
 
     drop(stderr);
     let status = child.wait_bounded(BOUND);

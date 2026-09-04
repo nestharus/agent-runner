@@ -272,7 +272,13 @@ fn handle_completed_success(
         &input.env.state,
         input.invocation_row_id,
         input.result.output_spool.is_some(),
-        formatter::emit_resume_success_output(&input.invocation.id, error_category, input.result),
+        || {
+            formatter::emit_resume_success_output(
+                &input.invocation.id,
+                error_category,
+                input.result,
+            )
+        },
     ) {
         return CompletedAttemptControl::Return(1);
     }

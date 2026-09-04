@@ -350,6 +350,72 @@ fn broken_native_control_handle_fails_closed_and_persists_delivery_failure() {
     assert_no_authoritative_success(&fixture, &surviving_stdout);
 }
 
+#[test]
+fn delivery_state_write_failure_leaves_retained_output_failed_without_provider_redispatch() {
+    for carrier in [Carrier::Fresh, Carrier::Resume] {
+        let fixture = Fixture::new(carrier);
+        let child = fixture
+            .command(carrier)
+            .env("AGE330_NATIVE_GATE_MODE", "delivery-state")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        fixture.wait_for_provider();
+        Connection::open(fixture.state_path())
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_output_delivered
+                 BEFORE UPDATE OF delivery_state ON invocation_output_deliveries
+                 WHEN NEW.delivery_state = 'delivered'
+                 BEGIN
+                     SELECT RAISE(FAIL, 'injected delivered-state write failure');
+                 END;",
+            )
+            .unwrap();
+        fixture.release_provider();
+
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "{carrier:?}: {output:?}");
+        assert_eq!(output.stdout, carrier.stdout(), "{carrier:?}");
+        let marker = final_result_marker_index(&output.stderr);
+        let mut provider_boundary = carrier.stderr().to_vec();
+        provider_boundary.push(b'\n');
+        assert!(
+            output.stderr[..marker].ends_with(&provider_boundary),
+            "{carrier:?}: {:?}",
+            output.stderr
+        );
+
+        let invocation = fixture.latest_invocation();
+        let matching = matching_results(&output.stderr, &invocation.uuid);
+        assert_eq!(matching.len(), 1, "{carrier:?}: {:?}", output.stderr);
+        assert_success_result(&matching[0], &invocation.uuid);
+
+        let delivery = fixture.latest_delivery();
+        assert_eq!(delivery.invocation_uuid, invocation.uuid, "{delivery:?}");
+        assert_eq!(delivery.provider_outcome_state, "settled", "{delivery:?}");
+        assert_eq!(delivery.delivery_state, "failed", "{delivery:?}");
+        assert_eq!(
+            delivery.failure_stage.as_deref(),
+            Some("delivery_confirmation"),
+            "{delivery:?}"
+        );
+        assert_eq!(
+            delivery.failure_kind.as_deref(),
+            Some("unconfirmed"),
+            "{delivery:?}"
+        );
+        assert_eq!(fs::read(delivery.stdout_path).unwrap(), carrier.stdout());
+        assert_eq!(fs::read(delivery.stderr_path).unwrap(), carrier.stderr());
+        assert_eq!(
+            fs::read_to_string(&fixture.provider_started).unwrap(),
+            "delivery-state\n",
+            "{carrier:?}: provider launch must not be redispatched"
+        );
+    }
+}
+
 fn assert_direct_success(fixture: &Fixture, carrier: Carrier, output: &Output) {
     assert!(output.status.success(), "{carrier:?}: {output:?}");
     assert_eq!(
@@ -615,7 +681,8 @@ def gated_mode():
     mode = os.environ.get("AGE330_NATIVE_GATE_MODE", "none")
     if mode == "none":
         return mode
-    pathlib.Path(os.environ["AGE330_NATIVE_PROVIDER_STARTED"]).write_text(mode)
+    with pathlib.Path(os.environ["AGE330_NATIVE_PROVIDER_STARTED"]).open("a") as started:
+        started.write(mode + "\n")
     release = pathlib.Path(os.environ["AGE330_NATIVE_PROVIDER_RELEASE"])
     deadline = time.monotonic() + 20
     while not release.exists() and time.monotonic() < deadline:
