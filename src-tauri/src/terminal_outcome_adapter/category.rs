@@ -12,6 +12,7 @@ use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 pub enum TerminalOutcomeCategory {
     QuotaExhausted,
     HungSubprocess,
+    ProviderUnavailable,
 }
 
 impl TerminalOutcomeCategory {
@@ -22,6 +23,9 @@ impl TerminalOutcomeCategory {
             }
             TerminalOutcomeCategory::HungSubprocess => {
                 Some(ErrorCategory::HungSubprocess.as_str().to_string())
+            }
+            TerminalOutcomeCategory::ProviderUnavailable => {
+                Some(ErrorCategory::ProviderUnavailable.as_str().to_string())
             }
         }
     }
@@ -51,6 +55,9 @@ fn category_for_signal_kind(kind: TerminalSignalKind) -> Option<TerminalOutcomeC
     match kind {
         TerminalSignalKind::QuotaExhaustedInband => Some(TerminalOutcomeCategory::QuotaExhausted),
         TerminalSignalKind::ProlongedSilence => Some(TerminalOutcomeCategory::HungSubprocess),
+        TerminalSignalKind::ProviderUnavailable => {
+            Some(TerminalOutcomeCategory::ProviderUnavailable)
+        }
         TerminalSignalKind::CleanExit
         | TerminalSignalKind::NonzeroExit
         | TerminalSignalKind::SignalExit

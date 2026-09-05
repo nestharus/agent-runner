@@ -1041,6 +1041,62 @@ fn external_launch_session_id_alias_persists_external_capture_method_without_ses
 }
 
 #[test]
+fn external_provider_unavailable_persists_failure_without_replay_or_quota_mutation() {
+    for raw_code in [0, 1] {
+        for resume in [false, true] {
+            let fixture = Fixture::new();
+            if resume {
+                assert_success(&fixture.run_launch());
+            }
+            let launches_before = records_for_subcommand(&fixture.records(), "launch").len();
+            let raw_code_text = raw_code.to_string();
+            let env = [
+                ("S10_PROVIDER_UNAVAILABLE", "1"),
+                ("S10_PROVIDER_UNAVAILABLE_EXIT_CODE", raw_code_text.as_str()),
+            ];
+            let output = if resume {
+                fixture.run_resume_with_env(&env)
+            } else {
+                fixture.run_launch_with_env(&env)
+            };
+            assert!(!output.status.success(), "{output:?}");
+            let result = assert_result_envelope_shape(&String::from_utf8_lossy(&output.stdout));
+            assert_eq!(result["status"], "failed");
+            assert_eq!(result["error_category"], "provider_unavailable");
+            assert_eq!(result["terminal_reason"], "provider_unavailable");
+            let row = fixture.latest_invocation_outcome();
+            assert_eq!(row.status, "failed");
+            assert_eq!(row.success, 0);
+            assert_eq!(row.exit_code, if raw_code == 0 { -1 } else { raw_code });
+            assert_eq!(row.terminal_reason.as_deref(), Some("provider_unavailable"));
+            let conn = open_invocation_db(&fixture.db_path());
+            let category: String = conn.query_row(
+            "SELECT error_category FROM invocations WHERE provider_name = ?1 ORDER BY id DESC LIMIT 1",
+            [PROVIDER], |row| row.get(0),
+        ).unwrap();
+            assert_eq!(category, "provider_unavailable");
+            let quota_mutations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM provider_quotas WHERE exhausted_at IS NOT NULL OR next_available_at IS NOT NULL OR failure_class IS NOT NULL",
+            [], |row| row.get(0),
+        ).unwrap();
+            assert_eq!(quota_mutations, 0);
+            let records = fixture.records();
+            let launches = records_for_subcommand(&records, "launch");
+            assert_eq!(
+                launches.len(),
+                launches_before + 1,
+                "request must not be replayed"
+            );
+            assert_eq!(
+                launches.last().unwrap()["request"]["host"]["env"]["OULIPOLY_HOST_TERMINAL_UNAVAILABLE_V1"],
+                "1"
+            );
+            assert_no_rotation_or_migration_provider_calls(&records);
+        }
+    }
+}
+
+#[test]
 fn external_provider_launch_terminal_error_exit_zero_finalizes_as_failed() {
     let fixture = Fixture::new();
 
@@ -1418,6 +1474,14 @@ def emit_long_launch_heartbeats():
 def launch():
     payload = launch_payload()
     emit(launch_stdout_event(1, payload))
+    if os.environ.get("S10_PROVIDER_UNAVAILABLE") == "1":
+        selected = request.get("host", {{}}).get("env", {{}}).get("OULIPOLY_HOST_TERMINAL_UNAVAILABLE_V1") == "1"
+        kind = "provider_unavailable" if selected else "unknown"
+        emit(launch_output_complete_event(2, payload))
+        event = launch_exit_event(3, launch_terminal_signal(kind, "upstream temporarily unavailable", 3))
+        event["status"]["code"] = int(os.environ.get("S10_PROVIDER_UNAVAILABLE_EXIT_CODE", "0"))
+        emit(event)
+        return
     if launch_error_exit_requested():
         emit(launch_output_complete_event(2, payload))
         emit(provider_error_exit_event(3))

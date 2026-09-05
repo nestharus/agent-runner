@@ -174,6 +174,7 @@ pub(crate) fn terminal_reason_from_signal_status(
         | TerminalSignalKind::MaybeQuotaExhausted
         | TerminalSignalKind::RateLimited
         | TerminalSignalKind::ProviderStorageContention
+        | TerminalSignalKind::ProviderUnavailable
         | TerminalSignalKind::SpawnError => {
             crate::diagnostics::canonical_terminal_reason_for_kind(signal.kind).map(str::to_string)
         }
@@ -212,6 +213,7 @@ pub(super) fn synthetic_exit_code(signal: &TerminalSignal) -> i32 {
         | TerminalSignalKind::MaybeQuotaExhausted
         | TerminalSignalKind::RateLimited
         | TerminalSignalKind::ProviderStorageContention
+        | TerminalSignalKind::ProviderUnavailable
         | TerminalSignalKind::NonzeroExit
         | TerminalSignalKind::SignalExit
         | TerminalSignalKind::SpawnError

@@ -9,6 +9,8 @@ pub enum TerminalSignalKind {
     QuotaExhaustedInband,
     MaybeQuotaExhausted,
     RateLimited,
+    /// The provider cannot serve this request. Terminal without quota mutation or replay.
+    ProviderUnavailable,
     /// The provider's backing session store (e.g. a per-account SQLite store) is
     /// contended/locked under concurrent load. Transient and retryable on a
     /// different, less-loaded account rather than terminal.

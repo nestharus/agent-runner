@@ -33,6 +33,7 @@ pub(in crate::run::balancing) fn terminal_signal_branch(
         | TerminalSignalKind::SignalExit
         | TerminalSignalKind::SpawnError
         | TerminalSignalKind::RateLimited
+        | TerminalSignalKind::ProviderUnavailable
         | TerminalSignalKind::Unknown => TerminalSignalBranch::InteractiveFail,
         TerminalSignalKind::CleanExit => TerminalSignalBranch::CompletedAttempt,
     }

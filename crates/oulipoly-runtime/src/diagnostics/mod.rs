@@ -51,6 +51,7 @@ pub enum ErrorCategory {
     HungSubprocess,
     ResumeSessionMismatch,
     ProviderProtocol,
+    ProviderUnavailable,
     DiagnosticsFailure,
     Unknown,
 }
@@ -66,6 +67,7 @@ impl ErrorCategory {
             ErrorCategory::HungSubprocess => "hung_subprocess",
             ErrorCategory::ResumeSessionMismatch => "resume_session_mismatch",
             ErrorCategory::ProviderProtocol => "provider_protocol",
+            ErrorCategory::ProviderUnavailable => "provider_unavailable",
             ErrorCategory::DiagnosticsFailure => "diagnostics_failure",
             ErrorCategory::Unknown => "unknown",
         }
@@ -316,6 +318,7 @@ fn map_error_category_token(token: &str) -> ErrorCategory {
         "hung_subprocess" => ErrorCategory::HungSubprocess,
         "resume_session_mismatch" => ErrorCategory::ResumeSessionMismatch,
         "provider_protocol" => ErrorCategory::ProviderProtocol,
+        "provider_unavailable" => ErrorCategory::ProviderUnavailable,
         "diagnostics_failure" => ErrorCategory::DiagnosticsFailure,
         _ => ErrorCategory::Unknown,
     }

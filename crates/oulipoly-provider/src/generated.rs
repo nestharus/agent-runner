@@ -16,6 +16,8 @@ pub const HOST_LAUNCH_OUTPUT_V1_ENV_VALUE: &str = "1";
 pub const SESSION_TURN_PAGES_V1: &str = "oulipoly.session_turn_pages/v1";
 pub const HOST_SESSION_TURN_PAGES_V1_ENV: &str = "OULIPOLY_HOST_SESSION_TURN_PAGES_V1";
 pub const HOST_SESSION_TURN_PAGES_V1_ENV_VALUE: &str = "1";
+pub const HOST_TERMINAL_UNAVAILABLE_V1_ENV: &str = "OULIPOLY_HOST_TERMINAL_UNAVAILABLE_V1";
+pub const HOST_TERMINAL_UNAVAILABLE_V1_ENV_VALUE: &str = "1";
 
 pub type JsonObject = BTreeMap<String, Value>;
 
@@ -59,6 +61,13 @@ pub fn host_requested_session_turn_pages_v1(host: &HostContext) -> bool {
         .get(HOST_SESSION_TURN_PAGES_V1_ENV)
         .map(String::as_str)
         == Some(HOST_SESSION_TURN_PAGES_V1_ENV_VALUE)
+}
+
+pub fn host_requested_terminal_unavailable_v1(host: &HostContext) -> bool {
+    host.env
+        .get(HOST_TERMINAL_UNAVAILABLE_V1_ENV)
+        .map(String::as_str)
+        == Some(HOST_TERMINAL_UNAVAILABLE_V1_ENV_VALUE)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -283,6 +292,7 @@ pub enum TerminalSignalKind {
     MaybeQuotaExhausted,
     RateLimited,
     ProviderStorageContention,
+    ProviderUnavailable,
     ProlongedSilence,
     Cancelled,
     Unknown,
@@ -299,6 +309,7 @@ impl TerminalSignalKind {
             Self::MaybeQuotaExhausted => "maybe_quota_exhausted",
             Self::RateLimited => "rate_limited",
             Self::ProviderStorageContention => "provider_storage_contention",
+            Self::ProviderUnavailable => "provider_unavailable",
             Self::ProlongedSilence => "prolonged_silence",
             Self::Cancelled => "cancelled",
             Self::Unknown => "unknown",

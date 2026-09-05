@@ -26,7 +26,8 @@ use oulipoly_config::PromptMode;
 use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_provider::generated::{
     BytePayload, CONTRACT_VERSION, HOST_LAUNCH_OUTPUT_V1_ENV, HOST_LAUNCH_OUTPUT_V1_ENV_VALUE,
-    HostContext, JsonObject, LAUNCH_OUTPUT_V1, LaunchOutputRequestV1, LaunchParams, LaunchRequest,
+    HOST_TERMINAL_UNAVAILABLE_V1_ENV, HOST_TERMINAL_UNAVAILABLE_V1_ENV_VALUE, HostContext,
+    JsonObject, LAUNCH_OUTPUT_V1, LaunchOutputRequestV1, LaunchParams, LaunchRequest,
     PROMPT_ACCEPTANCE_V1, PolicyEvaluateParams, PolicyEvaluateRequest, PromptAcceptanceRequestV1,
     ProviderModelRequest,
 };
@@ -362,6 +363,10 @@ fn launch_host_context(
     include_launch_output_v1: bool,
 ) -> HostContext {
     let mut host = host_context(host_options, working_directory);
+    host.env.insert(
+        HOST_TERMINAL_UNAVAILABLE_V1_ENV.to_string(),
+        HOST_TERMINAL_UNAVAILABLE_V1_ENV_VALUE.to_string(),
+    );
     if include_launch_output_v1 {
         host.env.insert(
             HOST_LAUNCH_OUTPUT_V1_ENV.to_string(),
@@ -524,8 +529,10 @@ fn request_id(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
+        DescribeHostOptions, HOST_LAUNCH_OUTPUT_V1_ENV, HOST_TERMINAL_UNAVAILABLE_V1_ENV,
         LaunchCandidate, OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES,
-        PromptAcceptanceCandidate, project_launch_carrier, prompt_acceptance_request,
+        PromptAcceptanceCandidate, host_context, launch_host_context, project_launch_carrier,
+        prompt_acceptance_request,
     };
     use crate::services::MailboxDeliveryCorrelation;
     use oulipoly_config::PromptMode;
@@ -557,6 +564,27 @@ mod tests {
         let acceptance = prompt_acceptance_request(&candidate).unwrap();
 
         assert_eq!(acceptance.delivery_nonce, None);
+    }
+
+    #[test]
+    fn unavailable_terminal_kind_is_selected_for_launch_only() {
+        let options = DescribeHostOptions::default();
+        let policy = host_context(&options, "/fixture");
+        assert!(!policy.env.contains_key(HOST_TERMINAL_UNAVAILABLE_V1_ENV));
+        for output_selected in [false, true] {
+            let launch = launch_host_context(&options, "/fixture", output_selected);
+            assert_eq!(
+                launch
+                    .env
+                    .get(HOST_TERMINAL_UNAVAILABLE_V1_ENV)
+                    .map(String::as_str),
+                Some("1")
+            );
+            assert_eq!(
+                launch.env.contains_key(HOST_LAUNCH_OUTPUT_V1_ENV),
+                output_selected
+            );
+        }
     }
 
     #[test]

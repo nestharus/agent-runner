@@ -12,6 +12,31 @@ use support::contract_matrix::{
 };
 
 #[test]
+fn terminal_unavailable_requires_request_selection_and_preserves_legacy_terminal_kinds() {
+    let mut host: dto::HostContext = serde_json::from_value(json!({"app":"fixture-host"})).unwrap();
+    assert!(!dto::host_requested_terminal_unavailable_v1(&host));
+    for value in ["", "0", "true"] {
+        host.env
+            .insert(dto::HOST_TERMINAL_UNAVAILABLE_V1_ENV.into(), value.into());
+        assert!(!dto::host_requested_terminal_unavailable_v1(&host));
+    }
+    host.env
+        .insert(dto::HOST_TERMINAL_UNAVAILABLE_V1_ENV.into(), "1".into());
+    assert!(dto::host_requested_terminal_unavailable_v1(&host));
+    for kind in [
+        "provider_unavailable",
+        "clean_exit",
+        "nonzero_exit",
+        "unknown",
+        "cancelled",
+    ] {
+        assert_json_round_trip::<dto::TerminalSignal>(&json!({
+            "kind":kind, "observed_at_unix_ms":0
+        }));
+    }
+}
+
+#[test]
 fn prompt_acceptance_capability_requires_explicit_v1_host_selection() {
     let mut host = dto::HostContext {
         app: "older-host".to_string(),

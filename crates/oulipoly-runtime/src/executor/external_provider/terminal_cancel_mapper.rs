@@ -83,6 +83,7 @@ fn terminal_signal_kind(kind: &ProviderTerminalSignalKind) -> TerminalSignalKind
         ProviderTerminalSignalKind::NonzeroExit => TerminalSignalKind::NonzeroExit,
         ProviderTerminalSignalKind::SignalExit => TerminalSignalKind::SignalExit,
         ProviderTerminalSignalKind::SpawnError => TerminalSignalKind::SpawnError,
+        ProviderTerminalSignalKind::ProviderUnavailable => TerminalSignalKind::ProviderUnavailable,
         ProviderTerminalSignalKind::ProviderStorageContention => {
             TerminalSignalKind::ProviderStorageContention
         }
@@ -112,6 +113,35 @@ mod tests {
             evidence: evidence.map(str::to_string),
             observed_at_unix_ms: 1_780_808_654_364,
         }
+    }
+
+    #[test]
+    fn provider_unavailable_is_typed_failure_and_cancellation_keeps_precedence() {
+        let signal = provider_signal(
+            ProviderTerminalSignalKind::ProviderUnavailable,
+            Some("upstream unavailable"),
+        );
+        for code in [0, 7] {
+            let outcome = map_terminal_cancel_outcome(
+                &ProcessStatus::Exited { code },
+                &signal,
+                "fixture-provider",
+            );
+            assert_eq!(outcome.exit_code, if code == 0 { -1 } else { code });
+            assert_eq!(
+                outcome.terminal_reason.as_deref(),
+                Some("provider_unavailable")
+            );
+            assert_eq!(
+                outcome.terminal_signal.kind,
+                TerminalSignalKind::ProviderUnavailable
+            );
+            assert_eq!(outcome.terminal_signal.evidence, "upstream unavailable");
+        }
+        let cancelled =
+            map_terminal_cancel_outcome(&ProcessStatus::Cancelled, &signal, "fixture-provider");
+        assert_eq!(cancelled.exit_code, 130);
+        assert_eq!(cancelled.terminal_reason.as_deref(), Some("cancelled"));
     }
 
     #[test]

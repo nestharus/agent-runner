@@ -477,6 +477,7 @@ mod tests {
             super::TerminalSignalKind::MaybeQuotaExhausted,
             super::TerminalSignalKind::RateLimited,
             super::TerminalSignalKind::ProviderStorageContention,
+            super::TerminalSignalKind::ProviderUnavailable,
             super::TerminalSignalKind::ProlongedSilence,
             super::TerminalSignalKind::Unknown,
         ] {

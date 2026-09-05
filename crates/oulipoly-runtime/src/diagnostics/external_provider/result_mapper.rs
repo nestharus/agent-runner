@@ -62,6 +62,7 @@ fn runtime_kind(kind: &ProviderTerminalSignalKind) -> TerminalSignalKind {
         }
         ProviderTerminalSignalKind::MaybeQuotaExhausted => TerminalSignalKind::MaybeQuotaExhausted,
         ProviderTerminalSignalKind::RateLimited => TerminalSignalKind::RateLimited,
+        ProviderTerminalSignalKind::ProviderUnavailable => TerminalSignalKind::ProviderUnavailable,
         ProviderTerminalSignalKind::ProviderStorageContention => {
             TerminalSignalKind::ProviderStorageContention
         }
@@ -110,6 +111,38 @@ mod tests {
                 observed_at_unix_ms: 1_780_808_654_364,
             },
         }
+    }
+
+    #[test]
+    fn provider_unavailable_classification_preserves_typed_evidence_and_cancellation() {
+        let classification = map_terminal_classify_result(
+            &request(ProcessStatus::Exited { code: 0 }),
+            result(
+                TerminalSignalKind::ProviderUnavailable,
+                Some("upstream unavailable"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(classification.exit_code, -1);
+        assert_eq!(
+            classification.terminal_reason.as_deref(),
+            Some("provider_unavailable")
+        );
+        assert_eq!(
+            classification.terminal_signal.kind,
+            crate::executor::terminal_signal::TerminalSignalKind::ProviderUnavailable
+        );
+        assert_eq!(
+            classification.terminal_signal.evidence,
+            "upstream unavailable"
+        );
+        let cancelled = map_terminal_classify_result(
+            &request(ProcessStatus::Cancelled),
+            result(TerminalSignalKind::ProviderUnavailable, None),
+        )
+        .unwrap();
+        assert_eq!(cancelled.exit_code, 130);
+        assert_eq!(cancelled.terminal_reason.as_deref(), Some("cancelled"));
     }
 
     #[test]

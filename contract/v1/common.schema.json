@@ -55,7 +55,7 @@
         },
         "env": {
           "$ref": "#/$defs/StringMap",
-          "description": "Open v1-compatible host negotiation map. OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1=1, OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1, and OULIPOLY_HOST_SESSION_TURN_PAGES_V1=1 explicitly select their respective extensions; absent selection means a provider must omit that extension capability."
+          "description": "Open v1-compatible host negotiation map. OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1=1, OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1, and OULIPOLY_HOST_SESSION_TURN_PAGES_V1=1 explicitly select their respective extensions; absent selection means a provider must omit that extension capability. OULIPOLY_HOST_TERMINAL_UNAVAILABLE_V1=1 explicitly permits provider_unavailable terminal signals on launch and terminal.classify responses; without that request selection, providers must use existing v1 terminal kinds."
         },
         "deadline_unix_ms": {
           "$ref": "#/$defs/UnixMilliseconds"
@@ -434,6 +434,7 @@
         "maybe_quota_exhausted",
         "rate_limited",
         "provider_storage_contention",
+        "provider_unavailable",
         "prolonged_silence",
         "cancelled",
         "unknown"

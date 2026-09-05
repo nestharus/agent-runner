@@ -182,6 +182,7 @@ fn terminal_signal_disposition(signal: &TerminalSignal) -> TerminalSignalDisposi
         | TerminalSignalKind::SignalExit
         | TerminalSignalKind::SpawnError
         | TerminalSignalKind::RateLimited
+        | TerminalSignalKind::ProviderUnavailable
         | TerminalSignalKind::Unknown => TerminalSignalDisposition::InteractiveFail,
     }
 }
