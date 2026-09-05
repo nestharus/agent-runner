@@ -42,10 +42,8 @@ use std::thread::{self, JoinHandle};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-const SOCKET_ENV: &str = "OULIPOLY_LIVE_SESSION_BIND_SOCKET";
-#[cfg(unix)]
-const TOKEN_ENV: &str = "OULIPOLY_LIVE_SESSION_BIND_TOKEN";
+pub(crate) const SOCKET_ENV: &str = "OULIPOLY_LIVE_SESSION_BIND_SOCKET";
+pub(crate) const TOKEN_ENV: &str = "OULIPOLY_LIVE_SESSION_BIND_TOKEN";
 #[cfg(unix)]
 const PROTOCOL_VERSION: u8 = 1;
 #[cfg(unix)]

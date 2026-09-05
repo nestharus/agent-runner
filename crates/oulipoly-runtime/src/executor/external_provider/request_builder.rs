@@ -19,6 +19,7 @@ use super::context::ExternalProviderDispatchContext;
 use crate::executor::cli::spawn_identity::{
     PARENT_INVOCATION_ENV, provider_parent_invocation_env, split_invocation_launch_environment,
 };
+use crate::executor::cli::{LIVE_SESSION_BIND_SOCKET_ENV, LIVE_SESSION_BIND_TOKEN_ENV};
 use crate::executor::cli::{resolve_input_flags, shell_split};
 use crate::provider_registry::DescribeHostOptions;
 use oulipoly_config::PromptMode;
@@ -122,6 +123,10 @@ pub(crate) fn remove_runner_private_environment(env: &mut BTreeMap<String, Strin
     env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
     env.remove(PARENT_INVOCATION_ENV);
     env.remove(RETURN_CHANNEL_ENV);
+    // The ancestor's interactive binding belongs to a different invocation.
+    // External launches publish their own session through provider events.
+    env.remove(LIVE_SESSION_BIND_SOCKET_ENV);
+    env.remove(LIVE_SESSION_BIND_TOKEN_ENV);
 }
 
 fn remove_configured_launch_env(env: &mut BTreeMap<String, String>, names: &[String]) {

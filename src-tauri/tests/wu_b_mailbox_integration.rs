@@ -4,9 +4,9 @@ mod provider_authority_fixture;
 
 use chrono::{DateTime, Utc};
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, InboxTarget, InboxTargetKind,
-    MailboxDb, MailboxRow, RuntimeGenerationId, RuntimeLifecycleState, RuntimeTerminalReason,
-    SubmittedInputEnqueue,
+    AgentBashCompleteEnqueue, CompletionEventTriggerInput, CreateRuntimeGeneration, EnqueueResult,
+    InboxTarget, InboxTargetKind, MailboxDb, MailboxRow, RuntimeGenerationId,
+    RuntimeLifecycleState, RuntimeTerminalReason, SubmittedInputEnqueue,
 };
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
@@ -101,6 +101,14 @@ impl Fixture {
             self.data_home.join("oulipoly-agent-runner"),
         );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+        for variable in [
+            "OULIPOLY_LIVE_SESSION_BIND_SOCKET",
+            "OULIPOLY_LIVE_SESSION_BIND_TOKEN",
+        ] {
+            if !cmd.get_envs().any(|(key, _)| key == variable) {
+                cmd.env_remove(variable);
+            }
+        }
         cmd.env_remove("OULIPOLY_AUTO_WAKE");
         cmd.env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID");
         cmd.env_remove("OULIPOLY_AUTO_WAKE_TOKEN");
@@ -169,6 +177,15 @@ impl Fixture {
     }
 
     fn run_notify_artifacts(&self, handle: &str, artifacts: &NotifyArtifacts) -> Output {
+        self.run_notify_artifacts_with_consumed(handle, artifacts, false)
+    }
+
+    fn run_notify_artifacts_with_consumed(
+        &self,
+        handle: &str,
+        artifacts: &NotifyArtifacts,
+        consumed: bool,
+    ) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("notify")
             .arg("agent-bash-complete")
@@ -185,6 +202,9 @@ impl Fixture {
             .arg("--rc")
             .arg(&artifacts.rc)
             .arg("--json");
+        if consumed {
+            cmd.arg("--consumed");
+        }
         self.run(cmd)
     }
 
@@ -1174,6 +1194,291 @@ fn completion_trigger_is_idempotent_for_the_registered_handle() {
 }
 
 #[test]
+fn completion_trigger_replay_accepts_delivery_bookkeeping_after_receipt() {
+    let fixture = Fixture::new();
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    let handle = "h-delivery-replay";
+    let mut metadata = completion_delivery_metadata(handle);
+    let artifacts = fixture.write_notify_artifacts(handle, metadata.clone(), 7);
+    let registration = fixture.run_register_artifacts(handle, "async", &artifacts);
+    assert!(registration.status.success(), "{registration:?}");
+    let first = fixture.run_notify_artifacts(handle, &artifacts);
+    assert!(first.status.success(), "{first:?}");
+    let row = fixture.mailbox_rows(SESSION_A, true).remove(0);
+    let original_payload = fs::read(row.payload_file_path.as_deref().unwrap()).unwrap();
+    let mut db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+    db.mark_delivered(SESSION_A, None, &[row.seq], INVOCATION_A)
+        .unwrap();
+    let original_event = db.completion_event(handle).unwrap().unwrap();
+    let delivered_row = fixture.mailbox_rows(SESSION_A, true).remove(0);
+
+    // Agent Bash writes this outcome after the callback exits. Its exit_code
+    // describes the notification helper; the workload's rc remains 7.
+    metadata["delivery"] = json!({
+        "attempted": true,
+        "exit_code": 0,
+        "error": null,
+        "lifecycle": "admitted_outcome",
+    });
+    metadata["updated_at_unix_ms"] = json!(1788585398898_i64);
+    fs::write(&artifacts.meta, notify_metadata_content(&metadata)).unwrap();
+
+    for _ in 0..2 {
+        let replay = fixture.run_notify_artifacts(handle, &artifacts);
+        assert!(replay.status.success(), "{replay:?}");
+        let response = stdout_json(&replay);
+        assert_eq!(response["status"], "already_triggered");
+        assert_eq!(response["seq"], row.seq);
+        assert_eq!(response["pty_deliveries"], json!([]));
+        assert_eq!(response["wake"], Value::Null);
+        assert_eq!(
+            fixture.mailbox_rows(SESSION_A, true),
+            vec![delivered_row.clone()]
+        );
+        assert_eq!(
+            db.completion_event(handle).unwrap().unwrap(),
+            original_event
+        );
+        assert_eq!(
+            fs::read(row.payload_file_path.as_deref().unwrap()).unwrap(),
+            original_payload
+        );
+    }
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_trigger_replay_accepts_bookkeeping_after_consumed_payload_reclamation() {
+    let fixture = Fixture::new();
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    let handle = "h-consumed-replay";
+    let mut metadata = completion_delivery_metadata(handle);
+    let artifacts = fixture.write_notify_artifacts(handle, metadata.clone(), 7);
+    let registration = fixture.run_register_artifacts(handle, "sync", &artifacts);
+    assert!(registration.status.success(), "{registration:?}");
+    let first = fixture.run_notify_artifacts_with_consumed(handle, &artifacts, true);
+    assert!(first.status.success(), "{first:?}");
+    let db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+    let original = db.completion_event(handle).unwrap().unwrap();
+    let listeners = db.completion_event_listeners(handle).unwrap();
+    assert!(original.payload_reclaimed_at.is_some());
+    assert!(!Path::new(original.payload_file_path.as_deref().unwrap()).exists());
+    metadata["delivery"] =
+        json!({"attempted": true, "exit_code": 0, "error": null, "lifecycle": "admitted_outcome"});
+    metadata["updated_at_unix_ms"] = json!(1788585398898_i64);
+    fs::write(&artifacts.meta, notify_metadata_content(&metadata)).unwrap();
+
+    let replay = fixture.run_notify_artifacts_with_consumed(handle, &artifacts, true);
+    assert!(replay.status.success(), "{replay:?}");
+    assert_eq!(stdout_json(&replay)["status"], "already_triggered");
+    assert_eq!(stdout_json(&replay)["pty_deliveries"], json!([]));
+    assert!(fixture.mailbox_rows(SESSION_A, true).is_empty());
+    let replayed = db.completion_event(handle).unwrap().unwrap();
+    assert_eq!(replayed.payload_sha256, original.payload_sha256);
+    assert_eq!(replayed.payload_byte_len, original.payload_byte_len);
+    assert_eq!(replayed.payload_file_path, original.payload_file_path);
+    assert_eq!(replayed.triggered_at, original.triggered_at);
+    assert_eq!(db.completion_event_listeners(handle).unwrap(), listeners);
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_trigger_replay_preserves_preexisting_payload_bytes() {
+    let fixture = Fixture::new();
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    let handle = "h-preexisting-replay";
+    let mut metadata = completion_delivery_metadata(handle);
+    let artifacts = fixture.write_notify_artifacts(handle, metadata.clone(), 7);
+    let registration = fixture.run_register_artifacts(handle, "async", &artifacts);
+    assert!(registration.status.success(), "{registration:?}");
+    let mut db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+    let listeners = db.completion_event_listeners(handle).unwrap();
+    // Seed a prior producer's full snapshot directly, including formatting that
+    // differs from today's callback serializer. It must stay byte-for-byte intact.
+    let original = serde_json::to_string_pretty(&json!({
+        "schema_version": 2,
+        "kind": "agent_bash_complete",
+        "event_id": handle,
+        "handle": handle,
+        "rc": 7,
+        "state_dir": artifacts.state_dir,
+        "meta_path": artifacts.meta,
+        "log_path": artifacts.log,
+        "rc_path": artifacts.rc,
+        "listeners": listeners.iter().map(|listener| json!({
+            "listener_id": listener.listener_id,
+            "session_id": listener.session_id,
+            "invocation_uuid": listener.owner_invocation_uuid,
+        })).collect::<Vec<_>>(),
+        "meta": metadata,
+    }))
+    .unwrap();
+    let seeded = db
+        .trigger_completion_event(CompletionEventTriggerInput {
+            event_id: handle,
+            payload_json: &original,
+            state_dir: artifacts.state_dir.to_str().unwrap(),
+            meta_path: artifacts.meta.to_str().unwrap(),
+            log_path: artifacts.log.to_str().unwrap(),
+            rc_path: artifacts.rc.to_str().unwrap(),
+            rc: 7,
+            consumed: false,
+        })
+        .unwrap();
+    db.mark_delivered(SESSION_A, None, &[seeded.mailbox_rows[0].seq], INVOCATION_A)
+        .unwrap();
+    metadata["delivery"] =
+        json!({"attempted": true, "exit_code": 0, "error": null, "lifecycle": "admitted_outcome"});
+    metadata["updated_at_unix_ms"] = json!(1788585398898_i64);
+    fs::write(&artifacts.meta, notify_metadata_content(&metadata)).unwrap();
+    let replay = fixture.run_notify_artifacts(handle, &artifacts);
+    assert!(replay.status.success(), "{replay:?}");
+    assert_eq!(stdout_json(&replay)["status"], "already_triggered");
+    assert_eq!(stdout_json(&replay)["pty_deliveries"], json!([]));
+    assert_eq!(db.completion_event(handle).unwrap().unwrap(), seeded.event);
+    assert_eq!(
+        fs::read_to_string(seeded.event.payload_file_path.as_deref().unwrap()).unwrap(),
+        original
+    );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_trigger_replay_rejects_unverifiable_retained_payload() {
+    for corruption in ["missing", "same-length", "oversized"] {
+        let fixture = Fixture::new();
+        fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+        let handle = "h-unverifiable-replay";
+        let mut metadata = completion_delivery_metadata(handle);
+        let artifacts = fixture.write_notify_artifacts(handle, metadata.clone(), 7);
+        let registration = fixture.run_register_artifacts(handle, "async", &artifacts);
+        assert!(registration.status.success(), "{registration:?}");
+        let first = fixture.run_notify_artifacts(handle, &artifacts);
+        assert!(first.status.success(), "{first:?}");
+        let original_rows = fixture.mailbox_rows(SESSION_A, true);
+        let path = original_rows[0].payload_file_path.as_deref().unwrap();
+        let original = fs::read_to_string(path).unwrap();
+        fs::remove_file(path).unwrap();
+        if corruption != "missing" {
+            let tampered = if corruption == "same-length" {
+                let tampered = original.replace("completed", "completeX");
+                assert_eq!(original.len(), tampered.len());
+                tampered
+            } else {
+                format!("{original}{}", " ".repeat(1024 * 1024))
+            };
+            fs::write(path, tampered).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        // Force semantic comparison with a historical payload by changing a
+        // stable field. Unverifiable bytes must never authorize its reuse.
+        metadata["workload_pid"] = json!(1235);
+        fs::write(&artifacts.meta, notify_metadata_content(&metadata)).unwrap();
+        let replay = fixture.run_notify_artifacts(handle, &artifacts);
+        assert_eq!(replay.status.code(), Some(74), "{replay:?}");
+        let message = stdout_json(&replay)["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains(if corruption != "missing" {
+                "integrity mismatch"
+            } else {
+                "Failed to read"
+            }),
+            "{message}"
+        );
+        assert_eq!(fixture.mailbox_rows(SESSION_A, true), original_rows);
+        fixture.assert_default_user_paths_untouched();
+    }
+}
+
+#[test]
+fn completion_trigger_replay_rejects_changed_completion_identity() {
+    let fixture = Fixture::new();
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    let handle = "h-conflicting-replay";
+    let original_metadata = completion_delivery_metadata(handle);
+    let artifacts = fixture.write_notify_artifacts(handle, original_metadata.clone(), 7);
+    let registration = fixture.run_register_artifacts(handle, "async", &artifacts);
+    assert!(registration.status.success(), "{registration:?}");
+    let first = fixture.run_notify_artifacts(handle, &artifacts);
+    assert!(first.status.success(), "{first:?}");
+    let original_rows = fixture.mailbox_rows(SESSION_A, true);
+
+    for (pointer, replacement) in [
+        ("/owner_session_id", json!(SESSION_B)),
+        ("/owner_invocation_uuid", json!(INVOCATION_B)),
+        ("/handle", json!("another-workload")),
+        ("/workload_pid", json!(1235)),
+        ("/workload_pid_starttime_ticks", json!(9877)),
+        ("/argv", json!(["sh", "-c", "exit 9"])),
+        ("/rc", json!(9)),
+        ("/workload_rc", json!(9)),
+        ("/completed_at_unix_ms", json!(1788585397778_i64)),
+        ("/error", json!("changed workload error")),
+        ("/delivery_helper", json!({"program": "/another/helper"})),
+    ] {
+        let mut metadata = original_metadata.clone();
+        *metadata.pointer_mut(pointer).unwrap() = replacement;
+        fs::write(&artifacts.meta, notify_metadata_content(&metadata)).unwrap();
+        let replay = fixture.run_notify_artifacts(handle, &artifacts);
+        assert_eq!(replay.status.code(), Some(74), "{pointer}: {replay:?}");
+        assert!(
+            stdout_json(&replay)["message"]
+                .as_str()
+                .unwrap()
+                .contains("different payload")
+        );
+        assert_eq!(fixture.mailbox_rows(SESSION_A, true), original_rows);
+    }
+    let mut metadata = original_metadata.clone();
+    metadata["delivery"]["unknown_identity_field"] = json!("must-not-be-ignored");
+    fs::write(&artifacts.meta, notify_metadata_content(&metadata)).unwrap();
+    let replay = fixture.run_notify_artifacts(handle, &artifacts);
+    assert_eq!(replay.status.code(), Some(74), "{replay:?}");
+
+    fs::write(&artifacts.meta, notify_metadata_content(&original_metadata)).unwrap();
+    fs::write(&artifacts.rc, "9\n").unwrap();
+    let replay = fixture.run_notify_artifacts(handle, &artifacts);
+    assert_eq!(replay.status.code(), Some(74), "{replay:?}");
+    fs::write(&artifacts.rc, "7\n").unwrap();
+
+    let alternate = fixture.write_notify_artifacts("h-alternate-paths", original_metadata, 7);
+    for changed in [
+        NotifyArtifacts {
+            state_dir: alternate.state_dir.clone(),
+            meta: artifacts.meta.clone(),
+            log: artifacts.log.clone(),
+            rc: artifacts.rc.clone(),
+        },
+        NotifyArtifacts {
+            state_dir: artifacts.state_dir.clone(),
+            meta: alternate.meta.clone(),
+            log: artifacts.log.clone(),
+            rc: artifacts.rc.clone(),
+        },
+        NotifyArtifacts {
+            state_dir: artifacts.state_dir.clone(),
+            meta: artifacts.meta.clone(),
+            log: alternate.log.clone(),
+            rc: artifacts.rc.clone(),
+        },
+        NotifyArtifacts {
+            state_dir: artifacts.state_dir.clone(),
+            meta: artifacts.meta.clone(),
+            log: artifacts.log.clone(),
+            rc: alternate.rc.clone(),
+        },
+    ] {
+        let replay = fixture.run_notify_artifacts(handle, &changed);
+        assert_eq!(replay.status.code(), Some(74), "{replay:?}");
+        assert_eq!(fixture.mailbox_rows(SESSION_A, true), original_rows);
+    }
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
 fn published_payload_without_metadata_commit_is_not_accepted() {
     let fixture = Fixture::new();
     let payload = r#"{"schema_version":1,"kind":"agent_bash_complete","body":"durable"}"#;
@@ -2006,6 +2311,33 @@ fn owner_metadata(session_id: &str, invocation_uuid: &str) -> Value {
         "owner_session_id": session_id,
         "owner_invocation_uuid": invocation_uuid,
         "spooler_extra": "preserve-me",
+    })
+}
+
+fn completion_delivery_metadata(handle: &str) -> Value {
+    json!({
+        "schema_version": 1,
+        "handle": handle,
+        "owner_session_id": SESSION_A,
+        "owner_invocation_uuid": INVOCATION_A,
+        "argv": ["sh", "-c", "exit 7"],
+        "workload_pid": 1234,
+        "workload_pid_starttime_ticks": 9876,
+        "state": "completed",
+        "rc": 7,
+        "workload_rc": 7,
+        "error": null,
+        "delivery_helper": {"program": "/runner/notify"},
+        "completed_at_unix_ms": 1788585397777_i64,
+        "updated_at_unix_ms": 1788585398888_i64,
+        "delivery": {
+            "attempted": true,
+            "exit_code": null,
+            "error": "delivery helper outcome is unknown until the admitted attempt exits",
+            "error_code": "delivery_attempt_in_progress",
+            "retryable": false,
+            "lifecycle": "provisional_transfer",
+        },
     })
 }
 

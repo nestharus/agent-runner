@@ -70,6 +70,9 @@ mod interactive;
 mod ipc;
 mod launch;
 mod live_session_binding;
+pub(crate) use live_session_binding::{
+    SOCKET_ENV as LIVE_SESSION_BIND_SOCKET_ENV, TOKEN_ENV as LIVE_SESSION_BIND_TOKEN_ENV,
+};
 mod policy;
 mod provider_execution;
 mod provider_identity;

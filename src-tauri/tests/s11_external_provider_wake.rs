@@ -400,6 +400,24 @@ fn assert_unconfirmed_resume(output: &Output) {
 }
 
 #[test]
+fn nested_external_provider_cannot_inherit_parent_live_session_binding() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    let output = fixture.run_agent_with_env(
+        "launch child with its own invocation authority",
+        &[
+            ("S11_CHECK_LIVE_BINDING_ISOLATION", "1"),
+            ("OULIPOLY_LIVE_SESSION_BIND_SOCKET", "/parent-owner.sock"),
+            ("OULIPOLY_LIVE_SESSION_BIND_TOKEN", "parent-owner-token"),
+        ],
+    );
+    assert_success(&output);
+    let child_invocation = fs::read_to_string(fixture.work_dir.join("child-invocation")).unwrap();
+    assert_eq!(child_invocation, fixture.latest_invocation_uuid());
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
 fn external_provider_runtime_uses_ingested_session_when_launch_capture_missing() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
@@ -1198,7 +1216,10 @@ def policy_evaluate(request):
         })
     return envelope(request, {
         "accepted": True,
-        "env": {},
+        "env": {
+            "OULIPOLY_LIVE_SESSION_BIND_SOCKET": "/policy-parent-owner.sock",
+            "OULIPOLY_LIVE_SESSION_BIND_TOKEN": "policy-parent-owner-token",
+        } if os.environ.get("S11_CHECK_LIVE_BINDING_ISOLATION") == "1" else {},
         "stdin": None,
         "prompt": None,
         "diagnostics": [],
@@ -1437,6 +1458,16 @@ def session_turn_page(request):
 def main():
     subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
     request = json.loads(sys.stdin.read() or "{}")
+    if os.environ.get("S11_CHECK_LIVE_BINDING_ISOLATION") == "1":
+        params = request.get("params", {})
+        environments = [os.environ, request.get("host", {}).get("env", {}),
+                        params.get("env", {}), params.get("launch", {}).get("env", {})]
+        for environment in environments:
+            for key in ("OULIPOLY_LIVE_SESSION_BIND_SOCKET", "OULIPOLY_LIVE_SESSION_BIND_TOKEN"):
+                assert key not in environment, f"{subcommand} inherited {key}"
+        if subcommand == "launch":
+            identity = json.loads(params["env"]["OULIPOLY_PARENT_INVOCATION"])
+            pathlib.Path(os.environ["S11_WORK_DIR"]).joinpath("child-invocation").write_text(identity["id"])
     if subcommand == "describe":
         print(json.dumps(describe(request)))
         return 0

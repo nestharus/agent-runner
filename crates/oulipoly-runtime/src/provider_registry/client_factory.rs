@@ -1,4 +1,5 @@
 use crate::executor::cli::spawn_identity::PARENT_INVOCATION_ENV;
+use crate::executor::cli::{LIVE_SESSION_BIND_SOCKET_ENV, LIVE_SESSION_BIND_TOKEN_ENV};
 use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_provider::client::{
     CancellationToken, ProcessSpawnObserver, ProviderClient, ProviderClientOptions,
@@ -71,5 +72,7 @@ fn provider_process_environment_removals() -> impl Iterator<Item = &'static str>
         .chain([
             oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
             PARENT_INVOCATION_ENV,
+            LIVE_SESSION_BIND_SOCKET_ENV,
+            LIVE_SESSION_BIND_TOKEN_ENV,
         ])
 }
