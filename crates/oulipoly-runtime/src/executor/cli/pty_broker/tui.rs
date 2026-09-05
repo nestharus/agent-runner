@@ -41,7 +41,9 @@ use super::outbound_observer::{
 #[cfg(test)]
 use super::seed_test_mailbox_delivery;
 use super::snapshot_worker::{MonitorSnapshotProvider, MonitorSnapshotWorker};
+use super::terminal_protocol::TerminalParser;
 use super::transcript_view::project_transcript_tail;
+use super::tui_profile::Profile;
 use super::{
     ChildOutputState, ControlPayloadOutcome, ControlSocket, INJECT_WAIT_LIMIT, InputLineState,
     PendingChildInput, RELAY_BUFFER_BYTES, begin_control_payload_submission,
@@ -76,7 +78,7 @@ use ratatui::style::{Color, Modifier, Style};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::process::ExitStatus;
@@ -101,6 +103,10 @@ pub(super) const FOREGROUND_RENDER_FPS: u64 = 60;
 pub(super) const BACKGROUND_RENDER_FPS: u64 = 10;
 /// Bounded PTY reads folded into one relay iteration before publishing a frame.
 const MAX_COALESCED_PTY_READS: usize = 8;
+/// Batch per-cell terminal commands into frame writes; Ratatui flushes after each draw.
+const RENDER_BUFFER_BYTES: usize = 64 * 1024;
+
+type TuiTerminal = Terminal<CrosstermBackend<BufWriter<File>>>;
 
 /// Bracketed-paste delimiters (DECSET 2004) the broker wraps an injected notification in
 /// when the child has advertised the mode, so the body is treated as pasted content and
@@ -3723,8 +3729,12 @@ fn format_tui_terminal_clone_error(err: io::Error) -> String {
     format!("Failed to clone terminal for TUI: {err}")
 }
 
-fn new_tui_terminal(writer: File) -> io::Result<Terminal<CrosstermBackend<File>>> {
-    Terminal::new(CrosstermBackend::new(writer))
+fn new_tui_terminal(writer: File) -> io::Result<TuiTerminal> {
+    Terminal::new(new_tui_backend(writer))
+}
+
+fn new_tui_backend<W: Write>(writer: W) -> CrosstermBackend<BufWriter<W>> {
+    CrosstermBackend::new(BufWriter::with_capacity(RENDER_BUFFER_BYTES, writer))
 }
 
 fn format_tui_terminal_init_error(err: io::Error) -> String {
@@ -3748,6 +3758,7 @@ struct PublishedRenderSnapshot {
 
 #[derive(Default)]
 struct RenderShared {
+    profile: Profile,
     state: Mutex<RenderState>,
     clipboard: Mutex<Vec<String>>,
     shutdown: AtomicBool,
@@ -3872,7 +3883,10 @@ struct RenderThread {
 
 impl RenderThread {
     fn start(writer: File) -> Result<Self, String> {
-        let shared = Arc::new(RenderShared::default());
+        let shared = Arc::new(RenderShared {
+            profile: Profile::from_env(),
+            ..RenderShared::default()
+        });
         let thread_shared = Arc::clone(&shared);
         let (ready_tx, ready_rx) = mpsc::channel();
         let join = thread::Builder::new()
@@ -3965,7 +3979,7 @@ fn report_render_ready_error(
 
 fn run_render_loop(
     shared: &RenderShared,
-    terminal: &mut Terminal<CrosstermBackend<File>>,
+    terminal: &mut TuiTerminal,
     alt: &mut AltScreenGuard,
 ) -> Result<(), String> {
     let mut next_frame = Instant::now();
@@ -4009,7 +4023,7 @@ fn unrendered_publish_deadline(
 
 fn render_latest_snapshot(
     shared: &RenderShared,
-    terminal: &mut Terminal<CrosstermBackend<File>>,
+    terminal: &mut TuiTerminal,
     alt: &mut AltScreenGuard,
 ) -> Result<(), String> {
     if let Some(snapshot) = shared.latest_snapshot() {
@@ -4020,10 +4034,12 @@ fn render_latest_snapshot(
 
 fn render_snapshot(
     shared: &RenderShared,
-    terminal: &mut Terminal<CrosstermBackend<File>>,
+    terminal: &mut TuiTerminal,
     alt: &mut AltScreenGuard,
     snapshot: &RenderSnapshot,
 ) -> Result<(), String> {
+    let _timing = shared.profile.measure("render.draw");
+    shared.profile.record_count("render.frames", 1);
     for text in shared.drain_clipboard_copies() {
         alt.copy_to_clipboard(&text)?;
     }
@@ -4084,12 +4100,13 @@ pub(super) fn relay_until_exit_observed(
     let master_fd = master.as_raw_fd();
     let renderer = RenderThread::start(writer)?;
     let publisher = renderer.publisher();
+    let profile = publisher.shared.profile.clone();
 
     let mut pane = MonitorPane::new();
     let snapshot_worker = MonitorSnapshotWorker::start(monitor, root, pane.refresh_interval())?;
     let outbound_worker = OutboundObserverWorker::start(outbound_source)?;
     let initial = child_pane_winsize(real_fd, &pane, TypingProtection::for_focus(Focus::Top));
-    let mut parser = vt100::Parser::new(initial.ws_row, initial.ws_col, TOP_PANE_SCROLLBACK_ROWS);
+    let mut parser = TerminalParser::new(initial.ws_row, initial.ws_col, TOP_PANE_SCROLLBACK_ROWS);
     let mut top_scrollback: usize = 0;
     let mut selection: Option<TopSelection> = None;
     let mut clipboard = String::new();
@@ -4113,6 +4130,7 @@ pub(super) fn relay_until_exit_observed(
     );
 
     while status.is_none() {
+        let _iteration = profile.measure("relay.iteration");
         publisher.check_error()?;
         let mut dirty = false;
         let mut priority = RenderPriority::Background;
@@ -4164,13 +4182,17 @@ pub(super) fn relay_until_exit_observed(
             RenderPriority::Interactive,
         );
         let release_gate_was_awaiting_output = outbound_release_gate.awaiting_child_output();
+        parser.append_replies(&mut pending_child_input);
+        let poll_timing = profile.measure("relay.poll");
         let ready = poll_relay_fds(
             real_fd,
             master_fd,
             control.map(ControlSocket::fd),
             !pending_child_input.is_empty(),
         )?;
+        drop(poll_timing);
         if ready.pty_writable {
+            let _timing = profile.measure("input.write");
             flush_pending_child_input(master_fd, &mut pending_child_input)?;
             outbound_release_gate.observe_pending_write_drained(pending_child_input.is_empty());
             mark_render_dirty(
@@ -4188,6 +4210,7 @@ pub(super) fn relay_until_exit_observed(
             );
         }
         if ready.real_input {
+            let _timing = profile.measure("input.forward");
             let mut input_io = RealInputForwardIo {
                 real_fd,
                 router: &mut router,
@@ -4283,12 +4306,14 @@ pub(super) fn relay_until_exit_observed(
                 );
             }
         }
+        let output_timing = ready.pty_output.then(|| profile.measure("pty.parse"));
         if ready.pty_output && pump_pty_output_burst(master_fd, &mut parser, &mut buffer)? {
             child_output_state.observe_child_output();
             outbound_release_gate
                 .observe_child_output(release_gate_was_awaiting_output, Instant::now());
             mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
         }
+        drop(output_timing);
         if ready.control
             && let Some(control) = control
         {
@@ -4398,7 +4423,7 @@ fn apply_sizing(
     child_pid: u32,
     pane: &MonitorPane,
     protection: TypingProtection,
-    parser: &mut vt100::Parser,
+    parser: &mut TerminalParser,
     applied: &mut Option<(libc::winsize, u16)>,
 ) -> bool {
     let Some(full) = read_terminal_winsize(real_fd) else {
@@ -4437,7 +4462,7 @@ fn sizing_already_applied(
     })
 }
 
-fn resize_virtual_terminal(parser: &mut vt100::Parser, child: &libc::winsize) {
+fn resize_virtual_terminal(parser: &mut TerminalParser, child: &libc::winsize) {
     parser.screen_mut().set_size(child.ws_row, child.ws_col);
 }
 
@@ -5198,7 +5223,7 @@ fn run_pending_outbound_recovery(pane: &mut MonitorPane, worker: &OutboundObserv
 /// arrived (requiring a redraw).
 fn pump_pty_output(
     master_fd: RawFd,
-    parser: &mut vt100::Parser,
+    parser: &mut TerminalParser,
     buffer: &mut [u8],
 ) -> Result<bool, String> {
     let output = read_pty_output(master_fd, buffer).map_err(format_pty_output_read_error)?;
@@ -5207,7 +5232,7 @@ fn pump_pty_output(
 
 fn pump_pty_output_burst(
     master_fd: RawFd,
-    parser: &mut vt100::Parser,
+    parser: &mut TerminalParser,
     buffer: &mut [u8],
 ) -> Result<bool, String> {
     let mut saw_output = false;
@@ -5243,7 +5268,7 @@ fn format_pty_output_coalesce_poll_error(err: io::Error) -> String {
 /// Drain any buffered child output into the virtual terminal after exit.
 fn drain_pty_output(
     master_fd: RawFd,
-    parser: &mut vt100::Parser,
+    parser: &mut TerminalParser,
     buffer: &mut [u8],
 ) -> Result<(), String> {
     while poll_single_fd(master_fd)? {
@@ -5280,7 +5305,7 @@ fn pty_read_error_is_eof(err: &io::Error) -> bool {
     is_pty_eof_error(err)
 }
 
-fn process_pty_output(parser: &mut vt100::Parser, buffer: &[u8], output: PtyOutput) -> bool {
+fn process_pty_output(parser: &mut TerminalParser, buffer: &[u8], output: PtyOutput) -> bool {
     if !pty_output_has_bytes(&output) {
         return false;
     }
@@ -5299,7 +5324,7 @@ fn pty_output_bytes<'a>(buffer: &'a [u8], output: &PtyOutput) -> &'a [u8] {
     }
 }
 
-fn process_pty_bytes(parser: &mut vt100::Parser, bytes: &[u8]) {
+fn process_pty_bytes(parser: &mut TerminalParser, bytes: &[u8]) {
     parser.process(bytes);
 }
 
@@ -5323,13 +5348,15 @@ fn current_render_selection(
 
 fn publish_render_snapshot(
     publisher: &RenderPublisher,
-    parser: &vt100::Parser,
+    parser: &TerminalParser,
     focus: Focus,
     pane: &MonitorPane,
     selection: Option<SelectionSpan>,
     typing_protection: TypingProtection,
     priority: RenderPriority,
 ) {
+    let _timing = publisher.shared.profile.measure("render.snapshot");
+    publisher.shared.profile.record_count("render.snapshots", 1);
     publisher.publish(RenderSnapshot::capture_with_typing_protection_and_priority(
         parser.screen(),
         focus,
@@ -5655,10 +5682,7 @@ fn queue_outbound_submit_delimiter(
 }
 
 /// Render one frame to the real terminal.
-fn draw_snapshot(
-    terminal: &mut Terminal<CrosstermBackend<File>>,
-    snapshot: &RenderSnapshot,
-) -> Result<(), String> {
+fn draw_snapshot(terminal: &mut TuiTerminal, snapshot: &RenderSnapshot) -> Result<(), String> {
     terminal
         .draw(|frame| render_snapshot_frame(frame, snapshot))
         .map(|_| ())
@@ -5667,7 +5691,7 @@ fn draw_snapshot(
 
 struct ControlInjectionIo<'a> {
     master_fd: RawFd,
-    parser: &'a mut vt100::Parser,
+    parser: &'a mut TerminalParser,
     line_state: &'a mut InputLineState,
     child_output_state: &'a mut ChildOutputState,
     pending_child_input: &'a mut PendingChildInput,
@@ -5832,6 +5856,7 @@ fn drain_control_payload(
             if pump_pty_output(io.master_fd, io.parser, io.buffer)
                 .map_err(|err| format!("control_submit_{}_drain_failed:{err}", phase.token()))?
             {
+                io.parser.append_replies(io.pending_child_input);
                 io.child_output_state.observe_child_output();
                 io.outbound_release_gate
                     .observe_child_output(false, Instant::now());
@@ -6105,7 +6130,7 @@ mod tests {
 
     #[test]
     fn child_bracketed_paste_mode_is_mirrored_only_for_agent_input() {
-        let mut parser = vt100::Parser::new(10, 20, 0);
+        let mut parser = TerminalParser::new(10, 20, 0);
         parser.process(b"\x1b[?2004h");
         let pane = MonitorPane::new();
 
@@ -6153,7 +6178,7 @@ mod tests {
 
     #[test]
     fn vt100_mouse_mode_mirrors_to_terminal_decsets_and_restore() {
-        let mut parser = vt100::Parser::new(10, 20, 0);
+        let mut parser = TerminalParser::new(10, 20, 0);
         parser.process(b"\x1b[?1006h\x1b[?1002h");
         let enabled = mouse_request_from_screen(parser.screen());
         assert_eq!(enabled.mode, vt100::MouseProtocolMode::ButtonMotion);
@@ -6564,7 +6589,7 @@ mod tests {
     fn control_submit_drains_body_then_final_delimiter_before_returning() {
         for bracketed_paste in [false, true] {
             let (mut read_end, write_end) = pipe_files();
-            let mut parser = vt100::Parser::new(10, 20, 0);
+            let mut parser = TerminalParser::new(10, 20, 0);
             let mut line_state = InputLineState::default();
             let mut child_output_state = ChildOutputState::default();
             let mut pending_child_input = PendingChildInput::new();
@@ -6599,7 +6624,7 @@ mod tests {
         }
 
         let (_read_end, _write_end) = pipe_files();
-        let mut parser = vt100::Parser::new(10, 20, 0);
+        let mut parser = TerminalParser::new(10, 20, 0);
         let mut line_state = InputLineState::default();
         let mut child_output_state = ChildOutputState::default();
         let mut pending_child_input = PendingChildInput::new();
@@ -6639,7 +6664,7 @@ mod tests {
         let envelope = format!("notify\n[OULIPOLY-DELIVERY {attempt_id}]");
         let mut payload = prepare_control_payload(envelope.into_bytes(), None).unwrap();
         let (child_peer, master) = pipe_files();
-        let mut parser = vt100::Parser::new(10, 20, 0);
+        let mut parser = TerminalParser::new(10, 20, 0);
         let mut line_state = InputLineState::default();
         let mut child_output_state = ChildOutputState::default();
         let mut pending_child_input = PendingChildInput::new();
@@ -7705,7 +7730,7 @@ mod tests {
 
     #[test]
     fn extract_selection_text_reads_screen_range_and_trims() {
-        let mut parser = vt100::Parser::new(4, 20, 0);
+        let mut parser = TerminalParser::new(4, 20, 0);
         parser.process(b"hello\r\nworld wide");
         let span = SelectionSpan {
             start: (0, 0),
@@ -7751,7 +7776,7 @@ mod tests {
         let backend = TestBackend::new(20, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         // top pane is 5 rows (10 - persistent overlay rows), 20 cols.
-        let mut parser = vt100::Parser::new(5, 20, 0);
+        let mut parser = TerminalParser::new(5, 20, 0);
         parser.process(b"hello world");
         let screen_owner = parser;
         let screen = screen_owner.screen();
@@ -7769,7 +7794,7 @@ mod tests {
 
     #[test]
     fn render_cadence_tracks_overlay_focus() {
-        let parser = vt100::Parser::new(5, 80, 0);
+        let parser = TerminalParser::new(5, 80, 0);
         let background =
             RenderSnapshot::capture(parser.screen(), Focus::Top, &MonitorPane::new(), None);
         assert_eq!(snapshot_render_fps(&background), BACKGROUND_RENDER_FPS);
@@ -7832,7 +7857,7 @@ mod tests {
 
     #[test]
     fn child_output_priority_reaches_foreground_without_bottom_focus() {
-        let parser = vt100::Parser::new(5, 80, 0);
+        let parser = TerminalParser::new(5, 80, 0);
         let snapshot = RenderSnapshot::capture_with_typing_protection_and_priority(
             parser.screen(),
             Focus::Top,
@@ -7847,7 +7872,7 @@ mod tests {
 
     #[test]
     fn interactive_publish_deadline_preempts_stale_background_wait() {
-        let parser = vt100::Parser::new(5, 80, 0);
+        let parser = TerminalParser::new(5, 80, 0);
         let pane = MonitorPane::new();
         let background = RenderSnapshot::capture_with_typing_protection_and_priority(
             parser.screen(),
@@ -7884,7 +7909,7 @@ mod tests {
 
     #[test]
     fn background_publish_deadline_remains_throttled() {
-        let parser = vt100::Parser::new(5, 80, 0);
+        let parser = TerminalParser::new(5, 80, 0);
         let snapshot =
             RenderSnapshot::capture(parser.screen(), Focus::Top, &MonitorPane::new(), None);
         let last_frame = Instant::now();
@@ -7902,7 +7927,7 @@ mod tests {
     fn child_output_burst_coalescing_preserves_final_screen_state() {
         let (read_end, mut write_end) = pipe_files();
         write_end.write_all(b"abcdef").unwrap();
-        let mut parser = vt100::Parser::new(1, 20, 0);
+        let mut parser = TerminalParser::new(1, 20, 0);
         let mut buffer = [0_u8; 2];
 
         assert!(pump_pty_output_burst(read_end.as_raw_fd(), &mut parser, &mut buffer).unwrap());
@@ -7933,6 +7958,72 @@ mod tests {
         assert_eq!(routed_priority(&routed), RenderPriority::Interactive);
     }
 
+    #[derive(Clone, Default)]
+    struct RenderWriteRecord {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingRenderWriter(Arc<Mutex<RenderWriteRecord>>);
+
+    impl Write for RecordingRenderWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut record = lock_or_recover(&self.0);
+            record.bytes.extend_from_slice(bytes);
+            record.writes += 1;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            lock_or_recover(&self.0).flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn buffered_render_preserves_frame_bytes_and_flushes_without_per_cell_writes() {
+        let mut parser = TerminalParser::new(48, 160, 0);
+        for row in 1..=48 {
+            parser.process(format!("\x1b[{row};1H{}", "x".repeat(160)).as_bytes());
+        }
+        let snapshot =
+            RenderSnapshot::capture(parser.screen(), Focus::Top, &MonitorPane::new(), None);
+        let options = ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 160, 50)),
+        };
+        let unbuffered_writer = RecordingRenderWriter::default();
+        let mut unbuffered = Terminal::with_options(
+            CrosstermBackend::new(unbuffered_writer.clone()),
+            options.clone(),
+        )
+        .unwrap();
+        let buffered_writer = RecordingRenderWriter::default();
+        let mut buffered =
+            Terminal::with_options(new_tui_backend(buffered_writer.clone()), options).unwrap();
+
+        unbuffered
+            .draw(|frame| render_snapshot_frame(frame, &snapshot))
+            .unwrap();
+        buffered
+            .draw(|frame| render_snapshot_frame(frame, &snapshot))
+            .unwrap();
+
+        // Inspect before dropping the terminals: draw itself must flush the complete
+        // frame, so later AltScreenGuard mode writes cannot overtake buffered output.
+        let unbuffered = lock_or_recover(&unbuffered_writer.0).clone();
+        let buffered = lock_or_recover(&buffered_writer.0).clone();
+        assert_eq!(buffered.bytes, unbuffered.bytes);
+        assert!(
+            unbuffered.writes > 7_000,
+            "fixture must exercise a full repaint"
+        );
+        assert!(buffered.writes <= 2, "frame must be batched before writing");
+        assert!(buffered.flushes > 0, "draw must flush before returning");
+        assert_eq!(buffered.flushes, unbuffered.flushes);
+    }
+
     #[test]
     fn render_thread_keeps_drawing_while_processing_side_is_busy() {
         let _terminal_lock = lock_terminal_render_test();
@@ -7961,7 +8052,7 @@ mod tests {
         let publisher = renderer.publisher();
         let mut pane = MonitorPane::new();
         pane.expand();
-        let mut parser = vt100::Parser::new(10, 80, 0);
+        let mut parser = TerminalParser::new(10, 80, 0);
         parser.process(b"responsive input echo");
         publish_render_snapshot(
             &publisher,
@@ -8127,7 +8218,7 @@ mod tests {
     // forwards typed input through the mux to the child, propagates the child's
     // exit status, and paints the collapsed monitor row to the real terminal.
     #[test]
-    fn observed_relay_gives_child_a_tty_forwards_input_and_renders_monitor() {
+    fn observed_relay_answers_cursor_queries_forwards_input_and_renders_monitor() {
         let _terminal_lock = lock_terminal_render_test();
         let outer = open_outer_pty(24, 80);
         make_raw(outer.slave.as_raw_fd());
@@ -8142,7 +8233,7 @@ mod tests {
 
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(
-            r#"[ -t 0 ] || exit 7; IFS= read -r -t 5 line || exit 6; [ "$line" = "ping" ] && exit 42 || exit 8"#,
+            r#"[ -t 0 ] || exit 7; printf '\033[3;7H\033[6n'; IFS= read -r -s -N 6 -t 2 reply || exit 9; [ "$reply" = $'\033[3;7R' ] || exit 10; IFS= read -r -t 5 line || exit 6; [ "$line" = "ping" ] && exit 42 || exit 8"#,
         );
         configure_child_pty(&mut cmd, &pty).expect("configure child pty");
         let child = cmd.spawn().expect("spawn child");
@@ -8213,7 +8304,7 @@ mod tests {
         assert_eq!(
             status.code(),
             Some(42),
-            "child must observe a tty (-t 0) and receive the forwarded line through the mux"
+            "child must receive its own cursor query reply and the forwarded line through the mux"
         );
         let stripped = strip_ansi(&rendered);
         assert!(
@@ -8444,7 +8535,7 @@ mod tests {
         };
         let termios = tty_termios(outer.slave.as_raw_fd());
         let pty = PtyPair::open(&initial, &termios).expect("inner pty");
-        let mut parser = vt100::Parser::new(10, 10, 0);
+        let mut parser = TerminalParser::new(10, 10, 0);
         let mut applied = None;
 
         // Collapsed: child PTY reserves the persistent overlay rows (30 -> 25).
@@ -8858,7 +8949,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut pane = MonitorPane::new();
         pane.expand();
-        let parser = vt100::Parser::new(INPUT_SAFE_TOP_PANE_MIN_ROWS, 80, 0);
+        let parser = TerminalParser::new(INPUT_SAFE_TOP_PANE_MIN_ROWS, 80, 0);
         terminal
             .draw(|frame| {
                 render_frame_with_typing_protection(
@@ -8893,7 +8984,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut pane = MonitorPane::new();
         pane.expand();
-        let mut parser = vt100::Parser::new(INPUT_SAFE_TOP_PANE_MIN_ROWS, 80, 0);
+        let mut parser = TerminalParser::new(INPUT_SAFE_TOP_PANE_MIN_ROWS, 80, 0);
         parser.process(b"\x1b[12;1Hcomposer line one\x1b[13;1Hcomposer line two\x1b[14;19H");
 
         terminal
@@ -8930,7 +9021,7 @@ mod tests {
         let mut snapshot = empty_snapshot();
         snapshot.summary = snapshot_summary(MonitorStatus::Running, 2, 1, 3, 0);
         let pane = pane_with(snapshot, true, 0);
-        let parser = vt100::Parser::new(5, 80, 0);
+        let parser = TerminalParser::new(5, 80, 0);
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Top, &pane, None))
             .unwrap();
@@ -9346,7 +9437,7 @@ mod tests {
             "compiling crate".to_string(),
             "running 12 tests".to_string(),
         ];
-        let parser = vt100::Parser::new(11, 60, 0);
+        let parser = TerminalParser::new(11, 60, 0);
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
@@ -9505,7 +9596,7 @@ mod tests {
 
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        let parser = vt100::Parser::new(15, 80, 0);
+        let parser = TerminalParser::new(15, 80, 0);
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
@@ -9608,7 +9699,7 @@ mod tests {
         pane.inspect = vec!["prepared detail sentinel".to_string()];
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        let parser = vt100::Parser::new(11, 60, 0);
+        let parser = TerminalParser::new(11, 60, 0);
 
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
@@ -9736,7 +9827,7 @@ mod tests {
             ),
         ];
         let pane = pane_with(snapshot, false, 1);
-        let parser = vt100::Parser::new(11, 80, 0);
+        let parser = TerminalParser::new(11, 80, 0);
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
@@ -9764,7 +9855,7 @@ mod tests {
         let mut pane = pane_with(snapshot, true, 0);
         pane.pseudo_input.buffer = "draft".to_string();
         pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
-        let parser = vt100::Parser::new(15, 80, 0);
+        let parser = TerminalParser::new(15, 80, 0);
 
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Top, &pane, None))
@@ -9794,7 +9885,7 @@ mod tests {
         let mut pane = pane_with(snapshot, false, 0);
         pane.pseudo_input.buffer = "draft".to_string();
         pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
-        let parser = vt100::Parser::new(12, 80, 0);
+        let parser = TerminalParser::new(12, 80, 0);
 
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
@@ -9857,7 +9948,7 @@ mod tests {
         let mut snapshot = empty_snapshot();
         snapshot.summary = snapshot_summary(MonitorStatus::Running, 3, 2, 1, 0);
         let pane = pane_with(snapshot, true, 0);
-        let parser = vt100::Parser::new(15, 80, 0);
+        let parser = TerminalParser::new(15, 80, 0);
 
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
@@ -9999,7 +10090,7 @@ mod tests {
         ];
         let mut pane = pane_with(snapshot, false, 0);
         pane.view_mode = MonitorViewMode::Tree;
-        let parser = vt100::Parser::new(11, 80, 0);
+        let parser = TerminalParser::new(11, 80, 0);
 
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))

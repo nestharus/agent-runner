@@ -42,8 +42,10 @@ use std::time::{Duration, Instant};
 mod cancel;
 mod outbound_observer;
 mod snapshot_worker;
+mod terminal_protocol;
 mod transcript_view;
 mod tui;
+mod tui_profile;
 
 const CONTROL_MAGIC: &[u8; 4] = b"OPTY";
 const CONTROL_VERSION: u8 = 1;
@@ -1579,6 +1581,13 @@ impl PendingChildInput {
     }
 
     fn enqueue(&mut self, bytes: &[u8]) {
+        // Sustained partial writes need not empty the queue. Reclaim a consumed
+        // prefix before refilling, amortizing the copy over at least as many
+        // consumed bytes as remain, so storage tracks live input rather than age.
+        if self.drained >= RELAY_BUFFER_BYTES && self.drained >= self.pending_len() {
+            self.bytes.drain(..self.drained);
+            self.drained = 0;
+        }
         self.bytes.extend_from_slice(bytes);
     }
 
