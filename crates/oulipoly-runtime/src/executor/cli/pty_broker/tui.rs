@@ -29,6 +29,10 @@
 //! bytes feed a `vt100` parser that backs the top pane, while `ratatui` owns the
 //! screen so the monitor pane is protected from provider escape codes.
 
+#[path = "tui_control.rs"]
+mod tui_control;
+use tui_control::{ControlProgressIo, ControlWorker};
+
 use super::cancel::{
     CancelRequest, cancel_outcome_message, cancel_request_for_node, execute_cancel,
 };
@@ -38,21 +42,14 @@ use super::outbound_observer::{
     OutboundObservation, OutboundObservationIdentity, OutboundObservationPhase,
     OutboundObservationResult, OutboundObserverSource, OutboundObserverWorker,
 };
-#[cfg(test)]
-use super::seed_test_mailbox_delivery;
 use super::snapshot_worker::{MonitorSnapshotProvider, MonitorSnapshotWorker};
 use super::terminal_protocol::TerminalParser;
 use super::transcript_view::project_transcript_tail;
 use super::tui_profile::Profile;
 use super::{
-    ChildOutputState, ControlPayloadOutcome, ControlSocket, INJECT_WAIT_LIMIT, InputLineState,
-    PendingChildInput, RELAY_BUFFER_BYTES, begin_control_payload_submission,
-    flush_pending_child_input, is_pty_eof_error, poll_fds, poll_master_fd, poll_relay_fds,
-    poll_single_fd, prepare_control_payload, pty_delivery_ack_message, pty_delivery_test_fault,
-    pty_delivery_uncertain_message, queue_control_injection, read_control_request, read_fd,
-    readable, send_signal_to_child_group, set_pty_winsize, settle_control_payload,
-    submission_uncertain_outcome, terminal_winsize, validate_peer_uid, winsize_eq, writable,
-    write_control_response,
+    ChildOutputState, ControlSocket, InputLineState, PendingChildInput, RELAY_BUFFER_BYTES,
+    flush_pending_child_input, is_pty_eof_error, poll_master_fd, poll_relay_fds, poll_single_fd,
+    read_fd, readable, send_signal_to_child_group, set_pty_winsize, terminal_winsize, winsize_eq,
 };
 use crate::executor::cli::spawn_identity::ChildGenerationCustody;
 use crate::observability::{
@@ -80,7 +77,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::UnixStream;
 use std::process::ExitStatus;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -429,11 +425,46 @@ enum TailFileReadError {
 #[derive(Debug)]
 struct InputRouter {
     focus: Focus,
+    pending_sequence: Vec<u8>,
+    sequence_started: Option<Instant>,
+    bracketed_paste: bool,
+    paste_marker_matched: usize,
 }
+
+const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
+const MAX_INPUT_SEQUENCE_BYTES: usize = 64;
 
 impl InputRouter {
     fn new() -> Self {
-        Self { focus: Focus::Top }
+        Self {
+            focus: Focus::Top,
+            pending_sequence: Vec::new(),
+            sequence_started: None,
+            bracketed_paste: false,
+            paste_marker_matched: 0,
+        }
+    }
+
+    fn sequence_expired(&self, now: Instant) -> bool {
+        self.sequence_started
+            .is_some_and(|started| now.duration_since(started) >= INPUT_SEQUENCE_TIMEOUT)
+    }
+
+    fn observe_paste_marker_byte(&mut self, byte: u8) {
+        let marker = if self.bracketed_paste {
+            BRACKETED_PASTE_END
+        } else {
+            BRACKETED_PASTE_START
+        };
+        self.paste_marker_matched = if byte == marker[self.paste_marker_matched] {
+            self.paste_marker_matched + 1
+        } else {
+            usize::from(byte == marker[0])
+        };
+        if self.paste_marker_matched == marker.len() {
+            self.bracketed_paste = !self.bracketed_paste;
+            self.paste_marker_matched = 0;
+        }
     }
 
     /// Keyboard-only routing helper. Production input always flows through
@@ -459,6 +490,9 @@ impl InputRouter {
 
     fn route_top_byte(&mut self, byte: u8, routed: &mut RoutedInput) -> usize {
         routed.forward.push(byte);
+        // Typing returns to the tail. Preserve wheel events that follow this key
+        // in the same read, while superseding wheel events before it.
+        routed.top_scroll_lines = 0;
         1
     }
 
@@ -3824,7 +3858,7 @@ impl RenderShared {
         }
     }
 
-    fn wait_until(&self, deadline: Instant) {
+    fn wait_until(&self, deadline: Instant, observed_generation: u64) {
         if self.shutdown_requested() {
             return;
         }
@@ -3833,6 +3867,11 @@ impl RenderShared {
             return;
         }
         let guard = lock_or_recover(&self.state);
+        // A publish between the caller's snapshot read and this lock must not
+        // lose its wakeup and wait out the old background frame deadline.
+        if guard.generation != observed_generation || self.shutdown_requested() {
+            return;
+        }
         match self.wake.wait_timeout(guard, deadline - now) {
             Ok((guard, _)) => drop(guard),
             Err(poisoned) => drop(poisoned.into_inner()),
@@ -3990,7 +4029,11 @@ fn run_render_loop(
             render_latest_snapshot(shared, terminal, alt)?;
             return Ok(());
         }
-        if let Some(published) = shared.latest_published()
+        let published = shared.latest_published();
+        let observed_generation = published
+            .as_ref()
+            .map_or(0, |published| published.generation);
+        if let Some(published) = &published
             && published.generation != last_rendered_generation
         {
             next_frame =
@@ -3998,7 +4041,7 @@ fn run_render_loop(
         }
         let now = Instant::now();
         if now < next_frame {
-            shared.wait_until(next_frame);
+            shared.wait_until(next_frame, observed_generation);
             continue;
         }
         let Some(published) = shared.latest_published() else {
@@ -4117,7 +4160,11 @@ pub(super) fn relay_until_exit_observed(
     let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
     let mut pending_child_input = PendingChildInput::new();
     let mut deferred_child_input = PendingChildInput::new();
+    let mut input_queue_timing = None;
     let mut outbound_release_gate = OutboundReleaseGate::default();
+    let mut control_worker = control
+        .map(|control| ControlWorker::start(control, profile.clone()))
+        .transpose()?;
     let mut status = None;
     publish_render_snapshot(
         &publisher,
@@ -4143,11 +4190,26 @@ pub(super) fn relay_until_exit_observed(
         mark_render_dirty(
             &mut dirty,
             &mut priority,
-            pane.refresh_detail_if_due(Instant::now()),
+            {
+                let _timing = profile.measure("monitor.detail_refresh");
+                pane.refresh_detail_if_due(Instant::now())
+            },
             RenderPriority::Background,
         );
+        progress_control_submission(
+            control_worker.as_mut(),
+            &mut ControlProgressIo {
+                master_fd,
+                child_pid: Some(custody.child().id()),
+                parser: &parser,
+                input: &mut line_state,
+                output: &child_output_state,
+                pending: &mut pending_child_input,
+                outbound_active: pane.outbound.active.is_some(),
+            },
+        );
         release_deferred_child_input(
-            pane.outbound.active.is_some(),
+            pane.outbound.active.is_some() || control_owns_child_input(&control_worker),
             &mut line_state,
             &mut pending_child_input,
             &mut deferred_child_input,
@@ -4178,23 +4240,43 @@ pub(super) fn relay_until_exit_observed(
                 &outbound_release_gate,
                 parser.screen().bracketed_paste(),
                 &outbound_worker,
+                control_blocks_outbound(&control_worker),
             ),
             RenderPriority::Interactive,
         );
         let release_gate_was_awaiting_output = outbound_release_gate.awaiting_child_output();
         parser.append_replies(&mut pending_child_input);
         let poll_timing = profile.measure("relay.poll");
-        let ready = poll_relay_fds(
-            real_fd,
-            master_fd,
-            control.map(ControlSocket::fd),
-            !pending_child_input.is_empty(),
-        )?;
+        let ready = poll_relay_fds(real_fd, master_fd, None, !pending_child_input.is_empty())?;
         drop(poll_timing);
         if ready.pty_writable {
             let _timing = profile.measure("input.write");
             flush_pending_child_input(master_fd, &mut pending_child_input)?;
+            if pending_child_input.is_empty() && deferred_child_input.is_empty() {
+                drop(input_queue_timing.take());
+            }
             outbound_release_gate.observe_pending_write_drained(pending_child_input.is_empty());
+            progress_control_submission(
+                control_worker.as_mut(),
+                &mut ControlProgressIo {
+                    master_fd,
+                    child_pid: Some(custody.child().id()),
+                    parser: &parser,
+                    input: &mut line_state,
+                    output: &child_output_state,
+                    pending: &mut pending_child_input,
+                    outbound_active: pane.outbound.active.is_some(),
+                },
+            );
+            // User keys held behind the control paste are older than any queued
+            // pseudo-editor prompt. Release them before considering another send.
+            release_deferred_child_input(
+                pane.outbound.active.is_some() || control_owns_child_input(&control_worker),
+                &mut line_state,
+                &mut pending_child_input,
+                &mut deferred_child_input,
+                &mut outbound_release_gate,
+            );
             mark_render_dirty(
                 &mut dirty,
                 &mut priority,
@@ -4205,16 +4287,18 @@ pub(super) fn relay_until_exit_observed(
                     &outbound_release_gate,
                     parser.screen().bracketed_paste(),
                     &outbound_worker,
+                    control_blocks_outbound(&control_worker),
                 ),
                 RenderPriority::Interactive,
             );
         }
-        if ready.real_input {
+        if ready.real_input || router.sequence_expired(Instant::now()) {
             let _timing = profile.measure("input.forward");
             let mut input_io = RealInputForwardIo {
                 real_fd,
                 router: &mut router,
                 pane: &pane,
+                control_active: control_owns_child_input(&control_worker),
                 mouse_request: mouse_request_from_screen(parser.screen()),
                 line_state: &mut line_state,
                 pending_child_input: &mut pending_child_input,
@@ -4222,11 +4306,14 @@ pub(super) fn relay_until_exit_observed(
                 outbound_release_gate: &mut outbound_release_gate,
                 buffer: &mut buffer,
             };
-            let mut routed = forward_real_input(&mut input_io)?;
+            let mut routed = forward_real_input(&mut input_io, ready.real_input, &profile)?;
             let scroll_lines = routed.top_scroll_lines;
             // Sending keystrokes to the child snaps the view back to the live tail, like
             // a terminal jumps to the prompt when you start typing.
             let typed_to_child = !routed.forward.is_empty();
+            if typed_to_child && input_queue_timing.is_none() {
+                input_queue_timing = Some(profile.measure("input.queue_to_write"));
+            }
             let right_click = routed.right_click;
             let gestures = std::mem::take(&mut routed.top_mouse);
             let input_priority = routed_input_render_priority(
@@ -4252,6 +4339,7 @@ pub(super) fn relay_until_exit_observed(
                     &outbound_release_gate,
                     parser.screen().bracketed_paste(),
                     &outbound_worker,
+                    control_blocks_outbound(&control_worker),
                 ),
                 RenderPriority::Interactive,
             );
@@ -4262,7 +4350,8 @@ pub(super) fn relay_until_exit_observed(
                     top_scrollback = 0;
                 }
                 mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
-            } else if scroll_lines != 0 {
+            }
+            if scroll_lines != 0 {
                 // Keep the selection — its highlight follows the content as we scroll.
                 top_scrollback = apply_top_scroll(top_scrollback, scroll_lines);
                 mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
@@ -4290,7 +4379,8 @@ pub(super) fn relay_until_exit_observed(
                     pending_child_input: &mut pending_child_input,
                     deferred_child_input: &mut deferred_child_input,
                     outbound_release_gate: &mut outbound_release_gate,
-                    outbound_active: pane.outbound.active.is_some(),
+                    outbound_active: pane.outbound.active.is_some()
+                        || control_owns_child_input(&control_worker),
                 };
                 mark_render_dirty(
                     &mut dirty,
@@ -4314,22 +4404,18 @@ pub(super) fn relay_until_exit_observed(
             mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
         }
         drop(output_timing);
-        if ready.control
-            && let Some(control) = control
-        {
-            let mut control_io = ControlInjectionIo {
+        progress_control_submission(
+            control_worker.as_mut(),
+            &mut ControlProgressIo {
                 master_fd,
-                parser: &mut parser,
-                line_state: &mut line_state,
-                child_output_state: &mut child_output_state,
-                pending_child_input: &mut pending_child_input,
-                outbound_release_gate: &mut outbound_release_gate,
-                buffer: &mut buffer,
                 child_pid: Some(custody.child().id()),
-            };
-            let _ = service_control(control, &mut control_io);
-            mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
-        }
+                parser: &parser,
+                input: &mut line_state,
+                output: &child_output_state,
+                pending: &mut pending_child_input,
+                outbound_active: pane.outbound.active.is_some(),
+            },
+        );
         // Re-assert the scrollback view each frame (clamped to retained history) so it
         // survives child output and resizes; reading it back keeps our offset honest.
         protection = typing_protection(router.focus, &line_state);
@@ -4366,6 +4452,7 @@ pub(super) fn relay_until_exit_observed(
             .map_err(format_interactive_child_poll_error)?;
     }
 
+    drop(control_worker);
     drain_pty_output(master_fd, &mut parser, &mut buffer)?;
     parser.screen_mut().set_scrollback(top_scrollback);
     let _ = pane.adopt_snapshot(snapshot_worker.latest_snapshot());
@@ -4486,6 +4573,7 @@ struct RealInputForwardIo<'a> {
     real_fd: RawFd,
     router: &'a mut InputRouter,
     pane: &'a MonitorPane,
+    control_active: bool,
     mouse_request: MouseRequest,
     line_state: &'a mut InputLineState,
     pending_child_input: &'a mut PendingChildInput,
@@ -4494,10 +4582,20 @@ struct RealInputForwardIo<'a> {
     buffer: &'a mut [u8],
 }
 
-fn forward_real_input(io: &mut RealInputForwardIo<'_>) -> Result<RoutedInput, String> {
-    match read_real_input(io.real_fd, io.buffer) {
-        Ok(0) => Ok(RoutedInput::default()),
+fn forward_real_input(
+    io: &mut RealInputForwardIo<'_>,
+    read_ready: bool,
+    profile: &Profile,
+) -> Result<RoutedInput, String> {
+    let read_result = if read_ready {
+        read_real_input(io.real_fd, io.buffer)
+    } else {
+        Ok(0)
+    };
+    match read_result {
         Ok(n) => {
+            profile.record_count("input.bytes_read", n as u64);
+            let _routing = profile.measure("input.route");
             let full = terminal_winsize_with_fallback(read_terminal_winsize(io.real_fd));
             let protection = typing_protection(io.router.focus, io.line_state);
             let routed = route_real_input_with_protection(
@@ -4513,7 +4611,7 @@ fn forward_real_input(io: &mut RealInputForwardIo<'_>) -> Result<RoutedInput, St
                 io.pending_child_input,
                 io.deferred_child_input,
                 io.outbound_release_gate,
-                io.pane.outbound.active.is_some(),
+                io.pane.outbound.active.is_some() || io.control_active,
                 &routed,
             );
             Ok(routed)
@@ -4557,6 +4655,34 @@ fn route_mouse_aware_input(
     winsize: &libc::winsize,
     protection: TypingProtection,
 ) -> RoutedInput {
+    route_mouse_aware_input_at(
+        bytes,
+        router,
+        pane,
+        mouse_request,
+        winsize,
+        protection,
+        Instant::now(),
+    )
+}
+
+fn route_mouse_aware_input_at(
+    bytes: &[u8],
+    router: &mut InputRouter,
+    pane: &MonitorPane,
+    mouse_request: MouseRequest,
+    winsize: &libc::winsize,
+    protection: TypingProtection,
+    now: Instant,
+) -> RoutedInput {
+    let expire_partial = router.sequence_expired(now);
+    let mut buffered = std::mem::take(&mut router.pending_sequence);
+    let bytes = if buffered.is_empty() {
+        bytes
+    } else {
+        buffered.extend_from_slice(bytes);
+        buffered.as_slice()
+    };
     let areas = pane_areas_for_winsize(winsize, pane, protection);
     let mut routed = RoutedInput {
         pseudo_input_width: Some(expanded_bottom_layout(areas.bottom, pane).input.width),
@@ -4564,7 +4690,23 @@ fn route_mouse_aware_input(
     };
     let mut i = 0;
     while i < bytes.len() {
-        if let Some(parsed) = parse_mouse_event(&bytes[i..]) {
+        let remaining = &bytes[i..];
+        let sequence_len = if router.bracketed_paste {
+            // Paste bytes pass immediately. Track the closing marker separately
+            // so even a delayed fragment cannot leave mouse routing disabled.
+            Some(1)
+        } else {
+            terminal_input_sequence_len(remaining)
+        };
+        if sequence_len.is_none() && !expire_partial {
+            router.pending_sequence.extend_from_slice(remaining);
+            router.sequence_started.get_or_insert(now);
+            return routed;
+        }
+        let input = &remaining[..sequence_len.unwrap_or(remaining.len())];
+        if !router.bracketed_paste
+            && let Some(parsed) = parse_mouse_event(input)
+        {
             route_mouse_event(
                 parsed.event,
                 areas,
@@ -4575,10 +4717,52 @@ fn route_mouse_aware_input(
             );
             i += parsed.consumed;
         } else {
-            i += router.route_next_input(&bytes[i..], &mut routed);
+            // Track both markers across forwarded chunks, including an opening
+            // marker whose initial Escape already passed the short CSI timeout.
+            for &byte in input {
+                router.observe_paste_marker_byte(byte);
+            }
+            let mut consumed = 0;
+            while consumed < input.len() {
+                consumed += router.route_next_input(&input[consumed..], &mut routed);
+            }
+            i += consumed;
+        }
+        router.sequence_started = None;
+    }
+    router.sequence_started = None;
+    routed
+}
+
+/// Bound the only ambiguous prefixes that may contain broker-owned mouse input.
+/// Ordinary keys pass immediately; incomplete Escape/CSI gets one short timeout.
+fn terminal_input_sequence_len(bytes: &[u8]) -> Option<usize> {
+    if bytes[0] != 0x1b {
+        return Some(1);
+    }
+    if bytes.len() == 1 {
+        return None;
+    }
+    if bytes[1] != b'[' {
+        return Some(1);
+    }
+    if bytes.starts_with(b"\x1b[M") {
+        return (bytes.len() >= 6).then_some(6);
+    }
+    for (i, byte) in bytes
+        .iter()
+        .enumerate()
+        .skip(2)
+        .take(MAX_INPUT_SEQUENCE_BYTES - 2)
+    {
+        if (0x40..=0x7e).contains(byte) {
+            return Some(i + 1);
+        }
+        if !(0x20..=0x3f).contains(byte) {
+            return Some(1);
         }
     }
-    routed
+    (bytes.len() >= MAX_INPUT_SEQUENCE_BYTES).then_some(1)
 }
 
 fn route_mouse_event(
@@ -5420,7 +5604,11 @@ fn pump_outbound_queue_from_worker(
     release_gate: &OutboundReleaseGate,
     bracketed_paste: bool,
     worker: &OutboundObserverWorker,
+    control_active: bool,
 ) -> bool {
+    if control_active {
+        return false;
+    }
     if let Some(generation_floor) = worker.set_demand(pane.outbound.observation_needed()) {
         pane.outbound.minimum_generation = pane.outbound.minimum_generation.max(generation_floor);
     }
@@ -5689,99 +5877,18 @@ fn draw_snapshot(terminal: &mut TuiTerminal, snapshot: &RenderSnapshot) -> Resul
         .map_err(|err| format!("Failed to render TUI frame: {err}"))
 }
 
-struct ControlInjectionIo<'a> {
-    master_fd: RawFd,
-    parser: &'a mut TerminalParser,
-    line_state: &'a mut InputLineState,
-    child_output_state: &'a mut ChildOutputState,
-    pending_child_input: &'a mut PendingChildInput,
-    outbound_release_gate: &'a mut OutboundReleaseGate,
-    buffer: &'a mut [u8],
-    child_pid: Option<u32>,
-}
-
-/// Inject a control-socket notification immediately; the agent harness queues it.
-fn service_control(control: &ControlSocket, io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
-    let mut stream = accept_control_stream(control).map_err(format_control_accept_error)?;
-    let response = inject_control_payload(&mut stream, io, control);
-    let (ack, message) = control_response_message(response);
-    super::trace_notify_gate_decision(
-        control,
-        io.master_fd,
-        io.child_pid,
-        io.line_state,
-        io.child_output_state,
-        if ack { "inject" } else { "skip" },
-        &message,
-    );
-    write_tui_control_response(&mut stream, ack, &message)
-        .map_err(format_control_response_write_error)
-}
-
-fn accept_control_stream(control: &ControlSocket) -> io::Result<UnixStream> {
-    control.listener.accept().map(|(stream, _)| stream)
-}
-
-fn format_control_accept_error(err: io::Error) -> String {
-    format!("Failed to accept PTY control connection: {err}")
-}
-
-fn control_response_message(response: Result<ControlPayloadOutcome, String>) -> (bool, String) {
-    match response {
-        Ok(ControlPayloadOutcome::Accepted(Some(delivery_nonce))) => {
-            (true, pty_delivery_ack_message(&delivery_nonce))
-        }
-        Ok(ControlPayloadOutcome::Accepted(None)) => (true, "ok".to_string()),
-        Ok(ControlPayloadOutcome::SubmissionUncertain(delivery_nonce)) => {
-            (true, pty_delivery_uncertain_message(&delivery_nonce))
-        }
-        Err(message) => (false, message),
+fn progress_control_submission(worker: Option<&mut ControlWorker>, io: &mut ControlProgressIo<'_>) {
+    if let Some(worker) = worker {
+        worker.progress(io, Instant::now());
     }
 }
 
-fn write_tui_control_response(stream: &mut UnixStream, ack: bool, message: &str) -> io::Result<()> {
-    write_control_response(stream, ack, message)
+fn control_owns_child_input(worker: &Option<ControlWorker>) -> bool {
+    worker.as_ref().is_some_and(ControlWorker::owns_child_input)
 }
 
-fn format_control_response_write_error(err: io::Error) -> String {
-    format!("Failed to write PTY control response: {err}")
-}
-
-fn inject_control_payload(
-    stream: &mut UnixStream,
-    io: &mut ControlInjectionIo<'_>,
-    control: &ControlSocket,
-) -> Result<ControlPayloadOutcome, String> {
-    validate_control_peer(stream)?;
-    let session_id = control
-        .session_id()
-        .ok_or_else(|| "awaiting_session_identity".to_string())?;
-    let mut payload = prepare_control_payload(
-        read_tui_control_payload(stream)?,
-        Some((&session_id, control.invocation_uuid())),
-    )?;
-    if payload.bytes.is_empty() {
-        if payload.submission_uncertain {
-            return Ok(submission_uncertain_outcome(&payload));
-        }
-        return settle_control_payload(&payload);
-    }
-    validate_control_input_ready(
-        io.parser.screen().bracketed_paste(),
-        io.parser.screen().alternate_screen(),
-        control.age(),
-    )?;
-    let bracketed_paste = io.parser.screen().bracketed_paste();
-    pty_delivery_test_fault("tui_pre_submission")?;
-    begin_control_payload_submission(&mut payload)?;
-    if let Err(error) = submit_control_payload(io, &payload.bytes, bracketed_paste) {
-        return if payload.submission_started {
-            Ok(submission_uncertain_outcome(&payload))
-        } else {
-            Err(error)
-        };
-    }
-    settle_control_payload(&payload)
+fn control_blocks_outbound(worker: &Option<ControlWorker>) -> bool {
+    worker.as_ref().is_some_and(ControlWorker::blocks_outbound)
 }
 
 fn validate_control_input_ready(
@@ -5796,97 +5903,6 @@ fn validate_control_input_ready(
     } else {
         Err("unsafe_provider_starting".to_string())
     }
-}
-
-fn validate_control_peer(stream: &UnixStream) -> Result<(), String> {
-    validate_peer_uid(stream)
-}
-
-fn read_tui_control_payload(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
-    read_control_request(stream)
-}
-
-fn submit_control_payload(
-    io: &mut ControlInjectionIo<'_>,
-    payload: &[u8],
-    bracketed_paste: bool,
-) -> Result<(), String> {
-    queue_control_injection(io.pending_child_input, payload, bracketed_paste, false);
-    drain_control_payload(io, ControlSubmitDrainPhase::Body)?;
-    // Let the child commit the body to its input buffer before Enter. Ink-style TUIs may
-    // batch a raw control write as a paste even before they advertise bracketed-paste mode.
-    std::thread::sleep(CONTROL_SUBMIT_DELAY);
-    io.pending_child_input.enqueue(b"\r");
-    io.line_state.mark_submitted();
-    drain_control_payload(io, ControlSubmitDrainPhase::Delimiter)
-}
-
-#[derive(Clone, Copy)]
-enum ControlSubmitDrainPhase {
-    Body,
-    Delimiter,
-}
-
-impl ControlSubmitDrainPhase {
-    fn token(self) -> &'static str {
-        match self {
-            Self::Body => "body",
-            Self::Delimiter => "delimiter",
-        }
-    }
-}
-
-fn drain_control_payload(
-    io: &mut ControlInjectionIo<'_>,
-    phase: ControlSubmitDrainPhase,
-) -> Result<(), String> {
-    pty_delivery_test_fault(&format!("tui_{}_drain", phase.token()))?;
-    let start = Instant::now();
-    while !io.pending_child_input.is_empty() {
-        if start.elapsed() >= INJECT_WAIT_LIMIT {
-            return Err(format!("control_submit_{}_drain_timeout", phase.token()));
-        }
-        let ready = poll_control_submit_pty(io.master_fd)
-            .map_err(|err| format!("control_submit_{}_drain_failed:{err}", phase.token()))?;
-        if ready.pty_writable {
-            flush_pending_child_input(io.master_fd, io.pending_child_input)
-                .map_err(|err| format!("control_submit_{}_drain_failed:{err}", phase.token()))?;
-        }
-        if ready.pty_output {
-            if pump_pty_output(io.master_fd, io.parser, io.buffer)
-                .map_err(|err| format!("control_submit_{}_drain_failed:{err}", phase.token()))?
-            {
-                io.parser.append_replies(io.pending_child_input);
-                io.child_output_state.observe_child_output();
-                io.outbound_release_gate
-                    .observe_child_output(false, Instant::now());
-            } else {
-                return Err(format!("control_submit_{}_pty_closed", phase.token()));
-            }
-        }
-    }
-    Ok(())
-}
-
-struct ControlSubmitReady {
-    pty_output: bool,
-    pty_writable: bool,
-}
-
-fn poll_control_submit_pty(master_fd: RawFd) -> Result<ControlSubmitReady, String> {
-    let mut pollfd = poll_master_fd(master_fd, true);
-    poll_fds(
-        std::slice::from_mut(&mut pollfd),
-        format_control_submit_poll_error,
-    )?;
-    Ok(ControlSubmitReady {
-        pty_output: readable(pollfd.revents),
-        pty_writable: writable(pollfd.revents),
-    })
-}
-
-fn format_control_submit_poll_error(err: io::Error) -> String {
-    format!("Failed to poll PTY before control submit: {err}")
 }
 
 /// The bytes to inject for a control payload. When the child advertised bracketed-paste
@@ -5918,7 +5934,6 @@ fn child_input_for_real_read(forward: &[u8]) -> Vec<u8> {
 mod tests {
     use super::super::{PtyPair, configure_child_pty};
     use super::*;
-    use oulipoly_state::mailbox::MailboxDb;
     use oulipoly_state::{InvocationStart, StateDb};
     use ratatui::backend::TestBackend;
     use std::ffi::OsString;
@@ -5930,12 +5945,12 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    struct DataDirOverride {
+    pub(super) struct DataDirOverride {
         prior: Option<OsString>,
     }
 
     impl DataDirOverride {
-        fn install(path: &std::path::Path) -> Self {
+        pub(super) fn install(path: &std::path::Path) -> Self {
             let prior = std::env::var_os("OULIPOLY_DATA_DIR");
             unsafe {
                 std::env::set_var("OULIPOLY_DATA_DIR", path);
@@ -6583,162 +6598,6 @@ mod tests {
     fn real_terminal_bracketed_paste_markers_are_preserved() {
         let paste = b"\x1b[200~abc\x1b[201~";
         assert_eq!(child_input_for_real_read(paste), paste.to_vec());
-    }
-
-    #[test]
-    fn control_submit_drains_body_then_final_delimiter_before_returning() {
-        for bracketed_paste in [false, true] {
-            let (mut read_end, write_end) = pipe_files();
-            let mut parser = TerminalParser::new(10, 20, 0);
-            let mut line_state = InputLineState::default();
-            let mut child_output_state = ChildOutputState::default();
-            let mut pending_child_input = PendingChildInput::new();
-            let mut outbound_release_gate = OutboundReleaseGate::default();
-            let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
-            let mut io = ControlInjectionIo {
-                master_fd: write_end.as_raw_fd(),
-                parser: &mut parser,
-                line_state: &mut line_state,
-                child_output_state: &mut child_output_state,
-                pending_child_input: &mut pending_child_input,
-                outbound_release_gate: &mut outbound_release_gate,
-                buffer: &mut buffer,
-                child_pid: None,
-            };
-
-            let started = Instant::now();
-            submit_control_payload(&mut io, b"body", bracketed_paste).expect("submit payload");
-
-            assert!(started.elapsed() >= CONTROL_SUBMIT_DELAY);
-            assert!(pending_child_input.is_empty());
-            let expected = [
-                control_payload_bytes(b"body", bracketed_paste).as_slice(),
-                b"\r",
-            ]
-            .concat();
-            let mut received = vec![0_u8; expected.len()];
-            read_end
-                .read_exact(&mut received)
-                .expect("body and delimiter should drain before submit returns");
-            assert_eq!(received, expected);
-        }
-
-        let (_read_end, _write_end) = pipe_files();
-        let mut parser = TerminalParser::new(10, 20, 0);
-        let mut line_state = InputLineState::default();
-        let mut child_output_state = ChildOutputState::default();
-        let mut pending_child_input = PendingChildInput::new();
-        pending_child_input.enqueue(b"\r");
-        let mut outbound_release_gate = OutboundReleaseGate::default();
-        let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
-        let mut io = ControlInjectionIo {
-            master_fd: -1,
-            parser: &mut parser,
-            line_state: &mut line_state,
-            child_output_state: &mut child_output_state,
-            pending_child_input: &mut pending_child_input,
-            outbound_release_gate: &mut outbound_release_gate,
-            buffer: &mut buffer,
-            child_pid: None,
-        };
-        let error = drain_control_payload(&mut io, ControlSubmitDrainPhase::Delimiter)
-            .expect_err("a delimiter drain failure must not report success");
-        assert!(error.starts_with("control_submit_delimiter_"), "{error}");
-    }
-
-    #[test]
-    fn tui_retains_one_submission_when_confirmation_fails_after_body_and_enter_drain() {
-        let _env_lock = crate::test_support::lock_env();
-        let dir = tempfile::tempdir().unwrap();
-        let _data_dir = DataDirOverride::install(dir.path());
-        let attempt_id = "tui-fault-attempt";
-        let path = seed_test_mailbox_delivery(dir.path(), attempt_id);
-        let fault = rusqlite::Connection::open(&path).unwrap();
-        fault
-            .execute_batch(
-                "CREATE TRIGGER fail_tui_confirmation
-                 BEFORE UPDATE OF acknowledged_at ON mailbox_delivery_attempts
-                 BEGIN SELECT RAISE(FAIL, 'injected TUI confirmation failure'); END;",
-            )
-            .unwrap();
-        let envelope = format!("notify\n[OULIPOLY-DELIVERY {attempt_id}]");
-        let mut payload = prepare_control_payload(envelope.into_bytes(), None).unwrap();
-        let (child_peer, master) = pipe_files();
-        let mut parser = TerminalParser::new(10, 20, 0);
-        let mut line_state = InputLineState::default();
-        let mut child_output_state = ChildOutputState::default();
-        let mut pending_child_input = PendingChildInput::new();
-        let mut outbound_release_gate = OutboundReleaseGate::default();
-        let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
-        let mut io = ControlInjectionIo {
-            master_fd: master.as_raw_fd(),
-            parser: &mut parser,
-            line_state: &mut line_state,
-            child_output_state: &mut child_output_state,
-            pending_child_input: &mut pending_child_input,
-            outbound_release_gate: &mut outbound_release_gate,
-            buffer: &mut buffer,
-            child_pid: None,
-        };
-
-        begin_control_payload_submission(&mut payload).unwrap();
-        submit_control_payload(&mut io, &payload.bytes, false).unwrap();
-        assert_eq!(
-            control_response_message(settle_control_payload(&payload)),
-            (true, pty_delivery_uncertain_message(attempt_id))
-        );
-        let mut retained = MailboxDb::open(&path).unwrap();
-        let window = retained
-            .delivery_attempt_window(attempt_id)
-            .unwrap()
-            .unwrap();
-        assert!(window.submission_started_at.is_some());
-        assert!(window.acknowledged_at.is_none());
-        assert!(window.resolved_at.is_none());
-        assert_eq!(window.rows.len(), 1);
-        assert!(
-            retained
-                .register_or_reuse_delivery_attempt(
-                    "replacement",
-                    "session-a",
-                    "invocation-b",
-                    "generation-b",
-                    &[window.rows[0].seq],
-                    0,
-                )
-                .unwrap_err()
-                .contains("mailbox_delivery_submission_uncertain:tui-fault-attempt")
-        );
-        drop(retained);
-        fault
-            .execute_batch("DROP TRIGGER fail_tui_confirmation")
-            .unwrap();
-        let retry = prepare_control_payload(
-            format!("notify\n[OULIPOLY-DELIVERY {attempt_id}]").into_bytes(),
-            None,
-        )
-        .unwrap();
-        assert!(retry.bytes.is_empty());
-        assert_eq!(
-            settle_control_payload(&retry),
-            Ok(ControlPayloadOutcome::SubmissionUncertain(
-                attempt_id.to_string()
-            ))
-        );
-        set_nonblocking(child_peer.as_raw_fd());
-        let mut submitted = Vec::new();
-        drain_available(child_peer.as_raw_fd(), &mut submitted).unwrap();
-        let submitted = String::from_utf8(submitted).unwrap();
-        assert_eq!(
-            submitted
-                .matches(&format!("[OULIPOLY-DELIVERY {attempt_id}]"))
-                .count(),
-            1,
-            "{submitted}"
-        );
-        assert!(submitted.ends_with('\r'));
-        let db = MailboxDb::open(&path).unwrap();
-        assert_eq!(db.list_pending("session-a").unwrap().len(), 1);
     }
 
     #[test]
@@ -7504,7 +7363,7 @@ mod tests {
         }
     }
 
-    fn available_observation<const N: usize>(
+    pub(super) fn available_observation<const N: usize>(
         generation: u64,
         turns: [(&str, Option<&str>); N],
     ) -> OutboundObservationResult {
@@ -7956,6 +7815,194 @@ mod tests {
 
         assert_eq!(routed.top_scroll_lines, TOP_SCROLL_STEP * 2);
         assert_eq!(routed_priority(&routed), RenderPriority::Interactive);
+    }
+
+    fn route_test_input_at(router: &mut InputRouter, bytes: &[u8], now: Instant) -> RoutedInput {
+        route_mouse_aware_input_at(
+            bytes,
+            router,
+            &MonitorPane::new(),
+            MouseRequest::disabled(),
+            &minimum_terminal_winsize(),
+            TypingProtection::for_focus(Focus::Top),
+            now,
+        )
+    }
+
+    #[test]
+    fn typing_and_wheel_in_one_read_preserve_event_order() {
+        let mut router = InputRouter::new();
+        let now = Instant::now();
+        let key_then_wheel = route_test_input_at(&mut router, b"a\x1b[<64;4;3M", now);
+        assert_eq!(key_then_wheel.forward, b"a");
+        assert_eq!(key_then_wheel.top_scroll_lines, TOP_SCROLL_STEP);
+        let wheel_then_key = route_test_input_at(&mut router, b"\x1b[<64;4;3Ma", now);
+        assert_eq!(wheel_then_key.forward, b"a");
+        assert_eq!(wheel_then_key.top_scroll_lines, 0);
+        let interleaved = route_test_input_at(&mut router, b"\x1b[<64;4;3Ma\x1b[<64;4;3M", now);
+        assert_eq!(interleaved.forward, b"a");
+        assert_eq!(interleaved.top_scroll_lines, TOP_SCROLL_STEP);
+    }
+
+    #[test]
+    fn split_mouse_reports_never_leak_as_keystrokes() {
+        for sequence in [b"\x1b[<64;4;3M".as_slice(), b"\x1b[M`$#".as_slice()] {
+            for split in 1..sequence.len() {
+                let mut router = InputRouter::new();
+                let now = Instant::now();
+                let first = route_test_input_at(&mut router, &sequence[..split], now);
+                assert!(first.forward.is_empty(), "split {split}");
+                assert_eq!(first.top_scroll_lines, 0);
+                let second = route_test_input_at(&mut router, &sequence[split..], now);
+                assert!(second.forward.is_empty(), "split {split}");
+                assert_eq!(second.top_scroll_lines, TOP_SCROLL_STEP);
+                assert!(router.pending_sequence.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_typing_is_immediate_and_partial_escape_has_bounded_wait() {
+        let mut router = InputRouter::new();
+        let now = Instant::now();
+        let first = route_test_input_at(&mut router, b"hello\x1b", now);
+        assert_eq!(first.forward, b"hello");
+        assert!(!router.sequence_expired(now));
+        let before = route_test_input_at(&mut router, b"", now + INPUT_SEQUENCE_TIMEOUT / 2);
+        assert!(before.forward.is_empty());
+        let after = route_test_input_at(&mut router, b"", now + INPUT_SEQUENCE_TIMEOUT);
+        assert_eq!(after.forward, b"\x1b");
+        assert!(router.pending_sequence.is_empty());
+        assert!(!router.sequence_expired(now + INPUT_SEQUENCE_TIMEOUT));
+    }
+
+    #[test]
+    fn bottom_pane_keys_decode_across_read_boundaries() {
+        for sequence in [b"\x1b[A".as_slice(), b"\x1b[13;5u".as_slice()] {
+            for split in 1..sequence.len() {
+                let now = Instant::now();
+                let mut whole_router = InputRouter::new();
+                whole_router.focus = Focus::Bottom;
+                let whole = route_test_input_at(&mut whole_router, sequence, now);
+                let mut router = InputRouter::new();
+                router.focus = Focus::Bottom;
+                let first = route_test_input_at(&mut router, &sequence[..split], now);
+                assert!(first.commands.is_empty());
+                assert!(first.pseudo_input.is_empty());
+                let second = route_test_input_at(&mut router, &sequence[split..], now);
+                assert_eq!(second, whole);
+                assert!(second.forward.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_escape_cannot_hold_unbounded_input() {
+        let mut router = InputRouter::new();
+        let mut bytes = b"\x1b[<".to_vec();
+        bytes.extend(vec![b'1'; MAX_INPUT_SEQUENCE_BYTES * 2]);
+        let routed = route_test_input_at(&mut router, &bytes, Instant::now());
+        assert_eq!(routed.forward, bytes);
+        assert!(router.pending_sequence.is_empty());
+    }
+
+    #[test]
+    fn partial_sequence_timeout_also_expires_during_continuous_input() {
+        let mut router = InputRouter::new();
+        let now = Instant::now();
+        assert!(
+            route_test_input_at(&mut router, b"\x1b[", now)
+                .forward
+                .is_empty()
+        );
+        let routed = route_test_input_at(&mut router, b"1", now + INPUT_SEQUENCE_TIMEOUT);
+        assert_eq!(routed.forward, b"\x1b[1");
+        assert!(router.pending_sequence.is_empty());
+    }
+
+    #[test]
+    fn bracketed_paste_preserves_mouse_shaped_text_across_reads() {
+        let mut router = InputRouter::new();
+        let now = Instant::now();
+        let first = route_test_input_at(&mut router, b"\x1b[200~text\x1b[<64;4;3M\x1b[20", now);
+        assert_eq!(first.forward, b"\x1b[200~text\x1b[<64;4;3M\x1b[20");
+        assert_eq!(first.top_scroll_lines, 0);
+        let second = route_test_input_at(&mut router, b"1~\x1b[<64;4;3M", now);
+        assert_eq!(second.forward, b"1~");
+        assert_eq!(second.top_scroll_lines, TOP_SCROLL_STEP);
+    }
+
+    #[test]
+    fn paste_payload_cannot_consume_the_paste_terminator() {
+        let mut router = InputRouter::new();
+        let routed = route_test_input_at(
+            &mut router,
+            b"\x1b[200~\x1b[M\x1b[201~\x1b[<64;4;3M",
+            Instant::now(),
+        );
+        assert_eq!(routed.forward, b"\x1b[200~\x1b[M\x1b[201~");
+        assert_eq!(routed.top_scroll_lines, TOP_SCROLL_STEP);
+        assert!(!router.bracketed_paste);
+    }
+
+    #[test]
+    fn delayed_paste_terminator_fragments_leave_wheel_routing_enabled() {
+        for split in 1..BRACKETED_PASTE_END.len() {
+            let mut router = InputRouter::new();
+            let now = Instant::now();
+            route_test_input_at(&mut router, BRACKETED_PASTE_START, now);
+            let first = route_test_input_at(&mut router, &BRACKETED_PASTE_END[..split], now);
+            assert_eq!(first.forward, BRACKETED_PASTE_END[..split]);
+            assert!(router.pending_sequence.is_empty());
+            let second = route_test_input_at(
+                &mut router,
+                &BRACKETED_PASTE_END[split..],
+                now + Duration::from_secs(1),
+            );
+            assert_eq!(second.forward, BRACKETED_PASTE_END[split..]);
+            let wheel =
+                route_test_input_at(&mut router, b"\x1b[<64;4;3M", now + Duration::from_secs(1));
+            assert_eq!(wheel.top_scroll_lines, TOP_SCROLL_STEP);
+            assert!(wheel.forward.is_empty());
+        }
+    }
+
+    #[test]
+    fn opening_paste_marker_survives_an_expired_escape_prefix() {
+        for split in 1..BRACKETED_PASTE_START.len() {
+            let mut router = InputRouter::new();
+            let now = Instant::now();
+            route_test_input_at(&mut router, &BRACKETED_PASTE_START[..split], now);
+            let first = route_test_input_at(&mut router, b"", now + INPUT_SEQUENCE_TIMEOUT);
+            assert_eq!(first.forward, BRACKETED_PASTE_START[..split]);
+            let remainder = [&BRACKETED_PASTE_START[split..], b"\x1b[<64;4;3M"].concat();
+            let second = route_test_input_at(&mut router, &remainder, now + Duration::from_secs(1));
+            assert_eq!(second.forward, remainder);
+            assert_eq!(second.top_scroll_lines, 0);
+            assert!(router.bracketed_paste);
+        }
+    }
+
+    #[test]
+    fn renderer_does_not_sleep_after_a_publish_races_with_wait() {
+        let shared = RenderShared::default();
+        let parser = TerminalParser::new(5, 80, 0);
+        shared.publish(RenderSnapshot::capture(
+            parser.screen(),
+            Focus::Top,
+            &MonitorPane::new(),
+            None,
+        ));
+        let observed_generation = shared.latest_published().unwrap().generation;
+        shared.publish(RenderSnapshot::capture(
+            parser.screen(),
+            Focus::Top,
+            &MonitorPane::new(),
+            None,
+        ));
+        let started = Instant::now();
+        shared.wait_until(started + Duration::from_secs(2), observed_generation);
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[derive(Clone, Default)]

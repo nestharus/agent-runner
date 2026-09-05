@@ -59,11 +59,20 @@ The summary contains counts, total/max nanoseconds and histogram buckets for:
 - `render.snapshot`: copying the virtual screen into a render snapshot;
 - `render.draw`: drawing and flushing a frame to the terminal;
 - `input.forward` and `input.write`: routing input and writing the child FIFO;
+- `input.route`: decoding and enqueuing an input read;
+- `input.queue_to_write`: time from enqueuing a user-input batch until the
+  pending and deferred FIFOs drain, including any wait for an atomic submission;
 - `pty.parse`: reading/parsing available child-output bursts;
-- `relay.iteration` and `relay.poll`: total iteration time and idle poll time.
+- `monitor.detail_refresh`: updating an expanded inspector's transcript detail;
+- `relay.iteration` and `relay.poll`: total iteration time and idle poll time;
+- `control.read`, `control.prepare`, `control.begin`, and `control.settle`:
+  socket and mailbox work on the control worker, outside the input relay.
 
-`render.frames` and `render.snapshots` count render activity. Large poll timings
-alone indicate idle waiting. Large draw timings identify rendering/output
+`render.frames` and `render.snapshots` count render activity;
+`input.bytes_read` counts input bytes without storing them. Queue timings end
+immediately after the write drains, before accepting another input read. They
+measure broker delivery, not the child application's handling or visible echo.
+Large poll timings alone indicate idle waiting. Large draw timings identify rendering/output
 backpressure; large snapshot or parse timings identify processing overhead.
 The file is written when the final profiler owner drops, so forced process
 termination may leave no summary.
@@ -91,3 +100,50 @@ profile timings at 120 columns:
 This fixture validates the installed-binary path independently of model speed.
 It cannot measure the operator's terminal-emulator frontend. Existing running
 sessions keep their original executable and need a restart after installation.
+
+## Input and wheel contention
+
+The observed relay used to accept control sockets, read complete frames, perform
+mailbox transactions, and sleep for the 400 ms body-to-Enter delay on the same
+thread that forwards keyboard input and routes wheel events. A partial control
+frame could block that thread indefinitely. Socket and mailbox work now run on
+a dedicated worker. The relay advances the body, delay, and delimiter phases
+without waiting, and acknowledges only after the delimiter drains and mailbox
+settlement succeeds. Ordinary keys remain responsive during socket/database
+preparation. During an actual atomic control submission they queue behind its
+Enter; wheel routing and rendering continue throughout.
+
+Two independent input-routing bugs also affected scrolling:
+
+- A read containing both a key and a wheel event discarded the wheel delta.
+  The router now preserves event order: typing returns to the live tail and a
+  subsequent wheel event in the same read scrolls away from it.
+- Mouse reports split across reads leaked into the child as ordinary input.
+  The router retains bounded incomplete Escape/CSI prefixes for up to 25 ms,
+  checked on the relay's 25 ms poll cadence. Ordinary keys have no added delay.
+  Bracketed-paste contents remain literal and cannot be mistaken for mouse input.
+
+The renderer also checks the publication generation under its wait mutex, so a
+new interactive frame cannot lose a wakeup just before a background-frame wait.
+
+These are runner defects demonstrated with isolated synthetic PTYs, not a
+measurement of the operator's complete terminal session. A private aggregate
+profile can distinguish remaining broker queue delays from child/UI latency.
+
+An isolated raw-child fixture measured input delivery with a deliberately
+incomplete control header held open at 601.65 ms before the fix (delivery resumed
+only when the peer closed) and 0.309 ms after it, while the peer remained open.
+Normal key delivery in the final fixture ranged from 0.193 to 0.432 ms. Mixed
+key/wheel input and fragmented wheel input both scrolled correctly. Scrolling
+also responded within the fixture's 100 ms observation window during the
+400 ms submission gap, while deferred keys arrived after the body and Enter.
+
+A separate Codex fixture with 3,000 synthetic history rows and a composer grown
+to 16 KiB measured roughly 24 ms visible input latency through the overlay and
+21 ms with passthrough. It did not reproduce persistent severe native input lag.
+
+Validation: 679 runtime library tests passed with an isolated data directory
+and serial execution; all 21 PTY delivery integration tests passed. Regression
+coverage includes stalled sockets, a locked mailbox database, delivery
+confirmation and uncertainty, duplicate suppression, deferred-input ordering,
+split keys/mouse reports, delayed paste markers and renderer wakeup races.

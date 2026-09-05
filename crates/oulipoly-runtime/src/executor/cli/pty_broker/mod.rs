@@ -991,10 +991,6 @@ impl ControlSocket {
     fn mark_child_spawned(&mut self) {
         self.child_started_at = Instant::now();
     }
-
-    fn age(&self) -> Duration {
-        self.child_started_at.elapsed()
-    }
 }
 
 fn control_socket_context<'a>(
@@ -2594,12 +2590,16 @@ pub fn append_notify_trace_record(fields: &str) {
     let Some(path) = notify_trace_path() else {
         return;
     };
+    append_notify_trace_record_at(&path, fields);
+}
+
+fn append_notify_trace_record_at(path: &Path, fields: &str) {
     let line = format!(
         "{} {}\n",
         Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         fields.trim()
     );
-    let _ = append_notify_trace_line(&path, &line);
+    let _ = append_notify_trace_line(path, &line);
 }
 
 fn notify_trace_path() -> Option<PathBuf> {
@@ -2715,19 +2715,41 @@ fn trace_notify_gate_decision(
 ) {
     let foreground = foreground_owner_state(master_fd, child_pid);
     let line = line_state.trace_snapshot_for_decision(decision);
+    let record = notify_gate_trace_record(
+        control.session_id().as_deref(),
+        control.invocation_uuid(),
+        foreground,
+        &line,
+        child_output_state,
+        decision,
+        status,
+    );
+    append_notify_trace_record(&record);
+    if trace_notify_enabled() {
+        eprintln!("oulipoly_notify_trace {record}");
+    }
+}
+
+fn notify_gate_trace_record(
+    session_id: Option<&str>,
+    invocation_uuid: &str,
+    foreground: ForegroundOwnerState,
+    line: &InputLineTraceSnapshot,
+    child_output_state: &ChildOutputState,
+    decision: &str,
+    status: &str,
+) -> String {
     let inject_status = notify_trace_inject_status(decision, status);
-    let reason = notify_trace_gate_reason(foreground, &line, child_output_state);
-    let record = format!(
+    let reason = notify_trace_gate_reason(foreground, line, child_output_state);
+    format!(
         "trigger=pty-control \
          session_id={} invocation_uuid={} input_empty={} at_boundary={} mid_escape={} \
          last_user_input_ms={} user_input_idle_ms={} user_input_idle={} \
          user_input_idle_threshold_ms={} boundary_probe={} mouse_skipped={} quiescent={} \
          last_child_output_ms={} foreground={} decision={} inject_status={} \
          reason={} consumed=unknown",
-        control
-            .session_id()
-            .unwrap_or_else(|| "<pending>".to_string()),
-        control.invocation_uuid(),
+        session_id.unwrap_or("<pending>"),
+        invocation_uuid,
         line.input_empty,
         line.at_boundary,
         line.mid_escape,
@@ -2743,11 +2765,7 @@ fn trace_notify_gate_decision(
         notify_trace_decision(decision, &inject_status),
         inject_status,
         reason,
-    );
-    append_notify_trace_record(&record);
-    if trace_notify_enabled() {
-        eprintln!("oulipoly_notify_trace {record}");
-    }
+    )
 }
 
 fn notify_trace_gate_reason(
