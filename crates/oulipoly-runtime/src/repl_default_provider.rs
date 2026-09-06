@@ -183,12 +183,18 @@ where
         None => services.state_db_opener.open_default(),
     }?;
 
+    // Match the current headless/model-REPL initial routing preparation.
+    let in_flight = crate::quota::InFlight::new();
+    let ctx = crate::balancer::BalanceContext {
+        providers_cfg: &providers,
+        in_flight: &in_flight,
+    };
     let provider_index = services
         .routing_service
         .select_route(RoutingServiceRequest {
             model: &carrier_model,
             state: &state,
-            ctx: None,
+            ctx: Some(&ctx),
         })
         .map_err(|error| error.to_string())?
         .provider_index;
@@ -696,7 +702,7 @@ executable = "{implementation}"
         )
     }
 
-    fn repl_test_provider_path() -> &'static Path {
+    pub(super) fn repl_test_provider_path() -> &'static Path {
         static PROVIDER: OnceLock<PathBuf> = OnceLock::new();
         PROVIDER
             .get_or_init(|| {
@@ -814,7 +820,8 @@ print(json.dumps({
         }
     }
 
-    fn successful_interactive_result() -> crate::executor::cli::InteractiveExecutionResult {
+    pub(super) fn successful_interactive_result() -> crate::executor::cli::InteractiveExecutionResult
+    {
         crate::executor::cli::InteractiveExecutionResult {
             exit_code: 0,
             terminal_reason: None,
@@ -1648,3 +1655,7 @@ default_provider = "claude"
         assert_eq!(launcher.calls.borrow().len(), 1);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "repl_default_provider_routing_tests.rs"]
+mod routing_tests;

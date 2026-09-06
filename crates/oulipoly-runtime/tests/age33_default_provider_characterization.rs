@@ -208,7 +208,9 @@ fn age_33_runtime_default_provider_cutover_preserves_load_open_select_launch_ord
     let _routing_request = run
         .find("RoutingServiceRequest")
         .expect("routing service request construction");
-    let _cached_only = run.find("ctx: None").expect("cached-only routing request");
+    let _contextual = run
+        .find("ctx: Some(&ctx)")
+        .expect("contextual routing request");
     let provider_selection = run
         .find("providers.runtime_provider(member_name)")
         .expect("runtime provider selection");
@@ -233,8 +235,8 @@ fn age_33_runtime_default_provider_cutover_preserves_load_open_select_launch_ord
         "provider selection and launcher invocation must remain downstream of the opened state"
     );
     assert!(
-        run.contains("RoutingServiceRequest") && run.contains("ctx: None"),
-        "runtime default-provider should build a cached-only routing request"
+        run.contains("RoutingServiceRequest") && run.contains("ctx: Some(&ctx)"),
+        "runtime default-provider should build a contextual routing request"
     );
     assert!(
         route < out_of_bounds && out_of_bounds < provider_selection,
