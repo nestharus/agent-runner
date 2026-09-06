@@ -10,9 +10,11 @@ All fixtures, source checkouts and failed attempts remain in that directory.
 import copy
 from datetime import datetime, timedelta, timezone
 import importlib
+import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -39,6 +41,56 @@ IDENTITY = {
 }
 producer.snapshot(REPO, SOURCE_ROOT, IDENTITY)
 SOURCE = SOURCE_ROOT / "source"
+
+
+def storage_entry(path):
+    """Observe bytes and write-sensitive metadata, not read-induced access times."""
+    info = path.lstat()
+    entry = {
+        "mode": info.st_mode,
+        "inode": info.st_ino,
+        "links": info.st_nlink,
+        "mtime_ns": info.st_mtime_ns,
+        "ctime_ns": info.st_ctime_ns,
+    }
+    if path.is_symlink():
+        return {**entry, "link": os.readlink(path)}
+    if path.is_file():
+        return {**entry, **fingerprint(path)}
+    return entry
+
+
+def storage_tree(root):
+    return {
+        str(path.relative_to(root)): storage_entry(path)
+        for path in [root, *sorted(root.rglob("*"))]
+    }
+
+
+def native_command(argv, cwd, capture):
+    """No mocks or inherited optional-lock suppression at the CLI boundary."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/nonexistent",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TMPDIR": str(EVIDENCE),
+    }
+    argv = [str(arg) for arg in argv]
+    write_json(
+        capture.with_suffix(".command.json"),
+        {"argv": argv, "cwd": str(cwd), "environment": env},
+    )
+    result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, check=False)
+    write_new(capture.with_suffix(".stdout"), result.stdout)
+    write_new(capture.with_suffix(".stderr"), result.stderr)
+    write_json(capture.with_suffix(".exit.json"), {"exit": result.returncode})
+    return result
 
 
 class ContractTests(unittest.TestCase):
@@ -153,6 +205,117 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(result["changed"])
         self.assertEqual(before, sorted(self.root.iterdir()))
         self.assertEqual(fingerprint(self.target), self.auth["current"])
+
+    def observe_storage(self, source, observations, name):
+        state = {"source": storage_tree(source), "bundle": storage_tree(self.root)}
+        write_json(observations / f"{name}.json", state)
+        write_new(observations / f"{name}.index", (source / ".git/index").read_bytes())
+        return state
+
+    def change_source_stat(self, source, observations, name):
+        path = source / "Cargo.lock"
+        info = path.stat()
+        times = (info.st_atime_ns, info.st_mtime_ns - 2_000_000_000)
+        write_json(
+            observations / f"{name}.json",
+            {"operation": "utime", "path": str(path), "ns": times},
+        )
+        os.utime(path, ns=times)
+
+    def verify_refreshable_source(self, exit_code):
+        fixture = EVIDENCE / f"{self._testMethodName}-source"
+        observations = EVIDENCE / f"{self._testMethodName}-observations"
+        fixture.mkdir()
+        observations.mkdir()
+        producer.snapshot(REPO, fixture, IDENTITY)
+        source = fixture / "source"
+        git_argv = [
+            "/usr/bin/git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            source,
+        ]
+        initial = self.observe_storage(source, observations, "00-initial")
+        self.change_source_stat(source, observations, "01-utime")
+        changed = self.observe_storage(source, observations, "02-restatted")
+        control = native_command(
+            git_argv + ["status", "--porcelain=v1", "--untracked-files=all"],
+            source,
+            observations / "03-status",
+        )
+        refreshed = self.observe_storage(source, observations, "04-refreshed")
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(control.stdout, b"")
+        self.assertEqual(
+            initial["source"]["Cargo.lock"]["sha256"],
+            changed["source"]["Cargo.lock"]["sha256"],
+        )
+        self.assertNotEqual(
+            changed["source"][".git/index"]["sha256"],
+            refreshed["source"][".git/index"]["sha256"],
+        )
+        self.change_source_stat(source, observations, "05-utime")
+        before = self.observe_storage(source, observations, "06-before")
+        clean = native_command(
+            git_argv
+            + [
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            source,
+            observations / "07-status",
+        )
+        checked = self.observe_storage(source, observations, "08-checked")
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertEqual(clean.stdout, b"")
+        self.assertEqual(before, checked)
+        result = native_command(
+            [
+                sys.executable,
+                "-B",
+                REPO / "scripts/runner-provenance.py",
+                "install",
+                "--source",
+                source,
+                "--manifest",
+                self.manifest_path,
+                "--producer-manifest-sha256",
+                self.custody,
+                "--authorization",
+                self.auth_path,
+                "--authorization-sha256",
+                self.auth_pin,
+                "--target",
+                self.target,
+            ],
+            REPO,
+            observations / "09-install",
+        )
+        after = self.observe_storage(source, observations, "10-after")
+        self.assertEqual(result.returncode, exit_code, result.stderr)
+        if exit_code == 0:
+            self.assertEqual(
+                json.loads(result.stdout),
+                {"verified": True, "changed": False, "target": str(self.target)},
+            )
+        else:
+            self.assertEqual(result.stdout, b"")
+            self.assertIn(b"wrong current target bytes", result.stderr)
+        self.assertEqual(before["bundle"], after["bundle"])
+        self.assertEqual(before["source"], after["source"])
+
+    def test_verify_only_preserves_refreshable_source_storage(self):
+        self.verify_refreshable_source(0)
+
+    def test_verify_only_late_rejection_preserves_refreshable_source_storage(self):
+        self.auth["current"]["sha256"] = "0" * 64
+        self.repin()
+        self.verify_refreshable_source(1)
 
     def test_install_and_rollback_preserve_bytes_and_mode(self):
         result = self.invoke(apply=True)
