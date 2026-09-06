@@ -43,12 +43,19 @@ Output locations:
 
 The raw binary is at `src-tauri/target/release/oulipoly-agent-runner` (or `.exe` on Windows).
 
-### Manual install (Linux/macOS)
+### Reviewed-source local runner installation (Linux x86_64)
 
-```bash
-bunx tauri build
-cp src-tauri/target/release/oulipoly-agent-runner ~/.local/bin/
-```
+For a CLI-use-only raw runner, use the repository-owned
+[provenance build/install procedure](scripts/runner-provenance.md). It builds from
+an exact clean commit in fresh isolated storage, records inputs and output
+identity, and requires independent producer custody plus root review/target
+authorization before installation. Verification is read-only by default;
+explicit installation preserves an atomic replacement and bounded rollback.
+
+Do not treat a manual binary copy, `BUILD_COMMIT`, or a manifest alone as reviewed
+installation provenance. This bounded profile does not package the desktop UI;
+use the Tauri build above for desktop bundles, which have separate frontend and
+release requirements. No provenance-backed macOS/Windows install is claimed.
 
 ## Testing
 
