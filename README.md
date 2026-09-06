@@ -250,6 +250,34 @@ oulipoly-agent-runner -m seedance-i2v-low -i image=cat.jpeg "The cat blinks slow
 `default_provider` from `config.toml`. This is the top-level fresh-session
 entrypoint; `--resume <session-id>` is its existing-session counterpart.
 
+Configure `default_provider` in the runner's global
+`<config_home>/oulipoly-agent-runner/config.toml` as an account **family**:
+
+```toml
+default_provider = "acme"
+```
+
+Here `acme` stands for your configured account-family key, not a new provider
+registration. It includes the exact `acme` account plus ASCII-numeric suffix
+accounts such as `acme2`, `acme3`, and `acme10` from the same directory's
+`providers.toml`. Dashed or prefixed keys (`acme-work`, `myacme`) are excluded.
+An account-looking family such as `acme2` also includes `acme20`; it is not an
+exact-account pin. Shared managed wrapper commands do not collapse the pool:
+membership comes from account keys, not command names. Each account still
+requires its own configured implementation endpoint and settings identity.
+
+Fresh default selection uses the standard initial routing service with quota
+refresh, exhaustion-marker verification and topology repair. Normal
+quota/error/history policies apply, not strict round robin: consecutive
+launches may legitimately select the same account. Like headless/model-REPL
+initial routing, this does not synchronously scan legacy `sessions.toml`
+turn scripts. The selected account's interactive arguments, settings and
+environment remain its own. No named model TOML is loaded for this path.
+
+Existing-session `--resume` follows the separate owner-preserving resume path,
+not this fresh-family selection. Explicit model launches are unchanged;
+`--pin-provider` is for fresh model runs and cannot be combined with `--new`.
+
 `oulipoly-agent-runner repl <model>` launches the wrapped CLI as an interactive session through the load balancer instead of as a one-shot. Stdin / stdout / stderr are inherited (TTY pass-through), so terminal-generated `Ctrl+C` reaches the child directly. The runner stays alive only long enough to reap and finalize the invocation row.
 
 ```bash
