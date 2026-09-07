@@ -316,6 +316,7 @@ fn attempt_account_dispatch(
                 launch_prompt_acceptance_v1_enabled,
                 output_spool,
                 returned_artifacts,
+                &session_authority,
             );
             return Ok(failed_finalization_result(
                 result,
