@@ -363,9 +363,10 @@ fn external_transport_timeout_fails_closed_before_sibling_account() {
     let fixture = make_fixture(&["slow-1"], &[]);
     let model = rotation_model(&fixture, &["slow-1", "fast-2"]);
 
-    let error = execute(&fixture, model, 0).expect_err("lifecycle transfer is unavailable");
+    let error =
+        execute(&fixture, model, 0).expect_err("single-account failure; no sibling authority");
 
-    assert_lifecycle_transfer_unavailable(error);
+    assert_honest_error(error, "host_timeout");
     assert_eq!(
         order_lines(&fixture.order_path),
         [format!("policy:{}", settings_id("slow-1"))],
@@ -378,9 +379,10 @@ fn external_provider_unavailable_fails_closed_before_sibling_account() {
     let fixture = make_fixture(&[], &["unavail-1"]);
     let model = rotation_model(&fixture, &["unavail-1", "fast-2"]);
 
-    let error = execute(&fixture, model, 0).expect_err("lifecycle transfer is unavailable");
+    let error =
+        execute(&fixture, model, 0).expect_err("single-account failure; no sibling authority");
 
-    assert_lifecycle_transfer_unavailable(error);
+    assert_honest_error(error, "auth_expired");
     assert_eq!(
         order_lines(&fixture.order_path),
         [format!("policy:{}", settings_id("unavail-1"))],
@@ -399,9 +401,9 @@ fn external_launch_heartbeat_gap_timeout_fails_closed_before_sibling_account() {
         0,
         ProviderClientOptions::default().with_launch_heartbeat_gap(HANDSHAKE_TIMEOUT),
     )
-    .expect_err("lifecycle transfer is unavailable");
+    .expect_err("single-account failure; no sibling authority");
 
-    assert_lifecycle_transfer_unavailable(result);
+    assert_honest_error(result, "host_timeout");
     assert_eq!(
         order_lines(&fixture.order_path),
         [
@@ -417,9 +419,10 @@ fn external_transport_pool_fails_closed_at_first_required_lifecycle_transfer() {
     let fixture = make_fixture(&["slow-1", "slow-2"], &[]);
     let model = rotation_model(&fixture, &["slow-1", "slow-2"]);
 
-    let error = execute(&fixture, model, 0).expect_err("lifecycle transfer is unavailable");
+    let error =
+        execute(&fixture, model, 0).expect_err("single-account failure; no sibling authority");
 
-    assert_lifecycle_transfer_unavailable(error);
+    assert_honest_error(error, "host_timeout");
     assert_eq!(
         order_lines(&fixture.order_path),
         [format!("policy:{}", settings_id("slow-1"))],
@@ -427,11 +430,330 @@ fn external_transport_pool_fails_closed_at_first_required_lifecycle_transfer() {
     );
 }
 
-fn assert_lifecycle_transfer_unavailable(error: ServiceError) {
-    assert!(matches!(
-        error,
-        ServiceError::Unavailable { ref code, ref message }
-            if code.as_deref() == Some("account_lifecycle_transfer_unavailable")
-                && message.contains("sibling launch was not attempted")
-    ));
+fn assert_honest_error(error: ServiceError, expected: &str) {
+    assert!(
+        matches!(error, ServiceError::Dependency { ref message } if message.contains(expected)),
+        "{error:?}"
+    );
+    assert!(!error.to_string().contains("lifecycle_transfer_unavailable"));
+}
+
+fn allocated_input(
+    fixture: &Fixture,
+    model: &ModelConfig,
+    active: bool,
+) -> executor::AllocatedProviderLaunchAttempt {
+    use oulipoly_state::*;
+    use uuid::Uuid;
+    let state_path = fixture
+        ._dir
+        .path()
+        .join(format!("state-{}.db", Uuid::new_v4()));
+    let db = StateDb::open(&state_path).unwrap();
+    let allocation = ProviderLaunchAttemptAllocation::allocate().unwrap();
+    let request = BeginProviderLaunchRequest {
+        logical_launch_id: Uuid::new_v4(),
+        request_identity_sha256: "a".repeat(64),
+        model_name: model.name.clone(),
+        start_mode: ProviderLaunchStartMode::Create,
+        expected_provider_session_id: None,
+        candidates: model
+            .providers
+            .iter()
+            .enumerate()
+            .map(|(provider_index, p)| ProviderLaunchCandidate {
+                provider_index,
+                account_name: p.name.clone(),
+            })
+            .collect(),
+        parent_invocation_id: None,
+        allocation: allocation.clone(),
+    };
+    let lease = db.begin_launch(&request).unwrap();
+    if active {
+        db.activate_attempt(&lease, &allocation.completion_authority)
+            .unwrap();
+    }
+    executor::AllocatedProviderLaunchAttempt {
+        lease,
+        completion_authority: allocation.completion_authority,
+        state_db_path: state_path,
+        mailbox_db_path: {
+            let dir = fixture
+                ._dir
+                .path()
+                .join(format!("runtime-{}", Uuid::new_v4()));
+            fs::create_dir(&dir).unwrap();
+            dir.join("pid-identity.db")
+        },
+        channel_root: fixture._dir.path().to_path_buf(),
+        parent_invocation_uuid: Uuid::new_v4(),
+    }
+}
+fn allocated_request(model: ModelConfig) -> ExecutorServiceRequest {
+    ExecutorServiceRequest::Facade {
+        model,
+        provider_index: 0,
+        prompt: "prompt-value".into(),
+        working_dir: None,
+        models_dir: None,
+        extra_inputs: HashMap::new(),
+        parent_invocation_env: None,
+    }
+}
+#[test]
+fn allocated_policy_failures_account_for_cold_and_cached_describe_without_sibling_work() {
+    use oulipoly_provider::custody::ProviderOperation;
+    let fixture = make_fixture(&[], &["unavail-1"]);
+    let model = rotation_model(&fixture, &["unavail-1", "fast-2"]);
+    let registry = registry_with_client_options(
+        &model,
+        &fixture,
+        ProviderClientOptions::default().with_timeout(HANDSHAKE_TIMEOUT),
+    );
+    let mut previous = None;
+    for cached in [false, true] {
+        let allocation = allocated_input(&fixture, &model, true);
+        let owner = allocation.lease.owner.clone();
+        let expected_generation = allocation.lease.runtime_generation_uuid;
+        let result = executor::execute_allocated_provider_attempt(
+            &registry,
+            allocated_request(model.clone()),
+            allocation,
+        );
+        let executor::ProviderLaunchAttemptOutcome::Failed(failure) = result else {
+            panic!("expected honest failure: {result:?}");
+        };
+        assert_eq!(failure.owner, owner);
+        assert!(
+            matches!(failure.error, executor::ProviderLaunchFailure::Provider(_)),
+            "{failure:?}"
+        );
+        assert_eq!(
+            failure.rotatable_kind,
+            Some(oulipoly_state::RotatableLaunchFailureKind::ProviderUnavailable)
+        );
+        assert_eq!(failure.actor_settlement.len(), 3);
+        assert!(
+            failure
+                .actor_settlement
+                .iter()
+                .all(|r| r.effect_incapable()),
+            "{:?}",
+            failure.actor_settlement
+        );
+        let describe = failure
+            .actor_settlement
+            .iter()
+            .find(|r| r.operation == ProviderOperation::Describe)
+            .unwrap();
+        assert_eq!(describe.spawned, !cached);
+        assert!(
+            failure.runtime_settlement.effect_incapable,
+            "{:?}",
+            failure.runtime_settlement
+        );
+        assert_eq!(
+            failure.runtime_settlement.runtime_generation_uuid,
+            expected_generation
+        );
+        assert_eq!(
+            failure.runtime_settlement.spawn_invocation_uuid,
+            owner.invocation_uuid
+        );
+        assert_eq!(
+            failure.return_channel_settlement,
+            executor::ReturnChannelSettlement::NotCreated
+        );
+        assert!(!failure.observations.transfer_forbidden());
+        let policy = failure
+            .requests
+            .iter()
+            .find(|r| r.operation == ProviderOperation::Policy)
+            .unwrap();
+        if let executor::ProviderLaunchFailure::Provider(error) = &failure.error {
+            assert_eq!(error.request_id(), Some(policy.wire_request_id.as_str()));
+        }
+        if let Some((old_owner, old_generation, old_request)) = previous {
+            assert_ne!(owner, old_owner);
+            assert_ne!(expected_generation, old_generation);
+            assert_ne!(policy.correlation, old_request);
+        }
+        previous = Some((owner, expected_generation, policy.correlation));
+    }
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        vec![format!("policy:{}", settings_id("unavail-1")); 2]
+    );
+}
+#[test]
+fn allocated_launch_timeout_settles_exact_generation_and_strict_empty_channel() {
+    let fixture = make_fixture_with_launch_stalls(&[], &[], &["stall-1"]);
+    let model = rotation_model(&fixture, &["stall-1", "fast-2"]);
+    let registry = registry_with_client_options(
+        &model,
+        &fixture,
+        ProviderClientOptions::default().with_timeout(HANDSHAKE_TIMEOUT),
+    );
+    let allocation = allocated_input(&fixture, &model, true);
+    let channel = allocation
+        .channel_root
+        .join(allocation.parent_invocation_uuid.to_string())
+        .join(allocation.lease.owner.logical_launch_id.to_string())
+        .join(allocation.lease.owner.attempt_id.to_string())
+        .join("returns.jsonl");
+    let outcome = executor::execute_allocated_provider_attempt(
+        &registry,
+        allocated_request(model),
+        allocation,
+    );
+    let executor::ProviderLaunchAttemptOutcome::Failed(failure) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(
+        failure.rotatable_kind,
+        Some(oulipoly_state::RotatableLaunchFailureKind::HostTimeout),
+        "{failure:?}"
+    );
+    assert_eq!(failure.actor_settlement.len(), 3);
+    assert!(
+        failure
+            .actor_settlement
+            .iter()
+            .all(|a| a.spawned && a.effect_incapable()),
+        "{:?}",
+        failure.actor_settlement
+    );
+    assert!(
+        failure.runtime_settlement.effect_incapable,
+        "{:?}",
+        failure.runtime_settlement
+    );
+    assert_eq!(
+        failure.return_channel_settlement,
+        executor::ReturnChannelSettlement::EmptyRemoved
+    );
+    assert!(!channel.exists());
+    assert!(
+        !failure.observations.transfer_forbidden(),
+        "partial stdout and heartbeat are not promotion"
+    );
+    if let executor::ProviderLaunchFailure::Provider(error) = &failure.error {
+        assert_eq!(
+            error.request_id(),
+            None,
+            "host timeout has no observed response ID"
+        );
+    }
+    assert_eq!(failure.requests.len(), 3);
+    assert_eq!(
+        failure
+            .output_spool
+            .unwrap()
+            .incomplete_output_bytes()
+            .unwrap()
+            .0,
+        vec![0, 1, 255]
+    );
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        [
+            format!("policy:{}", settings_id("stall-1")),
+            format!("launch:{}", settings_id("stall-1"))
+        ]
+    );
+}
+#[test]
+fn unactivated_or_changed_allocated_lease_starts_no_describe_or_runtime() {
+    let fixture = make_fixture(&[], &[]);
+    let model = rotation_model(&fixture, &["fast-1", "fast-2"]);
+    let registry = registry_with_client_options(&model, &fixture, ProviderClientOptions::default());
+    for active in [false, true] {
+        let mut allocation = allocated_input(&fixture, &model, active);
+        if active {
+            allocation.lease.runtime_generation_uuid = uuid::Uuid::new_v4();
+        }
+        let sidecar = allocation.mailbox_db_path.clone();
+        let outcome = executor::execute_allocated_provider_attempt(
+            &registry,
+            allocated_request(model.clone()),
+            allocation,
+        );
+        let executor::ProviderLaunchAttemptOutcome::Failed(failure) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(failure.actor_settlement.is_empty());
+        assert!(!failure.runtime_settlement.effect_incapable);
+        assert!(!sidecar.exists());
+        assert!(!fixture.order_path.exists());
+        assert!(failure.requests.is_empty());
+    }
+}
+
+#[test]
+fn allocated_failure_retains_artifacts_and_captured_children_on_the_producing_invocation() {
+    let fixture = make_fixture_with_launch_stalls(&[], &[], &["stall-1"]);
+    let body = fs::read_to_string(&fixture.provider_path).unwrap().replace(
+        "        time.sleep(SLEEP_SECONDS)\n        return 0",
+        r#"        env = request["params"]["env"]
+        producer = json.loads(env["OULIPOLY_PARENT_INVOCATION"])["id"]
+        ref = {"version_id": "store://return/" + producer + "/fixture/1", "name":"fixture", "store_address":{"workflow_run_id":"return:" + producer,"artifact_name":"fixture","version":1}, "sha256":"a"*64,"content_len":1,"format_hint":None,"verdict_line":None,"source":{"kind":"inline_bytes"},"producer_invocation_uuid":producer,"returned_at":"2026-09-07T00:00:00Z"}
+        pathlib.Path(env["OULIPOLY_RETURN_CHANNEL"]).write_text(json.dumps(ref) + "\n")
+        sys.stderr.write('OULIPOLY_INVOCATION={"source":"fake-child","id":"22222222-2222-4222-8222-222222222222"}\n')
+        sys.stderr.flush()
+        time.sleep(SLEEP_SECONDS)
+        return 0"#,
+    );
+    write_executable(&fixture.provider_path, &body);
+    let model = rotation_model(&fixture, &["stall-1", "fast-2"]);
+    let registry = registry_with_client_options(
+        &model,
+        &fixture,
+        ProviderClientOptions::default().with_timeout(HANDSHAKE_TIMEOUT),
+    );
+    let allocation = allocated_input(&fixture, &model, true);
+    let owner = allocation.lease.owner.clone();
+    let state_path = allocation.state_db_path.clone();
+    let outcome = executor::execute_allocated_provider_attempt(
+        &registry,
+        allocated_request(model),
+        allocation,
+    );
+    let executor::ProviderLaunchAttemptOutcome::Failed(failure) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(
+        failure.rotatable_kind,
+        Some(oulipoly_state::RotatableLaunchFailureKind::HostTimeout)
+    );
+    assert!(failure.observations.returned_artifact && failure.observations.captured_child);
+    assert!(failure.observations.transfer_forbidden());
+    assert_eq!(failure.captured_child_invocations.len(), 1);
+    assert_eq!(
+        failure.captured_child_invocations[0].composite_id.id,
+        "22222222-2222-4222-8222-222222222222"
+    );
+    assert!(
+        matches!(
+            failure.return_channel_settlement,
+            executor::ReturnChannelSettlement::ArtifactsCommitted(_)
+        ),
+        "{:?}",
+        failure.return_channel_settlement
+    );
+    let refs = failure.return_channel_settlement.artifacts();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].producer_invocation_uuid, owner.invocation_uuid);
+    let db = oulipoly_state::StateDb::open(&state_path).unwrap();
+    assert_eq!(
+        db.list_returned_artifacts(owner.invocation_row_id).unwrap(),
+        refs
+    );
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        [
+            format!("policy:{}", settings_id("stall-1")),
+            format!("launch:{}", settings_id("stall-1"))
+        ]
+    );
 }

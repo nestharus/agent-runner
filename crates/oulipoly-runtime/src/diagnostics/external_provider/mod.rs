@@ -51,6 +51,7 @@ pub(crate) fn classify_terminal_with_client(
         &request,
         &format!("{}-instance", describe.provider_id),
         registry.host_options(),
+        client.options().attempt_custody.as_ref(),
     )
     .map_err(error_mapper::projection_error)?;
     let result = client_invoker::invoke_terminal_classify(client, provider_request)

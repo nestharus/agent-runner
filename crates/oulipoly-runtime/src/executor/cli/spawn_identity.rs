@@ -55,6 +55,28 @@ pub(crate) struct SpawnIdentityContext {
 }
 
 impl SpawnIdentityContext {
+    pub(crate) fn for_allocated_attempt(
+        lease: &oulipoly_state::ProviderLaunchLease,
+        mailbox_path: PathBuf,
+        model: String,
+        cwd: Option<&Path>,
+        models_dir: Option<&Path>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            generation_id: RuntimeGenerationId::parse(&lease.runtime_generation_uuid.to_string())
+                .map_err(|e| e.to_string())?,
+            invocation_uuid: lease.owner.invocation_uuid.to_string(),
+            provider_name: lease.candidate.account_name.clone(),
+            model_name: Some(model),
+            session_id: None,
+            mode: SpawnRuntimeMode::Headless,
+            pty_control_path: None,
+            effective_cwd: cwd.map(|p| p.to_string_lossy().into_owned()),
+            models_dir: models_dir.map(|p| p.to_string_lossy().into_owned()),
+            mailbox_db_path: Some(mailbox_path),
+        })
+    }
+
     pub(super) fn invocation_uuid(&self) -> &str {
         &self.invocation_uuid
     }

@@ -126,6 +126,15 @@ impl PinnedProviderEndpoint {
         })
     }
 
+    pub fn endpoint_identity(&self) -> Result<oulipoly_state::ProviderLaunchEndpoint, String> {
+        Ok(oulipoly_state::ProviderLaunchEndpoint {
+            endpoint_family: self.family.clone(),
+            settings_id: self.settings_id().map_err(|e| e.to_string())?.into(),
+            provider_instance_id: format!("{}-instance", self.capabilities.provider_id),
+            endpoint_identity_sha256: self.client.pinned_executable_identity_sha256()?,
+        })
+    }
+
     pub fn canonical_executable(&self) -> &Path {
         self.client
             .resolved_executable()
@@ -349,11 +358,22 @@ impl ProviderRegistry {
         &self,
         account_name: &str,
     ) -> Result<Arc<PinnedProviderEndpoint>, ProviderRegistryError> {
+        self.preflight_account_with_custody(account_name, None)
+    }
+
+    pub(crate) fn preflight_account_with_custody(
+        &self,
+        account_name: &str,
+        custody: Option<oulipoly_provider::custody::AttemptActorCustody>,
+    ) -> Result<Arc<PinnedProviderEndpoint>, ProviderRegistryError> {
         let mut endpoints = self
             .endpoint_cache
             .lock()
             .expect("provider endpoint cache mutex should not be poisoned");
         if let Some(endpoint) = endpoints.get(account_name) {
+            if let Some(custody) = &custody {
+                custody.record_not_invoked("describe");
+            }
             return Ok(endpoint.clone());
         }
         let key = self.lookup_account_artifact_key(account_name)?;
@@ -366,9 +386,17 @@ impl ProviderRegistry {
                 });
             }
         };
-        let client = Arc::new(self.client_factory.client_for(artifact));
+        let client = Arc::new(self.client_factory.client_for_attempt(artifact, custody));
         let capabilities = describe_provider_client(client.as_ref(), &self.host_options)?;
         self.store_describe(&key, capabilities.clone());
+        let client = Arc::new(
+            client
+                .fork_from_pinned(self.client_factory.base_options())
+                .map_err(|source| ProviderRegistryError::ProviderTransport {
+                    kind: source.transport_kind().into(),
+                    source: Box::new(source),
+                })?,
+        );
         let endpoint = Arc::new(PinnedProviderEndpoint {
             account_name: account_name.to_string(),
             family: self

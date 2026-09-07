@@ -48,13 +48,14 @@
 
 use crate::error::{HostErrorKind, ProviderClientError, ProviderDiagnostics};
 use crate::generated::ProcessStatus;
+use crate::process_custody::OwnedChild as Child;
 use oulipoly_core::CancellationRegistration;
 pub use oulipoly_core::CancellationToken;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -279,6 +280,7 @@ fn capture_window(limit: ByteLimit, current_len: usize, incoming_len: usize) -> 
 
 #[derive(Debug, Clone)]
 pub struct ProcessLimits {
+    pub custody: Option<crate::custody::OperationCustody>,
     pub timeout: Duration,
     pub kill_after_grace: Duration,
     pub stdout_limit: ByteLimit,
@@ -314,6 +316,7 @@ impl std::fmt::Debug for ProcessSpawnObserver {
 impl Default for ProcessLimits {
     fn default() -> Self {
         Self {
+            custody: None,
             timeout: Duration::from_secs(30),
             kill_after_grace: Duration::from_millis(100),
             stdout_limit: ByteLimit::new(1024 * 1024),
@@ -570,7 +573,7 @@ impl ProcessRunner {
         P: StdoutProcessor,
     {
         let argv = command.argv();
-        let mut child = spawn_provider_process(&command, envs)?;
+        let mut child = spawn_provider_process(&command, envs, self.limits.custody.clone())?;
         if let Err(error) = notify_spawn_observer(&self.limits.spawn_observer, child.id()) {
             return Err(terminate_after_spawn_observer_failure(
                 child,
@@ -616,6 +619,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         loop {
             let events = self.record_pending_events();
             if events.worker_failed {
+                self.child.uncertain();
                 return Err(self.terminate_and_collect(HostErrorKind::WaitFailed, false));
             }
             if events.stdout_processor_failed {
@@ -627,6 +631,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
                     Ok(Some(status)) => return self.collect_completed(status),
                     Ok(None) => {}
                     Err(_) => {
+                        self.child.uncertain();
                         return Err(self.terminate_and_collect(HostErrorKind::WaitFailed, false));
                     }
                 }
@@ -685,6 +690,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
 
     fn begin_cancellation(&mut self) {
         if self.cancellation_started.is_none() {
+            self.child.cancellation();
             terminate_tree(&mut self.child);
             self.cancellation_started = Some(Instant::now());
             self.next_status_poll = Instant::now();
@@ -710,15 +716,23 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
                 HostErrorKind::Cancelled,
                 &self.command,
                 diagnostics,
+                Some(process_status(status)),
             ));
         }
-        map_completed_process_outcome(
+        let outcome = map_completed_process_outcome(
             status,
             self.threads,
             &self.command,
             self.argv,
             host_cancellation_requested,
-        )
+        );
+        if outcome
+            .as_ref()
+            .is_err_and(|e| e.transport_kind() == "wait_failed")
+        {
+            self.child.uncertain();
+        }
+        outcome
     }
 
     fn terminate_and_collect(
@@ -728,19 +742,22 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
     ) -> ProviderClientError {
         terminate_tree(&mut self.child);
         let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
+        let status = terminated.status.map(process_status);
         let diagnostics =
             map_termination_diagnostics(self.threads, terminated, host_cancellation_requested);
-        termination_transport_error(kind, &self.command, diagnostics)
+        termination_transport_error(kind, &self.command, diagnostics, status)
     }
 
     fn force_kill_and_collect(mut self) -> ProviderClientError {
+        self.child.forced();
         kill_tree(&mut self.child);
         let terminated = TerminatedProcess {
             status: self.child.wait().ok(),
             force_killed: true,
         };
+        let status = terminated.status.map(process_status);
         let diagnostics = map_termination_diagnostics(self.threads, terminated, true);
-        termination_transport_error(HostErrorKind::Cancelled, &self.command, diagnostics)
+        termination_transport_error(HostErrorKind::Cancelled, &self.command, diagnostics, status)
     }
 
     fn terminate_after_stdout_processor_failure(mut self) -> ProviderClientError {
@@ -756,6 +773,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
                 HostErrorKind::Cancelled,
                 &self.command,
                 diagnostics,
+                status,
             );
         }
         let processor_error = joined
@@ -785,22 +803,43 @@ fn termination_transport_error(
     kind: HostErrorKind,
     command: &ProcessCommand,
     diagnostics: ProviderDiagnostics,
+    status: Option<ProcessStatus>,
 ) -> ProviderClientError {
-    ProviderClientError::host_transport(kind, subcommand_for_error(command), None, diagnostics)
+    let error = ProviderClientError::host_transport(
+        kind,
+        subcommand_for_error(command),
+        None,
+        diagnostics.clone(),
+    );
+    match status {
+        Some(status) => error.with_process_context(diagnostics, status),
+        None => error,
+    }
 }
 
 fn spawn_provider_process<I, K, V>(
     command: &ProcessCommand,
     envs: I,
+    custody: Option<crate::custody::OperationCustody>,
 ) -> Result<Child, ProviderClientError>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
+    if custody.is_some() && !crate::process_custody::containment_supported() {
+        return Err(ProviderClientError::host_transport(
+            HostErrorKind::Other("attempt_process_custody_unsupported".into()),
+            subcommand_for_error(command),
+            None,
+            ProviderDiagnostics::default(),
+        ));
+    }
     let mut process = build_provider_process(command, envs);
+    crate::process_custody::configure_containment(&mut process, custody.is_some());
     process
         .spawn()
+        .map(|child| Child::new(child, custody))
         .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error))
 }
 
@@ -1180,11 +1219,15 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
             }
             Ok(false) if should_force_kill(&grace_started, kill_after_grace) => {
                 force_killed = true;
+                child.forced();
                 kill_tree(child);
                 break child.wait().ok();
             }
             Ok(false) => thread::sleep(Duration::from_millis(5)),
-            Err(_) => break None,
+            Err(_) => {
+                child.uncertain();
+                break None;
+            }
         }
     };
     TerminatedProcess {
@@ -1219,11 +1262,15 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
             Ok(Some(status)) => break Some(status),
             Ok(None) if should_force_kill(&grace_started, kill_after_grace) => {
                 force_killed = true;
+                child.forced();
                 kill_tree(child);
                 break child.wait().ok();
             }
             Ok(None) => thread::sleep(Duration::from_millis(5)),
-            Err(_) => break None,
+            Err(_) => {
+                child.uncertain();
+                break None;
+            }
         }
     };
     TerminatedProcess {
@@ -1621,6 +1668,10 @@ fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn terminate_tree(child: &mut Child) {
+    if !child.can_signal_group() {
+        child.uncertain();
+        return;
+    }
     let group = -(child.id() as i32);
     unsafe {
         libc::kill(group, libc::SIGTERM);
@@ -1639,10 +1690,13 @@ fn terminate_tree(child: &mut Child) {
 
 #[cfg(unix)]
 fn kill_tree(child: &mut Child) {
-    let group = -(child.id() as i32);
-    unsafe {
-        libc::kill(group, libc::SIGKILL);
+    if !child.can_signal_group() {
+        child.uncertain();
+        return;
     }
+    let group = -(child.id() as i32);
+    let signal_ok = unsafe { libc::kill(group, libc::SIGKILL) } == 0;
+    child.confirm_group_dead(signal_ok);
 }
 
 #[cfg(windows)]
@@ -2037,15 +2091,24 @@ mod tests {
     fn stdout_worker_panic_is_reported_as_wait_failure() {
         let fake = FakeProvider::compile(fake_provider_source());
         let started = std::time::Instant::now();
-        let error = ProcessRunner::new(ProcessLimits::default())
-            .run_with_stdout_line_gap_timeout_and_stdout_processor(
-                ProcessCommand::new(fake.path()).arg("launch"),
-                serde_json::to_vec(&describe_request()).expect("request should serialize"),
-                FakeProviderMode::LaunchPartialHang.env(),
-                PanickingStdoutProcessor,
-            )
-            .expect_err("stdout worker panic should fail the process outcome");
+        let custody = crate::custody::AttemptActorCustody::new(uuid::Uuid::new_v4());
+        let guard = custody.begin("launch");
+        let error = ProcessRunner::new(ProcessLimits {
+            custody: cfg!(target_os = "linux").then(|| guard.0.clone()),
+            ..ProcessLimits::default()
+        })
+        .run_with_stdout_line_gap_timeout_and_stdout_processor(
+            ProcessCommand::new(fake.path()).arg("launch"),
+            serde_json::to_vec(&describe_request()).expect("request should serialize"),
+            FakeProviderMode::LaunchPartialHang.env(),
+            PanickingStdoutProcessor,
+        )
+        .expect_err("stdout worker panic should fail the process outcome");
 
+        drop(guard);
+        if cfg!(target_os = "linux") {
+            assert!(!custody.receipts()[0].effect_incapable());
+        }
         assert_eq!(error.transport_kind(), "wait_failed");
         assert!(
             started.elapsed() < Duration::from_millis(500),

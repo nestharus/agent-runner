@@ -21,9 +21,9 @@
 
 mod captured_child_dedupe;
 mod captured_child_marker;
-mod return_channel;
+pub(crate) mod return_channel;
 mod return_channel_cleanup;
-mod return_channel_jsonl;
+
 mod return_channel_parent;
 mod return_channel_path;
 mod return_channel_predicates;

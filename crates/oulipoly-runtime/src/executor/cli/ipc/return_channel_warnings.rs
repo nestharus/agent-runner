@@ -23,17 +23,6 @@ pub(super) fn return_channel_parent_invocation_parse_error(err: &dyn Display) ->
     format!("Failed to parse parent invocation for return channel: {err}")
 }
 
-pub(super) fn create_return_channel_dir_error(dir: &Path, err: &std::io::Error) -> String {
-    format!(
-        "Failed to create return channel directory {}: {err}",
-        dir.display()
-    )
-}
-
-pub(super) fn create_return_channel_file_error(path: &Path, err: &std::io::Error) -> String {
-    format!("Failed to create return channel {}: {err}", path.display())
-}
-
 pub(super) fn delete_return_channel_warning(path: &Path, err: &std::io::Error) -> String {
     format!(
         "Warning: failed to delete return channel {}: {err}",
@@ -45,24 +34,5 @@ pub(super) fn delete_return_channel_dir_warning(dir: &Path, err: &std::io::Error
     format!(
         "Warning: failed to delete return channel directory {}: {err}",
         dir.display()
-    )
-}
-
-pub(super) fn read_return_channel_warning(path: &Path, err: &std::io::Error) -> String {
-    format!(
-        "Warning: failed to read return channel {}: {err}",
-        path.display()
-    )
-}
-
-pub(super) fn parse_return_channel_line_warning(
-    line_number: usize,
-    path: &Path,
-    err: &serde_json::Error,
-) -> String {
-    format!(
-        "Warning: failed to parse return channel line {} in {}: {err}",
-        line_number,
-        path.display()
     )
 }

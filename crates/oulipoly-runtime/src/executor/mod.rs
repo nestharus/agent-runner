@@ -640,6 +640,14 @@ pub fn execute_effective_with_inputs_and_env(
 }
 
 // Characterization test for AGE-8 — pins current behavior of executor/mod.rs facade wrappers in this inline test module.
+pub use cli::ipc::return_channel::{ReturnChannel, ReturnChannelSettlement};
+
+pub use external_provider::attempt::{
+    AllocatedProviderLaunchAttempt, ProviderLaunchAttemptFailure, ProviderLaunchAttemptOutcome,
+    ProviderLaunchFailure, ProviderLaunchPromotionSummary, RuntimeSettlementReceipt,
+    execute_allocated_provider_attempt,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
