@@ -60,6 +60,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+// Terminal observation has a fixed bound even when the OS cannot confirm death
+// or a pipe/worker remains live. It is not additional provider execution time.
+const SETTLEMENT_OBSERVATION_BOUND: Duration = Duration::from_secs(1);
+
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,6 +458,7 @@ struct JoinedProcessThreads<T: StdoutDrainOutput> {
     stderr: Option<CapturedBytes>,
     stdin_closed_early: Option<bool>,
     failed_workers: Vec<&'static str>,
+    cleanup_pending: bool,
 }
 
 struct TerminatedProcess {
@@ -703,7 +708,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
     ) -> Result<ProcessOutcome<T>, ProviderClientError> {
         let host_cancellation_requested =
             self.cancellation_started.is_some() || cancellation_requested(self.limits);
-        let joined = join_process_threads(self.threads, &self.child);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
         if host_cancellation_requested && self.timeout_mode == TimeoutMode::TotalRuntime {
             let diagnostics = termination_diagnostics_from_joined(
                 joined,
@@ -737,21 +742,23 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         terminate_tree(&mut self.child);
         let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
         let status = terminated.status.map(process_status);
-        let joined = join_process_threads(self.threads, &self.child);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
         let diagnostics =
             termination_diagnostics_from_joined(joined, terminated, host_cancellation_requested);
         termination_transport_error(kind, &self.command, diagnostics, status)
     }
 
     fn force_kill_and_collect(mut self) -> ProviderClientError {
-        self.child.forced();
-        kill_tree(&mut self.child);
+        let admitted = kill_tree(&mut self.child);
+        if admitted {
+            self.child.forced();
+        }
         let terminated = TerminatedProcess {
-            status: self.child.wait().ok(),
-            force_killed: true,
+            status: reap_after_kill(&mut self.child, admitted),
+            force_killed: admitted,
         };
         let status = terminated.status.map(process_status);
-        let joined = join_process_threads(self.threads, &self.child);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
         let diagnostics = termination_diagnostics_from_joined(joined, terminated, true);
         termination_transport_error(HostErrorKind::Cancelled, &self.command, diagnostics, status)
     }
@@ -760,7 +767,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         terminate_tree(&mut self.child);
         let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
         let status = terminated.status.map(process_status);
-        let joined = join_process_threads(self.threads, &self.child);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
         let host_cancellation_requested =
             self.cancellation_started.is_some() || cancellation_requested(self.limits);
         if host_cancellation_requested {
@@ -1027,7 +1034,13 @@ fn poll_child_status(
         return Ok(None);
     }
     // WNOWAIT keeps the exact leader unreaped while its owned descendants are cleaned.
-    kill_tree(child);
+    if !kill_tree(child) {
+        return Err(host_process_error(
+            HostErrorKind::WaitFailed,
+            command,
+            std::io::Error::other("process cleanup admission unavailable"),
+        ));
+    }
     child
         .wait()
         .map(Some)
@@ -1052,7 +1065,7 @@ fn map_completed_process_outcome<T: StdoutDrainOutput>(
     host_cancellation_requested: bool,
 ) -> Result<ProcessOutcome<T>, ProviderClientError> {
     let process_status = process_status(status);
-    if !joined.failed_workers.is_empty() {
+    if joined.cleanup_pending || !joined.failed_workers.is_empty() {
         return Err(process_worker_failure(
             command,
             joined,
@@ -1209,14 +1222,16 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
         match child_exited_without_reaping(child) {
             Ok(true) => {
                 // Keep the leader waitable until its exact process group is clean.
-                kill_tree(child);
-                break child.wait().ok();
+                let admitted = kill_tree(child);
+                break reap_after_kill(child, admitted);
             }
             Ok(false) if should_force_kill(&grace_started, kill_after_grace) => {
-                force_killed = true;
-                child.forced();
-                kill_tree(child);
-                break child.wait().ok();
+                let admitted = kill_tree(child);
+                force_killed = admitted;
+                if admitted {
+                    child.forced();
+                }
+                break reap_after_kill(child, admitted);
             }
             Ok(false) => thread::sleep(Duration::from_millis(5)),
             Err(_) => {
@@ -1256,10 +1271,12 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) if should_force_kill(&grace_started, kill_after_grace) => {
-                force_killed = true;
-                child.forced();
-                kill_tree(child);
-                break child.wait().ok();
+                let admitted = kill_tree(child);
+                force_killed = admitted;
+                if admitted {
+                    child.forced();
+                }
+                break reap_after_kill(child, admitted);
             }
             Ok(None) => thread::sleep(Duration::from_millis(5)),
             Err(_) => {
@@ -1283,6 +1300,7 @@ fn termination_diagnostics_from_joined<T: StdoutDrainOutput>(
     terminated: TerminatedProcess,
     host_cancellation_requested: bool,
 ) -> ProviderDiagnostics {
+    let description = joined_failure_description(&joined);
     let mut diagnostics = termination_diagnostics_from_parts(
         terminated,
         host_cancellation_requested,
@@ -1294,8 +1312,8 @@ fn termination_diagnostics_from_joined<T: StdoutDrainOutput>(
         joined.stderr.unwrap_or_default(),
     );
     diagnostics.stdin_closed_early = joined.stdin_closed_early.unwrap_or_default();
-    if !joined.failed_workers.is_empty() {
-        diagnostics.description = Some(worker_failure_description(&joined.failed_workers));
+    if joined.cleanup_pending || !joined.failed_workers.is_empty() {
+        diagnostics.description = Some(description);
     }
     diagnostics
 }
@@ -1411,6 +1429,7 @@ fn join_process_threads<T: StdoutDrainOutput>(
         stderr,
         stdin_closed_early,
         failed_workers,
+        cleanup_pending: false,
     }
 }
 
@@ -1420,6 +1439,7 @@ fn process_worker_failure<T: StdoutDrainOutput>(
     status: Option<ProcessStatus>,
     host_cancellation_requested: bool,
 ) -> ProviderClientError {
+    let description = joined_failure_description(&joined);
     let mut diagnostics = ProviderDiagnostics {
         stdout: joined
             .stdout
@@ -1430,7 +1450,7 @@ fn process_worker_failure<T: StdoutDrainOutput>(
         stdin_closed_early: joined.stdin_closed_early.unwrap_or_default(),
         process_was_reaped: status.is_some(),
         host_cancellation_requested,
-        description: Some(worker_failure_description(&joined.failed_workers)),
+        description: Some(description),
         ..ProviderDiagnostics::default()
     };
     if let Some(status) = &status {
@@ -1494,6 +1514,14 @@ fn terminate_after_spawn_observer_failure(
         let status = process_status(status);
         diagnostics.provider_exit_code = exit_code(&status);
         diagnostics.provider_process_nonzero = process_nonzero(&status);
+    }
+    if !child.is_reaped() {
+        child.uncertain();
+        diagnostics.description = Some(format!(
+            "{};process_cleanup_pending",
+            diagnostics.description.unwrap_or_default()
+        ));
+        cleanup::retain(child, || true);
     }
     ProviderClientError::host_transport(
         HostErrorKind::Other("spawn_observer_failed".to_string()),
@@ -1679,24 +1707,27 @@ fn terminate_tree(child: &mut Child) {
 }
 
 #[cfg(unix)]
-fn kill_tree(child: &mut Child) {
+fn kill_tree(child: &mut Child) -> bool {
     if !child.can_signal_group() {
         child.uncertain();
-        return;
+        return false;
     }
     let group = -(child.id() as i32);
     let signal_ok = unsafe { libc::kill(group, libc::SIGKILL) } == 0;
     child.confirm_group_dead(signal_ok);
+    if !signal_ok {
+        child.uncertain();
+    }
+    signal_ok
 }
 
-#[cfg(windows)]
-fn kill_tree(child: &mut Child) {
-    let _ = child.kill();
-}
-
-#[cfg(not(any(unix, windows)))]
-fn kill_tree(child: &mut Child) {
-    let _ = child.kill();
+#[cfg(not(unix))]
+fn kill_tree(child: &mut Child) -> bool {
+    let admitted = child.kill().is_ok();
+    if !admitted {
+        child.uncertain();
+    }
+    admitted
 }
 
 pub(crate) fn is_executable(path: &Path) -> bool {
@@ -2206,3 +2237,109 @@ mod tests {
 ))]
 #[path = "process_shutdown_tests.rs"]
 mod shutdown_tests;
+
+// Pending cleanup owns the exact Child and original worker handles, never a
+// reconstructed PID. A failed thread start retains its task in the queue.
+#[path = "process_cleanup.rs"]
+mod cleanup;
+
+fn reap_after_kill(child: &mut Child, admitted: bool) -> Option<ExitStatus> {
+    if !admitted {
+        child.uncertain();
+        return None;
+    }
+    let started = Instant::now();
+    loop {
+        #[cfg(unix)]
+        let result = child_exited_without_reaping(child).and_then(|exited| {
+            if exited {
+                child.wait().map(Some)
+            } else {
+                Ok(None)
+            }
+        });
+        #[cfg(not(unix))]
+        let result = child.try_wait();
+        match result {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if started.elapsed() < SETTLEMENT_OBSERVATION_BOUND => {
+                thread::sleep(Duration::from_millis(2))
+            }
+            _ => {
+                child.uncertain();
+                return None;
+            }
+        }
+    }
+}
+
+fn joined_failure_description<T: StdoutDrainOutput>(joined: &JoinedProcessThreads<T>) -> String {
+    let workers = if joined.failed_workers.is_empty() {
+        String::new()
+    } else {
+        worker_failure_description(&joined.failed_workers)
+    };
+    if joined.cleanup_pending {
+        format!("process_cleanup_pending; worker output may be incomplete; {workers}")
+    } else {
+        workers
+    }
+}
+
+fn collect_or_retain_process_threads<T: StdoutDrainOutput>(
+    threads: ProcessThreads<T>,
+    child: Child,
+) -> JoinedProcessThreads<T> {
+    let started = Instant::now();
+    while !(threads.stdout.is_finished()
+        && threads.stderr.is_finished()
+        && threads.stdin.is_finished())
+        && child.is_reaped()
+        && started.elapsed() < SETTLEMENT_OBSERVATION_BOUND
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    if threads.stdout.is_finished()
+        && threads.stderr.is_finished()
+        && threads.stdin.is_finished()
+        && child.is_reaped()
+    {
+        return join_process_threads(threads, &child);
+    }
+    child.uncertain();
+    let mut stdout = Some(threads.stdout);
+    let mut stderr = Some(threads.stderr);
+    let mut stdin = Some(threads.stdin);
+    let mut failed_workers = Vec::new();
+    fn finished<T>(
+        handle: &mut Option<thread::JoinHandle<T>>,
+        name: &'static str,
+        failed: &mut Vec<&'static str>,
+    ) -> Option<T> {
+        if !handle.as_ref()?.is_finished() {
+            return None;
+        }
+        match handle.take().unwrap().join() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                failed.push(name);
+                None
+            }
+        }
+    }
+    let joined = JoinedProcessThreads {
+        stdout: finished(&mut stdout, "stdout", &mut failed_workers),
+        stderr: finished(&mut stderr, "stderr", &mut failed_workers),
+        stdin_closed_early: finished(&mut stdin, "stdin", &mut failed_workers),
+        failed_workers,
+        cleanup_pending: true,
+    };
+    cleanup::retain(child, move || {
+        let mut ignored_failures = Vec::new();
+        finished(&mut stdout, "stdout", &mut ignored_failures);
+        finished(&mut stderr, "stderr", &mut ignored_failures);
+        finished(&mut stdin, "stdin", &mut ignored_failures);
+        stdout.is_none() && stderr.is_none() && stdin.is_none()
+    });
+    joined
+}

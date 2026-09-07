@@ -429,6 +429,23 @@ pub fn execute_allocated_provider_attempt(
     attempt.refresh_promotions();
     match result {
         Ok(mut result) => {
+            // Missing-final is a mapped failed execution, not the Err arm below.
+            // Persist its incomplete prefix before this attempt owner is dropped.
+            if result.terminal_reason.as_deref() == Some("external_provider_missing_final_exit")
+                && let Err(error) = result.persist_output_for_invocation(
+                    &attempt.state.lock().unwrap_or_else(|e| e.into_inner()),
+                    owner.invocation_row_id,
+                    &owner.invocation_uuid.to_string(),
+                )
+            {
+                result.exit_code = -1;
+                result
+                    .stderr
+                    .push_str(&format!("\nmissing_final_output_retention_failed: {error}"));
+                if let Some(signal) = &mut result.terminal_signal {
+                    signal.evidence.push_str(";output_retention=failed");
+                }
+            }
             // Terminal/result effects precede all outer orchestration attachment.
             let retained = attempt.retain_children(&result.stderr);
             if result.produced_assistant_response {

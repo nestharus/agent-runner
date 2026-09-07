@@ -67,7 +67,7 @@ pub struct ExecutionResult {
     pub stdout: Vec<u8>,
     pub stderr: String,
     /// External-provider output custody: complete on normal launches, explicitly
-    /// incomplete after live attachment abort. Complete-stream APIs reject partial
+    /// incomplete after live attachment abort or missing final event. Complete-stream APIs reject partial
     /// custody; failed retention writes `<invocation_uuid>.partial.{stdout,stderr}`.
     /// `stdout` and `stderr` remain bounded diagnostics when a spool is present.
     pub output_spool: Option<ExecutionOutputSpool>,
@@ -98,7 +98,11 @@ impl ExecutionResult {
     ) -> Result<(), &'static str> {
         if !matches!(
             self.terminal_reason.as_deref(),
-            Some("runtime_generation_attach_failed" | "runtime_generation_exit_failed")
+            Some(
+                "runtime_generation_attach_failed"
+                    | "runtime_generation_exit_failed"
+                    | "external_provider_missing_final_exit"
+            )
         ) {
             return Ok(());
         }

@@ -39,6 +39,12 @@ impl ReturnChannelSettlement {
         }
     }
 }
+#[derive(Clone, Copy)]
+enum ChannelUse {
+    AllocatedSeal,
+    StandaloneConsumption,
+}
+
 pub struct ReturnChannel {
     path: PathBuf,
     dir: PathBuf,
@@ -112,12 +118,12 @@ impl ReturnChannel {
         &mut self,
         commit: impl FnOnce(&[ReturnedArtifactRef]) -> Result<(), String>,
     ) -> ReturnChannelSettlement {
-        self.read_settled(commit, false)
+        self.read_settled(commit, ChannelUse::AllocatedSeal)
     }
     fn read_settled(
         &mut self,
         commit: impl FnOnce(&[ReturnedArtifactRef]) -> Result<(), String>,
-        retain_foreign_for_validation: bool,
+        use_kind: ChannelUse,
     ) -> ReturnChannelSettlement {
         self.emergency_cleanup = false;
         if !self.identical() {
@@ -155,8 +161,11 @@ impl ReturnChannel {
         {
             return self.quarantine(digest, vec![]);
         }
-        let (artifacts, valid) =
-            strict_records(&bytes, self.producer, retain_foreign_for_validation);
+        let (artifacts, valid) = strict_records(
+            &bytes,
+            self.producer,
+            matches!(use_kind, ChannelUse::StandaloneConsumption),
+        );
         // Retain valid prefix records even when another record is malformed.
         if !artifacts.is_empty() && commit(&artifacts).is_err() {
             return self.cleanup_failed(artifacts);
@@ -164,6 +173,22 @@ impl ReturnChannel {
         if !valid {
             return self.quarantine(digest, artifacts);
         }
+        if !self.remove_consumed_channel(use_kind) {
+            return self.cleanup_failed(artifacts);
+        }
+        if artifacts.is_empty() {
+            ReturnChannelSettlement::EmptyRemoved
+        } else {
+            ReturnChannelSettlement::ArtifactsCommitted(artifacts)
+        }
+    }
+    fn remove_consumed_channel(&mut self, use_kind: ChannelUse) -> bool {
+        #[cfg(windows)]
+        if matches!(use_kind, ChannelUse::StandaloneConsumption) {
+            return self.remove_standalone_windows();
+        }
+        #[cfg(not(windows))]
+        let _ = use_kind;
         if !self.identical()
             || std::fs::remove_file(&self.path).is_err()
             || std::fs::remove_dir(&self.dir).is_err()
@@ -172,16 +197,27 @@ impl ReturnChannel {
             || !unlinked(self.file.as_ref().unwrap())
             || !unlinked(self.directory.as_ref().unwrap())
         {
-            return self.cleanup_failed(artifacts);
+            return false;
         }
-        if !self.close_checked() {
-            return self.cleanup_failed(artifacts);
+        self.close_checked()
+    }
+    #[cfg(windows)]
+    fn remove_standalone_windows(&mut self) -> bool {
+        // Windows deletion can stay pending until the last open handle closes.
+        // This checks ordinary consumption only, not link-count/ACL transfer proof.
+        if !self.identical() {
+            return false;
         }
-        if artifacts.is_empty() {
-            ReturnChannelSettlement::EmptyRemoved
-        } else {
-            ReturnChannelSettlement::ArtifactsCommitted(artifacts)
-        }
+        let removed_file = std::fs::remove_file(&self.path).is_ok();
+        let closed_file = self.file.take().is_some_and(close_file_checked);
+        let removed_dir = std::fs::remove_dir(&self.dir).is_ok();
+        let closed_dir = self.directory.take().is_some_and(close_file_checked);
+        removed_file
+            && closed_file
+            && removed_dir
+            && closed_dir
+            && absent(&self.path)
+            && absent(&self.dir)
     }
     fn identical(&self) -> bool {
         let (Some(file), Some(directory)) = (&self.file, &self.directory) else {
@@ -235,7 +271,12 @@ fn close_file_checked(file: File) -> bool {
     use std::os::fd::IntoRawFd;
     unsafe { libc::close(file.into_raw_fd()) == 0 }
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn close_file_checked(file: File) -> bool {
+    use std::os::windows::io::IntoRawHandle;
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(file.into_raw_handle()) != 0 }
+}
+#[cfg(not(any(unix, windows)))]
 fn close_file_checked(file: File) -> bool {
     drop(file);
     false
@@ -428,7 +469,7 @@ pub(crate) fn read_and_cleanup_return_channel(
     // returned_artifacts error category. Carry structurally valid foreign refs
     // to that rejecting sink, but quarantine their channel: never bless or
     // delete them as accepted custody. Allocated seals never commit such refs.
-    let settlement = channel.read_settled(|_| Ok(()), true);
+    let settlement = channel.read_settled(|_| Ok(()), ChannelUse::StandaloneConsumption);
     match settlement {
         ReturnChannelSettlement::NotCreated | ReturnChannelSettlement::EmptyRemoved => Ok(vec![]),
         ReturnChannelSettlement::ArtifactsCommitted(refs) => Ok(refs),

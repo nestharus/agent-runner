@@ -1013,3 +1013,171 @@ fn allocated_decoded_final_partial_bytes_do_not_promote_on_timeout() {
         false,
     );
 }
+
+fn verified_missing_final_output(has_data: bool, complete: bool, retention_fault: bool) {
+    let fixture = make_fixture(&[], &[]);
+    let body = fs::read_to_string(&fixture.provider_path).unwrap();
+    let start = body.find("def launch(request):").unwrap();
+    let end = body[start..].find("\ndef main():").unwrap() + start;
+    let replacement = format!(
+        r#"def launch(request):
+    import base64, hashlib
+    append_order("launch:" + str(settings_id(request)))
+    reqid = request_id(request)
+    seq = 0
+    def emit(kind, **fields):
+        nonlocal seq
+        seq += 1
+        write_json(dict(contract=CONTRACT, request_id=reqid, seq=seq, time_unix_ms=1000+seq, kind=kind, **fields))
+    emit("marker", name="oulipoly.provider_session", value={{"provider_session_id":"example-session"}})
+    stdout = bytes([0,1,255,90]) if {has_data} else b""
+    stderr = bytes([101,114,114,255,254]) if {has_data} else b""
+    if {has_data}:
+        emit("stdout", data_base64=base64.b64encode(stdout).decode())
+        emit("stderr", data_base64=base64.b64encode(stderr).decode())
+    if {complete}:
+        emit("marker", name="oulipoly.launch_output_complete/v1", value={{"protocol":"oulipoly.launch_output/v1", "stdout":{{"bytes":len(stdout),"sha256":hashlib.sha256(stdout).hexdigest()}},"stderr":{{"bytes":len(stderr),"sha256":hashlib.sha256(stderr).hexdigest()}},"data_event_count":2 if {has_data} else 0}})
+        write_json(exit_event(request, seq+1, 0, "clean_exit"))
+    return 0
+
+"#,
+        has_data = if has_data { "True" } else { "False" },
+        complete = if complete { "True" } else { "False" }
+    );
+    write_executable(
+        &fixture.provider_path,
+        &format!("{}{}{}", &body[..start], replacement, &body[end..]),
+    );
+    let model = rotation_model(&fixture, &["first", "sibling"]);
+    let registry = registry_with_client_options(
+        &model,
+        &fixture,
+        ProviderClientOptions::default().with_timeout(HANDSHAKE_TIMEOUT),
+    );
+    let allocation = allocated_input(&fixture, &model, true);
+    let owner = allocation.lease.owner.clone();
+    let db = oulipoly_state::StateDb::open(&allocation.state_db_path).unwrap();
+    let paths = db
+        .invocation_output_artifact_paths(&format!("{}.partial", owner.invocation_uuid))
+        .unwrap()
+        .unwrap();
+    if retention_fault {
+        fs::create_dir_all(&paths.stdout).unwrap();
+    }
+    let outcome = executor::execute_allocated_provider_attempt(
+        &registry,
+        allocated_request(model),
+        allocation,
+    );
+    let executor::ProviderLaunchAttemptOutcome::Completed(result) = outcome else {
+        panic!("{outcome:?}")
+    };
+    eprintln!(
+        "missing-final has_data={has_data} complete={complete} retention_fault={retention_fault}; result={result:?}"
+    );
+    assert_eq!(
+        result.session_capture.session_id.as_deref(),
+        Some("example-session")
+    );
+    assert!(result.prompt_acceptance_attestation.is_none());
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        [
+            format!("policy:{}", settings_id("first")),
+            format!("launch:{}", settings_id("first"))
+        ]
+    );
+    assert!(
+        db.provider_launch_promotions(&owner)
+            .unwrap()
+            .contains(&oulipoly_state::ProviderLaunchPromotion::ProviderSessionObserved)
+    );
+    let stdout = if has_data {
+        vec![0, 1, 255, 90]
+    } else {
+        vec![]
+    };
+    let stderr = if has_data {
+        vec![101, 114, 114, 255, 254]
+    } else {
+        vec![]
+    };
+    if complete {
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.complete_stdout_bytes().unwrap(), stdout);
+        assert!(result.output_spool.as_ref().unwrap().summary().is_ok());
+        assert!(!paths.stdout.exists());
+        return;
+    }
+    assert_ne!(result.exit_code, 0);
+    assert_eq!(
+        result.terminal_reason.as_deref(),
+        Some("external_provider_missing_final_exit")
+    );
+    assert!(!result.produced_assistant_response);
+    let spool = result
+        .output_spool
+        .as_ref()
+        .expect("observed prefix must survive missing-final mapping");
+    assert_eq!(
+        spool.incomplete_output_bytes().unwrap(),
+        (stdout.clone(), stderr.clone())
+    );
+    assert!(spool.summary().is_err());
+    assert!(result.complete_stdout_bytes().is_err());
+    assert!(result.write_stdout_to(&mut Vec::new()).is_err());
+    let signal = result.terminal_signal.as_ref().unwrap();
+    assert!(signal.evidence.contains("output=incomplete"));
+    if retention_fault {
+        assert!(
+            signal.evidence.contains("output_retention=failed"),
+            "{}",
+            signal.evidence
+        );
+        assert!(
+            result
+                .persist_output_for_invocation(
+                    &db,
+                    owner.invocation_row_id,
+                    &owner.invocation_uuid.to_string()
+                )
+                .is_err()
+        );
+    } else {
+        assert_eq!(fs::read(&paths.stdout).unwrap(), stdout);
+        assert_eq!(fs::read(&paths.stderr).unwrap(), stderr);
+    }
+    let complete_paths = db
+        .invocation_output_artifact_paths(&owner.invocation_uuid.to_string())
+        .unwrap()
+        .unwrap();
+    assert!(!complete_paths.stdout.exists());
+    let count: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM invocation_output_deliveries WHERE invocation_id=?1",
+            [owner.invocation_row_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "incomplete evidence is not complete output delivery"
+    );
+}
+#[test]
+fn allocated_verified_missing_final_retains_binary_prefix() {
+    verified_missing_final_output(true, false, false);
+}
+#[test]
+fn allocated_verified_missing_final_retains_genuine_no_data() {
+    verified_missing_final_output(false, false, false);
+}
+#[test]
+fn allocated_verified_missing_final_retention_failure_is_explicit() {
+    verified_missing_final_output(true, false, true);
+}
+#[test]
+fn allocated_verified_complete_output_remains_complete() {
+    verified_missing_final_output(true, true, false);
+}

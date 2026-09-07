@@ -328,7 +328,7 @@ pub(super) fn attempt_account_dispatch(
                     )));
                 }
             };
-            if let Some(result) = map_missing_final_exit_with_prompt_acceptance(
+            if let Some(mut result) = map_missing_final_exit_with_prompt_acceptance(
                 &error,
                 verified_failure_session.as_ref(),
                 context.provider_index,
@@ -337,6 +337,13 @@ pub(super) fn attempt_account_dispatch(
                 returned_artifacts,
                 &session_authority,
             ) {
+                // The verified session authorizes failure mapping, not complete
+                // output. Retain exactly the observer's decoded prefix.
+                output_spool.mark_incomplete();
+                result.output_spool = Some(output_spool);
+                if let Some(signal) = &mut result.terminal_signal {
+                    signal.evidence.push_str(";output=incomplete;output_artifacts=<invocation_uuid>.partial.{stdout,stderr}");
+                }
                 return Ok(result);
             }
             return Err(classify_provider_client_attempt_error(error));

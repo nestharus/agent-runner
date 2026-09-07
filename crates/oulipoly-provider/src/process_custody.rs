@@ -6,8 +6,11 @@ use std::process::{Child, ExitStatus};
 
 pub(crate) struct OwnedChild {
     child: Child,
+    reaped: bool,
     custody: Option<OperationCustody>,
     confined: bool,
+    #[cfg(all(test, target_os = "linux"))]
+    identity_fault: u8,
 }
 impl std::ops::Deref for OwnedChild {
     type Target = Child;
@@ -26,12 +29,37 @@ impl OwnedChild {
             let mut r = c.0.lock().unwrap_or_else(|e| e.into_inner());
             r.spawned = true;
             r.exact_process_identity = identity(child.id()).ok();
+            #[cfg(all(test, target_os = "linux"))]
+            if IDENTITY_FAULT.get() == 1 {
+                r.exact_process_identity = None;
+            }
         }
         Self {
+            #[cfg(all(test, target_os = "linux"))]
+            identity_fault: IDENTITY_FAULT.get(),
             child,
+            reaped: false,
             confined: custody.is_some() && containment_supported(),
             custody,
         }
+    }
+    fn current_identity(&self) -> std::io::Result<ProcessIdentity> {
+        #[cfg(all(test, target_os = "linux"))]
+        if self.identity_fault != 0 {
+            return Err(std::io::Error::other("injected identity read unavailable"));
+        }
+        identity(self.child.id())
+    }
+    pub fn is_reaped(&self) -> bool {
+        self.reaped
+    }
+    #[cfg(not(unix))]
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            return self.wait().map(Some);
+        }
+        Ok(None)
     }
     pub fn uncertain(&self) {
         if let Some(c) = &self.custody {
@@ -59,7 +87,7 @@ impl OwnedChild {
                 return !r.leader_reaped
                     && r.exact_process_identity
                         .as_ref()
-                        .is_some_and(|p| identity(self.child.id()).ok().as_ref() == Some(p));
+                        .is_some_and(|p| self.current_identity().ok().as_ref() == Some(p));
             }
             true
         }
@@ -82,6 +110,7 @@ impl OwnedChild {
     }
     pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
         let result = self.child.wait();
+        self.reaped |= result.is_ok();
         if let Some(c) = &self.custody {
             let mut r = c.0.lock().unwrap_or_else(|e| e.into_inner());
             match &result {
@@ -106,7 +135,7 @@ impl OwnedChild {
             return;
         }
         let expected = r.exact_process_identity.as_ref().unwrap();
-        if identity(self.child.id()).ok().as_ref() != Some(expected) {
+        if self.current_identity().ok().as_ref() != Some(expected) {
             r.uncertain = true;
             return;
         }
@@ -469,5 +498,147 @@ mod pty_tests {
         assert!(
             String::from_utf8_lossy(&error.diagnostics().stdout.bytes).contains("owned PTY ready")
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    // Scope-local injection at the OS identity observation boundary, never an env switch.
+    static IDENTITY_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod supervisor_identity_tests {
+    use super::*;
+    use crate::custody::AttemptActorCustody;
+    use crate::process::{CancellationToken, ProcessCommand, ProcessLimits, ProcessRunner};
+    use std::time::{Duration, Instant};
+
+    fn unavailable_identity_terminal(cancel: bool, acquisition: bool, pipe_holder: bool) {
+        let dir = std::env::temp_dir().join(format!("identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let release = dir.join("release");
+        let ready = dir.join("ready");
+        let custody = AttemptActorCustody::new(uuid::Uuid::new_v4());
+        let guard = custody.begin("launch");
+        let token = CancellationToken::new();
+        let cancel_token = token.clone();
+        let ready_wait = ready.clone();
+        let release_watchdog = release.clone();
+        // Fixture releases itself after the observation deadline even on the red
+        // implementation. No PID signal or pre-kill substitutes for supervision.
+        let control = std::thread::spawn(move || {
+            let start = Instant::now();
+            while !ready_wait.exists() && start.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if cancel {
+                cancel_token.cancel();
+            }
+            while !release_watchdog.exists() && start.elapsed() < Duration::from_secs(4) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::fs::write(release_watchdog, b"release").unwrap();
+        });
+        let script = format!(
+            "import os,pathlib,sys,time,signal\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nif {} and os.fork()!=0: sys.exit(0)\npathlib.Path({:?}).touch()\nwhile not pathlib.Path({:?}).exists(): time.sleep(0.002)\n",
+            if pipe_holder { "True" } else { "False" },
+            ready.to_str().unwrap(),
+            release.to_str().unwrap()
+        );
+        IDENTITY_FAULT.set(if acquisition { 1 } else { 2 });
+        let started = Instant::now();
+        let result = ProcessRunner::new(ProcessLimits {
+            custody: Some(guard.0.clone()),
+            cancellation: Some(token),
+            timeout: Duration::from_millis(300),
+            kill_after_grace: Duration::from_millis(25),
+            ..ProcessLimits::default()
+        })
+        .run(
+            ProcessCommand::new("/usr/bin/python3")
+                .arg("-c")
+                .arg(script),
+            vec![],
+            Vec::<(String, String)>::new(),
+        );
+        IDENTITY_FAULT.set(0);
+        let elapsed = started.elapsed();
+        let before_release = custody.receipts()[0].clone();
+        std::fs::write(&release, b"release").unwrap();
+        control.join().unwrap();
+        let cleanup_start = Instant::now();
+        while !custody.receipts()[0].leader_reaped
+            && cleanup_start.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(guard);
+        eprintln!(
+            "identity acquisition={acquisition} cancel={cancel} pipe_holder={pipe_holder} elapsed={elapsed:?}; at_return={before_release:?}; result={result:?}; after_release={:?}",
+            custody.receipts()
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "supervisor waited for fixture watchdog"
+        );
+        let error = result.unwrap_err();
+        if !pipe_holder {
+            assert_eq!(
+                error.transport_kind(),
+                if cancel {
+                    "host_cancelled"
+                } else {
+                    "host_timeout"
+                }
+            );
+        }
+        assert!(before_release.uncertain);
+        assert!(
+            !before_release.force_killed,
+            "refused kill must not be described as an executed force kill"
+        );
+        assert!(!error.diagnostics().process_was_force_killed);
+        assert!(!before_release.effect_incapable());
+        assert!(
+            !before_release.leader_reaped,
+            "owned cleanup must still retain the live child"
+        );
+        assert!(
+            error
+                .diagnostics()
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .contains("cleanup_pending")
+        );
+        assert!(
+            custody.receipts()[0].leader_reaped,
+            "retained owner must reap after natural release"
+        );
+        assert!(
+            !custody.receipts()[0].effect_incapable(),
+            "uncertainty is sticky after deferred cleanup"
+        );
+    }
+    #[test]
+    fn supervisor_acquisition_unavailable_timeout() {
+        unavailable_identity_terminal(false, true, false);
+    }
+    #[test]
+    fn supervisor_acquisition_unavailable_cancel() {
+        unavailable_identity_terminal(true, true, false);
+    }
+    #[test]
+    fn supervisor_revalidation_unavailable_timeout() {
+        unavailable_identity_terminal(false, false, false);
+    }
+    #[test]
+    fn supervisor_revalidation_unavailable_cancel() {
+        unavailable_identity_terminal(true, false, false);
+    }
+    #[test]
+    fn supervisor_identity_unavailable_exited_leader_pipe_holder() {
+        unavailable_identity_terminal(false, true, true);
     }
 }

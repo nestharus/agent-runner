@@ -2938,3 +2938,105 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
         .exists()
     );
 }
+
+#[test]
+fn standalone_verified_missing_final_retains_binary_prefix_and_reports_storage_failure() {
+    let _lock = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let data_text = data_dir.to_string_lossy();
+    let _env = EnvScope::set_optional(&[
+        ("OULIPOLY_DATA_DIR", Some(&data_text)),
+        (CHILD_CUSTODY_FAULT_ENV, None),
+        (CHILD_CUSTODY_READY_FILE_ENV, None),
+        (CHILD_PID_FILE_ENV, None),
+    ]);
+    for blocked in [false, true] {
+        let fixture = make_external_fixture(
+            Capabilities {
+                policy: true,
+                launch: true,
+            },
+            PolicyMode::Accept,
+            LaunchMode::MissingFinal,
+        );
+        let original = "        write_jsonl({\"contract\": CONTRACT, \"request_id\": reqid, \"seq\": 1, \"time_unix_ms\": 1001, \"kind\": \"stdout\", \"data_base64\": \"YQ==\"})\n        return 0";
+        let replacement = r#"        write_jsonl({"contract": CONTRACT, "request_id": reqid, "seq": 1, "time_unix_ms": 1001, "kind": "marker", "name": "oulipoly.provider_session", "value": {"provider_session_id": "example-session"}})
+        write_jsonl({"contract": CONTRACT, "request_id": reqid, "seq": 2, "time_unix_ms": 1002, "kind": "stdout", "data_base64": "AAH/"})
+        write_jsonl({"contract": CONTRACT, "request_id": reqid, "seq": 3, "time_unix_ms": 1003, "kind": "stderr", "data_base64": "ZXJy//4="})
+        return 0"#;
+        let body = fs::read_to_string(&fixture.provider_path).unwrap();
+        assert!(body.contains(original));
+        fs::write(
+            &fixture.provider_path,
+            body.replacen(original, replacement, 1),
+        )
+        .unwrap();
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let parent = serde_json::json!({"source":"fixture","id":uuid}).to_string();
+        let state = oulipoly_state::StateDb::open(&data_dir.join("state.db")).unwrap();
+        let id = state
+            .start_invocation(&oulipoly_state::InvocationStart {
+                invocation_uuid: uuid.clone(),
+                model_name: "fixture".into(),
+                provider_name: "provider-a".into(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let paths = state
+            .invocation_output_artifact_paths(&format!("{uuid}.partial"))
+            .unwrap()
+            .unwrap();
+        if blocked {
+            fs::create_dir(&paths.stdout).unwrap();
+        }
+        let result =
+            execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(parent))
+                .unwrap();
+        assert_eq!(
+            result.terminal_reason.as_deref(),
+            Some("external_provider_missing_final_exit")
+        );
+        assert_eq!(
+            result.session_capture.session_id.as_deref(),
+            Some("example-session")
+        );
+        assert_eq!(
+            result
+                .output_spool
+                .as_ref()
+                .unwrap()
+                .incomplete_output_bytes()
+                .unwrap(),
+            (vec![0, 1, 255], vec![101, 114, 114, 255, 254])
+        );
+        assert!(result.complete_stdout_bytes().is_err());
+        assert!(!result.produced_assistant_response);
+        let retention = result.retain_failed_finalization_evidence(&state, id, &uuid);
+        eprintln!(
+            "standalone missing-final blocked={blocked} result={result:?} retention={retention:?}"
+        );
+        if blocked {
+            assert_eq!(
+                retention,
+                Err("finalization_evidence: artifacts=retained;output=storage_failure")
+            );
+        } else {
+            retention.unwrap();
+            assert_eq!(fs::read(paths.stdout).unwrap(), [0, 1, 255]);
+            assert_eq!(fs::read(paths.stderr).unwrap(), [101, 114, 114, 255, 254]);
+        }
+        let count: i64 = state
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM invocation_output_deliveries WHERE invocation_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(!fixture.legacy_record_path.exists());
+    }
+}
