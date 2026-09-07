@@ -841,6 +841,7 @@ print(json.dumps({
         session_id: String,
         exit_code: i32,
         terminal_reason: String,
+        spawn_error: bool,
     }
 
     impl InteractiveLauncher for CapturingTerminalLauncher {
@@ -853,15 +854,38 @@ print(json.dumps({
             live_session_binding: Option<InteractiveLiveSessionBinding>,
         ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
             let binding = live_session_binding.expect("live-session binding context");
-            StateDb::open(&binding.state_db_path)?.bind_invocation_provider_session_start(
-                binding.invocation_row_id,
-                &ProviderSessionBinding {
-                    provider_session_id: self.session_id.clone(),
+            let state = StateDb::open(&binding.state_db_path)?;
+            crate::session_authority::commit_session_authority(
+                crate::session_authority::SessionAuthorityCommitRequest {
+                    state: &state,
+                    invocation_row_id: binding.invocation_row_id,
+                    invocation_uuid: &binding.invocation_uuid,
+                    expectation: crate::session_authority::SessionAuthorityExpectation {
+                        account_name: &binding.identity.provider_name,
+                        provider_session_id: None,
+                    },
+                    observation: Some(crate::session_authority::AuthoritativeSessionObservation {
+                        account_name: binding.endpoint.account_name(),
+                        provider_session_id: &self.session_id,
+                    }),
                     capture_method: "provider_live_report",
+                    provider_instance_id: binding.identity.provider_instance_id.as_deref().unwrap(),
+                    settings_id: &binding.identity.settings_id,
                     resume_input_id: None,
-                    provider_session_resolved_account: Some(binding.identity.settings_id.clone()),
+                    provider_session_resolved_account: Some(
+                        binding
+                            .state_db_path
+                            .parent()
+                            .unwrap()
+                            .display()
+                            .to_string(),
+                    ),
                 },
-            )?;
+            )
+            .map_err(|error| error.to_string())?;
+            if self.spawn_error {
+                return Err("controlled post-capture launcher failure".into());
+            }
             Ok(crate::executor::cli::InteractiveExecutionResult {
                 exit_code: self.exit_code,
                 terminal_reason: Some(self.terminal_reason.clone()),
@@ -1533,6 +1557,7 @@ turn_script = "{}"
                 session_id: session_id.clone(),
                 exit_code,
                 terminal_reason: terminal_reason.to_string(),
+                spawn_error: false,
             };
 
             let code = run_repl_with_default_provider_with_launcher(
@@ -1547,6 +1572,54 @@ turn_script = "{}"
             assert_eq!(status, "failed");
             assert_eq!(provider_session_id.as_deref(), Some(session_id.as_str()));
             assert_eq!(capture_method.as_deref(), Some("provider_live_report"));
+        }
+    }
+
+    #[test]
+    fn age345_default_repl_retains_authority_after_already_bound_success_and_launcher_error() {
+        for spawn_error in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let state_path = temp.path().join("state.db");
+            StateDb::open(&state_path).unwrap();
+            write_config(temp.path(), r#"default_provider = "generic""#);
+            write_providers(temp.path(), &provider_fixture("generic"));
+            let launcher = CapturingTerminalLauncher {
+                session_id: "age345-retained-session".into(),
+                exit_code: 0,
+                terminal_reason: "completed".into(),
+                spawn_error,
+            };
+            let result = run_repl_with_default_provider_with_launcher(
+                runtime_services_with_state(temp.path().to_path_buf(), state_path.clone()),
+                &launcher,
+            );
+            if spawn_error {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "controlled post-capture launcher failure"
+                );
+            } else {
+                assert_eq!(result.unwrap(), 0);
+            }
+            let state = StateDb::open(&state_path).unwrap();
+            let chain = state
+                .chain_id_for_segment("generic", &launcher.session_id)
+                .unwrap()
+                .unwrap();
+            let authority = state
+                .active_provider_session_authority(&chain)
+                .unwrap()
+                .unwrap();
+            assert_eq!(authority.settings_id, "generic-settings");
+            assert_eq!(
+                table_count(&state_path, "invocation_provider_session_authority"),
+                1
+            );
+            assert_eq!(table_count(&state_path, "invocations"), 1);
+            let (_, _, status, native, method) = invocation_row(&state_path);
+            assert_eq!(status, if spawn_error { "failed" } else { "succeeded" });
+            assert_eq!(native.as_deref(), Some(launcher.session_id.as_str()));
+            assert_eq!(method.as_deref(), Some("provider_live_report"));
         }
     }
 

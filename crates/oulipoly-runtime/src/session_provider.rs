@@ -26,6 +26,7 @@ pub use dispatch::{
     locate_transcript_with_raw_metadata, read_turn_page,
 };
 pub use ingest::{canonical_stream_key, ingest_one_canonical_turn_page};
+pub(crate) use provider_client::validate_endpoint_identity;
 pub use lifecycle_proof::dispatch_aware_no_ref_lifecycle_proof;
 pub use types::{
     NoRefProofOutput, NoRefProofRequest, SessionProviderCaptureRequest,

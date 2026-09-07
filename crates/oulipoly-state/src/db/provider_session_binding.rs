@@ -42,6 +42,8 @@ pub struct ProviderSessionAuthorityCommit<'a> {
     pub invocation_uuid: &'a str,
     pub provider_name: &'a str,
     pub binding: &'a ProviderSessionBinding,
+    pub provider_instance_id: &'a str,
+    pub settings_id: &'a str,
 }
 
 struct ExistingProviderSessionBinding {
@@ -49,6 +51,7 @@ struct ExistingProviderSessionBinding {
     provider_name: Option<String>,
     provider_session_id: Option<String>,
     status: String,
+    resolved_workspace: Option<String>,
 }
 
 struct InvocationChainMintRow {
@@ -121,9 +124,22 @@ impl StateDb {
             existing.provider_session_id.as_deref(),
         )?;
         Self::write_provider_session_binding(&tx, invocation_row_id, commit.binding)?;
-        if Self::provider_session_binding_should_mint_chain(commit.binding) {
-            Self::mint_chain_for_invocation_session_on(&tx, invocation_row_id)?;
-        }
+        // Endpoint authority is part of the live binding, not final ingestion.
+        // Mint even for an exact resume: an authenticated session must have a segment.
+        Self::mint_chain_for_invocation_session_on(&tx, invocation_row_id)?;
+        Self::bind_session_provider_authority_on(
+            &tx,
+            commit.provider_name,
+            &commit.binding.provider_session_id,
+            commit.provider_instance_id,
+            commit.settings_id,
+        )?;
+        super::provider_session_authority::bind_invocation_authority_on(
+            &tx,
+            invocation_row_id,
+            commit.provider_instance_id,
+            commit.settings_id,
+        )?;
         tx.commit()
             .map_err(Self::format_provider_session_binding_commit_error)
     }
@@ -133,7 +149,7 @@ impl StateDb {
         invocation_row_id: i64,
     ) -> Result<ExistingProviderSessionBinding, String> {
         conn.query_row(
-            "SELECT invocation_uuid, provider_name, provider_session_id, status
+            "SELECT invocation_uuid, provider_name, provider_session_id, status, provider_session_resolved_account
              FROM invocations
              WHERE id = ?1",
             sqlite::params![invocation_row_id],
@@ -143,6 +159,7 @@ impl StateDb {
                     provider_name: row.get(1)?,
                     provider_session_id: row.get(2)?,
                     status: row.get(3)?,
+                    resolved_workspace: row.get(4)?,
                 })
             },
         )
@@ -171,6 +188,15 @@ impl StateDb {
                 "Invocation {invocation_row_id} provider mismatch: expected {}, observed {}",
                 commit.provider_name,
                 existing.provider_name.as_deref().unwrap_or("<none>")
+            ));
+        }
+        if let (Some(retained), Some(observed)) = (
+            existing.resolved_workspace.as_deref(),
+            commit.binding.provider_session_resolved_account.as_deref(),
+        ) && retained != observed
+        {
+            return Err(format!(
+                "Invocation {invocation_row_id} workspace mismatch; refusing provider session authority"
             ));
         }
         if existing.status != "running" {

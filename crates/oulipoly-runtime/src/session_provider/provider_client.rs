@@ -65,10 +65,16 @@ pub(super) fn session_page_client(
         .map_err(map_client_error)
 }
 
-fn validate_endpoint_identity(
+pub(crate) fn validate_endpoint_identity(
     endpoint: &PinnedProviderEndpoint,
     identity: &SessionProviderIdentity,
 ) -> Result<(), SessionProviderError> {
+    if endpoint.account_name() != identity.provider_name {
+        return Err(SessionProviderError::new(
+            "session_provider_account_identity_mismatch",
+            "session account identity does not match the selected account endpoint",
+        ));
+    }
     let expected_instance_id = format!("{}-instance", endpoint.capabilities().provider_id);
     if identity.provider_instance_id.as_deref() != Some(expected_instance_id.as_str()) {
         return Err(SessionProviderError::new(

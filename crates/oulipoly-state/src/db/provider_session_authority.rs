@@ -222,7 +222,7 @@ fn bind_segment_authority_on(
     )
 }
 
-fn bind_invocation_authority_on(
+pub(super) fn bind_invocation_authority_on(
     conn: &sqlite::Connection,
     invocation_row_id: i64,
     provider_instance_id: &str,

@@ -44,6 +44,8 @@ pub struct SessionAuthorityCommitRequest<'a> {
     pub expectation: SessionAuthorityExpectation<'a>,
     pub observation: Option<AuthoritativeSessionObservation<'a>>,
     pub capture_method: &'static str,
+    pub provider_instance_id: &'a str,
+    pub settings_id: &'a str,
     pub resume_input_id: Option<String>,
     pub provider_session_resolved_account: Option<String>,
 }
@@ -147,6 +149,8 @@ pub fn commit_session_authority(
             &ProviderSessionAuthorityCommit {
                 invocation_uuid: request.invocation_uuid,
                 provider_name: verified.account_name(),
+                provider_instance_id: request.provider_instance_id,
+                settings_id: request.settings_id,
                 binding: &ProviderSessionBinding {
                     provider_session_id: verified.provider_session_id().to_string(),
                     capture_method: request.capture_method,
@@ -181,6 +185,8 @@ mod tests {
             expectation: expectation(Some(SESSION)),
             observation: Some(observation(SESSION)),
             capture_method: "external_provider_launch",
+            provider_instance_id: "fixture-instance",
+            settings_id: "fixture-settings",
             resume_input_id: Some("requested-session".to_string()),
             provider_session_resolved_account: None,
         })
@@ -227,6 +233,8 @@ mod tests {
                 expectation: expectation(Some(SESSION)),
                 observation,
                 capture_method: "external_provider_launch",
+                provider_instance_id: "fixture-instance",
+                settings_id: "fixture-settings",
                 resume_input_id: None,
                 provider_session_resolved_account: None,
             })
@@ -256,6 +264,8 @@ mod tests {
             expectation: expectation(Some(SESSION)),
             observation: Some(observation(SESSION)),
             capture_method: "external_provider_launch",
+            provider_instance_id: "fixture-instance",
+            settings_id: "fixture-settings",
             resume_input_id: None,
             provider_session_resolved_account: None,
         })
@@ -269,6 +279,138 @@ mod tests {
         assert_eq!(row.provider_session_id, None);
         assert_eq!(row.provider_session_capture_method, None);
         assert_eq!(state.chain_id_for_segment(ACCOUNT, SESSION).unwrap(), None);
+    }
+
+    #[test]
+    fn age345_conflicting_endpoint_authority_rolls_back_native_binding_and_workspace() {
+        for conflict_table in [
+            "invocation_provider_session_authority",
+            "session_chain_segment_provider_authority",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("state.db");
+            let state = StateDb::open(&path).unwrap();
+            let row_id = running_invocation(&state);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            if conflict_table == "invocation_provider_session_authority" {
+                conn.execute("INSERT INTO invocation_provider_session_authority VALUES (?1, 'conflicting-instance', 'conflicting-settings')", [row_id]).unwrap();
+            } else {
+                // A retained segment from a prior invocation must not be adopted by a new endpoint.
+                state
+                    .bind_invocation_provider_session_start(
+                        row_id,
+                        &ProviderSessionBinding {
+                            provider_session_id: SESSION.into(),
+                            capture_method: "provider_live_report",
+                            resume_input_id: None,
+                            provider_session_resolved_account: Some("/original".into()),
+                        },
+                    )
+                    .unwrap();
+                conn.execute("INSERT INTO session_chain_segment_provider_authority SELECT id, 'conflicting-instance', 'conflicting-settings' FROM session_chain_segments", []).unwrap();
+            }
+            let before = state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap();
+            let error = commit_session_authority(SessionAuthorityCommitRequest {
+                state: &state,
+                invocation_row_id: row_id,
+                invocation_uuid: INVOCATION_UUID,
+                expectation: expectation(Some(SESSION)),
+                observation: Some(observation(SESSION)),
+                capture_method: "provider_live_report_pending",
+                provider_instance_id: "fixture-instance",
+                settings_id: "fixture-settings",
+                resume_input_id: Some(SESSION.into()),
+                provider_session_resolved_account: Some("/original".into()),
+            })
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("provider_session_authority_mismatch")
+            );
+            let after = state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.provider_session_id, before.provider_session_id);
+            assert_eq!(
+                after.provider_session_resolved_account,
+                before.provider_session_resolved_account
+            );
+            assert_eq!(
+                after.provider_session_capture_method,
+                before.provider_session_capture_method
+            );
+            let count: i64 = conn.query_row("SELECT count(*) FROM session_chain_segment_provider_authority WHERE provider_instance_id = 'fixture-instance'", [], |row| row.get(0)).unwrap();
+            assert_eq!(count, 0, "all endpoint writes must roll back");
+        }
+    }
+
+    #[test]
+    fn age345_repeated_native_binding_cannot_replace_original_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&temp.path().join("state.db")).unwrap();
+        let row_id = running_invocation(&state);
+        for (workspace, accepted) in [("/original", true), ("/replacement", false)] {
+            let result = commit_session_authority(SessionAuthorityCommitRequest {
+                state: &state,
+                invocation_row_id: row_id,
+                invocation_uuid: INVOCATION_UUID,
+                expectation: expectation(Some(SESSION)),
+                observation: Some(observation(SESSION)),
+                capture_method: "provider_live_report",
+                provider_instance_id: "fixture-instance",
+                settings_id: "fixture-settings",
+                resume_input_id: Some(SESSION.into()),
+                provider_session_resolved_account: Some(workspace.into()),
+            });
+            assert_eq!(result.is_ok(), accepted);
+        }
+        assert_eq!(
+            state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap()
+                .provider_session_resolved_account
+                .as_deref(),
+            Some("/original")
+        );
+    }
+
+    #[test]
+    fn age345_empty_endpoint_authority_does_not_mint_chain() {
+        for (instance, settings) in [("", "settings"), ("instance", " ")] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = StateDb::open(&temp.path().join("state.db")).unwrap();
+            let row_id = running_invocation(&state);
+            assert!(
+                commit_session_authority(SessionAuthorityCommitRequest {
+                    state: &state,
+                    invocation_row_id: row_id,
+                    invocation_uuid: INVOCATION_UUID,
+                    expectation: expectation(Some(SESSION)),
+                    observation: Some(observation(SESSION)),
+                    capture_method: "provider_live_report_pending",
+                    provider_instance_id: instance,
+                    settings_id: settings,
+                    resume_input_id: Some(SESSION.into()),
+                    provider_session_resolved_account: Some("/original".into()),
+                })
+                .is_err()
+            );
+            assert_eq!(
+                state
+                    .get_invocation_by_uuid(INVOCATION_UUID)
+                    .unwrap()
+                    .unwrap()
+                    .provider_session_id,
+                None
+            );
+            assert_eq!(state.chain_id_for_segment(ACCOUNT, SESSION).unwrap(), None);
+        }
     }
 
     fn running_invocation(state: &StateDb) -> i64 {
