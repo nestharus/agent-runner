@@ -947,3 +947,122 @@ fn public_persisted_lease_identity_cannot_replace_lost_live_secret() {
     );
     assert_eq!(count(&db, "provider_launch_attempts"), 1);
 }
+
+// These are supplied receipt DTOs, not proof of real process or channel cleanup.
+fn spawned_proof(lease: &ProviderLaunchLease) -> ProviderLaunchCustodyProof {
+    let mut settled = proof(lease);
+    settled.actors = ["describe", "policy", "launch"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, operation)| ProviderLaunchActorSettlement::Reaped {
+            operation: operation.into(),
+            process_identity_sha256: format!("{:064x}", index + 1),
+            process_tree_terminated: true,
+            leader_reaped: true,
+        })
+        .collect();
+    settled.runtime_never_bound = false;
+    settled.runtime_process_identity_sha256 = Some(format!("{:064x}", 3));
+    settled.runtime_terminal_code = "provider_unavailable".into();
+    settled.channel = ProviderLaunchChannelSettlement::EmptyRemoved;
+    settled
+}
+
+#[test]
+fn reaped_actors_with_matching_runtime_and_empty_removed_channel_allow_successor() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    db.request_transfer(&lease.owner, &failure()).unwrap();
+    let settled = spawned_proof(&lease);
+    db.certify_effect_incapable(&lease.owner, &settled).unwrap();
+    db.certify_effect_incapable(&lease.owner, &settled).unwrap();
+    let row: (String, String, bool) = Connection::open(db.path())
+        .unwrap()
+        .query_row(
+            "SELECT actor_custody_state,return_channel_state,effect_incapable_at IS NOT NULL FROM provider_launch_attempts WHERE attempt_id=?1",
+            [lease.owner.attempt_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        ("effect_incapable".into(), "empty_removed".into(), true)
+    );
+    let next = db
+        .lease_successor(
+            &lease.owner,
+            &request.allocation.completion_authority,
+            &lease.candidate_plan_sha256,
+            &request.candidates[1],
+            &settled,
+            &ProviderLaunchAttemptAllocation::allocate().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(next.owner.owner_epoch, 2);
+    assert_ne!(next.owner.invocation_row_id, lease.owner.invocation_row_id);
+}
+
+#[test]
+fn spawned_receipt_controls_reject_unsettled_actors_and_runtime_process_mismatch() {
+    // Change exactly one receipt fact per case, holding all other joins valid.
+    for case in 0..9 {
+        let (_dir, db, request) = fixture();
+        let lease = db.begin_launch(&request).unwrap();
+        db.activate_attempt(&lease, &request.allocation.completion_authority)
+            .unwrap();
+        db.request_transfer(&lease.owner, &failure()).unwrap();
+        let valid = spawned_proof(&lease);
+        let mut invalid = valid.clone();
+        match case {
+            0..=5 => {
+                let ProviderLaunchActorSettlement::Reaped {
+                    leader_reaped,
+                    process_tree_terminated,
+                    ..
+                } = &mut invalid.actors[case / 2]
+                else {
+                    panic!("spawned fixture must contain reaped actor receipts");
+                };
+                if case % 2 == 0 {
+                    *leader_reaped = false;
+                } else {
+                    *process_tree_terminated = false;
+                }
+            }
+            6 => invalid.runtime_process_identity_sha256 = Some("f".repeat(64)),
+            7 => invalid.runtime_process_identity_sha256 = None,
+            8 => invalid.runtime_never_bound = true,
+            _ => unreachable!(),
+        }
+        assert!(
+            db.certify_effect_incapable(&lease.owner, &invalid).is_err(),
+            "case {case}"
+        );
+        let row: (String, Option<String>) = Connection::open(db.path())
+            .unwrap()
+            .query_row(
+                "SELECT status,effect_incapable_at FROM provider_launch_attempts WHERE attempt_id=?1",
+                [lease.owner.attempt_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("transfer_requested".into(), None), "case {case}");
+        assert!(
+            db.lease_successor(
+                &lease.owner,
+                &request.allocation.completion_authority,
+                &lease.candidate_plan_sha256,
+                &request.candidates[1],
+                &invalid,
+                &ProviderLaunchAttemptAllocation::allocate().unwrap(),
+            )
+            .is_err(),
+            "case {case}"
+        );
+        assert_eq!(count(&db, "invocations"), 1, "case {case}");
+        // Failed certification must not poison the replay key or strand the owner.
+        db.certify_effect_incapable(&lease.owner, &valid).unwrap();
+    }
+}

@@ -76,7 +76,10 @@ mod tests {
 
     #[test]
     fn secondary_error_text_cannot_classify_original_or_infer_exhaustion() {
-        for original in ["unclassified failure", "quota exceeded; HTTP 429 rate limited"] {
+        for original in [
+            "unclassified failure",
+            "quota exceeded; HTTP 429 rate limited",
+        ] {
             assert_eq!(
                 render_diagnostics_result(Err("connection refused".to_string()), 17, original),
                 None

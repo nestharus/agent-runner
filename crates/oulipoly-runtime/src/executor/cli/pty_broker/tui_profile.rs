@@ -75,11 +75,11 @@ impl Profile {
     }
 
     pub(super) fn record_count(&self, name: &'static str, count: u64) {
-        if let Some(shared) = &self.0 {
-            if let Ok(mut metrics) = shared.metrics.lock() {
-                let total = metrics.counters.entry(name).or_default();
-                *total = total.saturating_add(count);
-            }
+        if let Some(shared) = &self.0
+            && let Ok(mut metrics) = shared.metrics.lock()
+        {
+            let total = metrics.counters.entry(name).or_default();
+            *total = total.saturating_add(count);
         }
     }
 }
