@@ -4,7 +4,7 @@ use crate::mailbox_delivery::{deliverable_pending_count_on, prepare_headless_res
 use oulipoly_runtime::session_provider::{SessionProviderPageTurn, SessionProviderReadPageResult};
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult};
 
-const SESSION: &str = "observation-session";
+const SESSION: &str = "11111111-1111-4111-8111-111111111111";
 struct Fixture {
     root: tempfile::TempDir,
     db: MailboxDb,
@@ -13,6 +13,7 @@ struct Fixture {
     anchor: MailboxDeliveryObservationAnchor,
     seq: i64,
     submissions: usize,
+    envelope: String,
 }
 impl Fixture {
     fn new() -> Self {
@@ -80,6 +81,7 @@ impl Fixture {
             anchor,
             seq: row.seq,
             submissions: 0,
+            envelope,
         }
     }
     fn submit(&mut self) -> Result<(), String> {
@@ -390,3 +392,7 @@ fn age347_legacy_null_marker_recovery_uses_beginning_without_invented_anchor() {
     );
     assert_eq!(f.submissions, 1);
 }
+
+#[cfg(unix)]
+#[path = "observation_paired_tests.rs"]
+mod paired_tests;

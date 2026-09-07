@@ -16,6 +16,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
+#[path = "turns_source_io.rs"]
+mod source_io;
+
 const MAX_ID_BYTES: usize = 1024;
 const MAX_ROLE_BYTES: usize = 64;
 const MAX_TIMESTAMP_BYTES: usize = 128;
@@ -105,9 +108,6 @@ fn validate_page_envelope(
     {
         return Err(page_error("provider_page_turn_count_invalid"));
     }
-    if result.source_bytes_examined > request.max_source_bytes {
-        return Err(page_error("provider_page_source_budget_exceeded"));
-    }
     validate_completion_tokens(result)?;
     validate_scan_progress(result, request)?;
     if result.warnings.len() > MAX_WARNINGS
@@ -118,7 +118,7 @@ fn validate_page_envelope(
     {
         return Err(page_error("provider_page_warning_bound_exceeded"));
     }
-    Ok(())
+    source_io::validate_source_io(result, request)
 }
 
 fn validate_page_position(
