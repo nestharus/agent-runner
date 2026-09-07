@@ -1,5 +1,6 @@
 //! Declared roles: accessor, predicate, validator.
 
+
 use std::path::{Path, PathBuf};
 #[path = "../../tests/support/provider_vocabulary_source_set.rs"]
 mod provider_vocabulary_source_set;

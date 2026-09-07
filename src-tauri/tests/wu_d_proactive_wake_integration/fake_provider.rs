@@ -25,6 +25,19 @@ pub(crate) fn provider_script(on_initial: &str, on_resume: &str, prompt_file: &s
         )
 }
 
+// A tail-read failure rejects the actual Runner anchor-admission path before
+// begin_headless_delivery_submission. It is not a provider launch attestation.
+pub(crate) fn anchor_admission_provider_script(
+    on_anchor: &str,
+    on_resume: &str,
+    prompt_file: &str,
+) -> String {
+    provider_script("", on_resume, prompt_file).replace(
+        "ON_ANCHOR = \"\"",
+        &format!("ON_ANCHOR = {}", serde_json::to_string(on_anchor).unwrap()),
+    )
+}
+
 pub(crate) fn delayed_agent_bash_provider_script(agent_bash_bin: &Path) -> String {
     let agent_bash_bin = shell_single_quote(&agent_bash_bin.to_string_lossy());
     provider_script(
@@ -195,6 +208,7 @@ SESSION = __WU_D_SESSION__
 ON_INITIAL = __WU_D_ON_INITIAL__
 ON_RESUME = __WU_D_ON_RESUME__
 PROMPT_FILE = __WU_D_PROMPT_FILE__
+ON_ANCHOR = ""
 
 def envelope(request, result):
     return {"contract": CONTRACT, "request_id": request["request_id"], "ok": True, "result": result}
@@ -204,8 +218,9 @@ def event(request, seq, kind, **fields):
     value.update(fields)
     print(json.dumps(value, separators=(",", ":")), flush=True)
 
-def next_resume_index(work):
-    lock = work / "provider-resume-sequence.lock"
+def next_resume_index(work, prefix="provider-resume-sequence"):
+
+    lock = work / (prefix + ".lock")
     while True:
         try:
             lock.mkdir()
@@ -213,7 +228,7 @@ def next_resume_index(work):
         except FileExistsError:
             time.sleep(0.01)
     try:
-        sequence_file = work / "provider-resume-sequence.txt"
+        sequence_file = work / (prefix + ".txt")
         index = int(sequence_file.read_text() or "0") if sequence_file.exists() else 0
         index += 1
         sequence_file.write_text(str(index))
@@ -309,6 +324,14 @@ def session_turn_page(request):
     records = load_turns(work, session)
     projection = params.get("turn_projection")
     if params.get("start_mode") == "tail":
+        if ON_ANCHOR:
+            index = next_resume_index(work, "anchor-admission-sequence")
+            env = dict(os.environ, WU_D_ANCHOR_INDEX=str(index), work=str(work))
+            checked = subprocess.run(["bash", "-c", ON_ANCHOR], cwd=work, env=env, capture_output=True)
+            if checked.returncode:
+                return {"contract": CONTRACT, "request_id": request["request_id"], "ok": False,
+                        "error": {"category": "unavailable", "code": "offline_anchor_unavailable",
+                                  "message": "synthetic pre-submission tail read unavailable", "retryable": True}}
         base = len(records)
         snapshot_count = base
         start = base

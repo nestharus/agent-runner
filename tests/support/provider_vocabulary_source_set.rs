@@ -2,6 +2,9 @@
 //! invocation inputs, never repository policy. Declared roles: validator, accessor, parser.
 #![allow(dead_code)] // Each integration target uses a different metric adapter.
 
+#[path = "../../test-support/provider_wire_policy.rs"]
+mod provider_wire_policy;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -257,6 +260,7 @@ impl SourceSet {
         assert_search(&output);
         let traversable = paths(&output.stdout);
         let mut count = 0;
+        let mut raw_count = 0;
         for path in &self.sources {
             let bytes = read(&self.root, path);
             let historical = self.historical_output(path, &bytes, true);
@@ -272,31 +276,53 @@ impl SourceSet {
             assert_search(&output);
             let text = String::from_utf8(output.stdout).expect("non-UTF-8 occurrence output");
             eprint!("{text}");
-            count += text.lines().count();
+            let raw = text.lines().count();
+            raw_count += raw;
+            let wire = std::str::from_utf8(&bytes).map_or(0, |text| {
+                text.lines()
+                    .map(|line| {
+                        occurrences(line, pattern) - vocabulary_occurrences(path, line, pattern)
+                    })
+                    .sum::<usize>()
+            });
+            count += raw.checked_sub(wire).expect("wire exceeds raw full count");
         }
-        eprintln!("source full occurrences={count}");
+        eprintln!("source full raw={raw_count} vocabulary={count}");
         count
     }
 
     pub fn added_occurrences(&self, base: Option<&str>, pattern: &str) -> usize {
-        let mut args = vec!["diff", "--no-ext-diff", "--unified=0"];
+        let mut args = vec!["diff", "--no-ext-diff", "--name-only", "-z"];
         if let Some(base) = base {
             args.push(base);
         }
         args.extend(["--", "."]);
         let exclusions = self.diff_exclusions(base);
         args.extend(exclusions.iter().map(String::as_str));
-        // Deleted, renamed, new or changed historical paths remain product.
-        let diff = String::from_utf8(git(&self.root, &args)).expect("non-UTF-8 source diff");
-        let added: Vec<_> = diff
-            .lines()
-            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-            .collect();
-        let tracked_count: usize = added.iter().map(|line| occurrences(line, pattern)).sum();
-        for line in added.iter().filter(|line| occurrences(line, pattern) != 0) {
-            eprintln!("tracked added {line}");
+        let changed = paths(&git(&self.root, &args));
+        let mut tracked_count = 0;
+        let mut raw_tracked = 0;
+        // Literal per-path diffs retain identity without parsing quoted diff
+        // headers; plain-index and historical-base comparisons remain distinct.
+        for path in changed.intersection(&self.sources) {
+            let literal = format!(":(literal){path}");
+            let mut args = vec!["diff", "--no-ext-diff", "--unified=0"];
+            if let Some(base) = base {
+                args.push(base);
+            }
+            args.extend(["--", &literal]);
+            let diff = String::from_utf8(git(&self.root, &args)).expect("source diff UTF-8");
+            for (_, line) in added_rows(&diff) {
+                let raw = occurrences(&line, pattern);
+                raw_tracked += raw;
+                tracked_count += vocabulary_occurrences(path, &line, pattern);
+                if raw != 0 {
+                    eprintln!("tracked added {path}:{line}");
+                }
+            }
         }
         let mut untracked_count = 0;
+        let mut raw_untracked = 0;
         for path in &self.untracked {
             let bytes = read(&self.root, path);
             if self.historical_output(path, &bytes, false) {
@@ -308,9 +334,15 @@ impl SourceSet {
             for line in text.lines().filter(|line| occurrences(line, pattern) != 0) {
                 eprintln!("untracked {path}:{line}");
             }
-            untracked_count += occurrences(&text, pattern);
+            raw_untracked += occurrences(&text, pattern);
+            untracked_count += text
+                .lines()
+                .map(|line| vocabulary_occurrences(path, line, pattern))
+                .sum::<usize>();
         }
-        eprintln!("source added base={base:?} tracked={tracked_count} untracked={untracked_count}");
+        eprintln!(
+            "source added base={base:?} raw_tracked={raw_tracked} raw_untracked={raw_untracked} vocabulary_tracked={tracked_count} vocabulary_untracked={untracked_count}"
+        );
         let approved = self.approved_added_occurrences(base, pattern);
         let raw = tracked_count + untracked_count;
         let rejected = raw
@@ -361,7 +393,7 @@ impl SourceSet {
             let diff = String::from_utf8(git(&self.root, &args)).expect("residue diff UTF-8");
             for (number, line) in added_rows(&diff) {
                 if rows.get(&number) == Some(&line) {
-                    let hits = occurrences(&line, pattern);
+                    let hits = vocabulary_occurrences(path, &line, pattern);
                     eprintln!("exact approved added {path}:{number}:{line} occurrences={hits}");
                     count += hits;
                 }
@@ -441,7 +473,10 @@ impl SourceSet {
             let text = String::from_utf8(bytes)
                 .unwrap_or_else(|e| panic!("unsupported text {path:?}: {e}"));
             for line in text.lines().filter(|line| occurrences(line, pattern) != 0) {
-                hits.insert(format!("{path}:{line}"));
+                eprintln!("source raw row base={base:?} {path}:{line}");
+                if vocabulary_occurrences(&path, line, pattern) != 0 {
+                    hits.insert(format!("{path}:{line}"));
+                }
             }
         }
         eprintln!("source line-set base={base:?} rows={}", hits.len());
@@ -582,6 +617,10 @@ fn assert_search(output: &Output) {
         output.status.success() || output.status.code() == Some(1),
         "source search failed: {output:?}"
     );
+}
+
+fn vocabulary_occurrences(path: &str, line: &str, pattern: &str) -> usize {
+    occurrences(&provider_wire_policy::vocabulary_text(path, line), pattern)
 }
 
 fn occurrences(text: &str, pattern: &str) -> usize {
@@ -903,6 +942,86 @@ mod tests {
         assert!(std::panic::catch_unwind(|| sources.full_occurrences("needle")).is_err());
         assert!(std::panic::catch_unwind(|| sources.line_set(None, "needle")).is_err());
     }
+    #[test]
+    fn wire_projection_reaches_active_metrics_without_membership_or_residue_amnesty() {
+        let root = fixture();
+        let base = String::from_utf8(git(root.path(), &["rev-parse", "HEAD"])).unwrap();
+        let location = git(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &["rev-parse", "--show-toplevel"],
+        );
+        let repository = PathBuf::from(String::from_utf8(location).unwrap().trim());
+        let path = "crates/oulipoly-runtime/src/session_provider/turns_source_io.rs";
+        let source = std::fs::read_to_string(repository.join(path)).unwrap();
+        let declaration = source
+            .lines()
+            .find(|line| line.starts_with("const DECLARATION:"))
+            .unwrap();
+        let wire = declaration.split('"').nth(1).unwrap();
+        let denied = wire.split('_').next().unwrap();
+        let file = root.path().join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, format!("{declaration}\n")).unwrap();
+        // Exact protocol syntax is admitted even before staging, but remains
+        // source membership, not an output receipt or exact-residue allowance.
+        let sources = SourceSet::load_input(root.path(), None, None);
+        assert!(sources.sources.contains(path));
+        assert_eq!(sources.full_occurrences(denied), 0);
+        assert_eq!(sources.added_occurrences(None, denied), 0);
+        assert!(sources.line_set(None, denied).is_empty());
+        git(root.path(), &["add", path]);
+        let sources = SourceSet::load_input(root.path(), None, None);
+        assert_eq!(sources.added_occurrences(Some(base.trim()), denied), 0);
+        // Same line suffix, routing use and unapproved path cannot inherit it.
+        for text in [
+            format!("{declaration} route({wire:?});\n"),
+            format!("if provider == {wire:?} {{ route(); }}\n"),
+            format!("{declaration}\nlet unrelated = {denied:?};\n"),
+        ] {
+            std::fs::write(&file, &text).unwrap();
+            let sources = SourceSet::load_input(root.path(), None, None);
+            assert!(sources.full_occurrences(denied) > 0);
+            assert!(sources.added_occurrences(None, denied) > 0);
+            assert!(sources.added_occurrences(Some(base.trim()), denied) > 0);
+            assert!(
+                !sources
+                    .unapproved_new_rows(&BTreeSet::new(), &sources.line_set(None, denied))
+                    .is_empty()
+            );
+        }
+        std::fs::write(&file, format!("{declaration}\n")).unwrap();
+        std::fs::write(root.path().join("unrelated.rs"), format!("{declaration}\n")).unwrap();
+        let sources = SourceSet::load_input(root.path(), None, None);
+        assert_eq!(sources.full_occurrences(denied), 1);
+        assert_eq!(sources.added_occurrences(None, denied), 1);
+        assert_eq!(sources.added_occurrences(Some(base.trim()), denied), 1);
+        assert_eq!(sources.line_set(None, denied).len(), 1);
+        // Exact residues still deduct only their physical pinned rows, while
+        // wire admission cannot subsidize an unrelated row in either metric.
+        stage_roles(root.path());
+        let pattern = format!("needle|{denied}");
+        let sources = residue_fixture(root.path());
+        assert_eq!(sources.full_occurrences(&pattern), 6);
+        assert_eq!(sources.added_occurrences(Some(base.trim()), &pattern), 2);
+        assert_eq!(
+            sources
+                .unapproved_new_rows(&BTreeSet::new(), &sources.line_set(None, &pattern))
+                .len(),
+            2
+        );
+        std::fs::write(
+            root.path().join("roles.txt"),
+            "needle needle\nneedle\nneedle\nother needle\nneedle\n",
+        )
+        .unwrap();
+        let sources = residue_fixture(root.path());
+        assert_eq!(
+            sources.approved_added_occurrences(Some(base.trim()), &pattern),
+            0
+        );
+        assert_eq!(sources.added_occurrences(Some(base.trim()), &pattern), 7);
+    }
+
     fn residue_fixture(root: &Path) -> SourceSet {
         let mut sources = SourceSet::load_input(root, None, None);
         sources.residues.insert(

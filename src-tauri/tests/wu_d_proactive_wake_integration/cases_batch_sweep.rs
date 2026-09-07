@@ -4,7 +4,7 @@
 //!
 //! TEST: proactive wake integration orchestration cases (batch delivery and wake-sweep regressions).
 
-use crate::fake_provider::provider_script;
+use crate::fake_provider::{anchor_admission_provider_script, provider_script};
 use crate::fixtures::Fixture;
 use crate::liveness::{
     assert_dead_owner_debris_retained, delivered_rows_without_pending_or_claim,
@@ -325,15 +325,15 @@ pub(crate) fn failed_auto_wake_retains_retry_ownership_during_backoff() {
     let fixture = Fixture::new();
     let first_failure = fixture.work_dir.join("first-auto-wake-failed");
     let hook = format!(
-        r#"if [ "$WU_D_PROVIDER_RESUME_INDEX" = 2 ]; then
+        r#"if [ "$WU_D_ANCHOR_INDEX" = 2 ]; then
   : > {}
   exit 17
 fi"#,
         shell_path(&first_failure),
     );
-    fixture.write_provider(&provider_script(
-        "",
+    fixture.write_provider(&anchor_admission_provider_script(
         &hook,
+        "",
         "retry-owner-${WU_D_PROVIDER_RESUME_INDEX}.txt",
     ));
     fixture.seed_session_turn();
@@ -365,8 +365,8 @@ fi"#,
     std::thread::sleep(std::time::Duration::from_millis(250));
     assert_eq!(
         std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
-        "2",
-        "a startup sweep must coalesce with the retry owner"
+        "1",
+        "a startup sweep must coalesce with the retry owner; rejected anchor never launched"
     );
 
     wait_until("owned retry renewed and delivered pending mailbox", || {
@@ -374,8 +374,9 @@ fi"#,
     });
     assert_eq!(
         std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
-        "3"
+        "2"
     );
+    assert_rejected_anchor_attempts(&fixture, 1, 1);
     assert_xdg_isolated(&fixture);
 }
 
@@ -384,15 +385,15 @@ pub(crate) fn maximum_chronology_and_delivery_attempts_stay_eligible_across_rech
     let fixture = Fixture::new();
     let first_failure = fixture.work_dir.join("maximum-chronology-first-failure");
     let hook = format!(
-        r#"if [ "$WU_D_PROVIDER_RESUME_INDEX" = 1 ]; then
+        r#"if [ "$WU_D_ANCHOR_INDEX" = 1 ]; then
   : > {}
   exit 17
 fi"#,
         shell_path(&first_failure),
     );
-    fixture.write_provider(&provider_script(
-        "",
+    fixture.write_provider(&anchor_admission_provider_script(
         &hook,
+        "",
         "maximum-chronology-${WU_D_PROVIDER_RESUME_INDEX}.txt",
     ));
     fixture.seed_session_turn();
@@ -420,7 +421,7 @@ fi"#,
                  ORDER BY enqueued_at, seq
                  LIMIT 20
              )",
-            rusqlite::params![SESSION, i64::MAX - 2],
+            rusqlite::params![SESSION, i64::MAX - 1],
         )
         .unwrap();
 
@@ -453,7 +454,7 @@ fi"#,
         rows[..20]
             .iter()
             .all(|row| row.delivery_attempts == i64::MAX),
-        "oldest-batch delivery attempts must survive failure and successful retry through i64::MAX"
+        "rejected anchor is not a delivery attempt; successful delivery saturates at i64::MAX"
     );
     assert_eq!(rows[20].delivery_attempts, 1);
     let runtime = fixture
@@ -463,6 +464,7 @@ fi"#,
         .unwrap()
         .unwrap();
     assert_eq!(runtime.auto_wake_count, i64::MAX);
+    assert_rejected_anchor_attempts(&fixture, 1, 20);
     assert_xdg_isolated(&fixture);
 }
 
@@ -473,17 +475,17 @@ pub(crate) fn repeated_failed_wakes_keep_oldest_batch_owned_past_terminal_budget
     let seventh_started = fixture.work_dir.join("persistent-failure-seventh-started");
     let release_seventh = fixture.work_dir.join("persistent-failure-release-seventh");
     let hook = format!(
-        r#"python3 - {attempt_ledger} "$WU_D_PROVIDER_RESUME_INDEX" <<'PY'
+        r#"python3 - {attempt_ledger} "$WU_D_ANCHOR_INDEX" <<'PY'
 import sys
 import time
 
 with open(sys.argv[1], "a", encoding="utf-8") as out:
     out.write(f"{{sys.argv[2]}} {{time.monotonic_ns()}}\n")
 PY
-if [ "$WU_D_PROVIDER_RESUME_INDEX" -le 6 ]; then
+if [ "$WU_D_ANCHOR_INDEX" -le 6 ]; then
   exit 17
 fi
-if [ "$WU_D_PROVIDER_RESUME_INDEX" = 7 ]; then
+if [ "$WU_D_ANCHOR_INDEX" = 7 ]; then
   : > {seventh_started}
   while [ ! -e {release_seventh} ]; do sleep 0.01; done
 fi"#,
@@ -491,9 +493,9 @@ fi"#,
         seventh_started = shell_path(&seventh_started),
         release_seventh = shell_path(&release_seventh),
     );
-    fixture.write_provider(&provider_script(
-        "",
+    fixture.write_provider(&anchor_admission_provider_script(
         &hook,
+        "",
         "persistent-failure-${WU_D_PROVIDER_RESUME_INDEX}.txt",
     ));
     fixture.seed_session_turn();
@@ -512,9 +514,10 @@ fi"#,
         .unwrap();
 
     let first = fixture.run_auto_wake_resume(claim_token, 1, 1_000);
-    assert_eq!(first.status.code(), Some(17), "{first:?}");
+    assert_eq!(first.status.code(), Some(1), "{first:?}");
+    assert!(String::from_utf8_lossy(&first.stderr).contains("offline_anchor_unavailable"));
     wait_until_with_timeout(
-        "seventh production retry reached the provider",
+        "seventh production retry reached pre-submission anchor admission",
         std::time::Duration::from_secs(120),
         || seventh_started.exists(),
     );
@@ -529,9 +532,19 @@ fi"#,
     assert_eq!(retained_claim.auto_wake_count, 7);
     assert!(retained_claim.wake_pid.is_some());
     let pending = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
-    assert!(pending[..20].iter().all(|row| {
-        row.delivery_attempts == 6 && row.delivery_error.as_deref() == Some("exit_nonzero")
-    }));
+    assert!(
+        pending[..20]
+            .iter()
+            .all(|row| row.delivery_attempts == 0 && row.delivery_error.is_none())
+    );
+    assert_rejected_anchor_attempts(&fixture, 6, 20);
+    assert!(
+        !fixture
+            .work_dir
+            .join("provider-resume-sequence.txt")
+            .exists(),
+        "six rejected admissions and held seventh must cause zero semantic submissions"
+    );
     assert_eq!(pending[20].delivery_attempts, 0);
     assert!(pending[20].delivery_error.is_none());
     assert!(pending.iter().all(|row| row.delivered_at.is_none()));
@@ -541,22 +554,20 @@ fi"#,
         "persistent failure lifecycle delivered oldest and newer work",
         || delivered_rows_without_pending_or_claim(&fixture, SESSION, 21),
     );
-    for index in 1..=7 {
-        let prompt =
-            wait_for_file(&fixture.prompt_file(&format!("persistent-failure-{index}.txt")));
-        assert_prompt_contains_handle(&prompt, "h-persistent-failure-00");
-        assert_prompt_contains_handle(&prompt, "h-persistent-failure-19");
-        assert!(!prompt.contains("h-persistent-failure-20"), "{prompt}");
-    }
-    let newer = wait_for_file(&fixture.prompt_file("persistent-failure-8.txt"));
+    let oldest = wait_for_file(&fixture.prompt_file("persistent-failure-1.txt"));
+    assert_prompt_contains_handle(&oldest, "h-persistent-failure-00");
+    assert_prompt_contains_handle(&oldest, "h-persistent-failure-19");
+    assert!(!oldest.contains("h-persistent-failure-20"), "{oldest}");
+    let newer = wait_for_file(&fixture.prompt_file("persistent-failure-2.txt"));
     assert_prompt_contains_handle(&newer, "h-persistent-failure-20");
+    assert!(!newer.contains("h-persistent-failure-00"), "{newer}");
 
     let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
-    assert!(rows[..20].iter().all(|row| row.delivery_attempts == 7));
+    assert!(rows[..20].iter().all(|row| row.delivery_attempts == 1));
     assert_eq!(rows[20].delivery_attempts, 1);
     assert_eq!(
         std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
-        "8"
+        "2"
     );
     let attempts = std::fs::read_to_string(&attempt_ledger)
         .unwrap()
@@ -813,5 +824,56 @@ pub(crate) fn maximum_persisted_count_allows_startup_sweep_delivery() {
         "1"
     );
     assert_one_failed_delivery(&fixture, SESSION);
+    assert_xdg_isolated(&fixture);
+}
+
+// Read-only proof from real admission failures, never injected submission state.
+fn assert_rejected_anchor_attempts(fixture: &Fixture, expected: i64, batch_size: i64) {
+    let conn = fixture.sidecar_conn();
+    let rejected: i64 = conn.query_row(
+        "SELECT count(*) FROM mailbox_delivery_attempts a
+         WHERE observation_error LIKE '%offline_anchor_unavailable%'
+           AND headless_submission_state = 'prepared' AND submission_started_at IS NULL
+           AND observation_anchor_token IS NULL AND observation_confirmed_at IS NULL
+           AND (SELECT count(*) FROM mailbox_delivery_attempt_items i WHERE i.attempt_id=a.attempt_id)=?1",
+        [batch_size], |row| row.get(0)).unwrap();
+    assert_eq!(
+        rejected, expected,
+        "only the prepared-before-CAS path proves non-submission"
+    );
+}
+
+#[test]
+fn failed_provider_exit_and_empty_observation_retain_uncertainty_across_rechecks() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "exit 17", "failed-after-cas.txt"));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    fixture.seed_mailbox(SESSION, "h-failed-after-cas");
+    let output = fixture.run_resume();
+    assert_eq!(output.status.code(), Some(17), "{output:?}");
+    let attempt: String = fixture.sidecar_conn().query_row(
+        "SELECT attempt_id FROM mailbox_delivery_attempts WHERE submission_started_at IS NOT NULL AND resolved_at IS NULL",
+        [], |row| row.get(0)).unwrap();
+    for _ in 0..3 {
+        assert_success(&fixture.run_mailbox_list(SESSION)); // fresh Runner process
+        settle_wake_sweep();
+        assert_eq!(
+            std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+            "1"
+        );
+        assert!(!fixture.work_dir.join("session-turns").exists());
+        let retained: i64 = fixture.sidecar_conn().query_row(
+            "SELECT count(*) FROM mailbox_delivery_attempts WHERE attempt_id=?1
+             AND headless_submission_state='possible' AND submission_started_at IS NOT NULL
+             AND resolved_at IS NULL AND observation_confirmed_at IS NULL AND acknowledged_at IS NULL",
+            [&attempt], |row| row.get(0)).unwrap();
+        assert_eq!(retained, 1);
+        let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivered_at.is_none());
+        assert_eq!(rows[0].delivery_attempts, 1);
+    }
     assert_xdg_isolated(&fixture);
 }
