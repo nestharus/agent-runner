@@ -159,10 +159,24 @@ pub(crate) fn discover_running_agent_bash_owners(
         if meta_workload_status(&meta, meta_workload_liveness(&meta)) != MonitorStatus::Running {
             continue;
         }
-        if let Some(owner) =
+        let owner_uuid =
             resolve_meta_owner(state, pid, &meta, cancellation, &mut discovery.diagnostics)
-        {
-            discovery.invocation_uuids.insert(owner.invocation_uuid);
+                .map(|owner| owner.invocation_uuid)
+                .or_else(|| {
+                    (!cancellation.is_cancelled())
+                        .then(|| {
+                            workload_marker_invocation_uuid(&meta_log_path(
+                                &candidate.state_dir,
+                                &meta,
+                            ))
+                        })
+                        .flatten()
+                });
+        // Marker UUIDs are discovery candidates, not ownership attestations.
+        // The invocation graph validates durable root ancestry before projection;
+        // the later marker owner fallback still requires that validated membership.
+        if let Some(owner_uuid) = owner_uuid {
+            discovery.invocation_uuids.insert(owner_uuid);
         }
     }
     discovery

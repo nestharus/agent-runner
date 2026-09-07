@@ -1581,6 +1581,88 @@ fn agent_bash_scan_uses_workload_invocation_marker_when_caller_chain_has_no_owne
 }
 
 #[test]
+fn agent_bash_marker_discovers_terminal_descendant_before_history_selection() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let state = fixture.open_state();
+    let root_id = state.get_invocation_by_uuid(ROOT_UUID).unwrap().unwrap().id;
+    let child_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
+    state
+        .finalize_invocation(child_id, true, 0, None, Some("completed"))
+        .unwrap();
+    drop(state);
+    write_agent_bash_meta(
+        &fixture.agent_bash_root(),
+        "terminal-marker",
+        &agent_bash_meta_with_workload_identity(
+            "terminal-marker",
+            &dead_identity(),
+            &current_identity(),
+        ),
+        &format!(
+            "OULIPOLY_INVOCATION={{\"source\":\"opencode\",\"id\":\"{CHILD_UUID}\"}}\noutput"
+        ),
+    );
+
+    let service = fixture.service();
+    for include_terminal in [false, true, false] {
+        let snapshot = service.snapshot(
+            &fixture.root(),
+            SnapshotLimits {
+                include_terminal,
+                ..SnapshotLimits::default()
+            },
+        );
+        let workload = node(&snapshot, "agent-bash:terminal-marker");
+        assert_eq!(workload.status, MonitorStatus::Running);
+        assert_eq!(workload.liveness, LivenessStatus::VerifiedLive);
+        assert_eq!(
+            workload.parent_id.as_deref(),
+            Some(format!("invocation:{CHILD_UUID}").as_str())
+        );
+        assert_eq!(
+            node(&snapshot, &format!("invocation:{CHILD_UUID}")).parent_id.as_deref(),
+            Some(format!("invocation:{ROOT_UUID}").as_str())
+        );
+        assert_eq!(snapshot.summary.running_agent_bash_count, 1);
+    }
+}
+
+#[test]
+fn agent_bash_live_marker_rejects_unrelated_terminal_invocation() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let state = fixture.open_state();
+    let unrelated_id = seed_invocation(&state, CHILD_UUID, None);
+    state
+        .finalize_invocation(unrelated_id, true, 0, None, Some("completed"))
+        .unwrap();
+    // Even sharing the displayed session does not prove root ancestry.
+    state.update_session_capture(unrelated_id, Some(SESSION_ID), "stdout-json").unwrap();
+    drop(state);
+    write_agent_bash_meta(
+        &fixture.agent_bash_root(),
+        "unrelated-terminal-marker",
+        &agent_bash_meta_with_workload_identity(
+            "unrelated-terminal-marker",
+            &dead_identity(),
+            &current_identity(),
+        ),
+        &format!(
+            "OULIPOLY_INVOCATION={{\"source\":\"opencode\",\"id\":\"{CHILD_UUID}\"}}\noutput"
+        ),
+    );
+    for include_terminal in [false, true] {
+        let snapshot = fixture.service().snapshot(
+            &fixture.root(),
+            SnapshotLimits { include_terminal, ..SnapshotLimits::default() },
+        );
+        assert!(find_node(&snapshot, "agent-bash:unrelated-terminal-marker").is_none());
+        assert!(find_node(&snapshot, &format!("invocation:{CHILD_UUID}")).is_none());
+    }
+}
+
+#[test]
 fn agent_bash_scan_rejects_workload_marker_outside_active_invocation_subtree() {
     let fixture = Fixture::new();
     seed_root_session(&fixture);
