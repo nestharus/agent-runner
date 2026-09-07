@@ -404,8 +404,8 @@ fn age346_ack_abandonment_and_payload_failure_do_not_replay() {
         .enqueue(TEXT, "abandoned", InboxTargetKind::Session, SESSION)
         .unwrap();
     // Frozen terminal/cancellation fixture state, not a production DB mutation.
-    f.mailbox
-        .connection()
+    rusqlite::Connection::open(f.root.path().join("mailbox.db"))
+        .unwrap()
         .execute(
             "UPDATE mailbox SET delivery_error = 'wake_sweep_abandoned' WHERE seq = ?1",
             [abandoned],
