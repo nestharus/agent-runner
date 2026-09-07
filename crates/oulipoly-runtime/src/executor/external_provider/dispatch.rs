@@ -724,29 +724,26 @@ mod tests {
         assert_eq!(failed.exit_code, -1);
         // Failure of one retention channel cannot skip the other or overwrite the cause.
         failed.output_spool = Some(ExecutionOutputSpool::new().unwrap());
-        let invocation_uuid = "22222222-2222-4222-8222-222222222222";
-        let invocation_id = state
-            .start_invocation(&oulipoly_state::InvocationStart {
-                invocation_uuid: invocation_uuid.into(),
-                model_name: "fixture".into(),
-                provider_name: "fixture".into(),
-                provider_index: 2,
-                parent_invocation_id: None,
-            })
-            .unwrap();
+        // Keep producer authority, but require a NEW reference absent before this call.
+        let mut new_reference = original.returned_artifacts[0].clone();
+        new_reference.name = "new-after-output-failure".into();
+        new_reference.store_address.artifact_name = new_reference.name.clone();
+        new_reference.version_id =
+            format!("store://return/{invocation_uuid}/{}/1", new_reference.name);
         assert!(
-            state
+            !state
                 .list_returned_artifacts(invocation_id)
                 .unwrap()
-                .is_empty()
+                .contains(&new_reference)
         );
+        failed.returned_artifacts = vec![new_reference.clone()];
         assert_eq!(
             failed.retain_failed_finalization_evidence(&state, invocation_id, invocation_uuid),
             Err("finalization_evidence: artifacts=retained;output=storage_failure")
         );
         assert_eq!(
             state.list_returned_artifacts(invocation_id).unwrap(),
-            original.returned_artifacts
+            vec![new_reference]
         );
         assert_eq!(
             failed.terminal_reason.as_deref(),

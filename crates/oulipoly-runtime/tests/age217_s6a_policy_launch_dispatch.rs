@@ -2754,6 +2754,30 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
         LaunchMode::LiveAttachmentStorageFailure,
     );
     let uuid = "76767676-7676-4676-8676-767676767676";
+    // Initialize only this temporary fixture store using the owner's unchanged schema
+    // asset embedded in its source, without adding a runtime dependency or schema.
+    let store_source = include_str!("../../oulipoly-agent-store/src/lib.rs");
+    let schema = store_source
+        .split("fn install_schema(")
+        .nth(1)
+        .unwrap()
+        .split("r#\"")
+        .nth(1)
+        .unwrap()
+        .split("\"#")
+        .next()
+        .unwrap();
+    let version_sql = store_source
+        .split("fn initialize_schema_version(")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .nth(1)
+        .unwrap();
+    let store_connection = Connection::open(dir.path().join("artifact-store.db")).unwrap();
+    store_connection.execute_batch(schema).unwrap();
+    store_connection.execute(version_sql, []).unwrap();
+    drop(store_connection);
     let artifact =
         oulipoly_agent_messenger::return_artifact(oulipoly_agent_messenger::ReturnRequest {
             db_path: dir.path().join("artifact-store.db"),
