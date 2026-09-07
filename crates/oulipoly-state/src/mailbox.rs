@@ -3432,6 +3432,7 @@ impl MailboxDb {
             delivery_invocation_uuid,
             seqs,
             remaining_count,
+            false,
         )
     }
 
@@ -3451,6 +3452,26 @@ impl MailboxDb {
             delivery_invocation_uuid,
             seqs,
             remaining_count,
+            false,
+        )
+    }
+
+    /// Admit only the explicitly submitted input under the same delivery fence.
+    pub fn register_explicit_input_delivery_attempt(
+        &mut self,
+        attempt_id: &str,
+        session_id: &str,
+        chain_id: Option<&str>,
+        seq: i64,
+    ) -> Result<(), String> {
+        self.register_delivery_attempt_for_target(
+            attempt_id,
+            session_id,
+            chain_id,
+            attempt_id,
+            &[seq],
+            0,
+            true,
         )
     }
 
@@ -3462,14 +3483,26 @@ impl MailboxDb {
         delivery_invocation_uuid: &str,
         seqs: &[i64],
         remaining_count: usize,
+        explicit_input: bool,
     ) -> Result<(), String> {
         if seqs.is_empty() {
             return Err("Cannot register an empty mailbox delivery attempt".to_string());
         }
         let now = now_rfc3339();
-        let tx = self.conn.transaction().map_err(|err| {
-            format!("Failed to start mailbox delivery attempt transaction: {err}")
-        })?;
+        let behavior = if explicit_input {
+            TransactionBehavior::Immediate
+        } else {
+            TransactionBehavior::Deferred
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(behavior)
+            .map_err(|err| {
+                format!("Failed to start mailbox delivery attempt transaction: {err}")
+            })?;
+        if explicit_input {
+            validate_explicit_input_delivery_on(&tx, session_id, chain_id, seqs[0])?;
+        }
         tx.execute(
             "UPDATE mailbox_delivery_attempts
              SET resolved_at = ?3
@@ -3477,8 +3510,19 @@ impl MailboxDb {
                 AND delivery_invocation_uuid != ?2
                 AND acknowledged_at IS NULL
                 AND submission_started_at IS NULL
-                AND resolved_at IS NULL",
-            params![session_id, delivery_invocation_uuid, &now],
+                AND resolved_at IS NULL
+                AND (?4 = 0 OR EXISTS (
+                    SELECT 1 FROM mailbox_delivery_attempt_items AS items
+                    WHERE items.attempt_id = mailbox_delivery_attempts.attempt_id
+                      AND items.mailbox_seq = ?5
+                ))",
+            params![
+                session_id,
+                delivery_invocation_uuid,
+                &now,
+                explicit_input,
+                seqs[0]
+            ],
         )
         .map_err(|err| {
             format!("Failed to resolve prior unacknowledged mailbox deliveries: {err}")
@@ -7718,6 +7762,50 @@ fn runtime_delivery_claim_is_stale(row: &RuntimeGenerationRow, stale_after_secon
         return true;
     };
     claim_age_exceeds_stale_after(claimed_at, stale_after_seconds)
+}
+
+fn validate_explicit_input_delivery_on(
+    conn: &Connection,
+    session_id: &str,
+    chain_id: Option<&str>,
+    seq: i64,
+) -> Result<(), String> {
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM mailbox
+         WHERE seq = ?3 AND {PENDING_MAILBOX_TARGET_PREDICATE}
+           AND kind = 'input' AND delivered_at IS NULL
+           AND (delivery_error IS NULL OR delivery_error != ?4))"
+    );
+    let pending: bool = conn
+        .query_row(
+            &sql,
+            params![session_id, chain_id, seq, WAKE_SWEEP_ABANDONED_ERROR],
+            |row| row.get(0),
+        )
+        .map_err(|err| format!("Failed to validate explicit input delivery: {err}"))?;
+    if !pending {
+        return Err(format!(
+            "explicit resume input {seq} is not pending for the resolved target; no launch"
+        ));
+    }
+    let occupied: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM mailbox_delivery_attempts AS attempts
+         JOIN mailbox_delivery_attempt_items AS items ON items.attempt_id = attempts.attempt_id
+         WHERE items.mailbox_seq = ?1 AND attempts.resolved_at IS NULL
+           AND (attempts.submission_started_at IS NOT NULL
+             OR attempts.acknowledged_at IS NOT NULL
+             OR attempts.delivery_invocation_uuid != attempts.attempt_id))",
+            [seq],
+            |row| row.get(0),
+        )
+        .map_err(|err| format!("Failed to validate explicit input delivery fence: {err}"))?;
+    if occupied {
+        return Err(format!(
+            "explicit resume input {seq} has an unresolved delivery; no launch"
+        ));
+    }
+    Ok(())
 }
 
 fn mailbox_delivery_states_on(

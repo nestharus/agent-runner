@@ -1074,25 +1074,70 @@ pub(crate) fn prepare_headless_resume_delivery(
     resolved: &oulipoly_state::ResolvedResume,
     answer: Option<String>,
     models_dir: Option<&Path>,
+    submitted_seq: Option<i64>,
 ) -> Result<PreparedMailboxDelivery, String> {
     let session_id = delivery_session_id(resolved);
     let Some(mut db) = open_mailbox_sidecar()? else {
+        if submitted_seq.is_some() {
+            return Err("explicit resume input mailbox missing; no launch".to_string());
+        }
         return Ok(empty_delivery(answer, session_id));
     };
     record_headless_session_metadata(&mut db, resolved, models_dir)?;
     let state = StateDb::open_default()?;
     reconcile_confirmed_headless_deliveries_on(&mut db, &state, &session_id)?;
-    if db.notifications_paused(&session_id)? {
-        return Ok(empty_delivery(answer, session_id));
-    }
-    let pending = pending_mailbox_rows(&db, &session_id, Some(&resolved.chain_id))?;
-    delivery_for_pending(
+    prepare_headless_resume_delivery_on(
         &mut db,
-        session_id,
-        Some(&resolved.chain_id),
-        pending,
+        &session_id,
+        &resolved.chain_id,
         answer,
+        submitted_seq,
     )
+}
+
+pub(crate) fn prepare_headless_resume_delivery_on(
+    db: &mut MailboxDb,
+    session_id: &str,
+    chain_id: &str,
+    answer: Option<String>,
+    submitted_seq: Option<i64>,
+) -> Result<PreparedMailboxDelivery, String> {
+    // A submission receipt is authority for this exact input, never for the
+    // paused notification backlog. Use the normal nonce/ACK delivery path.
+    if let Some(seq) = submitted_seq {
+        if answer.is_some() {
+            return Err("explicit resume input cannot also have an inline copy; no launch".into());
+        }
+        let row = load_pending_mailbox_rows(db, session_id, Some(chain_id))?
+            .into_iter()
+            .find(|row| {
+                row.seq == seq
+                    && row.kind == SUBMITTED_INPUT_KIND
+                    && mailbox_row_is_deliverable_pending(row)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "explicit resume input {seq} is not pending for the resolved target; no launch"
+                )
+            })?;
+        verify_pending_mailbox_payloads(db, std::slice::from_ref(&row))?;
+        return delivery_for_batch(
+            db,
+            session_id.to_string(),
+            Some(chain_id),
+            MailboxBatch {
+                rows: vec![row],
+                remaining_count: 0,
+            },
+            None,
+            true,
+        );
+    }
+    if db.notifications_paused(session_id)? {
+        return Ok(empty_delivery(answer, session_id.to_string()));
+    }
+    let pending = pending_mailbox_rows(db, session_id, Some(chain_id))?;
+    delivery_for_pending(db, session_id.to_string(), Some(chain_id), pending, answer)
 }
 
 pub(crate) fn deliverable_pending_count(session_id: &str) -> Result<usize, String> {
@@ -1176,7 +1221,7 @@ fn delivery_for_pending(
     }
 
     let batch = select_batch(&pending);
-    delivery_for_batch(db, session_id, chain_id, batch, answer)
+    delivery_for_batch(db, session_id, chain_id, batch, answer, false)
 }
 
 fn open_mailbox_sidecar() -> Result<Option<MailboxDb>, String> {
@@ -1207,6 +1252,7 @@ fn delivery_for_batch(
     chain_id: Option<&str>,
     batch: MailboxBatch,
     answer: Option<String>,
+    explicit_input: bool,
 ) -> Result<PreparedMailboxDelivery, String> {
     let seqs = batch_seqs(&batch);
     let requires_turn_confirmation = batch
@@ -1214,14 +1260,23 @@ fn delivery_for_batch(
         .iter()
         .any(|row| row.kind != SUBMITTED_INPUT_KIND);
     let delivery_nonce = new_delivery_nonce();
-    db.register_headless_delivery_attempt(
-        &delivery_nonce,
-        &session_id,
-        chain_id,
-        &delivery_nonce,
-        &seqs,
-        batch.remaining_count,
-    )?;
+    if explicit_input {
+        db.register_explicit_input_delivery_attempt(
+            &delivery_nonce,
+            &session_id,
+            chain_id,
+            seqs[0],
+        )?;
+    } else {
+        db.register_headless_delivery_attempt(
+            &delivery_nonce,
+            &session_id,
+            chain_id,
+            &delivery_nonce,
+            &seqs,
+            batch.remaining_count,
+        )?;
+    }
     let prefix = render_mailbox_prefix(&batch.rows, batch.remaining_count, &delivery_nonce)?;
     Ok(prepared_delivery(
         session_id,

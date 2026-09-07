@@ -80,7 +80,8 @@ pub(in crate::run) fn prepare_headless_resume_execution(
     models_dir_override: Option<&Path>,
 ) -> Result<Result<PreparedHeadlessResumeExecution, i32>, String> {
     let answer = resolve_resume_answer(prompt, file)?;
-    let answer = persist_tokenized_resume_input(answer, submission_token, target_kind, session_id)?;
+    let (answer, submitted_seq) =
+        persist_tokenized_resume_input(answer, submission_token, target_kind, session_id)?;
     let env = load_resume_execution_environment(models_dir_override)?;
     refresh_resume_provider_registry(agent_runtime_services, &env)?;
     let resolved = match resolve_resume_for_headless_execution(
@@ -118,8 +119,12 @@ pub(in crate::run) fn prepare_headless_resume_execution(
             "Warning: Pending mailbox delivery observation recovery failed: {error}"
         ));
     }
-    let mailbox_delivery =
-        wake::prepare_headless_resume_delivery(&resolved, answer, Some(&env.models_dir))?;
+    let mailbox_delivery = wake::prepare_headless_resume_delivery(
+        &resolved,
+        answer,
+        Some(&env.models_dir),
+        submitted_seq,
+    )?;
     if crate::wake_coordinator::is_auto_wake_invocation()
         && mailbox_delivery.seqs.is_empty()
         && mailbox_delivery.answer.is_none()
@@ -142,14 +147,33 @@ fn persist_tokenized_resume_input(
     submission_token: Option<&str>,
     target_kind: oulipoly_state::InboxTargetKind,
     target_id: &str,
-) -> Result<Option<String>, String> {
+) -> Result<(Option<String>, Option<i64>), String> {
     let Some(submission_token) = submission_token else {
-        return Ok(answer);
+        return Ok((answer, None));
     };
     let Some(answer) = answer else {
-        return Ok(None);
+        return Err("tokenized resume requires an explicit input payload; no launch".to_string());
     };
     let mut mailbox = oulipoly_state::mailbox::MailboxDb::open_default()?;
+    persist_tokenized_resume_input_on(
+        &mut mailbox,
+        answer,
+        submission_token,
+        target_kind,
+        target_id,
+    )
+}
+
+fn persist_tokenized_resume_input_on(
+    mailbox: &mut oulipoly_state::mailbox::MailboxDb,
+    answer: String,
+    submission_token: &str,
+    target_kind: oulipoly_state::InboxTargetKind,
+    target_id: &str,
+) -> Result<(Option<String>, Option<i64>), String> {
+    if answer.trim().is_empty() {
+        return Err("tokenized resume requires a nonempty input payload; no launch".into());
+    }
     match mailbox.enqueue_submitted_input(&oulipoly_state::SubmittedInputEnqueue {
         submission_token,
         target: oulipoly_state::InboxTarget {
@@ -158,8 +182,8 @@ fn persist_tokenized_resume_input(
         },
         input: answer.as_bytes(),
     })? {
-        oulipoly_state::mailbox::EnqueueResult::Inserted(_)
-        | oulipoly_state::mailbox::EnqueueResult::AlreadyEnqueued(_) => Ok(None),
+        oulipoly_state::mailbox::EnqueueResult::Inserted(row)
+        | oulipoly_state::mailbox::EnqueueResult::AlreadyEnqueued(row) => Ok((None, Some(row.seq))),
         oulipoly_state::mailbox::EnqueueResult::Conflict { existing } => {
             Err(format_submission_token_conflict(existing.seq))
         }
@@ -538,3 +562,7 @@ pub(super) fn resolved_uses_provider_ref(resolved: &oulipoly_state::ResolvedResu
         .as_ref()
         .is_some_and(|model| model.provider.is_some())
 }
+
+#[cfg(test)]
+#[path = "submitted_input_tests.rs"]
+mod submitted_input_tests;

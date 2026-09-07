@@ -87,8 +87,14 @@ pub(super) fn prepare_headless_resume_delivery(
     resolved: &oulipoly_state::ResolvedResume,
     answer: Option<String>,
     models_dir: Option<&std::path::Path>,
+    submitted_seq: Option<i64>,
 ) -> Result<crate::mailbox_delivery::PreparedMailboxDelivery, String> {
-    crate::mailbox_delivery::prepare_headless_resume_delivery(resolved, answer, models_dir)
+    crate::mailbox_delivery::prepare_headless_resume_delivery(
+        resolved,
+        answer,
+        models_dir,
+        submitted_seq,
+    )
 }
 
 pub(super) fn reconcile_pending_headless_delivery_observations(
