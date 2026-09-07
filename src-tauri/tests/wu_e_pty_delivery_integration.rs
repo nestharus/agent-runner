@@ -2059,8 +2059,21 @@ fn live_broker_transport_ack_completes_delivery_when_response_is_unread() {
     write_inject_request(&mut stream, envelope.as_bytes());
     drop(stream);
 
+    let deadline = Instant::now() + Duration::from_secs(5);
     let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
     assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
+    // The TUI relays provider output independently of its control worker. The
+    // provider can echo the input before the worker commits confirmation. Wait
+    // for that exact broker ACK event without reading the disconnected peer or
+    // extending the original five-second observation budget. The trace is only
+    // synchronization: the unchanged DB assertions below prove delivery.
+    read_pty_until_file_occurrences(
+        pty.master.as_raw_fd(),
+        &fixture.notify_trace_path(),
+        "inject_status=delivery_ack:lost-ack-attempt",
+        1,
+        deadline.saturating_duration_since(Instant::now()),
+    );
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_some());
