@@ -40,3 +40,16 @@ pub use worker::{
     SessionTurnIngestDriverRequest, SessionTurnIngestQuantumOutcome,
     run_one_session_turn_ingest_quantum, run_session_turn_ingest_quantum_for_key,
 };
+
+/// Fixed paging refusals require resolution and explicit host-consumer rearming.
+/// Arbitrary provider messages/codes are not diagnostic authority.
+pub(crate) fn fixed_paging_stop_reason(token: &str) -> Option<&'static str> {
+    match token {
+        "session_turn_page_budget_too_small" => Some("session_turn_page_budget_too_small"),
+        "session_turn_record_ceiling_exceeded" => Some("session_turn_record_ceiling_exceeded"),
+        "session_turn_staging_capacity_exceeded" => Some("session_turn_staging_capacity_exceeded"),
+        "session_turn_paging_paused" => Some("session_turn_paging_paused"),
+        "codex_rollout_capacity" => Some("codex_rollout_capacity"),
+        _ => None,
+    }
+}

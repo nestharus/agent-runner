@@ -213,10 +213,7 @@ fn backfill_enumerated_entry(
                 return;
             }
             Ok(SessionTurnIngestQuantumOutcome::Unsupported { error, .. }) => {
-                report.warnings.push(format!(
-                    "canonical turn backfill is unsupported for {}: {error}",
-                    stream.session_id
-                ));
+                report_stopped_backfill(report, stream, "unsupported", Some(&error));
                 return;
             }
             Ok(SessionTurnIngestQuantumOutcome::Quarantined { error, .. }) => {
@@ -227,18 +224,22 @@ fn backfill_enumerated_entry(
                 return;
             }
             Ok(SessionTurnIngestQuantumOutcome::Idle) => {
-                let status = request
-                    .state
-                    .session_turn_ingest_stream(stream)
-                    .ok()
-                    .flatten()
-                    .map(|stream| stream.status)
-                    .unwrap_or_else(|| "missing".to_string());
-                if status != "caught_up" {
-                    report.warnings.push(format!(
-                        "canonical turn backfill is retryable for {}: stream status {status}",
-                        stream.session_id
-                    ));
+                match request.state.session_turn_ingest_stream(stream) {
+                    Ok(Some(retained)) => match retained.status.as_str() {
+                        "caught_up" => {},
+                        "unsupported" | "quarantined" => report_stopped_backfill(
+                            report, stream, &retained.status, retained.last_error.as_deref()),
+                        "active" | "ready" | "retry_wait" if retained.lease_owner.is_some() => report.warnings.push(format!(
+                            "canonical turn backfill is leased for {}: awaiting the current worker; no new paging started",
+                            stream.session_id)),
+                        "ready" | "retry_wait" => report.warnings.push(format!(
+                            "canonical turn backfill is retryable for {}: stream status {}",
+                            stream.session_id, retained.status)),
+                        _ => report.errors.push(format!(
+                            "canonical turn backfill state unavailable for {}", stream.session_id)),
+                    },
+                    _ => report.errors.push(format!(
+                        "canonical turn backfill state unavailable for {}", stream.session_id)),
                 }
                 return;
             }
@@ -398,4 +399,32 @@ fn session_import_registry_unavailable() -> ServiceError {
 
 fn format_import_session_state_error(error: String) -> String {
     format!("state import failed: {error}")
+}
+
+fn report_stopped_backfill(
+    report: &mut SessionImportProviderReport,
+    stream: &SessionTurnIngestStreamKey,
+    status: &str,
+    reason: Option<&str>,
+) {
+    let fixed_reason = reason.and_then(session_provider::fixed_paging_stop_reason);
+    let reason = fixed_reason.unwrap_or(if status == "quarantined" {
+        "quarantined"
+    } else {
+        "unsupported_capability"
+    });
+    let recovery = if fixed_reason.is_some() || status == "quarantined" {
+        "resolve the cause and obtain authorized explicit recovery before rearming; ordinary import does not rearm this stream"
+    } else {
+        "restore the missing capability before requesting another import"
+    };
+    let message = format!(
+        "canonical turn backfill is stopped for {}: {}; {}",
+        stream.session_id, reason, recovery
+    );
+    if status == "quarantined" {
+        report.errors.push(message);
+    } else {
+        report.warnings.push(message);
+    }
 }

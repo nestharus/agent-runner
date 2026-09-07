@@ -57,8 +57,18 @@ pub(super) struct OutboundObservation {
 #[allow(dead_code)]
 pub(super) enum OutboundObservationResult {
     Available(Box<OutboundObservation>),
-    Unavailable { generation: u64, detail: String },
-    Failed { generation: u64, detail: String },
+    Unavailable {
+        generation: u64,
+        detail: String,
+    },
+    Failed {
+        generation: u64,
+        detail: String,
+    },
+    Stopped {
+        generation: u64,
+        reason: &'static str,
+    },
 }
 
 pub(super) struct ProviderSessionTurnSource {
@@ -69,6 +79,7 @@ pub(super) struct ProviderSessionTurnSource {
     cursor: Mutex<ObservationCursor>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ObservationCursor {
     Tail,
     After {
@@ -116,11 +127,26 @@ impl ProviderSessionTurnSource {
         cancellation: &CancellationToken,
     ) -> OutboundObservationResult {
         let mut cursor = lock_or_recover(&self.cursor);
-        if reset_anchor {
-            *cursor = ObservationCursor::Tail;
-        }
-        match self.read_page(&cursor, cancellation) {
-            Ok(page) => self.map_page(generation, &mut cursor, page),
+        // A refused reset must not destroy a retained continuation or anchor.
+        let requested = if reset_anchor {
+            ObservationCursor::Tail
+        } else {
+            cursor.clone()
+        };
+        match self.read_page(&requested, cancellation) {
+            Ok(page) => {
+                *cursor = requested;
+                self.map_page(generation, &mut cursor, page)
+            }
+            Err(error)
+                if crate::session_provider::fixed_paging_stop_reason(error.token()).is_some() =>
+            {
+                OutboundObservationResult::Stopped {
+                    generation,
+                    reason: crate::session_provider::fixed_paging_stop_reason(error.token())
+                        .unwrap(),
+                }
+            }
             Err(error) if observation_unavailable(&error) => {
                 OutboundObservationResult::Unavailable {
                     generation,
@@ -299,6 +325,19 @@ impl OutboundObserverWorker {
         self.shared.request_fresh_generation()
     }
 
+    /// Recovery entry. The confirmed TUI caller must own this invocation's observer
+    /// and have explicit authority after resolving the fixed cause. This is not
+    /// message retry/discard authority and does not reset cursors or confirmations.
+    pub(super) fn rearm_after_resolution(
+        &self,
+        expected_generation: u64,
+        reason: &'static str,
+        resolution: ObservationResolution,
+    ) -> Result<u64, &'static str> {
+        self.shared
+            .rearm_after_resolution(expected_generation, reason, resolution)
+    }
+
     pub(super) fn observe_after_anchor(&self) {
         self.shared.release_anchor();
     }
@@ -350,7 +389,46 @@ impl ObserverShared {
     }
 
     fn publish(&self, result: OutboundObservationResult) {
+        let mut state = lock_or_recover(&self.state);
+        if let OutboundObservationResult::Stopped { generation, reason } = &result {
+            // Even if demand refreshed during this read, a fixed refusal remains
+            // fixed for this identity. A refresh is not recovery authority.
+            state.stopped = Some((*generation, *reason));
+            state.refresh_requested = false;
+            state.anchor_reset_requested = false;
+        } else if matches!(&result, OutboundObservationResult::Available(observation)
+            if matches!(observation.phase, OutboundObservationPhase::TailAnchor { .. }))
+            && !state.anchor_reset_requested
+        {
+            state.anchor_held = true;
+        }
         *lock_or_recover(&self.latest) = Some(Arc::new(result));
+    }
+
+    fn rearm_after_resolution(
+        &self,
+        expected_generation: u64,
+        reason: &'static str,
+        resolution: ObservationResolution,
+    ) -> Result<u64, &'static str> {
+        let mut state = lock_or_recover(&self.state);
+        if state.stopped != Some((expected_generation, reason)) {
+            return Err("observation_stop_identity_changed");
+        }
+        if !resolution.permits(reason) {
+            return Err("observation_resolution_mismatch");
+        }
+        let floor = state
+            .started_generation
+            .checked_add(1)
+            .ok_or("observation_generation_exhausted")?;
+        state.stopped = None;
+        state.refresh_requested = true;
+        // Retain cursor and anchor; confirmation resumes, never resends input.
+        state.anchor_reset_requested = false;
+        *lock_or_recover(&self.latest) = None;
+        self.wake.notify_one();
+        Ok(floor)
     }
 
     fn set_demand(&self, active: bool) -> Option<u64> {
@@ -359,7 +437,7 @@ impl ObserverShared {
             return None;
         }
         state.demand = active;
-        if active {
+        if active && state.stopped.is_none() {
             let floor = state.started_generation.saturating_add(1);
             state.refresh_requested = true;
             state.anchor_reset_requested = true;
@@ -375,6 +453,9 @@ impl ObserverShared {
         let mut state = lock_or_recover(&self.state);
         let floor = state.started_generation.saturating_add(1);
         state.demand = true;
+        if state.stopped.is_some() {
+            return floor;
+        }
         state.refresh_requested = true;
         state.anchor_reset_requested = true;
         state.anchor_held = false;
@@ -382,16 +463,9 @@ impl ObserverShared {
         floor
     }
 
-    fn hold_anchor(&self) {
-        let mut state = lock_or_recover(&self.state);
-        if !state.anchor_reset_requested {
-            state.anchor_held = true;
-        }
-    }
-
     fn release_anchor(&self) {
         let mut state = lock_or_recover(&self.state);
-        if !state.anchor_held {
+        if state.stopped.is_some() || !state.anchor_held {
             return;
         }
         state.anchor_held = false;
@@ -418,6 +492,44 @@ struct ObserverState {
     started_generation: u64,
     anchor_reset_requested: bool,
     anchor_held: bool,
+    stopped: Option<(u64, &'static str)>,
+}
+
+/// The recovery owner attests the relevant cause is resolved before calling rearm.
+/// The TUI requires a distinct resolution/authority confirmation; routine demand
+/// and message retry/discard never supply it.
+#[derive(Clone, Copy)]
+pub(super) enum ObservationResolution {
+    PagingRestored,
+    CapacityResolved,
+}
+impl ObservationResolution {
+    fn permits(self, reason: &str) -> bool {
+        match self {
+            Self::PagingRestored => reason == "session_turn_paging_paused",
+            Self::CapacityResolved => {
+                crate::session_provider::fixed_paging_stop_reason(reason).is_some()
+                    && reason != "session_turn_paging_paused"
+            }
+        }
+    }
+}
+
+impl ObserverState {
+    fn take_read(&mut self, now: Instant, deadline: Instant) -> Option<(u64, bool)> {
+        if !self.demand
+            || self.stopped.is_some()
+            || self.anchor_held
+            || (!self.refresh_requested && now < deadline)
+        {
+            return None;
+        }
+        self.started_generation = self.started_generation.checked_add(1)?;
+        self.refresh_requested = false;
+        let reset_anchor = self.anchor_reset_requested;
+        self.anchor_reset_requested = false;
+        Some((self.started_generation, reset_anchor))
+    }
 }
 
 fn run_observer(source: OutboundObserverSource, shared: Arc<ObserverShared>) {
@@ -426,15 +538,7 @@ fn run_observer(source: OutboundObserverSource, shared: Arc<ObserverShared>) {
         if shared.shutdown_requested() {
             return;
         }
-        let result = source.read(generation, reset_anchor, &shared.cancellation);
-        if matches!(
-            result,
-            OutboundObservationResult::Available(ref observation)
-                if matches!(observation.phase, OutboundObservationPhase::TailAnchor { .. })
-        ) {
-            shared.hold_anchor();
-        }
-        shared.publish(result);
+        execute_read(&source, &shared, generation, reset_anchor);
         next_scan = Instant::now() + OBSERVATION_INTERVAL;
     }
 }
@@ -445,17 +549,10 @@ fn wait_for_read(shared: &ObserverShared, deadline: Instant) -> Option<(u64, boo
         if shared.shutdown_requested() {
             return None;
         }
-        if state.demand
-            && !state.anchor_held
-            && (state.refresh_requested || Instant::now() >= deadline)
-        {
-            state.refresh_requested = false;
-            state.started_generation = state.started_generation.saturating_add(1);
-            let reset_anchor = state.anchor_reset_requested;
-            state.anchor_reset_requested = false;
-            return Some((state.started_generation, reset_anchor));
+        if let Some(read) = state.take_read(Instant::now(), deadline) {
+            return Some(read);
         }
-        let wait = if state.demand {
+        let wait = if state.demand && state.stopped.is_none() && !state.anchor_held {
             deadline.saturating_duration_since(Instant::now())
         } else {
             Duration::from_secs(60)
@@ -525,7 +622,8 @@ mod tests {
         match result {
             OutboundObservationResult::Available(observation) => observation.generation,
             OutboundObservationResult::Unavailable { generation, .. }
-            | OutboundObservationResult::Failed { generation, .. } => *generation,
+            | OutboundObservationResult::Failed { generation, .. }
+            | OutboundObservationResult::Stopped { generation, .. } => *generation,
         }
     }
 
@@ -545,3 +643,17 @@ mod tests {
         panic!("observer did not publish generation {minimum}");
     }
 }
+
+fn execute_read(
+    source: &OutboundObserverSource,
+    shared: &ObserverShared,
+    generation: u64,
+    reset_anchor: bool,
+) {
+    let result = source.read(generation, reset_anchor, &shared.cancellation);
+    shared.publish(result);
+}
+
+#[cfg(all(test, unix))]
+#[path = "outbound_observer_fixtures.rs"]
+pub(super) mod fixtures;

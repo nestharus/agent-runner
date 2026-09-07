@@ -75,6 +75,7 @@ pub struct SessionTurnIngestStream {
     pub retry_count: u64,
     pub lease_owner: Option<String>,
     pub lease_expires_at: Option<String>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -808,7 +809,7 @@ fn read_stream_on(
         "SELECT checkpoint_generation, after_token, snapshot_id, next_page_token,
                 expected_page_index, expected_turn_sequence, status,
                 committed_page_count, committed_turn_count, projection,
-                retry_count, lease_owner, lease_expires_at
+                retry_count, lease_owner, lease_expires_at, last_error
          FROM session_turn_ingest_streams
          WHERE provider_name = ?1 AND provider_instance_id = ?2 AND settings_id = ?3
            AND session_id = ?4 AND projection = ?5",
@@ -845,6 +846,7 @@ fn read_stream_on(
                 retry_count: sqlite_u64(row.get(10)?, 10)?,
                 lease_owner: row.get(11)?,
                 lease_expires_at: row.get(12)?,
+                last_error: row.get(13)?,
             })
         },
     )

@@ -241,6 +241,7 @@ enum MonitorCommand {
     ToggleInspect,
     RequestCancel,
     RequestOutboundRetry,
+    RequestObservationRecovery,
     RequestOutboundDiscard,
     ConfirmAction,
     AbortAction,
@@ -363,6 +364,7 @@ enum BottomKey {
     Inspect,
     Cancel,
     RetryOutbound,
+    RecoverObservation,
     DiscardOutbound,
     Confirm,
     Abort,
@@ -617,6 +619,10 @@ fn parse_bottom_key(bytes: &[u8]) -> ParsedBottomKey {
             key: BottomKey::Cancel,
             consumed: 1,
         },
+        [0x07, ..] => ParsedBottomKey {
+            key: BottomKey::RecoverObservation,
+            consumed: 1,
+        },
         [0x10, ..] => ParsedBottomKey {
             key: BottomKey::RetryOutbound,
             consumed: 1,
@@ -702,6 +708,9 @@ fn bottom_key_route(key: BottomKey) -> BottomInputRoute {
         BottomKey::Collapse => BottomInputRoute::Command(MonitorCommand::Collapse),
         BottomKey::Inspect => BottomInputRoute::Command(MonitorCommand::ToggleInspect),
         BottomKey::Cancel => BottomInputRoute::Command(MonitorCommand::RequestCancel),
+        BottomKey::RecoverObservation => {
+            BottomInputRoute::Command(MonitorCommand::RequestObservationRecovery)
+        }
         BottomKey::RetryOutbound => BottomInputRoute::Command(MonitorCommand::RequestOutboundRetry),
         BottomKey::DiscardOutbound => {
             BottomInputRoute::Command(MonitorCommand::RequestOutboundDiscard)
@@ -1751,6 +1760,9 @@ struct MonitorPane {
     pending_outbound_recovery: Option<PendingOutboundRecovery>,
     outbound_recovery_request: Option<PendingOutboundRecovery>,
     outbound_recovery_feedback: Option<String>,
+    observation_stop: Option<(u64, &'static str)>,
+    pending_observation_recovery: Option<(u64, &'static str)>,
+    observation_recovery_request: Option<(u64, &'static str)>,
 }
 
 impl MonitorPane {
@@ -1774,6 +1786,9 @@ impl MonitorPane {
             pending_outbound_recovery: None,
             outbound_recovery_request: None,
             outbound_recovery_feedback: None,
+            observation_stop: None,
+            pending_observation_recovery: None,
+            observation_recovery_request: None,
         }
     }
 
@@ -2006,6 +2021,12 @@ impl MonitorPane {
                 self.request_cancel();
                 false
             }
+            MonitorCommand::RequestObservationRecovery => {
+                self.pending_cancel = None;
+                self.pending_outbound_recovery = None;
+                self.pending_observation_recovery = self.observation_stop;
+                false
+            }
             MonitorCommand::RequestOutboundRetry => {
                 self.request_outbound_recovery(OutboundRecoveryAction::Retry);
                 false
@@ -2038,6 +2059,7 @@ impl MonitorPane {
         self.last_inspect_refresh = None;
         self.pending_cancel = None;
         self.pending_outbound_recovery = None;
+        self.pending_observation_recovery = None;
     }
 
     fn selected_node(&self) -> Option<&MonitorNode> {
@@ -2054,10 +2076,12 @@ impl MonitorPane {
     fn request_cancel(&mut self) {
         self.cancel_feedback = None;
         self.pending_outbound_recovery = None;
+        self.pending_observation_recovery = None;
         self.pending_cancel = self.selected_cancelable_node().map(node_id);
     }
 
     fn request_outbound_recovery(&mut self, action: OutboundRecoveryAction) {
+        self.pending_observation_recovery = None;
         self.outbound_recovery_feedback = None;
         self.pending_cancel = None;
         self.pending_outbound_recovery = self
@@ -2083,6 +2107,15 @@ impl MonitorPane {
     }
 
     fn confirm_action(&mut self) {
+        if let Some(pending) = self.pending_observation_recovery.take() {
+            if self.observation_stop == Some(pending) {
+                self.observation_recovery_request = Some(pending);
+            } else {
+                self.outbound_recovery_feedback =
+                    Some("observation stop changed; recovery not applied".into());
+            }
+            return;
+        }
         if let Some(pending) = self.pending_outbound_recovery.take() {
             if self.outbound.oldest_ambiguous_id() == Some(pending.message_id) {
                 self.outbound_recovery_request = Some(pending);
@@ -2105,6 +2138,7 @@ impl MonitorPane {
     fn abort_action(&mut self) {
         self.pending_cancel = None;
         self.pending_outbound_recovery = None;
+        self.pending_observation_recovery = None;
     }
 
     fn take_cancel_request(&mut self) -> Option<CancelRequest> {
@@ -2118,6 +2152,7 @@ impl MonitorPane {
     fn record_outbound_recovery_feedback(&mut self, message: String) {
         self.outbound_recovery_feedback = Some(message);
         self.pending_outbound_recovery = None;
+        self.pending_observation_recovery = None;
     }
 
     fn record_cancel_feedback(&mut self, message: String) {
@@ -3380,6 +3415,16 @@ fn status_hint(pane: &MonitorPane, focus: Focus, overlay_constrained: bool) -> S
 
 fn bottom_status_hint(pane: &MonitorPane, overlay_constrained: bool) -> String {
     let protected_suffix = overlay_constrained.then_some("input viewport protected");
+    if let Some((_, reason)) = pane.pending_observation_recovery {
+        let resolution = if reason == "session_turn_paging_paused" {
+            "compatible forward paging has been restored"
+        } else {
+            "the reported capacity cause has been resolved"
+        };
+        return format!(
+            "confirm authorized observer recovery: {resolution}; Ctrl+Y = attest and rearm · Ctrl+N = abort; no message resend"
+        );
+    }
     if let Some(pending) = pane.pending_outbound_recovery {
         let action = match pending.action {
             OutboundRecoveryAction::Retry => {
@@ -3400,6 +3445,11 @@ fn bottom_status_hint(pane: &MonitorPane, overlay_constrained: bool) -> String {
             .map(|suffix| format!(" · {suffix}"))
             .unwrap_or_default();
         return format!("confirm cancel: y = SIGTERM · n = abort{protected_suffix}");
+    }
+    if let Some((_, reason)) = pane.observation_stop {
+        return format!(
+            "observation stopped: {reason} · Ctrl+G = recovery after resolution (not message retry)"
+        );
     }
     if let Some(message_id) = pane.outbound.oldest_ambiguous_id() {
         let suffix = protected_suffix
@@ -5291,7 +5341,8 @@ fn apply_routed_to_pane(
     );
     let force_refresh = apply_routed_commands(pane, &routed.commands);
     let cancelled = run_pending_cancel(pane);
-    let recovered = run_pending_outbound_recovery(pane, outbound_worker);
+    let observation_recovered = run_pending_observation_recovery(pane, outbound_worker);
+    let recovered = run_pending_outbound_recovery(pane, outbound_worker) || observation_recovered;
     snapshot_worker.set_interval(pane.refresh_interval());
     if pane_refresh_required(force_refresh, cancelled || recovered) {
         snapshot_worker.request_refresh();
@@ -5348,6 +5399,7 @@ fn monitor_command_is_interactive(command: &MonitorCommand) -> bool {
             | MonitorCommand::ToggleList
             | MonitorCommand::ToggleInspect
             | MonitorCommand::RequestCancel
+            | MonitorCommand::RequestObservationRecovery
             | MonitorCommand::RequestOutboundRetry
             | MonitorCommand::RequestOutboundDiscard
             | MonitorCommand::ConfirmAction
@@ -5380,6 +5432,38 @@ fn run_pending_cancel(pane: &mut MonitorPane) -> bool {
     let outcome = execute_cancel(&request);
     pane.record_cancel_feedback(cancel_outcome_message(&outcome));
     true
+}
+
+fn run_pending_observation_recovery(
+    pane: &mut MonitorPane,
+    worker: &OutboundObserverWorker,
+) -> bool {
+    let Some((generation, reason)) = pane.observation_recovery_request.take() else {
+        return false;
+    };
+    // Ctrl+Y attests resolution and authority for this exact observer stop, not
+    // permission to retry/discard any queued or ambiguously delivered message.
+    let resolution = if reason == "session_turn_paging_paused" {
+        super::outbound_observer::ObservationResolution::PagingRestored
+    } else {
+        super::outbound_observer::ObservationResolution::CapacityResolved
+    };
+    match worker.rearm_after_resolution(generation, reason, resolution) {
+        Ok(floor) => {
+            pane.outbound.require_generation(floor);
+            pane.observation_stop = None;
+            pane.record_outbound_recovery_feedback(
+                "observer rearmed; waiting for fresh evidence; no message resent".into(),
+            );
+            true
+        }
+        Err(error) => {
+            pane.record_outbound_recovery_feedback(format!(
+                "observer recovery not applied: {error}"
+            ));
+            false
+        }
+    }
 }
 
 fn run_pending_outbound_recovery(pane: &mut MonitorPane, worker: &OutboundObserverWorker) -> bool {
@@ -5613,6 +5697,12 @@ fn pump_outbound_queue_from_worker(
         pane.outbound.minimum_generation = pane.outbound.minimum_generation.max(generation_floor);
     }
     let latest = worker.latest_result();
+    pane.observation_stop = match latest.as_deref() {
+        Some(OutboundObservationResult::Stopped { generation, reason }) => {
+            Some((*generation, *reason))
+        }
+        _ => None,
+    };
     let now = Instant::now();
     let dirty = pump_outbound_queue_with_gate(
         pane,
@@ -5830,6 +5920,9 @@ fn observation_baseline(
 ) -> Result<OutboundBaseline, String> {
     match result {
         None => Err("awaiting_outbound_observation".to_string()),
+        Some(OutboundObservationResult::Stopped { reason, .. }) => Err(format!(
+            "outbound_observation_stopped:{reason}; resolve cause and obtain authorized explicit observer recovery; no automatic retry"
+        )),
         Some(OutboundObservationResult::Unavailable { detail, .. }) => Err(detail.clone()),
         Some(OutboundObservationResult::Failed { detail, .. }) => {
             Err(format!("outbound_observation_failed:{detail}"))
@@ -8825,6 +8918,9 @@ mod tests {
             pending_outbound_recovery: None,
             outbound_recovery_request: None,
             outbound_recovery_feedback: None,
+            observation_stop: None,
+            pending_observation_recovery: None,
+            observation_recovery_request: None,
         }
     }
 
@@ -10689,5 +10785,294 @@ mod tests {
         assert!(pane.adopt_snapshot(Some(Arc::clone(&snapshot))));
         assert!(!pane.adopt_snapshot(Some(snapshot)));
         assert!(pane.snapshot.is_some());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod host_observer_tests {
+    use super::super::outbound_observer::{ObservationResolution, fixtures::ObserverFixture};
+    use super::*;
+
+    fn pump(
+        pane: &mut MonitorPane,
+        pending: &mut PendingChildInput,
+        line: &mut InputLineState,
+        fixture: &ObserverFixture,
+    ) {
+        pump_outbound_queue_from_worker(
+            pane,
+            pending,
+            line,
+            &OutboundReleaseGate::default(),
+            false,
+            &fixture.worker,
+            false,
+        );
+    }
+
+    #[test]
+    fn queued_observation_stops_until_exact_authorized_resolution() {
+        for (reason, resolution, wrong_resolution) in [
+            (
+                "session_turn_staging_capacity_exceeded",
+                ObservationResolution::CapacityResolved,
+                ObservationResolution::PagingRestored,
+            ),
+            (
+                "session_turn_paging_paused",
+                ObservationResolution::PagingRestored,
+                ObservationResolution::CapacityResolved,
+            ),
+        ] {
+            let mut fixture = ObserverFixture::new(reason);
+            let mut pane = MonitorPane::new();
+            pane.outbound.enqueue("synthetic queued message".into());
+            let mut pending = PendingChildInput::new();
+            let mut line = InputLineState::default();
+            pump(&mut pane, &mut pending, &mut line, &fixture);
+            assert!(fixture.tick());
+            let (generation, stopped_reason) = fixture.stopped();
+            assert_eq!(stopped_reason, reason);
+            let cursor = fixture.cursor();
+            for _ in 0..400 {
+                pump(&mut pane, &mut pending, &mut line, &fixture);
+                assert!(!fixture.tick());
+            }
+            assert_eq!(fixture.calls().len(), 1);
+            assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
+            let message = pane.outbound.message(1).unwrap();
+            assert_eq!(message.body, "synthetic queued message");
+            assert!(message.baseline.is_none() && message.sent_at.is_none());
+            assert!(message.detail.as_deref().unwrap().contains(reason));
+            assert!(
+                !message
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("untrusted provider message")
+            );
+            assert!(pending.is_empty() && pane.outbound.active.is_none());
+            fixture.set_mode("restored");
+            fixture.worker.set_demand(false);
+            fixture.worker.set_demand(true);
+            fixture.worker.request_fresh_generation();
+            for _ in 0..400 {
+                pump(&mut pane, &mut pending, &mut line, &fixture);
+                assert!(!fixture.tick());
+            }
+            assert_eq!(fixture.cursor(), cursor);
+            assert_eq!(fixture.calls().len(), 1);
+            assert!(
+                fixture
+                    .worker
+                    .rearm_after_resolution(generation + 1, reason, resolution)
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .worker
+                    .rearm_after_resolution(generation, reason, wrong_resolution)
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .worker
+                    .rearm_after_resolution(generation, "codex_rollout_capacity", resolution)
+                    .is_err()
+            );
+            assert!(!fixture.tick());
+            let mut router = InputRouter::new();
+            router.focus = Focus::Bottom;
+            assert_eq!(
+                router.route_input(&[0x07]).commands,
+                vec![MonitorCommand::RequestObservationRecovery]
+            );
+            pane.apply(MonitorCommand::RequestObservationRecovery);
+            let hint = bottom_status_hint(&pane, false);
+            assert!(
+                hint.contains("authorized observer recovery") && hint.contains("no message resend")
+            );
+            pane.apply(MonitorCommand::AbortAction);
+            assert!(!run_pending_observation_recovery(
+                &mut pane,
+                &fixture.worker
+            ));
+            assert!(!fixture.tick());
+            pane.apply(MonitorCommand::RequestObservationRecovery);
+            pane.apply(MonitorCommand::ConfirmAction);
+            assert!(run_pending_observation_recovery(&mut pane, &fixture.worker));
+            assert!(!run_pending_observation_recovery(
+                &mut pane,
+                &fixture.worker
+            ));
+            assert!(
+                fixture
+                    .worker
+                    .rearm_after_resolution(generation, reason, resolution)
+                    .is_err()
+            );
+            pump(&mut pane, &mut pending, &mut line, &fixture);
+            assert!(pending.is_empty());
+            assert!(fixture.tick());
+            assert_eq!(fixture.calls().len(), 2);
+            let latest = fixture.worker.latest_result().unwrap();
+            let OutboundObservationResult::Available(observation) = latest.as_ref() else {
+                panic!("{latest:?}");
+            };
+            // An old successful generation cannot supply the newly required baseline.
+            let mut stale = observation.clone();
+            stale.generation = generation;
+            pump_outbound_queue(
+                &mut pane,
+                &mut pending,
+                &mut line,
+                false,
+                Some(&OutboundObservationResult::Available(stale)),
+                Instant::now(),
+            );
+            assert!(pending.is_empty());
+            assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
+            pump(&mut pane, &mut pending, &mut line, &fixture);
+            assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
+            let bytes = pending.pending_len();
+            assert!(bytes > 0);
+            for _ in 0..10 {
+                pump(&mut pane, &mut pending, &mut line, &fixture);
+            }
+            assert_eq!(
+                pending.pending_len(),
+                bytes,
+                "no duplicate enqueue or confirmation"
+            );
+            assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
+        }
+    }
+
+    #[test]
+    fn confirmed_observer_recovery_rejects_a_superseded_stop() {
+        let reason = "session_turn_paging_paused";
+        let mut fixture = ObserverFixture::new(reason);
+        let mut pane = MonitorPane::new();
+        pane.outbound.enqueue("synthetic queued message".into());
+        let mut pending = PendingChildInput::new();
+        let mut line = InputLineState::default();
+        pump(&mut pane, &mut pending, &mut line, &fixture);
+        assert!(fixture.tick());
+        pump(&mut pane, &mut pending, &mut line, &fixture);
+        pane.apply(MonitorCommand::RequestObservationRecovery);
+        pane.apply(MonitorCommand::ConfirmAction);
+        let old = fixture.stopped();
+        // Another explicitly authorized recovery was attempted before the saved
+        // confirmation executes. Still-refusing paging creates a fresh stop.
+        fixture
+            .worker
+            .rearm_after_resolution(old.0, old.1, ObservationResolution::PagingRestored)
+            .unwrap();
+        assert!(fixture.tick());
+        let current = fixture.stopped();
+        assert!(current.0 > old.0);
+        assert!(!run_pending_observation_recovery(
+            &mut pane,
+            &fixture.worker
+        ));
+        for _ in 0..400 {
+            assert!(!fixture.tick());
+        }
+        assert_eq!(fixture.stopped(), current);
+        assert_eq!(fixture.calls().len(), 2);
+        assert!(pending.is_empty());
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
+    }
+
+    #[test]
+    fn observation_transient_neighbor_keeps_automatic_retry() {
+        let mut fixture = ObserverFixture::new("session_turn_page_io");
+        let mut pane = MonitorPane::new();
+        pane.outbound.enqueue("synthetic queued message".into());
+        let mut pending = PendingChildInput::new();
+        let mut line = InputLineState::default();
+        pump(&mut pane, &mut pending, &mut line, &fixture);
+        assert!(fixture.tick());
+        pump(&mut pane, &mut pending, &mut line, &fixture);
+        assert!(fixture.tick());
+        assert_eq!(fixture.calls().len(), 2);
+        assert!(pending.is_empty());
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
+        fixture.set_mode("restored");
+        assert!(fixture.tick());
+        pump(&mut pane, &mut pending, &mut line, &fixture);
+        assert_eq!(fixture.calls().len(), 3);
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
+    }
+
+    #[test]
+    fn observation_stop_retains_partial_cursor_and_sent_confirmation_baseline() {
+        for (reason, resolution) in [
+            (
+                "session_turn_staging_capacity_exceeded",
+                ObservationResolution::CapacityResolved,
+            ),
+            (
+                "session_turn_paging_paused",
+                ObservationResolution::PagingRestored,
+            ),
+        ] {
+            let mut fixture = ObserverFixture::new("restored");
+            fixture.worker.set_demand(true);
+            assert!(fixture.tick());
+            let latest = fixture.worker.latest_result().unwrap();
+            let mut pane = MonitorPane::new();
+            pane.outbound.enqueue("synthetic already sent".into());
+            let baseline =
+                observation_baseline(Some(latest.as_ref()), 1, "synthetic already sent").unwrap();
+            pane.outbound.mark_sending(1, baseline.clone());
+            let sent_at = Instant::now();
+            pane.outbound
+                .set_status(1, OutboundStatus::Sent, sent_at, None);
+            pane.outbound.enqueue("synthetic second".into());
+            fixture.worker.observe_after_anchor();
+            assert!(fixture.tick());
+            assert!(fixture.cursor().contains("Continuation"));
+            let cursor = fixture.cursor();
+            fixture.set_mode(reason);
+            assert!(fixture.tick());
+            let stopped = fixture.stopped();
+            let mut pending = PendingChildInput::new();
+            let mut line = InputLineState::default();
+            for _ in 0..400 {
+                pump(&mut pane, &mut pending, &mut line, &fixture);
+                assert!(!fixture.tick());
+            }
+            assert_eq!(fixture.calls().len(), 3);
+            assert_eq!(fixture.cursor(), cursor);
+            assert_eq!(
+                pane.outbound.message(1).unwrap().baseline.as_ref(),
+                Some(&baseline)
+            );
+            assert_eq!(pane.outbound.message(1).unwrap().sent_at, Some(sent_at));
+            assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sent));
+            assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
+            assert!(pending.is_empty());
+            fixture.set_mode("restored");
+            fixture
+                .worker
+                .rearm_after_resolution(stopped.0, stopped.1, resolution)
+                .unwrap();
+            assert!(fixture.tick());
+            let calls = fixture.calls();
+            assert_eq!(calls.len(), 4);
+            assert_eq!(
+                calls[2]["params"], calls[3]["params"],
+                "same refused continuation and nonce resumed"
+            );
+            pump(&mut pane, &mut pending, &mut line, &fixture);
+            assert!(pending.is_empty());
+            assert_eq!(
+                pane.outbound.status(1),
+                Some(OutboundStatus::Sent),
+                "empty page is not confirmation"
+            );
+            assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
+        }
     }
 }

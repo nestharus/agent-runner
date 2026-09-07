@@ -1201,3 +1201,20 @@ Callers must not invoke it until the capacity cause is resolved or the compatibl
 forward provider is restored. Providing this operation grants no production
 mutation authority. A fallback intentionally pauses ingestion, not native sessions
 or model context; neither a stopped stream nor `last_success_at` proves catch-up.
+
+The import service reports an already-stopped backfill using its allowlisted
+fixed reason and explicit resolution/rearming requirement, not a retryable
+warning. Metadata import success is independent of backfill completion. A leased
+stream is reported separately; transient failures retain automatic retry behavior.
+
+Interactive user-observation paging has its own stop latch for the same fixed
+capacity/pause codes. Queued input, the observation cursor and existing delivery
+baseline are retained; demand, provider restoration and ordinary refresh do not
+clear the stop. In the bottom input/monitor pane, **Ctrl+G** requests observer
+recovery; **Ctrl+Y** explicitly attests authority and resolution of the displayed
+cause, and **Ctrl+N** aborts. The exact stopped generation/reason is rechecked
+before one re-entry. A still-refusing provider stops again. This is distinct from
+Ctrl+P message retry / Ctrl+D discard: it neither resends a sent message nor
+confirms consumption. Subsequent provider evidence remains necessary. The action
+relies on the operator's truthful resolution attestation; it does not itself
+install a provider, free storage, or rearm the canonical ingestion stream.
