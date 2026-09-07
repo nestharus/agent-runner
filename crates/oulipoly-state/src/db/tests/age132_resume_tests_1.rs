@@ -101,10 +101,20 @@ fn age132_full_projection_fixture() -> (StateDb, String, i64) {
             parent_invocation_id: None,
         })
         .unwrap();
-    db.update_session_capture(id, Some(SESSION_A), "verified")
-        .unwrap();
-    db.update_resume_acceptance(id, "accepted", Some("matched"))
-        .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        Some(SESSION_A),
+        "verified",
+    )
+    .unwrap();
+    db.update_resume_acceptance(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        "accepted",
+        Some("matched"),
+    )
+    .unwrap();
     db.conn
         .execute(
             "UPDATE invocations

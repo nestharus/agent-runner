@@ -90,12 +90,18 @@ impl StateDb {
 
     pub fn bind_invocation_provider_session_start(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_row_id: i64,
         binding: &ProviderSessionBinding,
     ) -> Result<(), String> {
         let tx =
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
                 .map_err(Self::format_provider_session_binding_begin_error)?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &tx,
+            invocation_row_id,
+            mutation_authority,
+        )?;
 
         let existing = Self::load_existing_provider_session_binding(&tx, invocation_row_id)?;
         Self::validate_provider_session_rebind(invocation_row_id, binding, existing.as_deref())?;
@@ -110,12 +116,24 @@ impl StateDb {
 
     pub fn commit_invocation_provider_session_authority(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_row_id: i64,
         commit: &ProviderSessionAuthorityCommit<'_>,
     ) -> Result<(), String> {
         let tx =
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
                 .map_err(Self::format_provider_session_binding_begin_error)?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &tx,
+            invocation_row_id,
+            mutation_authority,
+        )?;
+        super::provider_launch_lifecycle::promote_invocation_effect(
+            &tx,
+            mutation_authority,
+            crate::ProviderLaunchPromotion::ProviderSessionObserved,
+            1,
+        )?;
         let existing = Self::load_existing_provider_session_authority(&tx, invocation_row_id)?;
         Self::validate_provider_session_authority(invocation_row_id, commit, &existing)?;
         Self::validate_provider_session_rebind(
@@ -338,12 +356,22 @@ impl StateDb {
 
     pub fn transition_invocation_provider_session_capture_method(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_row_id: i64,
         provider_session_id: &str,
         expected_method: &str,
         next_method: &str,
     ) -> Result<(), String> {
-        let updated = self
+        let owner_tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &owner_tx,
+            invocation_row_id,
+            mutation_authority,
+        )?;
+        let result: Result<(), String> = {
+            let updated = self
             .conn
             .execute(
                 "UPDATE invocations
@@ -365,21 +393,39 @@ impl StateDb {
                     "Failed to transition provider session capture method for invocation {invocation_row_id}: {err}"
                 )
             })?;
-        if updated == 1 {
-            Ok(())
-        } else {
-            Err(format!(
-                "Invocation {invocation_row_id} is not a running {expected_method} binding for provider session {provider_session_id}"
-            ))
-        }
+            if updated == 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Invocation {invocation_row_id} is not a running {expected_method} binding for provider session {provider_session_id}"
+                ))
+            }
+        };
+        result?;
+        owner_tx.commit().map_err(|e| e.to_string())
     }
 
     fn provider_session_binding_should_mint_chain(binding: &ProviderSessionBinding) -> bool {
         binding.resume_input_id.as_deref() != Some(binding.provider_session_id.as_str())
     }
 
-    pub fn mint_chain_for_invocation_session(&self, invocation_row_id: i64) -> Result<(), DbError> {
-        Self::mint_chain_for_invocation_session_on(&self.conn, invocation_row_id)
+    pub fn mint_chain_for_invocation_session(
+        &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
+        invocation_row_id: i64,
+    ) -> Result<(), DbError> {
+        let owner_tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &owner_tx,
+            invocation_row_id,
+            mutation_authority,
+        )?;
+        let result: Result<(), String> =
+            Self::mint_chain_for_invocation_session_on(&self.conn, invocation_row_id);
+        result?;
+        owner_tx.commit().map_err(|e| e.to_string())
     }
 
     pub(super) fn mint_chain_for_invocation_session_on(

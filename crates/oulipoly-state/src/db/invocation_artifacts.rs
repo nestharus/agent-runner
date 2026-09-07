@@ -25,7 +25,7 @@
 //!
 //! Invocation sidecar artifact pathing, payload mapping, and atomic file writes.
 
-use super::{InvocationStart, StateDb, lc_log_adapter};
+use super::{InvocationStart, StateDb, lc_log_adapter, sqlite};
 use crate::result_envelope::{ResultEnvelopeInput, result_envelope_payload};
 use std::path::{Path, PathBuf};
 
@@ -88,6 +88,7 @@ impl StateDb {
     #[allow(clippy::too_many_arguments)]
     pub fn record_invocation_output_pending(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_id: i64,
         invocation_uuid: &str,
         paths: &InvocationOutputArtifactPaths,
@@ -97,10 +98,19 @@ impl StateDb {
         stderr_sha256: &str,
         data_event_count: u64,
     ) -> Result<(), String> {
-        let now = Self::current_rfc3339_timestamp();
-        self.conn
-            .execute(
-                "INSERT INTO invocation_output_deliveries (
+        let owner_tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &owner_tx,
+            invocation_id,
+            mutation_authority,
+        )?;
+        let result: Result<(), String> = {
+            let now = Self::current_rfc3339_timestamp();
+            self.conn
+                .execute(
+                    "INSERT INTO invocation_output_deliveries (
                     invocation_id, invocation_uuid, provider_outcome_state, delivery_state,
                     stdout_path, stdout_bytes, stdout_sha256,
                     stderr_path, stderr_bytes, stderr_sha256, data_event_count,
@@ -116,78 +126,110 @@ impl StateDb {
                     stderr_sha256 = excluded.stderr_sha256,
                     data_event_count = excluded.data_event_count,
                     updated_at = excluded.updated_at",
-                rusqlite::params![
-                    invocation_id,
-                    invocation_uuid,
-                    paths.stdout.to_string_lossy(),
-                    i64::try_from(stdout_bytes)
-                        .map_err(|_| "stdout byte count exceeds SQLite INTEGER".to_string())?,
-                    stdout_sha256,
-                    paths.stderr.to_string_lossy(),
-                    i64::try_from(stderr_bytes)
-                        .map_err(|_| "stderr byte count exceeds SQLite INTEGER".to_string())?,
-                    stderr_sha256,
-                    i64::try_from(data_event_count)
-                        .map_err(|_| "output event count exceeds SQLite INTEGER".to_string())?,
-                    now,
-                ],
-            )
-            .map_err(|error| format!("Failed to record pending invocation output: {error}"))?;
-        Ok(())
+                    rusqlite::params![
+                        invocation_id,
+                        invocation_uuid,
+                        paths.stdout.to_string_lossy(),
+                        i64::try_from(stdout_bytes)
+                            .map_err(|_| "stdout byte count exceeds SQLite INTEGER".to_string())?,
+                        stdout_sha256,
+                        paths.stderr.to_string_lossy(),
+                        i64::try_from(stderr_bytes)
+                            .map_err(|_| "stderr byte count exceeds SQLite INTEGER".to_string())?,
+                        stderr_sha256,
+                        i64::try_from(data_event_count)
+                            .map_err(|_| "output event count exceeds SQLite INTEGER".to_string())?,
+                        now,
+                    ],
+                )
+                .map_err(|error| format!("Failed to record pending invocation output: {error}"))?;
+            Ok(())
+        };
+        result?;
+        owner_tx.commit().map_err(|e| e.to_string())
     }
 
-    pub fn mark_invocation_output_delivered(&self, invocation_id: i64) -> Result<(), String> {
-        let now = Self::current_rfc3339_timestamp();
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE invocation_output_deliveries
+    pub fn mark_invocation_output_delivered(
+        &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
+        invocation_id: i64,
+    ) -> Result<(), String> {
+        let owner_tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &owner_tx,
+            invocation_id,
+            mutation_authority,
+        )?;
+        let result: Result<(), String> = {
+            let now = Self::current_rfc3339_timestamp();
+            let changed = self
+                .conn
+                .execute(
+                    "UPDATE invocation_output_deliveries
                  SET delivery_state = 'delivered', delivered_at = ?2, updated_at = ?2,
                      delivery_failure_stage = NULL, delivery_failure_kind = NULL,
                      delivery_failure_bytes = NULL
                  WHERE invocation_id = ?1 AND provider_outcome_state = 'settled'",
-                rusqlite::params![invocation_id, now],
-            )
-            .map_err(|error| format!("Failed to mark invocation output delivered: {error}"))?;
-        if changed != 1 {
-            return Err(
-                "invocation output is missing or provider outcome is unsettled".to_string(),
-            );
-        }
-        Ok(())
+                    rusqlite::params![invocation_id, now],
+                )
+                .map_err(|error| format!("Failed to mark invocation output delivered: {error}"))?;
+            if changed != 1 {
+                return Err(
+                    "invocation output is missing or provider outcome is unsettled".to_string(),
+                );
+            }
+            Ok(())
+        };
+        result?;
+        owner_tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn mark_invocation_output_delivery_failed(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_id: i64,
         stage: &str,
         kind: &str,
         delivered_bytes: Option<u64>,
     ) -> Result<(), String> {
-        let now = Self::current_rfc3339_timestamp();
-        let delivered_bytes = delivered_bytes
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|_| "delivered byte count exceeds SQLite INTEGER".to_string())?;
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE invocation_output_deliveries
+        let owner_tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &owner_tx,
+            invocation_id,
+            mutation_authority,
+        )?;
+        let result: Result<(), String> = {
+            let now = Self::current_rfc3339_timestamp();
+            let delivered_bytes = delivered_bytes
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| "delivered byte count exceeds SQLite INTEGER".to_string())?;
+            let changed = self
+                .conn
+                .execute(
+                    "UPDATE invocation_output_deliveries
                  SET delivery_state = 'failed', delivery_failure_stage = ?2,
                      delivery_failure_kind = ?3, delivery_failure_bytes = ?4,
                      updated_at = ?5
                  WHERE invocation_id = ?1 AND provider_outcome_state = 'settled'",
-                rusqlite::params![invocation_id, stage, kind, delivered_bytes, now],
-            )
-            .map_err(|error| {
-                format!("Failed to mark invocation output delivery failed: {error}")
-            })?;
-        if changed != 1 {
-            return Err(
-                "invocation output is missing or provider outcome is unsettled".to_string(),
-            );
-        }
-        Ok(())
+                    rusqlite::params![invocation_id, stage, kind, delivered_bytes, now],
+                )
+                .map_err(|error| {
+                    format!("Failed to mark invocation output delivery failed: {error}")
+                })?;
+            if changed != 1 {
+                return Err(
+                    "invocation output is missing or provider outcome is unsettled".to_string(),
+                );
+            }
+            Ok(())
+        };
+        result?;
+        owner_tx.commit().map_err(|e| e.to_string())
     }
 
     pub(super) fn write_invocation_artifact(

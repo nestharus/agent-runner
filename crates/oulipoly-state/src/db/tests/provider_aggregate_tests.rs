@@ -39,11 +39,25 @@ fn recent_errors() {
         parent_invocation_id: None,
     };
     let failed_id = db.start_invocation(&failed).unwrap();
-    db.finalize_invocation(failed_id, false, 1, None, None)
-        .unwrap();
+    db.finalize_invocation(
+        crate::InvocationMutationAuthority::Standalone,
+        failed_id,
+        false,
+        1,
+        None,
+        None,
+    )
+    .unwrap();
     let succeeded_id = db.start_invocation(&succeeded).unwrap();
-    db.finalize_invocation(succeeded_id, true, 0, None, None)
-        .unwrap();
+    db.finalize_invocation(
+        crate::InvocationMutationAuthority::Standalone,
+        succeeded_id,
+        true,
+        0,
+        None,
+        None,
+    )
+    .unwrap();
 
     let count = db.recent_error_count("m", "fixture-provider", 60).unwrap();
     assert_eq!(count, 1);

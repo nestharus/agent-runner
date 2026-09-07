@@ -252,6 +252,7 @@ impl Fixture {
         );
         state
             .bind_invocation_provider_session_start(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 invocation_id,
                 &ProviderSessionBinding {
                     provider_session_id: SESSION_A.to_string(),

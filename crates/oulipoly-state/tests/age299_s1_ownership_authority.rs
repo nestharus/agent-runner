@@ -172,6 +172,7 @@ fn schema_13_migrates_through_current_and_preserves_invocation_data() {
             (20, "0020_session_turn_pages"),
             (21, "0021_invocation_output_delivery"),
             (22, "0022_provider_session_authority"),
+            (23, "0023_provider_launch_lifecycle"),
         ]
     );
 

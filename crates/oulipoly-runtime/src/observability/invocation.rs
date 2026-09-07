@@ -710,7 +710,14 @@ mod tests {
                 Some(root_id),
             );
             state
-                .finalize_invocation(child_id, true, 0, None, None)
+                .finalize_invocation(
+                    oulipoly_state::InvocationMutationAuthority::Standalone,
+                    child_id,
+                    true,
+                    0,
+                    None,
+                    None,
+                )
                 .unwrap();
         }
         let hidden_ancestor_id = start_invocation(
@@ -719,7 +726,14 @@ mod tests {
             Some(root_id),
         );
         state
-            .finalize_invocation(hidden_ancestor_id, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                hidden_ancestor_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         start_invocation(
             &state,

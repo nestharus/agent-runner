@@ -99,6 +99,10 @@ pub(super) fn record_returned_artifacts(
     returned_artifacts: &[oulipoly_runtime::executor::ReturnedArtifactRef],
 ) -> Result<(), String> {
     state
-        .record_returned_artifacts(invocation_row_id, returned_artifacts)
+        .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            returned_artifacts,
+        )
         .map_err(|err| err.to_string())
 }

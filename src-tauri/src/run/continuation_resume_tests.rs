@@ -259,6 +259,7 @@ fn seed_terminal_resume_with_acceptance(
     let row_id = start_invocation(state, invocation_uuid, Some(parent_row_id));
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             row_id,
             &ProviderSessionBinding {
                 provider_session_id: ORIGIN_SESSION_ID.to_string(),
@@ -270,11 +271,23 @@ fn seed_terminal_resume_with_acceptance(
         .unwrap();
     if record_resume_acceptance {
         state
-            .update_resume_acceptance(row_id, "accepted", Some("matched origin session"))
+            .update_resume_acceptance(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                row_id,
+                "accepted",
+                Some("matched origin session"),
+            )
             .unwrap();
     }
     state
-        .finalize_invocation(row_id, false, 0, Some(UNCONFIRMED), Some(UNCONFIRMED))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            false,
+            0,
+            Some(UNCONFIRMED),
+            Some(UNCONFIRMED),
+        )
         .unwrap();
 }
 

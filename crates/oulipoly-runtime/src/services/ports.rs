@@ -50,6 +50,7 @@ pub trait InvocationLifecycleServicePort: Send + Sync {
 
     fn finalize_invocation(
         &self,
+        mutation_authority: oulipoly_state::InvocationMutationAuthority<'_>,
         request: InvocationLifecycleFinalizeRequest<'_>,
     ) -> Result<InvocationLifecycleFinalizeOutput, ServiceError>;
 }

@@ -526,11 +526,19 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
             parent_invocation_id: None,
         })
         .unwrap();
-    db.finalize_invocation(row_id, false, 7, Some("fixture"), Some("exit_nonzero"))
-        .unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        row_id,
+        false,
+        7,
+        Some("fixture"),
+        Some("exit_nonzero"),
+    )
+    .unwrap();
     let producer = invocation_uuid;
 
     db.record_returned_artifacts(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         row_id,
         &[
             returned_ref(producer, "first.md", 1),
@@ -539,6 +547,7 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
     )
     .expect("record returns");
     db.record_returned_artifacts(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         row_id,
         &[
             returned_ref(producer, "first.md", 1),
@@ -555,7 +564,11 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
     let mut mismatched = returned_ref(Uuid::new_v4(), "mismatch.md", 1);
     mismatched.producer_invocation_uuid = producer;
     let err = db
-        .record_returned_artifacts(row_id, &[mismatched])
+        .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            &[mismatched],
+        )
         .expect_err("mismatched producer id fails");
     assert!(
         err.contains("producer UUID mismatch"),
@@ -572,7 +585,11 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
         })
         .unwrap();
     let err = db
-        .record_returned_artifacts(other_row_id, &[returned_ref(producer, "wrong-row.md", 1)])
+        .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            other_row_id,
+            &[returned_ref(producer, "wrong-row.md", 1)],
+        )
         .expect_err("wrong invocation row fails");
     assert!(
         err.contains("belongs to"),
@@ -581,7 +598,11 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
     let mut wrong_version_id = returned_ref(producer, "wrong-version.md", 1);
     wrong_version_id.version_id = format!("store://return/{producer}/other-name.md/1");
     let err = db
-        .record_returned_artifacts(row_id, &[wrong_version_id])
+        .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            &[wrong_version_id],
+        )
         .expect_err("wrong version_id fails");
     assert!(
         err.contains("version_id mismatch"),
@@ -589,6 +610,7 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
     );
     let err = db
         .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             row_id,
             &[returned_ref(producer, "huge-version.md", u64::MAX)],
         )
@@ -600,7 +622,11 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
     let mut huge_content_len = returned_ref(producer, "huge-content.md", 1);
     huge_content_len.content_len = u64::MAX;
     let err = db
-        .record_returned_artifacts(row_id, &[huge_content_len])
+        .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            &[huge_content_len],
+        )
         .expect_err("oversized content_len fails");
     assert!(
         err.contains("content_len exceeds SQLite INTEGER range"),
@@ -652,8 +678,17 @@ fn trace_json_includes_returned_artifacts_and_legacy_missing_defaults_to_empty()
             parent_invocation_id: None,
         })
         .unwrap();
-    db.finalize_invocation(row_id, true, 0, None, None).unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        row_id,
+        true,
+        0,
+        None,
+        None,
+    )
+    .unwrap();
     db.record_returned_artifacts(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         row_id,
         &[returned_ref(
             Uuid::parse_str(invocation_uuid).unwrap(),

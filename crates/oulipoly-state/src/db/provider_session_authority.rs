@@ -18,13 +18,27 @@ pub struct FinalizedProviderSessionAuthority<'a> {
 impl StateDb {
     pub fn commit_finalized_provider_session_authority(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_row_id: i64,
         authority: &FinalizedProviderSessionAuthority<'_>,
     ) -> Result<(), DbError> {
         validate_authority(authority.provider_instance_id, authority.settings_id)?;
-        let tx = self.conn.unchecked_transaction().map_err(|error| {
-            format!("Failed to begin provider session authority commit: {error}")
-        })?;
+        let tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    format!("Failed to begin provider session authority commit: {error}")
+                })?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &tx,
+            invocation_row_id,
+            mutation_authority,
+        )?;
+        super::provider_launch_lifecycle::promote_invocation_effect(
+            &tx,
+            mutation_authority,
+            crate::ProviderLaunchPromotion::ProviderSessionObserved,
+            1,
+        )?;
         let provider_name = update_finalized_invocation_capture(
             &tx,
             invocation_row_id,

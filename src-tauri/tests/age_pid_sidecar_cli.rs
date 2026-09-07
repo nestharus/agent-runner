@@ -50,8 +50,13 @@ impl Fixture {
                 parent_invocation_id: None,
             })
             .unwrap();
-        db.update_session_capture(id, Some(ROOT_SESSION), "fixture")
-            .unwrap();
+        db.update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            id,
+            Some(ROOT_SESSION),
+            "fixture",
+        )
+        .unwrap();
         id
     }
 
@@ -66,8 +71,13 @@ impl Fixture {
                 parent_invocation_id: None,
             })
             .unwrap();
-        db.update_session_capture(root_id, Some(ROOT_SESSION), "fixture")
-            .unwrap();
+        db.update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(ROOT_SESSION),
+            "fixture",
+        )
+        .unwrap();
         let child_id = db
             .start_invocation(&InvocationStart {
                 invocation_uuid: CHILD_UUID.to_string(),
@@ -77,8 +87,13 @@ impl Fixture {
                 parent_invocation_id: Some(root_id),
             })
             .unwrap();
-        db.update_session_capture(child_id, Some(CHILD_SESSION), "fixture")
-            .unwrap();
+        db.update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            child_id,
+            Some(CHILD_SESSION),
+            "fixture",
+        )
+        .unwrap();
     }
 
     fn record_sidecar_identity(

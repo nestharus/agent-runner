@@ -59,7 +59,7 @@ fn assert_marker_emission_is_adjacent_to_typed_signal_finalization() {
         .expect("handle_quota_exhausted_retry must consume typed terminal signals");
     let after_signal = &quota_retry[signal_idx..];
     let finalize_idx = after_signal
-        .find(".finalize_invocation(")
+        .find(".finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone, ")
         .expect("typed terminal signal block must include lifecycle finalization");
     let retry_idx = after_signal
         .find("[routing] provider {provider_name} unavailable; rotating to another provider")

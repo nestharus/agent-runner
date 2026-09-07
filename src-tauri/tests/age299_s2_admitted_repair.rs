@@ -33,6 +33,7 @@ fn cli_repairs_each_exact_missing_suffix_row_without_expired_owner_authority() {
         .unwrap();
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             started.invocation_row_id,
             &ProviderSessionBinding {
                 provider_session_id: SESSION_ID.to_string(),
@@ -50,6 +51,7 @@ fn cli_repairs_each_exact_missing_suffix_row_without_expired_owner_authority() {
     for fixture in [&first, &second] {
         state
             .register_completion_event_with_authority(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 &started.completion_registration_authority,
                 &fixture.caller_admission_id(),
                 fixture.registration(),
@@ -58,6 +60,7 @@ fn cli_repairs_each_exact_missing_suffix_row_without_expired_owner_authority() {
     }
     state
         .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             started.invocation_row_id,
             false,
             74,

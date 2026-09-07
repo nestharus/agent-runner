@@ -149,6 +149,7 @@ fn duplicate_provider_session_owner_fixture() -> DuplicateProviderSessionOwnerFi
     runtime
         .db
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_id,
             &ProviderSessionBinding {
                 provider_session_id: INCIDENT_SESSION_ID.to_string(),
@@ -160,7 +161,14 @@ fn duplicate_provider_session_owner_fixture() -> DuplicateProviderSessionOwnerFi
         .unwrap();
     runtime
         .db
-        .finalize_invocation(invocation_id, true, 0, None, Some("exit_zero"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_id,
+            true,
+            0,
+            None,
+            Some("exit_zero"),
+        )
         .unwrap();
 
     let service = ProductionSessionImportService::with_registry_handle(

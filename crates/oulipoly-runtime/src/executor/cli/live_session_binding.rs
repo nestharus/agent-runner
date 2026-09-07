@@ -315,6 +315,7 @@ fn handle_live_session_report(
     backfill_captured_session_id(Some(spawn_context), Some(generation), &captured)?;
     set_shared_session(session_state, &captured)?;
     state.transition_invocation_provider_session_capture_method(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         context.invocation_row_id,
         &captured,
         PENDING_CAPTURE_METHOD,
@@ -348,6 +349,7 @@ fn restore_pending_capture_after_marker_failure(
     marker_error: String,
 ) -> String {
     match state.transition_invocation_provider_session_capture_method(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         invocation_row_id,
         provider_session_id,
         CAPTURE_METHOD,

@@ -34,12 +34,15 @@ pub(in crate::run::balancing) fn handle_prolonged_silence_fail(
     let finalize_result = input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::terminal_failure_finalize_request(
-            &input.env.state,
-            input.invocation_row_id,
-            input.result,
-            terminal_reason,
-        ));
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::terminal_failure_finalize_request(
+                &input.env.state,
+                input.invocation_row_id,
+                input.result,
+                terminal_reason,
+            ),
+        );
     match finalize_result {
         Ok(_) => input.guard.mark_finalized(),
         Err(err) => formatter::emit_finalize_invocation_warning(err),
@@ -90,12 +93,15 @@ pub(in crate::run::balancing) fn handle_interactive_fail(
     let finalize_result = input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::terminal_failure_finalize_request(
-            &input.env.state,
-            input.invocation_row_id,
-            input.result,
-            terminal_reason,
-        ));
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::terminal_failure_finalize_request(
+                &input.env.state,
+                input.invocation_row_id,
+                input.result,
+                terminal_reason,
+            ),
+        );
     match finalize_result {
         Ok(_) => input.guard.mark_finalized(),
         Err(err) => formatter::emit_finalize_invocation_warning(err),

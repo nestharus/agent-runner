@@ -69,7 +69,14 @@ impl Fixture {
             })
             .unwrap();
         self.state
-            .finalize_invocation(id, true, 0, None, Some("completed"))
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                id,
+                true,
+                0,
+                None,
+                Some("completed"),
+            )
             .unwrap();
         id
     }
@@ -86,7 +93,14 @@ impl Fixture {
             })
             .unwrap();
         self.state
-            .finalize_invocation(id, true, 0, None, Some("completed"))
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                id,
+                true,
+                0,
+                None,
+                Some("completed"),
+            )
             .unwrap();
         id
     }
@@ -345,7 +359,14 @@ fn session_lifecycle_uses_effective_cwd_to_disambiguate_window_candidates() {
         .unwrap();
     fixture
         .state
-        .finalize_invocation(invocation_row_id, true, 0, None, Some("completed"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            true,
+            0,
+            None,
+            Some("completed"),
+        )
         .unwrap();
 
     let mut stderr = Vec::new();
@@ -619,6 +640,7 @@ fn session_lifecycle_external_capture_replaces_start_bound_session_with_provider
         .fixture
         .state
         .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_row_id,
             Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
             "forced_flag_verified",
@@ -910,7 +932,14 @@ fn provider_ref_lifecycle_empty_capture_does_not_use_native_window_or_script_cwd
     provider
         .fixture
         .state
-        .finalize_invocation(invocation_row_id, true, 0, None, Some("completed"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            true,
+            0,
+            None,
+            Some("completed"),
+        )
         .unwrap();
     let mut stderr = Vec::new();
     let service =

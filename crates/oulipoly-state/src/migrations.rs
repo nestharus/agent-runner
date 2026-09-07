@@ -135,6 +135,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0022_provider_session_authority.sql"),
         post_sql_hook: None,
     },
+    Migration {
+        target_version: 23,
+        id: "0023_provider_launch_lifecycle",
+        sql: include_str!("../migrations/0023_provider_launch_lifecycle.sql"),
+        post_sql_hook: None,
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {

@@ -157,7 +157,7 @@ fn run_with_balancing_environment(
     );
     // Source guard marker: resolve_parent_invocation_id(&state)
     // Source guard marker: routing_service.select_route(RoutingServiceRequest { ctx: Some(
-    // Source guard marker: .finalize_invocation(
+    // Source guard marker: .finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,
     // Source guard marker: record_returned_artifacts(
     let max_attempts = super::max_attempts(super::mapper::quota_retry_budget(model), reservation);
     let mut attempts = 0usize;
@@ -1016,11 +1016,14 @@ fn finalize_spawn_error_invocation(
     let result = input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(super::mapper::spawn_error_finalize_request(
-            &input.env.state,
-            input.invocation_row_id,
-            terminal_reason,
-        ));
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            super::mapper::spawn_error_finalize_request(
+                &input.env.state,
+                input.invocation_row_id,
+                terminal_reason,
+            ),
+        );
     let status = spawn_error_finalization_status(result);
     if let Some(error) = status.error {
         formatter::emit_finalize_invocation_warning(error);

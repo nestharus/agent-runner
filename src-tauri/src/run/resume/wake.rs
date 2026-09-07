@@ -543,14 +543,17 @@ fn finalize_unconfirmed_mailbox_delivery(
     input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::finalize_request(
-            &input.env.state,
-            attempt.invocation_row_id,
-            false,
-            1,
-            Some("mailbox_delivery_unconfirmed"),
-            result.terminal_reason.as_deref(),
-        ))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::finalize_request(
+                &input.env.state,
+                attempt.invocation_row_id,
+                false,
+                1,
+                Some("mailbox_delivery_unconfirmed"),
+                result.terminal_reason.as_deref(),
+            ),
+        )
         .map_err(|err| err.to_string())?;
     attempt.guard.mark_finalized();
     Ok(())

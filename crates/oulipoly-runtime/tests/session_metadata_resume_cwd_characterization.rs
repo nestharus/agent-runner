@@ -393,6 +393,7 @@ fn seed_provider_session_resolved_account_for_model(
         .unwrap();
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_row_id,
             &ProviderSessionBinding {
                 provider_session_id: session_id.to_string(),
@@ -404,6 +405,7 @@ fn seed_provider_session_resolved_account_for_model(
         .unwrap();
     state
         .commit_finalized_provider_session_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_row_id,
             &FinalizedProviderSessionAuthority {
                 provider_session_id: session_id,

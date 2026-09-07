@@ -36,6 +36,7 @@ pub(super) fn update_session_capture(
     }
     env.state
         .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_row_id,
             result.session_capture.session_id.as_deref(),
             result.session_capture.method.db_value(),
@@ -132,6 +133,7 @@ fn bind_start_known_provider_session(
     };
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_row_id,
             &provider_session_binding(provider_session_id),
         )

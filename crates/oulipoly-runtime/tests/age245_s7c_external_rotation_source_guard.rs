@@ -1409,10 +1409,18 @@ fn seed_chain(state: &StateDb, model: &ModelConfig) -> ResolvedResume {
         })
         .expect("start invocation");
     state
-        .update_session_capture(invocation_id, Some(SOURCE_SESSION), "fixture")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_id,
+            Some(SOURCE_SESSION),
+            "fixture",
+        )
         .expect("capture");
     state
-        .mint_chain_for_invocation_session(invocation_id)
+        .mint_chain_for_invocation_session(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_id,
+        )
         .expect("chain");
     state
         .ingest_session_turns_batch(

@@ -617,7 +617,12 @@ fn resume_service_records_acceptance_matches_state_db_update_resume_acceptance()
     let direct_db = direct_fixture.open_db();
     let direct_id = start_invocation(&direct_db, "11111111-1111-4111-8111-111111111111");
     direct_db
-        .update_resume_acceptance(direct_id, "accepted", Some("matched session id"))
+        .update_resume_acceptance(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            direct_id,
+            "accepted",
+            Some("matched session id"),
+        )
         .unwrap();
     let expected = direct_db
         .get_invocation_by_uuid("11111111-1111-4111-8111-111111111111")

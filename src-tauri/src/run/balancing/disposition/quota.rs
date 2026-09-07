@@ -37,12 +37,15 @@ pub(in crate::run::balancing) fn handle_quota_exhausted_retry(
     let finalize_result = input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::quota_exhausted_finalize_request(
-            &input.env.state,
-            input.invocation_row_id,
-            input.result.exit_code,
-            terminal_reason,
-        ));
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::quota_exhausted_finalize_request(
+                &input.env.state,
+                input.invocation_row_id,
+                input.result.exit_code,
+                terminal_reason,
+            ),
+        );
     match finalize_result {
         Ok(_) => input.guard.mark_finalized(),
         Err(err) => formatter::emit_finalize_invocation_warning(err),

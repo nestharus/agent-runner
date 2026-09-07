@@ -223,6 +223,7 @@ fn seed_consumed_completion_fixture_mailbox(paths: &ConsumedCompletionFixturePat
         .unwrap();
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_start.invocation_row_id,
             &ProviderSessionBinding {
                 provider_session_id: ConsumedCompletionFixture::SESSION_ID.to_string(),
@@ -234,6 +235,7 @@ fn seed_consumed_completion_fixture_mailbox(paths: &ConsumedCompletionFixturePat
         .unwrap();
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &invocation_start.completion_registration_authority,
             "late-consumed-fixture-admission",
             CompletionEventRegistrationInput {

@@ -160,8 +160,13 @@ fn update_resume_acceptance_persists_status_and_evidence() {
     };
     let id = db.start_invocation(&start).unwrap();
 
-    db.update_resume_acceptance(id, "accepted", Some("matched session id"))
-        .unwrap();
+    db.update_resume_acceptance(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        "accepted",
+        Some("matched session id"),
+    )
+    .unwrap();
 
     let row = db
         .get_invocation_by_uuid(&start.invocation_uuid)

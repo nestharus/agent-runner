@@ -363,10 +363,17 @@ fn record_successful_invocation(
         .unwrap_or_else(|err| {
             panic!("case={case_label}: failed to start invocation for {provider_name}: {err}")
         });
-    db.finalize_invocation(id, true, 0, None, None)
-        .unwrap_or_else(|err| {
-            panic!("case={case_label}: failed to finalize invocation for {provider_name}: {err}")
-        });
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        id,
+        true,
+        0,
+        None,
+        None,
+    )
+    .unwrap_or_else(|err| {
+        panic!("case={case_label}: failed to finalize invocation for {provider_name}: {err}")
+    });
 }
 
 fn assert_route_winner(

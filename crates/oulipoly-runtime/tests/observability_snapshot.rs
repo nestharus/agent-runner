@@ -273,7 +273,12 @@ fn provider_invocation_process_liveness_distinguishes_verified_live_and_dead() {
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     seed_invocation(&state, CHILD_UUID, Some(root_id));
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     drop(state);
     let pid = fixture.open_pid();
@@ -308,7 +313,12 @@ fn running_invocation_with_dead_pid_is_reconciled_to_stale_not_running() {
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     seed_invocation(&state, CHILD_UUID, Some(root_id));
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     drop(state);
     let pid = fixture.open_pid();
@@ -379,18 +389,37 @@ fn overlay_retains_terminal_ancestor_of_live_grandchild_after_terminal_history()
     let state = fixture.open_state();
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     for index in 0..TERMINAL_DESCENDANT_COUNT {
         let uuid = format!("81000000-0000-4000-8000-{index:012}");
         let row_id = seed_invocation(&state, &uuid, Some(root_id));
         state
-            .finalize_invocation(row_id, true, 0, None, Some("completed"))
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                row_id,
+                true,
+                0,
+                None,
+                Some("completed"),
+            )
             .unwrap();
     }
     let ancestor_id = seed_invocation(&state, TERMINAL_ANCESTOR_UUID, Some(root_id));
     state
-        .finalize_invocation(ancestor_id, true, 0, None, Some("completed"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            ancestor_id,
+            true,
+            0,
+            None,
+            Some("completed"),
+        )
         .unwrap();
     seed_invocation(&state, LIVE_CHILD_UUID, Some(ancestor_id));
     drop(state);
@@ -425,14 +454,33 @@ fn delivered_wake_edge_keeps_live_workload_under_original_root() {
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     let owner_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
     state
-        .finalize_invocation(owner_id, true, 0, None, Some("completed"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            owner_id,
+            true,
+            0,
+            None,
+            Some("completed"),
+        )
         .unwrap();
     let wake_id = seed_invocation(&state, LIVE_CHILD_UUID, None);
     state
-        .finalize_invocation(wake_id, true, 0, None, Some("completed"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            wake_id,
+            true,
+            0,
+            None,
+            Some("completed"),
+        )
         .unwrap();
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     drop(state);
 
@@ -496,7 +544,12 @@ fn active_session_nodes_point_inspect_at_live_transcript_when_resolvable() {
     let state = fixture.open_state();
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     drop(state);
     let pid = fixture.open_pid();
@@ -542,7 +595,12 @@ fn active_session_nodes_do_not_attach_transcript_inspect_ref_without_local_trans
     let state = fixture.open_state();
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     drop(state);
     let pid = fixture.open_pid();
@@ -796,7 +854,12 @@ fn stale_runtime_snapshot_emits_diagnostic_without_mutating_runtime_row() {
     let state = fixture.open_state();
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     drop(state);
     let mut stale = current_identity();
@@ -1585,7 +1648,12 @@ fn seed_root_session(fixture: &Fixture) {
     let state = fixture.open_state();
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
 }
 
@@ -2214,13 +2282,25 @@ fn seed_overlay_logical_child_state(fixture: &Fixture) {
     let state = fixture.open_state();
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     for index in 0..TERMINAL_DESCENDANT_COUNT {
         let uuid = format!("10000000-0000-4000-8000-{index:012}");
         let row_id = seed_invocation(&state, &uuid, Some(root_id));
         state
-            .finalize_invocation(row_id, true, 0, None, Some("completed"))
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                row_id,
+                true,
+                0,
+                None,
+                Some("completed"),
+            )
             .unwrap();
     }
     seed_invocation(&state, LIVE_CHILD_UUID, Some(root_id));

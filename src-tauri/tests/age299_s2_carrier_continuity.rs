@@ -381,7 +381,14 @@ fn all_success_carriers_refuse_damaged_sidecar_then_finalize_retained_outcome_af
             .unwrap()
             .unwrap();
         restored_state
-            .finalize_invocation(row.id, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                row.id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         let finalized = restored_state
             .get_invocation_by_uuid(&invocation_uuid)
@@ -529,6 +536,7 @@ fn prepare_registered_carrier(carrier: Carrier) -> (Fixture, CarrierChild, Strin
     {
         state
             .bind_invocation_provider_session_start(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 running.id,
                 &ProviderSessionBinding {
                     provider_session_id: SESSION_ID.to_string(),

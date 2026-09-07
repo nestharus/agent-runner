@@ -289,8 +289,15 @@ fn start_test_invocation(
 }
 
 fn finalize_test_invocation_success(db: &StateDb, invocation_id: i64) {
-    db.finalize_invocation(invocation_id, true, 0, None, None)
-        .unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+        true,
+        0,
+        None,
+        None,
+    )
+    .unwrap();
 }
 
 fn increment_provider_call_count(db: &StateDb, provider_name: &str) {

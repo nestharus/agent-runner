@@ -128,6 +128,7 @@ fn bind_resume_attempt_session(
         return Ok(());
     }
     input.env.state.bind_invocation_provider_session_start(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         invocation_row_id,
         &mapper::resumed_provider_session_binding(
             provider,
@@ -136,10 +137,11 @@ fn bind_resume_attempt_session(
         ),
     )?;
     if should_record_legacy_resume_input(input.manual_migrate) {
-        input
-            .env
-            .state
-            .record_legacy_resume_input_session_id(invocation_row_id, input.session_id)?;
+        input.env.state.record_legacy_resume_input_session_id(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            input.session_id,
+        )?;
     }
     Ok(())
 }
@@ -233,10 +235,10 @@ pub(super) fn finalize_resume_spawn_error(
     input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::spawn_error_finalize_request(
-            &input.env.state,
-            attempt.invocation_row_id,
-        ))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::spawn_error_finalize_request(&input.env.state, attempt.invocation_row_id),
+        )
         .map_err(|err| err.to_string())?;
     attempt.guard.mark_finalized();
     wake::mark_resume_attempt_idle(

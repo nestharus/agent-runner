@@ -199,7 +199,14 @@ impl Fixture {
             })
             .expect("start");
         self.state
-            .finalize_invocation(row_id, true, 0, None, Some("completed"))
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                row_id,
+                true,
+                0,
+                None,
+                Some("completed"),
+            )
             .expect("finalize");
         row_id
     }

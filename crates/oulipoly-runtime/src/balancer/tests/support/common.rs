@@ -23,8 +23,15 @@ pub(in crate::balancer::tests) fn record_invocation_for_test(
 ) {
     let start = invocation_start_for_test(model_name, provider_name, provider_index);
     let id = db.start_invocation(&start).unwrap();
-    db.finalize_invocation(id, success, if success { 0 } else { 1 }, None, None)
-        .unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        id,
+        success,
+        if success { 0 } else { 1 },
+        None,
+        None,
+    )
+    .unwrap();
 }
 
 pub(in crate::balancer::tests) fn invocation_start_for_test(

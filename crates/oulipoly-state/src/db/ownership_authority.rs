@@ -248,11 +248,13 @@ impl std::error::Error for OwnershipAuthorityError {}
 impl StateDb {
     pub fn register_completion_event_with_authority(
         &mut self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         authority: &super::CompletionRegistrationAuthority,
         admission_id: &str,
         registration: CompletionEventRegistrationInput<'_>,
     ) -> Result<CompletionEventRegistrationResult, String> {
         self.register_completion_event_with_obligation_on(
+            mutation_authority,
             Some(authority),
             false,
             admission_id,
@@ -265,10 +267,12 @@ impl StateDb {
     /// Materialize a hash-identical State admission without creating new authority.
     pub fn repair_admitted_completion_event(
         &mut self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         admission_id: &str,
         registration: CompletionEventRegistrationInput<'_>,
     ) -> Result<CompletionEventRegistrationResult, String> {
         self.register_completion_event_with_obligation_on(
+            mutation_authority,
             None,
             true,
             admission_id,
@@ -281,10 +285,12 @@ impl StateDb {
     #[cfg(test)]
     pub fn register_completion_event_with_obligation(
         &mut self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         admission_id: &str,
         registration: CompletionEventRegistrationInput<'_>,
     ) -> Result<CompletionEventRegistrationResult, String> {
         self.register_completion_event_with_obligation_on(
+            mutation_authority,
             None,
             false,
             admission_id,
@@ -294,8 +300,11 @@ impl StateDb {
         )
     }
 
+    // Mandatory authority accompanies the existing terminal/admission transaction inputs.
+    #[allow(clippy::too_many_arguments)]
     fn register_completion_event_with_obligation_on<BeforeCommit, AfterCommit>(
         &mut self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         authority: Option<&super::CompletionRegistrationAuthority>,
         admitted_replay_only: bool,
         admission_id: &str,
@@ -327,6 +336,24 @@ impl StateDb {
             .map_err(|error| {
                 format!("Failed to begin completion admission transaction: {error}")
             })?;
+        let invocation_row_id: i64 = tx
+            .query_row(
+                "SELECT id FROM invocations WHERE invocation_uuid=?1",
+                [owner_invocation_uuid],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &tx,
+            invocation_row_id,
+            mutation_authority,
+        )?;
+        super::provider_launch_lifecycle::promote_invocation_effect(
+            &tx,
+            mutation_authority,
+            crate::ProviderLaunchPromotion::MailboxSubmissionAccepted,
+            1,
+        )?;
         require_completion_continuity_registration_ready(&tx)?;
         if admitted_replay_only {
             require_exact_admitted_completion_replay(
@@ -1367,7 +1394,11 @@ mod tests {
         let mut state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
 
         let error = state
-            .register_completion_event_with_obligation("age299-s2-memory-admission", registration())
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-memory-admission",
+                registration(),
+            )
             .unwrap_err();
 
         assert_eq!(
@@ -1434,6 +1465,7 @@ mod tests {
         assert!(state.path().is_absolute());
         state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-relative-path-admission",
                 registration(),
             )
@@ -1475,6 +1507,7 @@ mod tests {
         );
         alias_state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-symlink-admission",
                 registration(),
             )
@@ -1515,6 +1548,7 @@ mod tests {
 
         state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-parent-symlink-admission",
                 registration(),
             )
@@ -1561,6 +1595,7 @@ mod tests {
             .unwrap();
         state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-retarget-admission",
                 registration(),
             )
@@ -1569,7 +1604,14 @@ mod tests {
         symlink(&second_directory, &alias_directory).unwrap();
 
         let error = state
-            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .finalize_invocation(
+                crate::InvocationMutationAuthority::Standalone,
+                invocation_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap_err();
 
         assert!(error.contains("process_integrity"), "{error}");
@@ -1604,6 +1646,7 @@ mod tests {
 
         let error = state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-hard-link-admission",
                 registration(),
             )
@@ -1641,6 +1684,7 @@ mod tests {
             .unwrap();
         state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-state-replacement-admission",
                 registration(),
             )
@@ -1649,7 +1693,14 @@ mod tests {
         std::fs::File::create(&state_path).unwrap();
 
         let error = state
-            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .finalize_invocation(
+                crate::InvocationMutationAuthority::Standalone,
+                invocation_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap_err();
 
         assert!(error.contains("process_integrity"), "{error}");
@@ -1694,6 +1745,7 @@ mod tests {
             .unwrap();
         state
             .finalize_invocation(
+                crate::InvocationMutationAuthority::Standalone,
                 invocation_row_id,
                 false,
                 1,
@@ -1704,6 +1756,7 @@ mod tests {
 
         let error = state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-terminal-new-admission",
                 registration(),
             )
@@ -1760,6 +1813,7 @@ mod tests {
         ] {
             state
                 .register_completion_event_with_obligation(
+                    crate::InvocationMutationAuthority::Standalone,
                     "age299-s2-invalid-registration",
                     invalid,
                 )
@@ -1774,7 +1828,11 @@ mod tests {
         }
 
         state
-            .register_completion_event_with_obligation("age299-s2-invalid-registration", valid)
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-invalid-registration",
+                valid,
+            )
             .unwrap();
         assert_eq!(
             state
@@ -1865,7 +1923,11 @@ mod tests {
             ),
         ] {
             let error = state
-                .register_completion_event_with_obligation(admission_id, registration)
+                .register_completion_event_with_obligation(
+                    crate::InvocationMutationAuthority::Standalone,
+                    admission_id,
+                    registration,
+                )
                 .unwrap_err();
             assert!(error.contains(expected_error), "{error}");
             assert!(
@@ -1919,6 +1981,7 @@ mod tests {
         let writer = std::thread::spawn(move || {
             writer_state
                 .register_completion_event_with_obligation_on(
+                    crate::InvocationMutationAuthority::Standalone,
                     None,
                     false,
                     "age299-s2-barrier-admission",
@@ -1939,7 +2002,14 @@ mod tests {
         let (finalize_tx, finalize_rx) = mpsc::channel();
         let finalizer = std::thread::spawn(move || {
             finalize_tx
-                .send(finalizer_state.finalize_invocation(invocation_row_id, true, 0, None, None))
+                .send(finalizer_state.finalize_invocation(
+                    crate::InvocationMutationAuthority::Standalone,
+                    invocation_row_id,
+                    true,
+                    0,
+                    None,
+                    None,
+                ))
                 .unwrap();
         });
         assert!(
@@ -1980,7 +2050,11 @@ mod tests {
             })
             .unwrap();
         state
-            .register_completion_event_with_obligation("age299-s2-first-admission", registration())
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-first-admission",
+                registration(),
+            )
             .unwrap();
         let generation = MailboxDb::open(&sidecar_path)
             .unwrap()
@@ -2000,6 +2074,7 @@ mod tests {
         };
         let error = state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-second-admission",
                 second_registration,
             )
@@ -2019,6 +2094,7 @@ mod tests {
         std::fs::rename(&held_sidecar_path, &sidecar_path).unwrap();
         state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-second-admission",
                 second_registration,
             )
@@ -2053,7 +2129,11 @@ mod tests {
                 .unwrap();
         }
         state
-            .register_completion_event_with_obligation("age299-s2-first-admission", registration())
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-first-admission",
+                registration(),
+            )
             .unwrap();
         let retained_generation = MailboxDb::open(&sidecar_path)
             .unwrap()
@@ -2073,6 +2153,7 @@ mod tests {
 
         let missing_error = state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-other-invocation-admission",
                 second_registration,
             )
@@ -2092,6 +2173,7 @@ mod tests {
         std::fs::File::create(&sidecar_path).unwrap();
         let empty_error = state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-other-invocation-admission",
                 second_registration,
             )
@@ -2112,6 +2194,7 @@ mod tests {
         assert_ne!(replacement_generation, retained_generation);
         let mismatch_error = state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-other-invocation-admission",
                 second_registration,
             )
@@ -2135,6 +2218,7 @@ mod tests {
         std::fs::rename(&held_sidecar_path, &sidecar_path).unwrap();
         state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-other-invocation-admission",
                 second_registration,
             )
@@ -2171,6 +2255,7 @@ mod tests {
                 .unwrap();
             state
                 .register_completion_event_with_obligation(
+                    crate::InvocationMutationAuthority::Standalone,
                     &admission_id,
                     CompletionEventRegistrationInput {
                         event_id: &event_id,
@@ -2188,7 +2273,14 @@ mod tests {
         }
         for invocation_id in invocation_ids.into_iter().take(32) {
             state
-                .finalize_invocation(invocation_id, true, 0, None, None)
+                .finalize_invocation(
+                    crate::InvocationMutationAuthority::Standalone,
+                    invocation_id,
+                    true,
+                    0,
+                    None,
+                    None,
+                )
                 .unwrap();
         }
         COMPLETION_CONTINUITY_HEAD_QUERIES.with(|count| count.set(0));
@@ -2204,6 +2296,7 @@ mod tests {
             .unwrap();
         state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-post-mature-admission",
                 registration_for(
                     "age299-s2-post-mature-event",
@@ -2267,6 +2360,7 @@ mod tests {
         );
         let missing_error = state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-after-terminal-history-admission",
                 distinct_registration,
             )
@@ -2283,6 +2377,7 @@ mod tests {
         assert_ne!(replacement_generation, retained_generation);
         let replacement_error = state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-after-terminal-history-admission",
                 distinct_registration,
             )
@@ -2324,7 +2419,11 @@ mod tests {
             .unwrap();
         std::fs::copy(&sidecar_path, &stale_sidecar_path).unwrap();
         state
-            .register_completion_event_with_obligation("age299-s2-first-admission", registration())
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-first-admission",
+                registration(),
+            )
             .unwrap();
         std::fs::rename(&sidecar_path, &retained_sidecar_path).unwrap();
         std::fs::copy(&stale_sidecar_path, &sidecar_path).unwrap();
@@ -2336,6 +2435,7 @@ mod tests {
 
         let error = state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-stale-snapshot-admission",
                 second_registration,
             )
@@ -2364,6 +2464,7 @@ mod tests {
         std::fs::rename(&retained_sidecar_path, &sidecar_path).unwrap();
         state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-stale-snapshot-admission",
                 second_registration,
             )
@@ -2400,6 +2501,7 @@ mod tests {
 
         let first_error = state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-partial-admission",
                 registration(),
             )
@@ -2417,6 +2519,7 @@ mod tests {
         );
         let distinct_error = state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-distinct-admission",
                 registration_for(
                     "age299-s2-distinct-event",
@@ -2465,7 +2568,11 @@ mod tests {
             },
         ] {
             let changed_error = state
-                .register_completion_event_with_obligation("age299-s2-partial-admission", changed)
+                .register_completion_event_with_obligation(
+                    crate::InvocationMutationAuthority::Standalone,
+                    "age299-s2-partial-admission",
+                    changed,
+                )
                 .unwrap_err();
             assert!(
                 changed_error.contains("continuity heads do not match"),
@@ -2480,7 +2587,11 @@ mod tests {
             );
         }
         state
-            .register_completion_event_with_obligation("age299-s2-partial-admission", original)
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-partial-admission",
+                original,
+            )
             .unwrap();
         assert!(
             MailboxDb::open(&sidecar_path)
@@ -2531,10 +2642,18 @@ mod tests {
         let second = registration_for("age299-s2-rollback-second", SESSION_ID, INVOCATION_UUID);
 
         state
-            .register_completion_event_with_obligation("age299-s2-rollback-first", first)
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-rollback-first",
+                first,
+            )
             .unwrap();
         state
-            .register_completion_event_with_obligation("age299-s2-rollback-second", second)
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-rollback-second",
+                second,
+            )
             .unwrap();
         assert_eq!(
             state
@@ -2565,7 +2684,11 @@ mod tests {
         drop(rolled_back);
 
         let out_of_order_error = state
-            .register_completion_event_with_obligation("age299-s2-rollback-second", second)
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-rollback-second",
+                second,
+            )
             .unwrap_err();
         assert!(
             out_of_order_error.contains("continuity heads do not match"),
@@ -2573,6 +2696,7 @@ mod tests {
         );
         let new_admission_error = state
             .repair_admitted_completion_event(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-rollback-third",
                 registration_for("age299-s2-rollback-third", SESSION_ID, INVOCATION_UUID),
             )
@@ -2583,10 +2707,18 @@ mod tests {
         );
 
         state
-            .repair_admitted_completion_event("age299-s2-rollback-first", first)
+            .repair_admitted_completion_event(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-rollback-first",
+                first,
+            )
             .unwrap();
         state
-            .repair_admitted_completion_event("age299-s2-rollback-second", second)
+            .repair_admitted_completion_event(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-rollback-second",
+                second,
+            )
             .unwrap();
 
         let sidecar = MailboxDb::open(&sidecar_path).unwrap();
@@ -2655,7 +2787,11 @@ mod tests {
         drop(fault_connection);
 
         let first_error = state
-            .register_completion_event_with_obligation("age299-s2-terminal-partial", registration())
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-terminal-partial",
+                registration(),
+            )
             .unwrap_err();
         assert!(
             first_error.contains("forced terminal repair interruption"),
@@ -2663,6 +2799,7 @@ mod tests {
         );
         state
             .finalize_invocation(
+                crate::InvocationMutationAuthority::Standalone,
                 invocation_row_id,
                 false,
                 1,
@@ -2680,7 +2817,11 @@ mod tests {
         );
 
         let interrupted_repair = state
-            .register_completion_event_with_obligation("age299-s2-terminal-partial", registration())
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-terminal-partial",
+                registration(),
+            )
             .unwrap_err();
         assert!(
             interrupted_repair.contains("forced terminal repair interruption"),
@@ -2738,7 +2879,11 @@ mod tests {
             ),
         ] {
             let error = state
-                .register_completion_event_with_obligation(caller_admission_id, changed)
+                .register_completion_event_with_obligation(
+                    crate::InvocationMutationAuthority::Standalone,
+                    caller_admission_id,
+                    changed,
+                )
                 .unwrap_err();
             assert!(error.contains("not an exact admitted replay"), "{error}");
             let sidecar = MailboxDb::open(&sidecar_path).unwrap();
@@ -2763,7 +2908,11 @@ mod tests {
         }
 
         state
-            .register_completion_event_with_obligation("age299-s2-terminal-partial", registration())
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-terminal-partial",
+                registration(),
+            )
             .unwrap();
         let sidecar = MailboxDb::open(&sidecar_path).unwrap();
         let repaired_sidecar_head: (i64, String, String) = sidecar
@@ -2779,7 +2928,11 @@ mod tests {
         drop(sidecar);
 
         state
-            .register_completion_event_with_obligation("age299-s2-terminal-partial", registration())
+            .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
+                "age299-s2-terminal-partial",
+                registration(),
+            )
             .unwrap();
         assert_eq!(
             MailboxDb::open(&sidecar_path)
@@ -2805,6 +2958,7 @@ mod tests {
             .unwrap();
         state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-after-terminal-repair",
                 registration_for(
                     "age299-s2-after-terminal-repair-event",
@@ -2855,6 +3009,7 @@ mod tests {
             .unwrap();
         state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-immutable-continuity-admission",
                 registration(),
             )

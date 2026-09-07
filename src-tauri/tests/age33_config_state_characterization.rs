@@ -242,7 +242,15 @@ projects_dir = {:?}
                 parent_invocation_id: None,
             })
             .unwrap();
-        db.finalize_invocation(row_id, true, 0, None, None).unwrap();
+        db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            true,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
     }
 
     fn stage_claude_transcript(&self, projects_dir: &Path, session_id: &str) -> PathBuf {

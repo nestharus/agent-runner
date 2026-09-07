@@ -63,6 +63,7 @@ impl InvocationLifecycleServicePort for StubService {
 
     fn finalize_invocation(
         &self,
+        _mutation_authority: oulipoly_state::InvocationMutationAuthority<'_>,
         _request: InvocationLifecycleFinalizeRequest<'_>,
     ) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
         unimplemented!()
@@ -236,8 +237,11 @@ fn age_35_routing_and_invocation_lifecycle_services_are_object_safe_with_contrac
         let _: Result<RoutingServiceOutput, ServiceError> = routing.select_route(route_request);
         let _: Result<InvocationLifecycleStartOutput, ServiceError> =
             lifecycle.start_invocation(lifecycle_start);
-        let _: Result<InvocationLifecycleFinalizeOutput, ServiceError> =
-            lifecycle.finalize_invocation(lifecycle_finalize);
+        let _: Result<InvocationLifecycleFinalizeOutput, ServiceError> = lifecycle
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                lifecycle_finalize,
+            );
     }
 }
 

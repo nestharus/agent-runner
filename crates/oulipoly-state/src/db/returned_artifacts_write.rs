@@ -31,6 +31,7 @@ use uuid::Uuid;
 impl StateDb {
     pub fn record_returned_artifacts(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_row_id: i64,
         refs: &[ReturnedArtifactRef],
     ) -> Result<(), DbError> {
@@ -38,7 +39,12 @@ impl StateDb {
         let identity =
             Self::load_invocation_identity_for_returned_artifacts(&self.conn, invocation_row_id)?;
         Self::validate_returned_artifact_refs(&identity, refs)?;
-        Self::replace_returned_artifact_rows(&self.conn, invocation_row_id, refs)
+        Self::replace_returned_artifact_rows(
+            &self.conn,
+            mutation_authority,
+            invocation_row_id,
+            refs,
+        )
     }
 
     pub(super) fn prepare_returned_artifacts_table(
@@ -131,12 +137,23 @@ impl StateDb {
 
     pub(super) fn replace_returned_artifact_rows(
         conn: &sqlite::Connection,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_row_id: i64,
         refs: &[ReturnedArtifactRef],
     ) -> Result<(), DbError> {
-        let tx = conn
-            .unchecked_transaction()
+        let tx = sqlite::Transaction::new_unchecked(conn, sqlite::TransactionBehavior::Immediate)
             .map_err(Self::format_begin_returned_artifacts_tx_error)?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &tx,
+            invocation_row_id,
+            mutation_authority,
+        )?;
+        super::provider_launch_lifecycle::promote_invocation_effect(
+            &tx,
+            mutation_authority,
+            crate::ProviderLaunchPromotion::ReturnedArtifact,
+            refs.len(),
+        )?;
         tx.execute(
             "DELETE FROM invocation_returned_artifacts WHERE invocation_id = ?1",
             sqlite::params![invocation_row_id],

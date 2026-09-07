@@ -53,16 +53,34 @@ impl StateDb {
     /// last call wins, which matches the multi-call safety semantics.
     pub fn update_session_capture(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         id: i64,
         session_id: Option<&str>,
         method: &str,
     ) -> Result<(), String> {
+        let owner_tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &owner_tx,
+            id,
+            mutation_authority,
+        )?;
+        if session_id.is_some() && method != "resumed" {
+            super::provider_launch_lifecycle::promote_invocation_effect(
+                &owner_tx,
+                mutation_authority,
+                crate::ProviderLaunchPromotion::ProviderSessionObserved,
+                1,
+            )?;
+        }
         let lifecycle_row = self.lifecycle_context_for_row_or_none(id);
         let timer = lc_log_adapter::start_timer();
         let projection = Self::project_session_capture(session_id, method);
         let sql_result =
             self.execute_session_capture_persistence(id, session_id, method, projection);
-        let result = Self::translate_session_capture_result(id, sql_result);
+        let result = Self::translate_session_capture_result(id, sql_result)
+            .and_then(|()| owner_tx.commit().map_err(|error| error.to_string()));
         let context = self.optional_session_context(id, lifecycle_row.as_ref(), session_id, method);
         lc_log_adapter::emit_session_capture(&self.lifecycle_sink, timer, context, &result);
         result

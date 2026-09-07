@@ -835,6 +835,7 @@ fn assert_invalid_authority_matrix_rejects_before_spawn() {
     assert_process_integrity(
         missing_state
             .register_completion_event_with_authority(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 &unrelated.completion_registration_authority,
                 "age328-missing",
                 registration(missing_target, "missing-session"),
@@ -856,13 +857,21 @@ fn assert_invalid_authority_matrix_rejects_before_spawn() {
     let (stale_row_id, stale_authority) =
         start_bound_invocation(&stale_state, stale_owner, "stale-session");
     stale_state
-        .finalize_invocation(stale_row_id, true, 0, None, Some("completed"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            stale_row_id,
+            true,
+            0,
+            None,
+            Some("completed"),
+        )
         .unwrap();
     start_bound_invocation(&stale_state, current_owner, "current-session");
     let mut stale_state = stale_state;
     assert_process_integrity(
         stale_state
             .register_completion_event_with_authority(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 &stale_authority,
                 "stale",
                 registration(current_owner, "current-session"),
@@ -888,6 +897,7 @@ fn assert_invalid_authority_matrix_rejects_before_spawn() {
     assert_process_integrity(
         wrong_invocation_state
             .register_completion_event_with_authority(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 &foreign_authority,
                 "wrong-invocation",
                 registration(registration_owner, "registration-session"),
@@ -903,6 +913,7 @@ fn assert_invalid_authority_matrix_rejects_before_spawn() {
     assert_process_integrity(
         state
             .register_completion_event_with_authority(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 &authority,
                 "wrong-session",
                 registration(owner, "different-session"),
@@ -947,6 +958,7 @@ fn start_bound_invocation(
         .unwrap();
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             started.invocation_row_id,
             &ProviderSessionBinding {
                 provider_session_id: session_id.to_string(),

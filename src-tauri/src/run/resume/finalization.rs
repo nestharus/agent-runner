@@ -144,7 +144,11 @@ fn persist_returned_artifacts(input: &CompletedAttemptInput<'_, '_>) -> Result<(
     input
         .env
         .state
-        .record_returned_artifacts(input.invocation_row_id, &input.result.returned_artifacts)
+        .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            input.invocation_row_id,
+            &input.result.returned_artifacts,
+        )
         .map_err(|err| err.to_string())
 }
 
@@ -156,10 +160,10 @@ fn handle_returned_artifacts_persist_failure(
     input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::returned_artifacts_finalize_request(
-            &input.env.state,
-            input.invocation_row_id,
-        ))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::returned_artifacts_finalize_request(&input.env.state, input.invocation_row_id),
+        )
         .map(|_| ())
         .unwrap_or_else(formatter::emit_finalize_invocation_warning);
     input.guard.mark_finalized();
@@ -219,23 +223,26 @@ pub(super) fn finalize_confirmed_delivery(
 ) -> Result<(), String> {
     let delivery_ids = [settlement.delivery_id.to_string()];
     let acceptance = result.resume_acceptance.as_ref();
-    state.apply_provider_turn_effects(oulipoly_state::ProviderTurnEffectInput {
-        invocation_row_id,
-        delivery_ids: &delivery_ids,
-        accept_delivery_if_missing: true,
-        session_id: settlement.session_id,
-        turn_generation_id: settlement.turn_generation_id,
-        submitted_evidence: Some(settlement.submitted_evidence),
-        confirmed_evidence: Some(settlement.confirmed_evidence),
-        observed_at: settlement.observed_at,
-        returned_artifacts: &result.returned_artifacts,
-        resume_acceptance_status: acceptance.map(|value| value.status.db_value()),
-        resume_acceptance_evidence: acceptance.and_then(|value| value.evidence.as_deref()),
-        success,
-        exit_code: result.exit_code,
-        error_category,
-        terminal_reason,
-    })?;
+    state.apply_provider_turn_effects(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        oulipoly_state::ProviderTurnEffectInput {
+            invocation_row_id,
+            delivery_ids: &delivery_ids,
+            accept_delivery_if_missing: true,
+            session_id: settlement.session_id,
+            turn_generation_id: settlement.turn_generation_id,
+            submitted_evidence: Some(settlement.submitted_evidence),
+            confirmed_evidence: Some(settlement.confirmed_evidence),
+            observed_at: settlement.observed_at,
+            returned_artifacts: &result.returned_artifacts,
+            resume_acceptance_status: acceptance.map(|value| value.status.db_value()),
+            resume_acceptance_evidence: acceptance.and_then(|value| value.evidence.as_deref()),
+            success,
+            exit_code: result.exit_code,
+            error_category,
+            terminal_reason,
+        },
+    )?;
     Ok(())
 }
 

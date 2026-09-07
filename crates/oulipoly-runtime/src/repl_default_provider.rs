@@ -429,14 +429,17 @@ fn finalize_default_provider_spawn_error(
     invocation_row_id: i64,
 ) -> Result<(), String> {
     lifecycle
-        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-            state,
-            invocation_row_id,
-            success: false,
-            exit_code: 1,
-            error_category: Some("spawn_error"),
-            terminal_reason: Some("spawn_error"),
-        })
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            InvocationLifecycleFinalizeRequest {
+                state,
+                invocation_row_id,
+                success: false,
+                exit_code: 1,
+                error_category: Some("spawn_error"),
+                terminal_reason: Some("spawn_error"),
+            },
+        )
         .map(|_| ())
         .map_err(|err| err.to_string())
 }
@@ -447,14 +450,17 @@ fn finalize_default_provider_live_session_error(
     invocation_row_id: i64,
 ) -> Result<(), String> {
     lifecycle
-        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-            state,
-            invocation_row_id,
-            success: false,
-            exit_code: 1,
-            error_category: Some(LIVE_SESSION_IDENTITY_UNAVAILABLE),
-            terminal_reason: Some(LIVE_SESSION_IDENTITY_UNAVAILABLE),
-        })
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            InvocationLifecycleFinalizeRequest {
+                state,
+                invocation_row_id,
+                success: false,
+                exit_code: 1,
+                error_category: Some(LIVE_SESSION_IDENTITY_UNAVAILABLE),
+                terminal_reason: Some(LIVE_SESSION_IDENTITY_UNAVAILABLE),
+            },
+        )
         .map(|_| ())
         .map_err(|err| err.to_string())
 }
@@ -1642,6 +1648,7 @@ turn_script = "{}"
             .unwrap();
         state
             .bind_invocation_provider_session_start(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 invocation_row_id,
                 &ProviderSessionBinding {
                     provider_session_id: SESSION_ID.to_string(),
@@ -1659,6 +1666,7 @@ turn_script = "{}"
 
         state
             .transition_invocation_provider_session_capture_method(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 invocation_row_id,
                 SESSION_ID,
                 crate::executor::cli::PENDING_LIVE_SESSION_CAPTURE_METHOD,

@@ -1445,8 +1445,15 @@ mod tests {
                 parent_invocation_id: None,
             })
             .unwrap();
-        db.finalize_invocation(row_id, false, 1, None, Some("exit_nonzero"))
-            .unwrap();
+        db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            false,
+            1,
+            None,
+            Some("exit_nonzero"),
+        )
+        .unwrap();
         let parent_env = serde_json::to_string(&parent).unwrap();
 
         with_parent_invocation_env(Some(&parent_env), || {

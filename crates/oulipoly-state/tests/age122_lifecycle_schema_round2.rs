@@ -518,8 +518,13 @@ fn session_capture_emits_structured_record_with_invocation_row_id_capture_method
         let invocation_uuid = "12900000-0000-4000-8000-000000000201";
         let row_id = db.start_invocation(&start(invocation_uuid)).unwrap();
 
-        db.update_session_capture(row_id, Some("resume-input-129"), "resumed")
-            .unwrap();
+        db.update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            Some("resume-input-129"),
+            "resumed",
+        )
+        .unwrap();
 
         let records = sink_records(&sink);
         let record = sink_event(&records, "invocation.session_captured", invocation_uuid);
@@ -555,8 +560,15 @@ fn finalize_invocation_emits_structured_record_with_terminal_status_success_exit
         let invocation_uuid = "12900000-0000-4000-8000-000000000301";
         let row_id = db.start_invocation(&start(invocation_uuid)).unwrap();
 
-        db.finalize_invocation(row_id, true, 0, None, Some("done"))
-            .unwrap();
+        db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            true,
+            0,
+            None,
+            Some("done"),
+        )
+        .unwrap();
 
         let records = sink_records(&sink);
         let record = sink_event(&records, "invocation.finalized", invocation_uuid);
@@ -589,8 +601,13 @@ fn error_variants_emit_full_schema_for_start_session_finalize() {
         let session_uuid = "12900000-0000-4000-8000-000000000402";
         let session_row_id = db.start_invocation(&start(session_uuid)).unwrap();
         install_session_failure_trigger(&db);
-        db.update_session_capture(session_row_id, Some("session-err"), "fresh")
-            .unwrap_err();
+        db.update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            session_row_id,
+            Some("session-err"),
+            "fresh",
+        )
+        .unwrap_err();
         rusqlite::Connection::open(db.path())
             .unwrap()
             .execute_batch("DROP TRIGGER age129_fail_session_capture")
@@ -600,6 +617,7 @@ fn error_variants_emit_full_schema_for_start_session_finalize() {
         let finalize_row_id = db.start_invocation(&start(finalize_uuid)).unwrap();
         install_finalize_failure_trigger(&db);
         db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             finalize_row_id,
             false,
             9,
@@ -728,10 +746,22 @@ fn default_lifecycle_sink_noops_without_creating_events_jsonl_or_raw_io_director
     let db = StateDb::open_with_sink(&db_path, Box::new(NoopLifecycleEventSink)).unwrap();
     let invocation_uuid = "12900000-0000-4000-8000-000000000601";
     let row_id = db.start_invocation(&start(invocation_uuid)).unwrap();
-    db.update_session_capture(row_id, Some("session-noop"), "fresh")
-        .unwrap();
-    db.finalize_invocation(row_id, true, 0, None, Some("done"))
-        .unwrap();
+    db.update_session_capture(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        row_id,
+        Some("session-noop"),
+        "fresh",
+    )
+    .unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        row_id,
+        true,
+        0,
+        None,
+        Some("done"),
+    )
+    .unwrap();
 
     assert!(
         !dir.path().join("invocations").join("raw-io").exists(),
@@ -749,7 +779,14 @@ fn memory_lifecycle_records_do_not_construct_raw_io_paths() {
     let memory_uuid = "12900000-0000-4000-8000-000000000602";
     let memory_row_id = memory_db.start_invocation(&start(memory_uuid)).unwrap();
     memory_db
-        .finalize_invocation(memory_row_id, true, 0, None, Some("memory done"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            memory_row_id,
+            true,
+            0,
+            None,
+            Some("memory done"),
+        )
         .unwrap();
     let memory_records = sink_records(&memory_sink);
     let memory_finalize = sink_event(&memory_records, "invocation.finalized", memory_uuid);
@@ -773,20 +810,37 @@ fn lifecycle_method_sink_forward_invoked_with_same_record() {
         db.start_invocation(&start(ok_uuid)).unwrap();
 
         let session_row_id = db.start_invocation(&start(session_uuid)).unwrap();
-        db.update_session_capture(session_row_id, Some("session-ok"), "fresh")
-            .unwrap();
+        db.update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            session_row_id,
+            Some("session-ok"),
+            "fresh",
+        )
+        .unwrap();
 
         let finalize_row_id = db.start_invocation(&start(finalize_uuid)).unwrap();
-        db.finalize_invocation(finalize_row_id, true, 0, None, Some("done"))
-            .unwrap();
+        db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            finalize_row_id,
+            true,
+            0,
+            None,
+            Some("done"),
+        )
+        .unwrap();
 
         db.start_invocation(&start(duplicate_uuid)).unwrap();
         db.start_invocation(&start(duplicate_uuid)).unwrap_err();
 
         let session_err_row_id = db.start_invocation(&start(session_err_uuid)).unwrap();
         install_session_failure_trigger(&db);
-        db.update_session_capture(session_err_row_id, Some("session-err"), "fresh")
-            .unwrap_err();
+        db.update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            session_err_row_id,
+            Some("session-err"),
+            "fresh",
+        )
+        .unwrap_err();
         rusqlite::Connection::open(db.path())
             .unwrap()
             .execute_batch("DROP TRIGGER age129_fail_session_capture")
@@ -794,8 +848,15 @@ fn lifecycle_method_sink_forward_invoked_with_same_record() {
 
         let finalize_err_row_id = db.start_invocation(&start(finalize_err_uuid)).unwrap();
         install_finalize_failure_trigger(&db);
-        db.finalize_invocation(finalize_err_row_id, false, 7, Some("sqlite"), Some("boom"))
-            .unwrap_err();
+        db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            finalize_err_row_id,
+            false,
+            7,
+            Some("sqlite"),
+            Some("boom"),
+        )
+        .unwrap_err();
 
         sink_records(&sink)
     });
@@ -857,8 +918,13 @@ fn update_session_capture_callsite_emits_success_event_preserving_session_column
         let invocation_uuid = "12900000-0000-4000-8000-000000000901";
         let row_id = db.start_invocation(&start(invocation_uuid)).unwrap();
 
-        db.update_session_capture(row_id, Some("session-preserved"), "fresh")
-            .unwrap();
+        db.update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            Some("session-preserved"),
+            "fresh",
+        )
+        .unwrap();
 
         let columns = query_session_columns(&db, row_id);
         assert_eq!(
@@ -893,11 +959,25 @@ fn finalize_invocation_callsite_emits_single_terminal_event_after_commit() {
         let invocation_uuid = "12900000-0000-4000-8000-000000001001";
         let row_id = db.start_invocation(&start(invocation_uuid)).unwrap();
 
-        db.finalize_invocation(row_id, true, 0, None, Some("done"))
-            .unwrap();
+        db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            true,
+            0,
+            None,
+            Some("done"),
+        )
+        .unwrap();
         assert_eq!(invocation_status(&db, row_id), "succeeded");
         let second_err = db
-            .finalize_invocation(row_id, true, 0, None, Some("done again"))
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                row_id,
+                true,
+                0,
+                None,
+                Some("done again"),
+            )
             .unwrap_err();
         assert_eq!(
             second_err,
@@ -954,7 +1034,12 @@ fn lifecycle_method_errors_emit_sqlite_error_records_without_changing_return_err
         let session_row_id = db.start_invocation(&start(session_uuid)).unwrap();
         install_session_failure_trigger(&db);
         let session_err = db
-            .update_session_capture(session_row_id, Some("session-err"), "fresh")
+            .update_session_capture(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                session_row_id,
+                Some("session-err"),
+                "fresh",
+            )
             .unwrap_err();
         assert_eq!(
             session_err,
@@ -972,6 +1057,7 @@ fn lifecycle_method_errors_emit_sqlite_error_records_without_changing_return_err
         install_finalize_failure_trigger(&db);
         let finalize_err = db
             .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 finalize_row_id,
                 false,
                 42,
@@ -1016,6 +1102,7 @@ fn finalize_failed_when_context_lookup_fails_emits_record_with_null_row_id() {
     let ((result, sink_records), traces) = with_trace_capture(|_| {
         let (_dir, _db_path, db, sink) = fixture_db_with_capture();
         let result = db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             missing_row_id,
             false,
             77,

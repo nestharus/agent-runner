@@ -114,9 +114,21 @@ impl Fixture {
     fn seed_incident_state(&self) {
         let db = StateDb::open(&self.db_path()).unwrap();
         let row_id = db.start_invocation(&incident_invocation_start()).unwrap();
-        db.bind_invocation_provider_session_start(row_id, &incident_provider_binding())
-            .unwrap();
-        db.finalize_invocation(row_id, true, 0, None, None).unwrap();
+        db.bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            &incident_provider_binding(),
+        )
+        .unwrap();
+        db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            true,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         drop(db);
         let connection = rusqlite::Connection::open(self.db_path()).unwrap();
         provider_authority_fixture::bind_session_authority_with_cwd(

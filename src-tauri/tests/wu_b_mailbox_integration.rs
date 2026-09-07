@@ -321,6 +321,7 @@ impl Fixture {
             start.completion_registration_authority,
         );
         db.bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             id,
             &ProviderSessionBinding {
                 provider_session_id: provider_session_id.to_string(),
@@ -782,6 +783,7 @@ fn completion_registration_waits_for_live_session_binding() {
         StateDb::open(&state_path)
             .unwrap()
             .bind_invocation_provider_session_start(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 invocation_row_id,
                 &ProviderSessionBinding {
                     provider_session_id: SESSION_A.to_string(),

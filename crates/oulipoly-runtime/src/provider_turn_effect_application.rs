@@ -84,23 +84,26 @@ pub(crate) fn apply_provider_turn_effects_exact(
         .as_ref()
         .and_then(|result| result.resume_acceptance.as_ref());
     let write = state
-        .apply_provider_turn_effects(ProviderTurnEffectInput {
-            invocation_row_id: invocation.id,
-            delivery_ids: &launch.mailbox_batch.delivery_ids,
-            accept_delivery_if_missing: false,
-            session_id: &launch.mailbox_batch.session_id,
-            turn_generation_id: &fence.generation_id,
-            submitted_evidence,
-            confirmed_evidence,
-            observed_at,
-            returned_artifacts: artifacts,
-            resume_acceptance_status: acceptance.map(|value| value.status.db_value()),
-            resume_acceptance_evidence: acceptance.and_then(|value| value.evidence.as_deref()),
-            success,
-            exit_code,
-            error_category,
-            terminal_reason,
-        })
+        .apply_provider_turn_effects(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            ProviderTurnEffectInput {
+                invocation_row_id: invocation.id,
+                delivery_ids: &launch.mailbox_batch.delivery_ids,
+                accept_delivery_if_missing: false,
+                session_id: &launch.mailbox_batch.session_id,
+                turn_generation_id: &fence.generation_id,
+                submitted_evidence,
+                confirmed_evidence,
+                observed_at,
+                returned_artifacts: artifacts,
+                resume_acceptance_status: acceptance.map(|value| value.status.db_value()),
+                resume_acceptance_evidence: acceptance.and_then(|value| value.evidence.as_deref()),
+                success,
+                exit_code,
+                error_category,
+                terminal_reason,
+            },
+        )
         .map_err(ProviderTurnAdapterError::State)?;
     let acknowledgement = if submitted_evidence.is_none() && confirmed_evidence.is_none() {
         EffectWrite::NotApplicable

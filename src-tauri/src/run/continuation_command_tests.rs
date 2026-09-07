@@ -166,10 +166,16 @@ fn execute(
                 Some(ORIGIN_SESSION_ID),
             );
             observation_state
-                .update_resume_acceptance(row_id, "accepted", Some("matched origin session"))
+                .update_resume_acceptance(
+                    oulipoly_state::InvocationMutationAuthority::Standalone,
+                    row_id,
+                    "accepted",
+                    Some("matched origin session"),
+                )
                 .unwrap();
             observation_state
                 .finalize_invocation(
+                    oulipoly_state::InvocationMutationAuthority::Standalone,
                     row_id,
                     false,
                     0,
@@ -194,7 +200,14 @@ fn execute(
                 None,
             );
             observation_state
-                .finalize_invocation(row_id, true, 0, None, None)
+                .finalize_invocation(
+                    oulipoly_state::InvocationMutationAuthority::Standalone,
+                    row_id,
+                    true,
+                    0,
+                    None,
+                    None,
+                )
                 .unwrap();
             Ok(())
         },
@@ -304,6 +317,7 @@ fn bind_session(
 ) {
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             row_id,
             &ProviderSessionBinding {
                 provider_session_id: session_id.to_string(),

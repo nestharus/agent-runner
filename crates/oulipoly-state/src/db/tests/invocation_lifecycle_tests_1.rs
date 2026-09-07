@@ -62,6 +62,7 @@ fn running_invocation_provider_session_id() {
     let provider_session_id = Uuid::new_v4().to_string();
 
     db.bind_invocation_provider_session_start(
+        crate::InvocationMutationAuthority::Standalone,
         id,
         &ProviderSessionBinding {
             provider_session_id: provider_session_id.clone(),
@@ -95,6 +96,7 @@ fn running_invocation_chain_minted() {
     let provider_session_id = Uuid::new_v4().to_string();
 
     db.bind_invocation_provider_session_start(
+        crate::InvocationMutationAuthority::Standalone,
         id,
         &ProviderSessionBinding {
             provider_session_id: provider_session_id.clone(),
@@ -124,10 +126,18 @@ fn bind_invocation_provider_session_start_same_id_is_idempotent() {
         provider_session_resolved_account: None,
     };
 
-    db.bind_invocation_provider_session_start(id, &binding)
-        .unwrap();
-    db.bind_invocation_provider_session_start(id, &binding)
-        .unwrap();
+    db.bind_invocation_provider_session_start(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        &binding,
+    )
+    .unwrap();
+    db.bind_invocation_provider_session_start(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        &binding,
+    )
+    .unwrap();
 
     assert_eq!(segment_count(&db), 1);
     assert!(
@@ -141,10 +151,19 @@ fn bind_invocation_provider_session_start_same_id_is_idempotent() {
 fn bind_invocation_provider_session_start_rejects_terminal_invocation() {
     let db = test_db();
     let id = seed_running_invocation(&db);
-    db.finalize_invocation(id, true, 0, None, None).unwrap();
+    db.finalize_invocation(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        true,
+        0,
+        None,
+        None,
+    )
+    .unwrap();
 
     let err = db
         .bind_invocation_provider_session_start(
+            crate::InvocationMutationAuthority::Standalone,
             id,
             &ProviderSessionBinding {
                 provider_session_id: Uuid::new_v4().to_string(),
@@ -166,6 +185,7 @@ fn bind_invocation_provider_session_start_conflicting_rebind_rejects_without_mut
     let id = seed_running_invocation(&db);
     let provider_session_id = Uuid::new_v4().to_string();
     db.bind_invocation_provider_session_start(
+        crate::InvocationMutationAuthority::Standalone,
         id,
         &ProviderSessionBinding {
             provider_session_id: provider_session_id.clone(),
@@ -179,6 +199,7 @@ fn bind_invocation_provider_session_start_conflicting_rebind_rejects_without_mut
 
     let err = db
         .bind_invocation_provider_session_start(
+            crate::InvocationMutationAuthority::Standalone,
             id,
             &ProviderSessionBinding {
                 provider_session_id: Uuid::new_v4().to_string(),
@@ -205,6 +226,7 @@ fn bind_invocation_provider_session_start_matching_resume_input_does_not_mint_du
     let provider_session_id = Uuid::new_v4().to_string();
 
     db.bind_invocation_provider_session_start(
+        crate::InvocationMutationAuthority::Standalone,
         id,
         &ProviderSessionBinding {
             provider_session_id: provider_session_id.clone(),
@@ -234,12 +256,24 @@ fn bind_then_record_legacy_then_rebind_preserves_legacy_resume_session_id() {
         provider_session_resolved_account: None,
     };
 
-    db.bind_invocation_provider_session_start(id, &binding)
-        .unwrap();
-    db.record_legacy_resume_input_session_id(id, &legacy_resume_input)
-        .unwrap();
-    db.bind_invocation_provider_session_start(id, &binding)
-        .unwrap();
+    db.bind_invocation_provider_session_start(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        &binding,
+    )
+    .unwrap();
+    db.record_legacy_resume_input_session_id(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        &legacy_resume_input,
+    )
+    .unwrap();
+    db.bind_invocation_provider_session_start(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        &binding,
+    )
+    .unwrap();
 
     let row = invocation_session_provider_resume_ids(&db, id);
     assert_eq!(row.0.as_deref(), Some(legacy_resume_input.as_str()));
@@ -300,6 +334,7 @@ fn assert_operation_waits_for_competing_writer(
 fn provider_session_binding_waits_for_competing_writer() {
     assert_operation_waits_for_competing_writer(|db, id| {
         db.bind_invocation_provider_session_start(
+            crate::InvocationMutationAuthority::Standalone,
             id,
             &ProviderSessionBinding {
                 provider_session_id: Uuid::new_v4().to_string(),
@@ -314,6 +349,13 @@ fn provider_session_binding_waits_for_competing_writer() {
 #[test]
 fn invocation_finalization_waits_for_competing_writer() {
     assert_operation_waits_for_competing_writer(|db, id| {
-        db.finalize_invocation(id, true, 0, None, Some("completed"))
+        db.finalize_invocation(
+            crate::InvocationMutationAuthority::Standalone,
+            id,
+            true,
+            0,
+            None,
+            Some("completed"),
+        )
     });
 }

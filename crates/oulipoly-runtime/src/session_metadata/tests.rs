@@ -119,10 +119,20 @@ fn state_with_model_session(model: &ModelConfig, provider_name: &str, session_id
             parent_invocation_id: None,
         })
         .unwrap();
-    db.update_session_capture(invocation_id, Some(session_id), "fixture")
-        .unwrap();
-    db.mint_chain_for_invocation_session(invocation_id).unwrap();
+    db.update_session_capture(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+        Some(session_id),
+        "fixture",
+    )
+    .unwrap();
+    db.mint_chain_for_invocation_session(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+    )
+    .unwrap();
     db.commit_finalized_provider_session_authority(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         invocation_id,
         &FinalizedProviderSessionAuthority {
             provider_session_id: session_id,
@@ -449,6 +459,7 @@ fn seed_provider_session_resolved_account(
         })
         .unwrap();
     db.bind_invocation_provider_session_start(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         invocation_row_id,
         &ProviderSessionBinding {
             provider_session_id: session_id.to_string(),

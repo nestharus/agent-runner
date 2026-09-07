@@ -31,6 +31,7 @@ pub struct ProviderTurnEffectWrite {
 impl StateDb {
     pub fn apply_provider_turn_effects(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         input: ProviderTurnEffectInput<'_>,
     ) -> Result<ProviderTurnEffectWrite, String> {
         Self::prepare_returned_artifacts_table(&self.conn)?;
@@ -43,7 +44,8 @@ impl StateDb {
         let lifecycle_row = self.lifecycle_context_for_row_or_none(input.invocation_row_id);
         let timer = lc_log_adapter::start_timer();
         let finished_at = Self::current_rfc3339_timestamp();
-        let transaction_result = self.apply_provider_turn_effects_transaction(&input, &finished_at);
+        let transaction_result =
+            self.apply_provider_turn_effects_transaction(mutation_authority, &input, &finished_at);
 
         match transaction_result {
             Ok((invocation, acknowledgement)) => {
@@ -82,12 +84,40 @@ impl StateDb {
 
     fn apply_provider_turn_effects_transaction(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         input: &ProviderTurnEffectInput<'_>,
         finished_at: &str,
     ) -> Result<(FinalizeInvocationRow, AcknowledgementWrite), String> {
         let tx =
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
                 .map_err(Self::format_begin_transaction_error)?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &tx,
+            input.invocation_row_id,
+            mutation_authority,
+        )?;
+        super::provider_launch_lifecycle::promote_invocation_effect(
+            &tx,
+            mutation_authority,
+            crate::ProviderLaunchPromotion::ReturnedArtifact,
+            input.returned_artifacts.len(),
+        )?;
+        if input.resume_acceptance_status == Some("accepted") {
+            super::provider_launch_lifecycle::promote_invocation_effect(
+                &tx,
+                mutation_authority,
+                crate::ProviderLaunchPromotion::PromptAccepted,
+                1,
+            )?;
+        }
+        if input.submitted_evidence.is_some() {
+            super::provider_launch_lifecycle::promote_invocation_effect(
+                &tx,
+                mutation_authority,
+                crate::ProviderLaunchPromotion::MailboxSubmissionAccepted,
+                1,
+            )?;
+        }
         let mut acknowledgement = AcknowledgementWrite::AlreadyRecorded;
 
         for delivery_id in input.delivery_ids {

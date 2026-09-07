@@ -107,7 +107,11 @@ fn schema_18_migration_installs_the_running_projection_index() {
     let mut connection = Connection::open(&db_path).unwrap();
     connection
         .execute_batch(
-            "DROP INDEX idx_session_turns_canonical_text_sha256;
+            "PRAGMA foreign_keys=OFF;
+             DROP TABLE provider_launch_transition_replays;
+             DROP TABLE provider_logical_launches;
+             DROP TABLE provider_launch_attempts;
+             DROP INDEX idx_session_turns_canonical_text_sha256;
              DROP TABLE session_turn_ingest_streams;
              ALTER TABLE session_turns DROP COLUMN canonical_text_digest_verified;
              ALTER TABLE session_turns DROP COLUMN canonical_text_sha256;
@@ -304,6 +308,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             19,
             20,
             21,
+            22,
             CURRENT_SCHEMA_VERSION,
         ],
         "schema-4 DBs must take every ordered migration through the current schema"
@@ -329,6 +334,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0020_session_turn_pages",
             "0021_invocation_output_delivery",
             "0022_provider_session_authority",
+            "0023_provider_launch_lifecycle",
         ]
     );
 }

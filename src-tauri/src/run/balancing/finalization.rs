@@ -460,10 +460,10 @@ fn finalize_returned_artifacts_failure_lifecycle(
     input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::returned_artifacts_finalize_request(
-            &input.env.state,
-            input.invocation_row_id,
-        ))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::returned_artifacts_finalize_request(&input.env.state, input.invocation_row_id),
+        )
         .map(|_| ())
 }
 

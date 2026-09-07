@@ -163,12 +163,21 @@ fn source_invocation_start(model: &ModelConfig) -> InvocationStart {
 }
 
 fn capture_source_session(db: &StateDb, invocation_id: i64) {
-    db.update_session_capture(invocation_id, Some(SESSION_ID), "fixture")
-        .unwrap();
+    db.update_session_capture(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+        Some(SESSION_ID),
+        "fixture",
+    )
+    .unwrap();
 }
 
 fn mint_source_chain(db: &StateDb, invocation_id: i64) {
-    db.mint_chain_for_invocation_session(invocation_id).unwrap();
+    db.mint_chain_for_invocation_session(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+    )
+    .unwrap();
 }
 
 fn model_store_for_fixture(model: &ModelConfig) -> ModelStore {

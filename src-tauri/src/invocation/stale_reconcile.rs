@@ -230,6 +230,7 @@ fn process_identity_matches_row(identity: &ProcessIdentity, row: &PidIdentityRow
 
 fn finalize_stale_invocation(state: &StateDb, row_id: i64) -> Result<(), String> {
     match state.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         row_id,
         false,
         -1,

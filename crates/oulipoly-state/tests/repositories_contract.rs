@@ -105,17 +105,35 @@ fn invocation_repository_delegates_invocation_lifecycle_methods() {
     assert_eq!(trait_record.status, InvocationStatus::Running);
 
     direct_db
-        .update_session_capture(direct_id, Some("sess-direct"), "forced_flag_verified")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            direct_id,
+            Some("sess-direct"),
+            "forced_flag_verified",
+        )
         .unwrap();
     direct_db
-        .update_resume_acceptance(direct_id, "accepted", Some("direct evidence"))
+        .update_resume_acceptance(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            direct_id,
+            "accepted",
+            Some("direct evidence"),
+        )
         .unwrap();
     direct_db
-        .finalize_invocation(direct_id, true, 0, None, Some("done"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            direct_id,
+            true,
+            0,
+            None,
+            Some("done"),
+        )
         .unwrap();
 
     <StateDb as InvocationRepository>::update_session_capture(
         &trait_db,
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         &trait_start.invocation_uuid,
         Some("sess-trait"),
         "forced_flag_verified",
@@ -123,6 +141,7 @@ fn invocation_repository_delegates_invocation_lifecycle_methods() {
     .unwrap();
     <StateDb as InvocationRepository>::update_resume_acceptance(
         &trait_db,
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         &trait_start.invocation_uuid,
         "accepted",
         Some("trait evidence"),
@@ -130,6 +149,7 @@ fn invocation_repository_delegates_invocation_lifecycle_methods() {
     .unwrap();
     <StateDb as InvocationRepository>::finalize_invocation(
         &trait_db,
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         &trait_start.invocation_uuid,
         InvocationStatus::Succeeded,
         0,
@@ -193,8 +213,15 @@ fn provider_routing_repository_delegates_provider_quota_and_turn_reads() {
     let db = memory_db();
     let start = start_fixture("claude");
     let row_id = db.start_invocation(&start).unwrap();
-    db.finalize_invocation(row_id, false, 2, Some("quota"), Some("quota exhausted"))
-        .unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        row_id,
+        false,
+        2,
+        Some("quota"),
+        Some("quota exhausted"),
+    )
+    .unwrap();
     db.upsert_quota_refresh(
         "claude",
         &[QuotaWindowInput {
@@ -653,6 +680,7 @@ fn lifecycle_emission_does_not_break_existing_rows() {
 
     <StateDb as InvocationRepository>::update_session_capture(
         &db,
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         &parent.invocation_uuid,
         Some("lifecycle-preserved-session"),
         "forced_flag_verified",
@@ -660,6 +688,7 @@ fn lifecycle_emission_does_not_break_existing_rows() {
     .unwrap();
     <StateDb as InvocationRepository>::finalize_invocation(
         &db,
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         &parent.invocation_uuid,
         InvocationStatus::Succeeded,
         0,

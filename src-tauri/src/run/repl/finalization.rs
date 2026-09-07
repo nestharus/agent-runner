@@ -95,10 +95,10 @@ pub(super) fn finalize_spawn_error(
 ) -> Result<i32, String> {
     agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::spawn_error_finalize_request(
-            &env.state,
-            invocation_row_id,
-        ))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::spawn_error_finalize_request(&env.state, invocation_row_id),
+        )
         .map_err(|err| err.to_string())?;
     guard.mark_finalized();
     Ok(1)

@@ -489,7 +489,14 @@ fn validated_store_acceptance_binds_historical_authority_to_every_exact_identity
         .expect("query origin invocation")
         .expect("origin invocation row");
     state
-        .finalize_invocation(origin_row.id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            origin_row.id,
+            true,
+            0,
+            None,
+            None,
+        )
         .expect("historical authority must not require a running origin");
     assert_eq!(
         state

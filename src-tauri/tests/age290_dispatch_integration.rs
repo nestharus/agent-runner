@@ -135,7 +135,14 @@ impl ContinuationFixture {
             &worktree,
         );
         state
-            .finalize_invocation(origin_row_id, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                origin_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         seed_session_turn(&state, "resume-provider", ORIGIN_SESSION_ID, "origin-turn");
         drop(state);
@@ -318,7 +325,14 @@ impl LegacyResumeFixture {
             None,
         );
         state
-            .finalize_invocation(parent_row_id, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                parent_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         let interactive_origin_row_id = start_invocation(
             &state,
@@ -337,7 +351,14 @@ impl LegacyResumeFixture {
             &project,
         );
         state
-            .finalize_invocation(interactive_origin_row_id, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                interactive_origin_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         seed_session_turn(
             &state,
@@ -1163,6 +1184,7 @@ fn bind_provider_session(
 ) {
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             row_id,
             &ProviderSessionBinding {
                 provider_session_id: session_id.to_string(),

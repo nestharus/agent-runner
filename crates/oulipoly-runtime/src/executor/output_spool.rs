@@ -153,6 +153,7 @@ impl ExecutionOutputSpool {
                 .expect("sealed output spool has a summary")
         };
         state.record_invocation_output_pending(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_id,
             invocation_uuid,
             &paths,
@@ -641,7 +642,14 @@ mod tests {
         );
 
         state
-            .finalize_invocation(invocation_id, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                invocation_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .expect("settle provider outcome");
         assert_eq!(
             output_states(&state, invocation_id),
@@ -649,6 +657,7 @@ mod tests {
         );
         state
             .mark_invocation_output_delivery_failed(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 invocation_id,
                 "stdout_flush",
                 "broken_pipe",
@@ -664,7 +673,10 @@ mod tests {
             [0, 1, 255]
         );
         state
-            .mark_invocation_output_delivered(invocation_id)
+            .mark_invocation_output_delivered(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                invocation_id,
+            )
             .expect("settle delivery");
         assert_eq!(
             output_states(&state, invocation_id),

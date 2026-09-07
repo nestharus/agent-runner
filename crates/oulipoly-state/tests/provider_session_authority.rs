@@ -43,10 +43,18 @@ fn finalized_capture_commits_invocation_segment_and_endpoint_authority_together(
             parent_invocation_id: None,
         })
         .unwrap();
-    db.finalize_invocation(invocation_id, true, 0, None, None)
-        .unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+        true,
+        0,
+        None,
+        None,
+    )
+    .unwrap();
 
     db.commit_finalized_provider_session_authority(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         invocation_id,
         &FinalizedProviderSessionAuthority {
             provider_session_id: "session-a",
@@ -74,6 +82,7 @@ fn finalized_capture_commits_invocation_segment_and_endpoint_authority_together(
 
     let error = db
         .commit_finalized_provider_session_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_id,
             &FinalizedProviderSessionAuthority {
                 provider_session_id: "session-a",

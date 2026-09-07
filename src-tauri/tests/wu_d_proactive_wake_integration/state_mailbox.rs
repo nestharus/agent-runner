@@ -94,6 +94,7 @@ impl Fixture {
         let invocation_id = invocation_start.invocation_row_id;
         state
             .bind_invocation_provider_session_start(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 invocation_id,
                 &ProviderSessionBinding {
                     provider_session_id: session_id.to_string(),
@@ -152,6 +153,7 @@ impl Fixture {
         write_seed_mailbox_artifacts(&artifacts, event_id);
         state
             .register_completion_event_with_authority(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 &invocation_start.completion_registration_authority,
                 &format!("proactive-wake:{event_id}:owner:{invocation_uuid}"),
                 CompletionEventRegistrationInput {

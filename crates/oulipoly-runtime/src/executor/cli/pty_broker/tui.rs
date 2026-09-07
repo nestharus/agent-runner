@@ -8573,7 +8573,14 @@ mod tests {
             Some(root_id),
         );
         state
-            .finalize_invocation(ancestor_id, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                ancestor_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         start_monitor_invocation(
             &state,
@@ -8586,7 +8593,16 @@ mod tests {
                 &format!("34000000-0000-0000-0000-{index:012}"),
                 Some(root_id),
             );
-            state.finalize_invocation(id, true, 0, None, None).unwrap();
+            state
+                .finalize_invocation(
+                    oulipoly_state::InvocationMutationAuthority::Standalone,
+                    id,
+                    true,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
         }
         let unrelated_root =
             start_monitor_invocation(&state, "35000000-0000-0000-0000-000000000000", None);

@@ -43,13 +43,16 @@ pub(in crate::run::balancing) fn handle_maybe_quota_verify(
         .typed
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::maybe_quota_finalize_request(
-            &input.typed.env.state,
-            input.typed.invocation_row_id,
-            input.typed.result.exit_code,
-            confirmed,
-            terminal_reason,
-        ));
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::maybe_quota_finalize_request(
+                &input.typed.env.state,
+                input.typed.invocation_row_id,
+                input.typed.result.exit_code,
+                confirmed,
+                terminal_reason,
+            ),
+        );
     match finalize_result {
         Ok(_) => input.typed.guard.mark_finalized(),
         Err(err) => formatter::emit_finalize_invocation_warning(err),

@@ -40,10 +40,16 @@ fn agent_session_chain_records_initial_reason_even_if_ingestion_minted_first() {
             parent_invocation_id: None,
         })
         .unwrap();
-    db.update_session_capture(id, Some(SESSION_A), "fixture")
-        .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        Some(SESSION_A),
+        "fixture",
+    )
+    .unwrap();
 
-    db.mint_chain_for_invocation_session(id).unwrap();
+    db.mint_chain_for_invocation_session(crate::InvocationMutationAuthority::Standalone, id)
+        .unwrap();
 
     let reason = chain_segment_transition_reason(&db, "provider-a", SESSION_A);
     assert_eq!(reason, "initial");

@@ -183,9 +183,11 @@ impl InvocationLifecycleServicePort for ProductionInvocationLifecycleService {
 
     fn finalize_invocation(
         &self,
+        mutation_authority: oulipoly_state::InvocationMutationAuthority<'_>,
         request: InvocationLifecycleFinalizeRequest<'_>,
     ) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
         map_invocation_finalize_result(request.state.finalize_invocation_typed(
+            mutation_authority,
             request.invocation_row_id,
             request.success,
             request.exit_code,
@@ -208,6 +210,7 @@ impl ResumeServicePort for ProductionResumeService {
         request: ResumeAcceptanceRequest<'_>,
     ) -> Result<ResumeAcceptanceOutput, ServiceError> {
         map_resume_acceptance_result(request.state.update_resume_acceptance(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             request.invocation_row_id,
             request.status,
             request.evidence,

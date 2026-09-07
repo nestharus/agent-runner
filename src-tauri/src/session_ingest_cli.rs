@@ -256,7 +256,10 @@ fn mint_known_session_chain_if_needed(
 }
 
 fn mint_known_session_chain(state: &StateDb, invocation_row_id: i64) -> Result<(), String> {
-    state.mint_chain_for_invocation_session(invocation_row_id)
+    state.mint_chain_for_invocation_session(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_row_id,
+    )
 }
 
 fn emit_known_session_chain_warning(err: &str) {
@@ -385,7 +388,14 @@ mod tests {
                 })
                 .expect("start invocation");
             self.state
-                .finalize_invocation(row_id, true, 0, None, Some("completed"))
+                .finalize_invocation(
+                    oulipoly_state::InvocationMutationAuthority::Standalone,
+                    row_id,
+                    true,
+                    0,
+                    None,
+                    Some("completed"),
+                )
                 .expect("finalize invocation");
             row_id
         }
@@ -596,7 +606,12 @@ fn update_known_session_capture(
     session_id: Option<&str>,
     capture_method: &str,
 ) -> Result<(), String> {
-    state.update_session_capture(invocation_row_id, session_id, capture_method)
+    state.update_session_capture(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_row_id,
+        session_id,
+        capture_method,
+    )
 }
 
 fn should_mint_known_session_chain(record: Option<&InvocationRecord>) -> bool {

@@ -323,18 +323,31 @@ impl StateDb {
 
     pub fn record_legacy_resume_input_session_id(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         id: i64,
         resume_input_id: &str,
     ) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE invocations
+        let owner_tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &owner_tx,
+            id,
+            mutation_authority,
+        )?;
+        let result: Result<(), String> = {
+            self.conn
+                .execute(
+                    "UPDATE invocations
                  SET session_id = ?1
                  WHERE id = ?2 AND session_capture_method = 'resumed'",
-                sqlite::params![resume_input_id, id],
-            )
-            .map_err(|err| Self::format_legacy_resume_session_update_error(id, err))?;
-        Ok(())
+                    sqlite::params![resume_input_id, id],
+                )
+                .map_err(|err| Self::format_legacy_resume_session_update_error(id, err))?;
+            Ok(())
+        };
+        result?;
+        owner_tx.commit().map_err(|e| e.to_string())
     }
 
     fn format_legacy_resume_session_update_error(id: i64, err: sqlite::Error) -> String {
@@ -343,20 +356,41 @@ impl StateDb {
 
     pub fn update_resume_acceptance(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         id: i64,
         status: &str,
         evidence: Option<&str>,
     ) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE invocations
+        let owner_tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &owner_tx,
+            id,
+            mutation_authority,
+        )?;
+        if status == "accepted" {
+            super::provider_launch_lifecycle::promote_invocation_effect(
+                &owner_tx,
+                mutation_authority,
+                crate::ProviderLaunchPromotion::PromptAccepted,
+                1,
+            )?;
+        }
+        let result: Result<(), String> = {
+            self.conn
+                .execute(
+                    "UPDATE invocations
                  SET resume_acceptance_status = ?1,
                      resume_acceptance_evidence = ?2
                  WHERE id = ?3",
-                sqlite::params![status, evidence, id],
-            )
-            .map_err(|err| Self::format_resume_acceptance_update_error(id, err))?;
-        Ok(())
+                    sqlite::params![status, evidence, id],
+                )
+                .map_err(|err| Self::format_resume_acceptance_update_error(id, err))?;
+            Ok(())
+        };
+        result?;
+        owner_tx.commit().map_err(|e| e.to_string())
     }
 
     pub(super) fn format_resume_acceptance_update_error(id: i64, err: sqlite::Error) -> String {

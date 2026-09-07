@@ -99,8 +99,15 @@ prompt_mode = "arg"
                 parent_invocation_id: None,
             })
             .unwrap();
-        db.finalize_invocation(root_id, true, 0, None, None)
-            .unwrap();
+        db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            true,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
 
         let child_id = db
             .start_invocation(&InvocationStart {
@@ -112,6 +119,7 @@ prompt_mode = "arg"
             })
             .unwrap();
         db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             child_id,
             false,
             7,

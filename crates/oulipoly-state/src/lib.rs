@@ -316,3 +316,13 @@ mod age160_root_reexport_tests {
         );
     }
 }
+
+pub use db::{
+    BeginProviderLaunchRequest, InvocationMutationAuthority, ProviderLaunchActorSettlement,
+    ProviderLaunchAttemptAllocation, ProviderLaunchCandidate, ProviderLaunchChannelSettlement,
+    ProviderLaunchCustodyProof, ProviderLaunchEndpoint, ProviderLaunchFailureRecord,
+    ProviderLaunchLease, ProviderLaunchOwnerFence, ProviderLaunchPromotion,
+    ProviderLaunchRecoveryDisposition, ProviderLaunchStartMode, ProviderLaunchTerminalResult,
+    RotatableLaunchFailureKind,
+};
+pub use db::{ProviderLaunchRecoveryJoin, ProviderLaunchRequestIdentity};

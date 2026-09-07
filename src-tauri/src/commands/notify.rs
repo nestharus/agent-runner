@@ -241,11 +241,20 @@ fn register_completion_event(
         rc_path: &paths.rc_path,
     };
     if args.repair_admitted {
-        state.repair_admitted_completion_event(&admission_id, registration)
+        state.repair_admitted_completion_event(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            &admission_id,
+            registration,
+        )
     } else {
         let authority =
             oulipoly_state::CompletionRegistrationAuthority::from_process_environment()?;
-        state.register_completion_event_with_authority(&authority, &admission_id, registration)
+        state.register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            &authority,
+            &admission_id,
+            registration,
+        )
     }
 }
 
@@ -583,6 +592,7 @@ fn bind_verified_live_owner_session(
     owner: &OwnerBinding,
 ) -> Result<(), String> {
     state.bind_invocation_provider_session_start(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         record.id,
         &oulipoly_state::ProviderSessionBinding {
             provider_session_id: owner.session_id.clone(),

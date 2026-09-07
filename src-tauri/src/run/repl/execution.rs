@@ -173,8 +173,12 @@ pub(super) fn clear_repl_session_capture_for_unpinned(
     resume: Option<&str>,
 ) -> Result<(), String> {
     if repl_session_capture_is_unpinned(resume) {
-        env.state
-            .update_session_capture(invocation_row_id, None, "none")?;
+        env.state.update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            None,
+            "none",
+        )?;
     }
     Ok(())
 }
@@ -293,6 +297,7 @@ pub(super) fn bind_repl_resume_session(
         return Ok(());
     };
     env.state.bind_invocation_provider_session_start(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         invocation_row_id,
         &mapper::resumed_provider_session_binding(active_session_id, resume.map(str::to_string)),
     )?;
@@ -315,6 +320,7 @@ fn record_repl_legacy_resume_input(
     resume: Option<&str>,
 ) -> Result<(), String> {
     env.state.record_legacy_resume_input_session_id(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         invocation_row_id,
         resume.expect("resume checked before recording legacy input"),
     )

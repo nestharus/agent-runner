@@ -90,7 +90,7 @@ impl CompletionRegistrationAuthority {
         completion_registration_authority_digest(&self.secret)
     }
 
-    fn generate() -> Result<Self, String> {
+    pub fn generate() -> Result<Self, String> {
         let mut bytes = [0_u8; 32];
         getrandom::getrandom(&mut bytes).map_err(|error| {
             format!("Failed to generate completion registration authority: {error}")
@@ -257,7 +257,21 @@ impl StateDb {
         started_at: &str,
         completion_registration_capability_digest: Option<&str>,
     ) -> Result<i64, sqlite::Error> {
-        self.conn.execute(
+        Self::insert_invocation_start_on(
+            &self.conn,
+            start,
+            started_at,
+            completion_registration_capability_digest,
+        )
+    }
+
+    pub(super) fn insert_invocation_start_on(
+        conn: &sqlite::Connection,
+        start: &InvocationStart,
+        started_at: &str,
+        completion_registration_capability_digest: Option<&str>,
+    ) -> Result<i64, sqlite::Error> {
+        conn.execute(
             "INSERT INTO invocations (
                     invocation_uuid,
                     model_name,
@@ -284,7 +298,7 @@ impl StateDb {
                 completion_registration_capability_digest,
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
     }
 
     pub(super) fn warn_invocation_artifact_for_start_result(

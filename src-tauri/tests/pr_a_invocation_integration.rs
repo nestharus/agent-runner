@@ -388,6 +388,7 @@ fn nested_agent_bash_rejects_unattested_synthetic_completion_owner() {
         .unwrap();
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             started.invocation_row_id,
             &ProviderSessionBinding {
                 provider_session_id: owner_session_id.to_string(),
@@ -608,8 +609,15 @@ exit 7"#
     ));
     let child_id = seed_running_child_for_first_parent(&fixture, child_uuid);
     let db = fixture.open_db();
-    db.finalize_invocation(child_id, false, 7, None, Some("exit_nonzero"))
-        .unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        child_id,
+        false,
+        7,
+        None,
+        Some("exit_nonzero"),
+    )
+    .unwrap();
 
     let output = fixture.run(None);
 

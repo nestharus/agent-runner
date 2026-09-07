@@ -255,6 +255,7 @@ fn seed_terminal_fresh(state: &StateDb, invocation_uuid: &str, parent_row_id: i6
     let row_id = start_invocation(state, invocation_uuid, Some(parent_row_id));
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             row_id,
             &ProviderSessionBinding {
                 provider_session_id: FRESH_SESSION_ID.to_string(),
@@ -265,7 +266,14 @@ fn seed_terminal_fresh(state: &StateDb, invocation_uuid: &str, parent_row_id: i6
         )
         .unwrap();
     state
-        .finalize_invocation(row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap();
 }
 

@@ -200,8 +200,15 @@ fn record_invocation(
         parent_invocation_id: None,
     };
     let id = db.start_invocation(&start).unwrap();
-    db.finalize_invocation(id, success, if success { 0 } else { 1 }, None, None)
-        .unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        id,
+        success,
+        if success { 0 } else { 1 },
+        None,
+        None,
+    )
+    .unwrap();
 }
 
 #[derive(Clone, Debug)]

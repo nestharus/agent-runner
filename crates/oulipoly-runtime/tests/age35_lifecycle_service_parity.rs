@@ -157,6 +157,7 @@ fn state_with_completion_obligations(
     let invocation_row_id = invocation_start.invocation_row_id;
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_row_id,
             &ProviderSessionBinding {
                 provider_session_id: session_id.to_string(),
@@ -169,6 +170,7 @@ fn state_with_completion_obligations(
     for event_id in event_ids {
         state
             .register_completion_event_with_authority(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 &invocation_start.completion_registration_authority,
                 &format!("{event_id}-admission"),
                 CompletionEventRegistrationInput {
@@ -253,6 +255,7 @@ fn age_35_production_lifecycle_service_finalize_matches_direct_state_db_finalize
 
     direct_db
         .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             direct_row_id,
             false,
             7,
@@ -261,14 +264,17 @@ fn age_35_production_lifecycle_service_finalize_matches_direct_state_db_finalize
         )
         .unwrap();
     service
-        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-            state: &service_db,
-            invocation_row_id: service_row_id,
-            success: false,
-            exit_code: 7,
-            error_category: Some("quota_exhausted"),
-            terminal_reason: Some("exit_nonzero"),
-        })
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            InvocationLifecycleFinalizeRequest {
+                state: &service_db,
+                invocation_row_id: service_row_id,
+                success: false,
+                exit_code: 7,
+                error_category: Some("quota_exhausted"),
+                terminal_reason: Some("exit_nonzero"),
+            },
+        )
         .unwrap();
 
     assert_eq!(
@@ -284,36 +290,52 @@ fn age_35_production_lifecycle_service_finalize_matches_direct_state_db_finalize
 
     assert!(
         direct_db
-            .finalize_invocation(99_999, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                99_999,
+                true,
+                0,
+                None,
+                None
+            )
             .is_err()
     );
-    assert_dependency_error(
-        service.finalize_invocation(InvocationLifecycleFinalizeRequest {
+    assert_dependency_error(service.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        InvocationLifecycleFinalizeRequest {
             state: &service_db,
             invocation_row_id: 99_999,
             success: true,
             exit_code: 0,
             error_category: None,
             terminal_reason: None,
-        }),
-    );
+        },
+    ));
 
     assert!(
         direct_db
-            .finalize_invocation(direct_row_id, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                direct_row_id,
+                true,
+                0,
+                None,
+                None
+            )
             .is_err(),
         "direct finalize must reject already-finalized rows"
     );
-    assert_dependency_error(
-        service.finalize_invocation(InvocationLifecycleFinalizeRequest {
+    assert_dependency_error(service.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        InvocationLifecycleFinalizeRequest {
             state: &service_db,
             invocation_row_id: service_row_id,
             success: true,
             exit_code: 0,
             error_category: None,
             terminal_reason: None,
-        }),
-    );
+        },
+    ));
 }
 
 #[test]
@@ -333,6 +355,7 @@ fn age_299_s2_service_projects_missing_expected_sidecar_as_dependency_failure() 
     let invocation_row_id = invocation_start.invocation_row_id;
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_row_id,
             &ProviderSessionBinding {
                 provider_session_id: "age299-s2-service-session".to_string(),
@@ -344,6 +367,7 @@ fn age_299_s2_service_projects_missing_expected_sidecar_as_dependency_failure() 
         .unwrap();
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &invocation_start.completion_registration_authority,
             "age299-s2-service-admission",
             CompletionEventRegistrationInput {
@@ -361,6 +385,7 @@ fn age_299_s2_service_projects_missing_expected_sidecar_as_dependency_failure() 
     std::fs::remove_file(sidecar_path).unwrap();
 
     let result = ProductionInvocationLifecycleService.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         InvocationLifecycleFinalizeRequest {
             state: &state,
             invocation_row_id,
@@ -396,6 +421,7 @@ fn age_299_s2_state_writer_timeout_is_typed_contention_and_preserves_nonterminal
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let result = ProductionInvocationLifecycleService.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         InvocationLifecycleFinalizeRequest {
             state: &state,
             invocation_row_id,
@@ -420,14 +446,17 @@ fn age_299_s2_state_writer_timeout_is_typed_contention_and_preserves_nonterminal
     );
     writer.execute_batch("ROLLBACK").unwrap();
     ProductionInvocationLifecycleService
-        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-            state: &state,
-            invocation_row_id,
-            success: true,
-            exit_code: 0,
-            error_category: None,
-            terminal_reason: None,
-        })
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            InvocationLifecycleFinalizeRequest {
+                state: &state,
+                invocation_row_id,
+                success: true,
+                exit_code: 0,
+                error_category: None,
+                terminal_reason: None,
+            },
+        )
         .unwrap();
 }
 
@@ -443,6 +472,7 @@ fn age_299_s2_sidecar_writer_timeout_is_typed_contention_and_preserves_nontermin
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let result = ProductionInvocationLifecycleService.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         InvocationLifecycleFinalizeRequest {
             state: &state,
             invocation_row_id,
@@ -467,14 +497,17 @@ fn age_299_s2_sidecar_writer_timeout_is_typed_contention_and_preserves_nontermin
     );
     writer.execute_batch("ROLLBACK").unwrap();
     ProductionInvocationLifecycleService
-        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-            state: &state,
-            invocation_row_id,
-            success: true,
-            exit_code: 0,
-            error_category: None,
-            terminal_reason: None,
-        })
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            InvocationLifecycleFinalizeRequest {
+                state: &state,
+                invocation_row_id,
+                success: true,
+                exit_code: 0,
+                error_category: None,
+                terminal_reason: None,
+            },
+        )
         .unwrap();
 }
 
@@ -490,6 +523,7 @@ fn age_299_s2_corrupt_admitted_sidecar_fails_closed_without_recreation_or_result
     std::fs::write(&sidecar_path, corrupt_bytes).unwrap();
 
     let result = ProductionInvocationLifecycleService.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         InvocationLifecycleFinalizeRequest {
             state: &state,
             invocation_row_id,
@@ -535,6 +569,7 @@ fn age_299_s2_exact_listener_damage_is_a_typed_nonterminal_integrity_refusal() {
         damage.apply(&sidecar_path, event_id);
 
         let result = ProductionInvocationLifecycleService.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             InvocationLifecycleFinalizeRequest {
                 state: &state,
                 invocation_row_id,
@@ -605,6 +640,7 @@ fn age_299_s2_later_missing_listener_blocks_success_for_every_admitted_obligatio
     );
 
     let result = ProductionInvocationLifecycleService.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         InvocationLifecycleFinalizeRequest {
             state: &state,
             invocation_row_id,

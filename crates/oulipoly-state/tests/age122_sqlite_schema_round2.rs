@@ -70,8 +70,8 @@ fn invocations_schema_sql_keeps_raw_io_sidecar_based_with_completion_authority()
         "invocations repair SQL must remain sidecar-based and include completion authority"
     );
     assert!(
-        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 22;"),
-        "schema version must include persisted provider session authority"
+        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 23;"),
+        "schema version must include persisted provider launch ownership"
     );
     assert!(
         !lib_source().contains("pub mod lifecycle_log"),
@@ -124,6 +124,7 @@ fn invocations_schema_sql_keeps_raw_io_sidecar_based_with_completion_authority()
             "0020_session_turn_pages.sql",
             "0021_invocation_output_delivery.sql",
             "0022_provider_session_authority.sql",
+            "0023_provider_launch_lifecycle.sql",
         ],
         "migration inventory must include only sanctioned state-db migrations"
     );

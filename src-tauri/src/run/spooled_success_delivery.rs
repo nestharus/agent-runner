@@ -58,6 +58,7 @@ where
     // without a settled/pending row contradicting the nonzero process exit.
     if spooled
         && let Err(error) = state.mark_invocation_output_delivery_failed(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_row_id,
             "delivery_confirmation",
             "unconfirmed",
@@ -73,6 +74,7 @@ where
     let delivery = delivery();
     if let Err(error) = delivery {
         if let Err(state_error) = state.mark_invocation_output_delivery_failed(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_row_id,
             "payload_or_control",
             &format!("{:?}", error.kind()),
@@ -86,7 +88,12 @@ where
         return false;
     }
 
-    if spooled && let Err(error) = state.mark_invocation_output_delivered(invocation_row_id) {
+    if spooled
+        && let Err(error) = state.mark_invocation_output_delivered(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+        )
+    {
         emit_diagnostic(&format!(
             "failed to record provider output delivery: {error}"
         ));

@@ -372,6 +372,7 @@ fn age_299_s2_rebuild_backs_up_resets_and_readmits_state_sidecar_continuity() {
         start_authorized_invocation(&state, first_uuid, "age299-s2-rebuild-first-session");
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &first_start.completion_registration_authority,
             "age299-s2-rebuild-first-admission",
             completion_registration(
@@ -444,6 +445,7 @@ fn age_299_s2_rebuild_backs_up_resets_and_readmits_state_sidecar_continuity() {
     );
     fresh_state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &second_start.completion_registration_authority,
             "age299-s2-rebuild-second-admission",
             completion_registration(
@@ -476,6 +478,7 @@ fn age_299_s2_rebuild_sidecar_writer_contention_is_nondestructive_and_retryable(
     );
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &invocation_start.completion_registration_authority,
             "age299-s2-rebuild-contention-admission",
             completion_registration(
@@ -968,6 +971,7 @@ fn start_authorized_invocation(
         .unwrap();
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             start.invocation_row_id,
             &ProviderSessionBinding {
                 provider_session_id: session_id.to_string(),

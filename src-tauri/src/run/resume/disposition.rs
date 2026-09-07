@@ -196,14 +196,17 @@ fn finalize_terminal_disposition(
         input
             .agent_runtime_services
             .invocation_lifecycle_service
-            .finalize_invocation(mapper::finalize_request(
-                &input.env.state,
-                input.invocation_row_id,
-                false,
-                input.result.exit_code,
-                error_category,
-                Some(terminal_reason),
-            ))
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                mapper::finalize_request(
+                    &input.env.state,
+                    input.invocation_row_id,
+                    false,
+                    input.result.exit_code,
+                    error_category,
+                    Some(terminal_reason),
+                ),
+            )
             .map_err(|err| err.to_string())?;
     }
     input.guard.mark_finalized();
