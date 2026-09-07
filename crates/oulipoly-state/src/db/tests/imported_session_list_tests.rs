@@ -110,3 +110,50 @@ fn turn(session_id: &str, turn_id: &str, timestamp: &str) -> SessionTurnIngest {
         body: None,
     }
 }
+
+#[test]
+fn age343_list_and_preview_keep_canonical_counts_separate_from_import_timestamp() {
+    let db = test_db();
+    seed_test_chain(
+        &db,
+        CHAIN_A,
+        "codex",
+        "native-root",
+        "codex-model",
+        "2026-06-01T00:10:00Z",
+    );
+    seed_imported_metadata(
+        &db,
+        "codex",
+        "native-root",
+        None,
+        None,
+        "2026-06-01T00:05:00Z",
+    );
+    db.ingest_session_turns_batch(
+        "codex",
+        &[
+            turn("native-root", "canonical-1", "2026-06-01T00:11:00Z"),
+            turn("native-root", "canonical-2", "2026-06-01T00:12:00Z"),
+        ],
+    )
+    .unwrap();
+    let rows = db.imported_session_list().unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.active_provider_session_id == "native-root")
+        .unwrap();
+    assert_eq!(row.turn_count, 2); // imported metadata deliberately says 99
+    assert_eq!(row.last_used_or_updated_at, ts("2026-06-01T00:05:00Z"));
+    let previews = db.resume_previews(CHAIN_A).unwrap();
+    assert_eq!(previews.len(), 1);
+    assert_eq!(previews[0].active_session_id, "native-root");
+    assert_eq!(previews[0].turn_count, 2);
+    assert_eq!(previews[0].recent_turns.len(), 2);
+    assert!(
+        previews[0]
+            .recent_turns
+            .iter()
+            .all(|turn| turn.snippet.is_none())
+    );
+}

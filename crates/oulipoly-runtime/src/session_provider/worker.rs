@@ -124,7 +124,7 @@ fn dispose_failed_quantum(
     stream: SessionTurnIngestStream,
     error: SessionProviderError,
 ) -> Result<SessionTurnIngestQuantumOutcome, SessionProviderError> {
-    let error_token = error.token().to_string();
+    let error_token = disposition_token(&error).to_string();
     if stream_is_quarantined(request.state, &stream.key)? {
         return Ok(SessionTurnIngestQuantumOutcome::Quarantined {
             key: stream.key,
@@ -191,14 +191,20 @@ fn stream_is_quarantined(
 fn unsupported_error(error: &SessionProviderError) -> bool {
     matches!(
         error.token(),
-        "session_capability_missing" | "session_turn_pages_capability_missing"
+        "session_capability_missing"
+            | "session_turn_pages_capability_missing"
+            | "session_turn_page_budget_too_small"
+            | "session_turn_record_ceiling_exceeded"
+            | "codex_rollout_capacity"
     )
 }
 
 fn permanent_protocol_error(error: &SessionProviderError) -> bool {
     matches!(
         error.token(),
-        "provider_page_response_budget_exceeded"
+        "session_turn_page_token_stale"
+            | "invalid_session_read_turns_params"
+            | "provider_page_response_budget_exceeded"
             | "provider_page_identity_mismatch"
             | "provider_page_turn_count_invalid"
             | "provider_page_source_budget_exceeded"
@@ -227,6 +233,21 @@ fn permanent_protocol_error(error: &SessionProviderError) -> bool {
     )
 }
 
+// Only fixed host-recognized tokens may cross into durable state/UI. Provider
+// messages and arbitrary provider code strings are not diagnostic authority.
+fn disposition_token(error: &SessionProviderError) -> &str {
+    if unsupported_error(error) || permanent_protocol_error(error) {
+        return error.token();
+    }
+    match error.token() {
+        "provider_process_timeout"
+        | "session_turn_page_io"
+        | "session_turn_page_state_failed"
+        | "session_provider_describe_unavailable" => error.token(),
+        _ => "provider_page_failed",
+    }
+}
+
 fn retry_backoff(retry_count: u64) -> ChronoDuration {
     let exponent = retry_count.min(8) as u32;
     let seconds = 1_i64
@@ -242,7 +263,7 @@ fn state_error(error: String) -> SessionProviderError {
 
 #[cfg(test)]
 mod tests {
-    use super::permanent_protocol_error;
+    use super::*;
     use crate::session_provider::SessionProviderError;
 
     #[test]
@@ -263,6 +284,208 @@ mod tests {
             assert!(!permanent_protocol_error(&SessionProviderError::new(
                 token, token
             )));
+        }
+    }
+
+    #[test]
+    fn age343_disposition_retains_checkpoint_and_never_persists_provider_text() {
+        use crate::provider_registry::ProviderRegistryOptions;
+        use oulipoly_config::ProvidersConfig;
+        for (token, expected_status, expected_error) in [
+            (
+                "codex_rollout_capacity",
+                "unsupported",
+                "codex_rollout_capacity",
+            ),
+            (
+                "session_turn_page_budget_too_small",
+                "unsupported",
+                "session_turn_page_budget_too_small",
+            ),
+            (
+                "session_turn_record_ceiling_exceeded",
+                "unsupported",
+                "session_turn_record_ceiling_exceeded",
+            ),
+            (
+                "session_turn_page_token_stale",
+                "quarantined",
+                "session_turn_page_token_stale",
+            ),
+            (
+                "invalid_session_read_turns_params",
+                "quarantined",
+                "invalid_session_read_turns_params",
+            ),
+            ("session_turn_page_io", "retry_wait", "session_turn_page_io"),
+            (
+                "private/provider/body/token",
+                "retry_wait",
+                "provider_page_failed",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = StateDb::open(&temp.path().join("state.db")).unwrap();
+            let registry = ProviderRegistry::from_configs(
+                &[],
+                &ProvidersConfig::default(),
+                ProviderRegistryOptions::default(),
+            )
+            .unwrap();
+            let key = SessionTurnIngestStreamKey {
+                provider_name: "codex".into(),
+                provider_instance_id: "instance".into(),
+                settings_id: "codex".into(),
+                session_id: "synthetic".into(),
+                projection: SessionTurnStreamProjection::CanonicalIngest,
+            };
+            let strategy = oulipoly_config::ResumeStrategy {
+                kind: oulipoly_config::ResumeKind::Subcommand,
+                flag: None,
+                subcommand: Some(vec!["resume".into()]),
+            };
+            let resume_before =
+                crate::executor::cli::compose_resume_args(&strategy, &key.session_id).unwrap();
+            state.enqueue_session_turn_ingest_stream(&key).unwrap();
+            let now = Utc::now();
+            let stream = state
+                .lease_session_turn_ingest_stream(
+                    &key,
+                    "test",
+                    now,
+                    now + ChronoDuration::seconds(75),
+                )
+                .unwrap()
+                .unwrap();
+            use oulipoly_state::{
+                SessionTurnPageApply, SessionTurnPageBodyState, SessionTurnPageTurnIngest,
+            };
+            let prefix = SessionTurnPageApply {
+                key: key.clone(),
+                lease_owner: "test".into(),
+                expected_generation: 0,
+                request_token_sha256: "1".repeat(64),
+                snapshot_id: "snapshot".into(),
+                page_index: 0,
+                page_start_sequence: 0,
+                page_turn_count: 1,
+                scan_progress: false,
+                snapshot_complete: false,
+                next_page_token: Some("exact-failed-boundary".into()),
+                resume_token: None,
+                page_digest: "2".repeat(64),
+                turns: vec![SessionTurnPageTurnIngest {
+                    session_id: key.session_id.clone(),
+                    turn_id: "prefix".into(),
+                    snapshot_sequence: 0,
+                    timestamp: now,
+                    role: "user".into(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body_state: SessionTurnPageBodyState::Absent,
+                    body: None,
+                    body_bytes: None,
+                    body_sha256: None,
+                    canonical_text_sha256: None,
+                    canonical_text_digest_verified: false,
+                }],
+            };
+            assert_eq!(stream.checkpoint_generation, 0);
+            state.apply_session_turn_page(&prefix).unwrap();
+            let stream = state
+                .lease_session_turn_ingest_stream(
+                    &key,
+                    "test",
+                    now + ChronoDuration::seconds(1),
+                    now + ChronoDuration::seconds(75),
+                )
+                .unwrap()
+                .unwrap();
+            // Reacquired lease permits replay without duplicating prefix effects.
+            assert!(state.apply_session_turn_page(&prefix).unwrap().replayed);
+            assert_eq!(stream.checkpoint_generation, 1);
+            let stream = state
+                .lease_session_turn_ingest_stream(
+                    &key,
+                    "test",
+                    now + ChronoDuration::seconds(1),
+                    now + ChronoDuration::seconds(75),
+                )
+                .unwrap()
+                .unwrap();
+            let before = stream.clone();
+            assert_eq!(before.committed_turn_count, 1);
+            assert_eq!(
+                before.next_page_token.as_deref(),
+                Some("exact-failed-boundary")
+            );
+            let cancellation = CancellationToken::new();
+            let outcome = dispose_failed_quantum(
+                SessionTurnIngestDriverRequest {
+                    state: &state,
+                    registry: &registry,
+                    lease_owner: "test",
+                    effective_cwd: None,
+                    cancellation: &cancellation,
+                    now,
+                },
+                stream,
+                SessionProviderError::new(token, "private diagnostic body"),
+            )
+            .unwrap();
+            let after = state.session_turn_ingest_stream(&key).unwrap().unwrap();
+            assert_eq!(after.status, expected_status);
+            let resume_after =
+                crate::executor::cli::compose_resume_args(&strategy, &after.key.session_id)
+                    .unwrap();
+            assert_eq!(resume_before, resume_after);
+            assert_eq!(resume_after, vec!["resume", "synthetic"]);
+            let conn = rusqlite::Connection::open(temp.path().join("state.db")).unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT last_error FROM session_turn_ingest_streams",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, expected_error);
+            assert_eq!(after.checkpoint_generation, before.checkpoint_generation);
+            assert_eq!(after.snapshot_id, before.snapshot_id);
+            assert_eq!(after.next_page_token, before.next_page_token);
+            assert_eq!(after.after_token, before.after_token);
+            assert_eq!(after.committed_turn_count, before.committed_turn_count);
+            assert_eq!(after.expected_page_index, before.expected_page_index);
+            assert_eq!(after.expected_turn_sequence, before.expected_turn_sequence);
+            assert_eq!(after.lease_owner, None);
+            assert!(!format!("{outcome:?}").contains("private"));
+            // Existing state semantics count every worker failure, not just retries.
+            assert_eq!(after.retry_count, before.retry_count + 1);
+            if expected_status != "retry_wait" {
+                assert!(
+                    state
+                        .lease_ready_session_turn_ingest_stream(
+                            SessionTurnStreamProjection::CanonicalIngest,
+                            "next",
+                            now + ChronoDuration::days(1),
+                            now + ChronoDuration::days(2)
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                assert!(
+                    state
+                        .lease_session_turn_ingest_stream(
+                            &key,
+                            "retry",
+                            now + ChronoDuration::minutes(10),
+                            now + ChronoDuration::minutes(11)
+                        )
+                        .unwrap()
+                        .is_some()
+                );
+            }
         }
     }
 }
