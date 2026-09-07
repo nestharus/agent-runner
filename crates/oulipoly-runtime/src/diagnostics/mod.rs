@@ -422,6 +422,21 @@ fn is_network_error_heuristic(lower: &str) -> bool {
     lower.contains("connection") || lower.contains("timeout") || lower.contains("dns")
 }
 
+/// Recover a known non-quota diagnosis from the original failed attempt when
+/// secondary diagnostic work is unavailable. Never classify secondary errors or
+/// grant quota authority through this fallback.
+pub fn non_quota_failure_diagnosis(stderr: &str, exit_code: i32) -> Option<Diagnosis> {
+    let diagnosis = heuristic_diagnosis(stderr, exit_code);
+    matches!(
+        diagnosis.category,
+        ErrorCategory::AuthExpired
+            | ErrorCategory::ResumeSessionMismatch
+            | ErrorCategory::CliVersionMismatch
+            | ErrorCategory::NetworkError
+    )
+    .then_some(diagnosis)
+}
+
 fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
     let lower = normalize_stderr_for_heuristic(stderr);
     let category = heuristic_error_category(&lower);

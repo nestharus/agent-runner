@@ -604,6 +604,22 @@ fn resume_non_quota_failure_does_not_migrate_or_mark_exhausted() {
 
     assert_eq!(output.status.code(), Some(17), "{output:?}");
     assert_nonzero_failure_result(&output);
+    let result = single_result(&output);
+    let invocation_id = result["agent_runner_invocation_id"].as_str().unwrap();
+    let invocation = fixture
+        .open_db()
+        .get_invocation_by_uuid(invocation_id)
+        .unwrap()
+        .expect("returned invocation must be durable");
+    assert_eq!(invocation.invocation_uuid, invocation_id);
+    assert_eq!(invocation.status, InvocationStatus::Failed);
+    assert_eq!(invocation.success, Some(false));
+    assert_eq!(invocation.exit_code, Some(17));
+    assert_eq!(invocation.error_category.as_deref(), Some("network_error"));
+    assert_eq!(invocation.terminal_reason.as_deref(), Some("exit_nonzero"));
+    assert_eq!(invocation.provider_name.as_deref(), Some("claude-a"));
+    assert_eq!(invocation.provider_session_id.as_deref(), Some(SESSION_ID));
+    assert!(invocation.finished_at.is_some());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("connection refused for active resume provider"),
