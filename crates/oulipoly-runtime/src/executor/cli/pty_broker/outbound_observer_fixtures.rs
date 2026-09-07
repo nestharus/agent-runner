@@ -23,9 +23,10 @@ impl ObserverFixture {
         let mode_path = dir.path().join("mode");
         let calls = dir.path().join("calls");
         fs::write(&mode_path, mode).unwrap();
+        fs::write(dir.path().join("native.jsonl"), "").unwrap();
         let script = dir.path().join("provider.py");
         let text = r#"#!/usr/bin/env python3
-import json,sys,pathlib
+import json,sys,pathlib,hashlib
 root=pathlib.Path(__file__).parent
 r=json.load(sys.stdin)
 cmd=sys.argv[1]
@@ -35,7 +36,26 @@ if cmd=="describe":
 else:
  with (root/"calls").open("a") as f: f.write(json.dumps(r)+"\n")
  mode=(root/"mode").read_text()
- if mode!="restored":
+ if mode=="native-pages":
+  # Synthetic append-only JSONL. One complete native record per page;
+  # non-user records consume a page without producing a projected turn.
+  p=r["params"]
+  records=[json.loads(line) for line in (root/"native.jsonl").read_text().splitlines()]
+  tail=p.get("start_mode")=="tail"
+  if p.get("page_token"):
+   offset,end,index,sequence=json.loads(p["page_token"])
+  else:
+   offset=len(records) if tail else int(p.get("after_token") or "0")
+   end,index,sequence=len(records),0,0
+  turns=[]
+  if not tail and offset<end:
+   record=records[offset]
+   if record["role"]=="user":
+    turns=[{"session_id":"synthetic-session","turn_id":"native-"+str(offset),"snapshot_sequence":sequence,"timestamp":"2026-05-01T00:00:01Z","role":"user","is_sidechain":False,"is_compaction_boundary":False,"parent_turn_id":None,"body":None,"body_bytes":len(record["body"].encode()),"body_sha256":None,"body_state":"omitted_oversize","canonical_text_sha256":hashlib.sha256(record["body"].encode()).hexdigest()}]
+   offset+=1
+  complete=offset==end
+  result["result"]={"read_protocol":"oulipoly.session_turn_pages/v1","provider_instance_id":"synthetic-instance","settings_id":"synthetic-settings","session_id":"synthetic-session","turn_projection":"user_observation","snapshot_id":"native-snapshot-"+str(end),"page_index":index,"page_start_sequence":sequence,"turns":turns,"page_turn_count":len(turns),"source_bytes_examined":1,"scan_progress":not complete and not turns,"snapshot_complete":complete,"next_page_token":None if complete else json.dumps([offset,end,index+1,sequence+len(turns)]),"resume_token":str(offset) if complete else None,"source_final":False,"warnings":[]}
+ elif mode!="restored":
   result.update(ok=False,error={"category":"failed","code":mode,"message":"untrusted provider message","retryable":False})
  else:
   p=r["params"]
@@ -115,6 +135,15 @@ print(json.dumps(result))
             next_scan: now,
         }
     }
+    pub(crate) fn append_native(&self, role: &str, body: &str) {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(self._dir.path().join("native.jsonl"))
+            .unwrap();
+        writeln!(file, "{}", serde_json::json!({"role": role, "body": body})).unwrap();
+    }
+
     pub(crate) fn set_mode(&self, mode: &str) {
         fs::write(&self.mode, mode).unwrap();
     }
@@ -153,9 +182,13 @@ fn refused_anchor_refresh_preserves_cursor_and_latches_despite_inflight_refresh(
     let mut fixture = ObserverFixture::new("restored");
     fixture.worker.set_demand(true);
     assert!(fixture.tick());
+    let tail = fixture.worker.latest_result().unwrap();
+    fixture.worker.acknowledge(&tail);
     fixture.worker.observe_after_anchor();
     assert!(fixture.tick());
     let cursor = fixture.cursor();
+    let partial = fixture.worker.latest_result().unwrap();
+    fixture.worker.acknowledge(&partial);
     fixture.worker.request_fresh_generation();
     fixture.set_mode("session_turn_paging_paused");
     // Admit the read, then race a routine refresh before its result publishes.
@@ -163,6 +196,13 @@ fn refused_anchor_refresh_preserves_cursor_and_latches_despite_inflight_refresh(
         .take_read(fixture.now, fixture.now)
         .unwrap();
     assert!(reset);
+    // Replayed acknowledgements cannot release a newer in-flight reservation.
+    fixture.worker.acknowledge(&partial);
+    assert!(
+        lock_or_recover(&fixture.worker.shared.state)
+            .take_read(fixture.now, fixture.now)
+            .is_none()
+    );
     fixture.worker.request_fresh_generation();
     execute_read(&fixture.source, &fixture.worker.shared, generation, reset);
     assert_eq!(fixture.cursor(), cursor);

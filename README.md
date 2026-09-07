@@ -1218,3 +1218,19 @@ Ctrl+P message retry / Ctrl+D discard: it neither resends a sent message nor
 confirms consumption. Subsequent provider evidence remains necessary. The action
 relies on the operator's truthful resolution attestation; it does not itself
 install a provider, free storage, or rearm the canonical ingestion stream.
+
+
+Outbound observation keeps its pre-send tail position through body and submit
+input drainage. The anchor is released after the message becomes sent, not
+replaced by a new tail. Each observer read reserves one delivery slot until the
+queue incorporates and acknowledges that exact generation; a paused/control-mode
+consumer therefore backpressures paging rather than losing earlier page effects.
+Repeated reads of the published result do not acknowledge it. This preserves
+matching counts across incomplete and empty completion pages, including duplicate
+matches on separate pages, without growing a pending-page queue.
+
+Observer recovery does not replace the cached, pinned provider executable. A live
+observer pinned to a paging-paused containment provider can stop again even after
+an installed pathname is replaced. Neither explicit rearming nor these local
+queue semantics establishes an in-process provider-replacement handoff or deployed
+restoration; deployment authority and evidence remain separate.

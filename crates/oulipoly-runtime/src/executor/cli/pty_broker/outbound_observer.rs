@@ -71,6 +71,17 @@ pub(super) enum OutboundObservationResult {
     },
 }
 
+impl OutboundObservationResult {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Available(observation) => observation.generation,
+            Self::Unavailable { generation, .. }
+            | Self::Failed { generation, .. }
+            | Self::Stopped { generation, .. } => *generation,
+        }
+    }
+}
+
 pub(super) struct ProviderSessionTurnSource {
     registry: Arc<ProviderRegistry>,
     identity: SessionProviderIdentity,
@@ -317,6 +328,12 @@ impl OutboundObserverWorker {
         self.shared.latest_result()
     }
 
+    /// Acknowledge only after the queue has incorporated this exact result.
+    /// Reading/cloning the latest result does not authorize another page read.
+    pub(super) fn acknowledge(&self, result: &OutboundObservationResult) {
+        self.shared.acknowledge(result.generation());
+    }
+
     pub(super) fn set_demand(&self, active: bool) -> Option<u64> {
         self.shared.set_demand(active)
     }
@@ -388,6 +405,17 @@ impl ObserverShared {
         }
     }
 
+    fn acknowledge(&self, generation: u64) {
+        let mut state = lock_or_recover(&self.state);
+        if state.awaiting_incorporation != Some(generation) {
+            return;
+        }
+        // The reservation begins before reading. An old result cannot release
+        // an in-flight or subsequently published generation.
+        state.awaiting_incorporation = None;
+        self.wake.notify_one();
+    }
+
     fn publish(&self, result: OutboundObservationResult) {
         let mut state = lock_or_recover(&self.state);
         if let OutboundObservationResult::Stopped { generation, reason } = &result {
@@ -423,6 +451,7 @@ impl ObserverShared {
             .checked_add(1)
             .ok_or("observation_generation_exhausted")?;
         state.stopped = None;
+        state.awaiting_incorporation = None;
         state.refresh_requested = true;
         // Retain cursor and anchor; confirmation resumes, never resends input.
         state.anchor_reset_requested = false;
@@ -493,6 +522,8 @@ struct ObserverState {
     anchor_reset_requested: bool,
     anchor_held: bool,
     stopped: Option<(u64, &'static str)>,
+    // One bounded result (or its in-flight read) until consumer acknowledgement.
+    awaiting_incorporation: Option<u64>,
 }
 
 /// The recovery owner attests the relevant cause is resolved before calling rearm.
@@ -520,11 +551,13 @@ impl ObserverState {
         if !self.demand
             || self.stopped.is_some()
             || self.anchor_held
+            || self.awaiting_incorporation.is_some()
             || (!self.refresh_requested && now < deadline)
         {
             return None;
         }
         self.started_generation = self.started_generation.checked_add(1)?;
+        self.awaiting_incorporation = Some(self.started_generation);
         self.refresh_requested = false;
         let reset_anchor = self.anchor_reset_requested;
         self.anchor_reset_requested = false;
@@ -552,7 +585,11 @@ fn wait_for_read(shared: &ObserverShared, deadline: Instant) -> Option<(u64, boo
         if let Some(read) = state.take_read(Instant::now(), deadline) {
             return Some(read);
         }
-        let wait = if state.demand && state.stopped.is_none() && !state.anchor_held {
+        let wait = if state.demand
+            && state.stopped.is_none()
+            && !state.anchor_held
+            && state.awaiting_incorporation.is_none()
+        {
             deadline.saturating_duration_since(Instant::now())
         } else {
             Duration::from_secs(60)
@@ -600,11 +637,40 @@ mod tests {
         assert_eq!(worker.set_demand(true), Some(1));
         let first = wait_for_generation(&worker, 1);
         assert_eq!(result_generation(&first), 1);
+        worker.acknowledge(&first);
         assert_eq!(worker.set_demand(false), None);
         assert_eq!(worker.set_demand(true), Some(2));
         let second = wait_for_generation(&worker, 2);
         assert!(result_generation(&second) >= 2);
         worker.shutdown_and_join().expect("shutdown");
+    }
+
+    #[test]
+    fn acknowledgement_releases_continuous_demand_but_old_results_do_not() {
+        let worker = OutboundObserverWorker::start(OutboundObserverSource::Unavailable(
+            "synthetic unavailable source".to_string(),
+        ))
+        .expect("worker");
+        worker.set_demand(true);
+        let first = wait_for_generation(&worker, 1);
+        let later = Instant::now() + Duration::from_secs(1);
+        assert!(
+            lock_or_recover(&worker.shared.state)
+                .take_read(later, later)
+                .is_none()
+        );
+        worker.acknowledge(&first);
+        let second = wait_for_generation(&worker, 2);
+        assert_eq!(result_generation(&second), 2);
+        worker.acknowledge(&first);
+        assert!(
+            lock_or_recover(&worker.shared.state)
+                .take_read(later, later)
+                .is_none()
+        );
+        worker
+            .shutdown_and_join()
+            .expect("shutdown with outstanding result");
     }
 
     #[test]

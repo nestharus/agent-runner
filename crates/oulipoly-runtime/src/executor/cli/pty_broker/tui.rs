@@ -1503,11 +1503,14 @@ impl OutboundQueue {
         true
     }
 
+    // Sending owns the pre-send interval too: do not idle/reactivate demand
+    // between body/submit drainage and Sent, which would acquire a newer Tail.
     fn observation_needed(&self) -> bool {
         self.messages.iter().any(|message| {
             matches!(
                 message.status,
                 OutboundStatus::Queued
+                    | OutboundStatus::Sending
                     | OutboundStatus::Sent
                     | OutboundStatus::Ambiguous
                     | OutboundStatus::Retrying
@@ -5713,6 +5716,11 @@ fn pump_outbound_queue_from_worker(
         latest.as_deref(),
         now,
     );
+    // Page effects must enter confirmation before the source may advance again.
+    // Control mode returns above without acknowledging, backpressuring the worker.
+    if let Some(result) = latest.as_deref() {
+        worker.acknowledge(result);
+    }
     if pane.outbound.awaiting_tail_anchor() {
         let generation_floor = worker.request_fresh_generation();
         pane.outbound.require_generation(generation_floor);
@@ -10999,6 +11007,7 @@ mod host_observer_tests {
         assert!(pending.is_empty());
         assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
         fixture.set_mode("restored");
+        pump(&mut pane, &mut pending, &mut line, &fixture);
         assert!(fixture.tick());
         pump(&mut pane, &mut pending, &mut line, &fixture);
         assert_eq!(fixture.calls().len(), 3);
@@ -11030,15 +11039,18 @@ mod host_observer_tests {
             pane.outbound
                 .set_status(1, OutboundStatus::Sent, sent_at, None);
             pane.outbound.enqueue("synthetic second".into());
+            fixture.worker.acknowledge(&latest);
             fixture.worker.observe_after_anchor();
             assert!(fixture.tick());
             assert!(fixture.cursor().contains("Continuation"));
             let cursor = fixture.cursor();
+            let mut pending = PendingChildInput::new();
+            let mut line = InputLineState::default();
+            pump(&mut pane, &mut pending, &mut line, &fixture);
+            let baseline = pane.outbound.message(1).unwrap().baseline.clone().unwrap();
             fixture.set_mode(reason);
             assert!(fixture.tick());
             let stopped = fixture.stopped();
-            let mut pending = PendingChildInput::new();
-            let mut line = InputLineState::default();
             for _ in 0..400 {
                 pump(&mut pane, &mut pending, &mut line, &fixture);
                 assert!(!fixture.tick());
@@ -11076,3 +11088,7 @@ mod host_observer_tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "outbound_delivery_tests.rs"]
+mod outbound_delivery_tests;
