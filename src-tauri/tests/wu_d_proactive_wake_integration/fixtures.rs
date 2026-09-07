@@ -85,6 +85,13 @@ impl Fixture {
             .env_remove("AGENT_BASH_OWNER_SESSION_ID")
             .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
             .current_dir(self.root());
+        let helper = self.root().join("agent-bash/agent-bash");
+        if helper.is_file() {
+            cmd.env("AGENT_BASH_BIN", helper).env(
+                "AGENT_BASH_AGENT_RUNNER_BIN",
+                self.root().join("runner/oulipoly-agent-runner"),
+            );
+        }
     }
 
     pub(crate) fn run_agent(&self, prompt: &str) -> Output {
@@ -193,7 +200,7 @@ impl Fixture {
         link_or_copy(std::path::Path::new(crate::parse::runner_bin()), &runner);
 
         fs::write(
-            agent_bash_dir.join("config.toml"),
+            agent_bash_dir.join("agent-bash.toml"),
             format!(
                 "state_root = {:?}\nagent_runner_bin = {:?}\n",
                 self.state_home.join("agent-bash").display().to_string(),

@@ -1126,7 +1126,7 @@ fn agent_bash_integration_dependency_is_pinned_in_test_workflows() {
 }
 
 fn assert_agent_bash_action_is_pinned() {
-    const AGENT_BASH_REV: &str = "2a435c4909d184bbac28873fcfb8afb72861ec2c";
+    const AGENT_BASH_REV: &str = "1e88d3e1d0af710d1476fdab1c105014406c28db";
     let action = read_text("../../.github/actions/install-agent-bash/action.yml");
     let revision_argument = Regex::new(&format!(
         r"(?m)^\s*cargo\s+install\b[^\n]*\s--rev\s+{}(?:\s|$)",

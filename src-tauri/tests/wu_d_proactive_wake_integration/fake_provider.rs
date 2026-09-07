@@ -42,7 +42,8 @@ pub(crate) fn delayed_agent_bash_provider_script(agent_bash_bin: &Path) -> Strin
     let agent_bash_bin = shell_single_quote(&agent_bash_bin.to_string_lossy());
     provider_script(
         &format!(
-            r#"runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
+            r#"set -e
+runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
 owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
 writer_ready="$work/pid-sidecar-writer-ready"
 python3 - "$OULIPOLY_DATA_DIR/pid-identity.db" "$owner_invocation" "$writer_ready" <<'PY' &
@@ -110,6 +111,7 @@ else
   wait "$writer_pid" || true
   exit "$rc"
 fi
+python3 -c 'import json, sys; h = json.load(open(sys.argv[1]))["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"' "$work/agent-bash-dispatch.json"
 wait "$writer_pid"
 "#,
         ),
@@ -122,15 +124,15 @@ pub(crate) fn late_consumed_agent_bash_provider_script(agent_bash_bin: &Path) ->
     let agent_bash_bin = shell_single_quote(&agent_bash_bin.to_string_lossy());
     provider_script(
         &format!(
-            r#"runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
+            r#"set -e
+runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
 owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
 dispatch="$work/late-consumed-dispatch.json"
 AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
 AGENT_BASH_CONSUMER_GRACE_MS=0 \
 {agent_bash_bin} run --completion-scope root --delivery async -- \
   bash -lc 'printf nested-root-complete' > "$dispatch"
-handle="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["handle"])' "$dispatch")"
-state_dir="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["state_dir"])' "$dispatch")"
+handle="$(python3 -c 'import json, sys; h = json.load(open(sys.argv[1]))["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$dispatch")"
 found=""
 for _ in $(seq 1 200); do
   mailbox="$($runner mailbox list --session-id "$session" --json)"
@@ -142,7 +144,8 @@ for _ in $(seq 1 200); do
 done
 [ -n "$found" ]
 {agent_bash_bin} status "$handle" > "$work/late-consumed-poll.txt"
-: > "$state_dir/consumed""#,
+grep -q '^DONE rc=0' "$work/late-consumed-poll.txt"
+{agent_bash_bin} consume "$handle" > "$work/late-consumed-consume.json""#,
         ),
         "",
         "late-consumed-resumed-input.txt",
@@ -153,7 +156,8 @@ pub(crate) fn mixed_consumed_agent_bash_provider_script(agent_bash_bin: &Path) -
     let agent_bash_bin = shell_single_quote(&agent_bash_bin.to_string_lossy());
     provider_script(
         &format!(
-            r#"runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
+            r#"set -e
+runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
 owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
 run_job() {{
   local dispatch="$1"
@@ -165,10 +169,9 @@ run_job() {{
 consumed_dispatch="$work/mixed-consumed-dispatch.json"
 unpolled_dispatch="$work/mixed-unpolled-dispatch.json"
 run_job "$consumed_dispatch"
+consumed_handle="$(python3 -c 'import json, sys; h = json.load(open(sys.argv[1]))["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$consumed_dispatch")"
 run_job "$unpolled_dispatch"
-consumed_handle="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["handle"])' "$consumed_dispatch")"
-unpolled_handle="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["handle"])' "$unpolled_dispatch")"
-consumed_state_dir="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["state_dir"])' "$consumed_dispatch")"
+unpolled_handle="$(python3 -c 'import json, sys; h = json.load(open(sys.argv[1]))["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$unpolled_dispatch")"
 found=""
 for _ in $(seq 1 200); do
   mailbox="$($runner mailbox list --session-id "$session" --json)"
@@ -181,7 +184,8 @@ for _ in $(seq 1 200); do
 done
 [ -n "$found" ]
 {agent_bash_bin} status "$consumed_handle" > "$work/mixed-consumed-poll.txt"
-: > "$consumed_state_dir/consumed""#,
+grep -q '^DONE rc=0' "$work/mixed-consumed-poll.txt"
+{agent_bash_bin} consume "$consumed_handle" > "$work/mixed-consumed-consume.json""#,
         ),
         "",
         "mixed-resumed-input.txt",
