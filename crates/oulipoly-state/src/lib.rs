@@ -207,6 +207,16 @@ pub mod age_32_connection_boundary_doctest {
     pub struct StateDbRawConnectionEscapeMustNotCompile;
 }
 
+pub use db::{
+    BeginProviderLaunchRequest, InvocationMutationAuthority, ProviderLaunchActorSettlement,
+    ProviderLaunchAttemptAllocation, ProviderLaunchCandidate, ProviderLaunchChannelSettlement,
+    ProviderLaunchCustodyProof, ProviderLaunchEndpoint, ProviderLaunchFailureRecord,
+    ProviderLaunchLease, ProviderLaunchOwnerFence, ProviderLaunchPromotion,
+    ProviderLaunchRecoveryDisposition, ProviderLaunchStartMode, ProviderLaunchTerminalResult,
+    RotatableLaunchFailureKind,
+};
+pub use db::{ProviderLaunchRecoveryJoin, ProviderLaunchRequestIdentity};
+
 #[cfg(test)]
 mod age160_root_reexport_tests {
     /// AGE-160 risk: A6 lib.rs↔db root compatibility facade.
@@ -316,13 +326,3 @@ mod age160_root_reexport_tests {
         );
     }
 }
-
-pub use db::{
-    BeginProviderLaunchRequest, InvocationMutationAuthority, ProviderLaunchActorSettlement,
-    ProviderLaunchAttemptAllocation, ProviderLaunchCandidate, ProviderLaunchChannelSettlement,
-    ProviderLaunchCustodyProof, ProviderLaunchEndpoint, ProviderLaunchFailureRecord,
-    ProviderLaunchLease, ProviderLaunchOwnerFence, ProviderLaunchPromotion,
-    ProviderLaunchRecoveryDisposition, ProviderLaunchStartMode, ProviderLaunchTerminalResult,
-    RotatableLaunchFailureKind,
-};
-pub use db::{ProviderLaunchRecoveryJoin, ProviderLaunchRequestIdentity};
