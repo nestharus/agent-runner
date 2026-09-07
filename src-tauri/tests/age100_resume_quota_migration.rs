@@ -575,6 +575,15 @@ fn resume_all_pool_members_quota_exhausted_returns_all_providers_exhausted() {
 
 #[test]
 fn resume_non_quota_failure_does_not_migrate_or_mark_exhausted() {
+    assert_non_quota_resume_failure(false);
+}
+
+#[test]
+fn resume_diagnostic_request_failure_preserves_original_failure() {
+    assert_non_quota_resume_failure(true);
+}
+
+fn assert_non_quota_resume_failure(diagnostics_unavailable: bool) {
     let first_marker = std::env::temp_dir().join(format!(
         "age100-resume-non-quota-a-{}.txt",
         uuid::Uuid::new_v4()
@@ -601,10 +610,16 @@ fn resume_non_quota_failure_does_not_migrate_or_mark_exhausted() {
         true,
     );
 
+    if diagnostics_unavailable {
+        fs::remove_file(fixture.dir.path().join("diagnostic-provider.sh")).unwrap();
+    }
     let output = fixture.run_resume("age100-resume");
 
     assert_eq!(output.status.code(), Some(17), "{output:?}");
-    eprintln!("fixture resume stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+    eprintln!(
+        "fixture resume stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_nonzero_failure_result(&output);
     let result = single_result(&output);
     let invocation_id = result["agent_runner_invocation_id"].as_str().unwrap();
@@ -628,6 +643,9 @@ fn resume_non_quota_failure_does_not_migrate_or_mark_exhausted() {
         "{stderr}"
     );
     assert!(stderr.contains("[diagnostics: network_error]"), "{stderr}");
+    if diagnostics_unavailable {
+        assert_secondary_diagnostic_failure(&stderr);
+    }
     assert!(
         stderr.lines().any(|line| line == "exit_nonzero"),
         "{stderr}"
@@ -637,6 +655,20 @@ fn resume_non_quota_failure_does_not_migrate_or_mark_exhausted() {
     assert_eq!(line_count(&sibling_marker), 0);
     assert_eq!(fixture.exhausted_provider_count(), 0);
     assert_eq!(fixture.active_segment_provider(), "claude-a");
+}
+
+fn assert_secondary_diagnostic_failure(stderr: &str) {
+    let markers = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_DIAGNOSTIC_FAILURE="))
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 1, "{stderr}");
+    let failure: Value = serde_json::from_str(markers[0]).unwrap();
+    assert_eq!(failure["stage"], "diagnostics");
+    assert_eq!(failure["provider_exit_code"], 17);
+    assert_eq!(failure["error_category"], "diagnostics_failure");
+    assert_eq!(failure["operation"], "diagnose_error");
+    assert!(!failure["message"].as_str().unwrap().is_empty());
 }
 
 #[test]
