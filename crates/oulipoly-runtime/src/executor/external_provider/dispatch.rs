@@ -218,7 +218,9 @@ fn attempt_account_dispatch(
                     provider_index: context.provider_index,
                     session_capture: crate::executor::SessionCaptureResult {
                         session_id: None,
-                        method: crate::executor::SessionCaptureMethod::ExternalProviderLaunch,
+                        method: crate::executor::SessionCaptureMethod::ExternalProviderLaunch(
+                            session_authority.clone(),
+                        ),
                     },
                     resume_acceptance: None,
                     terminal_reason: None,
@@ -638,7 +640,13 @@ mod tests {
             provider_index: 2,
             session_capture: SessionCaptureResult {
                 session_id: Some("unverified".into()),
-                method: SessionCaptureMethod::ExternalProviderLaunch,
+                method: SessionCaptureMethod::ExternalProviderLaunch(
+                    ExternalProviderSessionAuthority {
+                        account_name: "fixture".into(),
+                        provider_instance_id: "fixture-instance".into(),
+                        settings_id: "fixture-settings".into(),
+                    },
+                ),
             },
             resume_acceptance: None,
             terminal_reason: None,
