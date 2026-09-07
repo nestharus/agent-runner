@@ -794,7 +794,7 @@ mod tests {
     fn attachment_outcomes_preserve_replay_session_and_invocation_fences() {
         use oulipoly_state::mailbox::GenerationRejection;
         let dir = tempfile::tempdir().unwrap();
-        let (context, generation) = attachment_fixture(&dir.path().join("pid.db"));
+        let (context, generation) = attachment_fixture(&dir.path().join("pid-identity.db"));
         assert_eq!(
             attach_captured_session_id(Some(&context), Some(&generation), "session-a"),
             Ok(GenerationOperationOutcome::Applied)
@@ -857,10 +857,10 @@ mod tests {
     #[test]
     fn attachment_and_cleanup_storage_failure_are_safe_and_distinct() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut context, generation) = attachment_fixture(&dir.path().join("pid.db"));
+        let (mut context, generation) = attachment_fixture(&dir.path().join("pid-identity.db"));
         let blocker = dir.path().join("secret-token-path");
         std::fs::write(&blocker, b"not a directory").unwrap();
-        context.mailbox_db_path = Some(blocker.join("pid.db"));
+        context.mailbox_db_path = Some(blocker.join("pid-identity.db"));
         let attachment =
             attach_captured_session_id(Some(&context), Some(&generation), "secret-session");
         let cleanup = exit_runtime_generation_outcome(
