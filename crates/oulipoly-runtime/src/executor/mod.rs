@@ -102,7 +102,11 @@ impl ExecutionResult {
         ) {
             return Ok(());
         }
-        let artifacts = state.record_returned_artifacts(invocation_id, &self.returned_artifacts);
+        let artifacts = state.record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_id,
+            &self.returned_artifacts,
+        );
         let output = self.persist_output_for_invocation(state, invocation_id, invocation_uuid);
         match (artifacts.is_ok(), output.is_ok()) {
             (true, true) => Ok(()),

@@ -2815,8 +2815,14 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
     else {
         panic!("attachment failure must retain exact external endpoint authority");
     };
-    assert_eq!(authority.account_name, external_model(&fixture).providers[0].name);
-    assert_eq!(authority.provider_instance_id, launch["provider_instance_id"]);
+    assert_eq!(
+        authority.account_name,
+        external_model(&fixture).providers[0].name
+    );
+    assert_eq!(
+        authority.provider_instance_id,
+        launch["provider_instance_id"]
+    );
     assert_eq!(authority.settings_id, launch["params"]["settings_id"]);
     let signal = result.terminal_signal.as_ref().unwrap();
     assert_eq!(signal.kind, TerminalSignalKind::SpawnError);

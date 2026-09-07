@@ -516,6 +516,8 @@ fn denied_writers(
             &ProviderSessionAuthorityCommit {
                 invocation_uuid: &uuid,
                 provider_name: "first",
+                provider_instance_id: "instance",
+                settings_id: "settings",
                 binding: &binding,
             },
         ),
@@ -1065,4 +1067,102 @@ fn spawned_receipt_controls_reject_unsettled_actors_and_runtime_process_mismatch
         // Failed certification must not poison the replay key or strand the owner.
         db.certify_effect_incapable(&lease.owner, &valid).unwrap();
     }
+}
+
+#[test]
+fn linked_session_commit_preserves_endpoint_authority_and_rolls_back_rejected_promotion() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    let id = lease.owner.invocation_row_id;
+    let uuid = lease.owner.invocation_uuid.to_string();
+    let binding = ProviderSessionBinding {
+        provider_session_id: "authenticated-native-session".into(),
+        capture_method: "provider_live_report",
+        resume_input_id: None,
+        provider_session_resolved_account: Some("/fixture/workspace".into()),
+    };
+    let commit = ProviderSessionAuthorityCommit {
+        invocation_uuid: &uuid,
+        provider_name: "first",
+        provider_instance_id: "authenticated-instance",
+        settings_id: "selected-settings",
+        binding: &binding,
+    };
+    let conn = Connection::open(db.path()).unwrap();
+    conn.execute(
+        "INSERT INTO invocation_provider_session_authority VALUES (?1, 'other-instance', 'other-settings')",
+        [id],
+    )
+    .unwrap();
+    let linked = InvocationMutationAuthority::ProviderLaunch(&lease.owner);
+    assert!(
+        db.commit_invocation_provider_session_authority(linked, id, &commit)
+            .is_err()
+    );
+    let row = db.get_invocation_by_uuid(&uuid).unwrap().unwrap();
+    assert_eq!(row.provider_session_id, None);
+    assert_eq!(row.provider_session_resolved_account, None);
+    assert_eq!(
+        db.chain_id_for_segment("first", &binding.provider_session_id)
+            .unwrap(),
+        None
+    );
+    let promoted: i64 = conn
+        .query_row(
+            "SELECT provider_session_observed FROM provider_launch_attempts WHERE invocation_id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        promoted, 0,
+        "endpoint rejection must roll back owner promotion"
+    );
+    conn.execute(
+        "DELETE FROM invocation_provider_session_authority WHERE invocation_id=?1",
+        [id],
+    )
+    .unwrap();
+    assert!(
+        db.commit_invocation_provider_session_authority(
+            InvocationMutationAuthority::Standalone,
+            id,
+            &commit
+        )
+        .is_err()
+    );
+    db.commit_invocation_provider_session_authority(linked, id, &commit)
+        .unwrap();
+    db.commit_invocation_provider_session_authority(linked, id, &commit)
+        .unwrap();
+    let row = db.get_invocation_by_uuid(&uuid).unwrap().unwrap();
+    assert_eq!(
+        row.provider_session_id.as_deref(),
+        Some("authenticated-native-session")
+    );
+    assert_eq!(
+        row.provider_session_resolved_account.as_deref(),
+        Some("/fixture/workspace")
+    );
+    let chain = db
+        .chain_id_for_segment("first", &binding.provider_session_id)
+        .unwrap()
+        .unwrap();
+    let authority = db
+        .active_provider_session_authority(&chain)
+        .unwrap()
+        .unwrap();
+    assert_eq!(authority.provider_instance_id, "authenticated-instance");
+    assert_eq!(authority.settings_id, "selected-settings");
+    let promoted: i64 = conn
+        .query_row(
+            "SELECT provider_session_observed FROM provider_launch_attempts WHERE invocation_id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(promoted, 1);
+    assert!(db.request_transfer(&lease.owner, &failure()).is_err());
 }

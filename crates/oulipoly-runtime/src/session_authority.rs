@@ -299,6 +299,7 @@ mod tests {
                 // A retained segment from a prior invocation must not be adopted by a new endpoint.
                 state
                     .bind_invocation_provider_session_start(
+                        oulipoly_state::InvocationMutationAuthority::Standalone,
                         row_id,
                         &ProviderSessionBinding {
                             provider_session_id: SESSION.into(),

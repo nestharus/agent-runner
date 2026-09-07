@@ -655,7 +655,14 @@ mod tests {
             assert_eq!(authority.provider_instance_id, "fixture-instance");
             assert_eq!(authority.settings_id, "live-binding-settings-record");
             state
-                .finalize_invocation(row_id, success, code, category, reason)
+                .finalize_invocation(
+                    oulipoly_state::InvocationMutationAuthority::Standalone,
+                    row_id,
+                    success,
+                    code,
+                    category,
+                    reason,
+                )
                 .unwrap();
             assert_eq!(
                 state.active_provider_session_authority(&chain).unwrap(),
