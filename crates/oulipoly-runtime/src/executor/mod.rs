@@ -86,6 +86,36 @@ pub struct ExecutionResult {
 }
 
 impl ExecutionResult {
+    /// Retain already-produced evidence on the bounded host-finalization failure path.
+    /// Both writes are attempted independently; neither changes terminal success.
+    pub fn retain_failed_finalization_evidence(
+        &self,
+        state: &oulipoly_state::StateDb,
+        invocation_id: i64,
+        invocation_uuid: &str,
+    ) -> Result<(), &'static str> {
+        if !matches!(
+            self.terminal_reason.as_deref(),
+            Some("runtime_generation_attach_failed" | "runtime_generation_exit_failed")
+        ) {
+            return Ok(());
+        }
+        let artifacts = state.record_returned_artifacts(invocation_id, &self.returned_artifacts);
+        let output = self.persist_output_for_invocation(state, invocation_id, invocation_uuid);
+        match (artifacts.is_ok(), output.is_ok()) {
+            (true, true) => Ok(()),
+            (false, true) => {
+                Err("finalization_evidence: artifacts=storage_failure;output=retained")
+            }
+            (true, false) => {
+                Err("finalization_evidence: artifacts=retained;output=storage_failure")
+            }
+            (false, false) => {
+                Err("finalization_evidence: artifacts=storage_failure;output=storage_failure")
+            }
+        }
+    }
+
     pub fn persist_output_for_invocation(
         &self,
         state: &oulipoly_state::StateDb,

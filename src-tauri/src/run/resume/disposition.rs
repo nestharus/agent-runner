@@ -36,6 +36,13 @@ pub(super) struct ResumeTerminalDispositionInput<'a, 'state> {
 pub(super) fn handle_terminal_signal_disposition(
     mut input: ResumeTerminalDispositionInput<'_, '_>,
 ) -> Result<ResumeLoopControl, String> {
+    if let Err(error) = input.result.retain_failed_finalization_evidence(
+        &input.env.state,
+        input.invocation_row_id,
+        input.invocation_id,
+    ) {
+        formatter::emit_stderr(error);
+    }
     if recovered_generic_nonzero_completed_attempt(&input) {
         return Ok(ResumeLoopControl::CompletedAttempt);
     }

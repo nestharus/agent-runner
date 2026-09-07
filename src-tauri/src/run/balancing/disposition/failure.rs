@@ -62,6 +62,13 @@ pub(in crate::run::balancing) fn handle_prolonged_silence_fail(
 pub(in crate::run::balancing) fn handle_interactive_fail(
     input: TypedDispositionInput<'_, '_, '_>,
 ) -> BalancedLoopControl {
+    if let Err(error) = input.result.retain_failed_finalization_evidence(
+        &input.env.state,
+        input.invocation_row_id,
+        &input.invocation.id,
+    ) {
+        formatter::emit_stderr(error);
+    }
     let disposition =
         apply_terminal_signal_outcome(input.terminal_signal, input.terminal_signal_ctx);
     validator::expect_interactive_fail_disposition(

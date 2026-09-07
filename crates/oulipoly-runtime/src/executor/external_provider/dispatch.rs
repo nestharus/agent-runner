@@ -32,9 +32,10 @@ use super::request_builder::{
 };
 use super::terminal_classify_handoff::classify_after_launch_success;
 use crate::executor::cli::spawn_identity::{
-    RunningRuntimeGeneration, SpawnIdentityContext, SpawnRuntimeMode, backfill_captured_session_id,
-    child_custody_test_fault, context_from_parent_invocation_env, mark_runtime_generation_exited,
-    mark_runtime_generation_orderly_completed, mark_runtime_generation_spawn_failed,
+    GenerationOperationError, GenerationOperationOutcome, RunningRuntimeGeneration,
+    SpawnIdentityContext, SpawnRuntimeMode, attach_captured_session_id,
+    backfill_captured_session_id, child_custody_test_fault, context_from_parent_invocation_env,
+    exit_runtime_generation_outcome, mark_runtime_generation_orderly_completed,
     record_child_identity, register_runtime_generation_starting,
 };
 use crate::executor::cli::{prepare_return_channel, read_and_cleanup_return_channel};
@@ -189,7 +190,7 @@ fn attempt_account_dispatch(
     let launch_result = match launch_outcome {
         Ok(result) => result,
         Err(error) => {
-            finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            let _ = finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
             let verified_failure_session = match verify_optional_failure_session(
                 context,
                 &endpoint,
@@ -220,7 +221,7 @@ fn attempt_account_dispatch(
     {
         Ok(verified) => verified,
         Err(error) => {
-            finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            let _ = finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
             return Err(terminal_attempt_error(protocol_service_error(
                 error.protocol_kind(),
             )));
@@ -228,33 +229,51 @@ fn attempt_account_dispatch(
     };
     if spawn_identity.is_some() {
         if require_recorded_external_generation(&recorded_generation).is_err() {
-            finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            let _ = finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
             return Err(terminal_attempt_error(protocol_service_error(
                 "runtime_generation_bind_failed",
             )));
         }
-        if backfill_external_launch_session_id(
+        let attachment = backfill_external_launch_session_id(
             spawn_identity.as_ref(),
             &recorded_generation,
             verified_session.as_ref(),
-        )
-        .is_err()
-        {
-            finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
-            return Err(terminal_attempt_error(protocol_service_error(
-                "runtime_generation_attach_failed",
-            )));
-        }
-        let exit_code = launch_exit_code(&launch_result.exit.status);
-        if mark_runtime_generation_orderly_completed(spawn_identity.as_ref(), exit_code, exit_code)
-            .is_err()
-        {
-            finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
-            return Err(terminal_attempt_error(protocol_service_error(
-                "runtime_generation_exit_failed",
-            )));
+        );
+        let failure = match attachment {
+            Err(error) => Some(("runtime_generation_attach_failed", error)),
+            Ok(_) => {
+                let exit_code = launch_exit_code(&launch_result.exit.status);
+                mark_runtime_generation_orderly_completed(
+                    spawn_identity.as_ref(),
+                    exit_code,
+                    exit_code,
+                )
+                .err()
+                .map(|error| ("runtime_generation_exit_failed", error))
+            }
+        };
+        if let Some((stage, error)) = failure {
+            let cleanup =
+                finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            let result = map_launch_result_with_terminal_classification(
+                launch_result,
+                context.provider_index,
+                &context.provider.name,
+                None,
+                launch_prompt_acceptance_v1_enabled,
+                output_spool,
+                returned_artifacts,
+            );
+            return Ok(failed_finalization_result(
+                result,
+                verified_session.as_ref(),
+                stage,
+                error,
+                cleanup,
+            ));
         }
     }
+
     let classification =
         classify_after_launch_success(registry, &client, describe, context, &launch_result);
 
@@ -391,28 +410,60 @@ fn require_recorded_external_generation(
 fn finalize_failed_external_launch(
     context: Option<&SpawnIdentityContext>,
     recorded_generation: &RecordedLaunchGeneration,
-) {
+) -> Result<GenerationOperationOutcome, GenerationOperationError> {
     let spawned = recorded_generation
         .lock()
-        .ok()
-        .and_then(|generation| generation.as_ref().map(Result::is_ok));
-    if spawned == Some(true) {
-        let _ = mark_runtime_generation_exited(context, None);
+        .map_err(|_| GenerationOperationError::Unknown)?
+        .as_ref()
+        .map(Result::is_ok);
+    let reason = if spawned == Some(true) {
+        oulipoly_state::mailbox::RuntimeTerminalReason::AbnormalTermination
     } else {
-        let _ = mark_runtime_generation_spawn_failed(context);
-    }
+        oulipoly_state::mailbox::RuntimeTerminalReason::StartupFailed
+    };
+    let outcome = exit_runtime_generation_outcome(context, reason, None);
+    // Also retain cleanup evidence on the earlier provider/authority failure paths.
+    tracing::warn!(cleanup = ?outcome, "External launch failure cleanup");
+    outcome
 }
 
 fn backfill_external_launch_session_id(
     context: Option<&SpawnIdentityContext>,
     recorded_generation: &RecordedLaunchGeneration,
     verified: Option<&VerifiedSessionAuthority>,
-) -> Result<(), String> {
+) -> Result<GenerationOperationOutcome, GenerationOperationError> {
     let Some(verified) = verified else {
-        return Ok(());
+        return Ok(GenerationOperationOutcome::NotRequired);
     };
-    let generation = require_recorded_external_generation(recorded_generation)?;
-    backfill_captured_session_id(context, Some(&generation), verified.provider_session_id())
+    let generation = require_recorded_external_generation(recorded_generation)
+        .map_err(|_| GenerationOperationError::MissingGeneration)?;
+    attach_captured_session_id(context, Some(&generation), verified.provider_session_id())
+}
+
+fn failed_finalization_result(
+    mut result: ExecutionResult,
+    verified: Option<&VerifiedSessionAuthority>,
+    stage: &'static str,
+    error: GenerationOperationError,
+    cleanup: Result<GenerationOperationOutcome, GenerationOperationError>,
+) -> ExecutionResult {
+    use crate::executor::terminal_signal::{TerminalSignal, TerminalSignalKind};
+    result.exit_code = -1;
+    result.terminal_reason = Some(stage.to_string());
+    result.terminal_signal = Some(TerminalSignal {
+        kind: TerminalSignalKind::SpawnError,
+        provider_name: result
+            .terminal_signal
+            .as_ref()
+            .map(|signal| signal.provider_name.clone())
+            .unwrap_or_default(),
+        evidence: format!("{stage};cause={error};cleanup={cleanup:?}"),
+        observed_at: std::time::SystemTime::now(),
+    });
+    // Only authority-verified public identity survives a host finalization failure.
+    result.session_capture.session_id =
+        verified.map(|session| session.provider_session_id().to_string());
+    result
 }
 
 fn verify_launch_session_authority(
@@ -457,8 +508,178 @@ fn verify_optional_failure_session(
 
 #[cfg(test)]
 mod tests {
-    use super::account_lifecycle_transfer_unavailable;
+    use super::*;
     use crate::services::ServiceError;
+
+    fn sealed_fixture_output() -> ExecutionOutputSpool {
+        use oulipoly_provider::generated::{LAUNCH_OUTPUT_COMPLETE_MARKER_V1, LAUNCH_OUTPUT_V1};
+        use sha2::{Digest, Sha256};
+        let spool = ExecutionOutputSpool::new().unwrap();
+        spool
+            .observe(&DecodedLaunchEvent::Stdout {
+                seq: 1,
+                data: vec![0, 255, 42],
+            })
+            .unwrap();
+        spool.observe(&DecodedLaunchEvent::Marker {
+            seq: 2, name: LAUNCH_OUTPUT_COMPLETE_MARKER_V1.into(),
+            value: serde_json::json!({
+                "protocol": LAUNCH_OUTPUT_V1,
+                "stdout": { "bytes": 3, "sha256": format!("{:x}", Sha256::digest([0, 255, 42])) },
+                "stderr": { "bytes": 0, "sha256": format!("{:x}", Sha256::digest([])) },
+                "data_event_count": 1
+            }),
+        }).unwrap();
+        spool
+            .observe(&DecodedLaunchEvent::Exit(
+                oulipoly_provider::stream::LaunchExit {
+                    seq: 3,
+                    status: ProcessStatus::Exited { code: 0 },
+                    terminal_signal: oulipoly_provider::generated::TerminalSignal {
+                        kind: oulipoly_provider::generated::TerminalSignalKind::CleanExit,
+                        evidence: None,
+                        observed_at_unix_ms: 1,
+                    },
+                    session: None,
+                },
+            ))
+            .unwrap();
+        spool
+    }
+
+    #[test]
+    fn attachment_failure_retains_verified_identity_output_and_failure_semantics() {
+        use crate::executor::terminal_signal::TerminalSignalKind;
+        use crate::executor::{SessionCaptureMethod, SessionCaptureResult};
+        let verified = verify_session_authority(
+            SessionAuthorityExpectation {
+                account_name: "fixture",
+                provider_session_id: Some("public-session"),
+            },
+            Some(AuthoritativeSessionObservation {
+                account_name: "fixture",
+                provider_session_id: "public-session",
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        let original = ExecutionResult {
+            stdout: vec![0, 255, 42],
+            stderr: "authentic stderr".into(),
+            output_spool: Some(sealed_fixture_output()),
+            exit_code: 0,
+            provider_index: 2,
+            session_capture: SessionCaptureResult {
+                session_id: Some("unverified".into()),
+                method: SessionCaptureMethod::ExternalProviderLaunch,
+            },
+            resume_acceptance: None,
+            terminal_reason: None,
+            terminal_signal: None,
+            produced_assistant_response: true,
+            prompt_acceptance_attestation: None,
+            captured_child_invocations: vec![],
+            returned_artifacts: vec![serde_json::from_value(serde_json::json!({
+                "version_id": "store://return/11111111-1111-4111-8111-111111111111/fixture/1",
+                "name": "fixture",
+                "store_address": { "workflow_run_id": "return:11111111-1111-4111-8111-111111111111", "artifact_name": "fixture", "version": 1 },
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "content_len": 3, "format_hint": null, "verdict_line": null,
+                "source": { "kind": "inline_bytes" },
+                "producer_invocation_uuid": "11111111-1111-4111-8111-111111111111",
+                "returned_at": "2026-09-07T00:00:00Z"
+            })).unwrap()],
+        };
+        for cleanup in [
+            Ok(GenerationOperationOutcome::Applied),
+            Err(GenerationOperationError::StorageFailure),
+        ] {
+            let result = failed_finalization_result(
+                original.clone(),
+                Some(&verified),
+                "runtime_generation_attach_failed",
+                GenerationOperationError::Rejected(
+                    oulipoly_state::mailbox::GenerationRejection::SessionConflict,
+                ),
+                cleanup.clone(),
+            );
+            assert_eq!(result.exit_code, -1);
+            assert_eq!(
+                result.terminal_reason.as_deref(),
+                Some("runtime_generation_attach_failed")
+            );
+            assert_eq!(
+                result.session_capture.session_id.as_deref(),
+                Some("public-session")
+            );
+            let signal = result.terminal_signal.as_ref().unwrap();
+            assert_eq!(signal.kind, TerminalSignalKind::SpawnError);
+            assert!(signal.evidence.contains("SessionConflict"));
+            assert!(signal.evidence.contains(&format!("cleanup={cleanup:?}")));
+            assert!(!signal.evidence.contains("public-session"));
+            assert_eq!(result.stdout, original.stdout);
+            assert_eq!(result.stderr, original.stderr);
+            assert_eq!(result.output_spool, original.output_spool);
+            assert_eq!(result.returned_artifacts, original.returned_artifacts);
+            assert!(result.produced_assistant_response);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = oulipoly_state::StateDb::open(&dir.path().join("state.db")).unwrap();
+        let invocation_uuid = "11111111-1111-4111-8111-111111111111";
+        let invocation_id = state
+            .start_invocation(&oulipoly_state::InvocationStart {
+                invocation_uuid: invocation_uuid.into(),
+                model_name: "fixture".into(),
+                provider_name: "fixture".into(),
+                provider_index: 2,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let mut failed = failed_finalization_result(
+            original.clone(),
+            Some(&verified),
+            "runtime_generation_attach_failed",
+            GenerationOperationError::StorageFailure,
+            Err(GenerationOperationError::StorageFailure),
+        );
+        failed
+            .retain_failed_finalization_evidence(&state, invocation_id, invocation_uuid)
+            .unwrap();
+        assert_eq!(
+            state.list_returned_artifacts(invocation_id).unwrap(),
+            original.returned_artifacts
+        );
+        let paths = state
+            .invocation_output_artifact_paths(invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(paths.stdout).unwrap(), original.stdout);
+        assert_eq!(failed.exit_code, -1);
+        // Failure of one retention channel cannot skip the other or overwrite the cause.
+        failed.output_spool = Some(ExecutionOutputSpool::new().unwrap());
+        assert_eq!(
+            failed.retain_failed_finalization_evidence(&state, invocation_id, invocation_uuid),
+            Err("finalization_evidence: artifacts=retained;output=storage_failure")
+        );
+        assert_eq!(
+            state.list_returned_artifacts(invocation_id).unwrap(),
+            original.returned_artifacts
+        );
+        assert_eq!(
+            failed.terminal_reason.as_deref(),
+            Some("runtime_generation_attach_failed")
+        );
+        assert_eq!(failed.exit_code, -1);
+        let result = failed_finalization_result(
+            original,
+            None,
+            "runtime_generation_exit_failed",
+            GenerationOperationError::Unknown,
+            Ok(GenerationOperationOutcome::AlreadyApplied),
+        );
+        assert_eq!(result.session_capture.session_id, None);
+        assert!(result.terminal_signal.unwrap().evidence.contains("Unknown"));
+    }
 
     #[test]
     fn sibling_rotation_fails_closed_with_typed_lifecycle_outcome() {
