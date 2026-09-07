@@ -18,7 +18,7 @@
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
 use oulipoly_runtime::session_authority::{
     AuthoritativeSessionObservation, SessionAuthorityCommitRequest, SessionAuthorityExpectation,
-    commit_session_authority,
+    commit_session_authority, verify_session_authority,
 };
 
 use super::finalization::{
@@ -149,30 +149,40 @@ pub(super) fn commit_resume_session_authority(
     attempt: &ResumeInvocationAttempt<'_>,
     provider: &oulipoly_config::ProviderConfig,
     result: &oulipoly_runtime::executor::ExecutionResult,
+    account_endpoint_configured: bool,
 ) -> Result<(), String> {
-    if !input
-        .agent_runtime_services
-        .provider_registry_handle
-        .current()
-        .has_account_endpoint(&provider.name)
+    if !account_endpoint_configured
+        && !matches!(
+            result.session_capture.method,
+            oulipoly_runtime::executor::SessionCaptureMethod::ExternalProviderLaunch(_)
+        )
     {
         return Ok(());
     }
     let observed_provider_name = result_provider_name(input, result)?;
-    let observed_session_id = match result.session_capture.method {
-        oulipoly_runtime::executor::SessionCaptureMethod::ExternalProviderLaunch => {
-            result.session_capture.session_id.as_deref()
-        }
-        _ => None,
+    let expectation = SessionAuthorityExpectation {
+        account_name: &provider.name,
+        provider_session_id: Some(&input.resolved.active_session_id),
     };
+    let authority = match &result.session_capture.method {
+        oulipoly_runtime::executor::SessionCaptureMethod::ExternalProviderLaunch(authority) => {
+            authority
+        }
+        _ => {
+            return verify_session_authority(expectation, None)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+        }
+    };
+    if authority.account_name != observed_provider_name {
+        return Err("external launch endpoint account does not match result account".to_string());
+    }
+    let observed_session_id = result.session_capture.session_id.as_deref();
     commit_session_authority(SessionAuthorityCommitRequest {
         state: &input.env.state,
         invocation_row_id: attempt.invocation_row_id,
         invocation_uuid: &attempt.invocation.id,
-        expectation: SessionAuthorityExpectation {
-            account_name: &provider.name,
-            provider_session_id: Some(&input.resolved.active_session_id),
-        },
+        expectation,
         observation: observed_session_id.map(|provider_session_id| {
             AuthoritativeSessionObservation {
                 account_name: observed_provider_name,
@@ -180,6 +190,8 @@ pub(super) fn commit_resume_session_authority(
             }
         }),
         capture_method: result.session_capture.method.db_value(),
+        provider_instance_id: &authority.provider_instance_id,
+        settings_id: &authority.settings_id,
         resume_input_id: Some(input.session_id.to_string()),
         provider_session_resolved_account:
             crate::migration_providers::provider_session_resolved_account(

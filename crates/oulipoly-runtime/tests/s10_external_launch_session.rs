@@ -121,6 +121,24 @@ fn external_launch_exit_session_populates_capture_and_resume_request() {
         second.result.session_capture.session_id.as_deref(),
         Some(expected_session.as_str())
     );
+    for result in [&first.result, &second.result] {
+        let oulipoly_runtime::executor::SessionCaptureMethod::ExternalProviderLaunch(authority) =
+            &result.session_capture.method
+        else {
+            panic!("missing endpoint authority")
+        };
+        assert_eq!(authority.account_name, provider_name());
+        assert_eq!(authority.settings_id, "external-session-settings-record");
+        let records = fixture.records_for("launch");
+        assert_eq!(
+            records[0]["request"]["provider_instance_id"],
+            authority.provider_instance_id
+        );
+        assert_eq!(
+            records[1]["request"]["provider_instance_id"],
+            authority.provider_instance_id
+        );
+    }
     let launch_records = fixture.records_for("launch");
     assert_eq!(
         launch_records.len(),

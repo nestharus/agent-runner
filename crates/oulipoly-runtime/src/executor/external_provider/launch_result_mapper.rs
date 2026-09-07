@@ -42,8 +42,8 @@ use crate::executor::cli::{
 };
 use crate::executor::terminal_signal::{TerminalSignal, TerminalSignalKind};
 use crate::executor::{
-    ExecutionOutputSpool, ExecutionResult, ReturnedArtifactRef, SessionCaptureMethod,
-    SessionCaptureResult,
+    ExecutionOutputSpool, ExecutionResult, ExternalProviderSessionAuthority, ReturnedArtifactRef,
+    SessionCaptureMethod, SessionCaptureResult,
 };
 use crate::services::TerminalClassification;
 use crate::session_authority::VerifiedSessionAuthority;
@@ -65,6 +65,7 @@ pub(crate) fn map_launch_result_with_terminal_classification(
     retain_prompt_acceptance_attestation_v1: bool,
     output_spool: ExecutionOutputSpool,
     returned_artifacts: Vec<ReturnedArtifactRef>,
+    authority: &ExternalProviderSessionAuthority,
 ) -> ExecutionResult {
     let stdout = result.stdout_bytes();
     let stderr = String::from_utf8_lossy(&result.stderr_bytes()).into_owned();
@@ -86,7 +87,7 @@ pub(crate) fn map_launch_result_with_terminal_classification(
         output_spool: Some(output_spool),
         exit_code: terminal.exit_code,
         provider_index,
-        session_capture: launch_session_capture(&result),
+        session_capture: launch_session_capture(&result, authority),
         resume_acceptance: None,
         terminal_reason: terminal.terminal_reason,
         terminal_signal: Some(terminal.terminal_signal),
@@ -126,6 +127,7 @@ pub(crate) fn map_missing_final_exit_with_prompt_acceptance(
     provider_name: &str,
     retain_prompt_acceptance_attestation_v1: bool,
     returned_artifacts: Vec<ReturnedArtifactRef>,
+    authority: &ExternalProviderSessionAuthority,
 ) -> Option<ExecutionResult> {
     if error.transport_kind() != "missing_final_exit" {
         return None;
@@ -164,7 +166,7 @@ pub(crate) fn map_missing_final_exit_with_prompt_acceptance(
         provider_index,
         session_capture: SessionCaptureResult {
             session_id: Some(verified_session.provider_session_id().to_string()),
-            method: SessionCaptureMethod::ExternalProviderLaunch,
+            method: SessionCaptureMethod::ExternalProviderLaunch(authority.clone()),
         },
         resume_acceptance: None,
         terminal_reason: Some("external_provider_missing_final_exit".to_string()),
@@ -201,11 +203,14 @@ fn missing_final_exit_evidence(status: Option<&ProcessStatus>) -> String {
     format!("missing_final_exit;{status}")
 }
 
-fn launch_session_capture(result: &LaunchResult) -> SessionCaptureResult {
+fn launch_session_capture(
+    result: &LaunchResult,
+    authority: &ExternalProviderSessionAuthority,
+) -> SessionCaptureResult {
     match launch_provider_session_id(result) {
         Some(session_id) => SessionCaptureResult {
             session_id: Some(session_id),
-            method: SessionCaptureMethod::ExternalProviderLaunch,
+            method: SessionCaptureMethod::ExternalProviderLaunch(authority.clone()),
         },
         None => SessionCaptureResult {
             session_id: None,
@@ -238,4 +243,71 @@ fn provider_session_id_from_value(value: &Value) -> Option<String> {
         .or_else(|| value.get("session_id").and_then(Value::as_str))
         .filter(|session_id| !session_id.is_empty())
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_authority::{
+        AuthoritativeSessionObservation, SessionAuthorityExpectation, verify_session_authority,
+    };
+    use oulipoly_provider::stream::LaunchJsonlReader;
+
+    #[test]
+    fn age345_missing_final_exit_retains_the_supplied_launch_endpoint() {
+        let marker = r#"{"contract":"oulipoly.provider/v1","request_id":"req-1","seq":1,"time_unix_ms":1,"kind":"marker","name":"oulipoly.provider_session","value":{"provider_session_id":"native-a"}}"#;
+        let error = LaunchJsonlReader::new("req-1")
+            .read(format!("{marker}\n").as_bytes())
+            .unwrap_err();
+        assert_eq!(error.transport_kind(), "missing_final_exit");
+        let verified = verify_session_authority(
+            SessionAuthorityExpectation {
+                account_name: "account-a",
+                provider_session_id: Some("native-a"),
+            },
+            Some(AuthoritativeSessionObservation {
+                account_name: "account-a",
+                provider_session_id: "native-a",
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        let authority = ExternalProviderSessionAuthority {
+            account_name: "account-a".into(),
+            provider_instance_id: "pinned-instance".into(),
+            settings_id: "pinned-settings".into(),
+        };
+        let result = map_missing_final_exit_with_prompt_acceptance(
+            &error,
+            Some(&verified),
+            0,
+            "account-a",
+            false,
+            Vec::new(),
+            &authority,
+        )
+        .unwrap();
+        assert_eq!(
+            result.session_capture.session_id.as_deref(),
+            Some("native-a")
+        );
+        assert_eq!(
+            result.session_capture.method,
+            SessionCaptureMethod::ExternalProviderLaunch(authority.clone())
+        );
+        assert_ne!(result.exit_code, 0);
+        assert!(
+            map_missing_final_exit_with_prompt_acceptance(
+                &error,
+                None,
+                0,
+                "account-a",
+                false,
+                Vec::new(),
+                &authority,
+            )
+            .is_none(),
+            "unverified native marker must not mint endpoint authority"
+        );
+    }
 }

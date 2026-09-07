@@ -197,6 +197,10 @@ fn run_with_balancing_environment(
             reservation,
         )?;
 
+        let account_endpoint_configured = agent_runtime_services
+            .provider_registry_handle
+            .current()
+            .has_account_endpoint(provider_name);
         let mut result = execute_balanced_attempt(
             agent_runtime_services,
             &env,
@@ -209,10 +213,11 @@ fn run_with_balancing_environment(
             extra_inputs,
             &mut attempt,
         )?;
-        if agent_runtime_services
-            .provider_registry_handle
-            .current()
-            .has_account_endpoint(provider_name)
+        if account_endpoint_configured
+            || matches!(
+                result.session_capture.method,
+                executor::SessionCaptureMethod::ExternalProviderLaunch(_)
+            )
         {
             let observed_provider_name = result_provider_name(model, &result)?;
             commit_balanced_session_authority(BalancedSessionAuthorityCommitRequest {

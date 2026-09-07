@@ -169,12 +169,21 @@ pub struct SessionCaptureResult {
     pub method: SessionCaptureMethod,
 }
 
+/// Endpoint identity retained from the pinned, authenticated launch client.
+/// Never reconstructed from a registry lookup after execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalProviderSessionAuthority {
+    pub account_name: String,
+    pub provider_instance_id: String,
+    pub settings_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionCaptureMethod {
     None,
     ForcedFlagVerified,
     StdoutJsonEvent,
-    ExternalProviderLaunch,
+    ExternalProviderLaunch(ExternalProviderSessionAuthority),
     Failed(String),
 }
 
@@ -184,7 +193,7 @@ impl SessionCaptureMethod {
             SessionCaptureMethod::None => "none",
             SessionCaptureMethod::ForcedFlagVerified => "forced_flag_verified",
             SessionCaptureMethod::StdoutJsonEvent => "stdout_json_event",
-            SessionCaptureMethod::ExternalProviderLaunch => "external_provider_launch",
+            SessionCaptureMethod::ExternalProviderLaunch(_) => "external_provider_launch",
             SessionCaptureMethod::Failed(_) => "failed",
         }
     }

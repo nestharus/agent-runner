@@ -278,7 +278,13 @@ fn run_resume_attempt(
         }
     };
 
-    lifecycle::commit_resume_session_authority(&input, &bound_attempt.attempt, &provider, &result)?;
+    lifecycle::commit_resume_session_authority(
+        &input,
+        &bound_attempt.attempt,
+        &provider,
+        &result,
+        account_endpoint_configured,
+    )?;
 
     terminal::handle_resume_attempt_result(&mut input, &mut bound_attempt, &provider, &mut result)
 }

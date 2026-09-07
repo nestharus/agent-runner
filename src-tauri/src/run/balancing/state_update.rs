@@ -4,7 +4,7 @@ use oulipoly_runtime::executor;
 use oulipoly_runtime::services::ProviderSessionStartMode;
 use oulipoly_runtime::session_authority::{
     AuthoritativeSessionObservation, SessionAuthorityCommitRequest, SessionAuthorityExpectation,
-    commit_session_authority,
+    commit_session_authority, verify_session_authority,
 };
 use oulipoly_state::StateDb;
 use std::path::Path;
@@ -30,7 +30,7 @@ pub(super) fn update_session_capture(
 ) {
     if matches!(
         result.session_capture.method,
-        executor::SessionCaptureMethod::ExternalProviderLaunch
+        executor::SessionCaptureMethod::ExternalProviderLaunch(_)
     ) {
         return;
     }
@@ -67,12 +67,18 @@ pub(super) fn commit_balanced_session_authority(
         working_dir,
         result,
     } = request;
-    let observed_session_id = match result.session_capture.method {
-        executor::SessionCaptureMethod::ExternalProviderLaunch => {
-            result.session_capture.session_id.as_deref()
+    let authority = match &result.session_capture.method {
+        executor::SessionCaptureMethod::ExternalProviderLaunch(authority) => authority,
+        _ => {
+            return verify_session_authority(expectation, None)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
         }
-        _ => None,
     };
+    if authority.account_name != observed_provider_name {
+        return Err("external launch endpoint account does not match result account".to_string());
+    }
+    let observed_session_id = result.session_capture.session_id.as_deref();
     commit_session_authority(SessionAuthorityCommitRequest {
         state,
         invocation_row_id,
@@ -88,6 +94,8 @@ pub(super) fn commit_balanced_session_authority(
             }
         }),
         capture_method: result.session_capture.method.db_value(),
+        provider_instance_id: &authority.provider_instance_id,
+        settings_id: &authority.settings_id,
         provider_session_resolved_account: Some(
             completed_session_ingest_effective_cwd(working_dir)?
                 .to_string_lossy()
@@ -173,6 +181,27 @@ mod tests {
             .unwrap();
         assert_eq!(row.provider_session_id.as_deref(), Some("session-a"));
         assert_eq!(row.resume_input_id.as_deref(), Some("session-a"));
+        let chain = state
+            .chain_id_for_segment("account-a", "session-a")
+            .unwrap()
+            .unwrap();
+        let authority = state
+            .active_provider_session_authority(&chain)
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority.provider_instance_id, "fixture-instance");
+        assert_eq!(authority.settings_id, "fixture-settings");
+        assert_eq!(
+            state
+                .latest_provider_session_resolved_account_for_authority(
+                    "account-a",
+                    "session-a",
+                    &authority,
+                )
+                .unwrap()
+                .as_deref(),
+            Some(temp.path().to_str().unwrap())
+        );
         assert_eq!(
             row.provider_session_capture_method.as_deref(),
             Some("external_provider_launch")
@@ -208,13 +237,91 @@ mod tests {
         })
         .unwrap_err();
 
-        assert!(error.contains("session account mismatch"), "{error}");
+        assert!(error.contains("account"), "{error}");
         let row = state
             .get_invocation_by_uuid(INVOCATION_UUID)
             .unwrap()
             .unwrap();
         assert_eq!(row.provider_session_id, None);
         assert_eq!(row.provider_session_capture_method, None);
+    }
+
+    #[test]
+    fn age345_endpoint_result_rejects_empty_conflicting_and_wrong_native_authority() {
+        for fault in [
+            "empty-instance",
+            "empty-settings",
+            "conflict-instance",
+            "conflict-settings",
+            "native",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("state.db");
+            let state = StateDb::open(&path).unwrap();
+            let row_id = state
+                .start_invocation(&InvocationStart {
+                    invocation_uuid: INVOCATION_UUID.into(),
+                    model_name: "model-a".into(),
+                    provider_name: "account-a".into(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                })
+                .unwrap();
+            let mut result = external_result("session-a");
+            let SessionCaptureMethod::ExternalProviderLaunch(authority) =
+                &mut result.session_capture.method
+            else {
+                unreachable!()
+            };
+            match fault {
+                "empty-instance" => authority.provider_instance_id.clear(),
+                "empty-settings" => authority.settings_id.clear(),
+                "native" => result.session_capture.session_id = Some("wrong-native".into()),
+                _ => {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    let (instance, settings) = if fault == "conflict-instance" {
+                        ("different-instance", "fixture-settings")
+                    } else {
+                        ("fixture-instance", "different-settings")
+                    };
+                    conn.execute(
+                        "INSERT INTO invocation_provider_session_authority VALUES (?1, ?2, ?3)",
+                        rusqlite::params![row_id, instance, settings],
+                    )
+                    .unwrap();
+                }
+            }
+            assert!(
+                commit_balanced_session_authority(BalancedSessionAuthorityCommitRequest {
+                    state: &state,
+                    invocation_row_id: row_id,
+                    invocation_uuid: INVOCATION_UUID,
+                    expectation: SessionAuthorityExpectation {
+                        account_name: "account-a",
+                        provider_session_id: Some("session-a")
+                    },
+                    observed_provider_name: "account-a",
+                    start_mode: Some(ProviderSessionStartMode::Resume),
+                    working_dir: Some(temp.path()),
+                    result: &result,
+                })
+                .is_err(),
+                "{fault}"
+            );
+            let row = state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.provider_session_id, None, "{fault}");
+            assert_eq!(row.provider_session_resolved_account, None, "{fault}");
+            assert_eq!(
+                state
+                    .chain_id_for_segment("account-a", "session-a")
+                    .unwrap(),
+                None,
+                "{fault}"
+            );
+        }
     }
 
     fn external_result(provider_session_id: &str) -> ExecutionResult {
@@ -226,7 +333,13 @@ mod tests {
             provider_index: 0,
             session_capture: SessionCaptureResult {
                 session_id: Some(provider_session_id.to_string()),
-                method: SessionCaptureMethod::ExternalProviderLaunch,
+                method: SessionCaptureMethod::ExternalProviderLaunch(
+                    executor::ExternalProviderSessionAuthority {
+                        account_name: "account-a".into(),
+                        provider_instance_id: "fixture-instance".into(),
+                        settings_id: "fixture-settings".into(),
+                    },
+                ),
             },
             resume_acceptance: None,
             terminal_reason: None,

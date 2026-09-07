@@ -38,7 +38,7 @@ use crate::executor::cli::spawn_identity::{
     record_child_identity, register_runtime_generation_starting,
 };
 use crate::executor::cli::{prepare_return_channel, read_and_cleanup_return_channel};
-use crate::executor::{ExecutionOutputSpool, ExecutionResult};
+use crate::executor::{ExecutionOutputSpool, ExecutionResult, ExternalProviderSessionAuthority};
 use crate::provider_registry::ProviderRegistry;
 use crate::services::ServiceError;
 use crate::session_authority::{
@@ -131,6 +131,11 @@ fn attempt_account_dispatch(
         .map_err(classify_provider_client_attempt_error)?;
     let describe = endpoint.capabilities();
     let provider_instance_id = format!("{}-instance", describe.provider_id);
+    let session_authority = ExternalProviderSessionAuthority {
+        account_name: endpoint.account_name().to_string(),
+        provider_instance_id: provider_instance_id.clone(),
+        settings_id: settings_id.to_string(),
+    };
     gate_required_capabilities(describe)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
     if !describe.capabilities.launch_output_v1 {
@@ -204,6 +209,7 @@ fn attempt_account_dispatch(
                 &context.provider.name,
                 launch_prompt_acceptance_v1_enabled,
                 returned_artifacts,
+                &session_authority,
             ) {
                 return Ok(result);
             }
@@ -260,6 +266,7 @@ fn attempt_account_dispatch(
         launch_prompt_acceptance_v1_enabled,
         output_spool,
         returned_artifacts,
+        &session_authority,
     ))
 }
 

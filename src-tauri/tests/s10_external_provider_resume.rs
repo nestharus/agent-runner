@@ -808,6 +808,40 @@ fn assert_unconfirmed_resume(output: &Output) {
 }
 
 #[test]
+fn age345_runner_launch_and_resume_persist_the_launch_request_endpoint() {
+    let fixture = Fixture::new();
+    assert_success(&fixture.run_launch());
+    assert_unconfirmed_resume(&fixture.run_resume());
+    let records = fixture.records();
+    let launches = records_for_subcommand(&records, "launch");
+    assert_eq!(launches.len(), 2);
+    let conn = open_invocation_db(&fixture.data_home.join("oulipoly-agent-runner/state.db"));
+    let mut stmt = conn.prepare("SELECT a.provider_instance_id, a.settings_id, i.provider_session_id FROM invocations i JOIN invocation_provider_session_authority a ON a.invocation_id = i.id ORDER BY i.id").unwrap();
+    let authorities: Vec<(String, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(authorities.len(), 2);
+    for (authority, launch) in authorities.iter().zip(launches) {
+        assert_eq!(
+            authority.0,
+            launch["request"]["provider_instance_id"].as_str().unwrap()
+        );
+        assert_eq!(
+            authority.1,
+            launch["request"]["params"]["settings_id"].as_str().unwrap()
+        );
+        assert_eq!(authority.2, SESSION_ID);
+    }
+    let segment_authority: (String, String) = conn.query_row("SELECT provider_instance_id, settings_id FROM session_chain_segment_provider_authority", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(
+        segment_authority,
+        (authorities[0].0.clone(), authorities[0].1.clone())
+    );
+}
+
+#[test]
 fn external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd() {
     let fixture = Fixture::new();
 
