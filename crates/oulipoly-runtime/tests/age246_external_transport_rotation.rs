@@ -757,3 +757,93 @@ fn allocated_failure_retains_artifacts_and_captured_children_on_the_producing_in
         ]
     );
 }
+
+#[test]
+fn repeating_an_allocated_lease_is_nonexecuting_and_cannot_settle_the_existing_generation() {
+    let fixture = make_fixture(&[], &["unavail-1"]);
+    let model = rotation_model(&fixture, &["unavail-1", "fast-2"]);
+    let registry = registry_with_client_options(
+        &model,
+        &fixture,
+        ProviderClientOptions::default().with_timeout(HANDSHAKE_TIMEOUT),
+    );
+    let allocation = allocated_input(&fixture, &model, true);
+    let first = executor::execute_allocated_provider_attempt(
+        &registry,
+        allocated_request(model.clone()),
+        allocation.clone(),
+    );
+    let executor::ProviderLaunchAttemptOutcome::Failed(first) = first else {
+        panic!("expected policy failure");
+    };
+    let before = order_lines(&fixture.order_path);
+    let second = executor::execute_allocated_provider_attempt(
+        &registry,
+        allocated_request(model),
+        allocation,
+    );
+    let executor::ProviderLaunchAttemptOutcome::Failed(second) = second else {
+        panic!("replay must be non-executing");
+    };
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        before,
+        "same-lease retry repeated provider work"
+    );
+    assert!(second.actor_settlement.is_empty());
+    assert!(second.rotatable_kind.is_none());
+    assert_eq!(
+        second.runtime_settlement.row_sha256,
+        first.runtime_settlement.row_sha256
+    );
+}
+
+#[test]
+fn concurrent_same_lease_entries_admit_only_one_process_capable_attempt() {
+    let fixture = make_fixture(&["slow-1"], &[]);
+    let model = rotation_model(&fixture, &["slow-1", "fast-2"]);
+    let registry = registry_with_client_options(
+        &model,
+        &fixture,
+        ProviderClientOptions::default().with_timeout(HANDSHAKE_TIMEOUT),
+    );
+    let allocation = allocated_input(&fixture, &model, true);
+    let outcomes = std::thread::scope(|scope| {
+        let run = || {
+            executor::execute_allocated_provider_attempt(
+                &registry,
+                allocated_request(model.clone()),
+                allocation.clone(),
+            )
+        };
+        let left = scope.spawn(run);
+        let right = scope.spawn(run);
+        [left.join().unwrap(), right.join().unwrap()]
+    });
+    let failures = outcomes
+        .into_iter()
+        .map(|outcome| match outcome {
+            executor::ProviderLaunchAttemptOutcome::Failed(failure) => failure,
+            _ => panic!("both calls should fail without any sibling"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failures
+            .iter()
+            .filter(|f| !f.actor_settlement.is_empty())
+            .count(),
+        1
+    );
+    assert_eq!(
+        failures
+            .iter()
+            .filter(|f| f.rotatable_kind
+                == Some(oulipoly_state::RotatableLaunchFailureKind::HostTimeout))
+            .count(),
+        1
+    );
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        [format!("policy:{}", settings_id("slow-1"))]
+    );
+}

@@ -384,11 +384,35 @@ pub(crate) fn prepare_return_channel(
 // explicit Child lifecycle precedes this read; no lifecycle authority is minted.
 pub(crate) fn read_and_cleanup_return_channel(
     channel: Option<ReturnChannel>,
-) -> Vec<ReturnedArtifactRef> {
+) -> Result<Vec<ReturnedArtifactRef>, String> {
     let Some(mut channel) = channel else {
-        return vec![];
+        return Ok(vec![]);
     };
-    channel.seal_settled(|_| Ok(())).artifacts().to_vec()
+    let settlement = channel.seal_settled(|_| Ok(()));
+    match settlement {
+        ReturnChannelSettlement::NotCreated | ReturnChannelSettlement::EmptyRemoved => Ok(vec![]),
+        ReturnChannelSettlement::ArtifactsCommitted(refs) => Ok(refs),
+        ReturnChannelSettlement::Quarantined {
+            path, artifacts, ..
+        }
+        | ReturnChannelSettlement::CleanupFailed { path, artifacts } => {
+            let error = format!(
+                "return_channel_custody_uncertain;retained={}",
+                path.display()
+            );
+            if artifacts.is_empty() {
+                return Err(error);
+            }
+            // The unlinked caller must retain valid producing-invocation refs
+            // even if cleanup failed. Nonempty effects are never empty custody;
+            // this standalone boundary returns no transfer certificate.
+            tracing::warn!(
+                error,
+                "Return channel retained artifacts with uncertain cleanup"
+            );
+            Ok(artifacts)
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

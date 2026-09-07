@@ -255,7 +255,20 @@ pub(super) fn attempt_account_dispatch(
         return_channel
     };
     let launch_outcome = invoke_provider_launch(&client, launch_request);
-    let returned_artifacts = read_and_cleanup_return_channel(standalone_channel);
+    let returned_artifacts = match read_and_cleanup_return_channel(standalone_channel) {
+        Ok(artifacts) => artifacts,
+        Err(message) if launch_outcome.is_ok() => {
+            let _ = finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            return Err(terminal_attempt_error(ServiceError::Dependency { message }));
+        }
+        Err(message) => {
+            tracing::warn!(
+                message,
+                "Return channel quarantined; retaining the original provider failure"
+            );
+            Vec::new()
+        }
+    };
     let launch_result = match launch_outcome {
         Ok(result) => result,
         Err(error) => {

@@ -436,6 +436,21 @@ pub(crate) fn register_runtime_generation_starting(
     let Some(context) = context else {
         return Ok(());
     };
+    register_generation_starting(context, false)
+}
+
+/// Allocation is single-use execution authority. Existing rows are evidence for
+/// non-executing reconciliation, never permission to run policy/launch again.
+pub(crate) fn register_allocated_runtime_generation_starting(
+    context: &SpawnIdentityContext,
+) -> Result<(), String> {
+    register_generation_starting(context, true)
+}
+
+fn register_generation_starting(
+    context: &SpawnIdentityContext,
+    fresh_only: bool,
+) -> Result<(), String> {
     let mut db = context.open_mailbox()?;
     recover_stale_session_generations(&mut db, context)?;
     match db
@@ -453,7 +468,11 @@ pub(crate) fn register_runtime_generation_starting(
         })
         .map_err(|err| err.to_string())?
     {
-        GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_) => Ok(()),
+        GenerationMutation::Applied(_) => Ok(()),
+        GenerationMutation::AlreadyApplied(_) if !fresh_only => Ok(()),
+        GenerationMutation::AlreadyApplied(_) => {
+            Err("allocated_runtime_generation_already_exists".into())
+        }
         GenerationMutation::Rejected(rejection) => Err(format!(
             "Runtime generation starting registration rejected: {rejection:?}"
         )),

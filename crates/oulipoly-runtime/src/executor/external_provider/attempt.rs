@@ -2,7 +2,8 @@
 //! account loop, or lifecycle coordinator lives here. Roles: mapper, orchestration.
 use super::context::ExternalProviderDispatchContext;
 use crate::executor::cli::spawn_identity::{
-    SpawnIdentityContext, exit_runtime_generation_outcome, register_runtime_generation_starting,
+    SpawnIdentityContext, exit_runtime_generation_outcome,
+    register_allocated_runtime_generation_starting,
 };
 use crate::executor::{
     CapturedChildInvocation, ExecutionOutputSpool, ExecutionResult, ReturnChannel,
@@ -364,13 +365,11 @@ pub fn execute_allocated_provider_attempt(
         Ok(value) => value,
         Err(message) => return setup_failure(allocation, message),
     };
-    let result = register_runtime_generation_starting(Some(&attempt.spawn))
-        .map_err(|_| {
-            super::dispatch::terminal_attempt_error(ServiceError::Dependency {
-                message: "runtime_generation_registration_failed".into(),
-            })
-        })
-        .and_then(|_| super::dispatch::attempt_account_dispatch(registry, &context));
+    if let Err(message) = register_allocated_runtime_generation_starting(&attempt.spawn) {
+        // Do not exit or otherwise mutate a generation owned by an earlier call.
+        return setup_failure(allocation, message);
+    }
+    let result = super::dispatch::attempt_account_dispatch(registry, &context);
     // Paths rejected before an operation call are explicitly accounted by the
     // single dispatch owner. A spawned/missing/uncertain receipt is never replaced.
     for operation in ["describe", "policy.evaluate", "launch"] {
@@ -799,7 +798,7 @@ mod tests {
         let (_dir, attempt, _) = fixture();
         let allocation = &attempt.allocation;
         assert!(!runtime_receipt(allocation, &[]).effect_incapable);
-        register_runtime_generation_starting(Some(&attempt.spawn)).unwrap();
+        register_allocated_runtime_generation_starting(&attempt.spawn).unwrap();
         attempt.actors.record_not_invoked("launch");
         let actors = attempt.actors.receipts();
         assert!(!runtime_receipt(allocation, &actors).effect_incapable);
