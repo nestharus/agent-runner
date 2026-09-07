@@ -2213,41 +2213,220 @@ fn settlement_trace_requires_exact_complete_result_and_distinguishes_timeout() {
     }
 }
 
+// Linux subreaping is confined to a fresh test subprocess, never the parallel
+// test harness. It lets the observer reap the orphaned provider and distinguish
+// provider death from runner reaping (and from a still-existing zombie group).
+#[cfg(target_os = "linux")]
 #[test]
 fn settlement_child_cleanup_reaps_on_panic_and_timeout() {
-    for panic_after_spawn in [false, true] {
-        let pty = OuterPty::open(30, 100);
-        // A blocked offline child, not a timing-based lifetime or real provider.
-        let child = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+    const OBSERVER: &str = "AGE348_CLEANUP_OBSERVER";
+    if std::env::var_os(OBSERVER).is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "settlement_child_cleanup_reaps_on_panic_and_timeout",
+                "--nocapture",
+            ])
+            .env(OBSERVER, "1")
+            .status()
             .unwrap();
-        let pid = child.id();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut guard = SettlementChild::new(child);
-            if panic_after_spawn {
-                panic!("injected settlement assertion panic");
-            }
+        assert!(
+            status.success(),
+            "isolated cleanup observer failed: {status}"
+        );
+        return;
+    }
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+    for recorded in [false, true] {
+        for panic_after_spawn in [false, true] {
+            observe_settlement_tree_cleanup(recorded, panic_after_spawn);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_settlement_tree_cleanup(recorded: bool, panic_after_spawn: bool) {
+    let fixture = Fixture::new();
+    let script = fixture.dir.path().join("cleanup-provider.sh");
+    let identity_path = fixture.dir.path().join("cleanup-provider.pid");
+    // Only Bash builtins: no independent timer or unrelated process to kill.
+    // read is a fixture barrier, not a successful lifetime-based assertion. Its
+    // 30s backstop bounds escape even if startup/observer assertions fail.
+    fs::write(
+        &script,
+        format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+test -t 0 && test -t 1 && test -t 2
+printf '%s\n' "$$" > {identity}
+printf 'CLEANUP_PROVIDER_BLOCKED\n'
+IFS= read -r -t 30 line
+exit 91
+"#,
+            identity = shell_single_quote(&path_string(&identity_path)),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.write_interactive_model("fixture-cleanup", "fixture-provider", &script);
+    fixture.seed_active_chain(
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-cleanup",
+    );
+    let pty = OuterPty::open(30, 100);
+    // Declared first so setup unwinding drops/reaps the runner before fallback.
+    let mut fallback = CleanupProviderFallback(None);
+    let mut guard = SettlementChild::new(spawn_repl_under_pty(
+        &fixture,
+        &pty,
+        "fixture-cleanup",
+        SESSION_A,
+    ));
+    let runner_pid = guard.child.id() as i32;
+    let runner_identity = read_live_process_identity(i64::from(runner_pid))
+        .unwrap()
+        .unwrap();
+    let startup = read_until(
+        pty.master.as_raw_fd(),
+        "CLEANUP_PROVIDER_BLOCKED",
+        Duration::from_secs(5),
+    );
+    assert!(startup.contains("CLEANUP_PROVIDER_BLOCKED"), "{startup:?}");
+    let provider_pid: i64 = fs::read_to_string(identity_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let identity = read_live_process_identity(provider_pid).unwrap().unwrap();
+    // An observer-owned fallback is not invoked until AFTER all death assertions;
+    // it cannot manufacture success for a leaking guard.
+    fallback.0 = Some(identity.clone());
+    assert_ne!(provider_pid, i64::from(runner_pid));
+    assert_eq!(
+        unsafe { libc::getpgid(provider_pid as i32) },
+        provider_pid as i32
+    );
+    assert_eq!(unsafe { libc::kill(-(provider_pid as i32), 0) }, 0);
+    assert!(guard.child.try_wait().unwrap().is_none());
+    if recorded {
+        let invocation = wait_for_running_invocation(&fixture);
+        let stored = wait_for_child_identity(&fixture, &invocation);
+        assert_eq!(stored, identity);
+        guard.provider = Some(stored);
+    } else {
+        // Provider is demonstrably live, but the guard has not learned its PID.
+        // Only PTY closure can terminate it in this case.
+        assert!(guard.provider.is_none());
+    }
+    eprintln!(
+        "cleanup before: recorded={recorded} panic={panic_after_spawn} runner={runner_identity:?} provider={identity:?} group_live=true"
+    );
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut guard = guard;
+        if panic_after_spawn {
+            panic!("injected actual-runner settlement assertion panic");
+        }
+        assert_eq!(
+            guard
+                .wait_bounded(pty.master.as_raw_fd(), Duration::from_millis(50))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut,
+        );
+    }));
+    assert_eq!(result.is_err(), panic_after_spawn);
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(runner_pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    assert!(
+        read_live_process_identity(i64::from(runner_pid))
+            .unwrap()
+            .is_none()
+    );
+    // Subreaper custody is observation only: no signal before this wait. A live
+    // provider yields zero until the deadline and fails, even if runner was reaped.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let provider_status = loop {
+        let waited = unsafe { libc::waitpid(provider_pid as i32, &mut status, libc::WNOHANG) };
+        if waited == provider_pid as i32 {
+            break Some(status);
+        }
+        if waited == -1 {
             assert_eq!(
-                guard
-                    .wait_bounded(pty.master.as_raw_fd(), Duration::ZERO)
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::TimedOut
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
             );
-        }));
-        assert_eq!(result.is_err(), panic_after_spawn);
-        let mut status = 0;
-        assert_eq!(
-            unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
-            -1
+            // The runner may win the reap race before its own SIGKILL. Absence
+            // checks below still independently prove provider/group termination.
+            break None;
+        }
+        assert_eq!(waited, 0);
+        assert!(
+            Instant::now() < deadline,
+            "runner reaped but provider survived: {identity:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    if let Some(status) = provider_status {
+        assert!(
+            libc::WIFSIGNALED(status),
+            "provider exited without cleanup signal: {status}"
         );
         assert_eq!(
-            io::Error::last_os_error().raw_os_error(),
-            Some(libc::ECHILD)
+            libc::WTERMSIG(status),
+            if recorded {
+                libc::SIGKILL
+            } else {
+                libc::SIGHUP
+            }
         );
+    }
+    assert!(read_live_process_identity(provider_pid).unwrap().is_none());
+    assert_eq!(unsafe { libc::kill(-(provider_pid as i32), 0) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    eprintln!(
+        "cleanup after: recorded={recorded} panic={panic_after_spawn} runner_reaped=ECHILD provider={provider_pid} observer_wait_status={provider_status:?} group_absent=ESRCH"
+    );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[cfg(target_os = "linux")]
+struct CleanupProviderFallback(Option<ProcessIdentity>);
+
+#[cfg(target_os = "linux")]
+impl Drop for CleanupProviderFallback {
+    fn drop(&mut self) {
+        let Some(identity) = &self.0 else { return };
+        if read_live_process_identity(identity.os_pid)
+            .ok()
+            .flatten()
+            .as_ref()
+            != Some(identity)
+        {
+            return;
+        }
+        eprintln!("cleanup observer fallback invoked after failed assertions: {identity:?}");
+        unsafe {
+            libc::kill(-(identity.os_pid as i32), libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let mut status = 0;
+            let waited =
+                unsafe { libc::waitpid(identity.os_pid as i32, &mut status, libc::WNOHANG) };
+            if waited != 0 || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
