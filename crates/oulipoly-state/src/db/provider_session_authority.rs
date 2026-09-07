@@ -63,6 +63,17 @@ impl StateDb {
             .map_err(|error| format!("Failed to commit provider session authority: {error}"))
     }
 
+    /// Read the authority of the exact invocation, never a later session/account.
+    pub fn invocation_provider_session_authority(
+        &self,
+        invocation_row_id: i64,
+    ) -> Result<Option<StoredProviderSessionAuthority>, DbError> {
+        self.conn.query_row(
+            "SELECT provider_instance_id, settings_id FROM invocation_provider_session_authority
+             WHERE invocation_id = ?1", sqlite::params![invocation_row_id], map_stored_authority,
+        ).optional().map_err(|error| format!("Failed to read invocation provider authority: {error}"))
+    }
+
     pub fn active_provider_session_authority(
         &self,
         chain_id: &str,

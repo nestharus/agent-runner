@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 12;
+pub(super) const CURRENT_VERSION: i64 = 13;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -107,6 +107,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 12,
         owner: SidecarEntity::MailboxDelivery,
         apply: ensure_mailbox_delivery_settlement_schema,
+    },
+    MigrationStep {
+        target_version: 13,
+        owner: SidecarEntity::MailboxDelivery,
+        apply: migrate_headless_observation_fence,
     },
 ];
 
@@ -524,4 +529,9 @@ fn session_has_nonterminal_generation(conn: &Connection, session_id: &str) -> Re
 fn sidecar_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|err| format!("Failed to read PID mailbox sidecar schema version: {err}"))
+}
+
+fn migrate_headless_observation_fence(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("0013_headless_observation_fence.sql"))
+        .map_err(|err| format!("Failed to migrate headless observation fence: {err}"))
 }

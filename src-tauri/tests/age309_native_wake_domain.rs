@@ -271,7 +271,7 @@ impl Fixture {
                     provider_instance_id: PROVIDER_INSTANCE_ID.to_string(),
                     settings_id: PROVIDER.to_string(),
                     provider_session_id: SESSION.to_string(),
-                    resume_token: "age309-anchor:0".to_string(),
+                    resume_token: Some("age309-anchor:0".to_string()),
                     expected_sha256: format!("{:x}", Sha256::digest(prompt.trim().as_bytes())),
                 },
             )

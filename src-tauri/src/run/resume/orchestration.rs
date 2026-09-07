@@ -261,6 +261,8 @@ fn run_resume_attempt(
         Some(&bound_attempt.provider_session_id),
     )?;
 
+    wake::begin_headless_delivery_submission(&input, &bound_attempt.attempt.invocation.id)?;
+
     let mut result = match execution::execute_resume_attempt_command(
         &input,
         &provider,
