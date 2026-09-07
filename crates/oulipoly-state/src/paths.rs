@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub const APP_DATA_DIR_NAME: &str = "oulipoly-agent-runner";
 pub const DATA_DIR_ENV: &str = "OULIPOLY_DATA_DIR";
@@ -51,23 +52,28 @@ struct RuntimePathConfigurationProviderFactory;
 
 impl RuntimePathConfigurationProviderFactory {
     fn for_current_executable() -> Result<SelectedConfigurationProvider, String> {
-        let executable = std::env::current_exe()
-            .map_err(|error| format!("Could not resolve the current executable: {error}"))?;
-        if is_deleted_linux_memfd(&executable) {
-            return Ok(SelectedConfigurationProvider::Environment(
+        // A live broker has selected its installation before accepting notifications.
+        // Retain that validated location: Linux current_exe() gains " (deleted)"
+        // after replacement, and resolving a replacement symlink would select an
+        // unrelated installation's roots. Do not strip suffixes or trust new bytes.
+        // Only the executable location is pinned; config contents and environment
+        // paths continue to be read by the existing providers on each lookup.
+        static EXECUTABLE: OnceLock<Result<Option<PathBuf>, String>> = OnceLock::new();
+        match EXECUTABLE.get_or_init(resolve_current_executable).as_ref() {
+            Ok(Some(executable)) => Self::for_resolved_executable(executable),
+            Ok(None) => Ok(SelectedConfigurationProvider::Environment(
                 EnvironmentConfigurationProvider,
-            ));
+            )),
+            Err(error) => Err(error.clone()),
         }
-        Self::for_executable(&executable)
     }
 
+    #[cfg(test)]
     fn for_executable(executable: &Path) -> Result<SelectedConfigurationProvider, String> {
-        let executable = std::fs::canonicalize(executable).map_err(|error| {
-            format!(
-                "Could not canonicalize executable {}: {error}",
-                executable.display()
-            )
-        })?;
+        Self::for_resolved_executable(&canonical_executable(executable)?)
+    }
+
+    fn for_resolved_executable(executable: &Path) -> Result<SelectedConfigurationProvider, String> {
         let executable_dir = executable.parent().ok_or_else(|| {
             format!(
                 "Could not resolve the directory containing executable {}",
@@ -88,6 +94,24 @@ impl RuntimePathConfigurationProviderFactory {
             )),
         }
     }
+}
+
+fn resolve_current_executable() -> Result<Option<PathBuf>, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not resolve the current executable: {error}"))?;
+    if is_deleted_linux_memfd(&executable) {
+        return Ok(None);
+    }
+    canonical_executable(&executable).map(Some)
+}
+
+fn canonical_executable(executable: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(executable).map_err(|error| {
+        format!(
+            "Could not canonicalize executable {}: {error}",
+            executable.display()
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -381,6 +405,34 @@ mod tests {
             error.contains("field data_dir must be an absolute path"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn unvalidated_deleted_path_cannot_select_a_replacement_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let replacement = dir.path().join("agents");
+        std::fs::write(&replacement, "replacement").unwrap();
+        std::fs::write(
+            dir.path().join(ADJACENT_PATHS_FILE_NAME),
+            "data_dir = \"/wrong-data\"\nconfig_home = \"/wrong-config\"\n",
+        )
+        .unwrap();
+        let deleted = dir.path().join("agents (deleted)");
+        let error = RuntimePathConfigurationProviderFactory::for_executable(&deleted)
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("Could not canonicalize executable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn literal_deleted_suffix_on_an_existing_executable_is_validated_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("agents (deleted)");
+        std::fs::write(&executable, "fixture").unwrap();
+        assert_eq!(canonical_executable(&executable).unwrap(), executable);
     }
 
     fn env_lock() -> &'static Mutex<()> {

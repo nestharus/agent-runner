@@ -40,6 +40,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod cancel;
+#[cfg(all(test, target_os = "linux"))]
+mod executable_replacement_tests;
 mod outbound_observer;
 mod snapshot_worker;
 mod terminal_protocol;
