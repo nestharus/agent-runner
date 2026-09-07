@@ -112,6 +112,13 @@ impl ReturnChannel {
         &mut self,
         commit: impl FnOnce(&[ReturnedArtifactRef]) -> Result<(), String>,
     ) -> ReturnChannelSettlement {
+        self.read_settled(commit, false)
+    }
+    fn read_settled(
+        &mut self,
+        commit: impl FnOnce(&[ReturnedArtifactRef]) -> Result<(), String>,
+        retain_foreign_for_validation: bool,
+    ) -> ReturnChannelSettlement {
         self.emergency_cleanup = false;
         if !self.identical() {
             return self.quarantine(None, vec![]);
@@ -148,7 +155,8 @@ impl ReturnChannel {
         {
             return self.quarantine(digest, vec![]);
         }
-        let (artifacts, valid) = strict_records(&bytes, self.producer);
+        let (artifacts, valid) =
+            strict_records(&bytes, self.producer, retain_foreign_for_validation);
         // Retain valid prefix records even when another record is malformed.
         if !artifacts.is_empty() && commit(&artifacts).is_err() {
             return self.cleanup_failed(artifacts);
@@ -235,7 +243,16 @@ fn close_file_checked(file: File) -> bool {
 #[cfg(unix)]
 fn opened_matches_path(file: &File, path: &Path, directory: bool) -> bool {
     match (file.metadata(), std::fs::symlink_metadata(path)) {
-        (Ok(a), Ok(b)) => (if directory { b.is_dir() } else { b.is_file() }) && same_file(&a, &b),
+        (Ok(a), Ok(b)) => {
+            use std::os::unix::fs::MetadataExt;
+            let mode = if directory { 0o700 } else { 0o600 };
+            (if directory { b.is_dir() } else { b.is_file() })
+                && same_file(&a, &b)
+                && a.uid() == unsafe { libc::geteuid() }
+                && b.uid() == a.uid()
+                && a.mode() & 0o7777 == mode
+                && b.mode() & 0o7777 == mode
+        }
         _ => false,
     }
 }
@@ -331,7 +348,11 @@ fn private_parents(root: &Path, final_dir: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-fn strict_records(bytes: &[u8], producer: Uuid) -> (Vec<ReturnedArtifactRef>, bool) {
+fn strict_records(
+    bytes: &[u8],
+    producer: Uuid,
+    retain_foreign_for_validation: bool,
+) -> (Vec<ReturnedArtifactRef>, bool) {
     let Ok(body) = std::str::from_utf8(bytes) else {
         return (vec![], false);
     };
@@ -340,11 +361,12 @@ fn strict_records(bytes: &[u8], producer: Uuid) -> (Vec<ReturnedArtifactRef>, bo
     for line in body.lines().filter(|line| !line.trim().is_empty()) {
         let parsed = serde_json::from_str::<ReturnedArtifactRef>(line);
         match parsed {
-            Ok(reference)
-                if reference.producer_invocation_uuid == producer
-                    && strict_shape(line, &reference) =>
-            {
-                refs.push(reference)
+            Ok(reference) if strict_shape(line, &reference) => {
+                let matches_producer = reference.producer_invocation_uuid == producer;
+                valid &= matches_producer;
+                if matches_producer || retain_foreign_for_validation {
+                    refs.push(reference);
+                }
             }
             _ => valid = false,
         }
@@ -388,7 +410,11 @@ pub(crate) fn read_and_cleanup_return_channel(
     let Some(mut channel) = channel else {
         return Ok(vec![]);
     };
-    let settlement = channel.seal_settled(|_| Ok(()));
+    // Standalone finalization owns the existing producer-fence validation and
+    // returned_artifacts error category. Carry structurally valid foreign refs
+    // to that rejecting sink, but quarantine their channel: never bless or
+    // delete them as accepted custody. Allocated seals never commit such refs.
+    let settlement = channel.read_settled(|_| Ok(()), true);
     match settlement {
         ReturnChannelSettlement::NotCreated | ReturnChannelSettlement::EmptyRemoved => Ok(vec![]),
         ReturnChannelSettlement::ArtifactsCommitted(refs) => Ok(refs),
@@ -469,6 +495,22 @@ mod tests {
         }
     }
     #[test]
+    fn broadened_file_or_directory_permissions_cannot_certify_empty_custody() {
+        use std::os::unix::fs::PermissionsExt;
+        for directory in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = channel(dir.path());
+            let target = if directory { &c.dir } else { &c.path };
+            let mode = if directory { 0o755 } else { 0o644 };
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(matches!(
+                c.seal_settled(|_| Ok(())),
+                ReturnChannelSettlement::Quarantined { .. }
+            ));
+            assert!(c.path().exists());
+        }
+    }
+    #[test]
     fn malformed_truncated_extra_and_unbounded_content_never_looks_empty() {
         for bytes in [
             b"{\n".to_vec(),
@@ -530,6 +572,34 @@ mod tests {
         "sha256":"a".repeat(64),"content_len":1,"format_hint":null,"verdict_line":null,
         "source":{"kind":"inline_bytes"},"producer_invocation_uuid":producer,"returned_at":"2026-09-07T00:00:00Z"
     })).unwrap()
+    }
+    #[test]
+    fn foreign_producer_is_quarantined_and_only_standalone_passes_it_to_the_rejecting_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut allocated = channel(dir.path());
+        let reference = artifact(Uuid::new_v4());
+        let bytes = format!("{}\n", serde_json::to_string(&reference).unwrap());
+        std::fs::write(allocated.path(), &bytes).unwrap();
+        let result = allocated.seal_settled(|_| panic!("foreign ref cannot be committed"));
+        assert!(matches!(
+            result,
+            ReturnChannelSettlement::Quarantined { .. }
+        ));
+        assert!(result.artifacts().is_empty());
+        assert!(!result.transferable());
+        assert!(allocated.path().exists());
+
+        let standalone = channel(dir.path());
+        let path = standalone.path().to_owned();
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            read_and_cleanup_return_channel(Some(standalone)).unwrap(),
+            vec![reference]
+        );
+        assert!(
+            path.exists(),
+            "rejected-provenance evidence must remain quarantined"
+        );
     }
     #[test]
     fn valid_artifacts_commit_to_producer_and_partial_records_are_retained_not_transferred() {
