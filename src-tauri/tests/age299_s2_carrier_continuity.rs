@@ -544,6 +544,7 @@ fn prepare_registered_carrier(carrier: Carrier) -> (Fixture, CarrierChild, Strin
                     provider_session_id: SESSION_ID.to_string(),
                     capture_method: "age299_s2_production_binary_fixture",
                     resume_input_id: None,
+                    // This field is the bound workspace path, not the account label.
                     provider_session_resolved_account: Some(workspace.clone()),
                 },
             )

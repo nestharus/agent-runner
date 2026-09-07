@@ -11,12 +11,16 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 const ACCOUNT: &str = "selected-account";
 const SESSION: &str = "provider-session";
 
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 struct Fixture {
+    _env_lock: MutexGuard<'static, ()>,
+    previous_data_dir: Option<std::ffi::OsString>,
     _temp: tempfile::TempDir,
     endpoint_path: PathBuf,
     order_path: PathBuf,
@@ -24,7 +28,14 @@ struct Fixture {
 
 impl Fixture {
     fn new(observed_session: Option<&str>, launch_output_v1: bool) -> Self {
+        let env_lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let previous_data_dir = std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV);
+        // Every test in this binary owns this lock until all dispatches finish.
+        // Launch environment authority must be fixture-owned, not a host default.
+        unsafe { std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, &data_dir) };
         let endpoint_path = temp.path().join("provider-endpoint.py");
         let order_path = temp.path().join("order.txt");
         fs::write(
@@ -36,6 +47,8 @@ impl Fixture {
         permissions.set_mode(0o755);
         fs::set_permissions(&endpoint_path, permissions).unwrap();
         Self {
+            _env_lock: env_lock,
+            previous_data_dir,
             _temp: temp,
             endpoint_path,
             order_path,
@@ -75,6 +88,18 @@ impl Fixture {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // Still holding ENV_LOCK; all provider subprocesses have completed.
+        unsafe {
+            match &self.previous_data_dir {
+                Some(value) => std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, value),
+                None => std::env::remove_var(oulipoly_state::paths::DATA_DIR_ENV),
+            }
+        }
     }
 }
 
