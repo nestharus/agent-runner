@@ -118,6 +118,7 @@ impl Fixture {
             "OULIPOLY_DATA_DIR",
             self.data_home.join("oulipoly-agent-runner"),
         );
+        cmd.env_remove("OULIPOLY_CONFIG_HOME");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.output().unwrap()
     }
@@ -214,6 +215,7 @@ impl Fixture {
             "OULIPOLY_DATA_DIR",
             self.data_home.join("oulipoly-agent-runner"),
         );
+        cmd.env_remove("OULIPOLY_CONFIG_HOME");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
     }
 
@@ -2018,6 +2020,15 @@ fn live_broker_contracts_registered_overlap_after_each_injection() {
 
 #[test]
 fn live_broker_transport_ack_completes_delivery_when_response_is_unread() {
+    unread_response_settlement(false);
+}
+
+#[test]
+fn unread_response_confirmation_failure_is_uncertain_without_retransmission() {
+    unread_response_settlement(true);
+}
+
+fn unread_response_settlement(inject_failure: bool) {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("lost-ack-received.log");
     let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
@@ -2029,7 +2040,12 @@ fn live_broker_transport_ack_completes_delivery_when_response_is_unread() {
         "fixture-lost-ack",
     );
     let pty = OuterPty::open(30, 100);
-    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-lost-ack", SESSION_A);
+    let mut repl = SettlementChild::new(spawn_repl_under_pty(
+        &fixture,
+        &pty,
+        "fixture-lost-ack",
+        SESSION_A,
+    ));
     let startup = read_until(
         pty.master.as_raw_fd(),
         "READY_FOR_NOTIFY",
@@ -2040,7 +2056,18 @@ fn live_broker_transport_ack_completes_delivery_when_response_is_unread() {
         "startup was {startup:?}"
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
+    repl.provider = Some(wait_for_child_identity(&fixture, &invocation_uuid));
     let control_path = running_control_path(&fixture);
+    if inject_failure {
+        Connection::open(fixture.sidecar_path())
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_unread_confirmation
+             BEFORE UPDATE OF acknowledged_at ON mailbox_delivery_attempts
+             BEGIN SELECT RAISE(FAIL, 'injected unread confirmation failure'); END;",
+            )
+            .unwrap();
+    }
     let row = fixture.seed_mailbox("h-lost-ack");
     let mut mailbox = fixture.mailbox();
     mailbox
@@ -2062,40 +2089,272 @@ fn live_broker_transport_ack_completes_delivery_when_response_is_unread() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
     assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
-    // The TUI relays provider output independently of its control worker. The
-    // provider can echo the input before the worker commits confirmation. Wait
-    // for that exact broker ACK event without reading the disconnected peer or
-    // extending the original five-second observation budget. The trace is only
-    // synchronization: the unchanged DB assertions below prove delivery.
-    read_pty_until_file_occurrences(
-        pty.master.as_raw_fd(),
+    // Child receipt is not a commit barrier. The worker records this exact nonce's
+    // result after process_peer settles, before trying to write the dropped response.
+    let settlement = wait_for_settlement_trace(
         &fixture.notify_trace_path(),
-        "inject_status=delivery_ack:lost-ack-attempt",
-        1,
+        pty.master.as_raw_fd(),
+        &invocation_uuid,
+        "lost-ack-attempt",
         deadline.saturating_duration_since(Instant::now()),
-    );
-    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].delivered_at.is_some());
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "{error}; attempt={:?}",
+            fixture
+                .mailbox()
+                .delivery_attempt_window("lost-ack-attempt")
+        )
+    });
+    eprintln!("unread response settlement: {settlement}");
+    if inject_failure {
+        assert_eq!(settlement, "delivery_submission_uncertain:lost-ack-attempt");
+        let mailbox = fixture.mailbox();
+        let rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivered_at.is_none());
+        assert!(rows[0].delivered_by_invocation_uuid.is_none());
+        assert_eq!(rows[0].delivery_attempts, 0);
+        let attempt = mailbox
+            .delivery_attempt_window("lost-ack-attempt")
+            .unwrap()
+            .unwrap();
+        assert!(attempt.submission_started_at.is_some());
+        assert!(attempt.acknowledged_at.is_none());
+        assert!(attempt.resolved_at.is_none());
+    } else {
+        assert_eq!(settlement, "delivery_ack:lost-ack-attempt");
+        let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivered_at.is_some());
+        assert_eq!(
+            rows[0].delivered_by_invocation_uuid.as_deref(),
+            Some(invocation_uuid.as_str())
+        );
+        assert_eq!(rows[0].delivery_attempts, 1);
+        let attempt = fixture
+            .mailbox()
+            .delivery_attempt_window("lost-ack-attempt")
+            .unwrap()
+            .unwrap();
+        assert!(attempt.acknowledged_at.is_some());
+        assert!(attempt.resolved_at.is_some());
+    }
+    // Exact replay retains the terminal outcome, without resubmission or a second count.
+    let retry = inject_control_envelope(&control_path, &envelope).unwrap();
+    assert!(retry.ack, "{retry:?}");
+    assert_eq!(retry.message, settlement);
     assert_eq!(
-        rows[0].delivered_by_invocation_uuid.as_deref(),
-        Some(invocation_uuid.as_str())
+        fixture.mailbox().list_mailbox(SESSION_A, true).unwrap()[0].delivery_attempts,
+        if inject_failure { 0 } else { 1 }
     );
-    assert_eq!(rows[0].delivery_attempts, 1);
-    let attempt = fixture
-        .mailbox()
-        .delivery_attempt_window("lost-ack-attempt")
-        .unwrap()
-        .unwrap();
-    assert!(attempt.acknowledged_at.is_some());
-    assert!(attempt.resolved_at.is_some());
-    assert!(repl.wait().unwrap().success());
+    assert!(
+        repl.wait_bounded(pty.master.as_raw_fd(), Duration::from_secs(5))
+            .unwrap()
+            .success()
+    );
     assert!(
         fs::read_to_string(&received_log)
             .unwrap()
             .contains("handle: h-lost-ack")
     );
+    assert_eq!(
+        fs::read_to_string(&received_log)
+            .unwrap()
+            .matches("handle: h-lost-ack")
+            .count(),
+        1
+    );
     fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn settlement_trace_requires_exact_complete_result_and_distinguishes_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trace");
+    let pty = OuterPty::open(30, 100);
+    let record = |session: &str, owner: &str, status: &str| {
+        format!(
+            "trigger=pty-control session_id={session} invocation_uuid={owner} inject_status={status}\n"
+        )
+    };
+    for ignored in [
+        record(SESSION_A, "stale-owner", "delivery_ack:exact"),
+        record("wrong-session", INVOCATION_A, "delivery_ack:exact"),
+        record(SESSION_A, INVOCATION_A, "delivery_ack:stale"),
+        record(SESSION_A, INVOCATION_A, "delivery_ack:exact")
+            .trim_end()
+            .to_string(),
+    ] {
+        fs::write(&path, &ignored).unwrap();
+        let error = wait_for_settlement_trace(
+            &path,
+            pty.master.as_raw_fd(),
+            INVOCATION_A,
+            "exact",
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("settlement timeout"), "{error}");
+    }
+    for status in ["delivery_ack:exact", "delivery_submission_uncertain:exact"] {
+        fs::write(&path, record(SESSION_A, INVOCATION_A, status)).unwrap();
+        assert_eq!(
+            wait_for_settlement_trace(
+                &path,
+                pty.master.as_raw_fd(),
+                INVOCATION_A,
+                "exact",
+                Duration::ZERO,
+            )
+            .unwrap(),
+            status
+        );
+    }
+}
+
+#[test]
+fn settlement_child_cleanup_reaps_on_panic_and_timeout() {
+    for panic_after_spawn in [false, true] {
+        let pty = OuterPty::open(30, 100);
+        // A blocked offline child, not a timing-based lifetime or real provider.
+        let child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = SettlementChild::new(child);
+            if panic_after_spawn {
+                panic!("injected settlement assertion panic");
+            }
+            assert_eq!(
+                guard
+                    .wait_bounded(pty.master.as_raw_fd(), Duration::ZERO)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+        }));
+        assert_eq!(result.is_err(), panic_after_spawn);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+}
+
+// This guard is installed immediately after spawn, before any fallible assertion.
+// Killing the runner closes the provider PTY (SIGHUP); once recorded, also fence
+// explicit provider cleanup by its OS identity. Reap our child even on unwind.
+struct SettlementChild {
+    child: Child,
+    provider: Option<ProcessIdentity>,
+}
+
+impl SettlementChild {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            provider: None,
+        }
+    }
+
+    fn wait_bounded(
+        &mut self,
+        fd: RawFd,
+        timeout: Duration,
+    ) -> io::Result<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fixture runner exit timed out",
+                ));
+            }
+            drain_settlement_output(fd, deadline)?;
+        }
+    }
+}
+
+impl Drop for SettlementChild {
+    fn drop(&mut self) {
+        if let Some(identity) = &self.provider
+            && read_live_process_identity(identity.os_pid)
+                .ok()
+                .flatten()
+                .as_ref()
+                == Some(identity)
+        {
+            unsafe {
+                libc::kill(-(identity.os_pid as i32), libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn drain_settlement_output(fd: RawFd, deadline: Instant) -> io::Result<()> {
+    // poll is only an observation cadence, never the success condition.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if poll_readable(fd, remaining.min(Duration::from_millis(20)))? {
+        let mut buffer = [0; 4096];
+        match read_fd(fd, &mut buffer) {
+            Ok(_) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_settlement_trace(
+    path: &Path,
+    fd: RawFd,
+    invocation: &str,
+    attempt: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let trace = fs::read_to_string(path).unwrap_or_default();
+        // Ignore an incomplete append and unrelated sessions/nonces. The fixture
+        // supplies one request; accepted and uncertain are distinct terminal results.
+        for line in trace
+            .split_inclusive('\n')
+            .filter(|line| line.ends_with('\n'))
+        {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if !fields.contains(&"trigger=pty-control")
+                || !fields.contains(&format!("invocation_uuid={invocation}").as_str())
+                || !fields.contains(&format!("session_id={SESSION_A}").as_str())
+            {
+                continue;
+            }
+            for prefix in ["delivery_ack:", "delivery_submission_uncertain:"] {
+                let status = format!("{prefix}{attempt}");
+                if fields.contains(&format!("inject_status={status}").as_str()) {
+                    return Ok(status);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("settlement timeout for {attempt}; trace={trace:?}"));
+        }
+        drain_settlement_output(fd, deadline).map_err(|error| error.to_string())?;
+    }
 }
 
 fn spawn_control_server(
