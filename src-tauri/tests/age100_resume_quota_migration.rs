@@ -168,6 +168,7 @@ impl Fixture {
             .arg("continue after quota");
         cmd.current_dir(self.dir.path());
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("OULIPOLY_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env(
             "OULIPOLY_DATA_DIR",
@@ -391,7 +392,7 @@ fn assert_nonzero_failure_result(output: &Output) {
     assert_eq!(result["status"], "failed");
     assert_eq!(result["success"], false);
     assert_eq!(result["exit_code"], 17);
-    assert_eq!(result["error_category"], "network_error");
+    assert_eq!(result["error_category"], "network_error", "{output:?}");
     assert_eq!(result["terminal_reason"], "exit_nonzero");
     assert_eq!(result["provider_name"], ["cla", "ude-a"].concat());
     assert_eq!(result["provider_session_id"], SESSION_ID);
@@ -603,6 +604,7 @@ fn resume_non_quota_failure_does_not_migrate_or_mark_exhausted() {
     let output = fixture.run_resume("age100-resume");
 
     assert_eq!(output.status.code(), Some(17), "{output:?}");
+    eprintln!("fixture resume stderr:\n{}", String::from_utf8_lossy(&output.stderr));
     assert_nonzero_failure_result(&output);
     let result = single_result(&output);
     let invocation_id = result["agent_runner_invocation_id"].as_str().unwrap();
