@@ -19,7 +19,7 @@ struct Fixture {
 impl Fixture {
     fn new(paused: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
-        let mut mailbox = MailboxDb::open(&root.path().join("mailbox.db")).unwrap();
+        let mut mailbox = MailboxDb::open(&root.path().join("pid-identity.db")).unwrap();
         mailbox.set_notifications_paused(SESSION, paused).unwrap();
         Self { root, mailbox }
     }
@@ -126,7 +126,7 @@ executable = "/nonexistent/age346-must-never-launch"
     })
     .unwrap();
     let env = ResumeExecutionEnvironment {
-        state: oulipoly_state::StateDb::open(&root.join("fixture-state.db")).unwrap(),
+        state: oulipoly_state::StateDb::open(&root.join("state.db")).unwrap(),
         providers_cfg: oulipoly_config::ProvidersConfig {
             entries: HashMap::new(),
         },
@@ -274,15 +274,24 @@ fn age346_conflict_target_unavailable_and_inflight_controls() {
     let seq = f
         .enqueue(TEXT, "token", InboxTargetKind::Session, SESSION)
         .unwrap();
-    for (text, kind, target) in [
-        ("different", InboxTargetKind::Session, SESSION),
-        (TEXT, InboxTargetKind::Session, "wrong"),
-        (TEXT, InboxTargetKind::Chain, SESSION),
+    assert!(
+        f.enqueue("different", "token", InboxTargetKind::Session, SESSION)
+            .unwrap_err()
+            .contains("conflicts")
+    );
+    // Existing identity is (token, target kind, target id), not a global token.
+    // Different target identities must never be selected for this resume.
+    for (kind, target) in [
+        (InboxTargetKind::Session, "wrong"),
+        (InboxTargetKind::Chain, SESSION),
     ] {
+        let foreign = f.enqueue(TEXT, "token", kind, target).unwrap();
+        assert_ne!(foreign, seq);
         assert!(
-            f.enqueue(text, "token", kind, target)
-                .unwrap_err()
-                .contains("conflicts")
+            f.prepare(Some(foreign), None)
+                .err()
+                .unwrap()
+                .contains("no launch")
         );
     }
     let wrong = f
@@ -404,7 +413,7 @@ fn age346_ack_abandonment_and_payload_failure_do_not_replay() {
         .enqueue(TEXT, "abandoned", InboxTargetKind::Session, SESSION)
         .unwrap();
     // Frozen terminal/cancellation fixture state, not a production DB mutation.
-    rusqlite::Connection::open(f.root.path().join("mailbox.db"))
+    rusqlite::Connection::open(f.root.path().join("pid-identity.db"))
         .unwrap()
         .execute(
             "UPDATE mailbox SET delivery_error = 'wake_sweep_abandoned' WHERE seq = ?1",
