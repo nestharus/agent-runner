@@ -51,7 +51,7 @@ const MISMATCHED_CHILD_UUID: &str = "66666666-6666-4666-8666-666666666666";
 #[cfg(target_os = "linux")]
 const UNRELATED_UUID: &str = "77777777-7777-4777-8777-777777777777";
 #[cfg(target_os = "linux")]
-const TERMINAL_DESCENDANT_COUNT: usize = 201;
+const TERMINAL_DESCENDANT_COUNT: usize = 800;
 
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
@@ -463,6 +463,16 @@ fn delivered_wake_edge_keeps_live_workload_under_original_root() {
             Some("completed"),
         )
         .unwrap();
+    for index in 0..SnapshotLimits::default().max_invocation_nodes {
+        let history_id = seed_invocation(
+            &state,
+            &format!("82000000-0000-4000-8000-{index:012}"),
+            Some(owner_id),
+        );
+        state
+            .finalize_invocation(history_id, true, 0, None, Some("completed"))
+            .unwrap();
+    }
     let wake_id = seed_invocation(&state, LIVE_CHILD_UUID, None);
     state
         .finalize_invocation(
@@ -521,9 +531,13 @@ fn delivered_wake_edge_keeps_live_workload_under_original_root() {
         .unwrap();
     drop(mailbox);
 
-    let snapshot = fixture
-        .service()
-        .snapshot(&fixture.root(), SnapshotLimits::default());
+    let snapshot = fixture.service().snapshot(
+        &fixture.root(),
+        SnapshotLimits {
+            agent_bash_scan_dirs: 0,
+            ..SnapshotLimits::default()
+        },
+    );
 
     let owner_node_id = format!("invocation:{CHILD_UUID}");
     let wake_node_id = format!("invocation:{LIVE_CHILD_UUID}");
@@ -534,6 +548,261 @@ fn delivered_wake_edge_keeps_live_workload_under_original_root() {
     let workload = node(&snapshot, &format!("agent-bash:{handle}"));
     assert_eq!(workload.status, MonitorStatus::Running);
     assert_eq!(workload.parent_id.as_deref(), Some(wake_node_id.as_str()));
+}
+
+#[test]
+fn persisted_agent_bash_owner_retains_completed_parent_without_caller_chain() {
+    let fixture = Fixture::new();
+    let state = fixture.open_state();
+    let root_id = seed_invocation(&state, ROOT_UUID, None);
+    let owner_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
+    state
+        .finalize_invocation(owner_id, true, 0, None, Some("completed"))
+        .unwrap();
+    state
+        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    drop(state);
+    let workload = current_identity();
+    let handle = "persisted-owner-running";
+    write_agent_bash_meta(
+        &fixture.agent_bash_root(),
+        handle,
+        &agent_bash_meta_with_persisted_owner(handle, CHILD_UUID, SESSION_ID, &workload),
+        "persisted owner workload",
+    );
+
+    let snapshot = fixture.service().snapshot(
+        &fixture.root(),
+        SnapshotLimits {
+            agent_bash_scan_dirs: 0,
+            ..SnapshotLimits::default()
+        },
+    );
+
+    let owner_node_id = format!("invocation:{CHILD_UUID}");
+    assert_eq!(
+        node(&snapshot, &owner_node_id).status,
+        MonitorStatus::Succeeded
+    );
+    assert_eq!(
+        node(&snapshot, &format!("agent-bash:{handle}"))
+            .parent_id
+            .as_deref(),
+        Some(owner_node_id.as_str())
+    );
+    assert!(!has_diagnostic(
+        &snapshot,
+        "agent-bash:owner-legacy-fallback"
+    ));
+}
+
+#[test]
+fn pending_mailbox_owner_retains_completed_invocation_path() {
+    let fixture = Fixture::new();
+    let state = fixture.open_state();
+    let root_id = seed_invocation(&state, ROOT_UUID, None);
+    let owner_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
+    state
+        .finalize_invocation(owner_id, true, 0, None, Some("completed"))
+        .unwrap();
+    state
+        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    drop(state);
+    let mut mailbox = fixture.open_mailbox();
+    mailbox
+        .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            owner_invocation_uuid: Some(CHILD_UUID),
+            ..mailbox_input("pending-terminal-owner", SESSION_ID)
+        })
+        .unwrap();
+    drop(mailbox);
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), SnapshotLimits::default());
+
+    let owner_node_id = format!("invocation:{CHILD_UUID}");
+    assert_eq!(
+        node(&snapshot, &owner_node_id).status,
+        MonitorStatus::Succeeded
+    );
+    let mailbox = snapshot
+        .nodes
+        .iter()
+        .find(|node| node.kind == MonitorNodeKind::MailboxNotification)
+        .unwrap();
+    assert_eq!(mailbox.status, MonitorStatus::Pending);
+    assert_eq!(mailbox.parent_id.as_deref(), Some(owner_node_id.as_str()));
+}
+
+#[test]
+fn legacy_agent_bash_owner_emits_explicit_exact_chain_fallback_diagnostic() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let owner = current_identity();
+    let pid = fixture.open_pid();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), &owner);
+    drop(pid);
+    write_agent_bash_meta(
+        &fixture.agent_bash_root(),
+        "legacy-owner-running",
+        &agent_bash_meta_with_workload_identity("legacy-owner-running", &owner, &owner),
+        "legacy workload",
+    );
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), SnapshotLimits::default());
+
+    assert!(has_diagnostic(
+        &snapshot,
+        "agent-bash:owner-legacy-fallback"
+    ));
+}
+
+#[test]
+fn resumed_delivery_does_not_reparent_existing_descendants() {
+    let fixture = Fixture::new();
+    let state = fixture.open_state();
+    let root_id = seed_invocation(&state, ROOT_UUID, None);
+    let owner_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
+    let existing_uuid = "83000000-0000-4000-8000-000000000001";
+    seed_invocation(&state, existing_uuid, Some(owner_id));
+    let wake_uuid = "83000000-0000-4000-8000-000000000002";
+    seed_invocation(&state, wake_uuid, None);
+    state
+        .finalize_invocation(owner_id, true, 0, None, Some("completed"))
+        .unwrap();
+    state
+        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    drop(state);
+    let mut mailbox = fixture.open_mailbox();
+    let row = match mailbox
+        .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            owner_invocation_uuid: Some(CHILD_UUID),
+            ..mailbox_input("resumed-parent", SESSION_ID)
+        })
+        .unwrap()
+    {
+        EnqueueResult::Inserted(row) => row,
+        result => panic!("unexpected enqueue result: {result:?}"),
+    };
+    mailbox
+        .mark_delivered(SESSION_ID, None, &[row.seq], wake_uuid)
+        .unwrap();
+    drop(mailbox);
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), full_snapshot_limits());
+
+    assert_eq!(
+        node(&snapshot, &format!("invocation:{existing_uuid}"))
+            .parent_id
+            .as_deref(),
+        Some(format!("invocation:{CHILD_UUID}").as_str())
+    );
+    assert_eq!(
+        node(&snapshot, &format!("invocation:{wake_uuid}"))
+            .parent_id
+            .as_deref(),
+        Some(format!("invocation:{CHILD_UUID}").as_str())
+    );
+}
+
+#[test]
+fn missing_durable_parent_is_diagnostic_and_not_promoted_to_root() {
+    let fixture = Fixture::new();
+    let state = fixture.open_state();
+    let root_id = seed_invocation(&state, ROOT_UUID, None);
+    seed_invocation(&state, CHILD_UUID, Some(root_id));
+    state
+        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    drop(state);
+    let conn = rusqlite::Connection::open(fixture.state_path()).unwrap();
+    conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    conn.execute(
+        "UPDATE invocations SET parent_invocation_id = 999999999 WHERE invocation_uuid = ?1",
+        [CHILD_UUID],
+    )
+    .unwrap();
+    drop(conn);
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), SnapshotLimits::default());
+
+    assert!(has_diagnostic(&snapshot, "invocation:missing-parent"));
+    assert!(find_node(&snapshot, &format!("invocation:{CHILD_UUID}")).is_none());
+    assert!(snapshot.nodes.iter().all(|node| node.id != "0"));
+}
+
+#[test]
+fn pid_reuse_changes_liveness_without_changing_durable_parent() {
+    let fixture = Fixture::new();
+    let state = fixture.open_state();
+    let root_id = seed_invocation(&state, ROOT_UUID, None);
+    seed_invocation(&state, CHILD_UUID, Some(root_id));
+    state
+        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    drop(state);
+    let mut reused = current_identity();
+    reused.os_pid_starttime_ticks += 1;
+    let pid = fixture.open_pid();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), &current_identity());
+    record_identity(&pid, CHILD_UUID, Some(SESSION_ID), &reused);
+    drop(pid);
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), full_snapshot_limits());
+
+    let child = node(&snapshot, &format!("invocation:{CHILD_UUID}"));
+    assert_eq!(child.liveness, LivenessStatus::PidReused);
+    assert_eq!(
+        child.parent_id.as_deref(),
+        Some(format!("invocation:{ROOT_UUID}").as_str())
+    );
+}
+
+#[test]
+fn live_closure_overflow_is_explicit_and_totals_are_non_authoritative() {
+    let fixture = Fixture::new();
+    let state = fixture.open_state();
+    let mut parent = seed_invocation(&state, ROOT_UUID, None);
+    for index in 0..8 {
+        parent = seed_invocation(
+            &state,
+            &format!("84000000-0000-4000-8000-{index:012}"),
+            Some(parent),
+        );
+    }
+    state
+        .update_session_capture(parent, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    drop(state);
+    let limits = SnapshotLimits {
+        max_invocation_nodes: 4,
+        ..SnapshotLimits::default()
+    };
+
+    let snapshot = fixture.service().snapshot(&fixture.root(), limits);
+
+    assert!(has_diagnostic(
+        &snapshot,
+        "truncated:invocation-live-coverage"
+    ));
+    assert_eq!(snapshot.summary.status, MonitorStatus::Error);
+    assert!(snapshot.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "truncated:invocation-live-coverage"
+            && diagnostic.message.contains("require pagination")
+            && diagnostic.message.contains("running totals are incomplete")
+    }));
 }
 
 #[test]
@@ -2590,6 +2859,28 @@ fn agent_bash_meta_with_workload_identity(
     meta.to_string()
 }
 
+fn agent_bash_meta_with_persisted_owner(
+    handle: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+    workload: &ProcessIdentity,
+) -> String {
+    serde_json::json!({
+        "handle": handle,
+        "state": "RUNNING",
+        "owner_invocation_uuid": owner_invocation_uuid,
+        "owner_session_id": owner_session_id,
+        "workload_pid": workload.os_pid,
+        "workload_pgid": workload.os_pid,
+        "workload_pid_starttime_ticks": workload.os_pid_starttime_ticks,
+        "process_boot_id": workload.os_boot_id,
+        "argv": ["bash", "-lc", "echo hi"],
+        "cwd": "/tmp/work",
+        "ready_at": "2026-06-08T12:00:00Z"
+    })
+    .to_string()
+}
+
 fn has_diagnostic(snapshot: &oulipoly_runtime::observability::MonitorSnapshot, code: &str) -> bool {
     snapshot
         .diagnostics
@@ -2617,4 +2908,134 @@ fn expect_node<'a>(
     id: &str,
 ) -> &'a oulipoly_runtime::observability::MonitorNode {
     node.unwrap_or_else(|| panic!("missing node {id}; nodes: {:#?}", snapshot.nodes))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn persisted_detached_nested_workload_refresh_removes_terminal_cancelled_and_exited_rows() {
+    let fixture = Fixture::new();
+    let state = fixture.open_state();
+    let root_id = seed_invocation(&state, ROOT_UUID, None);
+    let owner_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
+    let nested_id = seed_invocation(&state, LIVE_CHILD_UUID, Some(owner_id));
+    state
+        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    state
+        .finalize_invocation(owner_id, true, 0, None, None)
+        .unwrap();
+    state
+        .finalize_invocation(nested_id, true, 0, None, None)
+        .unwrap();
+    drop(state);
+    let owner = TestProcess::spawn();
+    let workload = TestProcess::spawn();
+    let pid = fixture.open_pid();
+    record_identity(&pid, CHILD_UUID, Some(SESSION_ID), owner.identity());
+    drop(pid);
+    let handle = "persisted-nested-refresh";
+    let original = agent_bash_meta_with_persisted_owner(
+        handle,
+        LIVE_CHILD_UUID,
+        SESSION_ID,
+        workload.identity(),
+    );
+    let spool = fixture.agent_bash_root();
+    write_agent_bash_meta(&spool, handle, &original, "fixture only");
+    let service = fixture.service();
+    let limits = SnapshotLimits {
+        agent_bash_scan_dirs: 0,
+        ..SnapshotLimits::default()
+    };
+    for _ in 0..2 {
+        let snapshot = service.snapshot(&fixture.root(), limits);
+        assert_eq!(snapshot.summary.running_agent_bash_count, 1);
+        assert_eq!(
+            node(&snapshot, &format!("agent-bash:{handle}"))
+                .parent_id
+                .as_deref(),
+            Some(format!("invocation:{LIVE_CHILD_UUID}").as_str())
+        );
+    }
+    // An exited launcher is not authority to hide its still-live detached work.
+    drop(owner);
+    assert_eq!(
+        service
+            .snapshot(&fixture.root(), limits)
+            .summary
+            .running_agent_bash_count,
+        1
+    );
+    for terminal in ["DONE", "CANCELLED"] {
+        let mut meta: Value = serde_json::from_str(&original).unwrap();
+        meta["state"] = terminal.into();
+        write_agent_bash_meta(&spool, handle, &meta.to_string(), "fixture terminal");
+        let snapshot = service.snapshot(&fixture.root(), limits);
+        assert_eq!(snapshot.summary.running_agent_bash_count, 0);
+        assert!(find_node(&snapshot, &format!("agent-bash:{handle}")).is_none());
+        write_agent_bash_meta(&spool, handle, &original, "fixture reset");
+        assert_eq!(
+            service
+                .snapshot(&fixture.root(), limits)
+                .summary
+                .running_agent_bash_count,
+            1
+        );
+    }
+    drop(workload);
+    let snapshot = service.snapshot(&fixture.root(), limits);
+    assert_eq!(snapshot.summary.running_agent_bash_count, 0);
+    assert!(find_node(&snapshot, &format!("agent-bash:{handle}")).is_none());
+    assert_invocation_absent(&snapshot, LIVE_CHILD_UUID);
+    assert_invocation_absent(&snapshot, CHILD_UUID);
+}
+
+#[test]
+fn interrupted_overlay_preserves_pending_delivery_and_idempotent_receipt() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let mut mailbox = fixture.open_mailbox();
+    let input = AgentBashCompleteEnqueue {
+        owner_invocation_uuid: Some(ROOT_UUID),
+        ..mailbox_input("overlay-interruption", SESSION_ID)
+    };
+    let row = match mailbox.enqueue_agent_bash_complete(&input).unwrap() {
+        EnqueueResult::Inserted(row) => row,
+        other => panic!("unexpected enqueue: {other:?}"),
+    };
+    drop(mailbox);
+    let before = physical_file_snapshot(&fixture.data_dir);
+    let service = fixture.service();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    assert_eq!(
+        service
+            .snapshot_with_cancel(&fixture.root(), SnapshotLimits::default(), &cancellation)
+            .summary
+            .status,
+        MonitorStatus::Cancelled
+    );
+    let snapshot = service.snapshot(&fixture.root(), SnapshotLimits::default());
+    assert_eq!(snapshot.summary.pending_mailbox_count, 1);
+    assert_physical_files_unchanged(&before, &physical_file_snapshot(&fixture.data_dir));
+    let mut mailbox = fixture.open_mailbox();
+    assert_eq!(mailbox.list_pending(SESSION_ID).unwrap().len(), 1);
+    mailbox
+        .mark_delivered(SESSION_ID, None, &[row.seq], "fixture-delivery")
+        .unwrap();
+    mailbox
+        .mark_delivered(SESSION_ID, None, &[row.seq], "duplicate-delivery")
+        .unwrap();
+    assert!(mailbox.list_pending(SESSION_ID).unwrap().is_empty());
+    let edges = mailbox.list_delivery_invocation_edges().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].delivered_by_invocation_uuid, "fixture-delivery");
+    drop(mailbox);
+    assert_eq!(
+        service
+            .snapshot(&fixture.root(), SnapshotLimits::default())
+            .summary
+            .pending_mailbox_count,
+        0
+    );
 }

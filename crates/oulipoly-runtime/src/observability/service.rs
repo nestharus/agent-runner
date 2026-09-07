@@ -5,7 +5,8 @@
 //! Public snapshot port and production read-only snapshot assembly.
 
 use crate::observability::agent_bash::{
-    AgentBashMetaCache, AgentBashProjectInput, default_agent_bash_root, project_agent_bash,
+    AgentBashMetaCache, AgentBashProjectInput, default_agent_bash_root,
+    discover_running_agent_bash_owners, project_agent_bash,
 };
 use crate::observability::dto::{
     InspectRef, MonitorDiagnostic, MonitorDiagnosticSeverity, MonitorNode, MonitorNodeKind,
@@ -154,11 +155,19 @@ impl ProductionObservabilitySnapshotService {
         if cancellation.is_cancelled() {
             return cancelled_snapshot(generated_at);
         }
+        let agent_bash_owners = discover_running_agent_bash_owners(
+            self.agent_bash_root.as_deref(),
+            &self.agent_bash_cache,
+            stores.state.as_ref(),
+            stores.pid.as_ref(),
+            cancellation,
+        );
         let invocation = project_invocations(
             stores.state.as_ref(),
             stores.pid.as_ref(),
             stores.mailbox.as_ref(),
             root,
+            &agent_bash_owners.invocation_uuids,
             limits,
             cancellation,
         );
@@ -195,6 +204,7 @@ impl ProductionObservabilitySnapshotService {
         let root_invocation_uuid = invocation.root_invocation_uuid.clone();
         let diagnostics = snapshot_diagnostics(
             stores.diagnostics,
+            agent_bash_owners.diagnostics,
             invocation.diagnostics,
             mailbox.diagnostics,
             agent_bash.diagnostics,
@@ -378,14 +388,24 @@ fn active_snapshot_session_id(
 
 fn snapshot_diagnostics(
     stores: Vec<MonitorDiagnostic>,
+    agent_bash_discovery: Vec<MonitorDiagnostic>,
     invocation: Vec<MonitorDiagnostic>,
     mailbox: Vec<MonitorDiagnostic>,
     agent_bash: Vec<MonitorDiagnostic>,
 ) -> Vec<MonitorDiagnostic> {
     let mut diagnostics = stores;
+    diagnostics.extend(agent_bash_discovery);
     diagnostics.extend(invocation);
     diagnostics.extend(mailbox);
     diagnostics.extend(agent_bash);
+    let mut seen = HashSet::new();
+    diagnostics.retain(|diagnostic| {
+        seen.insert((
+            diagnostic.code.clone(),
+            diagnostic.message.clone(),
+            diagnostic.node_id.clone(),
+        ))
+    });
     diagnostics
 }
 

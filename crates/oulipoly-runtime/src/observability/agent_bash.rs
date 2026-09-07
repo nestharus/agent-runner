@@ -37,6 +37,11 @@ pub(crate) struct AgentBashProjection {
     pub(crate) running_count: usize,
 }
 
+pub(crate) struct AgentBashLiveOwnerDiscovery {
+    pub(crate) invocation_uuids: HashSet<String>,
+    pub(crate) diagnostics: Vec<MonitorDiagnostic>,
+}
+
 pub(crate) struct AgentBashProjectInput<'a> {
     pub(crate) root_dir: Option<&'a Path>,
     pub(crate) cache: &'a AgentBashMetaCache,
@@ -65,6 +70,8 @@ struct CachedAgentBashMeta {
 struct AgentBashMeta {
     handle: String,
     state: String,
+    owner_invocation_uuid: Option<String>,
+    owner_session_id: Option<String>,
     caller_chain: Vec<CallerIdentity>,
     supervisor_pid: Option<i64>,
     workload_pid: Option<i64>,
@@ -119,6 +126,46 @@ struct WorkloadLogSnapshot {
 
 pub(crate) fn default_agent_bash_root() -> Option<PathBuf> {
     default_agent_bash_state_root().map(agent_bash_root_dir)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn discover_running_agent_bash_owners(
+    root_dir: Option<&Path>,
+    cache: &AgentBashMetaCache,
+    state: Option<&StateDb>,
+    pid: Option<&PidIdentityDb>,
+    cancellation: &CancellationToken,
+) -> AgentBashLiveOwnerDiscovery {
+    let mut discovery = AgentBashLiveOwnerDiscovery {
+        invocation_uuids: HashSet::new(),
+        diagnostics: Vec::new(),
+    };
+    let Some(root_dir) = root_dir else {
+        return discovery;
+    };
+    for candidate in all_candidate_dirs(root_dir, cancellation, &mut discovery.diagnostics) {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let meta_path = candidate.state_dir.join("meta.json");
+        let Some(meta) = read_meta_for_scan(
+            cache,
+            &candidate.state_dir,
+            &meta_path,
+            &mut discovery.diagnostics,
+        ) else {
+            continue;
+        };
+        if meta_workload_status(&meta, meta_workload_liveness(&meta)) != MonitorStatus::Running {
+            continue;
+        }
+        if let Some(owner) =
+            resolve_meta_owner(state, pid, &meta, cancellation, &mut discovery.diagnostics)
+        {
+            discovery.invocation_uuids.insert(owner.invocation_uuid);
+        }
+    }
+    discovery
 }
 
 fn default_agent_bash_state_root() -> Option<PathBuf> {
@@ -350,7 +397,10 @@ fn scanned_workload_nodes(
         return Vec::new();
     };
     let mut nodes = Vec::new();
-    for candidate in candidate_dirs(root_dir, limits, cancellation, diagnostics) {
+    for (index, candidate) in all_candidate_dirs(root_dir, cancellation, diagnostics)
+        .into_iter()
+        .enumerate()
+    {
         if cancellation.is_cancelled() {
             break;
         }
@@ -365,7 +415,9 @@ fn scanned_workload_nodes(
             diagnostics,
             seen_handles,
             &candidate.state_dir,
-        ) {
+        )
+        .filter(|node| index < limits.agent_bash_scan_dirs || node.status == MonitorStatus::Running)
+        {
             nodes.push(node);
         }
     }
@@ -397,12 +449,15 @@ fn scanned_workload_node(
         return None;
     }
     remember_meta_handle(seen_handles, &meta);
-    let owner =
-        resolve_owner(state, pid, &meta.caller_chain, cancellation, diagnostics).or_else(|| {
-            (!cancellation.is_cancelled())
-                .then(|| workload_marker_owner(state, state_dir, &meta, invocation_uuids))
-                .flatten()
-        })?;
+    let owner = resolve_meta_owner(state, pid, &meta, cancellation, diagnostics).or_else(|| {
+        (!cancellation.is_cancelled())
+            .then(|| workload_marker_owner(state, state_dir, &meta, invocation_uuids))
+            .flatten()
+    });
+    let Some(owner) = owner else {
+        diagnostics.push(agent_bash_owner_unattested_diagnostic(state_dir));
+        return None;
+    };
     if !owner_matches_root(&owner, session_id, invocation_uuids) {
         return None;
     }
@@ -483,9 +538,8 @@ fn workload_log_snapshot(path: PathBuf, tail: Option<String>) -> WorkloadLogSnap
     WorkloadLogSnapshot { tail, path }
 }
 
-fn candidate_dirs(
+fn all_candidate_dirs(
     root_dir: &Path,
-    limits: SnapshotLimits,
     cancellation: &CancellationToken,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Vec<CandidateDir> {
@@ -497,7 +551,50 @@ fn candidate_dirs(
             return Vec::new();
         }
     };
-    candidate_dirs_from_entries(entries, limits, cancellation)
+    complete_candidate_dirs(entries, cancellation, diagnostics)
+}
+
+fn complete_candidate_dirs(
+    entries: impl IntoIterator<Item = Result<std::fs::DirEntry, std::io::Error>>,
+    cancellation: &CancellationToken,
+    diagnostics: &mut Vec<MonitorDiagnostic>,
+) -> Vec<CandidateDir> {
+    let mut dirs = Vec::new();
+    for entry in entries {
+        if cancellation.is_cancelled() {
+            return Vec::new();
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                diagnostics.push(agent_bash_discovery_incomplete(error));
+                continue;
+            }
+        };
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {
+                // Missing mtime changes ordering, never whether a directory is discovered.
+                let modified_at = candidate_handle_created_at(&entry.file_name())
+                    .or_else(|| entry.metadata().ok()?.modified().ok());
+                dirs.push(candidate_dir_from_parts(entry.path(), modified_at));
+            }
+            Ok(_) => {}
+            Err(error) => diagnostics.push(agent_bash_discovery_incomplete(error)),
+        }
+    }
+    dirs.sort_by(compare_candidate_dir);
+    dirs
+}
+
+fn agent_bash_discovery_incomplete(error: std::io::Error) -> MonitorDiagnostic {
+    MonitorDiagnostic {
+        code: "agent-bash:discovery-incomplete".to_string(),
+        severity: MonitorDiagnosticSeverity::Warning,
+        message: format!(
+            "Agent Bash directory discovery failed; running totals are incomplete: {error}"
+        ),
+        node_id: None,
+    }
 }
 
 fn read_candidate_dir_entries(root_dir: &Path) -> Result<std::fs::ReadDir, std::io::Error> {
@@ -514,68 +611,10 @@ fn agent_bash_root_read_diagnostic(root_dir: &Path, err: std::io::Error) -> Moni
     )
 }
 
-fn candidate_dirs_from_entries(
-    entries: impl IntoIterator<Item = Result<std::fs::DirEntry, std::io::Error>>,
-    limits: SnapshotLimits,
-    cancellation: &CancellationToken,
-) -> Vec<CandidateDir> {
-    let limit = limits.agent_bash_scan_dirs;
-    if limit == 0 {
-        return Vec::new();
-    }
-    let mut dirs = Vec::new();
-    for entry in entries {
-        if cancellation.is_cancelled() {
-            return Vec::new();
-        }
-        if let Some(candidate) = entry.ok().and_then(candidate_dir) {
-            retain_candidate_dir(&mut dirs, candidate, limit);
-        }
-    }
-    dirs
-}
-
-fn retain_candidate_dir(dirs: &mut Vec<CandidateDir>, candidate: CandidateDir, limit: usize) {
-    let insertion = dirs
-        .binary_search_by(|existing| compare_candidate_dir(existing, &candidate))
-        .unwrap_or_else(|insertion| insertion);
-    if insertion >= limit {
-        return;
-    }
-    if dirs.len() == limit {
-        dirs.pop();
-    }
-    dirs.insert(insertion, candidate);
-}
-
-fn candidate_dir(entry: std::fs::DirEntry) -> Option<CandidateDir> {
-    if !candidate_entry_is_dir(&entry) {
-        return None;
-    }
-    let modified_at = candidate_handle_created_at(&entry.file_name())
-        .or_else(|| candidate_dir_metadata(&entry).ok()?.modified().ok());
-    Some(candidate_dir_from_parts(
-        candidate_entry_path(&entry),
-        modified_at,
-    ))
-}
-
-fn candidate_entry_is_dir(entry: &std::fs::DirEntry) -> bool {
-    entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
-}
-
 fn candidate_handle_created_at(name: &OsStr) -> Option<SystemTime> {
     let timestamp = name.to_str()?.strip_prefix("ab_")?.split('_').next()?;
     let unix_ms = u64::from_str_radix(timestamp, 16).ok()?;
     UNIX_EPOCH.checked_add(Duration::from_millis(unix_ms))
-}
-
-fn candidate_dir_metadata(entry: &std::fs::DirEntry) -> Result<std::fs::Metadata, std::io::Error> {
-    entry.metadata()
-}
-
-fn candidate_entry_path(entry: &std::fs::DirEntry) -> PathBuf {
-    entry.path()
 }
 
 fn candidate_dir_from_parts(state_dir: PathBuf, modified_at: Option<SystemTime>) -> CandidateDir {
@@ -744,7 +783,9 @@ fn format_meta_parse_error(meta_path: &Path, err: serde_json::Error) -> String {
 
 fn parse_meta_value(state_dir: &Path, value: &Value) -> Result<AgentBashMeta, String> {
     let handle = parse_meta_handle(state_dir, value)?;
-    let caller_chain = parse_caller_chain(value)?;
+    let owner_invocation_uuid =
+        optional_string(value, &["owner_invocation_uuid", "ownerInvocationUuid"]);
+    let caller_chain = parse_caller_chain(value, owner_invocation_uuid.is_some())?;
     Ok(agent_bash_meta(value, handle, caller_chain))
 }
 
@@ -780,6 +821,11 @@ fn agent_bash_meta(
     AgentBashMeta {
         handle,
         state: optional_string(value, &["state"]).unwrap_or_else(|| "UNKNOWN".to_string()),
+        owner_invocation_uuid: optional_string(
+            value,
+            &["owner_invocation_uuid", "ownerInvocationUuid"],
+        ),
+        owner_session_id: optional_string(value, &["owner_session_id", "ownerSessionId"]),
         caller_chain,
         supervisor_pid: optional_i64(value, &["supervisor_pid", "supervisorPid"]),
         workload_pid,
@@ -820,8 +866,16 @@ fn parse_workload_identity(value: &Value, workload_pid: Option<i64>) -> Workload
     }
 }
 
-fn parse_caller_chain(value: &Value) -> Result<Vec<CallerIdentity>, String> {
-    let chain = caller_chain_array(value).ok_or_else(missing_caller_chain_error)?;
+fn parse_caller_chain(
+    value: &Value,
+    persisted_owner_present: bool,
+) -> Result<Vec<CallerIdentity>, String> {
+    if persisted_owner_present {
+        return Ok(Vec::new());
+    }
+    let Some(chain) = caller_chain_array(value) else {
+        return Err(missing_caller_chain_error());
+    };
     validate_caller_chain(chain)?;
     parse_caller_identities(chain)
 }
@@ -904,6 +958,27 @@ fn resolve_owner(
         &|| cancellation.is_cancelled(),
         diagnostics,
     )
+}
+
+fn resolve_meta_owner(
+    state: Option<&StateDb>,
+    pid: Option<&PidIdentityDb>,
+    meta: &AgentBashMeta,
+    cancellation: &CancellationToken,
+    diagnostics: &mut Vec<MonitorDiagnostic>,
+) -> Option<ResolvedOwner> {
+    if let Some(invocation_uuid) = meta.owner_invocation_uuid.as_ref() {
+        return Some(ResolvedOwner {
+            session_id: meta
+                .owner_session_id
+                .clone()
+                .or_else(|| state_invocation_session(state, invocation_uuid)),
+            invocation_uuid: invocation_uuid.clone(),
+            matched_chain_index: None,
+        });
+    }
+    diagnostics.push(agent_bash_owner_fallback_diagnostic(&meta.handle));
+    resolve_owner(state, pid, &meta.caller_chain, cancellation, diagnostics)
 }
 
 fn resolve_owner_until(
@@ -1199,6 +1274,29 @@ fn agent_bash_meta_diagnostic_message(state_dir: &Path, message: String) -> Stri
     format!("{}: {message}", state_dir.display())
 }
 
+fn agent_bash_owner_fallback_diagnostic(handle: &str) -> MonitorDiagnostic {
+    MonitorDiagnostic {
+        code: "agent-bash:owner-legacy-fallback".to_string(),
+        severity: MonitorDiagnosticSeverity::Info,
+        message: format!(
+            "agent-bash {handle} lacks persisted owner fields; using exact caller-chain identity fallback"
+        ),
+        node_id: Some(agent_bash_node_id(handle)),
+    }
+}
+
+fn agent_bash_owner_unattested_diagnostic(state_dir: &Path) -> MonitorDiagnostic {
+    MonitorDiagnostic {
+        code: "agent-bash:owner-unattested".to_string(),
+        severity: MonitorDiagnosticSeverity::Warning,
+        message: format!(
+            "agent-bash workload at {} has no attested invocation owner",
+            state_dir.display()
+        ),
+        node_id: None,
+    }
+}
+
 fn agent_bash_node_id(handle: &str) -> String {
     format!("agent-bash:{handle}")
 }
@@ -1317,39 +1415,32 @@ mod cancellation_tests {
             cancel_after: 4,
         };
 
-        let candidates =
-            candidate_dirs_from_entries(entries, SnapshotLimits::default(), &cancellation);
+        let candidates = complete_candidate_dirs(entries, &cancellation, &mut Vec::new());
 
         assert!(candidates.is_empty());
         assert!(visited.get() < 32);
     }
 
     #[test]
-    fn candidate_retention_never_exceeds_the_configured_bound() {
-        let mut candidates = Vec::new();
-        let mut peak_retained = 0;
-
-        for age in 0..100 {
-            retain_candidate_dir(
-                &mut candidates,
-                candidate_dir_from_parts(
-                    PathBuf::from(format!("ab_{age:08x}")),
-                    UNIX_EPOCH.checked_add(Duration::from_secs(age)),
-                ),
-                4,
-            );
-            peak_retained = peak_retained.max(candidates.len());
+    fn complete_discovery_retains_every_directory_in_newest_first_order() {
+        let directory = tempfile::tempdir().unwrap();
+        for age in 0..120 {
+            std::fs::create_dir(directory.path().join(format!("ab_{age:08x}_100_1"))).unwrap();
         }
-
-        assert_eq!(peak_retained, 4);
-        assert_eq!(candidates.len(), 4);
-        assert_eq!(
-            candidates
-                .iter()
-                .map(|candidate| candidate.modified_at.unwrap())
-                .collect::<Vec<_>>(),
-            [99, 98, 97, 96].map(|age| UNIX_EPOCH + Duration::from_secs(age))
+        let mut diagnostics = Vec::new();
+        let candidates = complete_candidate_dirs(
+            std::fs::read_dir(directory.path()).unwrap(),
+            &CancellationToken::new(),
+            &mut diagnostics,
         );
+        assert!(diagnostics.is_empty());
+        assert_eq!(candidates.len(), 120);
+        assert!(candidates.len() > SnapshotLimits::default().agent_bash_scan_dirs);
+        assert_eq!(
+            candidates.first().unwrap().modified_at,
+            UNIX_EPOCH.checked_add(Duration::from_millis(119))
+        );
+        assert_eq!(candidates.last().unwrap().modified_at, Some(UNIX_EPOCH));
     }
 
     #[test]
@@ -1408,5 +1499,41 @@ mod cancellation_tests {
             resolve_owner_until(None, Some(&pid), &chain, &|| false, &mut diagnostics).unwrap();
         assert_eq!(resolved.invocation_uuid, "matching-invocation");
         assert_eq!(resolved.matched_chain_index, Some(1));
+    }
+
+    #[test]
+    fn complete_discovery_discloses_directory_entry_errors() {
+        let entries = vec![Err(std::io::Error::other("fixture unreadable entry"))];
+        let mut diagnostics = Vec::new();
+        assert!(
+            complete_candidate_dirs(entries, &CancellationToken::new(), &mut diagnostics)
+                .is_empty()
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "agent-bash:discovery-incomplete");
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("running totals are incomplete")
+        );
+    }
+
+    #[test]
+    fn persisted_owner_does_not_depend_on_legacy_caller_chain_validity() {
+        let value = serde_json::json!({
+            "handle": "persisted-owner",
+            "owner_invocation_uuid": "owner-invocation",
+            "owner_session_id": "owner-session",
+            "caller_chain": [{"pid": "not-an-integer"}],
+        });
+
+        let meta = parse_meta_value(Path::new("persisted-owner"), &value).unwrap();
+
+        assert_eq!(
+            meta.owner_invocation_uuid.as_deref(),
+            Some("owner-invocation")
+        );
+        assert_eq!(meta.owner_session_id.as_deref(), Some("owner-session"));
+        assert!(meta.caller_chain.is_empty());
     }
 }

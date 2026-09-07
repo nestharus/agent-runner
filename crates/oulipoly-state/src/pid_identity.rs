@@ -263,6 +263,22 @@ impl PidIdentityDb {
             .map_err(|err| format!("Failed to query invocation PID identities: {err}"))?;
         collect_rows(rows)
     }
+
+    pub fn list_identities(&self) -> Result<Vec<PidIdentityRow>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT os_pid, os_boot_id, os_pid_starttime_ticks, os_pgid,
+                        invocation_uuid, session_id, provider_name, model_name, recorded_at
+                 FROM pid_identity
+                 ORDER BY recorded_at DESC, os_pid DESC",
+            )
+            .map_err(|err| format!("Failed to prepare PID identity list: {err}"))?;
+        let rows = stmt
+            .query_map([], map_pid_identity_row)
+            .map_err(|err| format!("Failed to query PID identities: {err}"))?;
+        collect_rows(rows)
+    }
 }
 
 pub fn default_path() -> Result<PathBuf, String> {

@@ -88,6 +88,12 @@ impl RuntimeGenerationId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxDeliveryInvocationEdge {
+    pub owner_invocation_uuid: String,
+    pub delivered_by_invocation_uuid: String,
+}
+
 impl Default for RuntimeGenerationId {
     fn default() -> Self {
         Self::new()
@@ -3333,6 +3339,33 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to query mailbox delivery children: {err}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|err| format!("Failed to map mailbox delivery children: {err}"))
+    }
+
+    pub fn list_delivery_invocation_edges(
+        &self,
+    ) -> Result<Vec<MailboxDeliveryInvocationEdge>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT owner_invocation_uuid, delivered_by_invocation_uuid
+                 FROM mailbox INDEXED BY idx_mailbox_delivery_owner
+                 WHERE owner_invocation_uuid IS NOT NULL
+                   AND delivered_by_invocation_uuid IS NOT NULL
+                   AND delivered_by_invocation_uuid != owner_invocation_uuid
+                 GROUP BY owner_invocation_uuid, delivered_by_invocation_uuid
+                 ORDER BY owner_invocation_uuid, delivered_by_invocation_uuid",
+            )
+            .map_err(|err| format!("Failed to prepare mailbox delivery-edge query: {err}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(MailboxDeliveryInvocationEdge {
+                    owner_invocation_uuid: row.get(0)?,
+                    delivered_by_invocation_uuid: row.get(1)?,
+                })
+            })
+            .map_err(|err| format!("Failed to query mailbox delivery edges: {err}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("Failed to map mailbox delivery edges: {err}"))
     }
 
     fn bounded_mailbox_rows(

@@ -351,16 +351,16 @@ fn bounded_invocation_children_prioritize_terminal_ancestor_of_running_descendan
         .list_invocation_children_with_running_descendants_bounded(root_id, 2)
         .unwrap();
 
-    assert_eq!(children.len(), 2);
+    assert_eq!(children.len(), 1);
     assert_eq!(
         children[0].invocation_uuid,
         "23000000-0000-0000-0000-000000000000"
     );
-    assert_eq!(StateDb::invocation_row_map_count(), 2);
+    assert_eq!(StateDb::invocation_row_map_count(), 1);
 }
 
 #[test]
-fn bounded_invocation_children_report_live_coverage_when_candidate_window_saturates() {
+fn bounded_invocation_children_find_live_ancestor_after_saturated_terminal_history() {
     let db = test_db();
     let root_id = insert_invocation_fixture(
         &db,
@@ -409,18 +409,14 @@ fn bounded_invocation_children_report_live_coverage_when_candidate_window_satura
         )
         .unwrap();
 
-    assert_eq!(page.children.len(), 2);
-    assert!(page.has_more_children);
-    assert!(page.live_coverage_incomplete);
-    assert!(
-        page.children
-            .iter()
-            .all(|child| child.id != hidden_ancestor_id)
-    );
+    assert_eq!(page.children.len(), 1);
+    assert!(!page.has_more_children);
+    assert!(!page.live_coverage_incomplete);
+    assert_eq!(page.children[0].id, hidden_ancestor_id);
 }
 
 #[test]
-fn bounded_invocation_children_report_live_coverage_when_descendant_window_saturates() {
+fn bounded_invocation_children_find_live_ancestor_at_arbitrary_depth() {
     let db = test_db();
     let root_id = insert_invocation_fixture(
         &db,
@@ -469,7 +465,7 @@ fn bounded_invocation_children_report_live_coverage_when_descendant_window_satur
 
     assert_eq!(page.children.len(), 1);
     assert!(!page.has_more_children);
-    assert!(page.live_coverage_incomplete);
+    assert!(!page.live_coverage_incomplete);
 }
 
 #[test]
@@ -504,9 +500,9 @@ fn bounded_invocation_children_report_live_coverage_when_final_child_limit_satur
         )
         .unwrap();
 
-    assert_eq!(page.children.len(), 2);
-    assert!(page.has_more_children);
-    assert!(page.live_coverage_incomplete);
+    assert!(page.children.is_empty());
+    assert!(!page.has_more_children);
+    assert!(!page.live_coverage_incomplete);
 }
 
 #[test]
@@ -560,68 +556,35 @@ fn bounded_invocation_children_report_live_coverage_at_descendant_scan_boundary(
         vec!["30000000-0000-0000-0000-000000000000"]
     );
     assert!(!page.has_more_children);
-    assert!(page.live_coverage_incomplete);
+    assert!(!page.live_coverage_incomplete);
 }
 
 #[test]
-fn running_descendant_queries_are_root_scoped_indexed_and_sort_free() {
+fn running_descendant_query_uses_running_seed_and_primary_parent_indexes() {
     let db = test_db();
-    let mut candidate_statement = db
+    let mut statement = db
         .conn
         .prepare(&format!(
             "EXPLAIN QUERY PLAN {}",
-            StateDb::running_descendant_candidates_sql()
+            StateDb::live_subtree_child_ids_sql()
         ))
         .unwrap();
-    let candidate_details = candidate_statement
+    let details = statement
         .query_map(sqlite::params![1_i64, 8_i64], |row| row.get::<_, String>(3))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert!(
-        candidate_details
+        details
             .iter()
-            .any(|detail| detail.contains("idx_invocations_parent_running_created")),
-        "{candidate_details:?}"
+            .any(|detail| detail.contains("idx_invocations_running_parent")),
+        "{details:?}"
     );
     assert!(
-        candidate_details
+        details
             .iter()
-            .all(|detail| !detail.contains("TEMP B-TREE")),
-        "{candidate_details:?}"
-    );
-
-    let mut descendant_statement = db
-        .conn
-        .prepare(&format!(
-            "EXPLAIN QUERY PLAN {}",
-            StateDb::running_descendant_exists_sql()
-        ))
-        .unwrap();
-    let descendant_details = descendant_statement
-        .query_map(sqlite::params![1_i64, 16_i64], |row| {
-            row.get::<_, String>(3)
-        })
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert!(
-        descendant_details
-            .iter()
-            .any(|detail| detail.contains("idx_invocations_parent")),
-        "{descendant_details:?}"
-    );
-    assert!(
-        descendant_details
-            .iter()
-            .all(|detail| !detail.contains("idx_invocations_running_parent")),
-        "{descendant_details:?}"
-    );
-    assert!(
-        descendant_details
-            .iter()
-            .all(|detail| !detail.contains("TEMP B-TREE")),
-        "{descendant_details:?}"
+            .any(|detail| detail.contains("INTEGER PRIMARY KEY")),
+        "{details:?}"
     );
 
     let mut overflow_statement = db

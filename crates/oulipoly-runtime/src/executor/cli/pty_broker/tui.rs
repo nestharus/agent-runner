@@ -3390,8 +3390,8 @@ fn render_status_row(
     let hint = status_hint(pane, focus, overlay_constrained);
     let summary = format!(
         " OBS  {} · {}",
-        monitor_summary_text(pane),
         view_mode_word(pane.view_mode),
+        monitor_summary_text(pane),
     );
     let label = if hint.is_empty() {
         pad_to_width(summary, area.width)
@@ -3485,7 +3485,7 @@ fn monitor_summary_text(pane: &MonitorPane) -> String {
     match pane.snapshot.as_ref() {
         None => "starting…".to_string(),
         Some(snapshot) => format!(
-            "{} · {} proc · {} bash running · {} mailbox pending · {} diag",
+            "{} · {} running nodes · {} bash running · {} mailbox pending · {} diag",
             status_word(snapshot.summary.status),
             snapshot.summary.running_nodes,
             snapshot.summary.running_agent_bash_count,
@@ -10123,7 +10123,10 @@ mod tests {
 
         let text = screen_text(terminal.backend().buffer(), 20, 80);
         assert!(text.contains("OBS"), "{text}");
-        assert!(text.contains("running · 3 proc · 2 bash running"), "{text}");
+        assert!(
+            text.contains("running · 3 running nodes · 2 bash running"),
+            "{text}"
+        );
         assert!(!text.contains("Enter queue"), "{text}");
         assert!(!text.contains("Ctrl+Enter"), "{text}");
         assert!(!text.contains("Ctrl+F"), "{text}");
