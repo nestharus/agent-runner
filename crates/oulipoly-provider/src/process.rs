@@ -703,9 +703,10 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
     ) -> Result<ProcessOutcome<T>, ProviderClientError> {
         let host_cancellation_requested =
             self.cancellation_started.is_some() || cancellation_requested(self.limits);
+        let joined = join_process_threads(self.threads, &self.child);
         if host_cancellation_requested && self.timeout_mode == TimeoutMode::TotalRuntime {
-            let diagnostics = map_termination_diagnostics(
-                self.threads,
+            let diagnostics = termination_diagnostics_from_joined(
+                joined,
                 TerminatedProcess {
                     status: Some(status),
                     force_killed: false,
@@ -719,20 +720,13 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
                 Some(process_status(status)),
             ));
         }
-        let outcome = map_completed_process_outcome(
+        map_completed_process_outcome(
             status,
-            self.threads,
+            joined,
             &self.command,
             self.argv,
             host_cancellation_requested,
-        );
-        if outcome
-            .as_ref()
-            .is_err_and(|e| e.transport_kind() == "wait_failed")
-        {
-            self.child.uncertain();
-        }
-        outcome
+        )
     }
 
     fn terminate_and_collect(
@@ -743,8 +737,9 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         terminate_tree(&mut self.child);
         let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
         let status = terminated.status.map(process_status);
+        let joined = join_process_threads(self.threads, &self.child);
         let diagnostics =
-            map_termination_diagnostics(self.threads, terminated, host_cancellation_requested);
+            termination_diagnostics_from_joined(joined, terminated, host_cancellation_requested);
         termination_transport_error(kind, &self.command, diagnostics, status)
     }
 
@@ -756,7 +751,8 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
             force_killed: true,
         };
         let status = terminated.status.map(process_status);
-        let diagnostics = map_termination_diagnostics(self.threads, terminated, true);
+        let joined = join_process_threads(self.threads, &self.child);
+        let diagnostics = termination_diagnostics_from_joined(joined, terminated, true);
         termination_transport_error(HostErrorKind::Cancelled, &self.command, diagnostics, status)
     }
 
@@ -764,7 +760,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         terminate_tree(&mut self.child);
         let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
         let status = terminated.status.map(process_status);
-        let joined = join_process_threads(self.threads);
+        let joined = join_process_threads(self.threads, &self.child);
         let host_cancellation_requested =
             self.cancellation_started.is_some() || cancellation_requested(self.limits);
         if host_cancellation_requested {
@@ -1050,13 +1046,12 @@ fn poll_child_status(
 
 fn map_completed_process_outcome<T: StdoutDrainOutput>(
     status: ExitStatus,
-    threads: ProcessThreads<T>,
+    joined: JoinedProcessThreads<T>,
     command: &ProcessCommand,
     argv: Vec<OsString>,
     host_cancellation_requested: bool,
 ) -> Result<ProcessOutcome<T>, ProviderClientError> {
     let process_status = process_status(status);
-    let joined = join_process_threads(threads);
     if !joined.failed_workers.is_empty() {
         return Err(process_worker_failure(
             command,
@@ -1283,15 +1278,6 @@ fn should_force_kill(grace_started: &Instant, kill_after_grace: Duration) -> boo
     grace_started.elapsed() >= kill_after_grace
 }
 
-fn map_termination_diagnostics<T: StdoutDrainOutput>(
-    threads: ProcessThreads<T>,
-    terminated: TerminatedProcess,
-    host_cancellation_requested: bool,
-) -> ProviderDiagnostics {
-    let joined = join_process_threads(threads);
-    termination_diagnostics_from_joined(joined, terminated, host_cancellation_requested)
-}
-
 fn termination_diagnostics_from_joined<T: StdoutDrainOutput>(
     joined: JoinedProcessThreads<T>,
     terminated: TerminatedProcess,
@@ -1324,7 +1310,10 @@ fn processor_failure_with_process_context<T: StdoutDrainOutput>(
     let description = error.diagnostics().description.clone();
     let mut diagnostics =
         termination_diagnostics_from_joined(joined, terminated, host_cancellation_requested);
-    diagnostics.description = description;
+    diagnostics.description = match (description, diagnostics.description) {
+        (Some(original), Some(workers)) => Some(format!("{original}; {workers}")),
+        (original, workers) => original.or(workers),
+    };
     match status {
         Some(status) => error.with_process_context(diagnostics, status),
         None => replace_error_diagnostics(error, diagnostics),
@@ -1397,6 +1386,7 @@ fn completed_process_diagnostics<T: StdoutDrainOutput>(
 
 fn join_process_threads<T: StdoutDrainOutput>(
     threads: ProcessThreads<T>,
+    child: &Child,
 ) -> JoinedProcessThreads<T> {
     let stdout = threads.stdout.join().ok();
     let stderr = threads.stderr.join().ok();
@@ -1410,6 +1400,11 @@ fn join_process_threads<T: StdoutDrainOutput>(
     }
     if stdin_closed_early.is_none() {
         failed_workers.push("stdin");
+    }
+    // Joining is the final observation boundary, after the supervisor stops
+    // reading events. Successful tree cleanup cannot erase lost worker evidence.
+    if !failed_workers.is_empty() {
+        child.uncertain();
     }
     JoinedProcessThreads {
         stdout,
@@ -1438,16 +1433,11 @@ fn process_worker_failure<T: StdoutDrainOutput>(
         description: Some(worker_failure_description(&joined.failed_workers)),
         ..ProviderDiagnostics::default()
     };
-    if let Some(status) = status {
-        diagnostics.provider_exit_code = exit_code(&status);
-        diagnostics.provider_process_nonzero = process_nonzero(&status);
+    if let Some(status) = &status {
+        diagnostics.provider_exit_code = exit_code(status);
+        diagnostics.provider_process_nonzero = process_nonzero(status);
     }
-    ProviderClientError::host_transport(
-        HostErrorKind::WaitFailed,
-        subcommand_for_error(command),
-        None,
-        diagnostics,
-    )
+    termination_transport_error(HostErrorKind::WaitFailed, command, diagnostics, status)
 }
 
 fn worker_failure_description(failed_workers: &[&str]) -> String {
@@ -2208,3 +2198,11 @@ mod tests {
         })
     }
 }
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "process_shutdown_tests.rs"]
+mod shutdown_tests;

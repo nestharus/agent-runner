@@ -847,3 +847,155 @@ fn concurrent_same_lease_entries_admit_only_one_process_capable_attempt() {
         [format!("policy:{}", settings_id("slow-1"))]
     );
 }
+
+fn decoded_final_stderr_timeout(chunks: &[&str], expected_child: bool) {
+    let fixture = make_fixture_with_launch_stalls(&[], &[], &["stall-1"]);
+    let emission = format!(
+        r#"        import base64
+        chunks = {}
+        for seq, chunk in enumerate(chunks, start=3):
+            write_json({{"contract": CONTRACT, "request_id": reqid, "seq": seq, "time_unix_ms": 1000 + seq, "kind": "stderr", "data_base64": base64.b64encode(chunk.encode()).decode()}})
+        time.sleep(SLEEP_SECONDS)
+        return 0"#,
+        serde_json::to_string(chunks).unwrap()
+    );
+    let body = fs::read_to_string(&fixture.provider_path).unwrap().replace(
+        "        time.sleep(SLEEP_SECONDS)\n        return 0",
+        &emission,
+    );
+    write_executable(&fixture.provider_path, &body);
+    let model = rotation_model(&fixture, &["stall-1", "fast-2"]);
+    let registry = registry_with_client_options(
+        &model,
+        &fixture,
+        ProviderClientOptions::default().with_timeout(HANDSHAKE_TIMEOUT),
+    );
+    let allocation = allocated_input(&fixture, &model, true);
+    let owner = allocation.lease.owner.clone();
+    let state_path = allocation.state_db_path.clone();
+    let generation = allocation.lease.runtime_generation_uuid;
+    let outcome = executor::execute_allocated_provider_attempt(
+        &registry,
+        allocated_request(model),
+        allocation,
+    );
+    let executor::ProviderLaunchAttemptOutcome::Failed(failure) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(failure.owner, owner);
+    assert_eq!(
+        failure.runtime_settlement.runtime_generation_uuid,
+        generation
+    );
+    assert_eq!(
+        failure.runtime_settlement.spawn_invocation_uuid,
+        owner.invocation_uuid
+    );
+    assert_eq!(
+        failure.rotatable_kind,
+        Some(oulipoly_state::RotatableLaunchFailureKind::HostTimeout)
+    );
+    let executor::ProviderLaunchFailure::Provider(error) = &failure.error else {
+        panic!("{:?}", failure.error);
+    };
+    assert_eq!(error.transport_kind(), "host_timeout");
+    assert_eq!(error.request_id(), None);
+    assert!(
+        error.diagnostics().stderr.bytes.is_empty(),
+        "fixture must not write raw OS stderr"
+    );
+    assert!(
+        failure
+            .actor_settlement
+            .iter()
+            .all(|a| a.attempt_id == owner.attempt_id && a.effect_incapable())
+    );
+    assert!(failure.runtime_settlement.effect_incapable);
+    assert_eq!(
+        failure.return_channel_settlement,
+        executor::ReturnChannelSettlement::EmptyRemoved
+    );
+    assert!(failure.evidence_retention_failure.is_none());
+    assert!(!failure.observations.persistence_failed);
+    assert_eq!(
+        failure
+            .output_spool
+            .as_ref()
+            .unwrap()
+            .incomplete_output_bytes()
+            .unwrap()
+            .1,
+        chunks.concat().as_bytes()
+    );
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        [
+            format!("policy:{}", settings_id("stall-1")),
+            format!("launch:{}", settings_id("stall-1"))
+        ]
+    );
+    let db = oulipoly_state::StateDb::open(&state_path).unwrap();
+    let promotions = db.provider_launch_promotions(&owner).unwrap();
+    assert_eq!(
+        failure.observations.captured_child, expected_child,
+        "{failure:?}"
+    );
+    assert_eq!(failure.observations.transfer_forbidden(), expected_child);
+    assert_eq!(
+        promotions.contains(&oulipoly_state::ProviderLaunchPromotion::CapturedChild),
+        expected_child
+    );
+    assert_eq!(
+        failure.captured_child_invocations.len(),
+        usize::from(expected_child)
+    );
+    assert!(
+        !failure.observations.provider_session_observed
+            && !failure.observations.prompt_accepted
+            && !failure.observations.assistant_response_observed
+            && !failure.observations.returned_artifact
+            && !failure.observations.mailbox_submission_accepted
+    );
+    if expected_child {
+        let child = &failure.captured_child_invocations[0];
+        assert_eq!(child.composite_id.source, "decoded-child");
+        assert_eq!(
+            child.composite_id.id,
+            "22222222-2222-4222-8222-222222222222"
+        );
+        assert_eq!(child.raw_marker_line, chunks.concat());
+    }
+}
+
+#[test]
+fn allocated_decoded_final_marker_without_newline_promotes_on_timeout() {
+    decoded_final_stderr_timeout(
+        &[
+            r#"OULIPOLY_INVOCATION={"source":"decoded-child","id":"22222222-2222-4222-8222-222222222222"}"#,
+        ],
+        true,
+    );
+}
+
+#[test]
+fn allocated_decoded_final_marker_split_across_events_promotes_on_timeout() {
+    decoded_final_stderr_timeout(
+        &[
+            "OULIPOLY_INVO",
+            r#"CATION={"source":"decoded-child","id":"22222222-2222-4222-8222-222222222222"}"#,
+        ],
+        true,
+    );
+}
+
+#[test]
+fn allocated_decoded_final_partial_bytes_do_not_promote_on_timeout() {
+    decoded_final_stderr_timeout(&["unpublished ", "partial bytes"], false);
+    decoded_final_stderr_timeout(
+        &[
+            "OULIPOLY_INVOCATION=",
+            r#"{"source":"decoded-child","id":"22222222-2222-4222-8222-222222222222""#,
+        ],
+        false,
+    );
+}

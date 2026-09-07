@@ -261,6 +261,28 @@ impl AttemptExecution {
         }
         Ok(())
     }
+    fn finish_child_markers(&self) {
+        // Dispatch has joined the event workers. A transport record's newline
+        // does not imply a newline in its decoded stderr payload; parse the
+        // remaining final line with the same marker grammar as complete lines.
+        let pending = std::mem::take(
+            &mut self
+                .evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .stderr_pending,
+        );
+        if self
+            .retain_children(&String::from_utf8_lossy(&pending))
+            .is_err()
+        {
+            self.evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .promotions
+                .persistence_failed = true;
+        }
+    }
     pub(crate) fn retain_children(&self, stderr: &str) -> Result<(), String> {
         let children = crate::executor::cli::captured_child_invocations_from_stderr(stderr);
         if children.is_empty() {
@@ -370,6 +392,7 @@ pub fn execute_allocated_provider_attempt(
         return setup_failure(allocation, message);
     }
     let result = super::dispatch::attempt_account_dispatch(registry, &context);
+    attempt.finish_child_markers();
     // Paths rejected before an operation call are explicitly accounted by the
     // single dispatch owner. A spawned/missing/uncertain receipt is never replaced.
     for operation in ["describe", "policy.evaluate", "launch"] {
@@ -740,6 +763,31 @@ mod tests {
         }
         let evidence = attempt.evidence.lock().unwrap();
         assert!(evidence.promotions.captured_child);
+        assert_eq!(evidence.children.len(), 1);
+        assert_eq!(evidence.children[0].composite_id.id, id.to_string());
+    }
+    #[test]
+    fn final_child_marker_survives_promotion_write_failure_and_finish_does_not_replay() {
+        let (_dir, mut attempt, context) = fixture();
+        let id = Uuid::new_v4();
+        let marker = format!("OULIPOLY_INVOCATION={{\"source\":\"fixture\",\"id\":\"{id}\"}}");
+        attempt
+            .observe(
+                &context,
+                &DecodedLaunchEvent::Stderr {
+                    seq: 1,
+                    data: marker.into_bytes(),
+                },
+            )
+            .unwrap();
+        assert!(attempt.evidence.lock().unwrap().children.is_empty());
+        attempt.allocation.lease.owner.owner_epoch += 1;
+        attempt.finish_child_markers();
+        attempt.finish_child_markers();
+        let evidence = attempt.evidence.lock().unwrap();
+        assert!(evidence.stderr_pending.is_empty());
+        assert!(evidence.promotions.captured_child && evidence.promotions.persistence_failed);
+        assert!(evidence.promotions.transfer_forbidden());
         assert_eq!(evidence.children.len(), 1);
         assert_eq!(evidence.children[0].composite_id.id, id.to_string());
     }
