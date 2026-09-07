@@ -379,12 +379,26 @@ fn strict_shape(line: &str, reference: &ReturnedArtifactRef) -> bool {
     let Ok(input) = serde_json::from_str::<serde_json::Value>(line) else {
         return false;
     };
-    let Ok(output) = serde_json::to_value(reference) else {
-        return false;
+    let output = if input.get("schema_version").is_some() {
+        versioned_receipt_shape(line)
+    } else {
+        serde_json::to_value(reference).ok()
     };
-    input == output
+    output.as_ref() == Some(&input)
         && reference.sha256.len() == 64
         && reference.sha256.bytes().all(|b| b.is_ascii_hexdigit())
+}
+// Messenger writes ReturnedArtifact (schema v1), whereas in-process callers
+// can supply the projected ReturnedArtifactRef. Validate the producer's own
+// wire type before projection; schema_version is not an arbitrary extra field.
+// Typed decoding rejects duplicate fields; the round-trip still rejects all
+// unknown fields, including nested ones. Unsupported versions stay quarantined.
+fn versioned_receipt_shape(line: &str) -> Option<serde_json::Value> {
+    let receipt: oulipoly_agent_messenger::ReturnedArtifact = serde_json::from_str(line).ok()?;
+    if receipt.schema_version != 1 {
+        return None;
+    }
+    serde_json::to_value(receipt).ok()
 }
 pub(crate) fn prepare_return_channel(
     parent: Option<&str>,
@@ -646,6 +660,123 @@ mod tests {
             c.seal_settled(|_| panic!("extra is not accepted")),
             ReturnChannelSettlement::Quarantined { .. }
         ));
+    }
+    fn messenger_receipt(
+        reference: &ReturnedArtifactRef,
+    ) -> oulipoly_agent_messenger::ReturnedArtifact {
+        let mut value = serde_json::to_value(reference).unwrap();
+        value["schema_version"] = 1.into();
+        serde_json::from_value(value).unwrap()
+    }
+    #[test]
+    fn messenger_wire_receipts_commit_and_retain_prefix_without_weakening_custody() {
+        for suffix in ["", "{\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = channel(dir.path());
+            let reference = artifact(c.producer);
+            oulipoly_agent_messenger::append_return_channel(
+                c.path(),
+                &messenger_receipt(&reference),
+            )
+            .unwrap();
+            use std::io::Write;
+            OpenOptions::new()
+                .append(true)
+                .open(c.path())
+                .unwrap()
+                .write_all(suffix.as_bytes())
+                .unwrap();
+            let mut committed = false;
+            let result = c.seal_settled(|refs| {
+                assert_eq!(refs, &[reference]);
+                committed = true;
+                Ok(())
+            });
+            assert!(
+                committed,
+                "messenger's actual schema-v1 wire must be retained"
+            );
+            assert_eq!(result.artifacts().len(), 1);
+            assert!(!result.transferable());
+            assert_eq!(
+                matches!(result, ReturnChannelSettlement::ArtifactsCommitted(_)),
+                suffix.is_empty()
+            );
+        }
+    }
+    #[test]
+    fn versioned_receipt_rejects_unknown_versions_fields_and_duplicate_keys() {
+        let reference = artifact(Uuid::nil());
+        let wire = serde_json::to_value(messenger_receipt(&reference)).unwrap();
+        let mut unknown_version = wire.clone();
+        unknown_version["schema_version"] = 2.into();
+        let mut null_version = wire.clone();
+        null_version["schema_version"] = serde_json::Value::Null;
+        let mut extra = wire.clone();
+        extra["unexpected"] = true.into();
+        let mut nested_extra = wire.clone();
+        nested_extra["store_address"]["unexpected"] = true.into();
+        let duplicate_version = wire.to_string().replacen(
+            "\"schema_version\":1",
+            "\"schema_version\":1,\"schema_version\":1",
+            1,
+        );
+        let duplicate_name = wire.to_string().replacen(
+            "\"name\":\"fixture\"",
+            "\"name\":\"fixture\",\"name\":\"fixture\"",
+            1,
+        );
+        for bytes in [
+            unknown_version.to_string(),
+            null_version.to_string(),
+            extra.to_string(),
+            nested_extra.to_string(),
+            duplicate_version,
+            duplicate_name,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = channel(dir.path());
+            std::fs::write(c.path(), format!("{bytes}\n")).unwrap();
+            let result = c.seal_settled(|_| panic!("invalid wire must not commit"));
+            assert!(
+                matches!(result, ReturnChannelSettlement::Quarantined { .. }),
+                "{bytes}"
+            );
+            assert!(result.artifacts().is_empty());
+            assert!(!result.transferable());
+            assert!(c.path().exists());
+        }
+    }
+    #[test]
+    fn messenger_wire_standalone_retains_refs_and_allocated_foreign_stays_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let standalone = channel(dir.path());
+        let reference = artifact(standalone.producer);
+        oulipoly_agent_messenger::append_return_channel(
+            standalone.path(),
+            &messenger_receipt(&reference),
+        )
+        .unwrap();
+        assert_eq!(
+            read_and_cleanup_return_channel(Some(standalone)).unwrap(),
+            vec![reference]
+        );
+
+        let mut allocated = channel(dir.path());
+        let foreign = artifact(Uuid::new_v4());
+        oulipoly_agent_messenger::append_return_channel(
+            allocated.path(),
+            &messenger_receipt(&foreign),
+        )
+        .unwrap();
+        let result = allocated.seal_settled(|_| panic!("foreign wire cannot commit"));
+        assert!(matches!(
+            result,
+            ReturnChannelSettlement::Quarantined { .. }
+        ));
+        assert!(result.artifacts().is_empty());
+        assert!(!result.transferable());
+        assert!(allocated.path().exists());
     }
     #[test]
     fn deterministic_attempt_identity_is_exclusive() {

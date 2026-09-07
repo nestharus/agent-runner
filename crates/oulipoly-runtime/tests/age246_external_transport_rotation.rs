@@ -692,6 +692,15 @@ fn unactivated_or_changed_allocated_lease_starts_no_describe_or_runtime() {
 
 #[test]
 fn allocated_failure_retains_artifacts_and_captured_children_on_the_producing_invocation() {
+    assert_allocated_failure_retains_artifacts(false);
+}
+
+#[test]
+fn allocated_failure_retains_versioned_messenger_artifacts_on_the_producing_invocation() {
+    assert_allocated_failure_retains_artifacts(true);
+}
+
+fn assert_allocated_failure_retains_artifacts(versioned: bool) {
     let fixture = make_fixture_with_launch_stalls(&[], &[], &["stall-1"]);
     let body = fs::read_to_string(&fixture.provider_path).unwrap().replace(
         "        time.sleep(SLEEP_SECONDS)\n        return 0",
@@ -704,6 +713,11 @@ fn allocated_failure_retains_artifacts_and_captured_children_on_the_producing_in
         time.sleep(SLEEP_SECONDS)
         return 0"#,
     );
+    let body = if versioned {
+        body.replace("        pathlib.Path(env[\"OULIPOLY_RETURN_CHANNEL\"]).write_text", "        ref[\"schema_version\"] = 1\n        pathlib.Path(env[\"OULIPOLY_RETURN_CHANNEL\"]).write_text")
+    } else {
+        body
+    };
     write_executable(&fixture.provider_path, &body);
     let model = rotation_model(&fixture, &["stall-1", "fast-2"]);
     let registry = registry_with_client_options(
