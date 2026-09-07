@@ -470,7 +470,14 @@ fn delivered_wake_edge_keeps_live_workload_under_original_root() {
             Some(owner_id),
         );
         state
-            .finalize_invocation(history_id, true, 0, None, Some("completed"))
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                history_id,
+                true,
+                0,
+                None,
+                Some("completed"),
+            )
             .unwrap();
     }
     let wake_id = seed_invocation(&state, LIVE_CHILD_UUID, None);
@@ -557,10 +564,22 @@ fn persisted_agent_bash_owner_retains_completed_parent_without_caller_chain() {
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     let owner_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
     state
-        .finalize_invocation(owner_id, true, 0, None, Some("completed"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            owner_id,
+            true,
+            0,
+            None,
+            Some("completed"),
+        )
         .unwrap();
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     drop(state);
     let workload = current_identity();
@@ -604,10 +623,22 @@ fn pending_mailbox_owner_retains_completed_invocation_path() {
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     let owner_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
     state
-        .finalize_invocation(owner_id, true, 0, None, Some("completed"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            owner_id,
+            true,
+            0,
+            None,
+            Some("completed"),
+        )
         .unwrap();
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     drop(state);
     let mut mailbox = fixture.open_mailbox();
@@ -673,10 +704,22 @@ fn resumed_delivery_does_not_reparent_existing_descendants() {
     let wake_uuid = "83000000-0000-4000-8000-000000000002";
     seed_invocation(&state, wake_uuid, None);
     state
-        .finalize_invocation(owner_id, true, 0, None, Some("completed"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            owner_id,
+            true,
+            0,
+            None,
+            Some("completed"),
+        )
         .unwrap();
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     drop(state);
     let mut mailbox = fixture.open_mailbox();
@@ -720,7 +763,12 @@ fn missing_durable_parent_is_diagnostic_and_not_promoted_to_root() {
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     seed_invocation(&state, CHILD_UUID, Some(root_id));
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     drop(state);
     let conn = rusqlite::Connection::open(fixture.state_path()).unwrap();
@@ -748,7 +796,12 @@ fn pid_reuse_changes_liveness_without_changing_durable_parent() {
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     seed_invocation(&state, CHILD_UUID, Some(root_id));
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     drop(state);
     let mut reused = current_identity();
@@ -783,7 +836,12 @@ fn live_closure_overflow_is_explicit_and_totals_are_non_authoritative() {
         );
     }
     state
-        .update_session_capture(parent, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            parent,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     drop(state);
     let limits = SnapshotLimits {
@@ -1588,7 +1646,14 @@ fn agent_bash_marker_discovers_terminal_descendant_before_history_selection() {
     let root_id = state.get_invocation_by_uuid(ROOT_UUID).unwrap().unwrap().id;
     let child_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
     state
-        .finalize_invocation(child_id, true, 0, None, Some("completed"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            child_id,
+            true,
+            0,
+            None,
+            Some("completed"),
+        )
         .unwrap();
     drop(state);
     write_agent_bash_meta(
@@ -1599,9 +1664,7 @@ fn agent_bash_marker_discovers_terminal_descendant_before_history_selection() {
             &dead_identity(),
             &current_identity(),
         ),
-        &format!(
-            "OULIPOLY_INVOCATION={{\"source\":\"opencode\",\"id\":\"{CHILD_UUID}\"}}\noutput"
-        ),
+        &format!("OULIPOLY_INVOCATION={{\"source\":\"opencode\",\"id\":\"{CHILD_UUID}\"}}\noutput"),
     );
 
     let service = fixture.service();
@@ -1621,7 +1684,9 @@ fn agent_bash_marker_discovers_terminal_descendant_before_history_selection() {
             Some(format!("invocation:{CHILD_UUID}").as_str())
         );
         assert_eq!(
-            node(&snapshot, &format!("invocation:{CHILD_UUID}")).parent_id.as_deref(),
+            node(&snapshot, &format!("invocation:{CHILD_UUID}"))
+                .parent_id
+                .as_deref(),
             Some(format!("invocation:{ROOT_UUID}").as_str())
         );
         assert_eq!(snapshot.summary.running_agent_bash_count, 1);
@@ -1635,10 +1700,24 @@ fn agent_bash_live_marker_rejects_unrelated_terminal_invocation() {
     let state = fixture.open_state();
     let unrelated_id = seed_invocation(&state, CHILD_UUID, None);
     state
-        .finalize_invocation(unrelated_id, true, 0, None, Some("completed"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            unrelated_id,
+            true,
+            0,
+            None,
+            Some("completed"),
+        )
         .unwrap();
     // Even sharing the displayed session does not prove root ancestry.
-    state.update_session_capture(unrelated_id, Some(SESSION_ID), "stdout-json").unwrap();
+    state
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            unrelated_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
+        .unwrap();
     drop(state);
     write_agent_bash_meta(
         &fixture.agent_bash_root(),
@@ -1648,14 +1727,15 @@ fn agent_bash_live_marker_rejects_unrelated_terminal_invocation() {
             &dead_identity(),
             &current_identity(),
         ),
-        &format!(
-            "OULIPOLY_INVOCATION={{\"source\":\"opencode\",\"id\":\"{CHILD_UUID}\"}}\noutput"
-        ),
+        &format!("OULIPOLY_INVOCATION={{\"source\":\"opencode\",\"id\":\"{CHILD_UUID}\"}}\noutput"),
     );
     for include_terminal in [false, true] {
         let snapshot = fixture.service().snapshot(
             &fixture.root(),
-            SnapshotLimits { include_terminal, ..SnapshotLimits::default() },
+            SnapshotLimits {
+                include_terminal,
+                ..SnapshotLimits::default()
+            },
         );
         assert!(find_node(&snapshot, "agent-bash:unrelated-terminal-marker").is_none());
         assert!(find_node(&snapshot, &format!("invocation:{CHILD_UUID}")).is_none());
@@ -3001,13 +3081,32 @@ fn persisted_detached_nested_workload_refresh_removes_terminal_cancelled_and_exi
     let owner_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
     let nested_id = seed_invocation(&state, LIVE_CHILD_UUID, Some(owner_id));
     state
-        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            Some(SESSION_ID),
+            "stdout-json",
+        )
         .unwrap();
     state
-        .finalize_invocation(owner_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            owner_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap();
     state
-        .finalize_invocation(nested_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            nested_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap();
     drop(state);
     let owner = TestProcess::spawn();
