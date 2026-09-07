@@ -7788,6 +7788,9 @@ fn validate_explicit_input_delivery_on(
             "explicit resume input {seq} is not pending for the resolved target; no launch"
         ));
     }
+    // A chain retry may resolve to a new session. The replacement update
+    // only fences same-session preparations, so retain the old authority and
+    // refuse admission across sessions, even when it has not bound yet.
     let occupied: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM mailbox_delivery_attempts AS attempts
@@ -7795,8 +7798,9 @@ fn validate_explicit_input_delivery_on(
          WHERE items.mailbox_seq = ?1 AND attempts.resolved_at IS NULL
            AND (attempts.submission_started_at IS NOT NULL
              OR attempts.acknowledged_at IS NOT NULL
-             OR attempts.delivery_invocation_uuid != attempts.attempt_id))",
-            [seq],
+             OR attempts.delivery_invocation_uuid != attempts.attempt_id
+             OR attempts.session_id != ?2))",
+            params![seq, session_id],
             |row| row.get(0),
         )
         .map_err(|err| format!("Failed to validate explicit input delivery fence: {err}"))?;
@@ -13657,6 +13661,95 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn age346_chain_retry_preserves_cross_session_authority_and_unrelated_attempts() {
+        for state in ["unbound", "bound", "submitted", "acked"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+            let row = inserted_row(db.enqueue_submitted_input(&submitted_input(
+                "token",
+                InboxTargetKind::Chain,
+                "chain-a",
+                b"exact input",
+            )));
+            let unrelated = inserted_row(db.enqueue_submitted_input(&submitted_input(
+                "other-token",
+                InboxTargetKind::Chain,
+                "chain-a",
+                b"other input",
+            )));
+            db.register_explicit_input_delivery_attempt(
+                "old",
+                "session-a",
+                Some("chain-a"),
+                row.seq,
+            )
+            .unwrap();
+            db.register_explicit_input_delivery_attempt(
+                "unrelated",
+                "session-b",
+                Some("chain-a"),
+                unrelated.seq,
+            )
+            .unwrap();
+            match state {
+                "bound" => db
+                    .bind_delivery_attempt_invocation("old", "session-a", "invocation-a")
+                    .unwrap(),
+                "submitted" => {
+                    db.begin_delivery_attempt_submission("old").unwrap();
+                }
+                "acked" => {
+                    db.record_delivery_attempt_transport_ack("old").unwrap();
+                }
+                _ => {}
+            }
+            let snapshot = |db: &MailboxDb| {
+                let mut stmt = db.connection().prepare(
+                    "SELECT attempt_id, session_id, delivery_invocation_uuid, resolved_at, submission_started_at, acknowledged_at FROM mailbox_delivery_attempts ORDER BY attempt_id"
+                ).unwrap();
+                stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+            };
+            let before = snapshot(&db);
+            // Same durable chain input, newly resolved session, before either
+            // preparation binds in the unbound case: never admit a second owner.
+            assert!(
+                db.register_explicit_input_delivery_attempt(
+                    "new",
+                    "session-b",
+                    Some("chain-a"),
+                    row.seq
+                )
+                .unwrap_err()
+                .contains("no launch"),
+                "{state}"
+            );
+            assert_eq!(snapshot(&db), before, "{state}");
+            assert!(
+                db.bind_delivery_attempt_invocation("new", "session-b", "new-invocation")
+                    .is_err()
+            );
+            if state == "unbound" {
+                db.bind_delivery_attempt_invocation("old", "session-a", "old-invocation")
+                    .unwrap();
+            }
+            db.bind_delivery_attempt_invocation("unrelated", "session-b", "other-invocation")
+                .unwrap();
+        }
     }
 
     #[test]

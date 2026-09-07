@@ -550,3 +550,43 @@ fn age346_tokenized_inline_pending_retry_uses_only_durable_copy() {
     );
     assert!(f.mailbox.notifications_paused(SESSION).unwrap());
 }
+
+#[test]
+fn age346_chain_retry_new_resolved_session_refuses_second_preparation() {
+    const NEXT_SESSION: &str = "0369694d-de0f-40d1-890c-6e28e55bab28";
+    let mut f = Fixture::new(true);
+    f.mailbox
+        .set_notifications_paused(NEXT_SESSION, true)
+        .unwrap();
+    let notification = f.notification();
+    let seq = f
+        .enqueue(TEXT, "chain-retry", InboxTargetKind::Chain, CHAIN)
+        .unwrap();
+    let first = f.prepare(Some(seq), None).unwrap();
+    let retry = f
+        .enqueue(TEXT, "chain-retry", InboxTargetKind::Chain, CHAIN)
+        .unwrap();
+    assert_eq!(seq, retry);
+    // Model the supported chain resolver transition S1 -> S2. No first bind
+    // has happened; the second preparation must not create another authority.
+    let second =
+        prepare_headless_resume_delivery_on(&mut f.mailbox, NEXT_SESSION, CHAIN, None, Some(retry));
+    assert!(second.err().unwrap().contains("no launch"));
+    assert_eq!(first.answer.as_ref().unwrap().matches(TEXT).count(), 1);
+    f.mailbox
+        .bind_delivery_attempt_invocation(
+            first.delivery_nonce.as_deref().unwrap(),
+            SESSION,
+            "original-owner",
+        )
+        .unwrap();
+    assert!(f.mailbox.notifications_paused(SESSION).unwrap());
+    assert!(f.mailbox.notifications_paused(NEXT_SESSION).unwrap());
+    assert!(
+        f.mailbox
+            .list_pending(SESSION)
+            .unwrap()
+            .iter()
+            .any(|r| r.seq == notification)
+    );
+}
