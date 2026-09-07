@@ -107,6 +107,7 @@ enum LaunchMode {
     UnknownTerminalWithQuotaText,
     HostCancelledBeforeFinal,
     LargeOutput,
+    LiveAttachmentStorageFailure,
 }
 
 #[derive(Debug, Default)]
@@ -635,6 +636,7 @@ fn launch_mode_wire(launch_mode: LaunchMode) -> &'static str {
         LaunchMode::UnknownTerminalWithQuotaText => "unknown_terminal_with_quota_text",
         LaunchMode::HostCancelledBeforeFinal => "host_cancelled_before_final",
         LaunchMode::LargeOutput => "large_output",
+        LaunchMode::LiveAttachmentStorageFailure => "live_attachment_storage_failure",
     }
 }
 
@@ -849,6 +851,23 @@ def launch(_request):
     append_order("launch")
     LAUNCH_RECORD.write_text(json.dumps(_request, sort_keys=True))
     reqid = request_id(_request)
+    if LAUNCH_MODE == "live_attachment_storage_failure":
+        import sqlite3
+        # Controlled fixture-only trigger: actual attachment SQL fails after child binding.
+        db = sqlite3.connect(pathlib.Path(os.environ["OULIPOLY_DATA_DIR"]) / "pid-identity.db")
+        db.execute("CREATE TRIGGER reject_fixture_attachment BEFORE UPDATE OF session_id ON runtime_generation BEGIN SELECT RAISE(ABORT, 'fixture storage fault'); END")
+        db.commit()
+        db.close()
+        # Return an authentic artifact produced in the controlled fixture store.
+        ref = json.loads((LAUNCH_RECORD.parent / "produced-ref.json").read_text())
+        pathlib.Path(_request["params"]["env"]["OULIPOLY_RETURN_CHANNEL"]).write_text(json.dumps(ref) + "\n")
+        write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 1, "time_unix_ms": 1001, "kind": "stdout", "data_base64": "AAH/"}})
+        write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 2, "time_unix_ms": 1002, "kind": "stderr", "data_base64": "ZXJy//4="}})
+        write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 3, "time_unix_ms": 1003, "kind": "marker", "name": "oulipoly.provider_session", "value": {{"provider_session_id": "example-session"}}}})
+        # No output completion or exit event: the host must retain only partial evidence.
+        import time
+        time.sleep(5)
+        return 0
     if LAUNCH_MODE == "malformed_protocol":
         sys.stdout.write("{{not-json}}\n")
         sys.stdout.flush()
@@ -2704,5 +2723,179 @@ fn external_provider_launch_minimal_terminal_scope_uses_final_event_not_standalo
         result.terminal_signal.as_ref().map(|signal| &signal.kind),
         Some(&oulipoly_runtime::executor::terminal_signal::TerminalSignalKind::Unknown),
         "S6a must not run standalone terminal.classify over launch stderr text"
+    );
+}
+
+#[test]
+fn live_attachment_error_dispatch_retains_partial_output_and_new_return_reference() {
+    use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
+    use sha2::{Digest, Sha256};
+    let _lock = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let pid_path = dir.path().join("provider.pid");
+    let ready_path = dir.path().join("provider.ready");
+    let data_text = data_dir.to_string_lossy();
+    let pid_text = pid_path.to_string_lossy();
+    let ready_text = ready_path.to_string_lossy();
+    let _env = EnvScope::set_optional(&[
+        ("OULIPOLY_DATA_DIR", Some(&data_text)),
+        (CHILD_CUSTODY_FAULT_ENV, None),
+        (CHILD_CUSTODY_READY_FILE_ENV, Some(&ready_text)),
+        (CHILD_PID_FILE_ENV, Some(&pid_text)),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::LiveAttachmentStorageFailure,
+    );
+    let uuid = "76767676-7676-4676-8676-767676767676";
+    let artifact =
+        oulipoly_agent_messenger::return_artifact(oulipoly_agent_messenger::ReturnRequest {
+            db_path: dir.path().join("artifact-store.db"),
+            invocation_uuid: uuid.parse().unwrap(),
+            name: oulipoly_agent_messenger::ReturnName::new("fixture").unwrap(),
+            source: oulipoly_agent_messenger::ReturnSource::InlineBytes(
+                b"authentic-produced-artifact".to_vec(),
+            ),
+            format_hint: None,
+            verdict_line: None,
+            return_channel: None,
+        })
+        .unwrap();
+    fs::write(
+        fixture._dir.path().join("produced-ref.json"),
+        serde_json::to_vec(&artifact).unwrap(),
+    )
+    .unwrap();
+    let invocation = serde_json::json!({"source": "fixture", "id": uuid}).to_string();
+    let result =
+        execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(invocation))
+            .expect("typed failed result must survive observer transport failure");
+    assert_eq!(result.exit_code, -1);
+    assert_eq!(
+        result.terminal_reason.as_deref(),
+        Some("runtime_generation_attach_failed")
+    );
+    assert_eq!(
+        result.session_capture.session_id.as_deref(),
+        Some("example-session")
+    );
+    let signal = result.terminal_signal.as_ref().unwrap();
+    assert_eq!(signal.kind, TerminalSignalKind::SpawnError);
+    assert!(
+        signal.evidence.contains("cause=StorageFailure"),
+        "{}",
+        signal.evidence
+    );
+    assert!(
+        signal.evidence.contains("cleanup=Ok(Applied)"),
+        "{}",
+        signal.evidence
+    );
+    assert!(signal.evidence.contains("output=incomplete"));
+    assert!(!signal.evidence.contains("fixture storage fault"));
+    assert!(!result.produced_assistant_response);
+    assert!(result.prompt_acceptance_attestation.is_none());
+    let spool = result.output_spool.as_ref().unwrap();
+    assert_eq!(
+        spool.incomplete_output_bytes().unwrap(),
+        (vec![0, 1, 255], vec![101, 114, 114, 255, 254])
+    );
+    assert!(spool.summary().is_err());
+    assert!(result.complete_stdout_bytes().is_err());
+    assert!(result.write_stdout_to(&mut Vec::new()).is_err());
+    assert_eq!(result.returned_artifacts.len(), 1);
+    let stored = oulipoly_agent_messenger::show_returned(
+        oulipoly_agent_messenger::ShowReturnedRequest::VersionId {
+            db_path: dir.path().join("artifact-store.db"),
+            version_id: result.returned_artifacts[0].version_id.clone(),
+        },
+    )
+    .unwrap();
+    let payload = stored.content;
+    assert_eq!(payload, b"authentic-produced-artifact");
+    assert_eq!(result.returned_artifacts.len(), 1);
+    let reference = &result.returned_artifacts[0];
+    assert_eq!(reference.sha256, format!("{:x}", Sha256::digest(&payload)));
+    assert_eq!(reference.content_len, payload.len() as u64);
+    let state = oulipoly_state::StateDb::open(&data_dir.join("state.db")).unwrap();
+    let id = state
+        .start_invocation(&oulipoly_state::InvocationStart {
+            invocation_uuid: uuid.into(),
+            model_name: "fixture".into(),
+            provider_name: "provider-a".into(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    assert!(state.list_returned_artifacts(id).unwrap().is_empty());
+    result
+        .retain_failed_finalization_evidence(&state, id, uuid)
+        .unwrap();
+    assert_eq!(
+        state.list_returned_artifacts(id).unwrap(),
+        result.returned_artifacts
+    );
+    let paths = state
+        .invocation_output_artifact_paths(&format!("{uuid}.partial"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(fs::read(paths.stdout).unwrap(), [0, 1, 255]);
+    assert_eq!(fs::read(paths.stderr).unwrap(), [101, 114, 114, 255, 254]);
+    let complete_paths = state
+        .invocation_output_artifact_paths(uuid)
+        .unwrap()
+        .unwrap();
+    assert!(!complete_paths.stdout.exists());
+    let count: i64 = state
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM invocation_output_deliveries WHERE invocation_id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "partial output must not become complete delivery evidence"
+    );
+    let pid = fs::read_to_string(pid_path)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    assert_external_child_reaped(pid);
+    assert_external_terminal_generation(
+        &data_dir,
+        uuid,
+        "abnormal_termination",
+        Some(i64::from(pid)),
+    );
+    let conn = Connection::open(data_dir.join("pid-identity.db")).unwrap();
+    let session: Option<String> = conn
+        .query_row(
+            "SELECT session_id FROM runtime_generation WHERE spawn_invocation_uuid=?1",
+            [uuid],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        session.is_none(),
+        "rejected attachment must not mutate protected row"
+    );
+    let launch: Value =
+        serde_json::from_slice(&fs::read(&fixture.launch_record_path).unwrap()).unwrap();
+    assert!(
+        !Path::new(
+            launch["params"]["env"]["OULIPOLY_RETURN_CHANNEL"]
+                .as_str()
+                .unwrap()
+        )
+        .exists()
     );
 }

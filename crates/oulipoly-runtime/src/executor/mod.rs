@@ -66,8 +66,10 @@ pub use self::terminal_signal::TerminalSignalRecognizer;
 pub struct ExecutionResult {
     pub stdout: Vec<u8>,
     pub stderr: String,
-    /// Complete external-provider output. `stdout` and `stderr` remain bounded
-    /// diagnostic evidence when this spool is present.
+    /// External-provider output custody: complete on normal launches, explicitly
+    /// incomplete after live attachment abort. Complete-stream APIs reject partial
+    /// custody; failed retention writes `<invocation_uuid>.partial.{stdout,stderr}`.
+    /// `stdout` and `stderr` remain bounded diagnostics when a spool is present.
     pub output_spool: Option<ExecutionOutputSpool>,
     /// Numeric child-process exit code per `exit_code_from_status`.
     pub exit_code: i32,

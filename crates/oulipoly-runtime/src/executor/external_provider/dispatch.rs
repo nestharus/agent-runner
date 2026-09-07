@@ -33,10 +33,10 @@ use super::request_builder::{
 use super::terminal_classify_handoff::classify_after_launch_success;
 use crate::executor::cli::spawn_identity::{
     GenerationOperationError, GenerationOperationOutcome, RunningRuntimeGeneration,
-    SpawnIdentityContext, SpawnRuntimeMode, attach_captured_session_id,
-    backfill_captured_session_id, child_custody_test_fault, context_from_parent_invocation_env,
-    exit_runtime_generation_outcome, mark_runtime_generation_orderly_completed,
-    record_child_identity, register_runtime_generation_starting,
+    SpawnIdentityContext, SpawnRuntimeMode, attach_captured_session_id, child_custody_test_fault,
+    context_from_parent_invocation_env, exit_runtime_generation_outcome,
+    mark_runtime_generation_orderly_completed, record_child_identity,
+    register_runtime_generation_starting,
 };
 use crate::executor::cli::{prepare_return_channel, read_and_cleanup_return_channel};
 use crate::executor::{ExecutionOutputSpool, ExecutionResult, ExternalProviderSessionAuthority};
@@ -51,6 +51,14 @@ use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::ProcessStatus;
 use oulipoly_provider::stream::{DecodedLaunchEvent, LaunchEventObserver, LaunchResult};
 use std::sync::{Arc, Mutex};
+
+#[derive(Clone)]
+struct LiveAttachmentFailure {
+    verified: VerifiedSessionAuthority,
+    cause: GenerationOperationError,
+}
+
+type RecordedAttachmentFailure = Arc<Mutex<Option<LiveAttachmentFailure>>>;
 
 type RecordedLaunchGeneration = Arc<Mutex<Option<Result<RunningRuntimeGeneration, String>>>>;
 
@@ -118,8 +126,10 @@ fn attempt_account_dispatch(
     let recorded_generation = recorded_launch_generation();
     let spawn_observer =
         external_launch_spawn_observer(spawn_identity.as_ref(), Arc::clone(&recorded_generation));
+    let attachment_failure = Arc::new(Mutex::new(None));
     let launch_event_observer = external_launch_event_observer(
         output_spool.clone(),
+        Arc::clone(&attachment_failure),
         spawn_identity.clone(),
         Arc::clone(&recorded_generation),
         context.provider.name.clone(),
@@ -190,7 +200,48 @@ fn attempt_account_dispatch(
     let launch_result = match launch_outcome {
         Ok(result) => result,
         Err(error) => {
-            let _ = finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            let cleanup =
+                finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            // The observer records verified typed custody before returning its transport error.
+            // Do not infer attachment failure from provider-controlled diagnostics.
+            let live_failure = attachment_failure
+                .lock()
+                .ok()
+                .and_then(|failure| failure.clone());
+            if let Some(failure) = live_failure {
+                output_spool.mark_incomplete();
+                let result = ExecutionResult {
+                    stdout: Vec::new(),
+                    stderr: String::new(),
+                    output_spool: Some(output_spool),
+                    exit_code: -1,
+                    provider_index: context.provider_index,
+                    session_capture: crate::executor::SessionCaptureResult {
+                        session_id: None,
+                        method: crate::executor::SessionCaptureMethod::ExternalProviderLaunch,
+                    },
+                    resume_acceptance: None,
+                    terminal_reason: None,
+                    terminal_signal: None,
+                    produced_assistant_response: false,
+                    prompt_acceptance_attestation: None,
+                    captured_child_invocations: Vec::new(),
+                    returned_artifacts,
+                };
+                let mut result = failed_finalization_result(
+                    result,
+                    Some(&failure.verified),
+                    "runtime_generation_attach_failed",
+                    failure.cause,
+                    cleanup,
+                );
+                let signal = result.terminal_signal.as_mut().expect("failure signal");
+                signal.provider_name = context.provider.name.clone();
+                signal.evidence.push_str(
+                    ";output=incomplete;output_artifacts=<invocation_uuid>.partial.{stdout,stderr}",
+                );
+                return Ok(result);
+            }
             let verified_failure_session = match verify_optional_failure_session(
                 context,
                 &endpoint,
@@ -331,6 +382,7 @@ fn external_launch_spawn_observer(
 
 fn external_launch_event_observer(
     output_spool: ExecutionOutputSpool,
+    attachment_failure: RecordedAttachmentFailure,
     spawn_identity: Option<SpawnIdentityContext>,
     recorded_generation: RecordedLaunchGeneration,
     account_name: String,
@@ -342,6 +394,7 @@ fn external_launch_event_observer(
         bind_external_launch_session_from_event(
             spawn_identity.as_ref(),
             &recorded_generation,
+            &attachment_failure,
             &account_name,
             expected_provider_session_id.as_deref(),
             &observed_account_name,
@@ -353,6 +406,7 @@ fn external_launch_event_observer(
 fn bind_external_launch_session_from_event(
     context: Option<&SpawnIdentityContext>,
     recorded_generation: &RecordedLaunchGeneration,
+    attachment_failure: &RecordedAttachmentFailure,
     account_name: &str,
     expected_provider_session_id: Option<&str>,
     observed_account_name: &str,
@@ -373,8 +427,21 @@ fn bind_external_launch_session_from_event(
     )
     .map_err(|error| error.to_string())?
     .ok_or_else(|| "provider session marker produced no verified authority".to_string())?;
-    let generation = require_recorded_external_generation(recorded_generation)?;
-    backfill_captured_session_id(context, Some(&generation), verified.provider_session_id())
+    let attachment = require_recorded_external_generation(recorded_generation)
+        .map_err(|_| GenerationOperationError::MissingGeneration)
+        .and_then(|generation| {
+            attach_captured_session_id(context, Some(&generation), verified.provider_session_id())
+        });
+    match attachment {
+        Ok(_) => Ok(()),
+        Err(cause) => {
+            *attachment_failure
+                .lock()
+                .map_err(|_| "attachment failure custody unavailable".to_string())? =
+                Some(LiveAttachmentFailure { verified, cause });
+            Err("runtime_generation_attach_failed".to_string())
+        }
+    }
 }
 
 fn provider_session_id_from_launch_event(event: &DecodedLaunchEvent) -> Option<String> {
@@ -657,6 +724,22 @@ mod tests {
         assert_eq!(failed.exit_code, -1);
         // Failure of one retention channel cannot skip the other or overwrite the cause.
         failed.output_spool = Some(ExecutionOutputSpool::new().unwrap());
+        let invocation_uuid = "22222222-2222-4222-8222-222222222222";
+        let invocation_id = state
+            .start_invocation(&oulipoly_state::InvocationStart {
+                invocation_uuid: invocation_uuid.into(),
+                model_name: "fixture".into(),
+                provider_name: "fixture".into(),
+                provider_index: 2,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        assert!(
+            state
+                .list_returned_artifacts(invocation_id)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             failed.retain_failed_finalization_evidence(&state, invocation_id, invocation_uuid),
             Err("finalization_evidence: artifacts=retained;output=storage_failure")
@@ -679,6 +762,47 @@ mod tests {
         );
         assert_eq!(result.session_capture.session_id, None);
         assert!(result.terminal_signal.unwrap().evidence.contains("Unknown"));
+    }
+
+    #[test]
+    fn live_marker_authority_rejection_cannot_create_attachment_failure_custody() {
+        let failures = Arc::new(Mutex::new(None));
+        let generation = recorded_launch_generation();
+        let marker = DecodedLaunchEvent::Marker {
+            seq: 1,
+            name: PROVIDER_SESSION_MARKER.into(),
+            value: serde_json::json!({"provider_session_id": "observed"}),
+        };
+        for (expected, observed_account) in [(Some("expected"), "account"), (None, "foreign")] {
+            assert!(
+                bind_external_launch_session_from_event(
+                    None,
+                    &generation,
+                    &failures,
+                    "account",
+                    expected,
+                    observed_account,
+                    &marker,
+                )
+                .is_err()
+            );
+            assert!(failures.lock().unwrap().is_none());
+        }
+        assert!(
+            bind_external_launch_session_from_event(
+                None,
+                &generation,
+                &failures,
+                "account",
+                None,
+                "account",
+                &marker,
+            )
+            .is_err()
+        );
+        let retained = failures.lock().unwrap().clone().unwrap();
+        assert_eq!(retained.cause, GenerationOperationError::MissingGeneration);
+        assert_eq!(retained.verified.provider_session_id(), "observed");
     }
 
     #[test]

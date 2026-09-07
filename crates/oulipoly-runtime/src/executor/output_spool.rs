@@ -21,6 +21,7 @@ struct ExecutionOutputSpoolState {
     data_event_count: u64,
     summary: Option<ExecutionOutputSummary>,
     exit_observed: bool,
+    incomplete: bool,
 }
 
 struct SpooledStream {
@@ -49,6 +50,7 @@ impl ExecutionOutputSpool {
                 data_event_count: 0,
                 summary: None,
                 exit_observed: false,
+                incomplete: false,
             })),
         })
     }
@@ -59,6 +61,25 @@ impl ExecutionOutputSpool {
             .lock()
             .map_err(|_| "launch output spool lock was poisoned".to_string())?;
         state.observe(event)
+    }
+
+    /// Freeze observed bytes after a host attachment abort, without forging provider completion.
+    pub(crate) fn mark_incomplete(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.incomplete = true;
+        }
+    }
+
+    /// Read only the observed prefix of an aborted launch; never a complete-stream API.
+    pub fn incomplete_output_bytes(&self) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| std::io::Error::other("output lock poisoned"))?;
+        if !state.incomplete {
+            return Err(std::io::Error::other("output is not an incomplete launch"));
+        }
+        Ok((state.stdout.read_all()?, state.stderr.read_all()?))
     }
 
     pub fn write_stdout_to(&self, writer: &mut dyn Write) -> std::io::Result<()> {
@@ -82,6 +103,9 @@ impl ExecutionOutputSpool {
             .inner
             .lock()
             .map_err(|_| std::io::Error::other("launch output spool lock was poisoned"))?;
+        if state.incomplete {
+            return Err(std::io::Error::other("launch output is incomplete"));
+        }
         state
             .summary
             .clone()
@@ -94,6 +118,16 @@ impl ExecutionOutputSpool {
         invocation_id: i64,
         invocation_uuid: &str,
     ) -> Result<(), String> {
+        // Partial evidence has distinct names and no complete-output delivery row.
+        // The failed result's terminal evidence declares this path convention.
+        if self
+            .inner
+            .lock()
+            .map_err(|_| "output lock poisoned".to_string())?
+            .incomplete
+        {
+            return self.persist_incomplete_for_invocation(state, invocation_uuid);
+        }
         let Some(paths) = state.invocation_output_artifact_paths(invocation_uuid)? else {
             return Ok(());
         };
@@ -102,7 +136,7 @@ impl ExecutionOutputSpool {
                 .inner
                 .lock()
                 .map_err(|_| "launch output spool lock was poisoned".to_string())?;
-            if spool.summary.is_none() || !spool.exit_observed {
+            if spool.incomplete || spool.summary.is_none() || !spool.exit_observed {
                 return Err("launch output spool is not sealed".to_string());
             }
             spool
@@ -130,6 +164,29 @@ impl ExecutionOutputSpool {
         )
     }
 
+    fn persist_incomplete_for_invocation(
+        &self,
+        state: &oulipoly_state::StateDb,
+        invocation_uuid: &str,
+    ) -> Result<(), String> {
+        let paths = state
+            .invocation_output_artifact_paths(&format!("{invocation_uuid}.partial"))?
+            .ok_or_else(|| "partial output requires disk-backed custody".to_string())?;
+        let mut spool = self
+            .inner
+            .lock()
+            .map_err(|_| "output lock poisoned".to_string())?;
+        spool
+            .stdout
+            .persist_to(&paths.stdout)
+            .map_err(|error| error.to_string())?;
+        spool
+            .stderr
+            .persist_to(&paths.stderr)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub fn persist_artifact(
         &self,
         state: &oulipoly_state::StateDb,
@@ -142,7 +199,7 @@ impl ExecutionOutputSpool {
             .inner
             .lock()
             .map_err(|_| "launch output spool lock was poisoned".to_string())?;
-        if spool.summary.is_none() || !spool.exit_observed {
+        if spool.incomplete || spool.summary.is_none() || !spool.exit_observed {
             return Err("launch output spool is not sealed".to_string());
         }
         spool
@@ -178,7 +235,7 @@ impl ExecutionOutputSpool {
             .inner
             .lock()
             .map_err(|_| std::io::Error::other("launch output spool lock was poisoned"))?;
-        if state.summary.is_none() || !state.exit_observed {
+        if state.incomplete || state.summary.is_none() || !state.exit_observed {
             return Err(std::io::Error::other("launch output spool is not sealed"));
         }
         operation(&mut state)
@@ -207,6 +264,9 @@ impl PartialEq for ExecutionOutputSpool {
 
 impl ExecutionOutputSpoolState {
     fn observe(&mut self, event: &DecodedLaunchEvent) -> Result<(), String> {
+        if self.incomplete {
+            return Err("launch output was frozen incomplete".to_string());
+        }
         if self.exit_observed {
             return Err("launch event observed after final exit".to_string());
         }
@@ -439,6 +499,36 @@ mod tests {
     use oulipoly_provider::generated::LaunchOutputChannelSummaryV1;
     use oulipoly_provider::generated::{ProcessStatus, TerminalSignal, TerminalSignalKind};
     use oulipoly_provider::stream::LaunchExit;
+
+    #[test]
+    fn incomplete_custody_stays_frozen_and_cannot_claim_complete_output() {
+        let spool = ExecutionOutputSpool::new().unwrap();
+        spool
+            .observe(&DecodedLaunchEvent::Stdout {
+                seq: 1,
+                data: vec![0, 255],
+            })
+            .unwrap();
+        spool.mark_incomplete();
+        assert!(
+            spool
+                .observe(&DecodedLaunchEvent::Stdout {
+                    seq: 2,
+                    data: vec![42]
+                })
+                .is_err()
+        );
+        assert!(spool.observe(&exit_event(3)).is_err());
+        assert!(spool.summary().is_err());
+        assert!(spool.stdout_bytes().is_err());
+        assert!(spool.stderr_bytes().is_err());
+        assert_eq!(
+            spool.incomplete_output_bytes().unwrap(),
+            (vec![0, 255], vec![])
+        );
+        let state = oulipoly_state::StateDb::open(Path::new(":memory:")).unwrap();
+        assert!(spool.persist_for_invocation(&state, 1, "fixture").is_err());
+    }
 
     #[test]
     fn verifies_manifest_and_seals_complete_binary_streams() {
