@@ -18,6 +18,9 @@ if sys.argv[1] == "session.read_turns":
     if mode == "canonical_request":
         request["params"]["turn_projection"] = "canonical_ingest"
         request["params"].pop("expected_delivery_nonce", None)
+    if mode == "observation_request":
+        request["params"]["turn_projection"] = "user_observation"
+        request["params"]["expected_delivery_nonce"] = "a" * 64
     if mode == "wrong_nonce":
         request["params"]["expected_delivery_nonce"] = "b" * 64
     if mode == "wrong_account":
@@ -39,21 +42,33 @@ if sys.argv[1] == "session.read_turns" and response.get("ok"):
     result = response["result"]
     warnings = result["warnings"]
     # Neighbor mutations start with a real provider response, not a fabricated page.
-    declaration = next(w for w in warnings if w.startswith("codex_observation_io_v1:")) if mode != "canonical_request" else ""
+    # The actual request projection identifies observation, never the warning
+    # or a proxy mutation-mode name. Canonical real-provider pages declare none.
+    observation = request["params"]["turn_projection"] == "user_observation"
+    declaration = next(w for w in warnings if w.startswith("codex_observation_io_v1:")) if observation else ""
     other = [w for w in warnings if w != declaration]
     fields = dict(item.split("=") for item in declaration.split(":", 1)[1].split(";")) if declaration else {}
     if mode == "missing":
         result["warnings"] = other
     elif mode == "duplicate":
         warnings.append(declaration)
-    elif mode in ("negative", "overflow", "sum_overflow", "forward_over", "reconstruction_limit", "malformed"):
+    elif mode in ("negative", "fractional", "exponent", "signed", "overflow", "sum_overflow", "total_overflow", "forward_over", "reconstruction_limit", "malformed"):
         if mode == "negative": fields["reconstruction"] = "-1"
+        if mode == "fractional": fields["reconstruction"] = "1.5"
+        if mode == "exponent": fields["reconstruction"] = "1e0"
+        if mode == "signed": fields["reconstruction"] = "+1"
+        if mode == "total_overflow": fields.update(forward="18446744073709551615", metadata="0", reconstruction="1")
         if mode == "overflow": fields["reconstruction"] = "18446744073709551616"
         if mode == "sum_overflow": fields.update(forward="18446744073709551615", metadata="1")
-        if mode == "forward_over": fields["forward"] = "513"
+        if mode == "forward_over": fields["forward"] = str(request["params"]["max_source_bytes"] + 1)
         if mode == "reconstruction_limit": fields["reconstruction"] = "8388608"
         if mode == "malformed": fields.pop("metadata")
         result["warnings"] = other + ["codex_observation_io_v1:" + ";".join(f"{k}={v}" for k,v in fields.items())]
+    elif mode == "total_ceiling": result["source_bytes_examined"] = 16777216
+    elif mode == "noninteger_total": result["source_bytes_examined"] = 1.5
+    elif mode == "negative_total": result["source_bytes_examined"] = -1
+    elif mode == "wrong_instance": result["provider_instance_id"] = "wrong-instance"
+    elif mode == "wrong_settings": result["settings_id"] = "wrong-settings"
     elif mode == "wrong_total": result["source_bytes_examined"] += 1
     elif mode == "wrong_projection": result["turn_projection"] = "canonical_ingest"
     elif mode == "wrong_session": result["session_id"] = "22222222-2222-4222-8222-222222222222"
@@ -62,4 +77,7 @@ if sys.argv[1] == "session.read_turns" and response.get("ok"):
                     "error": {"category": "failed", "code": "session_turn_staging_capacity_exceeded" if mode == "capacity_error" else "offline_transient_error", "message": "synthetic offline observation failure", "retryable": False}}
     # Ordinary warnings must remain accepted alongside exactly one declaration.
     if mode == "normal": warnings.append("offline unrelated warning")
-print(json.dumps(response, separators=(",", ":")))
+encoded = json.dumps(response, separators=(",", ":"))
+if sys.argv[1] == "session.read_turns":
+    (root / "last-response.json").write_text(encoded + "\n")
+print(encoded)

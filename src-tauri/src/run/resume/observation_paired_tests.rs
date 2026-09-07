@@ -319,7 +319,16 @@ fn age347_paired_negative_accounting_preserves_uncertainty_and_checkpoint() {
         "missing",
         "duplicate",
         "negative",
+        "fractional",
+        "exponent",
+        "signed",
         "overflow",
+        "total_overflow",
+        "total_ceiling",
+        "noninteger_total",
+        "negative_total",
+        "wrong_instance",
+        "wrong_settings",
         "sum_overflow",
         "wrong_total",
         "forward_over",
@@ -482,3 +491,6 @@ fn restart_in_fresh_runner_process(root: &Path) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[path = "observation_paired_boundaries.rs"]
+mod boundaries;
