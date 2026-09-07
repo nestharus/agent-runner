@@ -453,3 +453,150 @@ fn unsupported_stream_is_not_scheduled_again() {
         .is_none()
     );
 }
+
+#[test]
+fn age343_fixed_capacity_requires_explicit_fenced_rearm_without_checkpoint_reset() {
+    let db = db();
+    db.enqueue_session_turn_ingest_stream(&key()).unwrap();
+    lease(&db);
+    db.apply_session_turn_page(&page(
+        0,
+        0,
+        0,
+        vec![turn("prefix", 0, "user", false)],
+        false,
+    ))
+    .unwrap();
+    lease(&db);
+    let before = db.session_turn_ingest_stream(&key()).unwrap().unwrap();
+    db.mark_session_turn_ingest_unsupported(
+        &key(),
+        LEASE_OWNER,
+        before.checkpoint_generation,
+        "session_turn_paging_paused",
+    )
+    .unwrap();
+    db.enqueue_session_turn_ingest_stream(&key()).unwrap();
+    let stopped = db.session_turn_ingest_stream(&key()).unwrap().unwrap();
+    assert_eq!(stopped.status, "unsupported");
+    assert!(
+        !db.canonical_session_turn_ingest_freshness(&key().provider_name, &key().session_id)
+            .unwrap()
+            .is_caught_up()
+    );
+    assert!(
+        !db.rearm_session_turn_ingest_after_capacity_resolution(
+            &key(),
+            before.checkpoint_generation + 1,
+            "session_turn_paging_paused"
+        )
+        .unwrap()
+    );
+    assert!(
+        !db.rearm_session_turn_ingest_after_capacity_resolution(
+            &key(),
+            before.checkpoint_generation,
+            "session_turn_staging_capacity_exceeded"
+        )
+        .unwrap()
+    );
+    assert!(
+        db.rearm_session_turn_ingest_after_capacity_resolution(
+            &key(),
+            before.checkpoint_generation,
+            "session_turn_paging_paused"
+        )
+        .unwrap()
+    );
+    assert!(
+        !db.rearm_session_turn_ingest_after_capacity_resolution(
+            &key(),
+            before.checkpoint_generation,
+            "session_turn_paging_paused"
+        )
+        .unwrap()
+    );
+    let resumed = db.session_turn_ingest_stream(&key()).unwrap().unwrap();
+    assert_eq!(resumed.next_page_token, before.next_page_token);
+    assert_eq!(resumed.checkpoint_generation, before.checkpoint_generation);
+    assert_eq!(resumed.committed_turn_count, 1);
+    assert_eq!(resumed.expected_page_index, before.expected_page_index);
+    lease(&db);
+    db.apply_session_turn_page(&page(
+        1,
+        1,
+        1,
+        vec![turn("after", 1, "assistant", false)],
+        true,
+    ))
+    .unwrap();
+    assert_eq!(
+        db.count_session_turns("provider-a", "session-a")
+            .unwrap()
+            .total,
+        2
+    );
+    assert!(
+        db.canonical_session_turn_ingest_freshness("provider-a", "session-a")
+            .unwrap()
+            .is_caught_up()
+    );
+}
+
+#[test]
+fn age343_rearm_rejects_other_authorities_and_preserves_missing_capability_behavior() {
+    let db = db();
+    db.enqueue_session_turn_ingest_stream(&key()).unwrap();
+    lease(&db);
+    db.mark_session_turn_ingest_unsupported(&key(), LEASE_OWNER, 0, "session_turn_paging_paused")
+        .unwrap();
+    let mut other = key();
+    other.provider_instance_id = "different-provider".into();
+    assert!(
+        !db.rearm_session_turn_ingest_after_capacity_resolution(
+            &other,
+            0,
+            "session_turn_paging_paused"
+        )
+        .unwrap()
+    );
+    assert!(
+        db.rearm_session_turn_ingest_after_capacity_resolution(
+            &key(),
+            0,
+            "session_turn_paging_paused"
+        )
+        .unwrap()
+    );
+    lease(&db);
+    db.mark_session_turn_ingest_unsupported(&key(), LEASE_OWNER, 0, "session_capability_missing")
+        .unwrap();
+    assert!(
+        !db.rearm_session_turn_ingest_after_capacity_resolution(
+            &key(),
+            0,
+            "session_capability_missing"
+        )
+        .unwrap()
+    );
+    db.enqueue_session_turn_ingest_stream(&key()).unwrap();
+    lease(&db); // unrelated unsupported capability still has its old enqueue behavior
+    db.quarantine_session_turn_ingest_stream(&key(), LEASE_OWNER, 0, "session_turn_paging_paused")
+        .unwrap();
+    assert!(
+        !db.rearm_session_turn_ingest_after_capacity_resolution(
+            &key(),
+            0,
+            "session_turn_paging_paused"
+        )
+        .unwrap()
+    );
+    db.enqueue_session_turn_ingest_stream(&key()).unwrap();
+    assert_eq!(
+        db.session_turn_ingest_stream(&key())
+            .unwrap()
+            .unwrap()
+            .status,
+        "quarantined"
+    );
+}

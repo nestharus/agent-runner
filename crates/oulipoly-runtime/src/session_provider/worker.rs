@@ -195,6 +195,8 @@ fn unsupported_error(error: &SessionProviderError) -> bool {
             | "session_turn_pages_capability_missing"
             | "session_turn_page_budget_too_small"
             | "session_turn_record_ceiling_exceeded"
+            | "session_turn_staging_capacity_exceeded"
+            | "session_turn_paging_paused"
             | "codex_rollout_capacity"
     )
 }
@@ -306,6 +308,16 @@ mod tests {
                 "session_turn_record_ceiling_exceeded",
                 "unsupported",
                 "session_turn_record_ceiling_exceeded",
+            ),
+            (
+                "session_turn_staging_capacity_exceeded",
+                "unsupported",
+                "session_turn_staging_capacity_exceeded",
+            ),
+            (
+                "session_turn_paging_paused",
+                "unsupported",
+                "session_turn_paging_paused",
             ),
             (
                 "session_turn_page_token_stale",
@@ -462,6 +474,26 @@ mod tests {
             // Existing state semantics count every worker failure, not just retries.
             assert_eq!(after.retry_count, before.retry_count + 1);
             if expected_status != "retry_wait" {
+                state.enqueue_session_turn_ingest_stream(&key).unwrap();
+                state
+                    .import_session_and_enqueue_turn_ingest(
+                        &oulipoly_state::ImportedSessionDisplayMetadataUpsert {
+                            provider_name: key.provider_name.clone(),
+                            provider_session_id: key.session_id.clone(),
+                            title: None,
+                            cwd: None,
+                            turn_count: Some(99),
+                            provider_updated_at: Some(now),
+                            seen_at: now,
+                        },
+                        &key,
+                        &now,
+                        "fixture-model",
+                    )
+                    .unwrap();
+                let reenqueued = state.session_turn_ingest_stream(&key).unwrap().unwrap();
+                assert_eq!(reenqueued.status, expected_status);
+                assert_eq!(reenqueued.next_page_token, before.next_page_token);
                 assert!(
                     state
                         .lease_ready_session_turn_ingest_stream(

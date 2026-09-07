@@ -162,6 +162,46 @@ impl StateDb {
         upsert_stream_on(&self.conn, key, &now)
     }
 
+    /// Explicit recovery after an operator resolves a fixed paging terminal.
+    /// Routine enqueue/import deliberately cannot invoke this transition.
+    /// Compare both the retained checkpoint generation and sanitized reason;
+    /// never reset tokens, turns, page indexes, or quarantine state.
+    pub fn rearm_session_turn_ingest_after_capacity_resolution(
+        &self,
+        key: &SessionTurnIngestStreamKey,
+        expected_generation: u64,
+        expected_error: &str,
+    ) -> Result<bool, DbError> {
+        validate_stream_key(key)?;
+        let generation = i64::try_from(expected_generation)
+            .map_err(|_| "invalid checkpoint generation".to_string())?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE session_turn_ingest_streams SET status = 'ready',
+                 next_attempt_at = NULL, updated_at = ?8
+             WHERE provider_name = ?1 AND provider_instance_id = ?2
+                 AND settings_id = ?3 AND session_id = ?4 AND projection = ?5
+                 AND checkpoint_generation = ?6 AND last_error = ?7
+                 AND status = 'unsupported' AND lease_owner IS NULL
+                 AND last_error IN ('codex_rollout_capacity',
+                     'session_turn_page_budget_too_small', 'session_turn_record_ceiling_exceeded',
+                     'session_turn_staging_capacity_exceeded', 'session_turn_paging_paused')",
+                params![
+                    key.provider_name,
+                    key.provider_instance_id,
+                    key.settings_id,
+                    key.session_id,
+                    key.projection.as_str(),
+                    generation,
+                    expected_error,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|error| format!("Failed to rearm resolved paging capacity: {error}"))?;
+        Ok(changed == 1)
+    }
+
     pub fn session_turn_ingest_stream(
         &self,
         key: &SessionTurnIngestStreamKey,
@@ -736,6 +776,12 @@ fn upsert_stream_on(
          DO UPDATE SET
             status = CASE
                 WHEN session_turn_ingest_streams.status = 'quarantined' THEN 'quarantined'
+                WHEN session_turn_ingest_streams.status = 'unsupported'
+                    AND session_turn_ingest_streams.last_error IN (
+                        'codex_rollout_capacity', 'session_turn_page_budget_too_small',
+                        'session_turn_record_ceiling_exceeded',
+                        'session_turn_staging_capacity_exceeded', 'session_turn_paging_paused'
+                    ) THEN 'unsupported'
                 ELSE 'ready'
             END,
             next_attempt_at = NULL,

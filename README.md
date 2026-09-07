@@ -1181,3 +1181,23 @@ Each session entry contains `provider_session_id`, optional `title`, optional ab
 - **account** — a runtime `providers.toml` entry keying per-account quota and session state.
 - **pool-member** — a `[[providers]]` entry in a model TOML that references an account and supplies model-specific arguments.
 - **implementation-reference** — the `provider = { ... }` TOML field pointing to a `ProviderCapabilities` implementation (parse-only in this release).
+
+### Fixed canonical-paging capacity terminals (AGE-343)
+
+The paging worker sanitizes provider capacity/containment errors to fixed codes.
+`session_turn_staging_capacity_exceeded` and `session_turn_paging_paused`, along
+with the existing fixed rollout/page/record capacity codes, stop the stream as
+`unsupported` without resetting the committed checkpoint. Routine lifecycle
+re-enqueue and import preserve these terminals rather than restarting unchanged
+requests. Other preexisting unsupported-capability enqueue behavior is unchanged;
+transient I/O still follows retry backoff, and quarantine remains sticky.
+
+After separately authorized resolution, the state-library operation
+`rearm_session_turn_ingest_after_capacity_resolution` compares exact stream key,
+checkpoint generation and terminal reason, requires unsupported/unleased state,
+and transitions only readiness. It retains turns, tokens, sequence and generation.
+It is not wired into automatic discovery, import, worker retry, or a CLI command.
+Callers must not invoke it until the capacity cause is resolved or the compatible
+forward provider is restored. Providing this operation grants no production
+mutation authority. A fallback intentionally pauses ingestion, not native sessions
+or model context; neither a stopped stream nor `last_success_at` proves catch-up.
