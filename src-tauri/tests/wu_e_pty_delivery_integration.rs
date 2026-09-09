@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+#[path = "fixtures/live_completion_diagnostic.rs"]
+mod live_completion_diagnostic;
 mod provider_authority_fixture;
 
 use oulipoly_runtime::executor::cli::pty_broker::{
@@ -891,11 +893,20 @@ fn fixture_interactive_session_agent_bash_completion_arrives_live() {
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
     fixture.associate_observed_completion_authority(&invocation_uuid);
-    let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+    let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
 
     let output = fixture.run_notify("h-e2e-live", owner_metadata(SESSION_A, &invocation_uuid));
     assert_success(&output);
     let value = stdout_json(&output);
+    if value["pty_delivery"]["status"] == "submission_uncertain" {
+        live_completion_diagnostic::retain(
+            &fixture,
+            &received_log,
+            &value,
+            &mut repl,
+            &child_identity,
+        );
+    }
     assert_eq!(value["pty_delivery"]["status"], "acked");
     assert_eq!(value["pty_delivery"]["submitted"], true);
     assert!(value["wake"].is_null());
@@ -3690,7 +3701,8 @@ fn safe_readiness_record(stage: &str, value: &Value) -> Value {
     let stage = match stage {
         "registration" | "notify" | "plain" | "tui" | "pty_read" | "post_confirm"
         | "deadline_pty" | "exit_wait" | "provider_exit" | "generation_exit"
-        | "invocation_exit" => stage,
+        | "invocation_exit" | "live_notify" | "live_receipt" | "live_runner" | "live_provider"
+        | "live_attempt" => stage,
         _ => "other",
     };
     let event = value["event"]
@@ -3720,12 +3732,28 @@ fn safe_readiness_record(stage: &str, value: &Value) -> Value {
         "elapsed_ms",
         "provider_absent_ms",
         "stage_code",
+        "os_error",
+        "exit_code",
+        "signal",
     ] {
         if let Some(count) = value[key].as_u64() {
             safe[key] = json!(count.min(DIAGNOSTIC_CAPTURE_LIMIT as u64));
         }
     }
-    for key in ["success", "released_marker", "timed_out"] {
+    for key in [
+        "success",
+        "released_marker",
+        "timed_out",
+        "submitted",
+        "wake_absent",
+        "submission_started",
+        "acknowledged",
+        "resolved",
+        "complete_capture",
+        "notification_marker",
+        "handle_marker",
+        "exact_attempt_marker",
+    ] {
         if let Some(flag) = value[key].as_bool() {
             safe[key] = json!(flag);
         }
