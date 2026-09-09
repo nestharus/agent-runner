@@ -2949,7 +2949,7 @@ impl ExitObservation {
                 Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                     .and_then(|connection| {
                         connection.busy_timeout(Duration::ZERO)?;
-                        connection.query_row(sql, [&self.invocation], |row| row.get::<_, u64>(0))
+                        connection.query_row(sql, [&self.invocation], |row| row.get::<_, u32>(0))
                     });
             readiness_diagnostic(
                 stage,
