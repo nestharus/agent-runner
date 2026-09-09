@@ -1989,6 +1989,7 @@ fn live_broker_rejects_attempt_resolved_before_socket_acceptance() {
 fn live_broker_contracts_registered_overlap_after_each_injection() {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("concurrent-overlap-received.log");
+    File::create(fixture.dir.path().join("stream-stages")).unwrap();
     let mut lifetime = ProviderLifetime::new(fixture.dir.path());
     let script = fixture_provider_with_lifetime(fixture.dir.path(), &received_log, &lifetime);
     fixture.write_interactive_model("fixture-concurrent-overlap", "fixture-provider", &script);
@@ -2084,6 +2085,7 @@ fn live_broker_contracts_registered_overlap_after_each_injection() {
         1,
         Duration::from_secs(5),
     );
+    repl.exit_observation = Some(ExitObservation::new(&fixture, &invocation_uuid));
     lifetime.release();
     assert!(
         repl.wait_bounded(pty.master.as_raw_fd(), Duration::from_secs(5))
@@ -2714,6 +2716,7 @@ impl Drop for CleanupProviderFallback {
 struct SettlementChild {
     child: Child,
     provider: Option<ProcessIdentity>,
+    exit_observation: Option<ExitObservation>,
 }
 
 impl SettlementChild {
@@ -2721,6 +2724,7 @@ impl SettlementChild {
         Self {
             child,
             provider: None,
+            exit_observation: None,
         }
     }
 
@@ -2730,18 +2734,30 @@ impl SettlementChild {
         timeout: Duration,
     ) -> io::Result<std::process::ExitStatus> {
         let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = self.child.try_wait()? {
-                return Ok(status);
+        let result = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Err(error) => break Err(error),
+                Ok(None) => {}
             }
             if Instant::now() >= deadline {
-                return Err(io::Error::new(
+                break Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "fixture runner exit timed out",
                 ));
             }
-            drain_settlement_output(fd, deadline)?;
+            if let Some(observation) = &mut self.exit_observation {
+                observation.sample_provider(self.provider.as_ref());
+            }
+            if let Err(error) = drain_exit_output(fd, deadline, self.exit_observation.as_mut()) {
+                break Err(error);
+            }
+        };
+        // This is before guard teardown. Later cleanup cannot establish earlier state.
+        if let Some(observation) = &mut self.exit_observation {
+            observation.finish(&result, self.provider.as_ref());
         }
+        result
     }
 }
 
@@ -2764,17 +2780,208 @@ impl Drop for SettlementChild {
 }
 
 fn drain_settlement_output(fd: RawFd, deadline: Instant) -> io::Result<()> {
-    // poll is only an observation cadence, never the success condition.
+    drain_exit_output(fd, deadline, None)
+}
+
+fn drain_exit_output(
+    fd: RawFd,
+    deadline: Instant,
+    observation: Option<&mut ExitObservation>,
+) -> io::Result<()> {
+    // Same cadence, read size and deadline; observation is never a success condition.
     let remaining = deadline.saturating_duration_since(Instant::now());
     if poll_readable(fd, remaining.min(Duration::from_millis(20)))? {
         let mut buffer = [0; 4096];
         match read_fd(fd, &mut buffer) {
-            Ok(_) => {}
+            Ok(n) => {
+                if let Some(observation) = observation {
+                    observation.output.observe(&buffer[..n]);
+                }
+            }
             Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
             Err(error) => return Err(error),
         }
     }
     Ok(())
+}
+
+// Only counts and fixed-marker match progress survive a read. No PTY payload,
+// path, invocation, environment or arbitrary string is serialized by this observer.
+#[derive(Default)]
+struct ExitOutput {
+    bytes: usize,
+    reads: usize,
+    matched: usize,
+    released: bool,
+}
+
+impl ExitOutput {
+    fn observe(&mut self, bytes: &[u8]) {
+        const MARKER: &[u8] = b"PROVIDER_INPUT_RELEASED";
+        self.bytes = self
+            .bytes
+            .saturating_add(bytes.len())
+            .min(DIAGNOSTIC_CAPTURE_LIMIT);
+        self.reads = self.reads.saturating_add(1).min(DIAGNOSTIC_CAPTURE_LIMIT);
+        for &byte in bytes {
+            if byte == MARKER[self.matched] {
+                self.matched += 1;
+            } else {
+                self.matched = usize::from(byte == MARKER[0]);
+            }
+            if self.matched == MARKER.len() {
+                self.released = true;
+                self.matched = 0;
+            }
+        }
+    }
+}
+
+struct ExitObservation {
+    started: Instant,
+    stages: PathBuf,
+    state: PathBuf,
+    sidecar: PathBuf,
+    invocation: String,
+    provider_absent_ms: Option<u64>,
+    output: ExitOutput,
+}
+
+impl ExitObservation {
+    fn new(fixture: &Fixture, invocation: &str) -> Self {
+        Self {
+            started: Instant::now(),
+            stages: fixture.dir.path().join("stream-stages"),
+            state: fixture.state_path(),
+            sidecar: fixture.sidecar_path(),
+            invocation: invocation.to_owned(),
+            provider_absent_ms: None,
+            output: ExitOutput::default(),
+        }
+    }
+
+    fn sample_provider(&mut self, provider: Option<&ProcessIdentity>) {
+        if self.provider_absent_ms.is_none()
+            && let Some(identity) = provider
+            && let Ok(current) = read_live_process_identity(identity.os_pid)
+            && current.as_ref() != Some(identity)
+        {
+            self.provider_absent_ms = Some(self.started.elapsed().as_millis() as u64);
+        }
+    }
+
+    fn finish(
+        &mut self,
+        result: &io::Result<std::process::ExitStatus>,
+        provider: Option<&ProcessIdentity>,
+    ) {
+        self.sample_provider(provider);
+        readiness_diagnostic(
+            "exit_wait",
+            json!({
+                "event": if result.is_ok() { "exit" } else if result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::TimedOut) { "deadline" } else { "read_error" },
+                "success": result.as_ref().is_ok_and(|status| status.success()),
+                "byte_count": self.output.bytes, "read_count": self.output.reads,
+                "elapsed_ms": self.started.elapsed().as_millis() as u64,
+                "provider_absent_ms": self.provider_absent_ms,
+                "released_marker": self.output.released,
+                "timed_out": result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::TimedOut),
+            }),
+        );
+        self.emit_provider_stages();
+        self.emit_durable_stages();
+    }
+
+    fn emit_provider_stages(&self) {
+        let mut bytes = Vec::new();
+        let available = File::open(&self.stages)
+            .and_then(|file| file.take(1025).read_to_end(&mut bytes))
+            .is_ok();
+        readiness_diagnostic(
+            "provider_exit",
+            json!({"success": available && bytes.len() <= 1024}),
+        );
+        if !available || bytes.len() > 1024 {
+            return;
+        }
+        for line in bytes.split_inclusive(|byte| *byte == b'\n').take(4) {
+            if !line.ends_with(b"\n") {
+                continue;
+            }
+            let Ok(line) = std::str::from_utf8(line) else {
+                continue;
+            };
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() != 3 {
+                continue;
+            }
+            if let (Ok(stage @ 1..=4), Ok(elapsed), Ok(count)) = (
+                fields[0].parse::<u64>(),
+                fields[1].parse::<u64>(),
+                fields[2].parse::<u64>(),
+            ) {
+                readiness_diagnostic(
+                    "provider_exit",
+                    json!({
+                        "stage_code": stage, "elapsed_ms": elapsed, "byte_count": count,
+                    }),
+                );
+            }
+        }
+    }
+
+    fn emit_durable_stages(&self) {
+        // Existing durable hooks, not a new production stage or a writable DB open.
+        // One zero-busy-timeout query per database; no retry or manufactured state.
+        for (path, sql, stage) in [
+            (
+                &self.sidecar,
+                "SELECT CASE lifecycle_state WHEN 'starting' THEN 1 WHEN 'running' THEN 2 WHEN 'draining' THEN 3 WHEN 'exited' THEN CASE WHEN terminal_reason = 'orderly_completion' THEN 4 ELSE 5 END ELSE 0 END FROM runtime_generation WHERE spawn_invocation_uuid = ?1",
+                "generation_exit",
+            ),
+            (
+                &self.state,
+                "SELECT CASE WHEN finished_at IS NULL THEN 1 WHEN success = 1 THEN 2 ELSE 3 END FROM invocations WHERE invocation_uuid = ?1",
+                "invocation_exit",
+            ),
+        ] {
+            let value =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .and_then(|connection| {
+                        connection.busy_timeout(Duration::ZERO)?;
+                        connection.query_row(sql, [&self.invocation], |row| row.get::<_, u64>(0))
+                    });
+            readiness_diagnostic(
+                stage,
+                json!({"success": value.is_ok(), "stage_code": value.ok()}),
+            );
+        }
+    }
+}
+
+#[test]
+fn exit_observation_redacts_stream_and_bounds_counts() {
+    let mut output = ExitOutput::default();
+    output.observe(b"private-token PROVIDER_INPUT_");
+    output.observe(b"RELEASED secret-argv");
+    assert!(output.released);
+    for _ in 0..100 {
+        output.observe(&[b'x'; 4096]);
+    }
+    assert_eq!(output.bytes, DIAGNOSTIC_CAPTURE_LIMIT);
+    let value = safe_readiness_record(
+        "exit_wait",
+        &json!({
+            "byte_count": u64::MAX, "elapsed_ms": u64::MAX,
+            "released_marker": true, "payload": "private-token", "event": "secret-argv",
+        }),
+    );
+    assert_eq!(value["byte_count"], DIAGNOSTIC_CAPTURE_LIMIT);
+    assert_eq!(value["elapsed_ms"], DIAGNOSTIC_CAPTURE_LIMIT);
+    assert_eq!(value["released_marker"], true);
+    let encoded = value.to_string();
+    assert!(!encoded.contains("private-token") && !encoded.contains("secret-argv"));
+    assert!(encoded.len() < DIAGNOSTIC_RECORD_LIMIT);
 }
 
 fn wait_for_settlement_trace(
@@ -3482,7 +3689,8 @@ static DIAGNOSTIC_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 fn safe_readiness_record(stage: &str, value: &Value) -> Value {
     let stage = match stage {
         "registration" | "notify" | "plain" | "tui" | "pty_read" | "post_confirm"
-        | "deadline_pty" => stage,
+        | "deadline_pty" | "exit_wait" | "provider_exit" | "generation_exit"
+        | "invocation_exit" => stage,
         _ => "other",
     };
     let event = value["event"]
@@ -3508,13 +3716,19 @@ fn safe_readiness_record(stage: &str, value: &Value) -> Value {
         "stdout_len",
         "stderr_len",
         "byte_count",
+        "read_count",
+        "elapsed_ms",
+        "provider_absent_ms",
+        "stage_code",
     ] {
         if let Some(count) = value[key].as_u64() {
             safe[key] = json!(count.min(DIAGNOSTIC_CAPTURE_LIMIT as u64));
         }
     }
-    if let Some(success) = value["success"].as_bool() {
-        safe["success"] = json!(success);
+    for key in ["success", "released_marker", "timed_out"] {
+        if let Some(flag) = value[key].as_bool() {
+            safe[key] = json!(flag);
+        }
     }
     safe
 }

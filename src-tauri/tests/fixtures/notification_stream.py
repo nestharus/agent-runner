@@ -15,6 +15,23 @@ deadline = time.monotonic() + 30
 seen = bytearray()
 commands = bytearray()
 notified = False
+# Optional fixture-owned sink. Four numeric records maximum, no input payload.
+try:
+    stages = os.open(os.path.join(os.path.dirname(control_path), "stream-stages"),
+                     os.O_WRONLY | os.O_APPEND | os.O_NONBLOCK)
+except OSError:
+    stages = None
+started = time.monotonic()
+
+
+def stage(code):
+    if stages is not None:
+        try:
+            record = f"{code} {min(65536, int((time.monotonic() - started) * 1000))} {len(seen)}\n"
+            os.write(stages, record.encode("ascii"))
+        except OSError:
+            pass
+
 print("\033[?2004hREADY_FOR_NOTIFY", flush=True)
 
 
@@ -51,12 +68,16 @@ with open(received, "wb", buffering=0) as output:
             if command == b"probe":
                 print("PROVIDER_LIFETIME_HELD", flush=True)
             elif command == b"release":
+                stage(1)
                 # Caller sends a broker input fence after retry and waits until
                 # it is observed. Also retain any queued input before exiting.
                 while select.select([0], [], [], 0)[0]:
                     observe(output)
+                stage(2)
                 print("PROVIDER_INPUT_RELEASED", flush=True)
+                stage(3)
                 os.close(control)
+                stage(4)
                 sys.exit(0)
             else:
                 raise RuntimeError("unknown provider lifetime command")
