@@ -10904,7 +10904,11 @@ mod host_observer_tests {
             assert!(
                 fixture
                     .worker
-                    .rearm_after_resolution(generation, "codex_rollout_capacity", resolution)
+                    .rearm_after_resolution(
+                        generation,
+                        "session_turn_page_budget_too_small",
+                        resolution,
+                    )
                     .is_err()
             );
             assert!(!fixture.tick());

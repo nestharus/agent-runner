@@ -117,21 +117,21 @@ fn age343_list_and_preview_keep_canonical_counts_separate_from_import_timestamp(
     seed_test_chain(
         &db,
         CHAIN_A,
-        "codex",
+        "provider-alpha",
         "native-root",
-        "codex-model",
+        "model-alpha",
         "2026-06-01T00:10:00Z",
     );
     seed_imported_metadata(
         &db,
-        "codex",
+        "provider-alpha",
         "native-root",
         None,
         None,
         "2026-06-01T00:05:00Z",
     );
     db.ingest_session_turns_batch(
-        "codex",
+        "provider-alpha",
         &[
             turn("native-root", "canonical-1", "2026-06-01T00:11:00Z"),
             turn("native-root", "canonical-2", "2026-06-01T00:12:00Z"),

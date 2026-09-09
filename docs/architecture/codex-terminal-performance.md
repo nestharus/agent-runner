@@ -1,7 +1,7 @@
 # Codex interactive terminal performance
 
 `agents --new` and `agents repl` run native clients through the shared PTY
-broker. The headless `agent-runner-codex` adapter does not render that screen.
+broker. The headless provider adapter does not render that screen.
 Codex normally leaves wheel scrolling to the surrounding terminal, so the
 broker renders its retained history and the top-right `SCROLLBACK` badge.
 A mouse-aware client such as OpenCode handles wheel events inside its own UI.
@@ -47,7 +47,7 @@ consumed prefixes are reclaimed even when a busy queue never empties.
 Run an interactive session with an unused absolute output path:
 
 ```sh
-OULIPOLY_TUI_PROFILE=/tmp/codex-tui-profile-1.json agents --new
+OULIPOLY_TUI_PROFILE=/tmp/pty-tui-profile-1.json agents --new
 ```
 
 After a normal session shutdown, the broker writes one private JSON summary.
