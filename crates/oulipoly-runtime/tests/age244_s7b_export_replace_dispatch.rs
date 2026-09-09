@@ -3155,7 +3155,7 @@ fn no_new_concrete_provider_name_grep_hits_are_introduced_against_base_ref() {
     let sources = SourceSet::load(&root);
     let base = sources.line_set(Some(BASE_REF), &concrete_provider_pattern());
     let current = sources.line_set(None, &concrete_provider_pattern());
-    let new_hits = current.difference(&base).cloned().collect::<Vec<_>>();
+    let new_hits = sources.unapproved_new_rows(&base, &current);
 
     assert!(
         new_hits.is_empty(),

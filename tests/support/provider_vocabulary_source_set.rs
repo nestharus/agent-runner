@@ -40,6 +40,7 @@ pub struct SourceSet {
     sources: BTreeSet<String>,
     untracked: BTreeSet<String>,
     historical: BTreeMap<String, HistoricalOutput>,
+    residues: BTreeMap<String, ExactResidue>,
 }
 
 struct HistoricalOutput {
@@ -105,6 +106,7 @@ impl SourceSet {
         let invocation = std::env::var("VOCABULARY_SOURCE_INVOCATION").ok();
         let mut selected = Self::load_input(root, receipt.as_deref(), invocation.as_deref());
         selected.historical = historical_outputs(&selected.root);
+        selected.residues = exact_residue_policy();
         eprintln!(
             "historical projection entries={}",
             selected.historical.len()
@@ -134,6 +136,7 @@ impl SourceSet {
                 sources: candidates,
                 untracked,
                 historical: BTreeMap::new(),
+                residues: BTreeMap::new(),
             };
         };
         let receipt_path = receipt_path
@@ -233,6 +236,7 @@ impl SourceSet {
             sources,
             untracked,
             historical: BTreeMap::new(),
+            residues: BTreeMap::new(),
         }
     }
 
@@ -307,7 +311,89 @@ impl SourceSet {
             untracked_count += occurrences(&text, pattern);
         }
         eprintln!("source added base={base:?} tracked={tracked_count} untracked={untracked_count}");
-        tracked_count + untracked_count
+        let approved = self.approved_added_occurrences(base, pattern);
+        let raw = tracked_count + untracked_count;
+        let rejected = raw
+            .checked_sub(approved)
+            .expect("residue exceeds raw delta");
+        eprintln!("source delta raw={raw} exact_approved={approved} rejected={rejected}");
+        rejected
+    }
+
+    // Whole-file digest is an invalidation fence, NOT a whole-file exemption.
+    // Only the enumerated physical rows can contribute to a delta deduction.
+    // Unrelated edits conservatively revoke the allowance; no automatic rebase.
+    fn exact_rows(&self, path: &str, policy: &ExactResidue) -> BTreeMap<usize, String> {
+        if !self.sources.contains(path) || self.untracked.contains(path) {
+            return BTreeMap::new();
+        }
+        let metadata = std::fs::symlink_metadata(self.root.join(path)).expect("residue metadata");
+        let bytes = read(&self.root, path);
+        if !metadata.is_file() || digest(&bytes) != policy.sha256 {
+            eprintln!("exact residue invalidated {path:?}");
+            return BTreeMap::new();
+        }
+        let text = String::from_utf8(bytes).expect("residue UTF-8");
+        let lines: Vec<_> = text.lines().collect();
+        policy
+            .lines
+            .iter()
+            .map(|&number| {
+                assert!(number > 0 && number <= lines.len(), "invalid residue row");
+                (number, lines[number - 1].to_owned())
+            })
+            .collect()
+    }
+
+    fn approved_added_occurrences(&self, base: Option<&str>, pattern: &str) -> usize {
+        let mut count = 0;
+        for (path, policy) in &self.residues {
+            let rows = self.exact_rows(path, policy);
+            if rows.is_empty() {
+                continue;
+            }
+            let literal = format!(":(literal){path}");
+            let mut args = vec!["diff", "--no-ext-diff", "--unified=0"];
+            if let Some(base) = base {
+                args.push(base);
+            }
+            args.extend(["--", &literal]);
+            let diff = String::from_utf8(git(&self.root, &args)).expect("residue diff UTF-8");
+            for (number, line) in added_rows(&diff) {
+                if rows.get(&number) == Some(&line) {
+                    let hits = occurrences(&line, pattern);
+                    eprintln!("exact approved added {path}:{number}:{line} occurrences={hits}");
+                    count += hits;
+                }
+            }
+        }
+        count
+    }
+
+    pub fn unapproved_new_rows(
+        &self,
+        base: &BTreeSet<String>,
+        current: &BTreeSet<String>,
+    ) -> Vec<String> {
+        let raw: BTreeSet<_> = current.difference(base).cloned().collect();
+        eprintln!("source raw new rows={} {raw:#?}", raw.len());
+        let mut approved = BTreeSet::new();
+        for (path, policy) in &self.residues {
+            for line in self.exact_rows(path, policy).values() {
+                let row = format!("{path}:{line}");
+                if raw.contains(&row) {
+                    approved.insert(row);
+                }
+            }
+        }
+        let rejected: Vec<_> = raw.difference(&approved).cloned().collect();
+        eprintln!(
+            "source row delta raw={} exact_approved={} rejected={} approved={approved:#?}",
+            raw.len(),
+            approved.len(),
+            rejected.len()
+        );
+        rejected
     }
 
     fn diff_exclusions(&self, base: Option<&str>) -> Vec<String> {
@@ -361,6 +447,93 @@ impl SourceSet {
         eprintln!("source line-set base={base:?} rows={}", hits.len());
         hits
     }
+}
+
+// AGE323 generation 2: exact-existing semantic residues authorized at
+// 78e01bc65741b268c314cab504ef693f364e8b4c. Pins below are source SHA-256
+// plus 1-based physical rows from membership-correction-2/source-boundary.json.
+// Six persisted reason roles: 7 physical rows / 8 occurrences. Endpoint
+// policy/storage: 12 unique rows / 15 physical rows and occurrences.
+// Hashes reference honest source bytes; raw scans still print every literal.
+// New files, same-role additions, relocated or mutated bytes get no allowance.
+struct ExactResidue {
+    sha256: String,
+    lines: BTreeSet<usize>,
+}
+
+fn exact_residue_policy() -> BTreeMap<String, ExactResidue> {
+    [
+        (
+            "crates/oulipoly-runtime/src/session_provider.rs",
+            "f9de5001fe1fadb0b2a5f6cc937f7066138ea1452dddce1e11899bd29b6d59d0",
+            &[53] as &[usize],
+        ),
+        (
+            "crates/oulipoly-runtime/src/session_provider/worker.rs",
+            "821283ea59003f6ac4167372ac60ad5eabded7c38a7ccfba2d3f3fc0225e315e",
+            &[200, 298, 300] as &[usize],
+        ),
+        (
+            "crates/oulipoly-runtime/tests/session_import.rs",
+            "0646bfe92c802e3163d2b09a56ee49ab6c66cab1f3ea81bb15b602eb100fee56",
+            &[712] as &[usize],
+        ),
+        (
+            "crates/oulipoly-state/src/db/session_turn_pages.rs",
+            "73d6c9bdd5ce432a8caab79f428ef734e99ba7ead1913b415182ef3001bd3277",
+            &[188, 782] as &[usize],
+        ),
+        (
+            "src-tauri/tests/fixtures/provider-authority-endpoint.py",
+            "63bf6a522f937cb0edc8e87c59077aebfa9b26892e996fd0acee88acec14662b",
+            &[
+                291, 294, 301, 302, 437, 438, 439, 440, 509, 518, 808, 810, 893, 899, 911,
+            ] as &[usize],
+        ),
+    ]
+    .into_iter()
+    .map(|(path, sha256, lines)| {
+        (
+            path.to_owned(),
+            ExactResidue {
+                sha256: sha256.to_owned(),
+                lines: lines.iter().copied().collect(),
+            },
+        )
+    })
+    .collect()
+}
+
+// Parse only new-side hunk coordinates, not filenames or payload-like headers.
+fn added_rows(diff: &str) -> Vec<(usize, String)> {
+    let mut number = None;
+    let mut rows = Vec::new();
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            number = None;
+        }
+        if line.starts_with("@@ ") {
+            let range = line.split_whitespace().nth(2).expect("new hunk range");
+            let start = range
+                .strip_prefix('+')
+                .expect("new hunk sign")
+                .split(',')
+                .next()
+                .unwrap();
+            number = Some(start.parse::<usize>().expect("new hunk coordinate"));
+            continue;
+        }
+        let Some(current) = number.as_mut() else {
+            continue;
+        };
+        if let Some(text) = line.strip_prefix('+') {
+            rows.push((*current, text.to_owned()));
+            *current += 1;
+        } else if line.starts_with(' ') {
+            *current += 1;
+        }
+    }
+    rows
 }
 
 // Positive historical authority: ba61435d6b68674901427da4cf61d7def10a6b39
@@ -728,5 +901,178 @@ mod tests {
         std::fs::remove_file(root.path().join("input.txt")).unwrap();
         assert!(std::panic::catch_unwind(|| sources.full_occurrences("needle")).is_err());
         assert!(std::panic::catch_unwind(|| sources.line_set(None, "needle")).is_err());
+    }
+    fn residue_fixture(root: &Path) -> SourceSet {
+        let mut sources = SourceSet::load_input(root, None, None);
+        sources.residues.insert(
+            "roles.txt".into(),
+            ExactResidue {
+                sha256: digest(b"needle needle\nneedle\nneedle\nother needle\n"),
+                lines: [1, 2, 3].into_iter().collect(),
+            },
+        );
+        sources
+    }
+
+    fn stage_roles(root: &Path) {
+        std::fs::write(
+            root.join("roles.txt"),
+            b"needle needle\nneedle\nneedle\nother needle\n",
+        )
+        .unwrap();
+        git(root, &["add", "roles.txt"]);
+    }
+
+    #[test]
+    fn exact_residues_deduct_only_listed_added_rows_and_keep_raw_metrics() {
+        let root = fixture();
+        let base = String::from_utf8(git(root.path(), &["rev-parse", "HEAD"])).unwrap();
+        stage_roles(root.path());
+        let sources = residue_fixture(root.path());
+        assert_eq!(sources.full_occurrences("needle"), 5);
+        let current = sources.line_set(None, "needle");
+        assert_eq!(current.len(), 3);
+        assert_eq!(
+            sources.unapproved_new_rows(&BTreeSet::new(), &current),
+            ["roles.txt:other needle"]
+        );
+        assert_eq!(sources.added_occurrences(Some(base.trim()), "needle"), 1);
+        // A clean working copy is not a committed-range proof. No fixed budget
+        // is subtracted when the selected index comparison has no additions.
+        assert_eq!(sources.added_occurrences(None, "needle"), 0);
+        assert_eq!(sources.approved_added_occurrences(None, "needle"), 0);
+        // Already-present set rows must not create deductions either.
+        assert!(sources.unapproved_new_rows(&current, &current).is_empty());
+    }
+
+    #[test]
+    fn exact_residues_revoke_on_same_role_additions_and_any_byte_mutation() {
+        let root = fixture();
+        let base = String::from_utf8(git(root.path(), &["rev-parse", "HEAD"])).unwrap();
+        stage_roles(root.path());
+        for bytes in [
+            "needle needle\nneedle\nneedle\nother needle\nneedle\n",
+            "needle needle\nneedle\nneedle\nother needle\nnew needle\n",
+            "needle needle\nneedle \nneedle\nother needle\n",
+            "needle needle\r\nneedle\r\nneedle\r\nother needle\r\n",
+            "needle needle\nneedle\nneedle\nother needle",
+            "ordinary\nneedle needle\nneedle\nneedle\nother needle\n",
+            "needle needle\nneedle\nneedle\nother needle\nordinary\n",
+        ] {
+            std::fs::write(root.path().join("roles.txt"), bytes).unwrap();
+            let sources = residue_fixture(root.path());
+            let raw = occurrences(bytes, "needle");
+            assert_eq!(sources.full_occurrences("needle"), raw);
+            assert_eq!(
+                sources.approved_added_occurrences(Some(base.trim()), "needle"),
+                0
+            );
+            assert_eq!(sources.added_occurrences(Some(base.trim()), "needle"), raw);
+            assert_eq!(
+                sources.added_occurrences(None, "needle"),
+                SourceSet::load_input(root.path(), None, None).added_occurrences(None, "needle")
+            );
+            let rows = sources.line_set(None, "needle");
+            assert_eq!(
+                sources.unapproved_new_rows(&BTreeSet::new(), &rows).len(),
+                rows.len()
+            );
+        }
+    }
+
+    #[test]
+    fn exact_residues_reject_path_widening_copies_and_untracked_replacements() {
+        let root = fixture();
+        let base = String::from_utf8(git(root.path(), &["rev-parse", "HEAD"])).unwrap();
+        stage_roles(root.path());
+        // Keep the genuine approved source alongside each copy: its allowance
+        // cannot subsidize any additional path, staged or untracked.
+        for name in ["roles.txt.extra", "Roles.txt", "nested/roles.txt"] {
+            let path = root.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, read(root.path(), "roles.txt")).unwrap();
+            let sources = residue_fixture(root.path());
+            assert!(sources.added_occurrences(Some(base.trim()), "needle") >= 6);
+            assert!(sources.added_occurrences(None, "needle") >= 5);
+            let rows = sources.line_set(None, "needle");
+            assert!(
+                sources
+                    .unapproved_new_rows(&BTreeSet::new(), &rows)
+                    .contains(&format!("{name}:needle"))
+            );
+            git(root.path(), &["add", name]);
+            assert!(
+                residue_fixture(root.path()).added_occurrences(Some(base.trim()), "needle") >= 6
+            );
+        }
+        git(root.path(), &["rm", "--cached", "roles.txt"]);
+        let sources = residue_fixture(root.path());
+        assert_eq!(
+            sources.approved_added_occurrences(Some(base.trim()), "needle"),
+            0
+        );
+        assert_eq!(sources.added_occurrences(None, "needle"), 5);
+        // Relocation never imports the original path's allowance.
+        std::fs::rename(
+            root.path().join("roles.txt"),
+            root.path().join("relocated.txt"),
+        )
+        .unwrap();
+        let sources = residue_fixture(root.path());
+        assert_eq!(
+            sources.approved_added_occurrences(Some(base.trim()), "needle"),
+            0
+        );
+        assert!(
+            sources
+                .unapproved_new_rows(&BTreeSet::new(), &sources.line_set(None, "needle"))
+                .contains(&"relocated.txt:needle".into())
+        );
+    }
+
+    #[test]
+    fn exact_residues_parse_physical_additions_not_deletions_or_headers() {
+        let diff = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n-old\n+++payload\n+needle\n context\n@@ -9 +10,0 @@\n-needle\n@@ -12 +13 @@\n-old\n+needle needle\n\\ No newline at end of file\n";
+        assert_eq!(
+            added_rows(diff),
+            [
+                (1, "++payload".into()),
+                (2, "needle".into()),
+                (13, "needle needle".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_residue_pins_match_frozen_source_without_expanding_row_scope() {
+        // Read immutable Git objects, not the mutable worktree, to validate the
+        // hand-encoded authority independently of the eligibility fence.
+        let location = git(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &["rev-parse", "--show-toplevel"],
+        );
+        let root = PathBuf::from(String::from_utf8(location).unwrap().trim());
+        let policy = exact_residue_policy();
+        assert_eq!(policy.len(), 5);
+        let mut physical = 0;
+        let mut unique = BTreeSet::new();
+        for (path, entry) in policy {
+            let bytes = git(
+                &root,
+                &[
+                    "show",
+                    &format!("78e01bc65741b268c314cab504ef693f364e8b4c:{path}"),
+                ],
+            );
+            assert_eq!(digest(&bytes), entry.sha256);
+            let text = String::from_utf8(bytes).unwrap();
+            let lines: Vec<_> = text.lines().collect();
+            for number in entry.lines {
+                physical += 1;
+                unique.insert(format!("{path}:{}", lines[number - 1]));
+            }
+        }
+        assert_eq!(physical, 22);
+        assert_eq!(unique.len(), 18);
     }
 }
