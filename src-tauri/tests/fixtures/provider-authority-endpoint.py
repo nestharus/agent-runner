@@ -291,18 +291,18 @@ def policy_evaluate():
     if kind == "claude":
         if system_prompt:
             policy_args.extend(["--append-system-prompt", system_prompt])
-        claude = restrictions.get("claude", {})
-        if claude.get("disallowed_tools"):
-            policy_args.extend(["--disallowed-tools", ",".join(claude["disallowed_tools"])])
-        if claude.get("allowed_tools"):
-            policy_args.extend(["--allowed-tools", ",".join(claude["allowed_tools"])])
-        if claude.get("disable_slash_commands"):
+        tool_policy = restrictions.get("claude", {})
+        if tool_policy.get("disallowed_tools"):
+            policy_args.extend(["--disallowed-tools", ",".join(tool_policy["disallowed_tools"])])
+        if tool_policy.get("allowed_tools"):
+            policy_args.extend(["--allowed-tools", ",".join(tool_policy["allowed_tools"])])
+        if tool_policy.get("disable_slash_commands"):
             policy_args.append("--disable-slash-commands")
     elif kind == "codex":
-        codex = restrictions.get("codex", {})
-        for pair in codex.get("config_pairs", []):
+        feature_policy = restrictions.get("codex", {})
+        for pair in feature_policy.get("config_pairs", []):
             policy_args.extend(["-c", pair])
-        for feature in codex.get("disabled_features", []):
+        for feature in feature_policy.get("disabled_features", []):
             policy_args.extend(["--disable", feature])
         if system_prompt and prompt is not None:
             transformed_prompt = (
@@ -485,7 +485,7 @@ def locate_script_transcript(storage, session_id):
     return pathlib.Path(lines[0])
 
 
-def codex_transcript_matches(path, session_id):
+def session_meta_matches(path, session_id):
     try:
         with path.open("r", encoding="utf-8") as transcript:
             for raw_line in transcript:
@@ -509,21 +509,21 @@ def locate_storage_transcript(session_id):
     if kind == "claude_code":
         root = pathlib.Path(storage.get("projects_dir", ""))
         if not root.is_dir():
-            unsupported_storage(f"claude projects directory unavailable: {root}")
+            unsupported_storage(f"projects directory unavailable: {root}")
         return single_path(
             root.rglob(f"{session_id}.jsonl"),
-            "claude storage scan did not locate the requested session",
-            "claude storage scan is ambiguous",
+            "project storage scan did not locate the requested session",
+            "project storage scan is ambiguous",
         )
     if kind == "codex":
         root = pathlib.Path(storage.get("sessions_dir", ""))
         if not root.is_dir():
-            unsupported_storage(f"codex sessions directory unavailable: {root}")
+            unsupported_storage(f"sessions directory unavailable: {root}")
         return single_path(
             (path for path in root.rglob("*.jsonl")
-             if codex_transcript_matches(path, session_id)),
-            "codex storage scan did not locate the requested session",
-            "codex storage scan is ambiguous",
+             if session_meta_matches(path, session_id)),
+            "session-metadata storage scan did not locate the requested session",
+            "session-metadata storage scan is ambiguous",
         )
     if kind == "script":
         return locate_script_transcript(storage, session_id)
@@ -713,7 +713,7 @@ def record_source(path, storage_type, line):
     }
 
 
-def claude_records(path, session_id, provider_name, storage_type):
+def session_id_message_records(path, session_id, provider_name, storage_type):
     records = []
     latest_compaction = None
     for line in scan_jsonl(path):
@@ -762,7 +762,7 @@ def claude_records(path, session_id, provider_name, storage_type):
     return records
 
 
-def codex_records(path, session_id, provider_name, storage_type):
+def response_item_records(path, session_id, provider_name, storage_type):
     records = []
     saw_session_meta = False
     for line in scan_jsonl(path):
@@ -797,7 +797,7 @@ def codex_records(path, session_id, provider_name, storage_type):
         })
     if not saw_session_meta:
         malformed_transcript(
-            path, 0, f"transcript is missing matching codex session_meta for {session_id}"
+            path, 0, f"transcript is missing matching session_meta for {session_id}"
         )
     validate_timestamp_order(records, path)
     return records
@@ -806,9 +806,9 @@ def codex_records(path, session_id, provider_name, storage_type):
 def canonical_records(path, session_id, provider_name):
     storage_type = storage_format(storage_config())
     if storage_type == "claude_code":
-        return claude_records(path, session_id, provider_name, storage_type)
+        return session_id_message_records(path, session_id, provider_name, storage_type)
     if storage_type == "codex_session":
-        return codex_records(path, session_id, provider_name, storage_type)
+        return response_item_records(path, session_id, provider_name, storage_type)
     unsupported_storage(f"unsupported storage format: {storage_type or 'other'}")
 
 

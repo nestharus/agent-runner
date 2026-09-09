@@ -39,6 +39,12 @@ pub struct SourceSet {
     root: PathBuf,
     sources: BTreeSet<String>,
     untracked: BTreeSet<String>,
+    historical: BTreeMap<String, HistoricalOutput>,
+}
+
+struct HistoricalOutput {
+    sha256: String,
+    full_excluded: bool,
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -97,24 +103,37 @@ impl SourceSet {
     pub fn load(root: &Path) -> Self {
         let receipt = std::env::var_os("VOCABULARY_SOURCE_RECEIPT").map(PathBuf::from);
         let invocation = std::env::var("VOCABULARY_SOURCE_INVOCATION").ok();
-        Self::load_input(root, receipt.as_deref(), invocation.as_deref())
+        let mut selected = Self::load_input(root, receipt.as_deref(), invocation.as_deref());
+        selected.historical = historical_outputs(&selected.root);
+        eprintln!(
+            "historical projection entries={}",
+            selected.historical.len()
+        );
+        selected
     }
 
     fn load_input(root: &Path, receipt: Option<&Path>, invocation: Option<&str>) -> Self {
         let root = root.canonicalize().expect("canonical repository");
         let tracked = paths(&git(&root, &["ls-files", "--cached", "-z"]));
-        // Deliberately no --exclude-standard: ignore rules cannot exempt product.
-        let untracked = paths(&git(&root, &["ls-files", "--others", "-z"]));
+        // Preserve nonignored-untracked semantics; tracked inputs remain accounted.
+        let untracked = paths(&git(
+            &root,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+        ));
         let candidates: BTreeSet<_> = tracked.union(&untracked).cloned().collect();
         let Some(receipt_path) = receipt else {
             assert!(
                 invocation.is_none(),
                 "invocation without membership receipt"
             );
+            for path in &candidates {
+                read(&root, path);
+            }
             return Self {
                 root,
                 sources: candidates,
                 untracked,
+                historical: BTreeMap::new(),
             };
         };
         let receipt_path = receipt_path
@@ -213,24 +232,32 @@ impl SourceSet {
             root,
             sources,
             untracked,
+            historical: BTreeMap::new(),
         }
     }
 
+    fn historical_output(&self, path: &str, bytes: &[u8], full: bool) -> bool {
+        self.historical
+            .get(path)
+            .is_some_and(|output| (!full || output.full_excluded) && digest(bytes) == output.sha256)
+    }
+
     pub fn full_occurrences(&self, pattern: &str) -> usize {
+        // Enumerate using rg's normal hidden traversal and ignore rules FIRST.
+        // Explicit per-file counting must never override that eligibility.
+        let output = Command::new("rg")
+            .current_dir(&self.root)
+            .args(["--no-config", "--files", "--hidden", "-0", "-g", "!.git/**"])
+            .output()
+            .expect("rg traversal membership");
+        assert_search(&output);
+        let traversable = paths(&output.stdout);
         let mut count = 0;
         for path in &self.sources {
-            // Explicit paths bypass ignore/hidden traversal heuristics; retain rg's
-            // case-sensitive -o occurrence metric and binary handling.
             let bytes = read(&self.root, path);
-            if std::fs::symlink_metadata(self.root.join(path))
-                .expect("source metadata")
-                .file_type()
-                .is_symlink()
-            {
-                let text = String::from_utf8(bytes).expect("source link text");
-                let matches = occurrences(&text, pattern);
-                eprintln!("source link {path:?} occurrences={matches}");
-                count += matches;
+            let historical = self.historical_output(path, &bytes, true);
+            if !traversable.contains(path) || historical {
+                eprintln!("full ineligible {path:?} historical={historical}");
                 continue;
             }
             let output = Command::new("rg")
@@ -252,8 +279,10 @@ impl SourceSet {
         if let Some(base) = base {
             args.push(base);
         }
-        args.push("--");
-        // All tracked product is admitted: do not suppress deleted/renamed paths.
+        args.extend(["--", "."]);
+        let exclusions = self.diff_exclusions(base);
+        args.extend(exclusions.iter().map(String::as_str));
+        // Deleted, renamed, new or changed historical paths remain product.
         let diff = String::from_utf8(git(&self.root, &args)).expect("non-UTF-8 source diff");
         let added: Vec<_> = diff
             .lines()
@@ -265,7 +294,11 @@ impl SourceSet {
         }
         let mut untracked_count = 0;
         for path in &self.untracked {
-            let text = String::from_utf8(read(&self.root, path)).unwrap_or_else(|e| {
+            let bytes = read(&self.root, path);
+            if self.historical_output(path, &bytes, false) {
+                continue;
+            }
+            let text = String::from_utf8(bytes).unwrap_or_else(|e| {
                 panic!("unsupported non-UTF-8 untracked product {path:?}: {e}")
             });
             for line in text.lines().filter(|line| occurrences(line, pattern) != 0) {
@@ -275,6 +308,25 @@ impl SourceSet {
         }
         eprintln!("source added base={base:?} tracked={tracked_count} untracked={untracked_count}");
         tracked_count + untracked_count
+    }
+
+    fn diff_exclusions(&self, base: Option<&str>) -> Vec<String> {
+        let mut exclusions = Vec::new();
+        for (path, output) in &self.historical {
+            if !self.sources.contains(path) {
+                continue;
+            }
+            if !self.historical_output(path, &read(&self.root, path), false) {
+                continue;
+            }
+            let object = format!("{}:{path}", base.unwrap_or(""));
+            // A missing preimage is an error, not authority to omit a path.
+            let bytes = git(&self.root, &["show", &object]);
+            if digest(&bytes) == output.sha256 {
+                exclusions.push(format!(":(exclude,literal){path}"));
+            }
+        }
+        exclusions
     }
 
     pub fn line_set(&self, base: Option<&str>, pattern: &str) -> BTreeSet<String> {
@@ -291,6 +343,10 @@ impl SourceSet {
                 Some(base) => git(&self.root, &["show", &format!("{base}:{path}")]),
                 None => read(&self.root, &path),
             };
+            if self.historical_output(&path, &bytes, false) {
+                eprintln!("line-set historical output base={base:?} {path:?}");
+                continue;
+            }
             // AGE244 explicitly used git grep -I: binary inputs are admitted,
             // but do not contribute line-set rows. Text decoding never fails open.
             if bytes.iter().take(8000).any(|b| *b == 0) {
@@ -304,6 +360,46 @@ impl SourceSet {
         }
         eprintln!("source line-set base={base:?} rows={}", hits.len());
         hits
+    }
+}
+
+// Positive historical authority: ba61435d6b68674901427da4cf61d7def10a6b39
+// planning/s10-gate/contracts/plk.contract.md assigns generated moveout planning
+// exclusions to all three guards. e5e41653f8339d3a4c3dc0f8d5c7e12d26686d6b
+// and 4d8a0815c23c7d378f2c123481c92672885fc784 extend ONLY line/delta
+// projection to the sweep. Resolve their concrete retained material at the
+// existing comparison identity, NOT future files matching a directory glob.
+fn historical_outputs(root: &Path) -> BTreeMap<String, HistoricalOutput> {
+    const SNAPSHOT: &str = "f0844a90d73c9196fc6fe53d510caf4d2c56c076";
+    let selected = paths(&git(
+        root,
+        &["ls-tree", "-r", "--name-only", "-z", SNAPSHOT],
+    ));
+    let mut outputs = BTreeMap::new();
+    for path in selected {
+        let Some(full_excluded) = historical_planning_scope(&path) else {
+            continue;
+        };
+        let bytes = git(root, &["show", &format!("{SNAPSHOT}:{path}")]);
+        outputs.insert(
+            path,
+            HistoricalOutput {
+                sha256: digest(&bytes),
+                full_excluded,
+            },
+        );
+    }
+    outputs
+}
+
+fn historical_planning_scope(path: &str) -> Option<bool> {
+    let rest = path.strip_prefix("planning/")?;
+    let (directory, _) = rest.split_once('/')?;
+    match directory {
+        "code-quality-sweep" => Some(false),
+        "wu-e" | "opencode-contract" | "s10-moveout" => Some(true),
+        _ if directory.ends_with("-gate") => Some(true),
+        _ => None,
     }
 }
 
@@ -349,14 +445,23 @@ mod tests {
 
     fn receipt(root: &Path, external: &Path, output: Option<&str>) -> PathBuf {
         let producer = external.join("producer.json");
-        let entries: Vec<_> = paths(&git(root, &["ls-files", "--cached", "--others", "-z"]))
-            .into_iter()
-            .map(|path| Entry {
-                sha256: digest(&read(root, &path)),
-                output_producer: (Some(path.as_str()) == output).then_some(0),
-                path,
-            })
-            .collect();
+        let entries: Vec<_> = paths(&git(
+            root,
+            &[
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+        ))
+        .into_iter()
+        .map(|path| Entry {
+            sha256: digest(&read(root, &path)),
+            output_producer: (Some(path.as_str()) == output).then_some(0),
+            path,
+        })
+        .collect();
         let inventory: BTreeMap<_, _> = entries
             .iter()
             .filter(|e| e.output_producer.is_some())
@@ -503,5 +608,125 @@ mod tests {
             ))
             .is_err()
         );
+    }
+    fn historical_fixture(root: &Path) -> SourceSet {
+        let mut sources = SourceSet::load_input(root, None, None);
+        for (path, full_excluded) in [
+            ("planning/old-gate/report.md", true),
+            ("planning/code-quality-sweep/report.md", false),
+        ] {
+            sources.historical.insert(
+                path.into(),
+                HistoricalOutput {
+                    sha256: digest(b"needle\n"),
+                    full_excluded,
+                },
+            );
+        }
+        sources
+    }
+
+    #[test]
+    fn membership_preserves_metric_specific_ignore_and_index_semantics() {
+        let root = fixture();
+        let base = String::from_utf8(git(root.path(), &["rev-parse", "HEAD"])).unwrap();
+        std::fs::write(root.path().join(".gitignore"), "ignored*\n").unwrap();
+        std::fs::write(root.path().join("ignored-untracked"), b"\xffneedle").unwrap();
+        let sources = SourceSet::load_input(root.path(), None, None);
+        assert!(!sources.sources.contains("ignored-untracked"));
+        assert_eq!(sources.full_occurrences("needle"), 0);
+        assert_eq!(sources.added_occurrences(None, "needle"), 0);
+        std::fs::write(root.path().join("ignored-tracked"), "needle\n").unwrap();
+        git(root.path(), &["add", "-f", "ignored-tracked"]);
+        let sources = SourceSet::load_input(root.path(), None, None);
+        assert!(sources.sources.contains("ignored-tracked"));
+        assert_eq!(sources.full_occurrences("needle"), 0);
+        assert_eq!(sources.line_set(None, "needle").len(), 1);
+        assert_eq!(sources.added_occurrences(None, "needle"), 0);
+        assert_eq!(sources.added_occurrences(Some(base.trim()), "needle"), 1);
+        std::fs::write(root.path().join("ignored-tracked"), "needle needle\n").unwrap();
+        let sources = SourceSet::load_input(root.path(), None, None);
+        assert_eq!(sources.added_occurrences(None, "needle"), 2);
+    }
+
+    #[test]
+    fn membership_projects_only_exact_historical_material_per_metric() {
+        let root = fixture();
+        for path in [
+            "planning/old-gate/report.md",
+            "planning/code-quality-sweep/report.md",
+        ] {
+            let full = root.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, "needle\n").unwrap();
+        }
+        git(root.path(), &["add", "."]);
+        git(
+            root.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "historical outputs",
+            ],
+        );
+        let base = String::from_utf8(git(root.path(), &["rev-parse", "HEAD"])).unwrap();
+        let sources = historical_fixture(root.path());
+        // The sweep never acquired a full-cap exemption.
+        assert_eq!(sources.full_occurrences("needle"), 1);
+        assert!(sources.line_set(Some(base.trim()), "needle").is_empty());
+        assert!(sources.line_set(None, "needle").is_empty());
+        assert_eq!(sources.added_occurrences(Some(base.trim()), "needle"), 0);
+        assert_eq!(sources.added_occurrences(None, "needle"), 0);
+        // New source cannot inherit an output classification from its name.
+        std::fs::write(root.path().join("planning/old-gate/source.rs"), "needle\n").unwrap();
+        let sources = historical_fixture(root.path());
+        assert_eq!(sources.full_occurrences("needle"), 2);
+        assert_eq!(sources.added_occurrences(None, "needle"), 1);
+        assert_eq!(sources.line_set(None, "needle").len(), 1);
+        git(root.path(), &["add", "planning/old-gate/source.rs"]);
+        assert_eq!(
+            historical_fixture(root.path()).added_occurrences(Some(base.trim()), "needle"),
+            1
+        );
+        // Replacing a historical file invalidates its exact-byte classification.
+        std::fs::write(
+            root.path().join("planning/old-gate/report.md"),
+            "needle needle\n",
+        )
+        .unwrap();
+        let sources = historical_fixture(root.path());
+        assert_eq!(sources.full_occurrences("needle"), 4);
+        assert_eq!(sources.added_occurrences(Some(base.trim()), "needle"), 3);
+        assert_eq!(sources.added_occurrences(None, "needle"), 2);
+        assert_eq!(sources.line_set(None, "needle").len(), 2);
+        assert!(sources.line_set(Some(base.trim()), "needle").is_empty());
+    }
+
+    #[test]
+    fn membership_missing_source_and_incomplete_inventory_fail_closed() {
+        let root = fixture();
+        let external = tempfile::tempdir().unwrap();
+        let path = receipt(root.path(), external.path(), None);
+        let mut value: Receipt = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value.entries.clear();
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| SourceSet::load_input(
+                root.path(),
+                Some(&path),
+                Some("synthetic-1")
+            ))
+            .is_err()
+        );
+        let sources = SourceSet::load_input(root.path(), None, None);
+        std::fs::remove_file(root.path().join("input.txt")).unwrap();
+        assert!(std::panic::catch_unwind(|| sources.full_occurrences("needle")).is_err());
+        assert!(std::panic::catch_unwind(|| sources.line_set(None, "needle")).is_err());
     }
 }
