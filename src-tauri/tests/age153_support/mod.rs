@@ -378,6 +378,14 @@ impl Age153Fixture {
     }
 
     pub fn seed_active_chain(&self, provider: &str, model: &str) {
+        self.seed_active_chain_with_instance(
+            provider,
+            model,
+            provider_authority_fixture::FIXTURE_PROVIDER_INSTANCE_ID,
+        );
+    }
+
+    pub fn seed_active_chain_with_instance(&self, provider: &str, model: &str, instance: &str) {
         let conn = self.conn();
         conn.execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
@@ -392,10 +400,12 @@ impl Age153Fixture {
             params![CHAIN_ID, provider, SESSION_ID],
         )
         .unwrap();
-        provider_authority_fixture::bind_session_authority_with_cwd(
+        provider_authority_fixture::bind_session_authority_with_cwd_at(
             &conn,
             provider,
             SESSION_ID,
+            instance,
+            provider,
             self.dir.path(),
         );
     }

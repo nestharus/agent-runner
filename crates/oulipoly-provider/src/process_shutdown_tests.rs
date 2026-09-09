@@ -260,8 +260,7 @@ fn timeout_pipe_eof_worker_panic_is_unsafe_but_healthy_neighbor_is_settled() {
             TimeoutMode::TotalRuntime,
             FinishProcessor(panic),
         )
-        .err()
-        .expect("timeout");
+        .expect_err("timeout");
         assert_eq!(error.transport_kind(), "host_timeout");
         assert_eq!(error.request_id(), None);
         assert!(error.diagnostics().process_was_reaped);
