@@ -584,23 +584,93 @@ fi"#,
         attempts.iter().map(|entry| entry.0).collect::<Vec<_>>(),
         [1, 2, 3, 4, 5, 6, 7, 8]
     );
-    let retry_intervals_ms = attempts[..7]
+    let anchor_intervals_ms = attempts[..7]
         .windows(2)
         .map(|pair| (pair[1].1 - pair[0].1) / 1_000_000)
         .collect::<Vec<_>>();
-    eprintln!("production exponential retry intervals (ms): {retry_intervals_ms:?}");
+    eprintln!("anchor-entry intervals including active work (ms): {anchor_intervals_ms:?}");
+    // Rejection unwinds the invocation guard before the failed-wake recheck
+    // sleeps. Anchor entry precedes that unwinding; timing from there charges
+    // observation/teardown to backoff. The next invocation starts after renewal.
+    // This bracket still includes recheck/spawn overhead, not just the sleep.
+    let retry_intervals_ms = failed_invocation_retry_intervals_ms(&fixture);
+    eprintln!("production finished-to-created retry intervals (ms): {retry_intervals_ms:?}");
     for (elapsed_ms, expected_ms) in retry_intervals_ms
         .iter()
-        .zip([1_000_u128, 2_000, 4_000, 8_000, 16_000, 30_000])
+        .zip([1_000_i64, 2_000, 4_000, 8_000, 16_000, 30_000])
     {
-        assert!(
-            (*elapsed_ms >= expected_ms.saturating_sub(100))
-                && *elapsed_ms <= expected_ms.saturating_add(1_500),
-            "production retry did not follow the selected exponential cadence: \
-             expected_ms={expected_ms}, intervals={retry_intervals_ms:?}"
-        );
+        assert_retry_interval_ms(*elapsed_ms, expected_ms);
     }
     assert_xdg_isolated(&fixture);
+}
+
+fn failed_invocation_retry_intervals_ms(fixture: &Fixture) -> Vec<i64> {
+    let state = fixture.state();
+    let mut statement = state
+        .connection()
+        .prepare("SELECT created_at, finished_at, status FROM invocations ORDER BY id")
+        .unwrap();
+    let invocations = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(invocations.len(), 8);
+    invocations[..7]
+        .windows(2)
+        .map(|pair| {
+            assert_eq!(pair[0].2, "failed");
+            finished_to_created_ms(
+                pair[0].1.as_deref().expect("rejected invocation finished"),
+                &pair[1].0,
+            )
+        })
+        .collect()
+}
+
+fn finished_to_created_ms(finished_at: &str, next_created_at: &str) -> i64 {
+    let finished = chrono::DateTime::parse_from_rfc3339(finished_at).unwrap();
+    let next_created = chrono::DateTime::parse_from_rfc3339(next_created_at).unwrap();
+    next_created
+        .signed_duration_since(finished)
+        .num_milliseconds()
+}
+
+fn assert_retry_interval_ms(elapsed_ms: i64, expected_ms: i64) {
+    assert!(
+        elapsed_ms >= expected_ms - 100 && elapsed_ms <= expected_ms + 1_500,
+        "production retry did not follow the selected exponential cadence: \
+         expected_ms={expected_ms}, elapsed_ms={elapsed_ms}"
+    );
+}
+
+#[test]
+fn retry_timestamp_oracle_excludes_active_attempt_duration() {
+    let created = "2026-09-09T10:00:00+00:00";
+    let finished = "2026-09-09T10:00:03+00:00";
+    let next_created = "2026-09-09T10:00:04+00:00";
+    assert_eq!(finished_to_created_ms(created, next_created), 4_000);
+    assert_eq!(finished_to_created_ms(finished, next_created), 1_000);
+    assert_eq!(finished_to_created_ms(next_created, finished), -1_000);
+    assert_retry_interval_ms(finished_to_created_ms(finished, next_created), 1_000);
+}
+
+#[test]
+#[should_panic(expected = "production retry did not follow the selected exponential cadence")]
+fn retry_timestamp_oracle_rejects_early_retry() {
+    assert_retry_interval_ms(899, 1_000);
+}
+
+#[test]
+#[should_panic(expected = "production retry did not follow the selected exponential cadence")]
+fn retry_timestamp_oracle_rejects_late_retry() {
+    assert_retry_interval_ms(2_501, 1_000);
 }
 
 #[cfg(target_os = "linux")]
