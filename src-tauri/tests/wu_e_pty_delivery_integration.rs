@@ -1989,7 +1989,8 @@ fn live_broker_rejects_attempt_resolved_before_socket_acceptance() {
 fn live_broker_contracts_registered_overlap_after_each_injection() {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("concurrent-overlap-received.log");
-    let script = fixture_provider_waiting_for_two_notifications(fixture.dir.path(), &received_log);
+    let mut lifetime = ProviderLifetime::new(fixture.dir.path());
+    let script = fixture_provider_with_lifetime(fixture.dir.path(), &received_log, &lifetime);
     fixture.write_interactive_model("fixture-concurrent-overlap", "fixture-provider", &script);
     fixture.seed_active_chain(
         "ffffffff-ffff-4fff-8fff-ffffffffffff",
@@ -1998,7 +1999,12 @@ fn live_broker_contracts_registered_overlap_after_each_injection() {
         "fixture-concurrent-overlap",
     );
     let pty = OuterPty::open(30, 100);
-    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-concurrent-overlap", SESSION_A);
+    let mut repl = SettlementChild::new(spawn_repl_under_pty(
+        &fixture,
+        &pty,
+        "fixture-concurrent-overlap",
+        SESSION_A,
+    ));
     let startup = read_until(
         pty.master.as_raw_fd(),
         "READY_FOR_NOTIFY",
@@ -2009,6 +2015,7 @@ fn live_broker_contracts_registered_overlap_after_each_injection() {
         "startup was {startup:?}"
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
+    repl.provider = Some(wait_for_child_identity(&fixture, &invocation_uuid));
     let control_path = running_control_path(&fixture);
     let rows = (1..=6)
         .map(|index| fixture.seed_mailbox(&format!("h-concurrent-overlap-{index}")))
@@ -2065,7 +2072,24 @@ fn live_broker_contracts_registered_overlap_after_each_injection() {
         .unwrap();
     assert!(second_window.acknowledged_at.is_some());
     assert!(second_window.resolved_at.is_some());
-    assert!(repl.wait().unwrap().success());
+    // Receipt is not settlement: keep observing input and own provider lifetime
+    // until both socket responses and the durable overlap assertions complete.
+    lifetime.probe(pty.master.as_raw_fd());
+    let fence = inject_control_envelope(&control_path, "PROVIDER_INPUT_FENCE\n").unwrap();
+    assert!(fence.ack, "{fence:?}");
+    read_pty_until_file_occurrences(
+        pty.master.as_raw_fd(),
+        &received_log,
+        "PROVIDER_INPUT_FENCE",
+        1,
+        Duration::from_secs(5),
+    );
+    lifetime.release();
+    assert!(
+        repl.wait_bounded(pty.master.as_raw_fd(), Duration::from_secs(5))
+            .unwrap()
+            .success()
+    );
 
     let received = fs::read_to_string(&received_log).unwrap();
     for index in 1..=6 {
@@ -2444,7 +2468,7 @@ fn readiness_deadline_unwinds_actual_scoped_caller_and_owned_processes() {
         assert!(
             diagnostics
                 .iter()
-                .all(|record| record.to_string().len() + 1 <= DIAGNOSTIC_RECORD_LIMIT)
+                .all(|record| record.to_string().len() < DIAGNOSTIC_RECORD_LIMIT)
         );
         assert!(
             diagnostics
@@ -3461,13 +3485,21 @@ fn safe_readiness_record(stage: &str, value: &Value) -> Value {
         | "deadline_pty" => stage,
         _ => "other",
     };
-    let event = match value["event"].as_str() {
-        Some(
-            event @ ("launch" | "exit" | "runner_spawned" | "startup_observed" | "ready_observed"
-            | "deadline" | "read_error"),
-        ) => event,
-        _ => "observation",
-    };
+    let event = value["event"]
+        .as_str()
+        .filter(|event| {
+            matches!(
+                *event,
+                "launch"
+                    | "exit"
+                    | "runner_spawned"
+                    | "startup_observed"
+                    | "ready_observed"
+                    | "deadline"
+                    | "read_error"
+            )
+        })
+        .unwrap_or("observation");
     let mut safe = json!({"readiness_diagnostic": stage, "event": event,
         "details": "redacted", "retention": "best_effort_process_budget"});
     for key in [
