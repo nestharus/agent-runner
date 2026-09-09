@@ -309,28 +309,51 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn real_provider_wait_failure_projects_first_errno_and_missing_identity() {
-        use oulipoly_provider::process::{
-            ProcessCommand, ProcessLimits, ProcessRunner, ProcessSpawnObserver,
+        use oulipoly_provider::client::{
+            ProcessSpawnObserver, ProviderClient, ProviderClientOptions,
         };
-        let limits = ProcessLimits {
+        use oulipoly_provider::custody::AttemptActorCustody;
+        use oulipoly_provider::resolver::ProviderArtifactRef;
+        let custody = AttemptActorCustody::new(uuid::Uuid::new_v4());
+        let options = ProviderClientOptions::default()
+            .with_attempt_custody(Some(custody.clone()))
             // Deliberate negative control: consume this exact child's status before
             // the provider owner polls. This is NOT a historical-cause claim.
-            spawn_observer: Some(ProcessSpawnObserver::new(|pid| {
+            .with_spawn_observer(Some(ProcessSpawnObserver::new(|pid| {
                 let mut status = 0;
                 assert_eq!(
                     unsafe { libc::waitpid(pid as i32, &mut status, 0) },
                     pid as i32
                 );
                 Ok(())
-            })),
-            ..ProcessLimits::default()
-        };
-        let error = ProcessRunner::new(limits)
-            .run(
-                ProcessCommand::new("/bin/true").arg("launch"),
-                vec![],
-                std::iter::empty::<(&str, &str)>(),
-            )
+            })));
+        let client = ProviderClient::new(
+            ProviderArtifactRef::Path {
+                path: "/bin/true".into(),
+            },
+            options,
+        );
+        let request = json!({
+            "contract": oulipoly_provider::generated::CONTRACT_VERSION,
+            "request_id": "projection-observed-request",
+            "provider_instance_id": "projection-test",
+            "host": {
+                "app": "oulipoly-test", "app_version": "0.0.0-test",
+                "platform": "linux", "working_directory": ".",
+                "config_root": ".", "data_root": ".", "env": {}
+            },
+            "params": {
+                "settings_id": "projection-test", "mode": "default",
+                "model": { "name": "test", "provider_args": [], "inputs": { "named": {} } },
+                "argv": [], "working_directory": ".", "env": {},
+                "stdin": { "encoding": "base64", "data": "" },
+                "session": {}, "output_delivery": { "protocol": "oulipoly.launch_output/v1" }
+            }
+        });
+        // The public JSON entrypoint reaches the byte-capture ProcessRunner path;
+        // the arranged wait error occurs before response parsing can take place.
+        let error = client
+            .invoke_json("launch", request, [])
             .expect_err("reaped child must expose real ECHILD");
         assert_eq!(error.transport_kind(), "wait_failed");
         assert!(!provider_client_error_is_rotatable(&error));
@@ -343,6 +366,9 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("operation=launch; observed_request_id=absent"));
+        let receipt = custody.receipts().remove(0);
+        assert!(receipt.uncertain);
+        assert!(!receipt.effect_incapable());
     }
     #[test]
     fn observed_wire_identity_hashes_verbatim_prefix_and_empty_is_not_absent() {
