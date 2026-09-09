@@ -45,13 +45,13 @@ pub(crate) fn delayed_agent_bash_provider_script(agent_bash_bin: &Path) -> Strin
             r#"set -e
 runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
 owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
-writer_ready="$work/pid-sidecar-writer-ready"
-python3 - "$OULIPOLY_DATA_DIR/pid-identity.db" "$owner_invocation" "$writer_ready" <<'PY' &
+coproc SIDECAR_WRITER {{
+python3 -u - "$OULIPOLY_DATA_DIR/pid-identity.db" "$owner_invocation" <<'PY' 2> "$work/pid-sidecar-writer.err"
 import sqlite3
 import sys
 import time
 
-path, owner_invocation, ready = sys.argv[1:]
+path, owner_invocation = sys.argv[1:]
 connection = sqlite3.connect(path, timeout=0.1)
 admission_deadline = time.monotonic() + 5
 revision = 0
@@ -74,7 +74,7 @@ while True:
         raise RuntimeError("owner identity did not appear before write burst")
     time.sleep(0.01)
 
-open(ready, "w", encoding="utf-8").close()
+print("owner-lookup-admitted", flush=True)
 deadline = time.monotonic() + 1
 while time.monotonic() < deadline:
     try:
@@ -93,12 +93,14 @@ while time.monotonic() < deadline:
         raise RuntimeError("owner identity disappeared during write burst")
     revision += 1
 PY
-writer_pid=$!
-for _ in $(seq 1 200); do
-  [ -e "$writer_ready" ] && break
-  sleep 0.01
-done
-[ -e "$writer_ready" ]
+}}
+writer_pid=$SIDECAR_WRITER_PID
+if ! IFS= read -r writer_ready <&"${{SIDECAR_WRITER[0]}}"; then
+  cat "$work/pid-sidecar-writer.err" >&2
+  wait "$writer_pid" || true
+  exit 1
+fi
+[ "$writer_ready" = owner-lookup-admitted ]
 if AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
    {agent_bash_bin} run --completion-scope tree --delivery async -- \
      bash -lc '( sleep 1; printf nested-tree-complete ) &' \
@@ -111,7 +113,7 @@ else
   wait "$writer_pid" || true
   exit "$rc"
 fi
-python3 -c 'import json, sys; h = json.load(open(sys.argv[1]))["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"' "$work/agent-bash-dispatch.json"
+python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"' "$work/agent-bash-dispatch.json"
 wait "$writer_pid"
 "#,
         ),
@@ -132,7 +134,7 @@ AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
 AGENT_BASH_CONSUMER_GRACE_MS=0 \
 {agent_bash_bin} run --completion-scope root --delivery async -- \
   bash -lc 'printf nested-root-complete' > "$dispatch"
-handle="$(python3 -c 'import json, sys; h = json.load(open(sys.argv[1]))["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$dispatch")"
+handle="$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$dispatch")"
 found=""
 for _ in $(seq 1 200); do
   mailbox="$($runner mailbox list --session-id "$session" --json)"
@@ -169,9 +171,9 @@ run_job() {{
 consumed_dispatch="$work/mixed-consumed-dispatch.json"
 unpolled_dispatch="$work/mixed-unpolled-dispatch.json"
 run_job "$consumed_dispatch"
-consumed_handle="$(python3 -c 'import json, sys; h = json.load(open(sys.argv[1]))["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$consumed_dispatch")"
+consumed_handle="$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$consumed_dispatch")"
 run_job "$unpolled_dispatch"
-unpolled_handle="$(python3 -c 'import json, sys; h = json.load(open(sys.argv[1]))["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$unpolled_dispatch")"
+unpolled_handle="$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$unpolled_dispatch")"
 found=""
 for _ in $(seq 1 200); do
   mailbox="$($runner mailbox list --session-id "$session" --json)"
