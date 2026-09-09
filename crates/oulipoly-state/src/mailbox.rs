@@ -57,6 +57,11 @@ const PENDING_MAILBOX_TARGET_PREDICATE: &str = "(
     OR (?2 IS NOT NULL AND target_kind = 'chain' AND target_id = ?2)
 )";
 
+struct DeliveryAttemptTarget<'a> {
+    session_id: &'a str,
+    chain_id: Option<&'a str>,
+}
+
 fn bounded_pending_mailbox_query() -> String {
     format!(
         "SELECT {MAILBOX_ROW_COLUMNS}
@@ -3460,8 +3465,10 @@ impl MailboxDb {
     ) -> Result<(), String> {
         self.register_delivery_attempt_for_target(
             attempt_id,
-            session_id,
-            None,
+            DeliveryAttemptTarget {
+                session_id,
+                chain_id: None,
+            },
             delivery_invocation_uuid,
             seqs,
             remaining_count,
@@ -3480,8 +3487,10 @@ impl MailboxDb {
     ) -> Result<(), String> {
         self.register_delivery_attempt_for_target(
             attempt_id,
-            session_id,
-            chain_id,
+            DeliveryAttemptTarget {
+                session_id,
+                chain_id,
+            },
             delivery_invocation_uuid,
             seqs,
             remaining_count,
@@ -3499,8 +3508,10 @@ impl MailboxDb {
     ) -> Result<(), String> {
         self.register_delivery_attempt_for_target(
             attempt_id,
-            session_id,
-            chain_id,
+            DeliveryAttemptTarget {
+                session_id,
+                chain_id,
+            },
             attempt_id,
             &[seq],
             0,
@@ -3511,13 +3522,16 @@ impl MailboxDb {
     fn register_delivery_attempt_for_target(
         &mut self,
         attempt_id: &str,
-        session_id: &str,
-        chain_id: Option<&str>,
+        target: DeliveryAttemptTarget<'_>,
         delivery_invocation_uuid: &str,
         seqs: &[i64],
         remaining_count: usize,
         explicit_input: bool,
     ) -> Result<(), String> {
+        let DeliveryAttemptTarget {
+            session_id,
+            chain_id,
+        } = target;
         if seqs.is_empty() {
             return Err("Cannot register an empty mailbox delivery attempt".to_string());
         }
