@@ -1,4 +1,49 @@
-//! Strict opened-file return-channel custody. Roles: orchestration, validator.
+//! Strict opened-file return-channel custody.
+//!
+//! ## Declared roles
+//!
+//! Roles: orchestration, predicate, accessor, parser, validator, formatter.
+//!
+//! - orchestration: sequences channel creation, actor-gated sealing, artifact
+//!   commitment, checked removal, and standalone consumption; Drop only cleans up.
+//! - predicate: answers transferability, opened/path identity, absence, and
+//!   unlink questions (`transferable`, `identical`, `same_file`, `absent`, `unlinked`).
+//! - accessor: exposes channel paths, settlement artifacts, and opened-file
+//!   identity/metadata (`path`, `artifacts`, `windows_file_identity`).
+//! - parser: decodes bounded JSONL and versioned receipts (`strict_records`,
+//!   `versioned_receipt_shape`), including valid prefix records.
+//! - validator: rejects invalid identity, permissions, bounds, record shapes,
+//!   and producer provenance during channel creation and settlement.
+//! - formatter: renders custody diagnostics and SHA-256 digest text.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/executor/cli/ipc/return_channel.rs
+//!     role: adapter
+//!     Translates:
+//!       - return-channel-filesystem-contract
+//!       - actor-settlement-custody-contract
+//!       - returned-artifact-jsonl-contract
+//!       - producing-invocation-artifact-commit-contract
+//!       - composite-invocation-id-contract
+//! ```
+//!
+//! - return-channel-filesystem-contract: `return_channel_path`,
+//!   `return_channel_dir`, opened handles, OS identity/permission checks, bounded
+//!   reads, checked close/unlink/rmdir, and emergency `cleanup_return_channel`.
+//! - actor-settlement-custody-contract: `seal` requires nonempty
+//!   `ActorSettlementReceipt` inputs that all report `effect_incapable`.
+//! - returned-artifact-jsonl-contract: `strict_records`, `strict_shape`, and
+//!   `versioned_receipt_shape` decode/validate projected `ReturnedArtifactRef`
+//!   records and messenger schema-v1 `ReturnedArtifact` wire receipts.
+//! - producing-invocation-artifact-commit-contract: the `commit` callback retains
+//!   accepted refs on their producer before settlement; `ReturnChannelSettlement`
+//!   carries artifacts even on quarantine or cleanup failure.
+//! - composite-invocation-id-contract: `parse_return_channel_parent_invocation`
+//!   supplies standalone parent identity; typed UUIDs bind attempt paths and the
+//!   producing invocation without turning standalone input into seal authority.
 use super::return_channel_cleanup::cleanup_return_channel;
 use super::return_channel_parent::parse_return_channel_parent_invocation;
 use super::return_channel_path::{return_channel_dir, return_channel_path};
