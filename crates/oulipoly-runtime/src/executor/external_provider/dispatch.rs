@@ -22,9 +22,9 @@ use super::error_mapper::{
     protocol_service_error, service_error,
 };
 use super::launch_result_mapper::{
-    PROVIDER_SESSION_MARKER, launch_failure_provider_session_id, launch_provider_session_id,
-    map_launch_result_with_terminal_classification, map_missing_final_exit_with_prompt_acceptance,
-    marker_provider_session_id,
+    LaunchOutputArtifacts, PROVIDER_SESSION_MARKER, launch_failure_provider_session_id,
+    launch_provider_session_id, map_launch_result_with_terminal_classification,
+    map_missing_final_exit_with_prompt_acceptance, marker_provider_session_id,
 };
 use super::output_spool_observer::observe_output;
 use super::policy_transform::apply_policy_transform;
@@ -393,8 +393,10 @@ pub(super) fn attempt_account_dispatch(
                 &context.provider.name,
                 None,
                 launch_prompt_acceptance_v1_enabled,
-                output_spool,
-                returned_artifacts,
+                LaunchOutputArtifacts {
+                    spool: output_spool,
+                    returned_artifacts,
+                },
                 &session_authority,
             );
             return Ok(failed_finalization_result(
@@ -416,8 +418,10 @@ pub(super) fn attempt_account_dispatch(
         &context.provider.name,
         classification,
         launch_prompt_acceptance_v1_enabled,
-        output_spool,
-        returned_artifacts,
+        LaunchOutputArtifacts {
+            spool: output_spool,
+            returned_artifacts,
+        },
         &session_authority,
     ))
 }

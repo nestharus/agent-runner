@@ -57,16 +57,24 @@ use std::time::SystemTime;
 
 pub(crate) const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 
+pub(crate) struct LaunchOutputArtifacts {
+    pub(super) spool: ExecutionOutputSpool,
+    pub(super) returned_artifacts: Vec<ReturnedArtifactRef>,
+}
+
 pub(crate) fn map_launch_result_with_terminal_classification(
     result: LaunchResult,
     provider_index: usize,
     provider_name: &str,
     classification: Option<TerminalClassification>,
     retain_prompt_acceptance_attestation_v1: bool,
-    output_spool: ExecutionOutputSpool,
-    returned_artifacts: Vec<ReturnedArtifactRef>,
+    output: LaunchOutputArtifacts,
     authority: &ExternalProviderSessionAuthority,
 ) -> ExecutionResult {
+    let LaunchOutputArtifacts {
+        spool: output_spool,
+        returned_artifacts,
+    } = output;
     let stdout = result.stdout_bytes();
     let stderr = String::from_utf8_lossy(&result.stderr_bytes()).into_owned();
     let terminal = map_terminal_cancel_outcome(
