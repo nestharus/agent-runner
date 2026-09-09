@@ -73,6 +73,8 @@ impl CliFixture {
 
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        // Provider lookup uses the runner root independently of --models-dir.
+        cmd.env("OULIPOLY_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env(
@@ -193,6 +195,7 @@ flag = "--resume"
             .arg("-c")
             .arg(command)
             .arg(&typescript)
+            .env("OULIPOLY_CONFIG_HOME", &self.config_home)
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
             .env(
