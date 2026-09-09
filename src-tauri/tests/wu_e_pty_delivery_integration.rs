@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -2020,18 +2020,29 @@ fn live_broker_contracts_registered_overlap_after_each_injection() {
 
 #[test]
 fn live_broker_transport_ack_completes_delivery_when_response_is_unread() {
-    unread_response_settlement(false);
+    unread_response_settlement(false, false);
 }
 
 #[test]
 fn unread_response_confirmation_failure_is_uncertain_without_retransmission() {
-    unread_response_settlement(true);
+    unread_response_settlement(true, false);
 }
 
-fn unread_response_settlement(inject_failure: bool) {
+#[test]
+fn accepted_settlement_retains_provider_through_held_retry() {
+    unread_response_settlement(false, true);
+}
+
+#[test]
+fn uncertain_settlement_retains_provider_through_held_retry() {
+    unread_response_settlement(true, true);
+}
+
+fn unread_response_settlement(inject_failure: bool, held_retry: bool) {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("lost-ack-received.log");
-    let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
+    let mut lifetime = ProviderLifetime::new(fixture.dir.path());
+    let script = fixture_provider_with_lifetime(fixture.dir.path(), &received_log, &lifetime);
     fixture.write_interactive_model("fixture-lost-ack", "fixture-provider", &script);
     fixture.seed_active_chain(
         "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
@@ -2141,13 +2152,32 @@ fn unread_response_settlement(inject_failure: bool) {
         assert!(attempt.resolved_at.is_some());
     }
     // Exact replay retains the terminal outcome, without resubmission or a second count.
-    let retry = inject_control_envelope(&control_path, &envelope).unwrap();
+    let retry = thread::scope(|scope| {
+        let (release, held) = std::sync::mpsc::channel();
+        let control_path = &control_path;
+        let envelope = &envelope;
+        let retry = scope.spawn(move || {
+            held.recv_timeout(Duration::from_secs(5)).unwrap();
+            inject_control_envelope(control_path, envelope).unwrap()
+        });
+        if held_retry {
+            // Settlement and durable assertions precede this independent gate.
+            // The provider must service a lifetime probe while retry is withheld.
+            lifetime.probe(pty.master.as_raw_fd());
+            assert!(!retry.is_finished(), "retry escaped its test-side gate");
+            assert!(repl.child.try_wait().unwrap().is_none());
+            eprintln!("settlement observed; retry held; provider lifetime probe completed");
+        }
+        release.send(()).unwrap();
+        retry.join().unwrap()
+    });
     assert!(retry.ack, "{retry:?}");
     assert_eq!(retry.message, settlement);
     assert_eq!(
         fixture.mailbox().list_mailbox(SESSION_A, true).unwrap()[0].delivery_attempts,
         if inject_failure { 0 } else { 1 }
     );
+    lifetime.release();
     assert!(
         repl.wait_bounded(pty.master.as_raw_fd(), Duration::from_secs(5))
             .unwrap()
@@ -2239,16 +2269,23 @@ fn settlement_child_cleanup_reaps_on_panic_and_timeout() {
     assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
     for recorded in [false, true] {
         for panic_after_spawn in [false, true] {
-            observe_settlement_tree_cleanup(recorded, panic_after_spawn);
+            observe_settlement_tree_cleanup(recorded, panic_after_spawn, false);
+            observe_settlement_tree_cleanup(recorded, panic_after_spawn, true);
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn observe_settlement_tree_cleanup(recorded: bool, panic_after_spawn: bool) {
+fn observe_settlement_tree_cleanup(recorded: bool, panic_after_spawn: bool, held_lifetime: bool) {
     let fixture = Fixture::new();
     let script = fixture.dir.path().join("cleanup-provider.sh");
     let identity_path = fixture.dir.path().join("cleanup-provider.pid");
+    let mut lifetime = ProviderLifetime::new(fixture.dir.path());
+    let barrier = if held_lifetime {
+        lifetime.provider_loop()
+    } else {
+        "IFS= read -r -t 30 line\nexit 91".to_owned()
+    };
     // Only Bash builtins: no independent timer or unrelated process to kill.
     // read is a fixture barrier, not a successful lifetime-based assertion. Its
     // 30s backstop bounds escape even if startup/observer assertions fail.
@@ -2260,8 +2297,7 @@ set -euo pipefail
 test -t 0 && test -t 1 && test -t 2
 printf '%s\n' "$$" > {identity}
 printf 'CLEANUP_PROVIDER_BLOCKED\n'
-IFS= read -r -t 30 line
-exit 91
+{barrier}
 "#,
             identity = shell_single_quote(&path_string(&identity_path)),
         ),
@@ -2294,6 +2330,9 @@ exit 91
         Duration::from_secs(5),
     );
     assert!(startup.contains("CLEANUP_PROVIDER_BLOCKED"), "{startup:?}");
+    if held_lifetime {
+        lifetime.probe(pty.master.as_raw_fd());
+    }
     let provider_pid: i64 = fs::read_to_string(identity_path)
         .unwrap()
         .trim()
@@ -2321,7 +2360,7 @@ exit 91
         assert!(guard.provider.is_none());
     }
     eprintln!(
-        "cleanup before: recorded={recorded} panic={panic_after_spawn} runner={runner_identity:?} provider={identity:?} group_live=true"
+        "cleanup before: lifetime_outstanding={held_lifetime} recorded={recorded} panic={panic_after_spawn} runner={runner_identity:?} provider={identity:?} group_live=true"
     );
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let mut guard = guard;
@@ -2393,7 +2432,7 @@ exit 91
     assert_eq!(unsafe { libc::kill(-(provider_pid as i32), 0) }, -1);
     assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     eprintln!(
-        "cleanup after: recorded={recorded} panic={panic_after_spawn} runner_reaped=ECHILD provider={provider_pid} observer_wait_status={provider_status:?} group_absent=ESRCH"
+        "cleanup after: lifetime_outstanding={held_lifetime} recorded={recorded} panic={panic_after_spawn} runner_reaped=ECHILD provider={provider_pid} observer_wait_status={provider_status:?} group_absent=ESRCH"
     );
     fixture.assert_default_user_paths_untouched();
 }
@@ -2717,6 +2756,64 @@ fn spawn_repl_under_pty_mode_with_test_hooks(
 }
 
 fn fixture_provider_waiting_for_notification(dir: &Path, received_log: &Path) -> PathBuf {
+    fixture_notification_provider(dir, received_log, "sleep 1\n    exit 0")
+}
+
+// The test owns the write end before spawn. No elapsed interval releases it.
+// SettlementChild owns process teardown on unwind, including blocked FIFO reads.
+struct ProviderLifetime {
+    path: PathBuf,
+    control: File,
+}
+
+impl ProviderLifetime {
+    fn new(dir: &Path) -> Self {
+        let path = dir.join("provider-lifetime");
+        let name = std::ffi::CString::new(path_string(&path)).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let control = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        Self { path, control }
+    }
+
+    fn provider_loop(&self) -> String {
+        format!(
+            r#"while IFS= read -r command; do
+  case "$command" in
+    probe) printf 'PROVIDER_LIFETIME_HELD\n' ;;
+    release) exit 0 ;;
+    *) exit 92 ;;
+  esac
+done < {}
+exit 93"#,
+            shell_single_quote(&path_string(&self.path))
+        )
+    }
+
+    fn probe(&mut self, fd: RawFd) {
+        self.control.write_all(b"probe\n").unwrap();
+        let output = read_until(fd, "PROVIDER_LIFETIME_HELD", Duration::from_secs(5));
+        assert!(output.contains("PROVIDER_LIFETIME_HELD"), "{output:?}");
+    }
+
+    fn release(&mut self) {
+        self.control.write_all(b"release\n").unwrap();
+    }
+}
+
+fn fixture_provider_with_lifetime(
+    dir: &Path,
+    received_log: &Path,
+    lifetime: &ProviderLifetime,
+) -> PathBuf {
+    fixture_notification_provider(dir, received_log, &lifetime.provider_loop())
+}
+
+fn fixture_notification_provider(dir: &Path, received_log: &Path, completion: &str) -> PathBuf {
     let path = dir.join("fixture-live-provider.sh");
     let authority = observed_completion_authority_path(dir);
     fs::write(
@@ -2736,8 +2833,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> {received}
   if [ "$line" = "[END OULIPOLY NOTIFICATIONS]" ]; then
     printf 'GOT_NOTIFY\n'
-    sleep 1
-    exit 0
+    {completion}
   fi
 done
 "#,
