@@ -11,6 +11,7 @@ enum TerminalPath {
     CancelledStreamCompleted,
     Timeout,
     ForcedCancel,
+    WaitFailure,
     ProcessorFailure,
     CancelledProcessorFailure,
 }
@@ -160,6 +161,20 @@ fn terminal_schedule(path: TerminalPath, failed_worker: Option<&str>) -> bool {
             Err(supervisor.terminate_and_collect(HostErrorKind::Timeout, false))
         }
         TerminalPath::ForcedCancel => Err(supervisor.force_kill_and_collect()),
+        TerminalPath::WaitFailure => {
+            let original = wait_operation_error(
+                &supervisor.command,
+                "owned_wait",
+                std::io::Error::from_raw_os_error(libc::ECHILD),
+            );
+            let error = ProviderClientError::host_transport(
+                HostErrorKind::WaitFailed,
+                "launch",
+                Some("observed-wait-id".into()),
+                original.diagnostics().clone(),
+            );
+            Err(supervisor.terminate_after_wait_failure(error))
+        }
         TerminalPath::ProcessorFailure | TerminalPath::CancelledProcessorFailure => {
             Err(supervisor.terminate_after_stdout_processor_failure())
         }
@@ -179,6 +194,20 @@ fn terminal_schedule(path: TerminalPath, failed_worker: Option<&str>) -> bool {
             if failed_worker.is_some() =>
         {
             assert_eq!(result.as_ref().unwrap_err().transport_kind(), "wait_failed")
+        }
+        TerminalPath::WaitFailure => {
+            let error = result.as_ref().unwrap_err();
+            assert_eq!(error.transport_kind(), "wait_failed");
+            assert_eq!(error.request_id(), Some("observed-wait-id"));
+            assert!(error.diagnostics().process_was_reaped);
+            let description = error.diagnostics().description.as_deref().unwrap();
+            assert!(description.starts_with("first_failure: owned_wait: "));
+            assert!(description.contains(&format!("errno={}", libc::ECHILD)));
+            if let Some(worker) = failed_worker {
+                assert!(description.contains(&format!(
+                    "; collection: process worker thread panicked: {worker}"
+                )));
+            }
         }
         TerminalPath::Completed | TerminalPath::CancelledStreamCompleted => assert!(result.is_ok()),
         TerminalPath::ProcessorFailure if failed_worker != Some("stdout") => assert_eq!(
@@ -202,8 +231,8 @@ fn terminal_schedule(path: TerminalPath, failed_worker: Option<&str>) -> bool {
         receipt.force_killed,
         matches!(path, TerminalPath::ForcedCancel)
     );
-    receipt.uncertain == failed_worker.is_some()
-        && receipt.effect_incapable() == failed_worker.is_none()
+    let unsafe_receipt = failed_worker.is_some() || matches!(path, TerminalPath::WaitFailure);
+    receipt.uncertain == unsafe_receipt && receipt.effect_incapable() != unsafe_receipt
 }
 
 #[test]
@@ -285,4 +314,109 @@ fn timeout_pipe_eof_worker_panic_is_unsafe_but_healthy_neighbor_is_settled() {
         mismatches.is_empty(),
         "incorrect EOF receipts for panic={mismatches:?}"
     );
+}
+
+#[test]
+fn first_wait_failure_survives_collection_and_cannot_make_custody_safe() {
+    for worker in [None, Some("stdout"), Some("stderr"), Some("stdin")] {
+        assert!(terminal_schedule(TerminalPath::WaitFailure, worker));
+    }
+}
+
+#[test]
+fn first_wait_failure_survives_pending_collection_without_inventing_errno_or_status() {
+    let command = ProcessCommand::new("/not-logged")
+        .arg("launch")
+        .arg("secret-argv");
+    let original = wait_operation_error(
+        &command,
+        "cleanup_admission_or_signal",
+        std::io::Error::other("process cleanup admission unavailable"),
+    );
+    let diagnostics = termination_diagnostics_from_joined(
+        JoinedProcessThreads::<CapturedBytes> {
+            stdout: None,
+            stderr: None,
+            stdin_closed_early: None,
+            failed_workers: vec!["stderr"],
+            cleanup_pending: true,
+        },
+        TerminatedProcess {
+            status: None,
+            force_killed: false,
+        },
+        false,
+    );
+    let error = wait_failure_with_process_context(original, diagnostics, None);
+    assert_eq!(error.transport_kind(), "wait_failed");
+    assert_eq!(error.request_id(), None);
+    assert_eq!(error.process_status(), None);
+    assert!(!error.diagnostics().process_was_reaped);
+    assert!(!error.diagnostics().process_was_force_killed);
+    assert_eq!(
+        error.diagnostics().description.as_deref(),
+        Some(
+            "first_failure: cleanup_admission_or_signal: process cleanup admission unavailable; errno=unavailable; collection: process_cleanup_pending; worker output may be incomplete; process worker thread panicked: stderr"
+        )
+    );
+}
+
+#[test]
+fn supervisor_preserves_actual_waitid_error_after_owned_reap() {
+    let custody = AttemptActorCustody::new(uuid::Uuid::new_v4());
+    let guard = custody.begin("launch");
+    let limits = ProcessLimits {
+        custody: Some(guard.0.clone()),
+        ..ProcessLimits::default()
+    };
+    let command = ProcessCommand::new("/bin/true").arg("launch");
+    let mut child = spawn_provider_process(
+        &command,
+        std::iter::empty::<(&str, &str)>(),
+        limits.custody.clone(),
+    )
+    .unwrap();
+    let (publisher, events) = process_event_bus();
+    let threads = start_process_threads(
+        &mut child,
+        vec![],
+        limits.stderr_limit,
+        publisher,
+        None,
+        ByteCaptureProcessor::new(limits.stdout_limit),
+    );
+    // Deterministic fixture: the same owner reaps first. No other waiter steals
+    // status, and this is not a proposed explanation of any historical failure.
+    child.wait().unwrap();
+    let now = Instant::now();
+    let error = ProcessSupervisor {
+        argv: command.argv(),
+        child,
+        command,
+        threads,
+        events,
+        timeout_mode: TimeoutMode::TotalRuntime,
+        started: now,
+        next_status_poll: now,
+        last_stdout_line: now,
+        cancellation_started: None,
+        _cancellation_registration: None,
+        limits: &limits,
+    }
+    .run()
+    .expect_err("already reaped child must fail waitid");
+    let detail = error.diagnostics().description.as_deref().unwrap();
+    assert!(
+        detail.starts_with("first_failure: waitid_wnowait: "),
+        "{error:?}"
+    );
+    assert!(
+        detail.contains(&format!("errno={}", libc::ECHILD)),
+        "{error:?}"
+    );
+    assert_eq!(error.transport_kind(), "wait_failed");
+    drop(guard);
+    let receipt = custody.receipts().remove(0);
+    assert!(receipt.leader_reaped && receipt.uncertain);
+    assert!(!receipt.effect_incapable());
 }

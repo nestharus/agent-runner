@@ -624,8 +624,13 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         loop {
             let events = self.record_pending_events();
             if events.worker_failed {
-                self.child.uncertain();
-                return Err(self.terminate_and_collect(HostErrorKind::WaitFailed, false));
+                let error = ProviderClientError::host_transport(
+                    HostErrorKind::WaitFailed,
+                    subcommand_for_error(&self.command),
+                    None,
+                    ProviderDiagnostics::with_description("worker_failure_observed".into()),
+                );
+                return Err(self.terminate_after_wait_failure(error));
             }
             if events.stdout_processor_failed {
                 return Err(self.terminate_after_stdout_processor_failure());
@@ -635,10 +640,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
                 match poll_child_status(&mut self.child, &self.command) {
                     Ok(Some(status)) => return self.collect_completed(status),
                     Ok(None) => {}
-                    Err(_) => {
-                        self.child.uncertain();
-                        return Err(self.terminate_and_collect(HostErrorKind::WaitFailed, false));
-                    }
+                    Err(error) => return Err(self.terminate_after_wait_failure(error)),
                 }
             }
 
@@ -746,6 +748,17 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         let diagnostics =
             termination_diagnostics_from_joined(joined, terminated, host_cancellation_requested);
         termination_transport_error(kind, &self.command, diagnostics, status)
+    }
+
+    fn terminate_after_wait_failure(mut self, error: ProviderClientError) -> ProviderClientError {
+        // Preserve the first observed failure; cleanup is not its replacement or proof.
+        self.child.uncertain();
+        terminate_tree(&mut self.child);
+        let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
+        let status = terminated.status.map(process_status);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
+        let diagnostics = termination_diagnostics_from_joined(joined, terminated, false);
+        wait_failure_with_process_context(error, diagnostics, status)
     }
 
     fn force_kill_and_collect(mut self) -> ProviderClientError {
@@ -1023,9 +1036,9 @@ fn poll_child_status(
         )
     };
     if result != 0 {
-        return Err(host_process_error(
-            HostErrorKind::WaitFailed,
+        return Err(wait_operation_error(
             command,
+            "waitid_wnowait",
             std::io::Error::last_os_error(),
         ));
     }
@@ -1035,16 +1048,16 @@ fn poll_child_status(
     }
     // WNOWAIT keeps the exact leader unreaped while its owned descendants are cleaned.
     if !kill_tree(child) {
-        return Err(host_process_error(
-            HostErrorKind::WaitFailed,
+        return Err(wait_operation_error(
             command,
+            "cleanup_admission_or_signal",
             std::io::Error::other("process cleanup admission unavailable"),
         ));
     }
     child
         .wait()
         .map(Some)
-        .map_err(|error| host_process_error(HostErrorKind::WaitFailed, command, error))
+        .map_err(|error| wait_operation_error(command, "owned_wait", error))
 }
 
 #[cfg(not(unix))]
@@ -1054,7 +1067,7 @@ fn poll_child_status(
 ) -> Result<Option<ExitStatus>, ProviderClientError> {
     child
         .try_wait()
-        .map_err(|error| host_process_error(HostErrorKind::WaitFailed, command, error))
+        .map_err(|error| wait_operation_error(command, "owned_try_wait", error))
 }
 
 fn map_completed_process_outcome<T: StdoutDrainOutput>(
@@ -1336,6 +1349,48 @@ fn processor_failure_with_process_context<T: StdoutDrainOutput>(
         Some(status) => error.with_process_context(diagnostics, status),
         None => replace_error_diagnostics(error, diagnostics),
     }
+}
+
+fn wait_failure_with_process_context(
+    error: ProviderClientError,
+    mut diagnostics: ProviderDiagnostics,
+    status: Option<ProcessStatus>,
+) -> ProviderClientError {
+    diagnostics.description = match (
+        error.diagnostics().description.as_deref(),
+        diagnostics.description.as_deref(),
+    ) {
+        (Some(first), Some(secondary)) => {
+            Some(format!("first_failure: {first}; collection: {secondary}"))
+        }
+        (Some(first), None) => Some(format!("first_failure: {first}")),
+        (None, Some(secondary)) => Some(format!("collection: {secondary}")),
+        (None, None) => None,
+    };
+    match status {
+        Some(status) => error.with_process_context(diagnostics, status),
+        None => replace_error_diagnostics(error, diagnostics),
+    }
+}
+
+// Callers supply only fixed operation labels and host wait/cleanup errors, never
+// provider output or argv. errno is recorded only when the io::Error carries it.
+fn wait_operation_error(
+    command: &ProcessCommand,
+    operation: &'static str,
+    error: std::io::Error,
+) -> ProviderClientError {
+    let detail: String = error.to_string().chars().take(256).collect();
+    let errno = match error.raw_os_error() {
+        Some(errno) => errno.to_string(),
+        None => "unavailable".into(),
+    };
+    ProviderClientError::host_transport(
+        HostErrorKind::WaitFailed,
+        subcommand_for_error(command),
+        None,
+        ProviderDiagnostics::with_description(format!("{operation}: {detail}; errno={errno}")),
+    )
 }
 
 fn replace_error_diagnostics(
@@ -2137,7 +2192,9 @@ mod tests {
         );
         assert_eq!(
             error.diagnostics().description.as_deref(),
-            Some("process worker thread panicked: stdout")
+            Some(
+                "first_failure: worker_failure_observed; collection: process worker thread panicked: stdout"
+            )
         );
     }
 
