@@ -76,7 +76,16 @@ fn read(root: &Path, path: &str) -> Vec<u8> {
     let full = root.join(path);
     let metadata = std::fs::symlink_metadata(&full)
         .unwrap_or_else(|e| panic!("unreadable candidate {path:?}: {e}"));
-    // Do not follow source symlinks outside the admitted input set.
+    // A tracked link is itself a configuration input. Scan its link text,
+    // never recursively follow it or import external bytes into membership.
+    if metadata.file_type().is_symlink() {
+        return std::fs::read_link(&full)
+            .expect("read source link")
+            .to_str()
+            .expect("non-UTF-8 source link")
+            .as_bytes()
+            .to_vec();
+    }
     assert!(
         metadata.is_file(),
         "unsupported source input {path:?}: {metadata:?}"
@@ -212,7 +221,18 @@ impl SourceSet {
         for path in &self.sources {
             // Explicit paths bypass ignore/hidden traversal heuristics; retain rg's
             // case-sensitive -o occurrence metric and binary handling.
-            read(&self.root, path);
+            let bytes = read(&self.root, path);
+            if std::fs::symlink_metadata(self.root.join(path))
+                .expect("source metadata")
+                .file_type()
+                .is_symlink()
+            {
+                let text = String::from_utf8(bytes).expect("source link text");
+                let matches = occurrences(&text, pattern);
+                eprintln!("source link {path:?} occurrences={matches}");
+                count += matches;
+                continue;
+            }
             let output = Command::new("rg")
                 .current_dir(&self.root)
                 .args(["--no-config", "--with-filename", "-o", pattern, "--", path])
