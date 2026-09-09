@@ -606,8 +606,8 @@ fi"#,
 
 fn failed_invocation_retry_intervals_ms(fixture: &Fixture) -> Vec<i64> {
     let state = fixture.state();
-    let mut statement = state
-        .connection()
+    let connection = state.connection();
+    let mut statement = connection
         .prepare("SELECT created_at, finished_at, status FROM invocations ORDER BY id")
         .unwrap();
     let invocations = statement
