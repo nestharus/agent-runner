@@ -108,7 +108,11 @@ impl Fixture {
         Connection::open(self.state_path()).unwrap()
     }
 
-    fn run(&self, mut cmd: Command) -> Output {
+    fn run(&self, cmd: Command) -> Output {
+        self.run_diagnostic(cmd, None)
+    }
+
+    fn run_diagnostic(&self, mut cmd: Command, stage: Option<&str>) -> Output {
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
@@ -120,10 +124,31 @@ impl Fixture {
         );
         cmd.env_remove("OULIPOLY_CONFIG_HOME");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
-        cmd.output().unwrap()
+        if let Some(stage) = stage {
+            readiness_diagnostic(
+                stage,
+                json!({"event": "launch", "program": cmd.get_program(),
+                "args": cmd.get_args().collect::<Vec<_>>(),
+                "environment_overrides": cmd.get_envs().collect::<Vec<_>>() }),
+            );
+        }
+        let output = cmd.output().unwrap();
+        if let Some(stage) = stage {
+            readiness_diagnostic(
+                stage,
+                json!({"event": "exit", "status": output.status.code(),
+                "raw_status": std::os::unix::process::ExitStatusExt::into_raw(output.status),
+                "stdout": output.stdout, "stderr": output.stderr }),
+            );
+        }
+        output
     }
 
     fn run_notify(&self, handle: &str, metadata: Value) -> Output {
+        self.run_notify_diagnostic(handle, metadata, false)
+    }
+
+    fn run_notify_diagnostic(&self, handle: &str, metadata: Value, diagnostic: bool) -> Output {
         let owner_invocation_uuid = metadata
             .get("owner_invocation_uuid")
             .and_then(Value::as_str)
@@ -136,9 +161,12 @@ impl Fixture {
             COMPLETION_REGISTRATION_AUTHORITY_ENV,
             authority.process_environment_value(),
         );
-        let registration = self.run(registration);
+        let registration = self.run_diagnostic(registration, diagnostic.then_some("registration"));
         assert!(registration.status.success(), "{registration:?}");
-        self.run(self.notify_command(handle, &artifacts))
+        self.run_diagnostic(
+            self.notify_command(handle, &artifacts),
+            diagnostic.then_some("notify"),
+        )
     }
 
     fn run_mailbox_status(&self, session_id: &str) -> Output {
@@ -1099,7 +1127,7 @@ fn production_plain_and_tui_state_open_faults_reconcile_exact_evidence_once() {
             "fixture-state-open-fault",
         );
         let pty = OuterPty::open(30, 100);
-        let mut repl = spawn_repl_under_pty_mode_with_test_hooks(
+        let mut repl = SettlementChild::new(spawn_repl_under_pty_mode_with_test_hooks(
             &fixture,
             &pty,
             "fixture-state-open-fault",
@@ -1107,8 +1135,12 @@ fn production_plain_and_tui_state_open_faults_reconcile_exact_evidence_once() {
             observed_tui,
             None,
             Some(&barrier),
+        ));
+        readiness_diagnostic(
+            mode,
+            json!({"event": "runner_spawned", "pid": repl.child.id()}),
         );
-        let startup = read_until(
+        let startup = read_until_diagnostic(
             pty.master.as_raw_fd(),
             "READY_FOR_NOTIFY",
             Duration::from_secs(5),
@@ -1119,17 +1151,22 @@ fn production_plain_and_tui_state_open_faults_reconcile_exact_evidence_once() {
         );
         let invocation_uuid = wait_for_running_invocation(&fixture);
         fixture.associate_observed_completion_authority(&invocation_uuid);
-        let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+        repl.provider = Some(wait_for_child_identity(&fixture, &invocation_uuid));
+        readiness_diagnostic(
+            mode,
+            json!({"event": "startup_observed", "invocation_uuid": invocation_uuid}),
+        );
 
         let state_path = fixture.state_path();
         let (output, attempt_id) = thread::scope(|scope| {
             let notify = scope.spawn(|| {
-                fixture.run_notify(
+                fixture.run_notify_diagnostic(
                     "h-production-state-open-fault",
                     owner_metadata(SESSION_A, &invocation_uuid),
+                    true,
                 )
             });
-            wait_for_file_contains(&barrier.join("ready"), "ready", Duration::from_secs(5));
+            wait_for_ready_diagnostic(&barrier.join("ready"), pty.master.as_raw_fd(), &mut repl);
             fs::rename(&state_path, &held_state_path).unwrap();
             fs::create_dir(&state_path).unwrap();
             fs::write(barrier.join("release"), "release").unwrap();
@@ -1156,12 +1193,12 @@ fn production_plain_and_tui_state_open_faults_reconcile_exact_evidence_once() {
         assert_eq!(diagnostic["pty_delivery"]["submitted"], true);
         assert_eq!(diagnostic["pty_delivery"]["delivered_seqs"], json!([1]));
         let provider_output =
-            read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
+            read_until_diagnostic(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
         assert!(
             provider_output.contains("GOT_NOTIFY"),
             "output was {provider_output:?}"
         );
-        assert!(repl.wait().unwrap().success());
+        assert!(repl.child.wait().unwrap().success());
         let received = fs::read_to_string(&received_log).unwrap();
         assert!(
             fixture
@@ -2944,6 +2981,10 @@ fn wait_for_file_contains(path: &Path, expected: &str, timeout: Duration) -> Str
 }
 
 fn read_until(fd: RawFd, needle: &str, timeout: Duration) -> String {
+    read_until_observed(fd, needle, timeout, false)
+}
+
+fn read_until_observed(fd: RawFd, needle: &str, timeout: Duration, diagnostic: bool) -> String {
     let start = Instant::now();
     let mut output = Vec::new();
     let mut buffer = [0_u8; 4096];
@@ -2952,6 +2993,9 @@ fn read_until(fd: RawFd, needle: &str, timeout: Duration) -> String {
             let n = read_fd(fd, &mut buffer).unwrap();
             if n == 0 {
                 break;
+            }
+            if diagnostic {
+                readiness_diagnostic("pty_read", json!({"bytes": &buffer[..n]}));
             }
             output.extend_from_slice(&buffer[..n]);
             let rendered = String::from_utf8_lossy(&output);
@@ -3205,4 +3249,116 @@ fn toml_string(value: &str) -> String {
 
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+// Separate nonblocking descriptor: never change flags of libtest's stderr,
+// never wait for a diagnostic reader and never panic on a closed/full sink.
+// The execution owner retains stderr as a regular raw file. A full pipe is an
+// explicitly best-effort sink, not a reason to stall the fixture or its unwind.
+fn readiness_diagnostic(stage: &str, value: Value) {
+    let record = json!({"readiness_diagnostic": stage, "at": std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_nanos().to_string()), "value": value});
+    let _ = write_readiness_record(Path::new("/dev/stderr"), &record);
+}
+
+fn write_readiness_record(path: &Path, record: &Value) -> io::Result<()> {
+    let mut sink = fs::OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    writeln!(sink, "{record}")
+}
+
+fn wait_for_ready_diagnostic(path: &Path, fd: RawFd, repl: &mut SettlementChild) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains("ready")
+        {
+            readiness_diagnostic(
+                "post_confirm",
+                json!({"event": "ready_observed", "path": path}),
+            );
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    // Drain ONLY after the unchanged deadline has failed, so successful-path
+    // assertions keep all their bytes. Zero-wait poll plus byte/iteration cap.
+    readiness_diagnostic(
+        "post_confirm",
+        json!({"event": "deadline", "path": path,
+        "child_status": format!("{:?}", repl.child.try_wait())}),
+    );
+    for _ in 0..16 {
+        if !poll_readable(fd, Duration::ZERO).unwrap_or(false) {
+            break;
+        }
+        let mut bytes = [0_u8; 4096];
+        match read_fd(fd, &mut bytes) {
+            Ok(0) => break,
+            Ok(n) => readiness_diagnostic("deadline_pty", json!({"bytes": &bytes[..n]})),
+            Err(error) => {
+                readiness_diagnostic("deadline_pty", json!({"read_error": error.to_string()}));
+                break;
+            }
+        }
+    }
+    panic!(
+        "timed out waiting for {:?} at {}: {:?}",
+        "ready",
+        path.display(),
+        fs::read_to_string(path)
+    );
+}
+
+fn read_until_diagnostic(fd: RawFd, needle: &str, timeout: Duration) -> String {
+    read_until_observed(fd, needle, timeout, true)
+}
+
+#[test]
+fn readiness_diagnostic_retains_bytes_before_assertion_unwind() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("diagnostic.jsonl");
+    File::create(&path).unwrap();
+    let record =
+        json!({"stage": "registration", "stdout": [0, 255, 10], "stderr": [27, 0], "rc": 1});
+    let panic = std::panic::catch_unwind(|| {
+        write_readiness_record(&path, &record).unwrap();
+        panic!("diagnostic unwind control");
+    });
+    assert!(panic.is_err());
+    let retained: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(retained, record);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn readiness_diagnostic_full_sink_does_not_wait_or_change_shared_flags() {
+    let mut fds = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) },
+        0
+    );
+    let _reader = unsafe { File::from_raw_fd(fds[0]) };
+    let mut writer = unsafe { File::from_raw_fd(fds[1]) };
+    let bytes = [0_u8; 4096];
+    while writer.write(&bytes).is_ok() {}
+    // Make the original blocking: the diagnostic must use its own open description.
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, 0) },
+        0
+    );
+    let path = PathBuf::from(format!("/proc/self/fd/{}", writer.as_raw_fd()));
+    assert_eq!(
+        write_readiness_record(&path, &json!({"event": "full"}))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0
+    );
 }

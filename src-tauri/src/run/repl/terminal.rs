@@ -132,7 +132,12 @@ pub(super) fn execute_and_finalize_repl_attempt(
             }
             finalize_repl_execution_result(input, &interactive_effective_cwd, &result)
         }
-        Err(_spawn_err) => {
+        Err(execution_error) => {
+            tracing::warn!(
+                invocation_uuid = input.invocation.id,
+                diagnostic = %interactive_error_diagnostic(&execution_error),
+                "Interactive execution returned an error (not necessarily an OS spawn failure)"
+            );
             let clear_result = clear_repl_session_capture_for_unpinned(
                 input.env,
                 input.invocation_row_id,
@@ -272,4 +277,100 @@ fn terminal_signal_disposition_for_result(
     );
     // AGE-153 source guard: marker emission routes through emit_terminal_signal_marker.
     apply_terminal_signal_outcome(&result.terminal_signal, &mut terminal_signal_ctx)
+}
+
+// This boundary receives String errors, including errors AFTER a successful launch.
+// Preserve only audited static operation labels and numeric OS error codes. Never
+// print the original String: it can contain a command, path or endpoint payload.
+fn interactive_error_diagnostic(error: &str) -> String {
+    const OPERATIONS: &[&str] = &[
+        "Failed to read terminal window size",
+        "Failed to spawn '",
+        "Failed to clone terminal for TUI",
+        "Failed to poll interactive child",
+        "Failed to poll PTY relay fds",
+        "Failed to write user input to PTY",
+        "Failed to read user terminal input",
+        "Failed to write PTY output to terminal",
+        "Failed to read PTY output",
+        "Failed to accept PTY control connection",
+        "Failed to set PTY control read timeout",
+        "Failed to set PTY control write timeout",
+        "Failed to write PTY control response",
+        "Runtime generation starting registration rejected",
+        "Runtime generation child binding rejected",
+        "Stale runtime generation recovery rejected",
+        "Cannot complete child generation before observing exit",
+        "Failed to start mailbox delivery claim transaction",
+        "database is locked",
+        "database is busy",
+    ];
+    let operation = OPERATIONS
+        .iter()
+        .copied()
+        .find(|prefix| error.starts_with(prefix))
+        .unwrap_or("unclassified interactive execution error");
+    let os_code = error
+        .rsplit_once("(os error ")
+        .and_then(|(_, tail)| tail.strip_suffix(')'))
+        .filter(|code| {
+            !code.is_empty() && code.len() <= 6 && code.bytes().all(|b| b.is_ascii_digit())
+        })
+        .unwrap_or("unavailable");
+    format!("operation={operation}; os_error={os_code}; detail=[REDACTED]")
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::interactive_error_diagnostic;
+
+    #[test]
+    fn interactive_diagnostic_preserves_operation_and_os_code_without_payload() {
+        let error = "Failed to write PTY control response: Broken pipe (os error 32)";
+        assert_eq!(
+            interactive_error_diagnostic(error),
+            "operation=Failed to write PTY control response; os_error=32; detail=[REDACTED]"
+        );
+        let secret =
+            "Failed to spawn 'env TOKEN=private provider --prompt private': denied (os error 13)";
+        assert_eq!(
+            interactive_error_diagnostic(secret),
+            "operation=Failed to spawn '; os_error=13; detail=[REDACTED]"
+        );
+        for secret in [
+            "password=secret\nBearer private".to_string(),
+            "秘密".repeat(10000),
+            "Failed to read PTY output: argv-secret (os error secret)".to_string(),
+        ] {
+            let diagnostic = interactive_error_diagnostic(&secret);
+            assert!(diagnostic.len() < 160);
+            assert!(!diagnostic.contains("secret"));
+            assert!(!diagnostic.contains("private"));
+            assert!(!diagnostic.contains("秘密"));
+        }
+    }
+
+    #[test]
+    fn interactive_error_mapping_and_handoff_remain_unchanged() {
+        // Source control only: proves branch order, NOT executed settlement behavior.
+        let source = include_str!("terminal.rs");
+        let branch = source
+            .split("Err(execution_error) => {")
+            .nth(1)
+            .unwrap()
+            .split("fn finalize_repl_execution_result")
+            .next()
+            .unwrap();
+        let operations = [
+            "tracing::warn!",
+            "clear_repl_session_capture_for_unpinned(",
+            "handoff_repl_pty_delivery(&input, 1)",
+            "clear_result?",
+            "finalize_repl_spawn_error(input)",
+        ];
+        let mut offset = 0;
+        for operation in operations {
+            offset += branch[offset..].find(operation).unwrap() + operation.len();
+        }
+    }
 }
