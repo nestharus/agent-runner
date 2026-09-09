@@ -1,5 +1,5 @@
 //! Complete source membership for the vocabulary guards; receipts are external
-//! invocation inputs, never repository policy. Declared roles: validator, accessor.
+//! invocation inputs, never repository policy. Declared roles: validator, accessor, parser.
 #![allow(dead_code)] // Each integration target uses a different metric adapter.
 
 use serde::{Deserialize, Serialize};
@@ -462,46 +462,47 @@ struct ExactResidue {
 }
 
 fn exact_residue_policy() -> BTreeMap<String, ExactResidue> {
-    [
+    let entries: [(&str, &str, &[usize]); 5] = [
         (
             "crates/oulipoly-runtime/src/session_provider.rs",
             "f9de5001fe1fadb0b2a5f6cc937f7066138ea1452dddce1e11899bd29b6d59d0",
-            &[53] as &[usize],
+            &[53],
         ),
         (
             "crates/oulipoly-runtime/src/session_provider/worker.rs",
             "821283ea59003f6ac4167372ac60ad5eabded7c38a7ccfba2d3f3fc0225e315e",
-            &[200, 298, 300] as &[usize],
+            &[200, 298, 300],
         ),
         (
             "crates/oulipoly-runtime/tests/session_import.rs",
             "0646bfe92c802e3163d2b09a56ee49ab6c66cab1f3ea81bb15b602eb100fee56",
-            &[712] as &[usize],
+            &[712],
         ),
         (
             "crates/oulipoly-state/src/db/session_turn_pages.rs",
             "73d6c9bdd5ce432a8caab79f428ef734e99ba7ead1913b415182ef3001bd3277",
-            &[188, 782] as &[usize],
+            &[188, 782],
         ),
         (
             "src-tauri/tests/fixtures/provider-authority-endpoint.py",
             "63bf6a522f937cb0edc8e87c59077aebfa9b26892e996fd0acee88acec14662b",
             &[
                 291, 294, 301, 302, 437, 438, 439, 440, 509, 518, 808, 810, 893, 899, 911,
-            ] as &[usize],
+            ],
         ),
-    ]
-    .into_iter()
-    .map(|(path, sha256, lines)| {
-        (
-            path.to_owned(),
-            ExactResidue {
-                sha256: sha256.to_owned(),
-                lines: lines.iter().copied().collect(),
-            },
-        )
-    })
-    .collect()
+    ];
+    entries
+        .into_iter()
+        .map(|(path, sha256, lines)| {
+            (
+                path.to_owned(),
+                ExactResidue {
+                    sha256: sha256.to_owned(),
+                    lines: lines.iter().copied().collect(),
+                },
+            )
+        })
+        .collect()
 }
 
 // Parse only new-side hunk coordinates, not filenames or payload-like headers.
