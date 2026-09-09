@@ -1811,7 +1811,12 @@ fn live_broker_confirmation_contracts_overlapping_attempts() {
         "fixture-overlap",
     );
     let pty = OuterPty::open(30, 100);
-    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-overlap", SESSION_A);
+    let mut repl = SettlementChild::new(spawn_repl_under_pty(
+        &fixture,
+        &pty,
+        "fixture-overlap",
+        SESSION_A,
+    ));
     let startup = read_until(
         pty.master.as_raw_fd(),
         "READY_FOR_NOTIFY",
@@ -1889,7 +1894,7 @@ fn live_broker_confirmation_contracts_overlapping_attempts() {
         "user",
         "[OULIPOLY-DELIVERY overlap-attempt-2]",
     );
-    assert!(repl.wait().unwrap().success());
+    assert!(repl.child.wait().unwrap().success());
 
     let received = fs::read_to_string(&received_log).unwrap();
     for index in 1..=3 {
