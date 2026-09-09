@@ -2,6 +2,7 @@
 
 use super::error_formatter::{
     format_external_dispatch_error, format_external_input_validation_error,
+    format_transport_diagnostic,
 };
 use super::errors::ExternalProviderDispatchError;
 use crate::provider_registry::ProviderRegistryError;
@@ -14,8 +15,11 @@ pub(crate) fn map_registry_error(error: ProviderRegistryError) -> ServiceError {
         ProviderRegistryError::RuntimeDisabledArtifact { .. } => {
             service_error(ExternalProviderDispatchError::runtime_disabled_artifact())
         }
-        ProviderRegistryError::ProviderTransport { kind, .. } => service_error(
-            ExternalProviderDispatchError::provider_transport_failure(kind),
+        ProviderRegistryError::ProviderTransport { kind, source } => service_error(
+            ExternalProviderDispatchError::provider_transport_diagnostic(
+                kind,
+                format_transport_diagnostic(&source),
+            ),
         ),
         ProviderRegistryError::ProviderProtocol { kind, .. } => service_error(
             ExternalProviderDispatchError::provider_protocol_failure(kind),
@@ -42,7 +46,10 @@ pub(crate) fn map_provider_client_error(error: ProviderClientError) -> ServiceEr
             ))
         }
         ProviderClientError::Transport { kind, .. } => service_error(
-            ExternalProviderDispatchError::provider_transport_failure(kind.as_str()),
+            ExternalProviderDispatchError::provider_transport_diagnostic(
+                kind.as_str(),
+                format_transport_diagnostic(&error),
+            ),
         ),
         ProviderClientError::Protocol {
             kind,
@@ -245,5 +252,126 @@ mod tests {
             error.to_string(),
             "external provider policy.evaluate failed: auth_expired: account token expired"
         );
+    }
+    #[test]
+    fn transport_projection_redacts_sensitive_values_and_preserves_absence() {
+        use oulipoly_provider::generated::ProcessStatus;
+        use sha2::{Digest, Sha256};
+        let secret = "credential=SECRET\n--argv-provider-output";
+        let mut diagnostics = ProviderDiagnostics::with_description(format!(
+            "first_failure: owned_wait: {secret}; errno=10; collection: {secret}"
+        ));
+        diagnostics.stdout.bytes = secret.as_bytes().to_vec();
+        diagnostics.stderr.bytes = secret.as_bytes().to_vec();
+        diagnostics.process_was_reaped = true;
+        diagnostics.process_was_force_killed = true;
+        diagnostics.provider_exit_code = Some(7);
+        let error = ProviderClientError::host_transport(
+            HostErrorKind::WaitFailed,
+            secret,
+            Some(secret.into()),
+            diagnostics.clone(),
+        )
+        .with_process_context(
+            diagnostics,
+            ProcessStatus::SpawnError {
+                reason: secret.into(),
+            },
+        );
+        let output = map_provider_client_error(error.clone()).to_string();
+        assert!(!output.contains("SECRET"));
+        assert!(!output.contains("--argv"));
+        assert!(output.contains("operation=redacted"));
+        assert!(output.contains(&format!(
+            "observed_request_id=sha256:{:x}",
+            Sha256::digest(secret.as_bytes())
+        )));
+        assert!(output.contains("first_failure: owned_wait; errno=10; detail=redacted"));
+        assert!(output.contains("collection: status=spawn_error:reason_redacted reaped=true force_killed=true nonzero=false exit_code=7"));
+        assert!(output.len() < 700);
+        assert_eq!(
+            output,
+            map_registry_error(ProviderRegistryError::ProviderTransport {
+                kind: "wait_failed".into(),
+                source: Box::new(error)
+            })
+            .to_string()
+        );
+        let absent = map_provider_client_error(transport(HostErrorKind::WaitFailed)).to_string();
+        assert!(absent.contains("operation=policy.evaluate; observed_request_id=absent; first_failure: absent; collection: status=absent"));
+        assert!(absent.contains("exit_code=absent"));
+        assert_eq!(
+            map_provider_client_error(transport(HostErrorKind::Cancelled)).to_string(),
+            "external provider launch cancelled before final event"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_provider_wait_failure_projects_first_errno_and_missing_identity() {
+        use oulipoly_provider::process::{
+            ProcessCommand, ProcessLimits, ProcessRunner, ProcessSpawnObserver,
+        };
+        let limits = ProcessLimits {
+            // Deliberate negative control: consume this exact child's status before
+            // the provider owner polls. This is NOT a historical-cause claim.
+            spawn_observer: Some(ProcessSpawnObserver::new(|pid| {
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(pid as i32, &mut status, 0) },
+                    pid as i32
+                );
+                Ok(())
+            })),
+            ..ProcessLimits::default()
+        };
+        let error = ProcessRunner::new(limits)
+            .run(
+                ProcessCommand::new("/bin/true").arg("launch"),
+                vec![],
+                std::iter::empty::<(&str, &str)>(),
+            )
+            .expect_err("reaped child must expose real ECHILD");
+        assert_eq!(error.transport_kind(), "wait_failed");
+        assert!(!provider_client_error_is_rotatable(&error));
+        let output = map_provider_client_error(error).to_string();
+        assert!(
+            output.contains(&format!(
+                "first_failure: waitid_wnowait; errno={}; detail=redacted",
+                libc::ECHILD
+            )),
+            "{output}"
+        );
+        assert!(output.contains("operation=launch; observed_request_id=absent"));
+    }
+    #[test]
+    fn observed_wire_identity_hashes_verbatim_prefix_and_empty_is_not_absent() {
+        use sha2::{Digest, Sha256};
+        let ids = [
+            None,
+            Some(""),
+            Some("external-provider-launch-same"),
+            Some("external-provider-policy-same"),
+        ];
+        let outputs: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                map_provider_client_error(ProviderClientError::host_transport(
+                    HostErrorKind::WaitFailed,
+                    "launch",
+                    id.map(str::to_owned),
+                    ProviderDiagnostics::default(),
+                ))
+                .to_string()
+            })
+            .collect();
+        for (index, id) in ids.iter().enumerate().skip(1) {
+            assert!(outputs[index].contains(&format!(
+                "sha256:{:x}",
+                Sha256::digest(id.unwrap().as_bytes())
+            )));
+            assert_ne!(outputs[0], outputs[index]);
+        }
+        assert_ne!(outputs[2], outputs[3]);
     }
 }
