@@ -523,7 +523,7 @@ pub(crate) fn read_and_cleanup_return_channel(
         }
         | ReturnChannelSettlement::CleanupFailed { path, artifacts } => {
             let error = format!(
-                "return_channel_custody_uncertain;retained={}",
+                "return_channel_custody_uncertain;channel_path={}",
                 path.display()
             );
             if artifacts.is_empty() {
@@ -534,7 +534,7 @@ pub(crate) fn read_and_cleanup_return_channel(
             // this standalone boundary returns no transfer certificate.
             tracing::warn!(
                 error,
-                "Return channel retained artifacts with uncertain cleanup"
+                "Artifact references preserved; channel cleanup uncertain"
             );
             Ok(artifacts)
         }
@@ -864,6 +864,134 @@ mod tests {
         assert!(!result.transferable());
         assert!(allocated.path().exists());
     }
+    #[test]
+    fn standalone_blank_removal_and_empty_dirty_directory_have_distinct_outcomes() {
+        let root = tempfile::tempdir().unwrap();
+        let normal = channel(root.path());
+        let path = normal.path.clone();
+        let dir = normal.dir.clone();
+        std::fs::write(&path, b" \n\t\r\n").unwrap();
+        assert!(
+            read_and_cleanup_return_channel(Some(normal))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(absent(&path) && absent(&dir));
+
+        let dirty = channel(root.path());
+        let path = dirty.path.clone();
+        let dir = dirty.dir.clone();
+        std::fs::write(dir.join("sidecar"), b"original bytes").unwrap();
+        let error = read_and_cleanup_return_channel(Some(dirty)).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "return_channel_custody_uncertain;channel_path={}",
+                path.display()
+            )
+        );
+        assert!(absent(&path));
+        assert!(std::fs::symlink_metadata(&dir).unwrap().is_dir());
+        assert_eq!(
+            std::fs::read(dir.join("sidecar")).unwrap(),
+            b"original bytes"
+        );
+    }
+
+    #[test]
+    fn allocated_dirty_directory_preserves_committed_refs_without_transfer() {
+        for refs_present in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut c = channel(root.path());
+            let refs = refs_present
+                .then(|| artifact(c.producer))
+                .into_iter()
+                .collect::<Vec<_>>();
+            let bytes = refs
+                .iter()
+                .map(|r| format!("{}\n", serde_json::to_string(r).unwrap()))
+                .collect::<String>();
+            std::fs::write(c.path(), bytes).unwrap();
+            std::fs::write(c.dir.join("sidecar"), b"original bytes").unwrap();
+            let mut committed = Vec::new();
+            let result = c.seal_settled(|refs| {
+                committed.extend_from_slice(refs);
+                Ok(())
+            });
+            assert_eq!(committed, refs);
+            assert_eq!(
+                result,
+                ReturnChannelSettlement::CleanupFailed {
+                    path: c.path.clone(),
+                    artifacts: refs,
+                }
+            );
+            assert!(!result.transferable());
+            assert!(absent(c.path()));
+            assert!(std::fs::symlink_metadata(&c.dir).unwrap().is_dir());
+            assert_eq!(
+                std::fs::read(c.dir.join("sidecar")).unwrap(),
+                b"original bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_suffix_and_removal_failure_preserve_exact_producer_refs() {
+        for suffix in ["", "{\n"] {
+            let root = tempfile::tempdir().unwrap();
+            let c = channel(root.path());
+            let path = c.path.clone();
+            let dir = c.dir.clone();
+            let reference = artifact(c.producer);
+            let bytes = format!("{}\n{suffix}", serde_json::to_string(&reference).unwrap());
+            std::fs::write(&path, &bytes).unwrap();
+            std::fs::write(dir.join("sidecar"), b"original bytes").unwrap();
+            let refs = read_and_cleanup_return_channel(Some(c)).unwrap();
+            assert_eq!(refs, vec![reference]);
+            assert!(std::fs::symlink_metadata(&dir).unwrap().is_dir());
+            assert_eq!(
+                std::fs::read(dir.join("sidecar")).unwrap(),
+                b"original bytes"
+            );
+            assert_eq!(absent(&path), suffix.is_empty());
+            assert_eq!(
+                std::fs::read(&path).as_deref().ok(),
+                (!suffix.is_empty()).then_some(bytes.as_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn public_seal_rejects_missing_and_unsettled_actors_before_reading() {
+        let custody = oulipoly_provider::custody::AttemptActorCustody::new(Uuid::new_v4());
+        custody.record_not_invoked("launch");
+        let mut unsettled = custody.receipts();
+        unsettled[0].operation_finished = false;
+        assert!(!unsettled[0].effect_incapable());
+        for actors in [vec![], unsettled] {
+            let root = tempfile::tempdir().unwrap();
+            let c = channel(root.path());
+            let path = c.path.clone();
+            let bytes = format!(
+                "{}\n",
+                serde_json::to_string(&artifact(c.producer)).unwrap()
+            );
+            std::fs::write(&path, &bytes).unwrap();
+            let result = c.seal(&actors, |_| panic!("unsettled actors cannot commit"));
+            assert_eq!(
+                result,
+                ReturnChannelSettlement::Quarantined {
+                    path: path.clone(),
+                    sha256: None,
+                    artifacts: vec![],
+                }
+            );
+            assert!(!result.transferable());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
+        }
+    }
+
     #[test]
     fn deterministic_attempt_identity_is_exclusive() {
         let root = tempfile::tempdir().unwrap();
