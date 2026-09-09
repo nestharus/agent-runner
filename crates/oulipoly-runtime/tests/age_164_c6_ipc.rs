@@ -1,20 +1,21 @@
 //! AGE-164 cluster 6 — return-channel + child-marker IPC contracts.
 //!
-//! The contract pins these implicit external contracts as bit-for-bit
-//! preservation invariants:
+//! Preserved wire contracts:
 //!
 //! - Environment variable names: `OULIPOLY_PARENT_INVOCATION`,
 //!   `OULIPOLY_RETURN_CHANNEL`.
 //! - Stderr marker prefix: `OULIPOLY_INVOCATION=<json>`.
-//! - Return-channel JSONL: one object per line; same field names
-//!   (`kind`, `payload`, etc.); blank lines tolerated; malformed lines
-//!   warned and dropped.
-//! - Return-channel cleanup: file is deleted after read; dir cleanup
-//!   tolerates `DirectoryNotEmpty` and `NotFound` without warning.
+//! - Return-channel JSONL: one artifact receipt per line; blank lines tolerated.
 //!
-//! These tests verify the contract bit-for-bit via fixture child scripts
-//! and observed-environment sidecars. They MUST remain PASS pre- and
-//! post-refactor.
+//! AGE-323 supersedes the old malformed-line and explicit-cleanup promises:
+//! malformed content quarantines the channel while valid producer references
+//! remain available. Failed complete removal is uncertain custody, not empty
+//! success. Standalone consumption preserves nonempty references without a
+//! transfer certificate; allocated transfer requires a safe typed disposition.
+//! Drop remains emergency best-effort cleanup, never a custody certificate.
+//!
+//! Tests observe fixture child scripts and exact environment sidecars rather
+//! than inferring custody from artifact-vector success or filesystem searches.
 //!
 //! ## Declared roles
 //!
@@ -404,14 +405,18 @@ fn return_channel_cleanup_tolerates_non_empty_dir() {
     let parent = parent_env(invocation);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("dirty.sh");
-    // Touch a sibling file in the channel dir before exit. The runtime
-    // owns `${TMPDIR}/oulipoly-return-channels/${invocation_id}/`; on
-    // cleanup the dir-not-empty case should be tolerated by the predicate.
+    let observed_channel = dir.path().join("observed-channel.txt");
+    // Keep the historical node name for failure-signal continuity. A normal
+    // child exit must not turn failed complete removal into empty success.
     std::fs::write(
         &path,
-        "#!/usr/bin/env bash\nset -euo pipefail\n\
-         channel_dir=\"$(dirname \"$OULIPOLY_RETURN_CHANNEL\")\"\n\
-         : > \"$channel_dir/sidecar.txt\"\nexit 0\n",
+        format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\n\
+             printf '%s' \"$OULIPOLY_RETURN_CHANNEL\" > '{}'\n\
+             channel_dir=\"$(dirname \"$OULIPOLY_RETURN_CHANNEL\")\"\n\
+             printf 'original sidecar bytes\\n' > \"$channel_dir/sidecar.txt\"\nexit 0\n",
+            observed_channel.display()
+        ),
     )
     .unwrap();
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
@@ -426,10 +431,25 @@ fn return_channel_cleanup_tolerates_non_empty_dir() {
         inputs: Vec::new(),
         provider: None,
     };
-    let result = execute_isolated(&model, &parent, dir.path()).expect("execute");
-
-    assert_eq!(result.exit_code, 0);
-    assert!(result.returned_artifacts.is_empty());
+    let error = execute_isolated(&model, &parent, dir.path()).unwrap_err();
+    let channel_path = PathBuf::from(std::fs::read_to_string(&observed_channel).unwrap());
+    assert_eq!(
+        error,
+        format!(
+            "return_channel_custody_uncertain;channel_path={}",
+            channel_path.display()
+        )
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&channel_path).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let channel_dir = channel_path.parent().unwrap();
+    assert!(std::fs::symlink_metadata(channel_dir).unwrap().is_dir());
+    assert_eq!(
+        std::fs::read(channel_dir.join("sidecar.txt")).unwrap(),
+        b"original sidecar bytes\n"
+    );
 }
 
 // ---------------------------------------------------------------------------

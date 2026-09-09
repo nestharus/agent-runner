@@ -674,6 +674,67 @@ mod tests {
     }
 
     #[test]
+    fn provider_can_observe_delimiter_before_disconnected_control_peer_is_confirmed() {
+        let _env_lock = crate::test_support::lock_env();
+        let directory = tempfile::tempdir().unwrap();
+        let _data_dir = DataDirOverride::install(directory.path());
+        let attempt = "disconnected-control-confirmation-order";
+        let path = broker::seed_test_mailbox_delivery(directory.path(), attempt);
+        let mut harness = Harness::new();
+        let peer = harness.request(format!("notify\n[OULIPOLY-DELIVERY {attempt}]").as_bytes());
+        drop(peer); // The client cannot consume any broker response.
+        harness.until(|h| matches!(h.worker.phase, Phase::Body(_)));
+        assert!(String::from_utf8_lossy(&harness.flush()).contains(attempt));
+        harness.step(Instant::now());
+        let Phase::Delay(until) = harness.worker.phase else {
+            panic!("expected delay")
+        };
+        harness.step(until);
+        assert_eq!(harness.flush(), b"\r");
+        // The child's complete input is observable, but Complete has not been
+        // sent to the worker. A provider echo is not a transport-ACK barrier.
+        let db = MailboxDb::open(&path).unwrap();
+        let rows = db.list_mailbox("session-a", true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivered_at.is_none());
+        assert!(
+            db.delivery_attempt_window(attempt)
+                .unwrap()
+                .unwrap()
+                .acknowledged_at
+                .is_none()
+        );
+        eprintln!("delimiter observable; confirmation not sent; delivered_at=None");
+
+        harness.step(until);
+        assert!(matches!(
+            harness
+                .worker
+                .events
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap(),
+            Event::Finished
+        ));
+        let trace = std::fs::read_to_string(harness._directory.path().join("trace.log")).unwrap();
+        assert!(
+            trace.contains(&format!("inject_status=delivery_ack:{attempt}")),
+            "{trace}"
+        );
+        let rows = db.list_mailbox("session-a", true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivered_at.is_some());
+        assert_eq!(
+            rows[0].delivered_by_invocation_uuid.as_deref(),
+            Some("invocation-a")
+        );
+        assert_eq!(rows[0].delivery_attempts, 1);
+        let window = db.delivery_attempt_window(attempt).unwrap().unwrap();
+        assert!(window.acknowledged_at.is_some() && window.resolved_at.is_some());
+        assert!(harness.flush().is_empty(), "disconnection must not resend");
+        eprintln!("worker finished; exact ACK trace; delivered once to invocation-a");
+    }
+
+    #[test]
     fn mailbox_control_confirms_only_after_enter_drains_and_confirmation_failure_stays_uncertain() {
         let _env_lock = crate::test_support::lock_env();
         let directory = tempfile::tempdir().unwrap();

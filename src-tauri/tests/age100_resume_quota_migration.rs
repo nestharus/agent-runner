@@ -12,6 +12,8 @@ use std::process::{Command, Output};
 
 const SESSION_ID: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 const CHAIN_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const NON_QUOTA_FIRST_ACCOUNT: &str = "account-alpha";
+const NON_QUOTA_SIBLING_ACCOUNT: &str = "account-beta";
 const FORCE_KIND: &str = "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND";
 
 struct ResumeProviderFixture<'a> {
@@ -394,7 +396,7 @@ fn assert_nonzero_failure_result(output: &Output) {
     assert_eq!(result["exit_code"], 17);
     assert_eq!(result["error_category"], "network_error", "{output:?}");
     assert_eq!(result["terminal_reason"], "exit_nonzero");
-    assert_eq!(result["provider_name"], ["cla", "ude-a"].concat());
+    assert_eq!(result["provider_name"], NON_QUOTA_FIRST_ACCOUNT);
     assert_eq!(result["provider_session_id"], SESSION_ID);
     assert_eq!(result["agent_runner_chain_id"], CHAIN_ID);
     assert_eq!(result["agent_runner_invocation_id"], result["id"]);
@@ -604,8 +606,8 @@ fn assert_non_quota_resume_failure(diagnostics_unavailable: bool) {
     );
     let fixture = seed_base_resume_fixture(
         &[
-            ("claude-a", &first_marker, first_body),
-            ("claude-b", &sibling_marker, sibling_body),
+            (NON_QUOTA_FIRST_ACCOUNT, &first_marker, first_body),
+            (NON_QUOTA_SIBLING_ACCOUNT, &sibling_marker, sibling_body),
         ],
         true,
     );
@@ -634,7 +636,10 @@ fn assert_non_quota_resume_failure(diagnostics_unavailable: bool) {
     assert_eq!(invocation.exit_code, Some(17));
     assert_eq!(invocation.error_category.as_deref(), Some("network_error"));
     assert_eq!(invocation.terminal_reason.as_deref(), Some("exit_nonzero"));
-    assert_eq!(invocation.provider_name.as_deref(), Some("claude-a"));
+    assert_eq!(
+        invocation.provider_name.as_deref(),
+        Some(NON_QUOTA_FIRST_ACCOUNT)
+    );
     assert_eq!(invocation.provider_session_id.as_deref(), Some(SESSION_ID));
     assert!(invocation.finished_at.is_some());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -654,7 +659,7 @@ fn assert_non_quota_resume_failure(diagnostics_unavailable: bool) {
     assert_eq!(line_count(&first_marker), 1);
     assert_eq!(line_count(&sibling_marker), 0);
     assert_eq!(fixture.exhausted_provider_count(), 0);
-    assert_eq!(fixture.active_segment_provider(), "claude-a");
+    assert_eq!(fixture.active_segment_provider(), NON_QUOTA_FIRST_ACCOUNT);
 }
 
 fn assert_secondary_diagnostic_failure(stderr: &str) {

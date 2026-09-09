@@ -289,44 +289,6 @@ impl ProviderClientError {
         }
     }
 
-    pub fn with_request_id_if_missing(self, fallback_request_id: Option<String>) -> Self {
-        match self {
-            Self::Transport {
-                kind,
-                subcommand,
-                request_id,
-                description,
-                diagnostics,
-                process_status,
-            } => Self::Transport {
-                kind,
-                subcommand,
-                request_id: request_id.or(fallback_request_id),
-                description,
-                diagnostics,
-                process_status,
-            },
-            Self::Protocol {
-                kind,
-                subcommand,
-                request_id,
-                description,
-                diagnostics,
-                process_status,
-                launch_failure_evidence,
-            } => Self::Protocol {
-                kind,
-                subcommand,
-                request_id: request_id.or(fallback_request_id),
-                description,
-                diagnostics,
-                process_status,
-                launch_failure_evidence,
-            },
-            Self::ProviderCapability(error) => Self::ProviderCapability(error),
-        }
-    }
-
     pub fn classify_non_launch(
         subcommand: &str,
         envelope: Option<Value>,

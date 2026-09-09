@@ -345,9 +345,9 @@ mod tests {
             )
             .unwrap();
             let key = SessionTurnIngestStreamKey {
-                provider_name: "codex".into(),
+                provider_name: "provider-alpha".into(),
                 provider_instance_id: "instance".into(),
-                settings_id: "codex".into(),
+                settings_id: "settings-alpha".into(),
                 session_id: "synthetic".into(),
                 projection: SessionTurnStreamProjection::CanonicalIngest,
             };

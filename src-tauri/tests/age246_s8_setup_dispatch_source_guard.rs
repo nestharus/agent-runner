@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+#[path = "../../tests/support/provider_vocabulary_source_set.rs"]
+mod provider_vocabulary_source_set;
+use provider_vocabulary_source_set::SourceSet;
 
 const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 4628;
 
@@ -82,12 +84,10 @@ fn new_setup_brain_host_does_not_construct_direct_process_command() {
 fn s8_files_introduce_zero_new_concrete_provider_vocabulary() {
     let root = workspace_root();
     let pattern = concrete_provider_pattern();
-    let tracked_added = tracked_added_provider_name_occurrences(&root, &pattern);
-    let untracked_added = untracked_provider_name_occurrences(&root, &pattern);
+    let added = SourceSet::load(&root).added_occurrences(None, &pattern);
 
     assert_eq!(
-        tracked_added + untracked_added,
-        0,
+        added, 0,
         "S8 files must not introduce concrete-provider vocabulary"
     );
 }
@@ -95,143 +95,12 @@ fn s8_files_introduce_zero_new_concrete_provider_vocabulary() {
 #[test]
 fn full_provider_name_grep_threshold_remains_within_manager_baseline() {
     let root = workspace_root();
-    let count = full_provider_name_occurrence_count(&root, &concrete_provider_pattern());
+    let count = SourceSet::load(&root).full_occurrences(&concrete_provider_pattern());
 
     assert!(
         count <= MANAGER_BASELINE_PROVIDER_NAME_COUNT,
         "full provider-name grep count {count} exceeds manager baseline {MANAGER_BASELINE_PROVIDER_NAME_COUNT}"
     );
-}
-
-fn full_provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
-    let output = full_provider_name_grep_output(root, pattern);
-    assert_full_provider_name_grep_status(&output);
-    stdout_line_count(output.stdout, "git grep stdout utf8")
-}
-
-fn full_provider_name_grep_output(root: &Path, pattern: &str) -> Output {
-    Command::new("rg")
-        .current_dir(root)
-        .args([
-            "--hidden",
-            "-o",
-            pattern,
-            "-g",
-            "!.git/**",
-            "-g",
-            "!src-tauri/target/**",
-            "-g",
-            "!target/**",
-            "-g",
-            "!planning/*-gate/**",
-            "-g",
-            "!planning/wu-e/**",
-            "-g",
-            "!planning/opencode-contract/**",
-            "-g",
-            "!planning/s10-moveout/**",
-        ])
-        .output()
-        .expect("rg must run")
-}
-
-fn assert_full_provider_name_grep_status(output: &Output) {
-    assert!(
-        output.status.success() || output.status.code() == Some(1),
-        "rg failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn stdout_line_count(stdout: Vec<u8>, expect_message: &str) -> usize {
-    String::from_utf8(stdout)
-        .expect(expect_message)
-        .lines()
-        .count()
-}
-
-fn tracked_added_provider_name_occurrences(root: &Path, pattern: &str) -> usize {
-    let output = tracked_diff_output(root);
-    assert_tracked_diff_status(&output);
-    added_provider_name_occurrence_count(output.stdout, pattern)
-}
-
-fn tracked_diff_output(root: &Path) -> Output {
-    Command::new("git")
-        .current_dir(root)
-        .args([
-            "diff",
-            "--unified=0",
-            "--",
-            ".",
-            ":(exclude)planning/*-gate/**",
-            ":(exclude)planning/wu-e/**",
-            ":(exclude)planning/opencode-contract/**",
-            ":(exclude)planning/s10-moveout/**",
-            ":(exclude)planning/code-quality-sweep/**",
-            ":(exclude)src-tauri/tests/provider_authority_fixture.rs",
-            ":(exclude)src-tauri/tests/fixtures/provider-authority-endpoint.py",
-        ])
-        .output()
-        .expect("git diff must run")
-}
-
-fn assert_tracked_diff_status(output: &Output) {
-    assert!(
-        output.status.success(),
-        "git diff failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn added_provider_name_occurrence_count(stdout: Vec<u8>, pattern: &str) -> usize {
-    String::from_utf8(stdout)
-        .expect("git diff stdout utf8")
-        .lines()
-        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
-        .flat_map(|line| provider_name_matches(line, pattern))
-        .count()
-}
-
-fn untracked_provider_name_occurrences(root: &Path, pattern: &str) -> usize {
-    let output = Command::new("git")
-        .current_dir(root)
-        .args([
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--",
-            ".",
-        ])
-        .output()
-        .expect("git ls-files must run");
-    assert!(
-        output.status.success(),
-        "git ls-files failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .filter_map(|relative| std::str::from_utf8(relative).ok())
-        .filter(|relative| !is_ignored_source_guard_path(relative))
-        .map(|relative| {
-            let source = std::fs::read_to_string(root.join(relative))
-                .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"));
-            provider_name_matches(&source, pattern).count()
-        })
-        .sum()
-}
-
-fn provider_name_matches<'a>(line: &'a str, pattern: &'a str) -> impl Iterator<Item = &'a str> {
-    let left = &pattern[..6];
-    let right = &pattern[7..];
-    line.match_indices(left)
-        .map(|(_, matched)| matched)
-        .chain(line.match_indices(right).map(|(_, matched)| matched))
 }
 
 fn concrete_provider_pattern() -> String {
@@ -240,25 +109,6 @@ fn concrete_provider_pattern() -> String {
         ["cl", "au", "de"].concat(),
         ["co", "de", "x"].concat()
     )
-}
-
-fn is_ignored_source_guard_path(relative: &str) -> bool {
-    relative.starts_with("target/")
-        || relative.starts_with("src-tauri/target/")
-        || is_planning_gate_artifact(relative)
-        || relative.starts_with("planning/wu-e/")
-        || relative.starts_with("planning/opencode-contract/")
-        || relative.starts_with("planning/s10-moveout/")
-        || relative.starts_with("planning/code-quality-sweep/")
-        || relative == "src-tauri/tests/provider_authority_fixture.rs"
-        || relative == "src-tauri/tests/fixtures/provider-authority-endpoint.py"
-}
-
-fn is_planning_gate_artifact(relative: &str) -> bool {
-    relative
-        .strip_prefix("planning/")
-        .and_then(|suffix| suffix.split_once('/'))
-        .is_some_and(|(dir, _)| dir.ends_with("-gate"))
 }
 
 fn read_source(relative: &str) -> String {

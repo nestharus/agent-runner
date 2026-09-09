@@ -90,6 +90,14 @@ fn declared_launch_env(
     env.extend(context.provider.environment.clone());
     remove_runner_private_environment(&mut env);
     insert_pinned_agent_data_dir(&mut env)?;
+    if let Some(attempt) = &context.attempt {
+        let data_dir = attempt
+            .allocation
+            .state_db_path
+            .parent()
+            .ok_or("allocated_state_root_missing")?;
+        env.insert(DATA_DIR_ENV.into(), data_dir.to_string_lossy().into_owned());
+    }
     let mut completion_registration_authority = None;
     if let Some(parent) = provider_parent_invocation_env(context.parent_invocation_env.as_deref()) {
         let selected_is_current = context.parent_invocation_env.as_deref() == Some(parent.as_str());
@@ -164,7 +172,7 @@ pub(crate) fn build_policy_request(
     let provider_args = model_provider_args(context);
     serde_json::to_value(PolicyEvaluateRequest {
         contract: CONTRACT_VERSION.to_string(),
-        request_id: request_id("policy"),
+        request_id: request_id("policy", context),
         provider_instance_id: Some(provider_instance_id.to_string()),
         host: host_context(host_options, &candidate.working_directory),
         params: PolicyEvaluateParams {
@@ -204,7 +212,7 @@ pub(crate) fn build_launch_request(
     });
     serde_json::to_value(LaunchRequest {
         contract: CONTRACT_VERSION.to_string(),
-        request_id: request_id("launch"),
+        request_id: request_id("launch", context),
         provider_instance_id: Some(provider_instance_id.to_string()),
         host: launch_host_context(
             host_options,
@@ -522,8 +530,19 @@ fn current_dir() -> Option<PathBuf> {
     std::env::current_dir().ok()
 }
 
-fn request_id(label: &str) -> String {
-    format!("external-provider-{label}-{}", uuid::Uuid::new_v4())
+fn request_id(label: &str, context: &ExternalProviderDispatchContext) -> String {
+    use oulipoly_provider::custody::{GeneratedRequestIdentity, ProviderOperation};
+    let operation = if label == "policy" {
+        ProviderOperation::Policy
+    } else {
+        ProviderOperation::Launch
+    };
+    let request = GeneratedRequestIdentity::new(operation, &format!("external-provider-{label}-"));
+    let wire = request.wire_request_id.clone();
+    if let Some(attempt) = &context.attempt {
+        attempt.actors.record_request(request);
+    }
+    wire
 }
 
 #[cfg(test)]

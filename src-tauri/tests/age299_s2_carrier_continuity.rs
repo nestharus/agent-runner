@@ -534,6 +534,8 @@ fn prepare_registered_carrier(carrier: Carrier) -> (Fixture, CarrierChild, Strin
     if !matches!(carrier, Carrier::DefaultProviderRepl)
         && running.provider_session_id.as_deref() != Some(SESSION_ID)
     {
+        assert!(fixture.root.path().is_absolute());
+        let workspace = fixture.root.path().display().to_string();
         state
             .bind_invocation_provider_session_start(
                 oulipoly_state::InvocationMutationAuthority::Standalone,
@@ -542,10 +544,19 @@ fn prepare_registered_carrier(carrier: Carrier) -> (Fixture, CarrierChild, Strin
                     provider_session_id: SESSION_ID.to_string(),
                     capture_method: "age299_s2_production_binary_fixture",
                     resume_input_id: None,
-                    provider_session_resolved_account: Some(PROVIDER.to_string()),
+                    provider_session_resolved_account: Some(workspace.clone()),
                 },
             )
             .unwrap();
+        let seeded_workspace: String = state
+            .connection()
+            .query_row(
+                "SELECT provider_session_resolved_account FROM invocations WHERE id = ?1",
+                [running.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seeded_workspace, workspace);
     }
     drop(state);
     fs::write(&fixture.bind, b"bind\n").unwrap();

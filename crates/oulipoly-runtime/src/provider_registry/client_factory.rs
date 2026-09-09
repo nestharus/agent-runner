@@ -20,8 +20,20 @@ impl ProviderClientFactory {
         }
     }
 
+    pub(crate) fn base_options(&self) -> ProviderClientOptions {
+        self.options.clone().with_attempt_custody(None)
+    }
+
     pub fn client_for(&self, artifact: ProviderArtifactRef) -> ProviderClient {
         ProviderClient::new(artifact, self.options.clone())
+    }
+
+    pub(crate) fn client_for_attempt(
+        &self,
+        artifact: ProviderArtifactRef,
+        custody: Option<oulipoly_provider::custody::AttemptActorCustody>,
+    ) -> ProviderClient {
+        ProviderClient::new(artifact, self.options.clone().with_attempt_custody(custody))
     }
 
     pub(crate) fn client_from_pinned_with_observers(
@@ -29,10 +41,12 @@ impl ProviderClientFactory {
         pinned: &ProviderClient,
         spawn_observer: Option<ProcessSpawnObserver>,
         launch_event_observer: Option<LaunchEventObserver>,
+        custody: Option<oulipoly_provider::custody::AttemptActorCustody>,
     ) -> Result<ProviderClient, oulipoly_provider::error::ProviderClientError> {
         pinned.fork_from_pinned(
             self.options
                 .clone()
+                .with_attempt_custody(custody)
                 .with_spawn_observer(spawn_observer)
                 .with_launch_event_observer(launch_event_observer),
         )

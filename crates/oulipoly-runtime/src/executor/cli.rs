@@ -67,7 +67,7 @@ mod capture_result;
 mod headless;
 mod input_flags;
 mod interactive;
-mod ipc;
+pub(crate) mod ipc;
 mod launch;
 mod live_session_binding;
 pub(crate) use live_session_binding::{

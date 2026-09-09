@@ -31,13 +31,23 @@ pub(crate) fn describe_provider_client(
     client: &ProviderClient,
     host_options: &DescribeHostOptions,
 ) -> Result<DescribeResult, ProviderRegistryError> {
-    let request = describe_request(host_options)?;
+    let identity = oulipoly_provider::custody::GeneratedRequestIdentity::new(
+        oulipoly_provider::custody::ProviderOperation::Describe,
+        "provider-registry-",
+    );
+    let request = describe_request(host_options, identity.wire_request_id.clone())?;
+    if let Some(custody) = &client.options().attempt_custody {
+        custody.record_request(identity);
+    }
     client
         .invoke_typed::<DescribeResult, _>("describe", request, NoProviderEnv)
         .map_err(map_describe_error)
 }
 
-fn describe_request(_host_options: &DescribeHostOptions) -> Result<Value, ProviderRegistryError> {
+fn describe_request(
+    _host_options: &DescribeHostOptions,
+    wire_request_id: String,
+) -> Result<Value, ProviderRegistryError> {
     let env = BTreeMap::from([
         (
             HOST_PROMPT_ACCEPTANCE_V1_ENV.to_string(),
@@ -54,7 +64,7 @@ fn describe_request(_host_options: &DescribeHostOptions) -> Result<Value, Provid
     ]);
     serde_json::to_value(DescribeRequest {
         contract: CONTRACT_VERSION.to_string(),
-        request_id: format!("provider-registry-{}", uuid::Uuid::new_v4()),
+        request_id: wire_request_id,
         provider_instance_id: Some("provider-registry".to_string()),
         host: HostContext {
             app: "oulipoly-agent-runner".to_string(),

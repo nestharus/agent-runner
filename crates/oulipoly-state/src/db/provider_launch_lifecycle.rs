@@ -460,6 +460,57 @@ impl StateDb {
         })
     }
 
+    /// Join accepted effect-writer promotions under the exact current fence.
+    pub fn provider_launch_promotions(
+        &self,
+        owner: &ProviderLaunchOwnerFence,
+    ) -> Result<Vec<ProviderLaunchPromotion>, String> {
+        let tx = immediate(&self.conn)?;
+        validate_mutation_authority(
+            &tx,
+            owner.invocation_row_id,
+            InvocationMutationAuthority::ProviderLaunch(owner),
+        )?;
+        let values: [i64; 6] = tx.query_row("SELECT provider_session_observed,prompt_accepted,assistant_response_observed,captured_child_count,returned_artifact_count,mailbox_submission_accepted FROM provider_launch_attempts WHERE attempt_id=?1",
+            [owner.attempt_id.to_string()], |r| Ok([r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?])).map_err(sql_error)?;
+        Ok([
+            ProviderLaunchPromotion::ProviderSessionObserved,
+            ProviderLaunchPromotion::PromptAccepted,
+            ProviderLaunchPromotion::AssistantResponseObserved,
+            ProviderLaunchPromotion::CapturedChild,
+            ProviderLaunchPromotion::ReturnedArtifact,
+            ProviderLaunchPromotion::MailboxSubmissionAccepted,
+        ]
+        .into_iter()
+        .zip(values)
+        .filter_map(|(promotion, count)| (count > 0).then_some(promotion))
+        .collect())
+    }
+
+    /// Readback only: consumes an already activated exact lease and retained
+    /// authority. This never activates or allocates an attempt.
+    pub fn validate_active_launch_attempt(
+        &self,
+        lease: &ProviderLaunchLease,
+        authority: &CompletionRegistrationAuthority,
+    ) -> Result<(), String> {
+        let tx = immediate(&self.conn)?;
+        validate_mutation_authority(
+            &tx,
+            lease.owner.invocation_row_id,
+            InvocationMutationAuthority::ProviderLaunch(&lease.owner),
+        )?;
+        validate_retained_authority(&tx, &lease.owner, authority)?;
+        let valid: bool = tx.query_row("SELECT a.status='active' AND l.status='active' AND l.cancel_requested_at IS NULL
+            AND a.account_name=?2 AND a.provider_index=?3 AND a.runtime_generation_uuid=?4 AND a.return_channel_id=?5 AND l.candidate_plan_sha256=?6
+            FROM provider_launch_attempts a JOIN provider_logical_launches l ON l.logical_launch_id=a.logical_launch_id WHERE a.attempt_id=?1",
+            params![lease.owner.attempt_id.to_string(),lease.candidate.account_name,lease.candidate.provider_index as i64,lease.runtime_generation_uuid.to_string(),lease.return_channel_id,lease.candidate_plan_sha256], |r| r.get(0)).map_err(sql_error)?;
+        if !valid {
+            return Err("inactive_or_changed_provider_launch_attempt".into());
+        }
+        Ok(())
+    }
+
     pub fn bind_launch_endpoint(
         &self,
         owner: &ProviderLaunchOwnerFence,

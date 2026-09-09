@@ -15,7 +15,8 @@ oulipoly-core = { path = "../oulipoly-core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
-sha2.workspace = true
 static_assertions = "1"

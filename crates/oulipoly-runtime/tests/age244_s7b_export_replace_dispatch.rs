@@ -23,12 +23,15 @@ use oulipoly_state::StateDb;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+#[path = "../../../tests/support/provider_vocabulary_source_set.rs"]
+mod provider_vocabulary_source_set;
+use provider_vocabulary_source_set::SourceSet;
+
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -3149,35 +3152,15 @@ fn external_replace_dry_run_no_change_returns_no_state_update_and_no_host_mutati
 #[test]
 fn no_new_concrete_provider_name_grep_hits_are_introduced_against_base_ref() {
     let root = repo_root();
-    let base = grep_snapshot(&root, &grep_scope_args(Some(BASE_REF), false));
-    let current = grep_snapshot(&root, &grep_scope_args(None, true));
-    let new_hits = current.difference(&base).cloned().collect::<Vec<_>>();
+    let sources = SourceSet::load(&root);
+    let base = sources.line_set(Some(BASE_REF), &concrete_provider_pattern());
+    let current = sources.line_set(None, &concrete_provider_pattern());
+    let new_hits = sources.unapproved_new_rows(&base, &current);
 
     assert!(
         new_hits.is_empty(),
         "AGE-244 S7b must not introduce concrete built-in provider-name grep hits: {new_hits:#?}"
     );
-}
-
-fn grep_scope_args(base_ref: Option<&'static str>, include_untracked: bool) -> Vec<&'static str> {
-    let mut args = Vec::new();
-    if include_untracked {
-        args.push("--untracked");
-    }
-    if let Some(base_ref) = base_ref {
-        args.push(base_ref);
-    }
-    args.extend([
-        "--",
-        ".",
-        ":(exclude)planning/code-quality-sweep/**",
-        ":(exclude)planning/*-gate/**",
-        ":(exclude)planning/s10-moveout/**",
-        ":(exclude)planning/wu-e/**",
-        ":(exclude)planning/opencode-contract/**",
-        ":(exclude)src-tauri/tests/fixtures/provider-authority-endpoint.py",
-    ]);
-    args
 }
 
 fn comparable_replace_state(
@@ -4695,50 +4678,6 @@ print(json.dumps(response))
 
 fn json_string(path: &Path) -> String {
     serde_json::to_string(&path.display().to_string()).expect("json path")
-}
-
-fn grep_snapshot(root: &Path, args: &[&str]) -> BTreeSet<String> {
-    let pattern = concrete_provider_pattern();
-    let mut command = Command::new("git");
-    command
-        .current_dir(root)
-        .arg("grep")
-        .arg("-n")
-        .arg("-I")
-        .arg("-E");
-    if args.contains(&"--untracked") {
-        command.arg("--untracked");
-    }
-    let output = command
-        .arg(pattern)
-        .args(args.iter().copied().filter(|arg| *arg != "--untracked"))
-        .output()
-        .expect("git grep");
-    if !output.status.success() && output.status.code() != Some(1) {
-        panic!(
-            "git grep failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(normalize_grep_hit)
-        .collect()
-}
-
-fn normalize_grep_hit(line: &str) -> Option<String> {
-    if line.is_empty() {
-        return None;
-    }
-    let normalized = line
-        .strip_prefix(BASE_REF)
-        .and_then(|rest| rest.strip_prefix(':'))
-        .unwrap_or(line);
-    let mut parts = normalized.splitn(3, ':');
-    let path = parts.next()?;
-    let _line_number = parts.next()?;
-    let text = parts.next()?;
-    Some(format!("{path}:{text}"))
 }
 
 fn concrete_provider_pattern() -> String {

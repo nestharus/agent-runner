@@ -48,16 +48,21 @@
 
 use crate::error::{HostErrorKind, ProviderClientError, ProviderDiagnostics};
 use crate::generated::ProcessStatus;
+use crate::process_custody::OwnedChild as Child;
 use oulipoly_core::CancellationRegistration;
 pub use oulipoly_core::CancellationToken;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+// Terminal observation has a fixed bound even when the OS cannot confirm death
+// or a pipe/worker remains live. It is not additional provider execution time.
+const SETTLEMENT_OBSERVATION_BOUND: Duration = Duration::from_secs(1);
 
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -279,6 +284,7 @@ fn capture_window(limit: ByteLimit, current_len: usize, incoming_len: usize) -> 
 
 #[derive(Debug, Clone)]
 pub struct ProcessLimits {
+    pub custody: Option<crate::custody::OperationCustody>,
     pub timeout: Duration,
     pub kill_after_grace: Duration,
     pub stdout_limit: ByteLimit,
@@ -314,6 +320,7 @@ impl std::fmt::Debug for ProcessSpawnObserver {
 impl Default for ProcessLimits {
     fn default() -> Self {
         Self {
+            custody: None,
             timeout: Duration::from_secs(30),
             kill_after_grace: Duration::from_millis(100),
             stdout_limit: ByteLimit::new(1024 * 1024),
@@ -451,6 +458,7 @@ struct JoinedProcessThreads<T: StdoutDrainOutput> {
     stderr: Option<CapturedBytes>,
     stdin_closed_early: Option<bool>,
     failed_workers: Vec<&'static str>,
+    cleanup_pending: bool,
 }
 
 struct TerminatedProcess {
@@ -570,7 +578,7 @@ impl ProcessRunner {
         P: StdoutProcessor,
     {
         let argv = command.argv();
-        let mut child = spawn_provider_process(&command, envs)?;
+        let mut child = spawn_provider_process(&command, envs, self.limits.custody.clone())?;
         if let Err(error) = notify_spawn_observer(&self.limits.spawn_observer, child.id()) {
             return Err(terminate_after_spawn_observer_failure(
                 child,
@@ -616,7 +624,13 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         loop {
             let events = self.record_pending_events();
             if events.worker_failed {
-                return Err(self.terminate_and_collect(HostErrorKind::WaitFailed, false));
+                let error = ProviderClientError::host_transport(
+                    HostErrorKind::WaitFailed,
+                    subcommand_for_error(&self.command),
+                    None,
+                    ProviderDiagnostics::with_description("worker_failure_observed".into()),
+                );
+                return Err(self.terminate_after_wait_failure(error));
             }
             if events.stdout_processor_failed {
                 return Err(self.terminate_after_stdout_processor_failure());
@@ -626,9 +640,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
                 match poll_child_status(&mut self.child, &self.command) {
                     Ok(Some(status)) => return self.collect_completed(status),
                     Ok(None) => {}
-                    Err(_) => {
-                        return Err(self.terminate_and_collect(HostErrorKind::WaitFailed, false));
-                    }
+                    Err(error) => return Err(self.terminate_after_wait_failure(error)),
                 }
             }
 
@@ -685,6 +697,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
 
     fn begin_cancellation(&mut self) {
         if self.cancellation_started.is_none() {
+            self.child.cancellation();
             terminate_tree(&mut self.child);
             self.cancellation_started = Some(Instant::now());
             self.next_status_poll = Instant::now();
@@ -697,9 +710,10 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
     ) -> Result<ProcessOutcome<T>, ProviderClientError> {
         let host_cancellation_requested =
             self.cancellation_started.is_some() || cancellation_requested(self.limits);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
         if host_cancellation_requested && self.timeout_mode == TimeoutMode::TotalRuntime {
-            let diagnostics = map_termination_diagnostics(
-                self.threads,
+            let diagnostics = termination_diagnostics_from_joined(
+                joined,
                 TerminatedProcess {
                     status: Some(status),
                     force_killed: false,
@@ -710,11 +724,12 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
                 HostErrorKind::Cancelled,
                 &self.command,
                 diagnostics,
+                Some(process_status(status)),
             ));
         }
         map_completed_process_outcome(
             status,
-            self.threads,
+            joined,
             &self.command,
             self.argv,
             host_cancellation_requested,
@@ -728,26 +743,44 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
     ) -> ProviderClientError {
         terminate_tree(&mut self.child);
         let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
+        let status = terminated.status.map(process_status);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
         let diagnostics =
-            map_termination_diagnostics(self.threads, terminated, host_cancellation_requested);
-        termination_transport_error(kind, &self.command, diagnostics)
+            termination_diagnostics_from_joined(joined, terminated, host_cancellation_requested);
+        termination_transport_error(kind, &self.command, diagnostics, status)
+    }
+
+    fn terminate_after_wait_failure(mut self, error: ProviderClientError) -> ProviderClientError {
+        // Preserve the first observed failure; cleanup is not its replacement or proof.
+        self.child.uncertain();
+        terminate_tree(&mut self.child);
+        let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
+        let status = terminated.status.map(process_status);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
+        let diagnostics = termination_diagnostics_from_joined(joined, terminated, false);
+        wait_failure_with_process_context(error, diagnostics, status)
     }
 
     fn force_kill_and_collect(mut self) -> ProviderClientError {
-        kill_tree(&mut self.child);
+        let admitted = kill_tree(&mut self.child);
+        if admitted {
+            self.child.forced();
+        }
         let terminated = TerminatedProcess {
-            status: self.child.wait().ok(),
-            force_killed: true,
+            status: reap_after_kill(&mut self.child, admitted),
+            force_killed: admitted,
         };
-        let diagnostics = map_termination_diagnostics(self.threads, terminated, true);
-        termination_transport_error(HostErrorKind::Cancelled, &self.command, diagnostics)
+        let status = terminated.status.map(process_status);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
+        let diagnostics = termination_diagnostics_from_joined(joined, terminated, true);
+        termination_transport_error(HostErrorKind::Cancelled, &self.command, diagnostics, status)
     }
 
     fn terminate_after_stdout_processor_failure(mut self) -> ProviderClientError {
         terminate_tree(&mut self.child);
         let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
         let status = terminated.status.map(process_status);
-        let joined = join_process_threads(self.threads);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
         let host_cancellation_requested =
             self.cancellation_started.is_some() || cancellation_requested(self.limits);
         if host_cancellation_requested {
@@ -756,6 +789,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
                 HostErrorKind::Cancelled,
                 &self.command,
                 diagnostics,
+                status,
             );
         }
         let processor_error = joined
@@ -785,22 +819,43 @@ fn termination_transport_error(
     kind: HostErrorKind,
     command: &ProcessCommand,
     diagnostics: ProviderDiagnostics,
+    status: Option<ProcessStatus>,
 ) -> ProviderClientError {
-    ProviderClientError::host_transport(kind, subcommand_for_error(command), None, diagnostics)
+    let error = ProviderClientError::host_transport(
+        kind,
+        subcommand_for_error(command),
+        None,
+        diagnostics.clone(),
+    );
+    match status {
+        Some(status) => error.with_process_context(diagnostics, status),
+        None => error,
+    }
 }
 
 fn spawn_provider_process<I, K, V>(
     command: &ProcessCommand,
     envs: I,
+    custody: Option<crate::custody::OperationCustody>,
 ) -> Result<Child, ProviderClientError>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
+    if custody.is_some() && !crate::process_custody::containment_supported() {
+        return Err(ProviderClientError::host_transport(
+            HostErrorKind::Other("attempt_process_custody_unsupported".into()),
+            subcommand_for_error(command),
+            None,
+            ProviderDiagnostics::default(),
+        ));
+    }
     let mut process = build_provider_process(command, envs);
+    crate::process_custody::configure_containment(&mut process, custody.is_some());
     process
         .spawn()
+        .map(|child| Child::new(child, custody))
         .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error))
 }
 
@@ -981,9 +1036,9 @@ fn poll_child_status(
         )
     };
     if result != 0 {
-        return Err(host_process_error(
-            HostErrorKind::WaitFailed,
+        return Err(wait_operation_error(
             command,
+            "waitid_wnowait",
             std::io::Error::last_os_error(),
         ));
     }
@@ -992,11 +1047,17 @@ fn poll_child_status(
         return Ok(None);
     }
     // WNOWAIT keeps the exact leader unreaped while its owned descendants are cleaned.
-    kill_tree(child);
+    if !kill_tree(child) {
+        return Err(wait_operation_error(
+            command,
+            "cleanup_admission_or_signal",
+            std::io::Error::other("process cleanup admission unavailable"),
+        ));
+    }
     child
         .wait()
         .map(Some)
-        .map_err(|error| host_process_error(HostErrorKind::WaitFailed, command, error))
+        .map_err(|error| wait_operation_error(command, "owned_wait", error))
 }
 
 #[cfg(not(unix))]
@@ -1006,19 +1067,18 @@ fn poll_child_status(
 ) -> Result<Option<ExitStatus>, ProviderClientError> {
     child
         .try_wait()
-        .map_err(|error| host_process_error(HostErrorKind::WaitFailed, command, error))
+        .map_err(|error| wait_operation_error(command, "owned_try_wait", error))
 }
 
 fn map_completed_process_outcome<T: StdoutDrainOutput>(
     status: ExitStatus,
-    threads: ProcessThreads<T>,
+    joined: JoinedProcessThreads<T>,
     command: &ProcessCommand,
     argv: Vec<OsString>,
     host_cancellation_requested: bool,
 ) -> Result<ProcessOutcome<T>, ProviderClientError> {
     let process_status = process_status(status);
-    let joined = join_process_threads(threads);
-    if !joined.failed_workers.is_empty() {
+    if joined.cleanup_pending || !joined.failed_workers.is_empty() {
         return Err(process_worker_failure(
             command,
             joined,
@@ -1175,16 +1235,22 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
         match child_exited_without_reaping(child) {
             Ok(true) => {
                 // Keep the leader waitable until its exact process group is clean.
-                kill_tree(child);
-                break child.wait().ok();
+                let admitted = kill_tree(child);
+                break reap_after_kill(child, admitted);
             }
             Ok(false) if should_force_kill(&grace_started, kill_after_grace) => {
-                force_killed = true;
-                kill_tree(child);
-                break child.wait().ok();
+                let admitted = kill_tree(child);
+                force_killed = admitted;
+                if admitted {
+                    child.forced();
+                }
+                break reap_after_kill(child, admitted);
             }
             Ok(false) => thread::sleep(Duration::from_millis(5)),
-            Err(_) => break None,
+            Err(_) => {
+                child.uncertain();
+                break None;
+            }
         }
     };
     TerminatedProcess {
@@ -1218,12 +1284,18 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) if should_force_kill(&grace_started, kill_after_grace) => {
-                force_killed = true;
-                kill_tree(child);
-                break child.wait().ok();
+                let admitted = kill_tree(child);
+                force_killed = admitted;
+                if admitted {
+                    child.forced();
+                }
+                break reap_after_kill(child, admitted);
             }
             Ok(None) => thread::sleep(Duration::from_millis(5)),
-            Err(_) => break None,
+            Err(_) => {
+                child.uncertain();
+                break None;
+            }
         }
     };
     TerminatedProcess {
@@ -1236,20 +1308,12 @@ fn should_force_kill(grace_started: &Instant, kill_after_grace: Duration) -> boo
     grace_started.elapsed() >= kill_after_grace
 }
 
-fn map_termination_diagnostics<T: StdoutDrainOutput>(
-    threads: ProcessThreads<T>,
-    terminated: TerminatedProcess,
-    host_cancellation_requested: bool,
-) -> ProviderDiagnostics {
-    let joined = join_process_threads(threads);
-    termination_diagnostics_from_joined(joined, terminated, host_cancellation_requested)
-}
-
 fn termination_diagnostics_from_joined<T: StdoutDrainOutput>(
     joined: JoinedProcessThreads<T>,
     terminated: TerminatedProcess,
     host_cancellation_requested: bool,
 ) -> ProviderDiagnostics {
+    let description = joined_failure_description(&joined);
     let mut diagnostics = termination_diagnostics_from_parts(
         terminated,
         host_cancellation_requested,
@@ -1261,8 +1325,8 @@ fn termination_diagnostics_from_joined<T: StdoutDrainOutput>(
         joined.stderr.unwrap_or_default(),
     );
     diagnostics.stdin_closed_early = joined.stdin_closed_early.unwrap_or_default();
-    if !joined.failed_workers.is_empty() {
-        diagnostics.description = Some(worker_failure_description(&joined.failed_workers));
+    if joined.cleanup_pending || !joined.failed_workers.is_empty() {
+        diagnostics.description = Some(description);
     }
     diagnostics
 }
@@ -1277,11 +1341,56 @@ fn processor_failure_with_process_context<T: StdoutDrainOutput>(
     let description = error.diagnostics().description.clone();
     let mut diagnostics =
         termination_diagnostics_from_joined(joined, terminated, host_cancellation_requested);
-    diagnostics.description = description;
+    diagnostics.description = match (description, diagnostics.description) {
+        (Some(original), Some(workers)) => Some(format!("{original}; {workers}")),
+        (original, workers) => original.or(workers),
+    };
     match status {
         Some(status) => error.with_process_context(diagnostics, status),
         None => replace_error_diagnostics(error, diagnostics),
     }
+}
+
+fn wait_failure_with_process_context(
+    error: ProviderClientError,
+    mut diagnostics: ProviderDiagnostics,
+    status: Option<ProcessStatus>,
+) -> ProviderClientError {
+    diagnostics.description = match (
+        error.diagnostics().description.as_deref(),
+        diagnostics.description.as_deref(),
+    ) {
+        (Some(first), Some(secondary)) => {
+            Some(format!("first_failure: {first}; collection: {secondary}"))
+        }
+        (Some(first), None) => Some(format!("first_failure: {first}")),
+        (None, Some(secondary)) => Some(format!("collection: {secondary}")),
+        (None, None) => None,
+    };
+    match status {
+        Some(status) => error.with_process_context(diagnostics, status),
+        None => replace_error_diagnostics(error, diagnostics),
+    }
+}
+
+// Callers supply only fixed operation labels and host wait/cleanup errors, never
+// provider output or argv. errno is recorded only when the io::Error carries it.
+fn wait_operation_error(
+    command: &ProcessCommand,
+    operation: &'static str,
+    error: std::io::Error,
+) -> ProviderClientError {
+    let detail: String = error.to_string().chars().take(256).collect();
+    let errno = match error.raw_os_error() {
+        Some(errno) => errno.to_string(),
+        None => "unavailable".into(),
+    };
+    ProviderClientError::host_transport(
+        HostErrorKind::WaitFailed,
+        subcommand_for_error(command),
+        None,
+        ProviderDiagnostics::with_description(format!("{operation}: {detail}; errno={errno}")),
+    )
 }
 
 fn replace_error_diagnostics(
@@ -1350,6 +1459,7 @@ fn completed_process_diagnostics<T: StdoutDrainOutput>(
 
 fn join_process_threads<T: StdoutDrainOutput>(
     threads: ProcessThreads<T>,
+    child: &Child,
 ) -> JoinedProcessThreads<T> {
     let stdout = threads.stdout.join().ok();
     let stderr = threads.stderr.join().ok();
@@ -1364,11 +1474,17 @@ fn join_process_threads<T: StdoutDrainOutput>(
     if stdin_closed_early.is_none() {
         failed_workers.push("stdin");
     }
+    // Joining is the final observation boundary, after the supervisor stops
+    // reading events. Successful tree cleanup cannot erase lost worker evidence.
+    if !failed_workers.is_empty() {
+        child.uncertain();
+    }
     JoinedProcessThreads {
         stdout,
         stderr,
         stdin_closed_early,
         failed_workers,
+        cleanup_pending: false,
     }
 }
 
@@ -1378,6 +1494,7 @@ fn process_worker_failure<T: StdoutDrainOutput>(
     status: Option<ProcessStatus>,
     host_cancellation_requested: bool,
 ) -> ProviderClientError {
+    let description = joined_failure_description(&joined);
     let mut diagnostics = ProviderDiagnostics {
         stdout: joined
             .stdout
@@ -1388,19 +1505,14 @@ fn process_worker_failure<T: StdoutDrainOutput>(
         stdin_closed_early: joined.stdin_closed_early.unwrap_or_default(),
         process_was_reaped: status.is_some(),
         host_cancellation_requested,
-        description: Some(worker_failure_description(&joined.failed_workers)),
+        description: Some(description),
         ..ProviderDiagnostics::default()
     };
-    if let Some(status) = status {
-        diagnostics.provider_exit_code = exit_code(&status);
-        diagnostics.provider_process_nonzero = process_nonzero(&status);
+    if let Some(status) = &status {
+        diagnostics.provider_exit_code = exit_code(status);
+        diagnostics.provider_process_nonzero = process_nonzero(status);
     }
-    ProviderClientError::host_transport(
-        HostErrorKind::WaitFailed,
-        subcommand_for_error(command),
-        None,
-        diagnostics,
-    )
+    termination_transport_error(HostErrorKind::WaitFailed, command, diagnostics, status)
 }
 
 fn worker_failure_description(failed_workers: &[&str]) -> String {
@@ -1457,6 +1569,14 @@ fn terminate_after_spawn_observer_failure(
         let status = process_status(status);
         diagnostics.provider_exit_code = exit_code(&status);
         diagnostics.provider_process_nonzero = process_nonzero(&status);
+    }
+    if !child.is_reaped() {
+        child.uncertain();
+        diagnostics.description = Some(format!(
+            "{};process_cleanup_pending",
+            diagnostics.description.unwrap_or_default()
+        ));
+        cleanup::retain(child, || true);
     }
     ProviderClientError::host_transport(
         HostErrorKind::Other("spawn_observer_failed".to_string()),
@@ -1621,6 +1741,10 @@ fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn terminate_tree(child: &mut Child) {
+    if !child.can_signal_group() {
+        child.uncertain();
+        return;
+    }
     let group = -(child.id() as i32);
     unsafe {
         libc::kill(group, libc::SIGTERM);
@@ -1638,21 +1762,27 @@ fn terminate_tree(child: &mut Child) {
 }
 
 #[cfg(unix)]
-fn kill_tree(child: &mut Child) {
-    let group = -(child.id() as i32);
-    unsafe {
-        libc::kill(group, libc::SIGKILL);
+fn kill_tree(child: &mut Child) -> bool {
+    if !child.can_signal_group() {
+        child.uncertain();
+        return false;
     }
+    let group = -(child.id() as i32);
+    let signal_ok = unsafe { libc::kill(group, libc::SIGKILL) } == 0;
+    child.confirm_group_dead(signal_ok);
+    if !signal_ok {
+        child.uncertain();
+    }
+    signal_ok
 }
 
-#[cfg(windows)]
-fn kill_tree(child: &mut Child) {
-    let _ = child.kill();
-}
-
-#[cfg(not(any(unix, windows)))]
-fn kill_tree(child: &mut Child) {
-    let _ = child.kill();
+#[cfg(not(unix))]
+fn kill_tree(child: &mut Child) -> bool {
+    let admitted = child.kill().is_ok();
+    if !admitted {
+        child.uncertain();
+    }
+    admitted
 }
 
 pub(crate) fn is_executable(path: &Path) -> bool {
@@ -2037,15 +2167,24 @@ mod tests {
     fn stdout_worker_panic_is_reported_as_wait_failure() {
         let fake = FakeProvider::compile(fake_provider_source());
         let started = std::time::Instant::now();
-        let error = ProcessRunner::new(ProcessLimits::default())
-            .run_with_stdout_line_gap_timeout_and_stdout_processor(
-                ProcessCommand::new(fake.path()).arg("launch"),
-                serde_json::to_vec(&describe_request()).expect("request should serialize"),
-                FakeProviderMode::LaunchPartialHang.env(),
-                PanickingStdoutProcessor,
-            )
-            .expect_err("stdout worker panic should fail the process outcome");
+        let custody = crate::custody::AttemptActorCustody::new(uuid::Uuid::new_v4());
+        let guard = custody.begin("launch");
+        let error = ProcessRunner::new(ProcessLimits {
+            custody: cfg!(target_os = "linux").then(|| guard.0.clone()),
+            ..ProcessLimits::default()
+        })
+        .run_with_stdout_line_gap_timeout_and_stdout_processor(
+            ProcessCommand::new(fake.path()).arg("launch"),
+            serde_json::to_vec(&describe_request()).expect("request should serialize"),
+            FakeProviderMode::LaunchPartialHang.env(),
+            PanickingStdoutProcessor,
+        )
+        .expect_err("stdout worker panic should fail the process outcome");
 
+        drop(guard);
+        if cfg!(target_os = "linux") {
+            assert!(!custody.receipts()[0].effect_incapable());
+        }
         assert_eq!(error.transport_kind(), "wait_failed");
         assert!(
             started.elapsed() < Duration::from_millis(500),
@@ -2053,7 +2192,9 @@ mod tests {
         );
         assert_eq!(
             error.diagnostics().description.as_deref(),
-            Some("process worker thread panicked: stdout")
+            Some(
+                "first_failure: worker_failure_observed; collection: process worker thread panicked: stdout"
+            )
         );
     }
 
@@ -2144,4 +2285,118 @@ mod tests {
             "params": {}
         })
     }
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "process_shutdown_tests.rs"]
+mod shutdown_tests;
+
+// Pending cleanup owns the exact Child and original worker handles, never a
+// reconstructed PID. A failed thread start retains its task in the queue.
+#[path = "process_cleanup.rs"]
+mod cleanup;
+
+fn reap_after_kill(child: &mut Child, admitted: bool) -> Option<ExitStatus> {
+    if !admitted {
+        child.uncertain();
+        return None;
+    }
+    let started = Instant::now();
+    loop {
+        #[cfg(unix)]
+        let result = child_exited_without_reaping(child).and_then(|exited| {
+            if exited {
+                child.wait().map(Some)
+            } else {
+                Ok(None)
+            }
+        });
+        #[cfg(not(unix))]
+        let result = child.try_wait();
+        match result {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if started.elapsed() < SETTLEMENT_OBSERVATION_BOUND => {
+                thread::sleep(Duration::from_millis(2))
+            }
+            _ => {
+                child.uncertain();
+                return None;
+            }
+        }
+    }
+}
+
+fn joined_failure_description<T: StdoutDrainOutput>(joined: &JoinedProcessThreads<T>) -> String {
+    let workers = if joined.failed_workers.is_empty() {
+        String::new()
+    } else {
+        worker_failure_description(&joined.failed_workers)
+    };
+    if joined.cleanup_pending {
+        format!("process_cleanup_pending; worker output may be incomplete; {workers}")
+    } else {
+        workers
+    }
+}
+
+fn collect_or_retain_process_threads<T: StdoutDrainOutput>(
+    threads: ProcessThreads<T>,
+    child: Child,
+) -> JoinedProcessThreads<T> {
+    let started = Instant::now();
+    while !(threads.stdout.is_finished()
+        && threads.stderr.is_finished()
+        && threads.stdin.is_finished())
+        && child.is_reaped()
+        && started.elapsed() < SETTLEMENT_OBSERVATION_BOUND
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    if threads.stdout.is_finished()
+        && threads.stderr.is_finished()
+        && threads.stdin.is_finished()
+        && child.is_reaped()
+    {
+        return join_process_threads(threads, &child);
+    }
+    child.uncertain();
+    let mut stdout = Some(threads.stdout);
+    let mut stderr = Some(threads.stderr);
+    let mut stdin = Some(threads.stdin);
+    let mut failed_workers = Vec::new();
+    fn finished<T>(
+        handle: &mut Option<thread::JoinHandle<T>>,
+        name: &'static str,
+        failed: &mut Vec<&'static str>,
+    ) -> Option<T> {
+        if !handle.as_ref()?.is_finished() {
+            return None;
+        }
+        match handle.take().unwrap().join() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                failed.push(name);
+                None
+            }
+        }
+    }
+    let joined = JoinedProcessThreads {
+        stdout: finished(&mut stdout, "stdout", &mut failed_workers),
+        stderr: finished(&mut stderr, "stderr", &mut failed_workers),
+        stdin_closed_early: finished(&mut stdin, "stdin", &mut failed_workers),
+        failed_workers,
+        cleanup_pending: true,
+    };
+    cleanup::retain(child, move || {
+        let mut ignored_failures = Vec::new();
+        finished(&mut stdout, "stdout", &mut ignored_failures);
+        finished(&mut stderr, "stderr", &mut ignored_failures);
+        finished(&mut stdin, "stdin", &mut ignored_failures);
+        stdout.is_none() && stderr.is_none() && stdin.is_none()
+    });
+    joined
 }

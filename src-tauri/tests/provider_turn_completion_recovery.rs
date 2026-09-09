@@ -171,9 +171,11 @@ fn automatic_legacy_turn_script_cannot_recover_a_nonzero_exit() {
 #[test]
 fn resumed_clean_exit_without_terminal_completion_is_unconfirmed_failure() {
     let fixture = ExternalRecoveryFixture::new("unconfirmed");
-    fixture
-        .base
-        .seed_active_chain(EXTERNAL_PROVIDER, EXTERNAL_MODEL);
+    fixture.base.seed_active_chain_with_instance(
+        EXTERNAL_PROVIDER,
+        EXTERNAL_MODEL,
+        "age270-local-external-provider-instance",
+    );
 
     let output = fixture.run_resume();
     let persisted = fixture.latest_persisted_invocation();
@@ -219,9 +221,11 @@ fn resumed_clean_exit_without_terminal_completion_is_unconfirmed_failure() {
 #[test]
 fn resumed_clean_exit_with_terminal_assistant_response_succeeds() {
     let fixture = ExternalRecoveryFixture::new("confirmed");
-    fixture
-        .base
-        .seed_active_chain(EXTERNAL_PROVIDER, EXTERNAL_MODEL);
+    fixture.base.seed_active_chain_with_instance(
+        EXTERNAL_PROVIDER,
+        EXTERNAL_MODEL,
+        "age270-local-external-provider-instance",
+    );
 
     let output = fixture.run_resume();
     let persisted = fixture.latest_persisted_invocation();

@@ -13,17 +13,18 @@
 //!       - launch-result mapper handoff
 //! ```
 
+use super::attempt::ProviderLaunchFailure;
 use super::capability_gate::gate_required_capabilities;
 use super::client_invoker::{invoke_provider_launch, invoke_provider_policy};
 use super::context::ExternalProviderDispatchContext;
 use super::error_mapper::{
     invalid_provider_input_error, map_provider_client_error, map_registry_error,
-    protocol_service_error, provider_client_error_is_rotatable, service_error,
+    protocol_service_error, service_error,
 };
 use super::launch_result_mapper::{
-    PROVIDER_SESSION_MARKER, launch_failure_provider_session_id, launch_provider_session_id,
-    map_launch_result_with_terminal_classification, map_missing_final_exit_with_prompt_acceptance,
-    marker_provider_session_id,
+    LaunchOutputArtifacts, PROVIDER_SESSION_MARKER, launch_failure_provider_session_id,
+    launch_provider_session_id, map_launch_result_with_terminal_classification,
+    map_missing_final_exit_with_prompt_acceptance, marker_provider_session_id,
 };
 use super::output_spool_observer::observe_output;
 use super::policy_transform::apply_policy_transform;
@@ -65,21 +66,21 @@ type RecordedLaunchGeneration = Arc<Mutex<Option<Result<RunningRuntimeGeneration
 /// A single account attempt either succeeded, hit a deterministic terminal
 /// failure (fail fast), or hit a rotatable transport-class failure (try the
 /// next pool account).
-struct AccountAttemptError {
-    service_error: ServiceError,
-    rotatable: bool,
+pub(super) struct AccountAttemptError {
+    pub(super) service_error: ServiceError,
+    pub(super) failure: Box<ProviderLaunchFailure>,
 }
 
-fn terminal_attempt_error(service_error: ServiceError) -> AccountAttemptError {
+pub(super) fn terminal_attempt_error(service_error: ServiceError) -> AccountAttemptError {
     AccountAttemptError {
+        failure: Box::new(ProviderLaunchFailure::Execution(service_error.clone())),
         service_error,
-        rotatable: false,
     }
 }
 
 fn classify_provider_client_attempt_error(error: ProviderClientError) -> AccountAttemptError {
     AccountAttemptError {
-        rotatable: provider_client_error_is_rotatable(&error),
+        failure: Box::new(ProviderLaunchFailure::Provider(error.clone())),
         service_error: map_provider_client_error(error),
     }
 }
@@ -88,32 +89,45 @@ pub(crate) fn dispatch(
     registry: &ProviderRegistry,
     context: ExternalProviderDispatchContext,
 ) -> Result<ExecutionResult, ServiceError> {
-    match attempt_account_dispatch(registry, &context) {
-        Ok(result) => Ok(result),
-        Err(attempt) => {
-            if attempt.rotatable && context.model.providers.len() > 1 {
-                return Err(account_lifecycle_transfer_unavailable());
-            }
-            Err(attempt.service_error)
-        }
-    }
+    attempt_account_dispatch(registry, &context).map_err(|attempt| attempt.service_error)
 }
 
-fn account_lifecycle_transfer_unavailable() -> ServiceError {
-    ServiceError::Unavailable {
-        message: "account lifecycle transfer is unavailable; sibling launch was not attempted"
-            .to_string(),
-        code: Some("account_lifecycle_transfer_unavailable".to_string()),
-    }
-}
-
-fn attempt_account_dispatch(
+pub(super) fn attempt_account_dispatch(
     registry: &ProviderRegistry,
     context: &ExternalProviderDispatchContext,
 ) -> Result<ExecutionResult, AccountAttemptError> {
     let endpoint = registry
-        .preflight_account(&context.provider.name)
-        .map_err(|error| terminal_attempt_error(map_registry_error(error)))?;
+        .preflight_account_with_custody(
+            &context.provider.name,
+            context.attempt.as_ref().map(|a| a.actors.clone()),
+        )
+        .map_err(|error| {
+            let source = match &error {
+                crate::provider_registry::ProviderRegistryError::ProviderTransport {
+                    source,
+                    ..
+                }
+                | crate::provider_registry::ProviderRegistryError::ProviderProtocol {
+                    source,
+                    ..
+                }
+                | crate::provider_registry::ProviderRegistryError::ProviderDescribeFailed {
+                    source,
+                    ..
+                } => Some((**source).clone()),
+                _ => None,
+            };
+            let mut mapped = terminal_attempt_error(map_registry_error(error));
+            if let Some(source) = source {
+                mapped.failure = Box::new(ProviderLaunchFailure::Provider(source));
+            }
+            mapped
+        })?;
+    if let Some(attempt) = &context.attempt {
+        attempt.bind_endpoint(&endpoint).map_err(|_| {
+            terminal_attempt_error(protocol_service_error("endpoint_identity_bind_failed"))
+        })?;
+    }
     let settings_id = endpoint
         .settings_id()
         .map_err(|error| terminal_attempt_error(map_registry_error(error)))?;
@@ -122,6 +136,13 @@ fn attempt_account_dispatch(
     let output_spool = ExecutionOutputSpool::new().map_err(|_| {
         terminal_attempt_error(protocol_service_error("launch_output_spool_create_failed"))
     })?;
+    if let Some(attempt) = &context.attempt {
+        attempt
+            .evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .output = Some(output_spool.clone());
+    }
     let spawn_identity = external_launch_spawn_identity_context(context);
     let recorded_generation = recorded_launch_generation();
     let spawn_observer =
@@ -132,13 +153,17 @@ fn attempt_account_dispatch(
         Arc::clone(&attachment_failure),
         spawn_identity.clone(),
         Arc::clone(&recorded_generation),
-        context.provider.name.clone(),
-        context.start_known_provider_session_id.clone(),
         endpoint.account_name().to_string(),
+        context.clone(),
     );
     let client = registry
         .client_factory()
-        .client_from_pinned_with_observers(endpoint.client(), spawn_observer, launch_event_observer)
+        .client_from_pinned_with_observers(
+            endpoint.client(),
+            spawn_observer,
+            launch_event_observer,
+            context.attempt.as_ref().map(|a| a.actors.clone()),
+        )
         .map_err(classify_provider_client_attempt_error)?;
     let describe = endpoint.capabilities();
     let provider_instance_id = format!("{}-instance", describe.provider_id);
@@ -168,10 +193,25 @@ fn attempt_account_dispatch(
         .map_err(classify_provider_client_attempt_error)?;
     let mut candidate = apply_policy_transform(candidate, policy_result)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
-    let return_channel =
+    let return_channel = if let Some(attempt) = &context.attempt {
+        let allocation = &attempt.allocation;
+        Some(
+            crate::executor::ReturnChannel::for_attempt(
+                &allocation.channel_root,
+                allocation.parent_invocation_uuid,
+                allocation.lease.owner.logical_launch_id,
+                allocation.lease.owner.attempt_id,
+                allocation.lease.owner.invocation_uuid,
+            )
+            .map_err(|_| {
+                terminal_attempt_error(protocol_service_error("return_channel_create_failed"))
+            })?,
+        )
+    } else {
         prepare_return_channel(context.parent_invocation_env.as_deref()).map_err(|_| {
             terminal_attempt_error(protocol_service_error("return_channel_create_failed"))
-        })?;
+        })?
+    };
     if let Some(return_channel) = return_channel.as_ref() {
         candidate.env.insert(
             RETURN_CHANNEL_ENV.to_string(),
@@ -190,13 +230,45 @@ fn attempt_account_dispatch(
         describe.capabilities.launch_output_v1,
     )
     .map_err(|_| terminal_attempt_error(protocol_service_error("schema_invalid_request")))?;
-    register_runtime_generation_starting(spawn_identity.as_ref()).map_err(|_| {
-        terminal_attempt_error(protocol_service_error(
-            "runtime_generation_registration_failed",
-        ))
-    })?;
+    if let Some(attempt) = &context.attempt {
+        let mut evidence = attempt.evidence.lock().unwrap_or_else(|e| e.into_inner());
+        evidence.prompt = launch_request
+            .get("params")
+            .and_then(|p| p.get("prompt_acceptance"))
+            .and_then(|p| serde_json::from_value(p.clone()).ok());
+    }
+    if context.attempt.is_none() {
+        register_runtime_generation_starting(spawn_identity.as_ref()).map_err(|_| {
+            terminal_attempt_error(protocol_service_error(
+                "runtime_generation_registration_failed",
+            ))
+        })?;
+    }
+    let standalone_channel = if let Some(attempt) = &context.attempt {
+        attempt
+            .evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .channel = return_channel;
+        None
+    } else {
+        return_channel
+    };
     let launch_outcome = invoke_provider_launch(&client, launch_request);
-    let returned_artifacts = read_and_cleanup_return_channel(return_channel);
+    let returned_artifacts = match read_and_cleanup_return_channel(standalone_channel) {
+        Ok(artifacts) => artifacts,
+        Err(message) if launch_outcome.is_ok() => {
+            let _ = finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            return Err(terminal_attempt_error(ServiceError::Dependency { message }));
+        }
+        Err(message) => {
+            tracing::warn!(
+                message,
+                "Return channel quarantined; retaining the original provider failure"
+            );
+            Vec::new()
+        }
+    };
     let launch_result = match launch_outcome {
         Ok(result) => result,
         Err(error) => {
@@ -256,7 +328,7 @@ fn attempt_account_dispatch(
                     )));
                 }
             };
-            if let Some(result) = map_missing_final_exit_with_prompt_acceptance(
+            if let Some(mut result) = map_missing_final_exit_with_prompt_acceptance(
                 &error,
                 verified_failure_session.as_ref(),
                 context.provider_index,
@@ -265,6 +337,13 @@ fn attempt_account_dispatch(
                 returned_artifacts,
                 &session_authority,
             ) {
+                // The verified session authorizes failure mapping, not complete
+                // output. Retain exactly the observer's decoded prefix.
+                output_spool.mark_incomplete();
+                result.output_spool = Some(output_spool);
+                if let Some(signal) = &mut result.terminal_signal {
+                    signal.evidence.push_str(";output=incomplete;output_artifacts=<invocation_uuid>.partial.{stdout,stderr}");
+                }
                 return Ok(result);
             }
             return Err(classify_provider_client_attempt_error(error));
@@ -314,8 +393,10 @@ fn attempt_account_dispatch(
                 &context.provider.name,
                 None,
                 launch_prompt_acceptance_v1_enabled,
-                output_spool,
-                returned_artifacts,
+                LaunchOutputArtifacts {
+                    spool: output_spool,
+                    returned_artifacts,
+                },
                 &session_authority,
             );
             return Ok(failed_finalization_result(
@@ -337,8 +418,10 @@ fn attempt_account_dispatch(
         &context.provider.name,
         classification,
         launch_prompt_acceptance_v1_enabled,
-        output_spool,
-        returned_artifacts,
+        LaunchOutputArtifacts {
+            spool: output_spool,
+            returned_artifacts,
+        },
         &session_authority,
     ))
 }
@@ -353,6 +436,9 @@ fn launch_exit_code(status: &ProcessStatus) -> Option<i32> {
 fn external_launch_spawn_identity_context(
     context: &ExternalProviderDispatchContext,
 ) -> Option<SpawnIdentityContext> {
+    if let Some(attempt) = &context.attempt {
+        return Some(attempt.spawn.clone());
+    }
     context_from_parent_invocation_env(
         context.parent_invocation_env.as_deref(),
         &context.provider.name,
@@ -388,18 +474,20 @@ fn external_launch_event_observer(
     attachment_failure: RecordedAttachmentFailure,
     spawn_identity: Option<SpawnIdentityContext>,
     recorded_generation: RecordedLaunchGeneration,
-    account_name: String,
-    expected_provider_session_id: Option<String>,
     observed_account_name: String,
+    dispatch_context: ExternalProviderDispatchContext,
 ) -> Option<LaunchEventObserver> {
     Some(LaunchEventObserver::new(move |event| {
+        if let Some(attempt) = &dispatch_context.attempt {
+            attempt.observe(&dispatch_context, event)?;
+        }
         observe_output(&output_spool, event)?;
         bind_external_launch_session_from_event(
             spawn_identity.as_ref(),
             &recorded_generation,
             &attachment_failure,
-            &account_name,
-            expected_provider_session_id.as_deref(),
+            &dispatch_context.provider.name,
+            dispatch_context.start_known_provider_session_id.as_deref(),
             &observed_account_name,
             event,
         )
@@ -447,7 +535,7 @@ fn bind_external_launch_session_from_event(
     }
 }
 
-fn provider_session_id_from_launch_event(event: &DecodedLaunchEvent) -> Option<String> {
+pub(super) fn provider_session_id_from_launch_event(event: &DecodedLaunchEvent) -> Option<String> {
     let DecodedLaunchEvent::Marker { name, value, .. } = event else {
         return None;
     };
@@ -579,7 +667,6 @@ fn verify_optional_failure_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::ServiceError;
 
     fn sealed_fixture_output() -> ExecutionOutputSpool {
         use oulipoly_provider::generated::{LAUNCH_OUTPUT_COMPLETE_MARKER_V1, LAUNCH_OUTPUT_V1};
@@ -809,15 +896,5 @@ mod tests {
         let retained = failures.lock().unwrap().clone().unwrap();
         assert_eq!(retained.cause, GenerationOperationError::MissingGeneration);
         assert_eq!(retained.verified.provider_session_id(), "observed");
-    }
-
-    #[test]
-    fn sibling_rotation_fails_closed_with_typed_lifecycle_outcome() {
-        assert!(matches!(
-            account_lifecycle_transfer_unavailable(),
-            ServiceError::Unavailable { message, code }
-                if message == "account lifecycle transfer is unavailable; sibling launch was not attempted"
-                    && code.as_deref() == Some("account_lifecycle_transfer_unavailable")
-        ));
     }
 }

@@ -31,5 +31,5 @@ pub(super) fn return_channel_path(dir: &Path) -> PathBuf {
 }
 
 fn return_channel_filename() -> String {
-    format!("returns-{}.jsonl", uuid::Uuid::new_v4())
+    "returns.jsonl".to_string()
 }

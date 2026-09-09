@@ -196,7 +196,7 @@ fn partial_match_survives_transient_then_fixed_stop_and_authorized_reentry() {
     assert!(d.fixture.tick());
     d.pump(false);
     let cursor = d.fixture.cursor();
-    d.fixture.set_mode("codex_rollout_read_failed");
+    d.fixture.set_mode("session_turn_page_io");
     assert!(d.fixture.tick());
     d.pump(false);
     assert_eq!(d.fixture.cursor(), cursor);

@@ -382,6 +382,7 @@ prompt_mode = "stdin"
     fn run(&self, mut cmd: Command) -> Output {
         cmd.current_dir(self.dir.path());
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("OULIPOLY_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env(
             "OULIPOLY_DATA_DIR",
