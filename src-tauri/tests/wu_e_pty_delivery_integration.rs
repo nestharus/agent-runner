@@ -3548,7 +3548,9 @@ fn capture_diagnostic_chunk(reader: &mut impl Read, bytes: &mut Vec<u8>) -> bool
 }
 
 fn bounded_diagnostic_output(mut cmd: Command, timeout: Duration) -> Output {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut guard = SettlementChild::new(cmd.spawn().expect("diagnostic command spawn failed"));
     let mut stdout = guard.child.stdout.take().unwrap();
     let mut stderr = guard.child.stderr.take().unwrap();
