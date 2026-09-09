@@ -292,33 +292,31 @@ impl SourceSet {
     }
 
     pub fn added_occurrences(&self, base: Option<&str>, pattern: &str) -> usize {
-        let mut args = vec!["diff", "--no-ext-diff", "--name-only", "-z"];
+        let mut args = vec![
+            "diff",
+            "--no-ext-diff",
+            "--raw",
+            "-z",
+            "--patch",
+            "--unified=0",
+        ];
         if let Some(base) = base {
             args.push(base);
         }
         args.extend(["--", "."]);
         let exclusions = self.diff_exclusions(base);
         args.extend(exclusions.iter().map(String::as_str));
-        let changed = paths(&git(&self.root, &args));
+        // Keep one global diff so Git's rename pairing and metric-specific
+        // comparison remain unchanged. NUL raw records bind patch sections to
+        // exact paths without interpreting quoted display headers.
         let mut tracked_count = 0;
         let mut raw_tracked = 0;
-        // Literal per-path diffs retain identity without parsing quoted diff
-        // headers; plain-index and historical-base comparisons remain distinct.
-        for path in changed.intersection(&self.sources) {
-            let literal = format!(":(literal){path}");
-            let mut args = vec!["diff", "--no-ext-diff", "--unified=0"];
-            if let Some(base) = base {
-                args.push(base);
-            }
-            args.extend(["--", &literal]);
-            let diff = String::from_utf8(git(&self.root, &args)).expect("source diff UTF-8");
-            for (_, line) in added_rows(&diff) {
-                let raw = occurrences(&line, pattern);
-                raw_tracked += raw;
-                tracked_count += vocabulary_occurrences(path, &line, pattern);
-                if raw != 0 {
-                    eprintln!("tracked added {path}:{line}");
-                }
+        for (path, line) in source_added_rows(&git(&self.root, &args)) {
+            let raw = occurrences(&line, pattern);
+            raw_tracked += raw;
+            tracked_count += vocabulary_occurrences(&path, &line, pattern);
+            if raw != 0 {
+                eprintln!("tracked added {path}:{line}");
             }
         }
         let mut untracked_count = 0;
@@ -536,6 +534,58 @@ fn exact_residue_policy() -> BTreeMap<String, ExactResidue> {
                     lines: lines.iter().copied().collect(),
                 },
             )
+        })
+        .collect()
+}
+
+// Git emits all NUL-delimited raw records, an empty field, then the patch.
+// Bind each patch section to its raw destination path; rename/copy records
+// carry two paths. Unsupported or mismatched structure is never ignored.
+fn source_added_rows(bytes: &[u8]) -> Vec<(String, String)> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let mut fields = bytes.split(|byte| *byte == 0);
+    let mut selected = Vec::new();
+    loop {
+        let header = fields.next().expect("missing raw diff delimiter");
+        if header.is_empty() {
+            break;
+        }
+        let header = std::str::from_utf8(header).expect("raw diff header UTF-8");
+        assert!(header.starts_with(':'), "unsupported raw diff header");
+        let status = header.split_whitespace().last().expect("raw diff status");
+        let first = fields.next().expect("raw diff path");
+        let path = if status.starts_with('R') || status.starts_with('C') {
+            fields.next().expect("raw destination path")
+        } else {
+            first
+        };
+        selected.push(
+            std::str::from_utf8(path)
+                .expect("raw diff path UTF-8")
+                .to_owned(),
+        );
+    }
+    let patch = fields.next().expect("missing patch");
+    assert!(fields.next().is_none(), "unexpected NUL in patch");
+    let patch = std::str::from_utf8(patch).expect("source diff UTF-8");
+    let mut sections = Vec::new();
+    let mut start = 0;
+    for (offset, _) in patch.match_indices("\ndiff --git ") {
+        sections.push(&patch[start..offset + 1]);
+        start = offset + 1;
+    }
+    sections.push(&patch[start..]);
+    assert_eq!(selected.len(), sections.len(), "raw/patch section mismatch");
+    selected
+        .into_iter()
+        .zip(sections)
+        .flat_map(|(path, section)| {
+            assert!(section.starts_with("diff --git "), "missing patch header");
+            added_rows(section)
+                .into_iter()
+                .map(move |(_, line)| (path.clone(), line))
         })
         .collect()
 }
@@ -1020,6 +1070,41 @@ mod tests {
             0
         );
         assert_eq!(sources.added_occurrences(Some(base.trim()), &pattern), 7);
+    }
+
+    #[test]
+    fn wire_delta_preserves_global_rename_pairing_and_quoted_path_identity() {
+        let root = fixture();
+        let old = "old \"source\".txt";
+        let new = "new\t source.txt";
+        let initial = format!("needle\n{}old\n", "unchanged row\n".repeat(20));
+        std::fs::write(root.path().join(old), &initial).unwrap();
+        git(root.path(), &["add", old]);
+        git(
+            root.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "rename preimage",
+            ],
+        );
+        let base = String::from_utf8(git(root.path(), &["rev-parse", "HEAD"])).unwrap();
+        git(root.path(), &["mv", old, new]);
+        std::fs::write(
+            root.path().join(new),
+            initial.replace("old\n", "new needle\n"),
+        )
+        .unwrap();
+        let sources = SourceSet::load_input(root.path(), None, None);
+        assert_eq!(sources.added_occurrences(Some(base.trim()), "needle"), 1);
+        assert_eq!(sources.added_occurrences(None, "needle"), 1);
+        assert_eq!(sources.full_occurrences("needle"), 2);
     }
 
     fn residue_fixture(root: &Path) -> SourceSet {
