@@ -3246,20 +3246,30 @@ impl ProviderLifetime {
         format!(
             r#"while IFS= read -r command; do
   case "$command" in
-    probe) printf 'PROVIDER_LIFETIME_HELD\n' ;;
+    probe:*) printf '%s' "${{command#probe:}}" > {} ; printf 'PROVIDER_LIFETIME_HELD\n' ;;
     release) exit 0 ;;
     *) exit 92 ;;
   esac
 done < {}
 exit 93"#,
+            shell_single_quote(&path_string(&self.path.with_extension("probe"))),
             shell_single_quote(&path_string(&self.path))
         )
     }
 
     fn probe(&mut self, fd: RawFd) {
-        self.control.write_all(b"probe\n").unwrap();
-        let output = read_until(fd, "PROVIDER_LIFETIME_HELD", Duration::from_secs(5));
-        assert!(output.contains("PROVIDER_LIFETIME_HELD"), "{output:?}");
+        // Differential TUI paint can reuse unchanged cells inside the marker.
+        // Only the provider consuming this fresh FIFO challenge may acknowledge it.
+        let nonce = Uuid::new_v4().to_string();
+        writeln!(self.control, "probe:{nonce}").unwrap();
+        let response = read_pty_until_file_occurrences(
+            fd,
+            &self.path.with_extension("probe"),
+            &nonce,
+            1,
+            Duration::from_secs(5),
+        );
+        assert_eq!(response, nonce);
     }
 
     fn release(&mut self) {

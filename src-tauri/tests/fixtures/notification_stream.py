@@ -65,7 +65,12 @@ with open(received, "wb", buffering=0) as output:
         while b"\n" in commands:
             command, _, rest = commands.partition(b"\n")
             commands[:] = rest
-            if command == b"probe":
+            if command.startswith(b"probe:"):
+                nonce = command.removeprefix(b"probe:")
+                if len(nonce) != 36:
+                    raise RuntimeError("invalid lifetime probe nonce")
+                with open(control_path + ".probe", "wb") as response:
+                    response.write(nonce)
                 print("PROVIDER_LIFETIME_HELD", flush=True)
             elif command == b"release":
                 stage(1)
