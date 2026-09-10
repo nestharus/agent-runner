@@ -67,6 +67,14 @@ fn prepare_wake_start_context_with_db<'a>(
     claim_token: &str,
     mut db: MailboxDb,
 ) -> Result<WakeStartContext<'a>, WakeDiagnostic> {
+    if let Some(stop) = db
+        .mailbox_observation_stop(input.session_id)
+        .map_err(storage_error_diagnostic)?
+    {
+        let mut diagnostic = WakeDiagnostic::status("observation_stopped");
+        diagnostic.message = Some(format!("stop_id={}: {}", stop.stop_id, stop.error));
+        return Err(diagnostic);
+    }
     let runtime =
         session_metadata_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
     let input = normalize_start_wake_input(input, runtime.as_ref());
@@ -209,6 +217,136 @@ mod tests {
     use super::*;
     use crate::wake_coordinator::consumed_completion::ConsumedCompletionFixture;
     use oulipoly_state::mailbox::{SessionMetadataUpsert, WakeClaimRequest};
+
+    #[test]
+    fn stopped_observation_rejects_notify_retry_and_restart_sweep_without_claim_takeover() {
+        let fixture = ConsumedCompletionFixture::new();
+        let session = ConsumedCompletionFixture::SESSION_ID;
+        let mut db = fixture.mailbox();
+        let rows = db.list_pending(session).unwrap();
+        let seq = rows[0].seq;
+        db.register_headless_delivery_attempt(
+            "stopped-attempt",
+            session,
+            None,
+            "native",
+            &[seq],
+            0,
+        )
+        .unwrap();
+        let claim = db
+            .wake_sessions()
+            .try_acquire_startable_wake_claim(
+                WakeClaimRequest {
+                    session_id: session,
+                    claim_token: "existing-owner",
+                    reason: "notify_idle",
+                    auto_wake_count: 1,
+                    wake_invocation_uuid: None,
+                    stale_after_seconds: 600,
+                },
+                None,
+            )
+            .unwrap();
+        assert!(matches!(claim, WakeClaimAcquireResult::Acquired(_)));
+        db.stop_mailbox_observation(
+            session,
+            "stopped-attempt",
+            "session_turn_staging_capacity_exceeded",
+            "capacity exhausted",
+        )
+        .unwrap();
+        let stop = db.mailbox_observation_stop(session).unwrap().unwrap();
+        drop(db);
+        for reason in [
+            "notify_idle",
+            "wake_failure_retry",
+            "process_start",
+            "maintenance_tick",
+        ] {
+            let diagnostic = match prepare_wake_start_context_with_db(
+                StartWakeInput {
+                    session_id: session,
+                    reason,
+                    auto_wake_count: 2,
+                    renew_token: Some("existing-owner"),
+                },
+                "replacement-owner",
+                fixture.mailbox(),
+            ) {
+                Err(diagnostic) => diagnostic,
+                Ok(_) => panic!("fixed failure must not reach spawn"),
+            };
+            assert_eq!(diagnostic.status, "observation_stopped");
+            assert!(!diagnostic.attempted);
+            assert!(diagnostic.message.unwrap().contains(&stop.stop_id));
+            let mut db = fixture.mailbox();
+            let denied = db
+                .wake_sessions()
+                .try_acquire_startable_wake_claim(
+                    WakeClaimRequest {
+                        session_id: session,
+                        claim_token: "replacement-owner",
+                        reason,
+                        auto_wake_count: 2,
+                        wake_invocation_uuid: None,
+                        stale_after_seconds: 0,
+                    },
+                    Some("existing-owner"),
+                )
+                .unwrap();
+            assert!(matches!(denied, WakeClaimAcquireResult::NoPending));
+            assert_eq!(
+                db.wake_session_reader()
+                    .wake_claim(session)
+                    .unwrap()
+                    .unwrap()
+                    .claim_token,
+                "existing-owner"
+            );
+            assert_eq!(db.list_pending(session).unwrap().len(), 1);
+            assert_eq!(
+                db.completion_event_listeners(ConsumedCompletionFixture::EVENT_ID)
+                    .unwrap()[0]
+                    .acknowledgement_reason,
+                None
+            );
+        }
+        let mut db = fixture.mailbox();
+        db.rearm_mailbox_observation(session, &stop.stop_id, "capacity restored and validated")
+            .unwrap();
+        // Rearm neither steals the live claim nor acknowledges the listener.
+        assert_eq!(
+            db.wake_session_reader()
+                .wake_claim(session)
+                .unwrap()
+                .unwrap()
+                .claim_token,
+            "existing-owner"
+        );
+        assert!(
+            !db.wake_sessions()
+                .release_wake_claim(session, "wrong-owner")
+                .unwrap()
+        );
+        assert!(
+            db.wake_sessions()
+                .release_wake_claim(session, "existing-owner")
+                .unwrap()
+        );
+        let context = prepare_wake_start_context_with_db(
+            StartWakeInput {
+                session_id: session,
+                reason: "notify_idle",
+                auto_wake_count: 2,
+                renew_token: None,
+            },
+            "rearmed-owner",
+            db,
+        )
+        .unwrap_or_else(|d| panic!("rearm rejected: {}", d.status));
+        assert_eq!(context.claim.claim_token, "rearmed-owner");
+    }
 
     #[test]
     fn maximum_persisted_count_acquires_exact_wake_claim() {

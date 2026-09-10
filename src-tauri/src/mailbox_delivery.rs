@@ -1102,6 +1102,12 @@ pub(crate) fn prepare_headless_resume_delivery_on(
     answer: Option<String>,
     submitted_seq: Option<i64>,
 ) -> Result<PreparedMailboxDelivery, String> {
+    if let Some(stop) = db.mailbox_observation_stop(session_id)? {
+        return Err(format!(
+            "mailbox_observation_stopped stop_id={}: {}",
+            stop.stop_id, stop.error
+        ));
+    }
     // A submission receipt is authority for this exact input, never for the
     // paused notification backlog. Use the normal nonce/ACK delivery path.
     if let Some(seq) = submitted_seq {
@@ -1154,7 +1160,9 @@ pub(crate) fn deliverable_pending_count_on(
     session_id: &str,
 ) -> Result<usize, String> {
     reconcile_confirmed_headless_deliveries_on(db, state, session_id)?;
-    if notifications_paused_on(db, session_id)? {
+    if notifications_paused_on(db, session_id)?
+        || db.mailbox_observation_stop(session_id)?.is_some()
+    {
         return Ok(0);
     }
     pending_mailbox_row_count(db, session_id)

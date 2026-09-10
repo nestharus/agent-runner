@@ -188,7 +188,43 @@ fn map_client_error(error: ProviderClientError) -> SessionProviderError {
         ProviderClientError::ProviderCapability(capability) => SessionProviderError::new(
             capability.error().code.clone(),
             capability.error().message.clone(),
-        ),
+        )
+        .with_retryable(capability.error().retryable),
         _ => SessionProviderError::new(error.transport_kind().to_string(), error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod observation_error_mapping_tests {
+    use super::*;
+    use oulipoly_provider::error::{ProviderCapabilityError, ProviderDiagnostics};
+
+    #[test]
+    fn observation_error_mapping_preserves_provider_retryability() {
+        for retryable in [false, true] {
+            let capability = ProviderCapabilityError::from_valid_envelope(
+                "session",
+                serde_json::json!({
+                    "contract": "oulipoly.provider/v1",
+                    "request_id": "offline-observation",
+                    "ok": false,
+                    "error": {
+                        "category": "unsupported",
+                        "code": "session_turn_staging_capacity_exceeded",
+                        "message": "checkpoint retained; operator intervention required",
+                        "retryable": retryable
+                    }
+                }),
+                ProviderDiagnostics::default(),
+                None,
+            )
+            .unwrap();
+            let error = map_client_error(ProviderClientError::from_capability(capability));
+            assert_eq!(
+                error.fixed_observation_stop_reason(),
+                (!retryable).then_some("session_turn_staging_capacity_exceeded")
+            );
+            assert!(error.to_string().contains("checkpoint retained"));
+        }
     }
 }

@@ -469,6 +469,19 @@ pub(crate) enum MailboxSubcommands {
         #[arg(long)]
         json: bool,
     },
+    /// Rearm a fixed observation stop after resolving its cause. Does not ACK or launch.
+    RearmObservation {
+        #[arg(long = "session-id")]
+        session_id: String,
+        /// Exact active stop ID from mailbox status.
+        #[arg(long)]
+        stop_id: String,
+        /// Operator attestation describing the resolved cause and verification evidence.
+        #[arg(long)]
+        cause_resolved: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Pause proactive notification delivery while continuing to enqueue rows.
     Pause {
         /// Provider session id.
@@ -632,4 +645,42 @@ pub(crate) enum SessionSubcommands {
         #[arg(long = "preimage-sha256")]
         preimage_sha256: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod observation_rearm_cli_tests {
+    use super::*;
+
+    #[test]
+    fn observation_rearm_requires_exact_stop_and_resolution_separate_from_resume() {
+        let base = [
+            "runner",
+            "mailbox",
+            "rearm-observation",
+            "--session-id",
+            "session",
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--stop-id", "stop"])).is_err());
+        let cli = Cli::try_parse_from(base.into_iter().chain([
+            "--stop-id",
+            "stop",
+            "--cause-resolved",
+            "capacity restored and verified",
+            "--json",
+        ]))
+        .unwrap();
+        assert!(matches!(cli.command, Some(Subcommands::Mailbox {
+            command: MailboxSubcommands::RearmObservation { session_id, stop_id, cause_resolved, json: true }
+        }) if session_id == "session" && stop_id == "stop" && cause_resolved == "capacity restored and verified"));
+        let ordinary =
+            Cli::try_parse_from(["runner", "mailbox", "resume", "--session-id", "session"])
+                .unwrap();
+        assert!(matches!(
+            ordinary.command,
+            Some(Subcommands::Mailbox {
+                command: MailboxSubcommands::Resume { .. }
+            })
+        ));
+    }
 }

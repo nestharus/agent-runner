@@ -205,6 +205,7 @@ pub struct SessionProviderEnumerateResult {
 pub struct SessionProviderError {
     token: String,
     message: String,
+    retryable: Option<bool>,
 }
 
 impl SessionProviderError {
@@ -212,7 +213,21 @@ impl SessionProviderError {
         Self {
             token: token.into(),
             message: message.into(),
+            retryable: None,
         }
+    }
+
+    pub(crate) fn with_retryable(mut self, retryable: bool) -> Self {
+        self.retryable = Some(retryable);
+        self
+    }
+
+    /// Only recognized, explicitly non-retryable paging refusals stop headless work.
+    /// Message text and unrelated provider error codes carry no stop authority.
+    pub fn fixed_observation_stop_reason(&self) -> Option<&'static str> {
+        (self.retryable == Some(false))
+            .then(|| super::fixed_paging_stop_reason(&self.token))
+            .flatten()
     }
 
     pub(crate) fn token(&self) -> &str {
@@ -242,4 +257,42 @@ pub struct NoRefProofRequest<'a> {
     pub session_id: &'a str,
     pub invocation_row_id: i64,
     pub invocation_uuid: &'a str,
+}
+
+#[cfg(test)]
+mod observation_stop_tests {
+    use super::SessionProviderError;
+
+    #[test]
+    fn fixed_observation_stop_requires_typed_code_and_explicit_nonretryable() {
+        for code in [
+            "session_turn_staging_capacity_exceeded",
+            "session_turn_paging_paused",
+            "session_turn_page_budget_too_small",
+            "session_turn_record_ceiling_exceeded",
+            "codex_rollout_capacity",
+        ] {
+            let error = SessionProviderError::new(code, "operator intervention required");
+            assert_eq!(error.fixed_observation_stop_reason(), None);
+            assert_eq!(
+                error
+                    .clone()
+                    .with_retryable(true)
+                    .fixed_observation_stop_reason(),
+                None
+            );
+            assert_eq!(
+                error.with_retryable(false).fixed_observation_stop_reason(),
+                Some(code)
+            );
+        }
+        for token in ["provider_io", "timeout", "other_capacity", "exit_3"] {
+            let error = SessionProviderError::new(
+                token,
+                "session_turn_staging_capacity_exceeded: retryable=false",
+            )
+            .with_retryable(false);
+            assert_eq!(error.fixed_observation_stop_reason(), None);
+        }
+    }
 }

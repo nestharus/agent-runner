@@ -36,6 +36,7 @@ struct MailboxArtifacts {
 struct MailboxStatusResponse {
     session_id: String,
     paused: bool,
+    observation_stop: Option<oulipoly_state::mailbox::MailboxObservationStop>,
     pending_count: usize,
     deliverable_count: usize,
     min_pending_seq: Option<i64>,
@@ -171,6 +172,7 @@ fn mailbox_status(session_id: &str) -> Result<MailboxStatusResponse, String> {
         return Ok(MailboxStatusResponse {
             session_id: session_id.to_string(),
             paused: false,
+            observation_stop: None,
             pending_count: 0,
             deliverable_count: 0,
             min_pending_seq: None,
@@ -185,6 +187,7 @@ fn mailbox_status(session_id: &str) -> Result<MailboxStatusResponse, String> {
     Ok(MailboxStatusResponse {
         session_id: session_id.to_string(),
         paused,
+        observation_stop: db.mailbox_observation_stop(session_id)?,
         pending_count: pending.len(),
         deliverable_count,
         min_pending_seq,
@@ -205,6 +208,12 @@ fn render_status(response: &MailboxStatusResponse, json: bool) -> Result<(), Str
             optional_seq(response.min_pending_seq),
             optional_seq(response.max_pending_seq)
         );
+        if let Some(stop) = &response.observation_stop {
+            println!(
+                "observation_stopped stop_id={} attempt_id={} reason={} error={}",
+                stop.stop_id, stop.attempt_id, stop.reason, stop.error
+            );
+        }
         Ok(())
     }
 }
@@ -479,4 +488,20 @@ fn print_json(value: &impl Serialize) -> Result<(), String> {
         .map_err(|err| format!("Failed to serialize mailbox JSON: {err}"))?;
     println!("{rendered}");
     Ok(())
+}
+
+pub(crate) fn run_rearm_observation(
+    session_id: &str,
+    stop_id: &str,
+    resolution: &str,
+    json: bool,
+) -> Result<i32, String> {
+    let db = MailboxDb::open_default()?;
+    db.rearm_mailbox_observation(session_id, stop_id, resolution)?;
+    if json {
+        print_json(&serde_json::json!({"session_id": session_id, "rearmed_stop_id": stop_id}))?;
+    } else {
+        println!("session={session_id} rearmed_stop_id={stop_id}; no ACK or launch performed");
+    }
+    Ok(0)
 }

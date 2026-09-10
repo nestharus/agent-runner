@@ -1270,6 +1270,15 @@ enum BoundedMailboxRowsError {
     Row(rusqlite::Error),
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MailboxObservationStop {
+    pub stop_id: String,
+    pub attempt_id: String,
+    pub reason: String,
+    pub error: String,
+    pub stopped_at: String,
+}
+
 impl MailboxDb {
     pub fn path_for_state_db(state_db_path: &Path) -> PathBuf {
         if state_db_path.file_name() == Some(std::ffi::OsStr::new("state.db")) {
@@ -3236,6 +3245,93 @@ impl MailboxDb {
         }
     }
 
+    /// Retain a fixed observation failure separately from pause and delivery/ACK state.
+    /// The attempt/session join prevents a stale or foreign attempt stopping another owner.
+    pub fn stop_mailbox_observation(
+        &self,
+        session_id: &str,
+        attempt_id: &str,
+        reason: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "INSERT INTO mailbox_observation_stops
+             (stop_id, session_id, attempt_id, reason, error, stopped_at)
+             SELECT ?1, session_id, attempt_id, ?4, ?5, ?6 FROM mailbox_delivery_attempts
+             WHERE session_id = ?2 AND attempt_id = ?3 AND resolved_at IS NULL
+               AND observation_confirmed_at IS NULL AND acknowledged_at IS NULL
+             ON CONFLICT(session_id) WHERE rearmed_at IS NULL DO NOTHING",
+                params![
+                    Uuid::new_v4().to_string(),
+                    session_id,
+                    attempt_id,
+                    reason,
+                    truncate_utf8(error, 1024),
+                    now_rfc3339()
+                ],
+            )
+            .map_err(|err| format!("Failed to stop mailbox observation: {err}"))?;
+        if changed == 0 && self.mailbox_observation_stop(session_id)?.is_none() {
+            return Err("observation stop requires an unresolved owned delivery attempt".into());
+        }
+        Ok(())
+    }
+
+    pub fn mailbox_observation_stop(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<MailboxObservationStop>, String> {
+        self.conn
+            .query_row(
+                "SELECT stop_id, attempt_id, reason, error, stopped_at
+             FROM mailbox_observation_stops WHERE session_id = ?1 AND rearmed_at IS NULL",
+                params![session_id],
+                |row| {
+                    Ok(MailboxObservationStop {
+                        stop_id: row.get(0)?,
+                        attempt_id: row.get(1)?,
+                        reason: row.get(2)?,
+                        error: row.get(3)?,
+                        stopped_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| format!("Failed to read observation stop: {err}"))
+    }
+
+    /// Explicit operator attestation, not an ACK or a claim takeover. A stale
+    /// stop ID cannot clear a subsequent failure, even for the same cause.
+    pub fn rearm_mailbox_observation(
+        &self,
+        session_id: &str,
+        stop_id: &str,
+        resolution: &str,
+    ) -> Result<(), String> {
+        if resolution.trim().is_empty() {
+            return Err("cause resolution is required".into());
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE mailbox_observation_stops SET rearmed_at = ?3, resolution = ?4
+             WHERE session_id = ?1 AND stop_id = ?2 AND rearmed_at IS NULL",
+                params![
+                    session_id,
+                    stop_id,
+                    now_rfc3339(),
+                    truncate_utf8(resolution, 1024)
+                ],
+            )
+            .map_err(|err| format!("Failed to rearm mailbox observation: {err}"))?;
+        if changed != 1 {
+            return Err("active observation stop ID did not match; no rearm".into());
+        }
+        Ok(())
+    }
+
     pub fn notifications_paused(&self, session_id: &str) -> Result<bool, String> {
         self.conn
             .query_row(
@@ -3562,6 +3658,11 @@ impl MailboxDb {
             .map_err(|err| {
                 format!("Failed to start mailbox delivery attempt transaction: {err}")
             })?;
+        if headless && mailbox_observation_stopped_on(&tx, session_id)? {
+            return Err(
+                "mailbox observation stopped; explicit cause-resolved rearm required".into(),
+            );
+        }
         if explicit_input {
             validate_explicit_input_delivery_on(&tx, session_id, chain_id, seqs[0])?;
         }
@@ -3703,6 +3804,8 @@ impl MailboxDb {
              WHERE attempt_id = ?1 AND session_id = ?2 AND delivery_invocation_uuid = ?3
                AND resolved_at IS NULL AND submission_started_at IS NULL
                AND headless_submission_state = 'prepared'
+               AND NOT EXISTS (SELECT 1 FROM mailbox_observation_stops
+                   WHERE session_id = ?2 AND rearmed_at IS NULL)
                AND (?5 = 0 OR observation_anchor_token IS NOT NULL)",
                 params![
                     attempt_id,
@@ -5194,7 +5297,9 @@ impl WakeSessionRepository<'_> {
             commit_empty_wake_claim_transaction(tx)?;
             return Ok(WakeClaimAcquireResult::Busy);
         }
-        if wake_claim_notifications_paused_tx(&tx, input.session_id)? {
+        if wake_claim_notifications_paused_tx(&tx, input.session_id)?
+            || mailbox_observation_stopped_on(&tx, input.session_id)?
+        {
             commit_empty_wake_claim_transaction(tx)?;
             return Ok(WakeClaimAcquireResult::NoPending);
         }
@@ -5498,7 +5603,10 @@ impl WakeSessionRepository<'_> {
                 .map_err(|err| format!("Failed to commit replayed wake-child admission: {err}"))?;
             return Ok(replay_matches);
         }
-        if observed_busy || wake_claim_runtime_is_busy_tx(&tx, session_id)? {
+        if observed_busy
+            || wake_claim_runtime_is_busy_tx(&tx, session_id)?
+            || mailbox_observation_stopped_on(&tx, session_id)?
+        {
             tx.execute(
                 "DELETE FROM session_wake_claim
                  WHERE session_id = ?1
@@ -18016,5 +18124,86 @@ mod tests {
         stmt.query_map([], |row| row.get::<_, String>(1))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
+    }
+}
+
+fn mailbox_observation_stopped_on(conn: &Connection, session_id: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mailbox_observation_stops
+        WHERE session_id = ?1 AND rearmed_at IS NULL)",
+        params![session_id],
+        |row| row.get(0),
+    )
+    .map_err(|err| format!("Failed to read mailbox observation stop: {err}"))
+}
+
+#[cfg(test)]
+mod observation_stop_history_tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_v13_upgrade_and_rearm_keep_failure_history_and_fence_stale_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pid-identity.db");
+        {
+            let db = MailboxDb::open(&path).unwrap();
+            // Exact prior schema: v14 adds only the independent stop-history table.
+            db.conn
+                .execute_batch("DROP TABLE mailbox_observation_stops; PRAGMA user_version = 13;")
+                .unwrap();
+        }
+        let mut db = MailboxDb::open(&path).unwrap();
+        let EnqueueResult::Inserted(row) = db
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "session",
+                handle: "work",
+                payload_json: "{}",
+                owner_invocation_uuid: Some("owner"),
+                matched_os_pid: None,
+                matched_os_boot_id: None,
+                matched_os_pid_starttime_ticks: None,
+                matched_chain_index: None,
+                state_dir: "/offline",
+                meta_path: "/offline/meta",
+                log_path: "/offline/log",
+                rc_path: "/offline/rc",
+                rc: 0,
+            })
+            .unwrap()
+        else {
+            panic!("missing fixture row")
+        };
+        db.register_headless_delivery_attempt("attempt", "session", None, "native", &[row.seq], 0)
+            .unwrap();
+        assert!(
+            db.stop_mailbox_observation("foreign", "attempt", "capacity", "error")
+                .is_err()
+        );
+        db.stop_mailbox_observation("session", "attempt", "capacity", "causal error")
+            .unwrap();
+        let old = db.mailbox_observation_stop("session").unwrap().unwrap();
+        db.rearm_mailbox_observation("session", &old.stop_id, "restored capacity evidence")
+            .unwrap();
+        db.stop_mailbox_observation("session", "attempt", "capacity", "new exhaustion")
+            .unwrap();
+        let current = db.mailbox_observation_stop("session").unwrap().unwrap();
+        assert_ne!(old.stop_id, current.stop_id);
+        assert!(
+            db.rearm_mailbox_observation("session", &old.stop_id, "stale resolution")
+                .is_err()
+        );
+        let retained: (String, String, String) = db.conn.query_row(
+            "SELECT error, rearmed_at, resolution FROM mailbox_observation_stops WHERE stop_id = ?1",
+            params![old.stop_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(retained.0, "causal error");
+        assert!(!retained.1.is_empty());
+        assert_eq!(retained.2, "restored capacity evidence");
+        assert_eq!(db.list_pending("session").unwrap().len(), 1);
+        assert!(
+            db.delivery_observation_confirmation("attempt")
+                .unwrap()
+                .is_none()
+        );
     }
 }

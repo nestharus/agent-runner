@@ -1220,6 +1220,37 @@ relies on the operator's truthful resolution attestation; it does not itself
 install a provider, free storage, or rearm the canonical ingestion stream.
 
 
+Headless mailbox observation uses a **durable stop** for these same recognized
+codes when the typed provider error explicitly reports `retryable=false`.
+Pre-submission anchor failures and post-submission observation failures retain
+pending notifications, delivery attempts, checkpoints and ACK evidence. Routine
+wake retry, startup sweep, new notifications, manual resume and mailbox
+pause/resume do not clear this stop. Other errors retain existing retry behavior;
+nonzero exits and arbitrary error-message text do not establish a fixed stop.
+
+After separately authorized cause resolution, inspect `mailbox status --session-id
+<session> --json` for `observation_stop` (stop ID, attempt, reason, causal error),
+then use:
+
+```bash
+oulipoly-agent-runner mailbox rearm-observation --session-id <session> \
+  --stop-id <exact-active-stop-id> \
+  --cause-resolved "<what was restored and the verification evidence>"
+```
+
+This records the operator's resolution attestation against that exact stop ID;
+it does not prove capacity restoration, ACK anything, clear notification pause,
+steal a wake claim, launch a provider or rearm canonical/PTY consumers. Stop and
+resolution history remain in the sidecar. A stale stop ID cannot clear a new
+failure. After rearm, use the supported `resume --session-id <session>` with the
+session's appropriate saved model/configuration, or let ordinary eligible wake
+demand proceed. If notifications were separately paused, separately authorized
+`mailbox resume` is still required. Possibly submitted attempts are observed from
+the retained anchor/checkpoint, never blindly resubmitted. Unsubmitted work may
+prepare once under the normal submission fence. Actual receipt evidence is still
+required for settlement; a still-refusing provider stops again. Do not ACK pending
+notifications as a workaround for a capacity or observation failure.
+
 Outbound observation keeps its pre-send tail position through body and submit
 input drainage. The anchor is released after the message becomes sent, not
 replaced by a new tail. Each observer read reserves one delivery slot until the

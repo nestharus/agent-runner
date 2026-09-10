@@ -183,6 +183,18 @@ fn read_paired(
     index: u64,
     sequence: u64,
 ) -> Result<SessionProviderReadPageResult, String> {
+    read_paired_typed(root, registry, nonce, cursor, index, sequence).map_err(|err| err.to_string())
+}
+
+fn read_paired_typed(
+    root: &Path,
+    registry: &ProviderRegistry,
+    nonce: &str,
+    cursor: SessionProviderPageCursor,
+    index: u64,
+    sequence: u64,
+) -> Result<SessionProviderReadPageResult, oulipoly_runtime::session_provider::SessionProviderError>
+{
     let cancellation = CancellationToken::new();
     read_turn_page(SessionProviderReadPageRequest {
         registry,
@@ -201,7 +213,6 @@ fn read_paired(
         cancellation: &cancellation,
         timeout: Duration::from_secs(5),
     })
-    .map_err(|err| err.to_string())
 }
 
 fn write_proxy(root: &Path, binary: &str) -> PathBuf {
@@ -540,3 +551,77 @@ fn restart_in_fresh_runner_process(root: &Path) {
 
 #[path = "observation_paired_boundaries.rs"]
 mod boundaries;
+
+#[test]
+#[ignore = "requires explicit freshly source-built candidate provider; offline only"]
+fn age353_paired_typed_anchor_stop_explicit_rearm_and_transient_control() {
+    let mut p = Paired::new();
+    p.set_mode("capacity_error");
+    let error = read_paired_typed(
+        p.f.root.path(),
+        &p.registry,
+        &p.f.attempt,
+        SessionProviderPageCursor::Tail,
+        0,
+        0,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.fixed_observation_stop_reason(),
+        Some("session_turn_staging_capacity_exceeded")
+    );
+    let message = retain_observation_failure(&p.f.db, SESSION, &p.f.attempt, error);
+    p.f.db
+        .record_delivery_observation_anchor_failure(&p.f.attempt, SESSION, &message)
+        .unwrap();
+    let stop = p.f.db.mailbox_observation_stop(SESSION).unwrap().unwrap();
+    p.restart();
+    p.set_mode("normal"); // storage restoration is not automatic rearm authority
+    assert!(
+        prepare_headless_resume_delivery_on(&mut p.f.db, SESSION, "chain", None, None).is_err()
+    );
+    assert_eq!(p.f.submissions, 0);
+    assert_eq!(p.f.db.list_pending(SESSION).unwrap().len(), 1);
+    p.f.db
+        .rearm_mailbox_observation(SESSION, &stop.stop_id, "fixture refusal disabled")
+        .unwrap();
+    p.set_mode("transient_error");
+    let error = read_paired_typed(
+        p.f.root.path(),
+        &p.registry,
+        &p.f.attempt,
+        SessionProviderPageCursor::Tail,
+        0,
+        0,
+    )
+    .unwrap_err();
+    assert_eq!(error.fixed_observation_stop_reason(), None);
+    retain_observation_failure(&p.f.db, SESSION, &p.f.attempt, error);
+    assert!(p.f.db.mailbox_observation_stop(SESSION).unwrap().is_none());
+    p.set_mode("normal");
+    p.anchor_and_submit();
+    assert!(p.f.submit().is_err());
+    p.append("user", &p.f.envelope);
+    assert!(
+        confirm_delivery_observation(
+            &p.f.db,
+            &p.f.attempt,
+            &p.registry,
+            identity(p.f.root.path()),
+            p.f.root.path(),
+            &p.f.anchor
+        )
+        .unwrap()
+    );
+    p.restart();
+    assert_eq!(
+        deliverable_pending_count_on(&mut p.f.db, &p.f.state, SESSION).unwrap(),
+        0
+    );
+    assert_eq!(
+        p.f.db.list_mailbox(SESSION, true).unwrap()[0].delivery_attempts,
+        1
+    );
+    assert_eq!(p.f.submissions, 1);
+    p.assert_staging_untouched();
+}

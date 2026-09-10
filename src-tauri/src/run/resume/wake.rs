@@ -105,6 +105,7 @@ pub(super) fn reconcile_pending_headless_delivery_observations(
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
+    ensure_observation_not_stopped(&db, &resolved.active_session_id)?;
     prepare_legacy_observation_recovery(&db, resolved)?;
     let registry = agent_runtime_services.provider_registry_handle.current();
     for pending in db.pending_delivery_observations(
@@ -244,6 +245,7 @@ fn persist_pre_delivery_observation_anchor(
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Err("mailbox sidecar missing while anchoring headless delivery".to_string());
     };
+    ensure_observation_not_stopped(&db, input.mailbox_session_id)?;
     if db.delivery_observation_anchor(attempt_id)?.is_some() {
         return Ok(());
     }
@@ -300,7 +302,18 @@ fn capture_pre_delivery_observation_anchor(
         cancellation: &cancellation,
         timeout: OBSERVATION_TIMEOUT,
     })
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| {
+        let db = MailboxDb::open_default_if_exists();
+        match db {
+            Ok(Some(db)) => {
+                retain_observation_failure(&db, input.mailbox_session_id, attempt_id, error)
+            }
+            Ok(None) => {
+                format!("{error}; mailbox sidecar missing while retaining observation failure")
+            }
+            Err(storage) => format!("{error}; {storage}"),
+        }
+    })?;
     let resume_token = page
         .resume_token
         .ok_or_else(|| "mailbox_delivery_observation_anchor_missing".to_string())?;
@@ -540,6 +553,7 @@ fn confirm_delivery_observation(
     effective_cwd: &std::path::Path,
     anchor: &MailboxDeliveryObservationAnchor,
 ) -> Result<bool, String> {
+    ensure_observation_not_stopped(db, &anchor.provider_session_id)?;
     let cancellation = CancellationToken::new();
     observe_delivery_with(
         db,
@@ -563,7 +577,9 @@ fn confirm_delivery_observation(
                 cancellation: &cancellation,
                 timeout: remaining.min(OBSERVATION_TIMEOUT),
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                retain_observation_failure(db, &anchor.provider_session_id, attempt_id, error)
+            })
         },
     )
 }
@@ -585,6 +601,7 @@ fn observe_delivery_with(
         String,
     >,
 ) -> Result<bool, String> {
+    ensure_observation_not_stopped(db, &anchor.provider_session_id)?;
     if db.delivery_observation_confirmation(attempt_id)?.is_some() {
         return Ok(true);
     }
@@ -844,3 +861,29 @@ pub(super) fn settle_clean_exit_mailbox_delivery_outcome(
 #[cfg(test)]
 #[path = "observation_tests.rs"]
 mod observation_tests;
+
+fn ensure_observation_not_stopped(db: &MailboxDb, session_id: &str) -> Result<(), String> {
+    if let Some(stop) = db.mailbox_observation_stop(session_id)? {
+        return Err(format!(
+            "mailbox_observation_stopped stop_id={}: {}",
+            stop.stop_id, stop.error
+        ));
+    }
+    Ok(())
+}
+
+fn retain_observation_failure(
+    db: &MailboxDb,
+    session_id: &str,
+    attempt_id: &str,
+    error: oulipoly_runtime::session_provider::SessionProviderError,
+) -> String {
+    let message = error.to_string();
+    if let Some(reason) = error.fixed_observation_stop_reason() {
+        if let Err(storage) = db.stop_mailbox_observation(session_id, attempt_id, reason, &message)
+        {
+            return format!("{message}; {storage}");
+        }
+    }
+    message
+}
