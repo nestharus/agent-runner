@@ -33,7 +33,7 @@ fn high_weekly_account_stops_winning_after_cumulative_turns() {
 }
 
 #[test]
-fn compute_projections_with_context_refreshes_stale_quota_and_scans_sessions() {
+fn compute_projections_with_context_refreshes_stale_quota_without_scanning_sessions() {
     let db = StateDb::open(Path::new(":memory:")).unwrap();
     let model = two_provider_model();
     let resets = (Utc::now() + Duration::hours(48)).to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -41,21 +41,16 @@ fn compute_projections_with_context_refreshes_stale_quota_and_scans_sessions() {
         "printf '%s' '{{\"windows\":[{{\"used_percent\":25,\"resets_at\":\"{resets}\"}}]}}'"
     );
     let providers_cfg = providers_config_with_scripts(&[("a", quota_script.as_str())]);
-    let sessions_cfg = sessions_config_with_scripts(&[(
-        "a",
-        "printf '%s\n' '{\"session_id\":\"a-session\",\"turn_id\":\"turn-1\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"role\":\"assistant\"}'",
-    )]);
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 
     let projections = compute_projections(&model, &db, Some(&ctx));
 
     assert_eq!(db.get_windows("a").unwrap().len(), 1);
-    assert_eq!(db.count_assistant_turns_since("a", None).unwrap(), 1);
+    assert_eq!(db.count_assistant_turns_since("a", None).unwrap(), 0);
     assert_eq!(
         projections
             .iter()
@@ -69,18 +64,16 @@ fn compute_projections_with_context_refreshes_stale_quota_and_scans_sessions() {
 }
 
 #[test]
-fn compute_projections_with_context_swallows_refresh_and_scan_failures() {
+fn compute_projections_with_context_swallows_quota_refresh_failures() {
     let db = StateDb::open(Path::new(":memory:")).unwrap();
     let model = two_provider_model();
     seed_windows_with_deltas(&db, "a", &[(0.20, 24, 0.01, 10)]);
     db.set_refreshed_at_for_test("a", &(Utc::now() - Duration::days(30)))
         .unwrap();
     let providers_cfg = providers_config_with_scripts(&[("a", "exit 1")]);
-    let sessions_cfg = sessions_config_with_scripts(&[("a", "exit 1")]);
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 
@@ -94,6 +87,30 @@ fn compute_projections_with_context_swallows_refresh_and_scan_failures() {
     assert!(projection.binding_score.is_some());
     assert_eq!(db.count_assistant_turns_since("a", None).unwrap(), 0);
     assert_approx(db.get_windows("a").unwrap()[0].used_percent, 0.20, 1e-12);
+}
+
+#[test]
+fn compute_projections_exposes_lagging_turn_count_and_withholds_density_score() {
+    let db = StateDb::open(Path::new(":memory:")).unwrap();
+    let model = two_provider_model();
+    seed_windows_with_deltas(&db, "a", &[(0.10, 24, 0.01, 10)]);
+    let lagging = oulipoly_state::SessionTurnIngestStreamKey {
+        provider_name: "a".to_string(),
+        provider_instance_id: "a".to_string(),
+        settings_id: "balancer-test-settings".to_string(),
+        session_id: "a-lagging-session".to_string(),
+        projection: oulipoly_state::SessionTurnStreamProjection::CanonicalIngest,
+    };
+    db.enqueue_session_turn_ingest_stream(&lagging).unwrap();
+
+    let projection = compute_projections(&model, &db, None)
+        .into_iter()
+        .find(|projection| projection.provider_index == 0)
+        .unwrap();
+
+    assert!(!projection.turn_count_fresh);
+    assert_eq!(projection.binding_score, None);
+    assert_eq!(projection.projections_per_window.len(), 1);
 }
 
 #[test]
@@ -123,7 +140,7 @@ fn compute_projections_suppresses_recent_error_provider_with_windows() {
 }
 
 #[test]
-fn compute_projections_treats_turn_count_read_errors_as_zero_turns() {
+fn compute_projections_withholds_density_score_on_turn_count_read_error() {
     let (_dir, path, db) = file_backed_state("turn-count-errors");
     let model = two_provider_model();
     seed_windows_with_deltas(&db, "a", &[(0.10, 24, 0.01, 1)]);
@@ -136,6 +153,8 @@ fn compute_projections_treats_turn_count_read_errors_as_zero_turns() {
         .iter()
         .find(|projection| projection.provider_index == 0)
         .unwrap();
+    assert!(!projection.turn_count_fresh);
+    assert_eq!(projection.binding_score, None);
     assert_approx(
         projection.projections_per_window[0].projected_used,
         0.10,

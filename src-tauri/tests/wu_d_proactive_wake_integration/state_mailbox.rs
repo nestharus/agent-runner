@@ -20,6 +20,8 @@ use rusqlite::Connection;
 use std::fs;
 use std::path::PathBuf;
 
+const PROVIDER_INSTANCE_ID: &str = "wu-d-native-fixture-instance";
+
 struct SeedMailboxArtifacts {
     state_dir: PathBuf,
     meta: PathBuf,
@@ -92,6 +94,7 @@ impl Fixture {
         let invocation_id = invocation_start.invocation_row_id;
         state
             .bind_invocation_provider_session_start(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 invocation_id,
                 &ProviderSessionBinding {
                     provider_session_id: session_id.to_string(),
@@ -128,7 +131,6 @@ impl Fixture {
                 model_name: Some(MODEL),
                 models_dir: Some(&models_dir),
                 effective_cwd: None,
-                selected_auto_wake_max: None,
             })
             .unwrap();
         mailbox
@@ -151,6 +153,7 @@ impl Fixture {
         write_seed_mailbox_artifacts(&artifacts, event_id);
         state
             .register_completion_event_with_authority(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 &invocation_start.completion_registration_authority,
                 &format!("proactive-wake:{event_id}:owner:{invocation_uuid}"),
                 CompletionEventRegistrationInput {
@@ -192,6 +195,42 @@ impl Fixture {
             }],
         )
         .unwrap();
+        drop(db);
+
+        let conn = Connection::open(self.state_path()).unwrap();
+        let has_segment = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM session_chain_segments
+                    WHERE provider_name = ?1 AND session_id = ?2
+                )",
+                rusqlite::params![provider_name, session_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        if !has_segment {
+            conn.execute(
+                "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                 VALUES (?1, '2026-06-04T12:00:00Z', '2026-06-04T12:00:00Z', ?2)",
+                rusqlite::params![session_id, MODEL],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_chain_segments
+                    (chain_id, provider_name, session_id, started_at, transition_reason)
+                 VALUES (?1, ?2, ?3, '2026-06-04T12:00:00Z', 'initial')",
+                rusqlite::params![session_id, provider_name, session_id],
+            )
+            .unwrap();
+        }
+        crate::provider_authority_fixture::bind_session_authority_with_cwd_at(
+            &conn,
+            provider_name,
+            session_id,
+            PROVIDER_INSTANCE_ID,
+            provider_name,
+            &self.work_dir,
+        );
     }
 
     pub(crate) fn seed_consumed_notification_turn(&self, handle: &str) {
@@ -233,7 +272,6 @@ impl Fixture {
                 model_name: Some(model_name),
                 models_dir: Some(&models_dir),
                 effective_cwd: None,
-                selected_auto_wake_max: None,
             })
             .unwrap();
     }
@@ -249,17 +287,11 @@ impl Fixture {
                 model_name: Some(MODEL),
                 models_dir: None,
                 effective_cwd: None,
-                selected_auto_wake_max: None,
             })
             .unwrap();
     }
 
-    pub(crate) fn seed_idle_runtime_with_wake_policy(
-        &self,
-        session_id: &str,
-        selected_auto_wake_max: i64,
-        auto_wake_count: i64,
-    ) {
+    pub(crate) fn seed_idle_runtime_with_wake_count(&self, session_id: &str, auto_wake_count: i64) {
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
         let models_dir = path_string(&self.models_dir);
         db.wake_sessions()
@@ -271,7 +303,6 @@ impl Fixture {
                 model_name: Some(MODEL),
                 models_dir: Some(&models_dir),
                 effective_cwd: None,
-                selected_auto_wake_max: Some(selected_auto_wake_max),
             })
             .unwrap();
         self.sidecar_conn()
@@ -304,6 +335,14 @@ impl Fixture {
             rusqlite::params![chain_id, provider_name, session_id],
         )
         .unwrap();
+        crate::provider_authority_fixture::bind_session_authority_with_cwd_at(
+            &conn,
+            provider_name,
+            session_id,
+            PROVIDER_INSTANCE_ID,
+            provider_name,
+            &self.work_dir,
+        );
     }
 
     pub(crate) fn seed_mailbox(&self, session_id: &str, handle: &str) {

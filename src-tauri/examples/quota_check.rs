@@ -7,18 +7,14 @@
 //! DB, refreshes any stale quotas, then prints — for every multi-provider
 //! model — what `select_provider` would pick and the score breakdown.
 
-use oulipoly_config::{ProvidersConfig, SessionsConfig, load_models};
+use oulipoly_config::{ProvidersConfig, load_models};
 use oulipoly_runtime::balancer::{BalanceContext, select_provider};
 use oulipoly_runtime::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
 use oulipoly_state::StateDb;
 
 fn main() {
-    let config_dir = dirs::config_dir()
-        .expect("no config dir")
-        .join("oulipoly-agent-runner");
-    let data_dir = dirs::data_dir()
-        .expect("no data dir")
-        .join("oulipoly-agent-runner");
+    let config_dir = oulipoly_state::paths::config_dir().expect("no configured config dir");
+    let data_dir = oulipoly_state::paths::data_dir().expect("no configured data dir");
     let models_dir = config_dir.join("models");
     let providers_path = config_dir.join("providers.toml");
     let db_path = data_dir.join("state.db");
@@ -29,8 +25,6 @@ fn main() {
 
     let providers_cfg = ProvidersConfig::load(&providers_path).expect("load providers.toml");
     let models = load_models(&models_dir, Some(&providers_cfg)).expect("load models");
-    let sessions_cfg =
-        SessionsConfig::load(&config_dir.join("sessions.toml")).expect("load sessions.toml");
     let db = StateDb::open(&db_path).expect("open state db");
     let in_flight = InFlight::new();
 
@@ -103,7 +97,6 @@ fn main() {
     println!("=== Balancer picks for multi-provider models ===");
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
     let mut model_names: Vec<&String> = models.keys().collect();

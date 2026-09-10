@@ -34,7 +34,7 @@ fn load_usage_context_parts(cli: &Cli) -> Result<UsageContextParts, String> {
 
 fn load_usage_providers_config() -> Result<ProvidersConfig, String> {
     Ok(ProvidersConfig::load(
-        &default_config_root().join("providers.toml"),
+        &default_config_root()?.join("providers.toml"),
     )?)
 }
 
@@ -42,7 +42,7 @@ fn load_usage_models(
     cli: &Cli,
     providers_cfg: &ProvidersConfig,
 ) -> Result<HashMap<String, ModelConfig>, String> {
-    Ok(load_models(&resolve_models_dir(cli), Some(providers_cfg))?)
+    Ok(load_models(&resolve_models_dir(cli)?, Some(providers_cfg))?)
 }
 
 fn usage_context_from_parts(

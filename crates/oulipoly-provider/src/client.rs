@@ -62,7 +62,8 @@ use crate::stream::{LaunchEventObserver, LaunchResult, LaunchStdoutDrain, Launch
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::ffi::OsString;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 pub use crate::process::{CancellationToken, ProcessSpawnObserver};
@@ -128,11 +129,14 @@ impl Default for ProviderOutputLimits {
 
 #[derive(Debug, Clone)]
 pub struct ProviderClientOptions {
+    pub attempt_custody: Option<crate::custody::AttemptActorCustody>,
     pub timeouts: ProviderTimeouts,
     pub output_limits: ProviderOutputLimits,
     pub timeout: Duration,
     pub cancellation: Option<CancellationToken>,
     pub resolver: ProviderResolveOptions,
+    pub provider_config_dir: Option<PathBuf>,
+    pub environment_removals: Vec<OsString>,
     pub spawn_observer: Option<ProcessSpawnObserver>,
     pub launch_event_observer: Option<LaunchEventObserver>,
 }
@@ -167,11 +171,14 @@ impl Default for ProviderClientOptions {
     fn default() -> Self {
         let timeouts = ProviderTimeouts::default();
         Self {
+            attempt_custody: None,
             timeout: timeouts.default,
             timeouts,
             output_limits: ProviderOutputLimits::default(),
             cancellation: None,
             resolver: ProviderResolveOptions::default(),
+            provider_config_dir: None,
+            environment_removals: Vec::new(),
             spawn_observer: None,
             launch_event_observer: None,
         }
@@ -179,6 +186,14 @@ impl Default for ProviderClientOptions {
 }
 
 impl ProviderClientOptions {
+    pub fn with_attempt_custody(
+        mut self,
+        custody: Option<crate::custody::AttemptActorCustody>,
+    ) -> Self {
+        self.attempt_custody = custody;
+        self
+    }
+
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self.timeouts.default = timeout;
@@ -201,6 +216,20 @@ impl ProviderClientOptions {
         self
     }
 
+    pub fn with_environment_removals<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        for name in names {
+            let name = name.into();
+            if !self.environment_removals.contains(&name) {
+                self.environment_removals.push(name);
+            }
+        }
+        self
+    }
+
     pub fn with_spawn_observer(mut self, observer: Option<ProcessSpawnObserver>) -> Self {
         self.spawn_observer = observer;
         self
@@ -216,6 +245,7 @@ impl ProviderClientOptions {
 pub struct ProviderClient {
     artifact: ProviderArtifactRef,
     options: ProviderClientOptions,
+    resolved: OnceLock<ResolvedProviderCommand>,
     last_diagnostics: Mutex<ProviderDiagnostics>,
     last_argv: Mutex<Vec<OsString>>,
 }
@@ -225,6 +255,7 @@ impl ProviderClient {
         Self {
             artifact,
             options,
+            resolved: OnceLock::new(),
             last_diagnostics: Mutex::new(ProviderDiagnostics::default()),
             last_argv: Mutex::new(Vec::new()),
         }
@@ -246,6 +277,88 @@ impl ProviderClient {
             .lock()
             .expect("argv mutex should not be poisoned")
             .clone()
+    }
+
+    pub fn resolved_executable(&self) -> Option<&Path> {
+        self.resolved
+            .get()
+            .map(|resolved| resolved.executable.as_path())
+    }
+
+    /// Digest the retained opened executable, never re-open the configured path.
+    pub fn pinned_executable_identity_sha256(&self) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let resolved = self.resolved.get().ok_or("endpoint_not_pinned")?;
+        let file = resolved.pinned_executable();
+        // Native resolver handles may be O_PATH. Re-open the retained descriptor,
+        // never the configured pathname, and compare metadata around the read.
+        #[cfg(target_os = "linux")]
+        let file = {
+            use std::os::fd::AsRawFd;
+            std::fs::File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                .map_err(|e| e.to_string())?
+        };
+        let before = file.metadata().map_err(|e| e.to_string())?;
+        if !before.is_file() || before.len() > 512 * 1024 * 1024 {
+            return Err("endpoint_identity_unbounded".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileExt, MetadataExt};
+            let mut digest = Sha256::new();
+            let metadata = |m: &std::fs::Metadata| {
+                (
+                    m.dev(),
+                    m.ino(),
+                    m.len(),
+                    m.mtime(),
+                    m.mtime_nsec(),
+                    m.ctime(),
+                    m.ctime_nsec(),
+                )
+            };
+            digest.update(serde_json::to_vec(&metadata(&before)).map_err(|e| e.to_string())?);
+            let mut offset = 0;
+            let mut bytes = [0u8; 65536];
+            loop {
+                let read = file
+                    .read_at(&mut bytes, offset)
+                    .map_err(|e| e.to_string())?;
+                if read == 0 {
+                    break;
+                }
+                offset += read as u64;
+                if offset > before.len() {
+                    return Err("endpoint_identity_changed".into());
+                }
+                digest.update(&bytes[..read]);
+            }
+            if offset != before.len()
+                || metadata(&before) != metadata(&file.metadata().map_err(|e| e.to_string())?)
+            {
+                return Err("endpoint_identity_changed".into());
+            }
+            Ok(format!("{:x}", digest.finalize()))
+        }
+        #[cfg(not(unix))]
+        {
+            Err("endpoint_identity_unsupported".into())
+        }
+    }
+
+    /// Build another client for the exact executable already resolved and
+    /// pinned by this client. This changes operation-local options without
+    /// re-resolving a pathname or opening a replacement executable.
+    pub fn fork_from_pinned(
+        &self,
+        options: ProviderClientOptions,
+    ) -> Result<Self, ProviderClientError> {
+        let resolved = self.resolve("describe", None)?;
+        let fork = Self::new(self.artifact.clone(), options);
+        fork.resolved
+            .set(resolved)
+            .expect("new provider client cannot already contain a resolved command");
+        Ok(fork)
     }
 
     pub fn invoke_typed<T, I>(
@@ -271,12 +384,23 @@ impl ProviderClient {
     where
         I: ProviderEnv,
     {
+        let operation = self
+            .options
+            .attempt_custody
+            .as_ref()
+            .map(|c| c.begin(subcommand));
         let request_id = request_id_from(&request);
         let registry = SchemaRegistry::new();
         validate_json_request(&registry, subcommand, &request, request_id.clone())?;
         let resolved = self.resolve(subcommand, request_id.clone())?;
-        let outcome =
-            self.run_resolved(subcommand, &resolved, request, envs, self.options.timeout)?;
+        let outcome = self.run_resolved(
+            subcommand,
+            &resolved,
+            request,
+            envs,
+            self.options.timeout,
+            operation.as_ref().map(|g| g.0.clone()),
+        )?;
         let diagnostics = outcome.diagnostics();
         self.record_process_state(&outcome, &diagnostics);
         ensure_invocation_stdout_within_limit(subcommand, &diagnostics, request_id.clone())?;
@@ -306,11 +430,21 @@ impl ProviderClient {
     where
         I: ProviderEnv,
     {
+        let operation = self
+            .options
+            .attempt_custody
+            .as_ref()
+            .map(|c| c.begin("launch"));
         let request_id = request_id_from(&request);
         let registry = SchemaRegistry::new();
         validate_launch_request(&registry, &request, request_id.clone())?;
         let resolved = self.resolve("launch", request_id.clone())?;
-        let outcome = self.run_launch_resolved(&resolved, request, envs)?;
+        let outcome = self.run_launch_resolved(
+            &resolved,
+            request,
+            envs,
+            operation.as_ref().map(|g| g.0.clone()),
+        )?;
         let diagnostics = launch_diagnostics(&outcome);
         self.record_process_state(&outcome, &diagnostics);
         parse_launch_output(
@@ -341,8 +475,11 @@ impl ProviderClient {
         subcommand: &str,
         request_id: Option<String>,
     ) -> Result<ResolvedProviderCommand, ProviderClientError> {
-        ProviderResolver::new(self.options.resolver.clone())
-            .resolve(&self.artifact, None)
+        if let Some(resolved) = self.resolved.get() {
+            return Ok(resolved.clone());
+        }
+        let resolved = ProviderResolver::new(self.options.resolver.clone())
+            .resolve(&self.artifact, self.options.provider_config_dir.as_deref())
             .map_err(|error| {
                 ProviderClientError::host_transport(
                     HostErrorKind::Other(error.kind().to_owned()),
@@ -350,7 +487,13 @@ impl ProviderClient {
                     request_id,
                     ProviderDiagnostics::default(),
                 )
-            })
+            })?;
+        let _ = self.resolved.set(resolved);
+        Ok(self
+            .resolved
+            .get()
+            .expect("resolved provider command should be initialized")
+            .clone())
     }
 
     fn run_resolved<I>(
@@ -360,21 +503,22 @@ impl ProviderClient {
         request: Value,
         envs: I,
         timeout: Duration,
+        custody: Option<crate::custody::OperationCustody>,
     ) -> Result<crate::process::ProcessOutcome, ProviderClientError>
     where
         I: ProviderEnv,
     {
         let request_id = request_id_from(&request);
         let request_bytes = serialize_request_bytes(subcommand, &request, request_id.clone())?;
-        let limits = process_limits_for(subcommand, timeout, &self.options);
-        let command = process_command_from_resolved(resolved, subcommand);
+        let mut limits = process_limits_for(subcommand, timeout, &self.options);
+        limits.custody = custody;
+        let command = process_command_from_resolved(resolved, subcommand, &self.options);
         let runner = ProcessRunner::new(limits);
-        let result = if subcommand == "launch" {
+        if subcommand == "launch" {
             runner.run_with_stdout_line_gap_timeout(command, request_bytes, envs.into_env_vec())
         } else {
             runner.run(command, request_bytes, envs.into_env_vec())
-        };
-        result.map_err(|error| error.with_request_id_if_missing(request_id))
+        }
     }
 
     fn run_launch_resolved<I>(
@@ -382,26 +526,26 @@ impl ProviderClient {
         resolved: &ResolvedProviderCommand,
         request: Value,
         envs: I,
+        custody: Option<crate::custody::OperationCustody>,
     ) -> Result<ProcessOutcome<LaunchStdoutDrain>, ProviderClientError>
     where
         I: ProviderEnv,
     {
         let request_id = request_id_from(&request);
         let request_bytes = serialize_request_bytes("launch", &request, request_id.clone())?;
-        let limits = process_limits_for("launch", self.options.timeouts.launch, &self.options);
-        let command = process_command_from_resolved(resolved, "launch");
+        let mut limits = process_limits_for("launch", self.options.timeouts.launch, &self.options);
+        limits.custody = custody;
+        let command = process_command_from_resolved(resolved, "launch", &self.options);
         let stdout_processor =
             LaunchStdoutProcessor::new(request_id.clone().unwrap_or_default(), limits.stdout_limit)
                 .with_event_observer(self.options.launch_event_observer.clone());
         let runner = ProcessRunner::new(limits);
-        runner
-            .run_with_stdout_line_gap_timeout_and_stdout_processor(
-                command,
-                request_bytes,
-                envs.into_env_vec(),
-                stdout_processor,
-            )
-            .map_err(|error| error.with_request_id_if_missing(request_id))
+        runner.run_with_stdout_line_gap_timeout_and_stdout_processor(
+            command,
+            request_bytes,
+            envs.into_env_vec(),
+            stdout_processor,
+        )
     }
 }
 
@@ -695,6 +839,14 @@ fn launch_diagnostics<T: StdoutDrainOutput>(outcome: &ProcessOutcome<T>) -> Prov
     diagnostics
 }
 
+fn observed_stdout_request_id(bytes: &[u8]) -> Option<String> {
+    let value = serde_json::Deserializer::from_slice(bytes)
+        .into_iter::<Value>()
+        .next()?
+        .ok()?;
+    request_id_from(&value)
+}
+
 fn parse_launch_output(
     stdout: LaunchStdoutDrain,
     diagnostics: ProviderDiagnostics,
@@ -708,6 +860,17 @@ fn parse_launch_output(
             Ok(result)
         }
         Err(error) => {
+            if diagnostics.host_cancellation_requested
+                && error.transport_kind() == HostErrorKind::MissingFinalExit.as_str()
+            {
+                return Err(ProviderClientError::host_transport(
+                    HostErrorKind::Cancelled,
+                    "launch",
+                    observed_stdout_request_id(&captured_stdout.bytes),
+                    diagnostics.clone(),
+                )
+                .with_process_context(diagnostics, status));
+            }
             if let Some(capability_error) =
                 launch_capability_error(&captured_stdout.bytes, &diagnostics, &status, request_id)
             {
@@ -779,6 +942,7 @@ fn process_limits_for(
     options: &ProviderClientOptions,
 ) -> ProcessLimits {
     ProcessLimits {
+        custody: None,
         timeout,
         kill_after_grace: kill_after_grace_for(subcommand, options),
         stdout_limit: ByteLimit::new(options.output_limits.stdout_bytes),
@@ -802,13 +966,17 @@ fn kill_after_grace_for(subcommand: &str, options: &ProviderClientOptions) -> Du
 fn process_command_from_resolved(
     resolved: &ResolvedProviderCommand,
     subcommand: &str,
+    options: &ProviderClientOptions,
 ) -> ProcessCommand {
     let mut argv = resolved.argv_for_subcommand(subcommand);
     let program = argv.remove(0);
-    argv.into_iter()
-        .fold(ProcessCommand::new(program), |command, arg| {
-            command.arg(arg)
-        })
+    argv.into_iter().fold(
+        ProcessCommand::new(program)
+            .with_pinned_executable(Some(resolved.pinned_executable()))
+            .with_script(resolved.is_script())
+            .with_environment_removals(options.environment_removals.clone()),
+        |command, arg| command.arg(arg),
+    )
 }
 
 fn launch_spawn_observer(

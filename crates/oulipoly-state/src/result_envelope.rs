@@ -1,11 +1,11 @@
-//! Shared `OULIPOLY_RESULT` payload construction for stdout markers and raw
+//! Shared `OULIPOLY_RESULT` payload construction for stream markers and raw
 //! invocation result artifacts.
 
 use serde_json::Value;
 
 /// Identity fields attached to failed `OULIPOLY_RESULT` payloads.
 ///
-/// These fields connect a failure reported on stdout back to the runner
+/// These fields connect a reported failure back to the runner
 /// invocation, provider account, provider session, and chain when those values
 /// are known. Provider-derived fields are `Some` after execution has reached a
 /// concrete provider and session metadata has been captured or inferred; they
@@ -24,7 +24,7 @@ pub struct ResultEnvelopeFailureIdentity {
     pub agent_runner_chain_id: Option<String>,
 }
 
-/// Input used to build a stdout/result-artifact `OULIPOLY_RESULT` payload.
+/// Input used to build a stream/result-artifact `OULIPOLY_RESULT` payload.
 ///
 /// Successful payloads include the common result fields only. Failed payloads
 /// include those common fields plus failure identity fields, using

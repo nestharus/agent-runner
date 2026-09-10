@@ -23,6 +23,7 @@ use std::process::Command;
 use crate::executor::cli::spawn_identity::{
     provider_parent_invocation_env, split_invocation_launch_environment,
 };
+use oulipoly_core::AutoWakeEnvironmentVariable;
 
 pub(super) fn command_from_parts(
     parts: &[String],
@@ -44,6 +45,9 @@ pub(super) fn command_from_parts(
         cmd.env_remove(name);
     }
     cmd.envs(environment);
+    for variable in AutoWakeEnvironmentVariable::ALL {
+        cmd.env_remove(variable.name());
+    }
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -69,15 +73,15 @@ pub(super) fn command_from_parts(
     } else {
         cmd.env_remove("OULIPOLY_RETURN_CHANNEL");
     }
-    pin_agent_data_dir(&mut cmd);
+    pin_agent_data_dir(&mut cmd)?;
 
     Ok(cmd)
 }
 
-fn pin_agent_data_dir(cmd: &mut Command) {
-    if let Ok(data_dir) = oulipoly_state::paths::data_dir() {
-        cmd.env(oulipoly_state::paths::DATA_DIR_ENV, data_dir);
-    }
+fn pin_agent_data_dir(cmd: &mut Command) -> Result<(), String> {
+    let data_dir = oulipoly_state::paths::data_dir()?;
+    cmd.env(oulipoly_state::paths::DATA_DIR_ENV, data_dir);
+    Ok(())
 }
 
 pub(in crate::executor::cli) fn append_command_args(cmd: &mut Command, args: &[String]) {
@@ -118,5 +122,41 @@ mod tests {
             Some(authority.process_environment_value())
         );
         assert!(!format!("{authority:?}").contains(authority.process_environment_value()));
+    }
+
+    #[test]
+    fn provider_launch_removes_runner_private_auto_wake_environment() {
+        assert!(
+            AutoWakeEnvironmentVariable::ALL.contains(&AutoWakeEnvironmentVariable::TEST_SENTINEL),
+            "runtime tests must extend the production catalog"
+        );
+        let environment = AutoWakeEnvironmentVariable::ALL
+            .into_iter()
+            .map(|variable| (variable.name().to_string(), "private".to_string()))
+            .collect();
+
+        let command = command_from_parts(
+            &["provider".to_string()],
+            &[],
+            &environment,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let explicit_environment: BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        for variable in AutoWakeEnvironmentVariable::ALL {
+            assert_eq!(explicit_environment.get(variable.name()), Some(&None));
+        }
     }
 }

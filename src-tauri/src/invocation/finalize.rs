@@ -79,7 +79,7 @@ fn should_skip_guard_drop_finalize(finalized: bool) -> bool {
 }
 
 fn finalize_unfinalized_guard_invocation(guard: &FinalizerGuard<'_>) {
-    // Source guard marker: self.db.finalize_invocation(
+    // Source guard marker: self.db.finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,
     emit_guard_finalize_failure(finalize_invocation_from_guard(
         guard.db,
         guard.invocation_id,
@@ -92,6 +92,7 @@ fn emit_guard_finalize_failure(result: Result<(), String>) {
 
 fn finalize_invocation_from_guard(db: &StateDb, invocation_id: i64) -> Result<(), String> {
     db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         invocation_id,
         false,
         -1,
@@ -138,6 +139,7 @@ mod tests {
 
         fn finalize_invocation(
             &self,
+            _mutation_authority: oulipoly_state::InvocationMutationAuthority<'_>,
             request: InvocationLifecycleFinalizeRequest<'_>,
         ) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
             let mut observed = self.observed.lock().unwrap();
@@ -264,8 +266,15 @@ mod tests {
 
         {
             let mut guard = FinalizerGuard::new(&db, invocation_id);
-            db.finalize_invocation(invocation_id, true, 0, None, None)
-                .unwrap();
+            db.finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                invocation_id,
+                true,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
             guard.mark_finalized();
         }
 
@@ -326,6 +335,7 @@ mod tests {
         {
             let mut guard = FinalizerGuard::new(&db, invocation_id);
             db.finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 invocation_id,
                 false,
                 1,
@@ -393,6 +403,7 @@ mod tests {
             .unwrap();
         let invocation_id = invocation_start.invocation_row_id;
         db.bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_id,
             &ProviderSessionBinding {
                 provider_session_id: "finalizer-guard-contention-session".to_string(),
@@ -403,6 +414,7 @@ mod tests {
         )
         .unwrap();
         db.register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &invocation_start.completion_registration_authority,
             "finalizer-guard-contention-admission",
             CompletionEventRegistrationInput {
@@ -430,6 +442,7 @@ mod tests {
         {
             let mut guard = FinalizerGuard::new(&db, invocation_id);
             let result = ProductionInvocationLifecycleService.finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 InvocationLifecycleFinalizeRequest {
                     state: &db,
                     invocation_row_id: invocation_id,
@@ -464,8 +477,15 @@ mod tests {
 
         <std::fs::File as fs4::FileExt>::unlock(&authority_file).unwrap();
         drop(authority_file);
-        db.finalize_invocation(invocation_id, true, 0, None, None)
-            .unwrap();
+        db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_id,
+            true,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             db.get_invocation_by_uuid(&start.invocation_uuid)
                 .unwrap()

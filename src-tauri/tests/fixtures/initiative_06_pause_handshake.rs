@@ -110,7 +110,11 @@ prompt_mode = "arg"
 "#
             ));
         }
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            super::provider_authority::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
     }
 
     pub fn seed_active_chain(
@@ -350,7 +354,7 @@ fn base_command(config_home: &Path, data_home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_DATA_HOME", data_home);
-    cmd.env_remove("OULIPOLY_DATA_DIR");
+    cmd.env("OULIPOLY_DATA_DIR", data_home.join("oulipoly-agent-runner"));
     cmd.env("HOME", data_home);
     cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
     cmd

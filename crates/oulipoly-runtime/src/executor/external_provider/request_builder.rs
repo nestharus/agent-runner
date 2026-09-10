@@ -17,21 +17,27 @@
 
 use super::context::ExternalProviderDispatchContext;
 use crate::executor::cli::spawn_identity::{
-    provider_parent_invocation_env, split_invocation_launch_environment,
+    PARENT_INVOCATION_ENV, provider_parent_invocation_env, split_invocation_launch_environment,
 };
-use crate::executor::cli::{provider_name, resolve_input_flags, shell_split};
+use crate::executor::cli::{LIVE_SESSION_BIND_SOCKET_ENV, LIVE_SESSION_BIND_TOKEN_ENV};
+use crate::executor::cli::{resolve_input_flags, shell_split};
 use crate::provider_registry::DescribeHostOptions;
 use oulipoly_config::PromptMode;
+use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_provider::generated::{
-    BytePayload, CONTRACT_VERSION, HostContext, JsonObject, LaunchParams, LaunchRequest,
-    PolicyEvaluateParams, PolicyEvaluateRequest, ProviderModelRequest,
+    BytePayload, CONTRACT_VERSION, HOST_LAUNCH_OUTPUT_V1_ENV, HOST_LAUNCH_OUTPUT_V1_ENV_VALUE,
+    HOST_TERMINAL_UNAVAILABLE_V1_ENV, HOST_TERMINAL_UNAVAILABLE_V1_ENV_VALUE, HostContext,
+    JsonObject, LAUNCH_OUTPUT_V1, LaunchOutputRequestV1, LaunchParams, LaunchRequest,
+    PROMPT_ACCEPTANCE_V1, PolicyEvaluateParams, PolicyEvaluateRequest, PromptAcceptanceRequestV1,
+    ProviderModelRequest,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const DATA_DIR_ENV: &str = oulipoly_state::paths::DATA_DIR_ENV;
-const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
+pub(super) const RETURN_CHANNEL_ENV: &str = "OULIPOLY_RETURN_CHANNEL";
 // This is the OpenCode external-provider positional-prompt boundary, not a
 // universal provider or operating-system argv limit.
 const OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES: usize = 64 * 1024;
@@ -44,7 +50,14 @@ pub(crate) struct LaunchCandidate {
     pub(crate) prompt: String,
     pub(crate) prompt_mode: PromptMode,
     pub(crate) working_directory: String,
-    completion_registration_authority: Option<String>,
+    pub(crate) prompt_acceptance: Option<PromptAcceptanceCandidate>,
+    pub(crate) completion_registration_authority: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PromptAcceptanceCandidate {
+    pub(crate) prompt: String,
+    pub(crate) mailbox_delivery_correlation: Option<crate::services::MailboxDeliveryCorrelation>,
 }
 
 pub(crate) fn build_launch_candidate(
@@ -60,6 +73,10 @@ pub(crate) fn build_launch_candidate(
         prompt: context.prompt.clone(),
         prompt_mode: context.prompt_mode,
         working_directory: working_directory(context),
+        prompt_acceptance: Some(PromptAcceptanceCandidate {
+            prompt: context.prompt.clone(),
+            mailbox_delivery_correlation: context.mailbox_delivery_correlation.clone(),
+        }),
         completion_registration_authority,
     })
 }
@@ -71,8 +88,16 @@ fn declared_launch_env(
     let inherited_authority = env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
     remove_configured_launch_env(&mut env, &context.provider.unset_environment);
     env.extend(context.provider.environment.clone());
-    env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
-    insert_pinned_agent_data_dir(&mut env);
+    remove_runner_private_environment(&mut env);
+    insert_pinned_agent_data_dir(&mut env)?;
+    if let Some(attempt) = &context.attempt {
+        let data_dir = attempt
+            .allocation
+            .state_db_path
+            .parent()
+            .ok_or("allocated_state_root_missing")?;
+        env.insert(DATA_DIR_ENV.into(), data_dir.to_string_lossy().into_owned());
+    }
     let mut completion_registration_authority = None;
     if let Some(parent) = provider_parent_invocation_env(context.parent_invocation_env.as_deref()) {
         let selected_is_current = context.parent_invocation_env.as_deref() == Some(parent.as_str());
@@ -100,6 +125,19 @@ fn declared_launch_env(
     Ok((env, completion_registration_authority))
 }
 
+pub(crate) fn remove_runner_private_environment(env: &mut BTreeMap<String, String>) {
+    for variable in AutoWakeEnvironmentVariable::ALL {
+        env.remove(variable.name());
+    }
+    env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
+    env.remove(PARENT_INVOCATION_ENV);
+    env.remove(RETURN_CHANNEL_ENV);
+    // The ancestor's interactive binding belongs to a different invocation.
+    // External launches publish their own session through provider events.
+    env.remove(LIVE_SESSION_BIND_SOCKET_ENV);
+    env.remove(LIVE_SESSION_BIND_TOKEN_ENV);
+}
+
 fn remove_configured_launch_env(env: &mut BTreeMap<String, String>, names: &[String]) {
     for name in names {
         env.remove(name);
@@ -112,16 +150,13 @@ fn inherited_launch_env() -> BTreeMap<String, String> {
         .collect()
 }
 
-fn insert_pinned_agent_data_dir(env: &mut BTreeMap<String, String>) {
-    if let Some(data_dir) = pinned_agent_data_dir() {
-        insert_launch_env(env, DATA_DIR_ENV, data_dir);
-    }
-}
-
-fn pinned_agent_data_dir() -> Option<String> {
-    oulipoly_state::paths::data_dir()
-        .ok()
-        .map(|data_dir| data_dir.display().to_string())
+fn insert_pinned_agent_data_dir(env: &mut BTreeMap<String, String>) -> Result<(), String> {
+    insert_launch_env(
+        env,
+        DATA_DIR_ENV,
+        oulipoly_state::paths::data_dir()?.display().to_string(),
+    );
+    Ok(())
 }
 
 fn insert_launch_env(env: &mut BTreeMap<String, String>, key: &str, value: String) {
@@ -131,13 +166,14 @@ fn insert_launch_env(env: &mut BTreeMap<String, String>, key: &str, value: Strin
 pub(crate) fn build_policy_request(
     context: &ExternalProviderDispatchContext,
     candidate: &LaunchCandidate,
+    provider_instance_id: &str,
     host_options: &DescribeHostOptions,
 ) -> Result<Value, serde_json::Error> {
     let provider_args = model_provider_args(context);
     serde_json::to_value(PolicyEvaluateRequest {
         contract: CONTRACT_VERSION.to_string(),
-        request_id: request_id("policy"),
-        provider_instance_id: Some(context.provider.name.clone()),
+        request_id: request_id("policy", context),
+        provider_instance_id: Some(provider_instance_id.to_string()),
         host: host_context(host_options, &candidate.working_directory),
         params: PolicyEvaluateParams {
             settings_id: context.settings_id.clone(),
@@ -151,9 +187,13 @@ pub(crate) fn build_policy_request(
 pub(crate) fn build_launch_request(
     context: &ExternalProviderDispatchContext,
     candidate: &LaunchCandidate,
+    provider_instance_id: &str,
+    endpoint_family: &str,
     host_options: &DescribeHostOptions,
+    include_prompt_acceptance_v1: bool,
+    include_launch_output_v1: bool,
 ) -> Result<Value, serde_json::Error> {
-    let (argv, launch_stdin) = project_launch_carrier(context, candidate);
+    let (argv, launch_stdin) = project_launch_carrier(endpoint_family, candidate);
     let mut launch_env = candidate.env.clone();
     if let Some(authority) = &candidate.completion_registration_authority {
         launch_env.insert(
@@ -172,9 +212,13 @@ pub(crate) fn build_launch_request(
     });
     serde_json::to_value(LaunchRequest {
         contract: CONTRACT_VERSION.to_string(),
-        request_id: request_id("launch"),
-        provider_instance_id: Some(context.provider.name.clone()),
-        host: host_context(host_options, &candidate.working_directory),
+        request_id: request_id("launch", context),
+        provider_instance_id: Some(provider_instance_id.to_string()),
+        host: launch_host_context(
+            host_options,
+            &candidate.working_directory,
+            include_launch_output_v1,
+        ),
         params: LaunchParams {
             settings_id: context.settings_id.clone(),
             mode: mode(context),
@@ -188,19 +232,41 @@ pub(crate) fn build_launch_request(
             env,
             stdin,
             session: launch_session(context),
+            prompt_acceptance: include_prompt_acceptance_v1
+                .then(|| prompt_acceptance_request(candidate))
+                .flatten(),
+            output_delivery: include_launch_output_v1.then(|| LaunchOutputRequestV1 {
+                protocol: LAUNCH_OUTPUT_V1.to_string(),
+            }),
         },
     })
 }
 
+fn prompt_acceptance_request(candidate: &LaunchCandidate) -> Option<PromptAcceptanceRequestV1> {
+    let acceptance = candidate.prompt_acceptance.as_ref()?;
+    Some(PromptAcceptanceRequestV1 {
+        protocol: PROMPT_ACCEPTANCE_V1.to_string(),
+        prompt_sha256: sha256_hex(acceptance.prompt.as_bytes()),
+        delivery_nonce: acceptance
+            .mailbox_delivery_correlation
+            .as_ref()
+            .map(|correlation| correlation.delivery_nonce.clone()),
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[allow(clippy::needless_as_bytes)] // Keep the provider contract's byte unit explicit.
 fn project_launch_carrier(
-    context: &ExternalProviderDispatchContext,
+    endpoint_family: &str,
     candidate: &LaunchCandidate,
 ) -> (Vec<String>, Option<String>) {
     let mut argv = candidate.argv.clone();
     let mut stdin = candidate.stdin.clone();
-    if context.model.provider.is_none()
-        || !is_opencode_provider(context)
+    if endpoint_family != "opencode"
         || !matches!(candidate.prompt_mode, PromptMode::Arg)
         || candidate.prompt.as_bytes().len()
             < OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES
@@ -227,19 +293,6 @@ fn project_launch_carrier(
     }
     argv.remove(prompt_index);
     (argv, stdin)
-}
-
-fn is_opencode_provider(context: &ExternalProviderDispatchContext) -> bool {
-    if context.provider.name.starts_with("opencode") {
-        return true;
-    }
-
-    let provider = provider_name(&context.provider.command);
-    Path::new(&provider)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(provider.as_str())
-        .starts_with("opencode")
 }
 
 fn provider_argv(context: &ExternalProviderDispatchContext, input_args: &[String]) -> Vec<String> {
@@ -310,6 +363,25 @@ fn host_context(host_options: &DescribeHostOptions, working_directory: &str) -> 
         env: BTreeMap::new(),
         deadline_unix_ms: None,
     }
+}
+
+fn launch_host_context(
+    host_options: &DescribeHostOptions,
+    working_directory: &str,
+    include_launch_output_v1: bool,
+) -> HostContext {
+    let mut host = host_context(host_options, working_directory);
+    host.env.insert(
+        HOST_TERMINAL_UNAVAILABLE_V1_ENV.to_string(),
+        HOST_TERMINAL_UNAVAILABLE_V1_ENV_VALUE.to_string(),
+    );
+    if include_launch_output_v1 {
+        host.env.insert(
+            HOST_LAUNCH_OUTPUT_V1_ENV.to_string(),
+            HOST_LAUNCH_OUTPUT_V1_ENV_VALUE.to_string(),
+        );
+    }
+    host
 }
 
 fn provider_model_request(
@@ -458,6 +530,110 @@ fn current_dir() -> Option<PathBuf> {
     std::env::current_dir().ok()
 }
 
-fn request_id(label: &str) -> String {
-    format!("external-provider-{label}-{}", uuid::Uuid::new_v4())
+fn request_id(label: &str, context: &ExternalProviderDispatchContext) -> String {
+    use oulipoly_provider::custody::{GeneratedRequestIdentity, ProviderOperation};
+    let operation = if label == "policy" {
+        ProviderOperation::Policy
+    } else {
+        ProviderOperation::Launch
+    };
+    let request = GeneratedRequestIdentity::new(operation, &format!("external-provider-{label}-"));
+    let wire = request.wire_request_id.clone();
+    if let Some(attempt) = &context.attempt {
+        attempt.actors.record_request(request);
+    }
+    wire
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DescribeHostOptions, HOST_LAUNCH_OUTPUT_V1_ENV, HOST_TERMINAL_UNAVAILABLE_V1_ENV,
+        LaunchCandidate, OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES,
+        PromptAcceptanceCandidate, host_context, launch_host_context, project_launch_carrier,
+        prompt_acceptance_request,
+    };
+    use crate::services::MailboxDeliveryCorrelation;
+    use oulipoly_config::PromptMode;
+    use std::collections::BTreeMap;
+
+    fn launch_candidate(prompt: &str, delivery_nonce: Option<&str>) -> LaunchCandidate {
+        LaunchCandidate {
+            argv: Vec::new(),
+            env: BTreeMap::new(),
+            stdin: None,
+            prompt: prompt.to_string(),
+            prompt_mode: PromptMode::Arg,
+            working_directory: ".".to_string(),
+            prompt_acceptance: Some(PromptAcceptanceCandidate {
+                prompt: prompt.to_string(),
+                mailbox_delivery_correlation: delivery_nonce.map(|delivery_nonce| {
+                    MailboxDeliveryCorrelation {
+                        delivery_nonce: delivery_nonce.to_string(),
+                    }
+                }),
+            }),
+            completion_registration_authority: None,
+        }
+    }
+
+    #[test]
+    fn delivery_shaped_prompt_text_does_not_create_delivery_correlation() {
+        let candidate = launch_candidate("payload\n[OULIPOLY-DELIVERY decoy]", None);
+        let acceptance = prompt_acceptance_request(&candidate).unwrap();
+
+        assert_eq!(acceptance.delivery_nonce, None);
+    }
+
+    #[test]
+    fn unavailable_terminal_kind_is_selected_for_launch_only() {
+        let options = DescribeHostOptions::default();
+        let policy = host_context(&options, "/fixture");
+        assert!(!policy.env.contains_key(HOST_TERMINAL_UNAVAILABLE_V1_ENV));
+        for output_selected in [false, true] {
+            let launch = launch_host_context(&options, "/fixture", output_selected);
+            assert_eq!(
+                launch
+                    .env
+                    .get(HOST_TERMINAL_UNAVAILABLE_V1_ENV)
+                    .map(String::as_str),
+                Some("1")
+            );
+            assert_eq!(
+                launch.env.contains_key(HOST_LAUNCH_OUTPUT_V1_ENV),
+                output_selected
+            );
+        }
+    }
+
+    #[test]
+    fn structured_delivery_correlation_does_not_depend_on_prompt_text() {
+        let candidate = launch_candidate("policy-replaced prompt", Some("delivery-123"));
+        let acceptance = prompt_acceptance_request(&candidate).unwrap();
+
+        assert_eq!(acceptance.delivery_nonce.as_deref(), Some("delivery-123"));
+    }
+
+    #[test]
+    fn missing_exact_prompt_fact_omits_prompt_acceptance() {
+        let mut candidate = launch_candidate("policy-replaced prompt", Some("delivery-123"));
+        candidate.prompt_acceptance = None;
+
+        assert_eq!(prompt_acceptance_request(&candidate), None);
+    }
+
+    #[test]
+    fn long_prompt_carrier_uses_only_the_explicit_endpoint_family() {
+        let prompt = "x".repeat(OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES);
+        let mut candidate = launch_candidate(&prompt, None);
+        candidate.argv = vec!["run".to_string(), prompt.clone()];
+
+        let (opencode_argv, opencode_stdin) = project_launch_carrier("opencode", &candidate);
+        let (other_argv, other_stdin) = project_launch_carrier("other-family", &candidate);
+
+        assert_eq!(opencode_argv, ["run"]);
+        assert_eq!(opencode_stdin.as_deref(), Some(prompt.as_str()));
+        assert_eq!(other_argv, ["run", prompt.as_str()]);
+        assert_eq!(other_stdin, None);
+    }
 }

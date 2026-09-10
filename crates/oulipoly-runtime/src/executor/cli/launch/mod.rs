@@ -75,9 +75,7 @@ pub(super) fn assemble_provider_launch(
         &base_args,
         request.working_dir,
         request.parent_invocation_env,
-        return_channel
-            .as_ref()
-            .map(|channel| channel.path.as_path()),
+        return_channel.as_ref().map(|channel| channel.path()),
     )?;
     append_command_args(&mut cmd, request.input_args);
     let (capture_plan, capture_args, mut temp_files) = capture::build_launch_capture_plan(

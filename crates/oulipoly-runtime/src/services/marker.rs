@@ -88,7 +88,12 @@ fn update_session_capture_for_marker(
     session_id: &str,
     capture_method: &str,
 ) -> Result<(), String> {
-    state.update_session_capture(invocation_row_id, Some(session_id), capture_method)
+    state.update_session_capture(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_row_id,
+        Some(session_id),
+        capture_method,
+    )
 }
 
 fn write_session_capture_update_warning(
@@ -133,7 +138,10 @@ fn mint_chain_for_marker_if_needed(
     }
     write_marker_chain_mint_warning_on_error(
         stderr,
-        state.mint_chain_for_invocation_session(invocation_row_id),
+        state.mint_chain_for_invocation_session(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+        ),
     )
 }
 

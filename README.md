@@ -43,6 +43,19 @@ Output locations:
 
 The raw binary is at `src-tauri/target/release/oulipoly-agent-runner` (or `.exe` on Windows).
 
+Provider launch admission requires host-memory telemetry and checks current
+available memory against its configured or default admission floor. Linux
+requires a mounted procfs exposing valid `MemTotal` and `MemAvailable` values
+(Linux 3.14 or newer); macOS and Windows use their native memory APIs. Concurrent
+starts are serialized until the preceding provider runtime is running, so a new
+observation cannot race an earlier unstarted provider. Already-running turns do
+not consume count slots or block child launches. The floor is an admission-time
+observation, not a reservation against later provider working-set growth; set an
+explicit floor that includes the deployment's expected post-start growth. If
+telemetry is unavailable, the launch fails explicitly before provider spawn
+instead of waiting indefinitely. Automatic mailbox work remains pending for its
+existing bounded-cadence retry.
+
 ### Manual install (Linux/macOS)
 
 ```bash
@@ -237,6 +250,34 @@ oulipoly-agent-runner -m seedance-i2v-low -i image=cat.jpeg "The cat blinks slow
 `default_provider` from `config.toml`. This is the top-level fresh-session
 entrypoint; `--resume <session-id>` is its existing-session counterpart.
 
+Configure `default_provider` in the runner's global
+`<config_home>/oulipoly-agent-runner/config.toml` as an account **family**:
+
+```toml
+default_provider = "acme"
+```
+
+Here `acme` stands for your configured account-family key, not a new provider
+registration. It includes the exact `acme` account plus ASCII-numeric suffix
+accounts such as `acme2`, `acme3`, and `acme10` from the same directory's
+`providers.toml`. Dashed or prefixed keys (`acme-work`, `myacme`) are excluded.
+An account-looking family such as `acme2` also includes `acme20`; it is not an
+exact-account pin. Shared managed wrapper commands do not collapse the pool:
+membership comes from account keys, not command names. Each account still
+requires its own configured implementation endpoint and settings identity.
+
+Fresh default selection uses the standard initial routing service with quota
+refresh, exhaustion-marker verification and topology repair. Normal
+quota/error/history policies apply, not strict round robin: consecutive
+launches may legitimately select the same account. Like headless/model-REPL
+initial routing, this does not synchronously scan legacy `sessions.toml`
+turn scripts. The selected account's interactive arguments, settings and
+environment remain its own. No named model TOML is loaded for this path.
+
+Existing-session `--resume` follows the separate owner-preserving resume path,
+not this fresh-family selection. Explicit model launches are unchanged;
+`--pin-provider` is for fresh model runs and cannot be combined with `--new`.
+
 `oulipoly-agent-runner repl <model>` launches the wrapped CLI as an interactive session through the load balancer instead of as a one-shot. Stdin / stdout / stderr are inherited (TTY pass-through), so terminal-generated `Ctrl+C` reaches the child directly. The runner stays alive only long enough to reap and finalize the invocation row.
 
 ```bash
@@ -282,11 +323,40 @@ After the normal stale-refresh pass, balanced CLI routing also compares live quo
 
 Provider state is keyed by the provider's `name` field (the CLI account — e.g. `claude`, `claude2`) and is shared across every model routed through that account. This means two models pointing at the same provider share quota and error history.
 
-**Persistent state**: invocation history, quota snapshots, and ingested session turns live in SQLite at `~/.local/share/oulipoly-agent-runner/state.db`. No daemon or background process — state is shared via filesystem-level SQLite WAL locking, so multiple CLI invocations coordinate safely.
+**Runtime paths**: install the real runner binary outside a general-purpose `bin` directory and place `config.toml` beside it. For example:
+
+```text
+~/.config/oulipoly-agent-runner/runner/
+├── oulipoly-agent-runner
+└── config.toml
+
+~/.local/bin/agents -> ~/.config/oulipoly-agent-runner/runner/oulipoly-agent-runner
+~/.local/bin/oulipoly-agent-runner -> ~/.config/oulipoly-agent-runner/runner/oulipoly-agent-runner
+```
+
+The adjacent `config.toml` contains the runtime roots:
+
+```toml
+data_dir = "/home/example/.local/share/oulipoly-agent-runner"
+config_home = "/home/example/.config"
+```
+
+Both values must be absolute. The runner canonicalizes its executable path before looking for `config.toml`, so a symlink in `~/.local/bin` resolves configuration beside the real binary and no configuration file is needed in `bin`. When this file exists, it is the exclusive runtime-path source: unreadable, malformed, incomplete, or relative values are errors and do not fall through to process environment. Keeping the production file beside the canonical installed binary prevents development and test binaries elsewhere on disk from discovering production state.
+
+When the adjacent file is absent, provide runtime paths through the process environment:
+
+```bash
+export OULIPOLY_DATA_DIR="$HOME/.local/share/oulipoly-agent-runner"
+export OULIPOLY_CONFIG_HOME="$HOME/.config"
+```
+
+Invocation history, quota snapshots, and ingested session turns live at `<data_dir>/state.db`; the PID-identity/mailbox sidecar, payload store, and application lock files use the same explicit root. Without an adjacent paths file, an unset `OULIPOLY_DATA_DIR` is an error in installed, development, and test environments. No daemon or background process is required: state is shared through filesystem-level SQLite WAL locking, so multiple CLI invocations coordinate safely.
+
+Application configuration lives under `<config_home>/oulipoly-agent-runner`. When using the environment provider, an explicitly set `XDG_CONFIG_HOME` is accepted when `OULIPOLY_CONFIG_HOME` is absent. The runner does not derive either root from HOME, the current directory, or the build profile.
 
 ### `providers.toml`
 
-Create `~/.config/oulipoly-agent-runner/providers.toml` with one entry per provider account. This is the runtime config for that account: how to invoke the CLI, how prompts are passed, how resume is composed, where local session files live, and optional quota/auth hooks.
+Create `$OULIPOLY_CONFIG_HOME/oulipoly-agent-runner/providers.toml` with one entry per provider account. This is the runtime config for that account: how to invoke the CLI, how prompts are passed, how resume is composed, where local session files live, and optional quota/auth hooks.
 
 ```toml
 [claude]
@@ -507,10 +577,23 @@ Every invocation that reaches provider dispatch emits a stable identifier on
 OULIPOLY_INVOCATION={"source":"claude2","id":"9e69e8cc-616d-4640-bf1d-96f5391b1a2e"}
 ```
 
-Provider `stdout` bytes are forwarded unchanged, so image/video model output
-remains binary-safe. After terminal completion the runner appends one structured
-`OULIPOLY_RESULT=<json>` line on stdout. Successful results keep the compact
-terminal shape; failed results also include:
+External-provider spooled `stdout` bytes are forwarded unchanged, so binary
+model output remains safe. After the spool payload has been copied and stdout
+has been flushed, the runner writes one structured
+`OULIPOLY_RESULT=<json>` line to stderr. When stdout lacks a trailing newline,
+the runner writes the framing newline to stderr so `2>&1 | tee` still records
+an anchored, ordered result line without changing redirected provider stdout.
+Provider stdout and stderr are arbitrary replayed bytes and may themselves
+contain shape-valid `OULIPOLY_RESULT` lines, including lines with the current
+invocation UUID. For a successful merged external-provider capture, consumers
+must ignore earlier matching lines and accept only the final shape-valid
+`OULIPOLY_RESULT` whose `id` matches the invocation, after the runner process
+exits successfully. The runner's write-after-complete-spool ordering is the
+provenance boundary for that final record.
+The complete payload-and-control delivery must succeed before delivery is
+recorded as successful. Non-spooled and failed committed invocations retain
+their stdout result marker for compatibility.
+Successful results keep the compact terminal shape; failed results also include:
 
 - `agent_runner_invocation_id` — the same UUID as `id`
 - `provider_name` — the selected provider/account, or `null`
@@ -835,7 +918,7 @@ SQL is for ad-hoc debugging when `trace` or `oulipoly-agent-runner session locat
 
 ```bash
 # All invocations for one account today
-sqlite3 ~/.local/share/oulipoly-agent-runner/state.db "
+sqlite3 "$OULIPOLY_DATA_DIR/state.db" "
   SELECT invocation_uuid, model_name, status, created_at
   FROM invocations
   WHERE provider_name = 'claude2'
@@ -866,10 +949,10 @@ Falls back to heuristic keyword matching if the diagnostics model itself fails.
 
 ## Configuration
 
-All user config lives in `~/.config/oulipoly-agent-runner/`:
+All user config lives in `$OULIPOLY_CONFIG_HOME/oulipoly-agent-runner/`:
 
 ```
-~/.config/oulipoly-agent-runner/
+$OULIPOLY_CONFIG_HOME/oulipoly-agent-runner/
   config.toml          Global settings
   providers.toml       Per-provider runtime config, resume/session storage, quota scripts
   sessions.toml        Per-provider turn ingestion + transcript locator adapters
@@ -1009,7 +1092,10 @@ and passes them as CLI flags to the underlying command.
 - Inputs with defaults are passed automatically when not overridden
 - Unknown inputs pass through as `--key value`
 
-**Stdout is raw bytes** — commands can output binary data (images, videos) and it passes through unmodified. Pipe to a file to save: `agents -m seedream-t2i "A cat" > cat.jpeg`
+**External-provider spooled stdout is raw bytes** — commands can output binary
+data (images, videos), and it passes through unmodified while the terminal
+result is emitted on stderr. Pipe to a file to save:
+`agents -m seedream-t2i "A cat" > cat.jpeg`.
 
 ### Adding an Agent
 
@@ -1061,6 +1147,27 @@ To implement a provider, begin with the [`Provider Contract Crate (oulipoly-prov
 
 > **Parse-only in this release:** Dynamic loading and runtime dispatch are not implemented in this release; the `provider = { ... }` field is recorded by the parser but has no effect on routing or execution.
 
+### Required Complete Launch Output
+
+Current runner hosts always select `OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1` when
+describing a provider for launch dispatch. The provider must then advertise
+`capabilities.launch_output_v1: true` and implement the
+`oulipoly.launch_output/v1` stream. A missing or false capability is an
+incompatible provider version: the runner returns
+`complete_launch_output_unsupported` before policy evaluation or launch, and
+the provider must be upgraded. There is no legacy launch-output fallback.
+
+The provider protocol remains additive at the JSON parsing boundary, but that
+does not make every older provider launch-compatible with a newer host. The
+host may require a selected extension before dispatch when that extension is
+necessary to preserve execution correctness.
+
+### Prompt Acceptance Attestation
+
+External provider binaries advertise `capabilities.prompt_acceptance_v1: true` only when they implement the `oulipoly.prompt_acceptance/v1` launch extension and the describe request explicitly selects it with `host.env.OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1=1`. The provider crate exposes `host_requested_prompt_acceptance_v1` for this check. A provider must omit the capability property for a host that does not select it, preserving the closed legacy `oulipoly.provider/v1` describe shape for older hosts; older providers can ignore the already-open host environment map and return their existing shape to a new host. For an advertised provider, the host adds `params.prompt_acceptance` with the protocol id, the SHA-256 of the exact launch prompt, and the mailbox delivery nonce when that prompt contains one. This contract data lets the provider correlate delivery without parsing an application-local prompt envelope. If provider policy changes the `argv`, `stdin`, or canonical `prompt` bytes, the host omits the extension for that launch and ignores any acceptance marker; byte-identical policy results retain eligibility.
+
+After submitting that exact prompt, the provider may emit a request-correlated marker named `oulipoly.prompt_accepted/v1`. Its value must contain the protocol id, provider session id, exact prompt SHA-256, and the requested delivery nonce when present. The host trusts the marker only when the capability was advertised and all supplied identities match; a nonce never substitutes for the exact prompt hash. Providers that omit the capability may still launch normally, but their prompt-acceptance markers cannot authorize durable settlement or suppress replay. Incompatible attestation semantics require a new protocol and capability version rather than changing v1 in place.
+
 ### Provider-Native Session Enumeration
 
 External provider binaries that support provider-native session discovery advertise `capabilities.session_enumerate: true` in `describe` and implement the `session.enumerate` subcommand. The runner uses this command for session import/listing metadata and treats provider-native stores as **read-only** during import: enumeration records chain rows and display metadata in `state.db`, and optional turn backfill reads through `session.read_turns`; it does not write to Claude, OpenCode, or any other provider-native store.
@@ -1074,3 +1181,56 @@ Each session entry contains `provider_session_id`, optional `title`, optional ab
 - **account** — a runtime `providers.toml` entry keying per-account quota and session state.
 - **pool-member** — a `[[providers]]` entry in a model TOML that references an account and supplies model-specific arguments.
 - **implementation-reference** — the `provider = { ... }` TOML field pointing to a `ProviderCapabilities` implementation (parse-only in this release).
+
+### Fixed canonical-paging capacity terminals (AGE-343)
+
+The paging worker sanitizes provider capacity/containment errors to fixed codes.
+`session_turn_staging_capacity_exceeded` and `session_turn_paging_paused`, along
+with the existing fixed rollout/page/record capacity codes, stop the stream as
+`unsupported` without resetting the committed checkpoint. Routine lifecycle
+re-enqueue and import preserve these terminals rather than restarting unchanged
+requests. Other preexisting unsupported-capability enqueue behavior is unchanged;
+transient I/O still follows retry backoff, and quarantine remains sticky.
+
+After separately authorized resolution, the state-library operation
+`rearm_session_turn_ingest_after_capacity_resolution` compares exact stream key,
+checkpoint generation and terminal reason, requires unsupported/unleased state,
+and transitions only readiness. It retains turns, tokens, sequence and generation.
+It is not wired into automatic discovery, import, worker retry, or a CLI command.
+Callers must not invoke it until the capacity cause is resolved or the compatible
+forward provider is restored. Providing this operation grants no production
+mutation authority. A fallback intentionally pauses ingestion, not native sessions
+or model context; neither a stopped stream nor `last_success_at` proves catch-up.
+
+The import service reports an already-stopped backfill using its allowlisted
+fixed reason and explicit resolution/rearming requirement, not a retryable
+warning. Metadata import success is independent of backfill completion. A leased
+stream is reported separately; transient failures retain automatic retry behavior.
+
+Interactive user-observation paging has its own stop latch for the same fixed
+capacity/pause codes. Queued input, the observation cursor and existing delivery
+baseline are retained; demand, provider restoration and ordinary refresh do not
+clear the stop. In the bottom input/monitor pane, **Ctrl+G** requests observer
+recovery; **Ctrl+Y** explicitly attests authority and resolution of the displayed
+cause, and **Ctrl+N** aborts. The exact stopped generation/reason is rechecked
+before one re-entry. A still-refusing provider stops again. This is distinct from
+Ctrl+P message retry / Ctrl+D discard: it neither resends a sent message nor
+confirms consumption. Subsequent provider evidence remains necessary. The action
+relies on the operator's truthful resolution attestation; it does not itself
+install a provider, free storage, or rearm the canonical ingestion stream.
+
+
+Outbound observation keeps its pre-send tail position through body and submit
+input drainage. The anchor is released after the message becomes sent, not
+replaced by a new tail. Each observer read reserves one delivery slot until the
+queue incorporates and acknowledges that exact generation; a paused/control-mode
+consumer therefore backpressures paging rather than losing earlier page effects.
+Repeated reads of the published result do not acknowledge it. This preserves
+matching counts across incomplete and empty completion pages, including duplicate
+matches on separate pages, without growing a pending-page queue.
+
+Observer recovery does not replace the cached, pinned provider executable. A live
+observer pinned to a paging-paused containment provider can stop again even after
+an installed pathname is replaced. Neither explicit rearming nor these local
+queue semantics establishes an in-process provider-replacement handoff or deployed
+restoration; deployment authority and evidence remain separate.

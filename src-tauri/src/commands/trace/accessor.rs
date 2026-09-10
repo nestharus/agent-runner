@@ -11,7 +11,7 @@ pub(super) struct TraceEnvironment {
 pub(super) fn load_trace_environment() -> Result<TraceEnvironment, String> {
     let state = StateDb::open_default()?;
     crate::invocation::stale_reconcile::reconcile_stale_running_invocations(&state)?;
-    let sessions_path = crate::cli::paths::default_config_root().join("sessions.toml");
+    let sessions_path = crate::cli::paths::default_config_root()?.join("sessions.toml");
     let sessions_cfg = load_trace_sessions_config(&sessions_path)?;
     Ok(super::mapper::trace_environment(state, sessions_cfg))
 }

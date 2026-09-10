@@ -3,6 +3,8 @@
 //!
 //! `accessor`, `formatter`, `parser`, `mapper`, `validator`, `orchestration`
 
+mod provider_authority_fixture;
+
 use chrono::{TimeZone, Utc};
 use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, StoreAddress};
 use oulipoly_state::{
@@ -77,7 +79,7 @@ interactive_args = ["launch"]
             self.config_home
                 .join("oulipoly-agent-runner")
                 .join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[fixture-provider]
 command = "{}"
 args = []
@@ -89,7 +91,7 @@ kind = "flag"
 flag = "--resume"
 "#,
                 script_path.display()
-            ),
+            )),
         )
         .expect("write providers");
     }
@@ -133,7 +135,10 @@ flag = "--resume"
     fn apply_env(&self, cmd: &mut Command) {
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.env_remove("OULIPOLY_RETURN_CHANNEL");
     }
@@ -149,6 +154,29 @@ flag = "--resume"
             "fixture.jsonl",
         )
         .expect("seed turn");
+        drop(db);
+        let connection = Connection::open(self.db_path()).expect("open fixture connection");
+        connection
+            .execute(
+                "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                 VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', 'fixture')",
+                [session_id],
+            )
+            .expect("seed chain");
+        connection
+            .execute(
+                "INSERT INTO session_chain_segments
+                    (chain_id, provider_name, session_id, started_at, transition_reason)
+                 VALUES (?1, ?2, ?1, '2026-04-17T08:00:00Z', 'initial')",
+                params![session_id, provider],
+            )
+            .expect("seed segment");
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &connection,
+            provider,
+            session_id,
+            self.dir.path(),
+        );
     }
 }
 
@@ -165,41 +193,10 @@ fn parse_invocation(stderr: &str) -> String {
         .to_string()
 }
 
-fn assert_resume_success_result(stdout: &[u8]) {
-    let stdout = String::from_utf8_lossy(stdout);
-    assert!(
-        stdout.starts_with("resume stdout\nOULIPOLY_RESULT="),
-        "{stdout}"
-    );
-    let raw = stdout
-        .strip_prefix("resume stdout\nOULIPOLY_RESULT=")
-        .unwrap()
-        .trim();
-    let result: serde_json::Value = serde_json::from_str(raw).unwrap();
-    let mut keys = result
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    keys.sort();
-    assert_eq!(
-        keys,
-        [
-            "error_category",
-            "exit_code",
-            "finished_at",
-            "id",
-            "status",
-            "success",
-            "terminal_reason"
-        ]
-    );
-    assert_eq!(result["status"], "succeeded");
-    assert_eq!(result["success"], true);
-    assert_eq!(result["exit_code"], 0);
-    assert!(result["error_category"].is_null());
-    assert!(result["terminal_reason"].is_null());
+fn assert_resume_success_result(output: &Output) {
+    assert_eq!(output.stdout, b"resume stdout");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("OULIPOLY_RESULT=").count(), 1, "{stderr}");
 }
 
 fn invocation_count(db: &StateDb) -> i64 {
@@ -279,20 +276,10 @@ printf 'provider stdout'"#,
     let output = fixture.run_one_shot();
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    // run_with_balancing now appends a single-line `OULIPOLY_RESULT={...}` envelope
-    // after the provider stdout; the spirit of "preserves stdout" is now "preserves
-    // the provider-stdout PREFIX."
-    assert!(
-        output.stdout.starts_with(b"provider stdout"),
-        "{:?}",
-        output.stdout
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("OULIPOLY_RESULT="),
-        "{:?}",
-        output.stdout
-    );
-    let invocation_id = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"provider stdout", "{:?}", output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("OULIPOLY_RESULT=").count(), 1, "{stderr}");
+    let invocation_id = parse_invocation(&stderr);
     let db = fixture.open_db();
     let row = db.get_invocation_by_uuid(&invocation_id).unwrap().unwrap();
     assert_eq!(row.status, InvocationStatus::Succeeded);
@@ -359,11 +346,14 @@ printf 'resume stdout'"#,
     let output = fixture.run_headless_resume(session_id);
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert_resume_success_result(&output.stdout);
+    assert_resume_success_result(&output);
     let invocation_id = parse_invocation(&String::from_utf8_lossy(&output.stderr));
     let db = fixture.open_db();
     let row = db.get_invocation_by_uuid(&invocation_id).unwrap().unwrap();
-    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        row.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
     assert_eq!(returned_rows(db.connection(), row.id).len(), 1);
 }
 
@@ -536,11 +526,19 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
             parent_invocation_id: None,
         })
         .unwrap();
-    db.finalize_invocation(row_id, false, 7, Some("fixture"), Some("exit_nonzero"))
-        .unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        row_id,
+        false,
+        7,
+        Some("fixture"),
+        Some("exit_nonzero"),
+    )
+    .unwrap();
     let producer = invocation_uuid;
 
     db.record_returned_artifacts(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         row_id,
         &[
             returned_ref(producer, "first.md", 1),
@@ -549,6 +547,7 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
     )
     .expect("record returns");
     db.record_returned_artifacts(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         row_id,
         &[
             returned_ref(producer, "first.md", 1),
@@ -565,7 +564,11 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
     let mut mismatched = returned_ref(Uuid::new_v4(), "mismatch.md", 1);
     mismatched.producer_invocation_uuid = producer;
     let err = db
-        .record_returned_artifacts(row_id, &[mismatched])
+        .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            &[mismatched],
+        )
         .expect_err("mismatched producer id fails");
     assert!(
         err.contains("producer UUID mismatch"),
@@ -582,7 +585,11 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
         })
         .unwrap();
     let err = db
-        .record_returned_artifacts(other_row_id, &[returned_ref(producer, "wrong-row.md", 1)])
+        .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            other_row_id,
+            &[returned_ref(producer, "wrong-row.md", 1)],
+        )
         .expect_err("wrong invocation row fails");
     assert!(
         err.contains("belongs to"),
@@ -591,7 +598,11 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
     let mut wrong_version_id = returned_ref(producer, "wrong-version.md", 1);
     wrong_version_id.version_id = format!("store://return/{producer}/other-name.md/1");
     let err = db
-        .record_returned_artifacts(row_id, &[wrong_version_id])
+        .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            &[wrong_version_id],
+        )
         .expect_err("wrong version_id fails");
     assert!(
         err.contains("version_id mismatch"),
@@ -599,6 +610,7 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
     );
     let err = db
         .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             row_id,
             &[returned_ref(producer, "huge-version.md", u64::MAX)],
         )
@@ -610,7 +622,11 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
     let mut huge_content_len = returned_ref(producer, "huge-content.md", 1);
     huge_content_len.content_len = u64::MAX;
     let err = db
-        .record_returned_artifacts(row_id, &[huge_content_len])
+        .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            &[huge_content_len],
+        )
         .expect_err("oversized content_len fails");
     assert!(
         err.contains("content_len exceeds SQLite INTEGER range"),
@@ -662,8 +678,17 @@ fn trace_json_includes_returned_artifacts_and_legacy_missing_defaults_to_empty()
             parent_invocation_id: None,
         })
         .unwrap();
-    db.finalize_invocation(row_id, true, 0, None, None).unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        row_id,
+        true,
+        0,
+        None,
+        None,
+    )
+    .unwrap();
     db.record_returned_artifacts(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         row_id,
         &[returned_ref(
             Uuid::parse_str(invocation_uuid).unwrap(),
@@ -731,7 +756,21 @@ fn test_model_ipc_result_source_shape_has_no_returned_artifacts_field() {
     }
     let struct_body = &source[struct_start..=brace_end.expect("TestModelResult closing brace")];
 
-    for field in ["success:", "stdout:", "stderr:", "exit_code:"] {
+    for field in [
+        "success:",
+        "exit_code:",
+        "stdout_preview:",
+        "stdout_preview_truncated:",
+        "stdout_bytes:",
+        "stdout_sha256:",
+        "stdout_content_type:",
+        "stderr_preview:",
+        "stderr_preview_truncated:",
+        "stderr_bytes:",
+        "stderr_sha256:",
+        "stderr_content_type:",
+        "output_artifact_token:",
+    ] {
         assert!(
             struct_body.contains(field),
             "missing existing field {field}"

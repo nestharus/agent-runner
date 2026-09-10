@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 pub mod rc1_schema_contract;
-pub mod rc2_ingest_body_payload;
 pub mod rc3_export_db_source;
 pub mod rc4_trace_inline_transcript;
 
@@ -68,6 +67,12 @@ impl RcaFixture {
         let conn = self.conn();
         insert_session_chain(&conn);
         insert_session_chain_segment(&conn);
+        crate::provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            PROVIDER,
+            SESSION_ID,
+            self.root(),
+        );
     }
 
     pub fn seed_body_turns(&self) {
@@ -270,7 +275,9 @@ fn empty_body_model_toml() -> String {
 
 fn write_empty_body_provider_toml(app_config_dir: &Path, root: &Path) {
     let path = empty_body_provider_toml_path(app_config_dir);
-    let contents = empty_body_provider_toml(root);
+    let contents = crate::provider_authority_fixture::with_explicit_provider_authority(
+        &empty_body_provider_toml(root),
+    );
     write_text_file(&path, &contents);
 }
 
@@ -365,7 +372,10 @@ fn export_command() -> Command {
 fn apply_export_env(cmd: &mut Command, fixture: &RcaFixture) {
     cmd.env("XDG_CONFIG_HOME", &fixture.config_home);
     cmd.env("XDG_DATA_HOME", &fixture.data_home);
-    cmd.env_remove("OULIPOLY_DATA_DIR");
+    cmd.env(
+        "OULIPOLY_DATA_DIR",
+        fixture.data_home.join("oulipoly-agent-runner"),
+    );
     cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
 }
 

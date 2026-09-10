@@ -3,7 +3,6 @@
 //! `accessor`
 
 use oulipoly_state::StateDb;
-use oulipoly_state::mailbox::MailboxDb;
 use std::path::Path;
 use std::time::Duration;
 
@@ -78,15 +77,6 @@ fn open_state_read_only_at_with_retry_and_work_timeout(
     )
     .map(Some)
     .map_err(|error| format!("Failed to open State read-only for wake sweep: {error:?}"))
-}
-
-pub(super) fn pending_mailbox_provider_name(
-    db: &MailboxDb,
-    session_id: &str,
-) -> Result<Option<String>, String> {
-    db.wake_session_reader()
-        .session_metadata(session_id)
-        .map(|runtime| runtime.and_then(|runtime| runtime.provider_name))
 }
 
 #[cfg(test)]

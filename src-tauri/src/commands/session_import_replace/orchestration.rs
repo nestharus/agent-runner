@@ -28,7 +28,10 @@ pub(crate) fn run_session_import_replace(
             session_id,
         ) {
             Ok(identity) => identity,
-            Err(message) => {
+            Err(crate::commands::session_external_provider_identity::SessionExternalProviderIdentityError::AmbiguousSession { input }) => {
+                return super::render_import_replace_output(Err(ReplaceError::AmbiguousSession { input }));
+            }
+            Err(crate::commands::session_external_provider_identity::SessionExternalProviderIdentityError::Operational { message }) => {
                 return super::render_import_replace_output(Err(replace_error_from_identity_error(
                     message,
                 )));

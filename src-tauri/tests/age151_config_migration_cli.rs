@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -33,7 +35,10 @@ impl CliFixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env("HOME", &self.data_home);
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
@@ -51,6 +56,14 @@ impl CliFixture {
 
     fn sessions_path(&self) -> PathBuf {
         self.app_config_dir.join("sessions.toml")
+    }
+
+    fn write_valid_providers(&self, body: &str) {
+        fs::write(
+            self.providers_path(),
+            provider_authority_fixture::with_explicit_provider_authority(body),
+        )
+        .unwrap();
     }
 
     fn migrate_config_output(&self) -> Output {
@@ -74,15 +87,13 @@ fn stderr(output: &Output) -> String {
 #[test]
 fn age151_migrate_config_missing_sessions_toml_is_noop_for_session_storage_backfill() {
     let fixture = CliFixture::new();
-    fs::write(
-        fixture.providers_path(),
+    fixture.write_valid_providers(
         r#"[claude]
 command = "claude"
 args = []
 prompt_mode = "arg"
 "#,
-    )
-    .unwrap();
+    );
     assert!(
         !fixture.sessions_path().exists(),
         "fixture must exercise the missing sessions.toml branch"
@@ -111,8 +122,7 @@ prompt_mode = "arg"
 #[test]
 fn age151_migrate_config_preserves_existing_session_storage_and_ignores_unbackfillable_sessions() {
     let fixture = CliFixture::new();
-    fs::write(
-        fixture.providers_path(),
+    fixture.write_valid_providers(
         r#"[claude]
 command = "claude"
 args = []
@@ -132,8 +142,7 @@ command = "missing-provider"
 args = []
 prompt_mode = "arg"
 "#,
-    )
-    .unwrap();
+    );
     fs::write(
         fixture.sessions_path(),
         r#"[claude]

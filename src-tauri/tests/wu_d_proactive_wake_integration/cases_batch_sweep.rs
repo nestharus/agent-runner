@@ -4,20 +4,23 @@
 //!
 //! TEST: proactive wake integration orchestration cases (batch delivery and wake-sweep regressions).
 
-use crate::fake_cli::provider_script;
+use crate::fake_provider::{anchor_admission_provider_script, provider_script};
 use crate::fixtures::Fixture;
 use crate::liveness::{
     assert_dead_owner_debris_retained, delivered_rows_without_pending_or_claim,
     delivered_single_row_without_error_or_claim, settle_wake_sweep, wait_for_file, wait_until,
+    wait_until_with_timeout,
 };
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
     assert_additional_notifications_remain_queued, assert_age270_invocation,
-    assert_live_claim_token, assert_no_wake_claim, assert_pending_handle_with_delivery_attempts,
-    assert_pending_handle_without_error, assert_pending_mailbox_count,
-    assert_prompt_contains_handle, assert_prompt_file_missing, assert_success, assert_xdg_isolated,
+    assert_live_claim_token, assert_no_wake_claim, assert_pending_handle_without_error,
+    assert_pending_mailbox_count, assert_prompt_contains_handle, assert_prompt_file_missing,
+    assert_success, assert_xdg_isolated,
 };
-use crate::wake_claim_setup::{seed_dead_wake_claim, seed_live_wake_claim};
+use crate::wake_claim_setup::{
+    acquire_seed_wake_claim, seed_dead_wake_claim, seed_live_wake_claim,
+};
 use crate::{MODEL, PROVIDER, SESSION};
 
 fn direct_unconfirmed_invocation(output: &std::process::Output) -> String {
@@ -82,16 +85,16 @@ fn assert_one_failed_delivery(fixture: &Fixture, session_id: &str) {
     assert_no_wake_claim(fixture, session_id);
 }
 
-pub(crate) fn batch_cap_followup_wake() {
+pub(crate) fn persisted_count_at_five_allows_turn_end_followup_wake() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script(
         "",
         "",
-        "batch-${OULIPOLY_AUTO_WAKE_COUNT:-manual}.txt",
+        "batch-${WU_D_PROVIDER_RESUME_INDEX}.txt",
     ));
     fixture.seed_session_turn();
-    fixture.seed_idle_runtime();
+    fixture.seed_idle_runtime_with_wake_count(SESSION, 5);
     for index in 0..25 {
         fixture.seed_mailbox(SESSION, &format!("h-batch-{index:02}"));
     }
@@ -99,13 +102,13 @@ pub(crate) fn batch_cap_followup_wake() {
     let output = fixture.run_resume();
     let manual_invocation = direct_unconfirmed_invocation(&output);
 
-    let first = wait_for_file(&fixture.prompt_file("batch-manual.txt"));
-    let second = wait_for_file(&fixture.prompt_file("batch-1.txt"));
+    let first = wait_for_file(&fixture.prompt_file("batch-1.txt"));
     assert_additional_notifications_remain_queued(&first);
-    assert_prompt_contains_handle(&second, "h-batch-20");
     wait_until("batch rows delivered", || {
         delivered_rows_without_pending_or_claim(&fixture, SESSION, 25)
     });
+    let second = wait_for_file(&fixture.prompt_file("batch-2.txt"));
+    assert_prompt_contains_handle(&second, "h-batch-20");
     let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
     assert!(
         rows.iter()
@@ -126,9 +129,14 @@ pub(crate) fn batch_cap_followup_wake() {
     assert_eq!(*followup.1, 5);
     assert_age270_invocation(&fixture, &manual_invocation);
     assert_age270_invocation(&fixture, followup.0);
-    assert!(fixture.prompt_file("batch-manual.txt").exists());
-    assert!(fixture.prompt_file("batch-1.txt").exists());
-    assert!(!fixture.prompt_file("batch-2.txt").exists());
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.auto_wake_count, 6);
+    assert!(!fixture.prompt_file("batch-3.txt").exists());
     assert_xdg_isolated(&fixture);
 }
 
@@ -262,10 +270,10 @@ pub(crate) fn wake_sweep_does_not_disturb_live_identity_matched_claim() {
     assert_xdg_isolated(&fixture);
 }
 
-pub(crate) fn wake_sweep_does_not_rewake_consumed_pending_mailbox() {
+pub(crate) fn wake_sweep_does_not_treat_pre_anchor_prose_as_consumption() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.write_provider(&provider_script("", "", "consumed-not-rewoken.txt"));
+    fixture.write_provider(&provider_script("", "", "pre-anchor-prose-retried.txt"));
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-consumed");
@@ -274,21 +282,29 @@ pub(crate) fn wake_sweep_does_not_rewake_consumed_pending_mailbox() {
 
     let output = fixture.run_mailbox_list(SESSION);
     assert_success(&output);
-    settle_wake_sweep();
-
-    assert_prompt_file_missing(&fixture, "consumed-not-rewoken.txt");
-    assert_pending_mailbox_count(&fixture, SESSION, 1);
+    // The stored prose predates the delivery anchor and has no exact nonce.
+    // It cannot suppress this row; only the new provider-observed submission
+    // may settle it (sweep/consumed.rs and the AGE347 observation contract).
+    let prompt = wait_for_file(&fixture.prompt_file("pre-anchor-prose-retried.txt"));
+    assert_prompt_contains_handle(&prompt, "h-consumed");
+    wait_until("fresh post-anchor evidence settles the pending row", || {
+        delivered_single_row_without_error_or_claim(&fixture, SESSION)
+    });
+    let row = fixture
+        .mailbox()
+        .list_mailbox(SESSION, true)
+        .unwrap()
+        .remove(0);
+    assert_eq!(row.delivery_attempts, 1);
+    assert!(row.delivered_by_invocation_uuid.is_some());
+    assert_pending_mailbox_count(&fixture, SESSION, 0);
     assert_xdg_isolated(&fixture);
 }
 
-pub(crate) fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
+pub(crate) fn wake_sweep_retries_twice_unconfirmed_pending_mailbox() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.write_provider(&provider_script(
-        "",
-        "",
-        "twice-unconfirmed-not-rewoken.txt",
-    ));
+    fixture.write_provider(&provider_script("", "", "twice-unconfirmed-retried.txt"));
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-unconfirmed");
@@ -297,54 +313,381 @@ pub(crate) fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
 
     let output = fixture.run_mailbox_list(SESSION);
     assert_success(&output);
-    settle_wake_sweep();
 
-    assert_prompt_file_missing(&fixture, "twice-unconfirmed-not-rewoken.txt");
-    assert_pending_handle_with_delivery_attempts(&fixture, SESSION, "h-unconfirmed", 2);
+    let prompt = wait_for_file(&fixture.prompt_file("twice-unconfirmed-retried.txt"));
+    assert_prompt_contains_handle(&prompt, "h-unconfirmed");
+    wait_until("twice-unconfirmed mailbox retried and delivered", || {
+        delivered_single_row_without_error_or_claim(&fixture, SESSION)
+    });
+    let row = fixture
+        .mailbox()
+        .list_mailbox(SESSION, true)
+        .unwrap()
+        .remove(0);
+    assert_eq!(row.delivery_attempts, 3);
+    assert_age270_invocation(
+        &fixture,
+        row.delivered_by_invocation_uuid.as_deref().unwrap(),
+    );
     assert_xdg_isolated(&fixture);
 }
 
-pub(crate) fn environment_empty_sweep_uses_persisted_wake_max_beyond_five() {
+pub(crate) fn failed_auto_wake_retains_retry_ownership_during_backoff() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.write_provider(&provider_script(
+    let first_failure = fixture.work_dir.join("first-auto-wake-failed");
+    let hook = format!(
+        r#"if [ "$WU_D_ANCHOR_INDEX" = 2 ]; then
+  : > {}
+  exit 17
+fi"#,
+        shell_path(&first_failure),
+    );
+    fixture.write_provider(&anchor_admission_provider_script(
+        &hook,
         "",
-        r#"printf '%s' "${OULIPOLY_AUTO_WAKE_MAX:-missing}" > "$work/sweep-persisted-max.txt""#,
-        "sweep-persisted-${OULIPOLY_AUTO_WAKE_COUNT:-missing}.txt",
+        "retry-owner-${WU_D_PROVIDER_RESUME_INDEX}.txt",
     ));
     fixture.seed_session_turn();
-    fixture.seed_idle_runtime_with_wake_policy(SESSION, 32, 5);
-    fixture.seed_mailbox_for(SESSION, "h-sweep-persisted", None);
-    seed_dead_wake_claim(&fixture, "ffffffff-ffff-4fff-8fff-ffffffffffff", 601);
+    fixture.seed_idle_runtime();
+    for index in 0..21 {
+        fixture.seed_mailbox(SESSION, &format!("h-retry-owner-{index:02}"));
+    }
 
-    let output = fixture.run_mailbox_list(SESSION);
-    assert_success(&output);
-
-    let prompt = wait_for_file(&fixture.prompt_file("sweep-persisted-6.txt"));
-    assert_prompt_contains_handle(&prompt, "h-sweep-persisted");
-    assert_eq!(
-        wait_for_file(&fixture.prompt_file("sweep-persisted-max.txt")),
-        "32"
-    );
-    wait_until("persisted-max sweep delivery", || {
-        delivered_single_row_without_error_or_claim(&fixture, SESSION)
+    let manual_resume = fixture.run_resume_with_retry_base(2_000);
+    direct_unconfirmed_invocation(&manual_resume);
+    wait_until("first automatic wake failed and entered backoff", || {
+        first_failure.exists()
+            && crate::liveness::runtime_is_idle(&fixture, SESSION)
+            && invocation_count(&fixture) == 2
     });
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    let claim = fixture
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .expect("failed automatic wake must retain retry ownership during backoff");
+    assert_eq!(claim.auto_wake_count, 1);
+    assert!(claim.wake_pid.is_some());
+
+    let overlapping_sweep = fixture.run_mailbox_list(SESSION);
+    assert_success(&overlapping_sweep);
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert_eq!(
+        std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+        "1",
+        "a startup sweep must coalesce with the retry owner; rejected anchor never launched"
+    );
+
+    wait_until("owned retry renewed and delivered pending mailbox", || {
+        delivered_rows_without_pending_or_claim(&fixture, SESSION, 21)
+    });
+    assert_eq!(
+        std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+        "2"
+    );
+    assert_rejected_anchor_attempts(&fixture, 1, 1);
+    assert_xdg_isolated(&fixture);
+}
+
+pub(crate) fn maximum_chronology_and_delivery_attempts_stay_eligible_across_rechecks() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    let first_failure = fixture.work_dir.join("maximum-chronology-first-failure");
+    let hook = format!(
+        r#"if [ "$WU_D_ANCHOR_INDEX" = 1 ]; then
+  : > {}
+  exit 17
+fi"#,
+        shell_path(&first_failure),
+    );
+    fixture.write_provider(&anchor_admission_provider_script(
+        &hook,
+        "",
+        "maximum-chronology-${WU_D_PROVIDER_RESUME_INDEX}.txt",
+    ));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime_with_wake_count(SESSION, i64::MAX);
+    for index in 0..21 {
+        fixture.seed_mailbox(SESSION, &format!("h-maximum-chronology-{index:02}"));
+    }
+    let claim_token = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    acquire_seed_wake_claim(&fixture, claim_token);
+    fixture
+        .sidecar_conn()
+        .execute(
+            "UPDATE session_wake_claim SET auto_wake_count = ?2 WHERE session_id = ?1",
+            rusqlite::params![SESSION, i64::MAX],
+        )
+        .unwrap();
+    fixture
+        .sidecar_conn()
+        .execute(
+            "UPDATE mailbox
+             SET delivery_attempts = ?2
+             WHERE seq IN (
+                 SELECT seq FROM mailbox
+                 WHERE session_id = ?1
+                 ORDER BY enqueued_at, seq
+                 LIMIT 20
+             )",
+            rusqlite::params![SESSION, i64::MAX - 1],
+        )
+        .unwrap();
+
+    let retry_started = std::time::Instant::now();
+    let first = fixture.run_auto_wake_resume(claim_token, i64::MAX, 30);
+    let retry_elapsed = retry_started.elapsed();
+    eprintln!("production maximum-chronology retry elapsed: {retry_elapsed:?}");
+    assert!(
+        first_failure.exists(),
+        "maximum-count failure path was not reached"
+    );
+    assert!(
+        retry_elapsed >= std::time::Duration::from_secs(29)
+            && retry_elapsed <= std::time::Duration::from_secs(45),
+        "the production maximum-chronology retry must select the 30-second cadence ceiling: \
+         {retry_elapsed:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&first.stderr).contains("attempt to add with overflow"),
+        "maximum chronology overflowed before retry renewal: {first:?}"
+    );
+
+    wait_until(
+        "maximum chronology retry delivered all pending rows",
+        || delivered_rows_without_pending_or_claim(&fixture, SESSION, 21),
+    );
+    let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert_eq!(rows.len(), 21);
+    assert!(
+        rows[..20]
+            .iter()
+            .all(|row| row.delivery_attempts == i64::MAX),
+        "rejected anchor is not a delivery attempt; successful delivery saturates at i64::MAX"
+    );
+    assert_eq!(rows[20].delivery_attempts, 1);
     let runtime = fixture
         .mailbox()
         .wake_session_reader()
         .session_metadata(SESSION)
         .unwrap()
         .unwrap();
-    assert_eq!(runtime.selected_auto_wake_max, Some(32));
-    assert_eq!(runtime.auto_wake_count, 6);
-    assert_one_failed_delivery(&fixture, SESSION);
+    assert_eq!(runtime.auto_wake_count, i64::MAX);
+    assert_rejected_anchor_attempts(&fixture, 1, 20);
     assert_xdg_isolated(&fixture);
+}
+
+pub(crate) fn repeated_failed_wakes_keep_oldest_batch_owned_past_terminal_budget() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    let attempt_ledger = fixture.work_dir.join("persistent-failure-attempts.txt");
+    let seventh_started = fixture.work_dir.join("persistent-failure-seventh-started");
+    let release_seventh = fixture.work_dir.join("persistent-failure-release-seventh");
+    let hook = format!(
+        r#"python3 - {attempt_ledger} "$WU_D_ANCHOR_INDEX" <<'PY'
+import sys
+import time
+
+with open(sys.argv[1], "a", encoding="utf-8") as out:
+    out.write(f"{{sys.argv[2]}} {{time.monotonic_ns()}}\n")
+PY
+if [ "$WU_D_ANCHOR_INDEX" -le 6 ]; then
+  exit 17
+fi
+if [ "$WU_D_ANCHOR_INDEX" = 7 ]; then
+  : > {seventh_started}
+  while [ ! -e {release_seventh} ]; do sleep 0.01; done
+fi"#,
+        attempt_ledger = shell_path(&attempt_ledger),
+        seventh_started = shell_path(&seventh_started),
+        release_seventh = shell_path(&release_seventh),
+    );
+    fixture.write_provider(&anchor_admission_provider_script(
+        &hook,
+        "",
+        "persistent-failure-${WU_D_PROVIDER_RESUME_INDEX}.txt",
+    ));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime_with_wake_count(SESSION, 1);
+    for index in 0..21 {
+        fixture.seed_mailbox(SESSION, &format!("h-persistent-failure-{index:02}"));
+    }
+    let claim_token = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    acquire_seed_wake_claim(&fixture, claim_token);
+    fixture
+        .sidecar_conn()
+        .execute(
+            "UPDATE session_wake_claim SET auto_wake_count = ?2 WHERE session_id = ?1",
+            rusqlite::params![SESSION, 1],
+        )
+        .unwrap();
+
+    let first = fixture.run_auto_wake_resume(claim_token, 1, 1_000);
+    assert_eq!(first.status.code(), Some(1), "{first:?}");
+    assert!(String::from_utf8_lossy(&first.stderr).contains("offline_anchor_unavailable"));
+    wait_until_with_timeout(
+        "seventh production retry reached pre-submission anchor admission",
+        std::time::Duration::from_secs(120),
+        || seventh_started.exists(),
+    );
+
+    let retained_claim = fixture
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .expect("six consecutive failures must retain one claim for a seventh attempt");
+    assert_ne!(retained_claim.claim_token, claim_token);
+    assert_eq!(retained_claim.auto_wake_count, 7);
+    assert!(retained_claim.wake_pid.is_some());
+    let pending = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert!(
+        pending[..20]
+            .iter()
+            .all(|row| row.delivery_attempts == 0 && row.delivery_error.is_none())
+    );
+    assert_rejected_anchor_attempts(&fixture, 6, 20);
+    assert!(
+        !fixture
+            .work_dir
+            .join("provider-resume-sequence.txt")
+            .exists(),
+        "six rejected admissions and held seventh must cause zero semantic submissions"
+    );
+    assert_eq!(pending[20].delivery_attempts, 0);
+    assert!(pending[20].delivery_error.is_none());
+    assert!(pending.iter().all(|row| row.delivered_at.is_none()));
+
+    std::fs::write(&release_seventh, "release\n").unwrap();
+    wait_until(
+        "persistent failure lifecycle delivered oldest and newer work",
+        || delivered_rows_without_pending_or_claim(&fixture, SESSION, 21),
+    );
+    let oldest = wait_for_file(&fixture.prompt_file("persistent-failure-1.txt"));
+    assert_prompt_contains_handle(&oldest, "h-persistent-failure-00");
+    assert_prompt_contains_handle(&oldest, "h-persistent-failure-19");
+    assert!(!oldest.contains("h-persistent-failure-20"), "{oldest}");
+    let newer = wait_for_file(&fixture.prompt_file("persistent-failure-2.txt"));
+    assert_prompt_contains_handle(&newer, "h-persistent-failure-20");
+    assert!(!newer.contains("h-persistent-failure-00"), "{newer}");
+
+    let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert!(rows[..20].iter().all(|row| row.delivery_attempts == 1));
+    assert_eq!(rows[20].delivery_attempts, 1);
+    assert_eq!(
+        std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+        "2"
+    );
+    let attempts = std::fs::read_to_string(&attempt_ledger)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (index, timestamp) = line.split_once(' ').unwrap();
+            (
+                index.parse::<usize>().unwrap(),
+                timestamp.parse::<u128>().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempts.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6, 7, 8]
+    );
+    let anchor_intervals_ms = attempts[..7]
+        .windows(2)
+        .map(|pair| (pair[1].1 - pair[0].1) / 1_000_000)
+        .collect::<Vec<_>>();
+    eprintln!("anchor-entry intervals including active work (ms): {anchor_intervals_ms:?}");
+    // Rejection unwinds the invocation guard before the failed-wake recheck
+    // sleeps. Anchor entry precedes that unwinding; timing from there charges
+    // observation/teardown to backoff. The next invocation starts after renewal.
+    // This bracket still includes recheck/spawn overhead, not just the sleep.
+    let retry_intervals_ms = failed_invocation_retry_intervals_ms(&fixture);
+    eprintln!("production finished-to-created retry intervals (ms): {retry_intervals_ms:?}");
+    for (elapsed_ms, expected_ms) in retry_intervals_ms
+        .iter()
+        .zip([1_000_i64, 2_000, 4_000, 8_000, 16_000, 30_000])
+    {
+        assert_retry_interval_ms(*elapsed_ms, expected_ms);
+    }
+    assert_xdg_isolated(&fixture);
+}
+
+fn failed_invocation_retry_intervals_ms(fixture: &Fixture) -> Vec<i64> {
+    let state = fixture.state();
+    let connection = state.connection();
+    let mut statement = connection
+        .prepare("SELECT created_at, finished_at, status FROM invocations ORDER BY id")
+        .unwrap();
+    let invocations = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(invocations.len(), 8);
+    invocations[..7]
+        .windows(2)
+        .map(|pair| {
+            assert_eq!(pair[0].2, "failed");
+            finished_to_created_ms(
+                pair[0].1.as_deref().expect("rejected invocation finished"),
+                &pair[1].0,
+            )
+        })
+        .collect()
+}
+
+fn finished_to_created_ms(finished_at: &str, next_created_at: &str) -> i64 {
+    let finished = chrono::DateTime::parse_from_rfc3339(finished_at).unwrap();
+    let next_created = chrono::DateTime::parse_from_rfc3339(next_created_at).unwrap();
+    next_created
+        .signed_duration_since(finished)
+        .num_milliseconds()
+}
+
+fn assert_retry_interval_ms(elapsed_ms: i64, expected_ms: i64) {
+    assert!(
+        elapsed_ms >= expected_ms - 100 && elapsed_ms <= expected_ms + 1_500,
+        "production retry did not follow the selected exponential cadence: \
+         expected_ms={expected_ms}, elapsed_ms={elapsed_ms}"
+    );
+}
+
+#[test]
+fn retry_timestamp_oracle_excludes_active_attempt_duration() {
+    let created = "2026-09-09T10:00:00+00:00";
+    let finished = "2026-09-09T10:00:03+00:00";
+    let next_created = "2026-09-09T10:00:04+00:00";
+    assert_eq!(finished_to_created_ms(created, next_created), 4_000);
+    assert_eq!(finished_to_created_ms(finished, next_created), 1_000);
+    assert_eq!(finished_to_created_ms(next_created, finished), -1_000);
+    assert_retry_interval_ms(finished_to_created_ms(finished, next_created), 1_000);
+}
+
+#[test]
+#[should_panic(expected = "production retry did not follow the selected exponential cadence")]
+fn retry_timestamp_oracle_rejects_early_retry() {
+    assert_retry_interval_ms(899, 1_000);
+}
+
+#[test]
+#[should_panic(expected = "production retry did not follow the selected exponential cadence")]
+fn retry_timestamp_oracle_rejects_late_retry() {
+    assert_retry_interval_ms(2_501, 1_000);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn renewed_followup_claim_survives_old_failed_child_recheck() {
-    use sha2::{Digest, Sha256};
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     let fifo = fixture.work_dir.join("renewed-release.fifo");
@@ -358,38 +701,36 @@ fn renewed_followup_claim_survives_old_failed_child_recheck() {
     let ledger = fixture.work_dir.join("renewed-ledger.txt");
     let count1_pid = fixture.work_dir.join("count1.pid");
     let count1_start = fixture.work_dir.join("count1.start");
-    let count1_token = fixture.work_dir.join("count1.token");
     let count2_pid = fixture.work_dir.join("count2.pid");
-    let count2_token = fixture.work_dir.join("count2.token");
     let held = fixture.work_dir.join("count2.held");
     let hook = format!(
-        r#"count="${{OULIPOLY_AUTO_WAKE_COUNT:-manual}}"
-token="${{OULIPOLY_AUTO_WAKE_TOKEN:-manual}}"
-printf '%s|%s|%s\n' "$count" "$PPID" "$token" >> {ledger}
-if [ "$count" = 1 ]; then
-  printf '%s' "$PPID" > {count1_pid}
-  awk '{{print $22}}' "/proc/$PPID/stat" > {count1_start}
-  printf '%s' "$token" > {count1_token}
+        r#"index="$WU_D_PROVIDER_RESUME_INDEX"
+label=manual
+if [ "$index" -gt 1 ]; then
+  label=$((index - 1))
 fi
-if [ "$count" = 2 ]; then
-  printf '%s' "$PPID" > {count2_pid}
-  printf '%s' "$token" > {count2_token}
+wake_pid="$(awk '{{print $4}}' "/proc/$PPID/stat")"
+printf '%s|%s\n' "$label" "$wake_pid" >> {ledger}
+if [ "$index" = 2 ]; then
+  printf '%s' "$wake_pid" > {count1_pid}
+  awk '{{print $22}}' "/proc/$wake_pid/stat" > {count1_start}
+fi
+if [ "$index" = 3 ]; then
+  printf '%s' "$wake_pid" > {count2_pid}
   : > {held}
   IFS= read -r _ < {fifo}
 fi"#,
         ledger = shell_path(&ledger),
         count1_pid = shell_path(&count1_pid),
         count1_start = shell_path(&count1_start),
-        count1_token = shell_path(&count1_token),
         count2_pid = shell_path(&count2_pid),
-        count2_token = shell_path(&count2_token),
         held = shell_path(&held),
         fifo = shell_path(&fifo),
     );
     fixture.write_provider(&provider_script(
         "",
         &hook,
-        "batch-${OULIPOLY_AUTO_WAKE_COUNT:-manual}.txt",
+        "batch-${WU_D_PROVIDER_RESUME_INDEX}.txt",
     ));
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
@@ -398,21 +739,12 @@ fi"#,
     }
     let output = fixture.run_resume();
     let manual_invocation = direct_unconfirmed_invocation(&output);
-    wait_until("count 2 held", || {
-        held.exists() && count2_pid.exists() && count2_token.exists()
-    });
-    let turn_id = format!("wu-d-delivery-{SESSION}-2");
-    let turn_name = Sha256::digest(turn_id.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
-        + ".jsonl";
-    assert!(
-        !fixture
-            .work_dir
-            .join("session-turns")
-            .join(turn_name)
-            .exists()
+    wait_until("count 2 held", || held.exists() && count2_pid.exists());
+    assert_eq!(
+        std::fs::read_dir(fixture.work_dir.join("session-turns"))
+            .unwrap()
+            .count(),
+        2
     );
     assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 5);
     let old_pid = std::fs::read_to_string(&count1_pid)
@@ -426,8 +758,6 @@ fi"#,
     wait_until("count 1 process identity gone", || {
         process_start(old_pid).as_deref() != Some(old_start.as_str())
     });
-    let old_token = std::fs::read_to_string(&count1_token).unwrap();
-    let renewed_token = std::fs::read_to_string(&count2_token).unwrap();
     let renewed_pid = std::fs::read_to_string(&count2_pid)
         .unwrap()
         .parse::<i64>()
@@ -438,8 +768,7 @@ fi"#,
         .wake_claim(SESSION)
         .unwrap()
         .unwrap();
-    assert_eq!(claim.claim_token, renewed_token);
-    assert_ne!(claim.claim_token, old_token);
+    assert!(!claim.claim_token.is_empty());
     assert_eq!(claim.wake_pid, Some(renewed_pid));
     assert_eq!(claim.auto_wake_count, 2);
     assert_eq!(invocation_count(&fixture), 3);
@@ -470,10 +799,10 @@ fi"#,
             .count(),
         1
     );
-    assert!(fixture.prompt_file("batch-manual.txt").exists());
     assert!(fixture.prompt_file("batch-1.txt").exists());
     assert!(fixture.prompt_file("batch-2.txt").exists());
-    assert!(!fixture.prompt_file("batch-3.txt").exists());
+    assert!(fixture.prompt_file("batch-3.txt").exists());
+    assert!(!fixture.prompt_file("batch-4.txt").exists());
     std::fs::write(&fifo, "release\n").unwrap();
     wait_until("renewed delivery settled", || {
         delivered_rows_without_pending_or_claim(&fixture, SESSION, 45)
@@ -529,28 +858,104 @@ fn process_start(pid: u32) -> Option<String> {
     tail.split_whitespace().nth(19).map(str::to_string)
 }
 
-pub(crate) fn persisted_wake_max_caps_sweep_at_selected_value() {
+pub(crate) fn maximum_persisted_count_allows_startup_sweep_delivery() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.write_provider(&provider_script("", "", "sweep-cap-should-not-run.txt"));
+    let started = fixture.work_dir.join("maximum-sweep-started");
+    let release = fixture.work_dir.join("maximum-sweep-release");
+    let hook = format!(
+        ": > {started}\nwhile [ ! -e {release} ]; do sleep 0.01; done",
+        started = shell_path(&started),
+        release = shell_path(&release),
+    );
+    fixture.write_provider(&provider_script("", &hook, "maximum-sweep-count.txt"));
     fixture.seed_session_turn();
-    fixture.seed_idle_runtime_with_wake_policy(SESSION, 32, 32);
-    fixture.seed_mailbox_for(SESSION, "h-sweep-cap", None);
-    seed_dead_wake_claim(&fixture, "abababab-abab-4bab-8bab-abababababab", 601);
+    fixture.seed_idle_runtime_with_wake_count(SESSION, i64::MAX);
+    fixture.seed_mailbox_for(SESSION, "h-sweep-count", None);
+    let stale_token = "abababab-abab-4bab-8bab-abababababab";
+    seed_dead_wake_claim(&fixture, stale_token, 601);
 
     let output = fixture.run_mailbox_list(SESSION);
     assert_success(&output);
-    settle_wake_sweep();
 
-    assert_prompt_file_missing(&fixture, "sweep-cap-should-not-run.txt");
-    assert_pending_mailbox_count(&fixture, SESSION, 1);
+    wait_for_file(&started);
+    let claim = fixture
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .expect("maximum chronology sweep must acquire a replacement claim");
+    assert_ne!(claim.claim_token, stale_token);
+    assert_eq!(claim.auto_wake_count, i64::MAX);
+    assert!(claim.wake_pid.is_some());
+    let prompt = wait_for_file(&fixture.prompt_file("maximum-sweep-count.txt"));
+    assert_prompt_contains_handle(&prompt, "h-sweep-count");
+    std::fs::write(&release, "release\n").unwrap();
+    wait_until("maximum chronology startup sweep delivery", || {
+        delivered_single_row_without_error_or_claim(&fixture, SESSION)
+    });
     let runtime = fixture
         .mailbox()
         .wake_session_reader()
         .session_metadata(SESSION)
         .unwrap()
         .unwrap();
-    assert_eq!(runtime.selected_auto_wake_max, Some(32));
-    assert_eq!(runtime.auto_wake_count, 32);
+    assert_eq!(runtime.auto_wake_count, i64::MAX);
+    assert_eq!(
+        std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+        "1"
+    );
+    assert_one_failed_delivery(&fixture, SESSION);
+    assert_xdg_isolated(&fixture);
+}
+
+// Read-only proof from real admission failures, never injected submission state.
+fn assert_rejected_anchor_attempts(fixture: &Fixture, expected: i64, batch_size: i64) {
+    let conn = fixture.sidecar_conn();
+    let rejected: i64 = conn.query_row(
+        "SELECT count(*) FROM mailbox_delivery_attempts a
+         WHERE observation_error LIKE '%offline_anchor_unavailable%'
+           AND headless_submission_state = 'prepared' AND submission_started_at IS NULL
+           AND observation_anchor_token IS NULL AND observation_confirmed_at IS NULL
+           AND (SELECT count(*) FROM mailbox_delivery_attempt_items i WHERE i.attempt_id=a.attempt_id)=?1",
+        [batch_size], |row| row.get(0)).unwrap();
+    assert_eq!(
+        rejected, expected,
+        "only the prepared-before-CAS path proves non-submission"
+    );
+}
+
+#[test]
+fn failed_provider_exit_and_empty_observation_retain_uncertainty_across_rechecks() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "exit 17", "failed-after-cas.txt"));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    fixture.seed_mailbox(SESSION, "h-failed-after-cas");
+    let output = fixture.run_resume();
+    assert_eq!(output.status.code(), Some(17), "{output:?}");
+    let attempt: String = fixture.sidecar_conn().query_row(
+        "SELECT attempt_id FROM mailbox_delivery_attempts WHERE submission_started_at IS NOT NULL AND resolved_at IS NULL",
+        [], |row| row.get(0)).unwrap();
+    for _ in 0..3 {
+        assert_success(&fixture.run_mailbox_list(SESSION)); // fresh Runner process
+        settle_wake_sweep();
+        assert_eq!(
+            std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+            "1"
+        );
+        assert!(!fixture.work_dir.join("session-turns").exists());
+        let retained: i64 = fixture.sidecar_conn().query_row(
+            "SELECT count(*) FROM mailbox_delivery_attempts WHERE attempt_id=?1
+             AND headless_submission_state='possible' AND submission_started_at IS NOT NULL
+             AND resolved_at IS NULL AND observation_confirmed_at IS NULL AND acknowledged_at IS NULL",
+            [&attempt], |row| row.get(0)).unwrap();
+        assert_eq!(retained, 1);
+        let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivered_at.is_none());
+        assert_eq!(rows[0].delivery_attempts, 1);
+    }
     assert_xdg_isolated(&fixture);
 }

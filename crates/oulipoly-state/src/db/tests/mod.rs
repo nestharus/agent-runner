@@ -23,7 +23,7 @@
 //!       - opening_core_tests, provider_aggregate_tests, provider_migration_tests_1, provider_migration_tests_2
 //!       - quota_exhaustion_tests, quota_refresh_tests_1, quota_refresh_tests_2, quota_refresh_tests_3
 //!       - resume_resolution_tests_1, resume_resolution_tests_2, resume_window_tests
-//!       - session_capture_tests, session_turn_schema_tests, session_turn_tests_1, session_turn_tests_2
+//!       - session_capture_tests, session_turn_schema_tests, session_turn_tests_1
 //!       - setup_counter_tests, setup_crud_tests_1, setup_crud_tests_2
 //! ```
 
@@ -70,7 +70,6 @@ mod resume_window_tests;
 mod session_capture_tests;
 mod session_turn_schema_tests;
 mod session_turn_tests_1;
-mod session_turn_tests_2;
 mod setup_counter_tests;
 mod setup_crud_tests_1;
 mod setup_crud_tests_2;

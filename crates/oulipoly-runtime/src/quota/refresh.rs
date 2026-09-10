@@ -12,7 +12,7 @@
 //!       - quota service port contract (`QuotaServicePort`, `QuotaServiceRequest`, `QuotaServiceOutput`, `QuotaServiceExternalProviderIdentity`, `ServiceError`)
 //!       - quota refresh primitive contract (`InFlight`, `RefreshOutcome`, `QuotaScriptWindow`, `parse_output`, `run_script`, `run_auth_refresh_command_coalesced`, `AuthRefreshAttempt`)
 //!       - quota state persistence contract (`StateDb`, `QuotaWindowInput`, `upsert_quota_refresh`, `get_windows`)
-//!       - provider/session config and external-provider registry contract (`ProvidersConfig`, `SessionsConfig`, `ProviderRegistryHandle`)
+//!       - provider config and external-provider registry contract (`ProvidersConfig`, `ProviderRegistryHandle`)
 //!       - in-file test harness contract (`EnvGuard`, `chrono::Utc`, `tempfile::TempDir`, `ProviderEntry`, in-memory `StateDb` fixtures)
 //! ```
 use super::{
@@ -24,7 +24,7 @@ use crate::services::{
     QuotaServiceExternalProviderIdentity, QuotaServiceOutput, QuotaServicePort,
     QuotaServiceRequest, ServiceError,
 };
-use oulipoly_config::{ProvidersConfig, SessionsConfig};
+use oulipoly_config::ProvidersConfig;
 use oulipoly_state::{QuotaWindowInput, StateDb};
 
 #[derive(Debug, Clone, Default)]
@@ -50,14 +50,25 @@ impl QuotaServicePort for RuntimeQuotaService {
         &self,
         request: QuotaServiceRequest<'_>,
     ) -> Result<QuotaServiceOutput, ServiceError> {
-        let outcome = match request.external_provider.clone() {
-            Some(identity) => self.refresh_external(request, identity),
-            None => refresh_provider(
+        let has_account_endpoint = self.provider_registry.as_ref().is_some_and(|registry| {
+            registry
+                .current()
+                .has_account_endpoint(&request.provider_name)
+        });
+        let outcome = if has_account_endpoint {
+            match request.external_provider.clone() {
+                Some(identity) => self.refresh_external(request, identity),
+                None => RefreshOutcome::Failed(
+                    "external provider quota identity is unavailable".to_string(),
+                ),
+            }
+        } else {
+            refresh_provider(
                 &request.provider_name,
                 request.providers_cfg,
                 request.in_flight,
                 request.state,
-            ),
+            )
         };
 
         Ok(QuotaServiceOutput { outcome })
@@ -124,18 +135,14 @@ pub fn refresh_provider(
     )
 }
 
-/// Refresh a provider for routing. Prefer the explicit providers.toml
-/// `quota_script`; when legacy migrated configs only have provider/session
-/// storage adapters, derive the standard quota adapter from those roots.
+/// Refresh a provider for routing from its provider-owned quota source.
 pub fn refresh_provider_for_routing(
     provider_name: &str,
     providers_cfg: &ProvidersConfig,
-    sessions_cfg: &SessionsConfig,
     in_flight: &InFlight,
     state: &StateDb,
 ) -> RefreshOutcome {
-    let Some(source) = super::source::refresh_source(provider_name, providers_cfg, sessions_cfg)
-    else {
+    let Some(source) = super::source::refresh_source(provider_name, providers_cfg) else {
         return RefreshOutcome::NoScript;
     };
     refresh_provider_from_script(
@@ -337,7 +344,15 @@ mod tests {
     ) -> RefreshFixture {
         let lock_home = tempfile::tempdir().unwrap();
         let env = EnvGuard::set_many(vec![
-            ("OULIPOLY_DATA_DIR", None),
+            (
+                "OULIPOLY_DATA_DIR",
+                Some(
+                    lock_home
+                        .path()
+                        .join(oulipoly_state::paths::APP_DATA_DIR_NAME)
+                        .into_os_string(),
+                ),
+            ),
             (
                 "OULIPOLY_DATA_HOME",
                 Some(lock_home.path().as_os_str().to_os_string()),

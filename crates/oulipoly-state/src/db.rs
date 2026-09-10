@@ -122,6 +122,7 @@ mod opening_write;
 mod owned_turn_event_read;
 mod owned_turn_event_write;
 mod ownership_authority;
+mod provider_launch_lifecycle;
 mod provider_quota_reads;
 mod provider_quota_refresh;
 mod provider_quota_status;
@@ -130,8 +131,10 @@ mod provider_quota_window_writes;
 mod provider_quotas;
 mod provider_schema_migration;
 mod provider_schema_validation;
+mod provider_session_authority;
 mod provider_session_binding;
 mod provider_turn_effects;
+pub use provider_launch_lifecycle::*;
 mod providers;
 mod resume_active_segment;
 mod resume_lookup;
@@ -145,6 +148,7 @@ mod schema_types;
 mod session_capture;
 mod session_lifecycle;
 mod session_markers;
+mod session_turn_pages;
 mod session_turns_ingest;
 mod session_turns_query;
 mod session_turns_replace;
@@ -165,6 +169,7 @@ pub use self::imported_session_display_metadata::{
     ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert,
 };
 pub use self::imported_session_list::ImportedSessionListRow;
+pub use self::invocation_artifacts::InvocationOutputArtifactPaths;
 pub use self::invocation_lifecycle_finalize::InvocationFinalizeError;
 pub use self::invocation_lifecycle_start::{
     COMPLETION_REGISTRATION_AUTHORITY_ENV, COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD,
@@ -202,7 +207,10 @@ use self::provider_quotas::{
 };
 pub use self::provider_quotas::{QuotaRecord, QuotaWindow, QuotaWindowInput};
 use self::provider_schema_migration::ProviderColumn;
-pub use self::provider_session_binding::ProviderSessionBinding;
+pub use self::provider_session_authority::{
+    FinalizedProviderSessionAuthority, StoredProviderSessionAuthority,
+};
+pub use self::provider_session_binding::{ProviderSessionAuthorityCommit, ProviderSessionBinding};
 pub use self::provider_turn_effects::{ProviderTurnEffectInput, ProviderTurnEffectWrite};
 pub use self::providers::ProviderRecord;
 pub use self::resume_types::{
@@ -233,6 +241,11 @@ pub use self::session_lifecycle::{
     TurnState,
 };
 pub use self::session_markers::SessionMarkerPayload;
+pub use self::session_turn_pages::{
+    SESSION_TURN_PAGES_PROTOCOL, SessionTurnIngestFreshness, SessionTurnIngestStream,
+    SessionTurnIngestStreamKey, SessionTurnPageApply, SessionTurnPageApplyOutcome,
+    SessionTurnPageBodyState, SessionTurnPageTurnIngest, SessionTurnStreamProjection,
+};
 #[allow(unused_imports)]
 pub use self::session_turns_ingest::SessionTurnRecord;
 pub use self::session_turns_ingest::{SessionTurnCounts, SessionTurnIngest};

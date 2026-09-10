@@ -20,31 +20,39 @@ pub(super) struct ResumeFailureOutputInput<'a> {
 }
 
 pub(super) fn emit_stderr(message: &str) {
-    eprintln!("{message}");
+    let _ = writeln!(std::io::stderr().lock(), "{message}");
 }
 
 pub(super) fn emit_resume_success_output(
     invocation_id: &str,
-    exit_code: i32,
     error_category: Option<&str>,
-    terminal_reason: Option<&str>,
-    stdout: &[u8],
-) {
-    let mut output = std::io::stdout().lock();
-    let _ = output.write_all(stdout);
-    if !stdout.is_empty() && !stdout.ends_with(b"\n") {
-        let _ = output.write_all(b"\n");
+    result: &oulipoly_runtime::executor::ExecutionResult,
+) -> std::io::Result<()> {
+    if let Some(spool) = &result.output_spool {
+        return crate::run::spooled_success_delivery::deliver(
+            spool,
+            invocation_id,
+            result.exit_code,
+            error_category,
+            result.terminal_reason.as_deref(),
+        );
     }
-    let _ = output.flush();
+
+    let mut output = std::io::stdout().lock();
+    result.write_stdout_to(&mut output)?;
+    if !result.stdout_is_empty()? && !result.stdout_ends_with_newline() {
+        output.write_all(b"\n")?;
+    }
+    output.flush()?;
     drop(output);
     emit_result_envelope(
         invocation_id,
         true,
-        exit_code,
+        result.exit_code,
         error_category,
-        terminal_reason,
+        result.terminal_reason.as_deref(),
         None,
-    );
+    )
 }
 
 pub(super) fn emit_resume_failure_output(input: ResumeFailureOutputInput<'_>) {
@@ -63,14 +71,16 @@ pub(super) fn emit_resume_failure_output(input: ResumeFailureOutputInput<'_>) {
             }
         },
     };
-    emit_result_envelope(
+    if let Err(error) = emit_result_envelope(
         input.invocation_id,
         false,
         input.exit_code,
         input.error_category,
         input.terminal_reason,
         Some(&failure_identity),
-    );
+    ) {
+        emit_stderr(&format!("failed to deliver result envelope: {error}"));
+    }
     emit_stderr(input.stderr);
     if let Some(terminal_reason) = input.terminal_reason {
         emit_stderr(terminal_reason);
@@ -91,6 +101,10 @@ pub(super) fn emit_migration_dependency_failure(message: &str) {
 
 pub(super) fn emit_migration_service_failure(error: impl Display) {
     eprintln!("migration service failed: {error}");
+}
+
+pub(super) fn emit_resume_spawn_error(error: impl Display) {
+    eprintln!("resume launch failed: {error}");
 }
 
 pub(super) fn emit_finalize_invocation_warning(error: impl Display) {

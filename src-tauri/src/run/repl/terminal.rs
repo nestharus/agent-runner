@@ -6,6 +6,7 @@ use std::path::Path;
 
 use oulipoly_config::{ModelConfig, ProviderConfig};
 use oulipoly_runtime::executor;
+use oulipoly_runtime::session_provider::SessionProviderIdentity;
 
 use super::disposition::{
     ReplTerminalControl, ReplTerminalDispositionInput, handle_terminal_signal_disposition,
@@ -52,6 +53,39 @@ pub(super) fn execute_and_finalize_repl_attempt(
     let interactive_effective_cwd =
         repl_interactive_effective_cwd(input.resume_spawn_cwd, input.working_dir)?;
     let resume_payload = repl_resume_payload(input.provider, input.resume_session_id);
+    let provider_registry = input
+        .agent_runtime_services
+        .provider_registry_handle
+        .current();
+    // Endpoint-backed PTY launches bind the provider's real session before its first model turn.
+    let live_session_binding = if provider_registry.has_account_endpoint(&input.provider.name) {
+        let endpoint = provider_registry
+            .preflight_account(&input.provider.name)
+            .map_err(|error| {
+                format!("Failed to preflight provider endpoint for live session binding: {error}")
+            })?;
+        let settings_id = endpoint.settings_id().map_err(|error| error.to_string())?;
+        Some(executor::cli::InteractiveLiveSessionBinding {
+            endpoint: endpoint.clone(),
+            registry: provider_registry.clone(),
+            identity: SessionProviderIdentity {
+                model_name: input.model.name.clone(),
+                provider_name: input.provider.name.clone(),
+                provider_instance_id: Some(format!(
+                    "{}-instance",
+                    endpoint.capabilities().provider_id
+                )),
+                settings_id: settings_id.to_string(),
+            },
+            state_db_path: input.env.state.path().to_path_buf(),
+            invocation_row_id: input.invocation_row_id,
+            invocation_uuid: input.invocation.id.clone(),
+            expected_provider_session_id: input.resume_session_id.map(str::to_string),
+            effective_cwd: Some(interactive_effective_cwd.clone()),
+        })
+    } else {
+        None
+    };
     let zero_turn_baseline = zero_turn_record_baseline(
         &input.env.state,
         &input.env.sessions_cfg,
@@ -59,17 +93,28 @@ pub(super) fn execute_and_finalize_repl_attempt(
         input.resume_session_id,
     );
 
-    match executor::cli::execute_interactive_with_result_and_model_config(
-        input.provider,
-        repl_execution_cwd(input.resume_spawn_cwd, input.working_dir),
-        Some(input.invocation_env),
-        resume_payload,
-        input.model,
-        input
-            .agent_runtime_services
-            .provider_registry_handle
-            .current(),
-    ) {
+    let execution_result = match live_session_binding {
+        Some(binding) => {
+            executor::cli::execute_interactive_with_result_and_model_config_and_live_session_binding(
+                input.provider,
+                repl_execution_cwd(input.resume_spawn_cwd, input.working_dir),
+                Some(input.invocation_env),
+                resume_payload,
+                input.model,
+                binding,
+            )
+        }
+        None => executor::cli::execute_interactive_with_result_and_model_config(
+            input.provider,
+            repl_execution_cwd(input.resume_spawn_cwd, input.working_dir),
+            Some(input.invocation_env),
+            resume_payload,
+            input.model,
+            provider_registry,
+        ),
+    };
+
+    match execution_result {
         Ok(mut result) => {
             classify_repl_result(
                 input.env,
@@ -87,7 +132,12 @@ pub(super) fn execute_and_finalize_repl_attempt(
             }
             finalize_repl_execution_result(input, &interactive_effective_cwd, &result)
         }
-        Err(_spawn_err) => {
+        Err(execution_error) => {
+            tracing::warn!(
+                invocation_uuid = input.invocation.id,
+                diagnostic = %interactive_error_diagnostic(&execution_error),
+                "Interactive execution returned an error (not necessarily an OS spawn failure)"
+            );
             let clear_result = clear_repl_session_capture_for_unpinned(
                 input.env,
                 input.invocation_row_id,
@@ -227,4 +277,100 @@ fn terminal_signal_disposition_for_result(
     );
     // AGE-153 source guard: marker emission routes through emit_terminal_signal_marker.
     apply_terminal_signal_outcome(&result.terminal_signal, &mut terminal_signal_ctx)
+}
+
+// This boundary receives String errors, including errors AFTER a successful launch.
+// Preserve only audited static operation labels and numeric OS error codes. Never
+// print the original String: it can contain a command, path or endpoint payload.
+fn interactive_error_diagnostic(error: &str) -> String {
+    const OPERATIONS: &[&str] = &[
+        "Failed to read terminal window size",
+        "Failed to spawn '",
+        "Failed to clone terminal for TUI",
+        "Failed to poll interactive child",
+        "Failed to poll PTY relay fds",
+        "Failed to write user input to PTY",
+        "Failed to read user terminal input",
+        "Failed to write PTY output to terminal",
+        "Failed to read PTY output",
+        "Failed to accept PTY control connection",
+        "Failed to set PTY control read timeout",
+        "Failed to set PTY control write timeout",
+        "Failed to write PTY control response",
+        "Runtime generation starting registration rejected",
+        "Runtime generation child binding rejected",
+        "Stale runtime generation recovery rejected",
+        "Cannot complete child generation before observing exit",
+        "Failed to start mailbox delivery claim transaction",
+        "database is locked",
+        "database is busy",
+    ];
+    let operation = OPERATIONS
+        .iter()
+        .copied()
+        .find(|prefix| error.starts_with(prefix))
+        .unwrap_or("unclassified interactive execution error");
+    let os_code = error
+        .rsplit_once("(os error ")
+        .and_then(|(_, tail)| tail.strip_suffix(')'))
+        .filter(|code| {
+            !code.is_empty() && code.len() <= 6 && code.bytes().all(|b| b.is_ascii_digit())
+        })
+        .unwrap_or("unavailable");
+    format!("operation={operation}; os_error={os_code}; detail=[REDACTED]")
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::interactive_error_diagnostic;
+
+    #[test]
+    fn interactive_diagnostic_preserves_operation_and_os_code_without_payload() {
+        let error = "Failed to write PTY control response: Broken pipe (os error 32)";
+        assert_eq!(
+            interactive_error_diagnostic(error),
+            "operation=Failed to write PTY control response; os_error=32; detail=[REDACTED]"
+        );
+        let secret =
+            "Failed to spawn 'env TOKEN=private provider --prompt private': denied (os error 13)";
+        assert_eq!(
+            interactive_error_diagnostic(secret),
+            "operation=Failed to spawn '; os_error=13; detail=[REDACTED]"
+        );
+        for secret in [
+            "password=secret\nBearer private".to_string(),
+            "秘密".repeat(10000),
+            "Failed to read PTY output: argv-secret (os error secret)".to_string(),
+        ] {
+            let diagnostic = interactive_error_diagnostic(&secret);
+            assert!(diagnostic.len() < 160);
+            assert!(!diagnostic.contains("secret"));
+            assert!(!diagnostic.contains("private"));
+            assert!(!diagnostic.contains("秘密"));
+        }
+    }
+
+    #[test]
+    fn interactive_error_mapping_and_handoff_remain_unchanged() {
+        // Source control only: proves branch order, NOT executed settlement behavior.
+        let source = include_str!("terminal.rs");
+        let branch = source
+            .split("Err(execution_error) => {")
+            .nth(1)
+            .unwrap()
+            .split("fn finalize_repl_execution_result")
+            .next()
+            .unwrap();
+        let operations = [
+            "tracing::warn!",
+            "clear_repl_session_capture_for_unpinned(",
+            "handoff_repl_pty_delivery(&input, 1)",
+            "clear_result?",
+            "finalize_repl_spawn_error(input)",
+        ];
+        let mut offset = 0;
+        for operation in operations {
+            offset += branch[offset..].find(operation).unwrap() + operation.len();
+        }
+    }
 }

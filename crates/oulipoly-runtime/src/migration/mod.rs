@@ -948,10 +948,18 @@ mod tests {
             })
             .unwrap();
         state
-            .update_session_capture(invocation_id, Some(session_id), "fixture")
+            .update_session_capture(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                invocation_id,
+                Some(session_id),
+                "fixture",
+            )
             .unwrap();
         state
-            .mint_chain_for_invocation_session(invocation_id)
+            .mint_chain_for_invocation_session(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                invocation_id,
+            )
             .unwrap();
         let chain_id = state
             .chain_id_for_segment("claude", session_id)

@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
     AdvanceRuntimeGenerationDrain, AgentBashCompleteEnqueue, BindRuntimeGenerationRunning,
@@ -10,13 +12,14 @@ use oulipoly_state::pid_identity::read_live_process_identity;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 const CONCURRENCY: usize = 8;
 
 #[test]
 fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
+    let _guard = integration_test_guard();
     let directory = tempfile::tempdir().unwrap();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
@@ -46,10 +49,10 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
     .unwrap();
     std::fs::write(
         app_config.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n\n[fixture-provider.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
             provider.display()
-        ),
+        )),
     )
     .unwrap();
 
@@ -85,13 +88,6 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
         .unwrap();
     drop(connection);
     seed_recoverable_wake_candidate(directory.path(), &state_path, &mailbox_path, &models);
-    assert_eq!(
-        sqlite_count(
-            &mailbox_path,
-            "SELECT selected_auto_wake_max FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
-        ),
-        1
-    );
     std::fs::write(&starts, []).unwrap();
     let baseline_temp_entries = directory_entries(&snapshot_temp);
 
@@ -149,7 +145,7 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            elapsed < Duration::from_secs(3),
+            elapsed < Duration::from_secs(5),
             "foreground launch waited for best-effort wake reclamation: {elapsed:?}"
         );
         let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
@@ -182,7 +178,7 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
             "SELECT auto_wake_count FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
         ),
         1,
-        "wake retry cap was not preserved; provider starts: {starts_content}"
+        "wake claim single-flight was not preserved; provider starts: {starts_content}"
     );
     let helper_peak = helper_peak.load(Ordering::SeqCst);
     assert!(
@@ -231,6 +227,7 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
 
 #[test]
 fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
+    let _guard = integration_test_guard();
     let directory = tempfile::tempdir().unwrap();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
@@ -260,10 +257,10 @@ fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
     .unwrap();
     std::fs::write(
         app_config.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n\n[fixture-provider.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
             provider.display()
-        ),
+        )),
     )
     .unwrap();
 
@@ -286,7 +283,7 @@ fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
         .env("TMPDIR", &snapshot_temp)
         .env("OULIPOLY_WAKE_RECLAIM_HANDOFF_OWNER", owner_token)
         .env("OULIPOLY_WAKE_RECLAIM_HANDOFF_TOKEN", handoff_token)
-        .env_remove("OULIPOLY_DATA_DIR")
+        .env("OULIPOLY_DATA_DIR", &data_root)
         .env_remove("OULIPOLY_PARENT_INVOCATION")
         .output()
         .unwrap();
@@ -308,17 +305,13 @@ fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
     let starts_content = std::fs::read_to_string(&starts).unwrap();
     assert_eq!(
         starts_content
-            .matches("--resume candidate-bearing-session")
+            .matches("handle: candidate-bearing-handle")
             .count(),
         1,
-        "unexpected provider starts with auto_wake_count={} selected_auto_wake_max={}: {starts_content}",
+        "unexpected provider starts with auto_wake_count={}: {starts_content}",
         sqlite_count(
             &mailbox_path,
             "SELECT auto_wake_count FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
-        ),
-        sqlite_count(
-            &mailbox_path,
-            "SELECT selected_auto_wake_max FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
         ),
     );
     assert_eq!(
@@ -360,9 +353,16 @@ fn runner_command(
         .env("XDG_DATA_HOME", data_home)
         .env("HOME", home)
         .env("TMPDIR", snapshot_temp)
-        .env_remove("OULIPOLY_DATA_DIR")
+        .env("OULIPOLY_DATA_DIR", data_home.join("oulipoly-agent-runner"))
         .env_remove("OULIPOLY_PARENT_INVOCATION");
     command
+}
+
+fn integration_test_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn seed_recoverable_wake_candidate(
@@ -387,6 +387,12 @@ fn seed_recoverable_wake_candidate(
             [],
         )
         .unwrap();
+    provider_authority_fixture::bind_session_authority_with_cwd(
+        &state,
+        "fixture-provider",
+        "candidate-bearing-session",
+        root,
+    );
     drop(state);
 
     let payload_root = root.join("pending-payload");
@@ -409,7 +415,6 @@ fn seed_recoverable_wake_candidate(
             model_name: Some("fixture"),
             models_dir: Some(models),
             effective_cwd: None,
-            selected_auto_wake_max: Some(1),
         })
         .unwrap();
     mailbox

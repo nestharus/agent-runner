@@ -29,29 +29,21 @@ use chrono::{DateTime, Utc};
 use oulipoly_core::CancellationToken;
 
 const INVOCATION_QUERY_PROGRESS_OPS: i32 = 100;
-// Inspect a finite window beyond the rendered node budget so terminal ancestors of
-// active descendants are preferred without returning to a global running-row seed.
-const RUNNING_DESCENDANT_CANDIDATE_FACTOR: usize = 4;
-const RUNNING_DESCENDANT_SCAN_FACTOR: usize = 8;
-const RUNNING_DESCENDANT_CANDIDATES_SQL: &str = "SELECT id
-     FROM invocations INDEXED BY idx_invocations_parent_running_created
-     WHERE parent_invocation_id = ?1
-     ORDER BY (status = 'running') DESC, created_at, id
-     LIMIT ?2";
-const RUNNING_DESCENDANT_EXISTS_SQL: &str = "WITH RECURSIVE descendants(id, status) AS (
-         SELECT id, status
-         FROM invocations
-         WHERE id = ?1
+const LIVE_SUBTREE_CHILD_IDS_SQL: &str = "WITH RECURSIVE live_paths(id, parent_invocation_id) AS (
+         SELECT id, parent_invocation_id
+         FROM invocations INDEXED BY idx_invocations_running_parent
+         WHERE status = 'running'
          UNION
-         SELECT child.id, child.status
-         FROM invocations AS child INDEXED BY idx_invocations_parent
-         JOIN descendants AS parent ON child.parent_invocation_id = parent.id
-         WHERE parent.status != 'running'
-         LIMIT ?2
+         SELECT parent.id, parent.parent_invocation_id
+         FROM invocations AS parent
+         JOIN live_paths AS child ON parent.id = child.parent_invocation_id
      )
-     SELECT EXISTS(SELECT 1 FROM descendants WHERE status = 'running'),
-            COUNT(*)
-     FROM descendants";
+     SELECT id
+     FROM live_paths
+     WHERE parent_invocation_id = ?1
+     GROUP BY id
+     ORDER BY id
+     LIMIT ?2";
 const INVOCATION_CHILDREN_OVERFLOW_SQL: &str = "SELECT EXISTS(
          SELECT 1
          FROM invocations INDEXED BY idx_invocations_parent
@@ -323,18 +315,31 @@ impl StateDb {
 
     pub fn record_legacy_resume_input_session_id(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         id: i64,
         resume_input_id: &str,
     ) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE invocations
+        let owner_tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &owner_tx,
+            id,
+            mutation_authority,
+        )?;
+        let result: Result<(), String> = {
+            self.conn
+                .execute(
+                    "UPDATE invocations
                  SET session_id = ?1
                  WHERE id = ?2 AND session_capture_method = 'resumed'",
-                sqlite::params![resume_input_id, id],
-            )
-            .map_err(|err| Self::format_legacy_resume_session_update_error(id, err))?;
-        Ok(())
+                    sqlite::params![resume_input_id, id],
+                )
+                .map_err(|err| Self::format_legacy_resume_session_update_error(id, err))?;
+            Ok(())
+        };
+        result?;
+        owner_tx.commit().map_err(|e| e.to_string())
     }
 
     fn format_legacy_resume_session_update_error(id: i64, err: sqlite::Error) -> String {
@@ -343,20 +348,41 @@ impl StateDb {
 
     pub fn update_resume_acceptance(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         id: i64,
         status: &str,
         evidence: Option<&str>,
     ) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE invocations
+        let owner_tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &owner_tx,
+            id,
+            mutation_authority,
+        )?;
+        if status == "accepted" {
+            super::provider_launch_lifecycle::promote_invocation_effect(
+                &owner_tx,
+                mutation_authority,
+                crate::ProviderLaunchPromotion::PromptAccepted,
+                1,
+            )?;
+        }
+        let result: Result<(), String> = {
+            self.conn
+                .execute(
+                    "UPDATE invocations
                  SET resume_acceptance_status = ?1,
                      resume_acceptance_evidence = ?2
                  WHERE id = ?3",
-                sqlite::params![status, evidence, id],
-            )
-            .map_err(|err| Self::format_resume_acceptance_update_error(id, err))?;
-        Ok(())
+                    sqlite::params![status, evidence, id],
+                )
+                .map_err(|err| Self::format_resume_acceptance_update_error(id, err))?;
+            Ok(())
+        };
+        result?;
+        owner_tx.commit().map_err(|e| e.to_string())
     }
 
     pub(super) fn format_resume_acceptance_update_error(id: i64, err: sqlite::Error) -> String {
@@ -376,6 +402,42 @@ impl StateDb {
             Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(err) => Err(Self::format_invocation_lookup_query_error(err)),
         }
+    }
+
+    pub fn get_invocation_by_id(&self, id: i64) -> Result<Option<InvocationRecord>, String> {
+        let sql = Self::invocation_record_select_sql(&self.conn, "WHERE id = ?1")?;
+        let mut statement = self
+            .conn
+            .prepare(&sql)
+            .map_err(Self::format_invocation_lookup_prepare_error)?;
+        match statement.query_row(sqlite::params![id], Self::map_invocation_row) {
+            Ok(record) => Ok(Some(record)),
+            Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(Self::format_invocation_lookup_query_error(error)),
+        }
+    }
+
+    pub fn list_running_invocations_with_cancel(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<InvocationRecord>, String> {
+        self.with_invocation_query_cancellation(cancellation, || {
+            let sql = Self::invocation_record_select_sql(
+                &self.conn,
+                "INDEXED BY idx_invocations_running_parent
+                 WHERE status = 'running'
+                 ORDER BY id",
+            )?;
+            let mut statement = self
+                .conn
+                .prepare(&sql)
+                .map_err(Self::format_invocation_lookup_prepare_error)?;
+            let rows = statement
+                .query_map([], Self::map_invocation_row)
+                .map_err(Self::format_invocation_children_query_error)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(Self::format_invocation_children_map_error)
+        })
     }
 
     fn format_invocation_lookup_prepare_error(err: sqlite::Error) -> String {
@@ -523,11 +585,10 @@ impl StateDb {
                     limit,
                     cancellation,
                 )?;
-            let has_more_children = self.invocation_children_overflow(parent_id, limit)?;
             Ok(InvocationChildrenPage {
                 children,
-                has_more_children,
-                live_coverage_incomplete: live_coverage_incomplete || has_more_children,
+                has_more_children: live_coverage_incomplete,
+                live_coverage_incomplete,
             })
         })
     }
@@ -538,113 +599,35 @@ impl StateDb {
         limit: usize,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<InvocationRecord>, bool), String> {
-        if limit == 0 {
-            return Ok((Vec::new(), self.invocation_children_overflow(parent_id, 0)?));
-        }
         let live_subtrees = self.list_live_subtree_child_ids(parent_id, limit, cancellation)?;
-        let mut children = Vec::with_capacity(limit);
+        let mut children = Vec::with_capacity(live_subtrees.ids.len());
         for id in &live_subtrees.ids {
             if let Some(record) = self.get_invocation_by_id(*id)? {
                 children.push(record);
             }
         }
-        if children.len() >= limit {
-            return Ok((children, live_subtrees.coverage_incomplete));
-        }
-
-        let candidates = self.list_invocation_children_excluding_ids_bounded(
-            parent_id,
-            limit - children.len(),
-            &live_subtrees.ids,
-        )?;
-        children.extend(candidates);
         Ok((children, live_subtrees.coverage_incomplete))
-    }
-
-    fn list_invocation_children_excluding_ids_bounded(
-        &self,
-        parent_id: i64,
-        limit: usize,
-        excluded_ids: &[i64],
-    ) -> Result<Vec<InvocationRecord>, String> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        if excluded_ids.is_empty() {
-            return self.list_invocation_children_bounded_inner(parent_id, limit, true);
-        }
-        let excluded_ids = excluded_ids
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let clause = format!(
-            "WHERE parent_invocation_id = ?1
-               AND id NOT IN ({excluded_ids})
-             ORDER BY (status = 'running') DESC, created_at, id
-             LIMIT ?2"
-        );
-        let sql = Self::invocation_record_select_sql(&self.conn, &clause)?;
-        let mut statement = self
-            .conn
-            .prepare(&sql)
-            .map_err(Self::format_invocation_child_lookup_prepare_error)?;
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = statement
-            .query_map(sqlite::params![parent_id, limit], Self::map_invocation_row)
-            .map_err(Self::format_invocation_children_query_error)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(Self::format_invocation_children_map_error)
     }
 
     fn list_live_subtree_child_ids(
         &self,
         parent_id: i64,
         limit: usize,
-        cancellation: &CancellationToken,
+        _cancellation: &CancellationToken,
     ) -> Result<LiveSubtreeChildIds, String> {
-        let candidate_limit = limit.saturating_mul(RUNNING_DESCENDANT_CANDIDATE_FACTOR);
-        let mut coverage_incomplete =
-            self.invocation_children_overflow(parent_id, candidate_limit)?;
-        let query_limit = i64::try_from(candidate_limit).unwrap_or(i64::MAX);
+        let query_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let mut statement = self
             .conn
-            .prepare(RUNNING_DESCENDANT_CANDIDATES_SQL)
+            .prepare(LIVE_SUBTREE_CHILD_IDS_SQL)
             .map_err(Self::format_invocation_child_lookup_prepare_error)?;
-        let candidate_ids = statement
+        let rows = statement
             .query_map(sqlite::params![parent_id, query_limit], |row| row.get(0))
             .map_err(Self::format_invocation_children_query_error)?;
-        let candidate_ids = candidate_ids
+        let mut live_child_ids = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(Self::format_invocation_children_map_error)?;
-        drop(statement);
-
-        let descendant_limit =
-            Self::scaled_invocation_query_limit(limit, RUNNING_DESCENDANT_SCAN_FACTOR);
-        let mut statement = self
-            .conn
-            .prepare(RUNNING_DESCENDANT_EXISTS_SQL)
-            .map_err(Self::format_invocation_child_lookup_prepare_error)?;
-        let mut live_child_ids = Vec::with_capacity(limit);
-        for candidate_id in candidate_ids {
-            if cancellation.is_cancelled() {
-                return Err("Invocation child lookup cancelled".to_string());
-            }
-            let (has_running_descendant, visited_rows) = statement
-                .query_row(sqlite::params![candidate_id, descendant_limit], |row| {
-                    Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?))
-                })
-                .map_err(Self::format_invocation_children_query_error)?;
-            if visited_rows >= descendant_limit {
-                coverage_incomplete = true;
-            }
-            if has_running_descendant {
-                live_child_ids.push(candidate_id);
-                if live_child_ids.len() == limit {
-                    break;
-                }
-            }
-        }
+        let coverage_incomplete = live_child_ids.len() > limit;
+        live_child_ids.truncate(limit);
         Ok(LiveSubtreeChildIds {
             ids: live_child_ids,
             coverage_incomplete,
@@ -659,10 +642,6 @@ impl StateDb {
                 |row| row.get(0),
             )
             .map_err(Self::format_invocation_children_query_error)
-    }
-
-    fn scaled_invocation_query_limit(limit: usize, factor: usize) -> i64 {
-        i64::try_from(limit.saturating_mul(factor)).unwrap_or(i64::MAX)
     }
 
     fn with_invocation_query_cancellation<T>(
@@ -704,31 +683,13 @@ impl StateDb {
     }
 
     #[cfg(test)]
-    pub(super) fn running_descendant_candidates_sql() -> &'static str {
-        RUNNING_DESCENDANT_CANDIDATES_SQL
-    }
-
-    #[cfg(test)]
-    pub(super) fn running_descendant_exists_sql() -> &'static str {
-        RUNNING_DESCENDANT_EXISTS_SQL
+    pub(super) fn live_subtree_child_ids_sql() -> &'static str {
+        LIVE_SUBTREE_CHILD_IDS_SQL
     }
 
     #[cfg(test)]
     pub(super) fn invocation_children_overflow_sql() -> &'static str {
         INVOCATION_CHILDREN_OVERFLOW_SQL
-    }
-
-    fn get_invocation_by_id(&self, id: i64) -> Result<Option<InvocationRecord>, String> {
-        let sql = Self::invocation_record_select_sql(&self.conn, "WHERE id = ?1")?;
-        let mut statement = self
-            .conn
-            .prepare(&sql)
-            .map_err(Self::format_invocation_lookup_prepare_error)?;
-        match statement.query_row(sqlite::params![id], Self::map_invocation_row) {
-            Ok(record) => Ok(Some(record)),
-            Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(Self::format_invocation_lookup_query_error(error)),
-        }
     }
 
     fn format_invocation_child_lookup_prepare_error(err: sqlite::Error) -> String {

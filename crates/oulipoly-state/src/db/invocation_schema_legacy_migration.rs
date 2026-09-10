@@ -384,11 +384,33 @@ impl StateDb {
     pub(super) fn replace_invocations_with_migrated_table(
         conn: &sqlite::Connection,
     ) -> Result<(), String> {
+        // The numbered lifecycle migration may precede the legacy invocation rebuild.
+        // Preserve its exact trigger inside this transaction; linked rows cannot be rebuilt.
+        let launch_join: Option<String> = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='provider_launch_attempt_invocation_join'",
+            [], |row| row.get(0)).optional().map_err(Self::format_invocations_table_replace_error)?;
+        if launch_join.is_some() {
+            let attempts: i64 = conn
+                .query_row("SELECT count(*) FROM provider_launch_attempts", [], |row| {
+                    row.get(0)
+                })
+                .map_err(Self::format_invocations_table_replace_error)?;
+            if attempts != 0 {
+                return Err("Cannot rebuild invocations with provider launch ownership".into());
+            }
+            conn.execute_batch("DROP TRIGGER provider_launch_attempt_invocation_join;")
+                .map_err(Self::format_invocations_table_replace_error)?;
+        }
         conn.execute_batch(
             "DROP TABLE invocations;
              ALTER TABLE invocations_new RENAME TO invocations;",
         )
-        .map_err(Self::format_invocations_table_replace_error)
+        .map_err(Self::format_invocations_table_replace_error)?;
+        if let Some(sql) = launch_join {
+            conn.execute_batch(&sql)
+                .map_err(Self::format_invocations_table_replace_error)?;
+        }
+        Ok(())
     }
 
     fn format_invocations_table_replace_error(err: sqlite::Error) -> String {

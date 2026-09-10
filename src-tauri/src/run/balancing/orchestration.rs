@@ -24,6 +24,7 @@ use oulipoly_runtime::executor;
 use oulipoly_runtime::services::{
     InvocationLifecycleServicePort, ProviderSessionStartMode, RoutingServicePort,
 };
+use oulipoly_runtime::session_authority::SessionAuthorityExpectation;
 use oulipoly_state::CompositeInvocationId;
 use oulipoly_state::repositories::StateDbOpener;
 
@@ -39,7 +40,10 @@ use super::predicate::{
     attempts_exhausted, confirmed_zero_turn_exhaustion, provider_selection_pool_exhausted,
     should_defer_generic_exit, should_late_bind_zero_turn_baseline,
 };
-use super::state_update::bind_start_known_provider_session_if_present;
+use super::state_update::{
+    BalancedSessionAuthorityCommitRequest, bind_start_known_provider_session_if_present,
+    commit_balanced_session_authority,
+};
 use crate::captured_child::emit_captured_child_marker_lines;
 use crate::error_emit::effective_model_for_execution;
 use crate::invocation::finalize::FinalizerGuard;
@@ -145,7 +149,7 @@ fn run_with_balancing_environment(
     reservation: Option<&ReservedRun>,
 ) -> Result<i32, String> {
     let in_flight = oulipoly_runtime::quota::InFlight::new();
-    let ctx = super::mapper::balance_context(&env.providers_cfg, &env.sessions_cfg, &in_flight);
+    let ctx = super::mapper::balance_context(&env.providers_cfg, &in_flight);
     let state = &env.state;
     let parent_invocation_id = super::parent_invocation_row_id(
         crate::dispatch::resolve_parent_invocation_id(state),
@@ -153,7 +157,7 @@ fn run_with_balancing_environment(
     );
     // Source guard marker: resolve_parent_invocation_id(&state)
     // Source guard marker: routing_service.select_route(RoutingServiceRequest { ctx: Some(
-    // Source guard marker: .finalize_invocation(
+    // Source guard marker: .finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,
     // Source guard marker: record_returned_artifacts(
     let max_attempts = super::max_attempts(super::mapper::quota_retry_budget(model), reservation);
     let mut attempts = 0usize;
@@ -193,6 +197,10 @@ fn run_with_balancing_environment(
             reservation,
         )?;
 
+        let account_endpoint_configured = agent_runtime_services
+            .provider_registry_handle
+            .current()
+            .has_account_endpoint(provider_name);
         let mut result = execute_balanced_attempt(
             agent_runtime_services,
             &env,
@@ -205,6 +213,27 @@ fn run_with_balancing_environment(
             extra_inputs,
             &mut attempt,
         )?;
+        if account_endpoint_configured
+            || matches!(
+                result.session_capture.method,
+                executor::SessionCaptureMethod::ExternalProviderLaunch(_)
+            )
+        {
+            let observed_provider_name = result_provider_name(model, &result)?;
+            commit_balanced_session_authority(BalancedSessionAuthorityCommitRequest {
+                state: &env.state,
+                invocation_row_id: attempt.invocation_row_id,
+                invocation_uuid: &attempt.invocation.id,
+                expectation: SessionAuthorityExpectation {
+                    account_name: provider_name,
+                    provider_session_id: attempt.start_known_provider_session_id.as_deref(),
+                },
+                observed_provider_name,
+                start_mode: attempt.start_known_provider_session_mode,
+                working_dir,
+                result: &result,
+            })?;
+        }
         let zero_turn = classify_balanced_zero_turn_result(BalancedZeroTurnInput {
             env: &env,
             provider_name,
@@ -261,6 +290,22 @@ fn run_with_balancing_environment(
             BalancedLoopControl::Return(result) => return result,
         }
     }
+}
+
+fn result_provider_name<'a>(
+    model: &'a ModelConfig,
+    result: &executor::ExecutionResult,
+) -> Result<&'a str, String> {
+    model
+        .providers
+        .get(result.provider_index)
+        .map(|provider| provider.name.as_str())
+        .ok_or_else(|| {
+            format!(
+                "executor returned provider index {} outside model {} pool",
+                result.provider_index, model.name
+            )
+        })
 }
 
 struct BalancedAttemptProvider {
@@ -395,11 +440,17 @@ fn start_balanced_attempt<'state>(
     let guard = FinalizerGuard::new(&env.state, invocation_row_id);
     let start_known_provider_session =
         start_known_provider_session_for_attempt(provider, pending_verification)?;
-    bind_start_known_provider_session_if_present(
-        &env.state,
-        invocation_row_id,
-        start_known_provider_session.id.as_deref(),
-    );
+    if !agent_runtime_services
+        .provider_registry_handle
+        .current()
+        .has_account_endpoint(provider_name)
+    {
+        bind_start_known_provider_session_if_present(
+            &env.state,
+            invocation_row_id,
+            start_known_provider_session.id.as_deref(),
+        );
+    }
     let zero_turn_baseline = zero_turn_record_baseline(
         &env.state,
         &env.sessions_cfg,
@@ -965,11 +1016,14 @@ fn finalize_spawn_error_invocation(
     let result = input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(super::mapper::spawn_error_finalize_request(
-            &input.env.state,
-            input.invocation_row_id,
-            terminal_reason,
-        ));
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            super::mapper::spawn_error_finalize_request(
+                &input.env.state,
+                input.invocation_row_id,
+                terminal_reason,
+            ),
+        );
     let status = spawn_error_finalization_status(result);
     if let Some(error) = status.error {
         formatter::emit_finalize_invocation_warning(error);

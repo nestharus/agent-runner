@@ -117,6 +117,30 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0019_invocation_running_projection_index.sql"),
         post_sql_hook: Some(apply_v19_invocation_running_projection_index),
     },
+    Migration {
+        target_version: 20,
+        id: "0020_session_turn_pages",
+        sql: include_str!("../migrations/0020_session_turn_pages.sql"),
+        post_sql_hook: None,
+    },
+    Migration {
+        target_version: 21,
+        id: "0021_invocation_output_delivery",
+        sql: include_str!("../migrations/0021_invocation_output_delivery.sql"),
+        post_sql_hook: None,
+    },
+    Migration {
+        target_version: 22,
+        id: "0022_provider_session_authority",
+        sql: include_str!("../migrations/0022_provider_session_authority.sql"),
+        post_sql_hook: None,
+    },
+    Migration {
+        target_version: 23,
+        id: "0023_provider_launch_lifecycle",
+        sql: include_str!("../migrations/0023_provider_launch_lifecycle.sql"),
+        post_sql_hook: None,
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {

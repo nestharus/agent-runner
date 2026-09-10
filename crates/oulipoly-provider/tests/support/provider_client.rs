@@ -117,7 +117,10 @@ pub fn launch_request() -> Value {
                 "encoding": "base64",
                 "data": "cHJvbXB0"
             },
-            "session": {}
+            "session": {},
+            "output_delivery": {
+                "protocol": "oulipoly.launch_output/v1"
+            }
         }
     })
 }

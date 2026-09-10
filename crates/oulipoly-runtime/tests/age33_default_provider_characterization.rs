@@ -17,11 +17,11 @@ struct EnvRestore {
 }
 
 impl EnvRestore {
-    fn set_xdg_data_home(path: &Path) -> Self {
+    fn set_data_dir(path: &Path) -> Self {
         let old_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
         let old_data_home = std::env::var_os("XDG_DATA_HOME");
         unsafe {
-            std::env::remove_var("OULIPOLY_DATA_DIR");
+            std::env::set_var("OULIPOLY_DATA_DIR", path);
             std::env::set_var("XDG_DATA_HOME", path);
         }
         Self {
@@ -56,6 +56,46 @@ fn write_executable(path: &Path, body: &str) {
     fs::write(
         path,
         format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+fn write_provider_endpoint(path: &Path) {
+    fs::write(
+        path,
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+request = json.load(sys.stdin)
+print(json.dumps({
+    "contract": request["contract"],
+    "request_id": request["request_id"],
+    "ok": True,
+    "result": {
+        "provider_id": "age33-default-provider-fixture",
+        "display_name": "AGE-33 Default Provider Fixture",
+        "contract_versions": [request["contract"]],
+        "preferred_contract": request["contract"],
+        "capabilities": {
+            "launch": False,
+            "policy": False,
+            "quota": False,
+            "session": True,
+            "terminal": False,
+            "rotation": False,
+            "discovery": False,
+            "settings": False,
+            "setup_brain": False,
+            "setup": False,
+            "migration": False,
+        },
+    },
+}))
+"#,
     )
     .unwrap();
     let mut perms = fs::metadata(path).unwrap().permissions();
@@ -168,7 +208,9 @@ fn age_33_runtime_default_provider_cutover_preserves_load_open_select_launch_ord
     let _routing_request = run
         .find("RoutingServiceRequest")
         .expect("routing service request construction");
-    let _cached_only = run.find("ctx: None").expect("cached-only routing request");
+    let _contextual = run
+        .find("ctx: Some(&ctx)")
+        .expect("contextual routing request");
     let provider_selection = run
         .find("providers.runtime_provider(member_name)")
         .expect("runtime provider selection");
@@ -193,8 +235,8 @@ fn age_33_runtime_default_provider_cutover_preserves_load_open_select_launch_ord
         "provider selection and launcher invocation must remain downstream of the opened state"
     );
     assert!(
-        run.contains("RoutingServiceRequest") && run.contains("ctx: None"),
-        "runtime default-provider should build a cached-only routing request"
+        run.contains("RoutingServiceRequest") && run.contains("ctx: Some(&ctx)"),
+        "runtime default-provider should build a contextual routing request"
     );
     assert!(
         route < out_of_bounds && out_of_bounds < provider_selection,
@@ -340,6 +382,8 @@ fn age_33_runtime_default_provider_none_state_path_uses_injected_default_opener(
 
     let marker = temp.path().join("launched.txt");
     let provider_script = temp.path().join("provider.sh");
+    let provider_endpoint = temp.path().join("provider-endpoint.py");
+    write_provider_endpoint(&provider_endpoint);
     write_executable(
         &provider_script,
         &format!("printf launched > {:?}\n", marker.to_string_lossy()),
@@ -351,8 +395,14 @@ fn age_33_runtime_default_provider_none_state_path_uses_injected_default_opener(
 command = {:?}
 interactive_args = ["interactive-launch"]
 prompt_mode = "arg"
+settings_id = "fixture"
+
+[fixture.implementation]
+family = "fixture"
+executable = {:?}
 "#,
-            provider_script.to_string_lossy()
+            provider_script.to_string_lossy(),
+            provider_endpoint.to_string_lossy(),
         ),
     )
     .unwrap();
@@ -392,10 +442,12 @@ fn age_33_runtime_default_provider_uses_explicit_state_db_path_when_supplied() {
     let explicit_state_db = temp.path().join("explicit-state").join("state.db");
     let blocked_default_data_home = temp.path().join("blocked-default-data-home");
     fs::write(&blocked_default_data_home, "not a directory").unwrap();
-    let _restore = EnvRestore::set_xdg_data_home(&blocked_default_data_home);
+    let _restore = EnvRestore::set_data_dir(&blocked_default_data_home);
 
     let marker = temp.path().join("launched.txt");
     let provider_script = temp.path().join("provider.sh");
+    let provider_endpoint = temp.path().join("provider-endpoint.py");
+    write_provider_endpoint(&provider_endpoint);
     write_executable(
         &provider_script,
         &format!(
@@ -416,8 +468,14 @@ command = {:?}
 args = ["one-shot-only"]
 interactive_args = ["interactive-launch"]
 prompt_mode = "arg"
+settings_id = "fixture"
+
+[fixture.implementation]
+family = "fixture"
+executable = {:?}
 "#,
-            provider_script.to_string_lossy()
+            provider_script.to_string_lossy(),
+            provider_endpoint.to_string_lossy(),
         ),
     )
     .unwrap();

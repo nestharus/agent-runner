@@ -111,7 +111,14 @@ fn finalize_captured_child_row(
     row: &InvocationRecord,
     supervisor_reason: &str,
 ) -> Result<(), String> {
-    state.finalize_invocation(row.id, false, -1, None, Some(supervisor_reason))
+    state.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        row.id,
+        false,
+        -1,
+        None,
+        Some(supervisor_reason),
+    )
 }
 
 fn emit_captured_child_finalize_warning(child: &executor::CapturedChildInvocation, err: &str) {

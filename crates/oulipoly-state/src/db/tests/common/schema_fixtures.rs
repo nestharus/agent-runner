@@ -25,6 +25,19 @@ use super::super::*;
 use super::*;
 pub(in crate::db::tests) fn mark_current_schema_version(conn: &sqlite::Connection) {
     seed_current_drift_required_tables(conn);
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='provider_logical_launches')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if !exists {
+        conn.execute_batch(include_str!(
+            "../../../../migrations/0023_provider_launch_lifecycle.sql"
+        ))
+        .unwrap();
+    }
     conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
         .unwrap();
 }

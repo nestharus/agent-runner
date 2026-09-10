@@ -19,9 +19,22 @@ use crate::session_ingest_cli::{
 };
 use crate::wiring;
 
+const TERMINAL_PERSISTENCE_ERROR_CATEGORY: &str = "terminal_persistence";
+const TERMINAL_PERSISTENCE_TERMINAL_REASON: &str = "terminal_persistence_failed";
+
 pub(super) enum CompletedAttemptControl {
     Continue,
     Return(i32),
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ConfirmedDeliverySettlement<'a> {
+    pub(super) delivery_id: &'a str,
+    pub(super) session_id: &'a str,
+    pub(super) turn_generation_id: &'a str,
+    pub(super) submitted_evidence: &'a str,
+    pub(super) confirmed_evidence: &'a str,
+    pub(super) observed_at: i64,
 }
 
 pub(super) struct CompletedAttemptInput<'a, 'state> {
@@ -43,6 +56,7 @@ pub(super) struct CompletedAttemptInput<'a, 'state> {
     pub(super) max_attempts: usize,
     pub(super) recovered_generic_nonzero: bool,
     pub(super) terminal_completion_confirmed: bool,
+    pub(super) confirmed_delivery: Option<ConfirmedDeliverySettlement<'a>>,
 }
 
 pub(super) fn finalize_completed_attempt(
@@ -59,8 +73,49 @@ pub(super) fn finalize_completed_attempt(
     let quota_exhausted =
         super::predicate::completed_attempt_quota_exhausted(error_category.as_deref());
 
-    if let Err(err) = persist_returned_artifacts(&input) {
+    if input.confirmed_delivery.is_none()
+        && let Err(err) = persist_returned_artifacts(&input)
+    {
         return Ok(handle_returned_artifacts_persist_failure(&mut input, err));
+    }
+
+    if success
+        && let Err(error) = input.result.persist_output_for_invocation(
+            &input.env.state,
+            input.invocation_row_id,
+            &input.invocation.id,
+        )
+    {
+        formatter::emit_stderr(&format!("failed to persist provider output: {error}"));
+        let finalize_result = finalize_retained_outcome_with_contention_retry(
+            input
+                .agent_runtime_services
+                .invocation_lifecycle_service
+                .as_ref(),
+            mapper::finalize_request(
+                &input.env.state,
+                input.invocation_row_id,
+                false,
+                1,
+                Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
+                Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
+            ),
+        );
+        match finalize_result {
+            Ok(_) => input.guard.mark_finalized(),
+            Err(error) => formatter::emit_finalize_invocation_warning(error),
+        }
+        formatter::emit_resume_failure_output(formatter::ResumeFailureOutputInput {
+            state: &input.env.state,
+            invocation_id: &input.invocation.id,
+            provider_name: input.provider_name,
+            provider_session_id: input.provider_session_id,
+            exit_code: 1,
+            error_category: Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
+            terminal_reason: Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
+            stderr: &input.result.stderr,
+        });
+        return Ok(CompletedAttemptControl::Return(1));
     }
 
     finalize_regular_completed_attempt(&mut input, success, error_category.as_deref())?;
@@ -89,7 +144,11 @@ fn persist_returned_artifacts(input: &CompletedAttemptInput<'_, '_>) -> Result<(
     input
         .env
         .state
-        .record_returned_artifacts(input.invocation_row_id, &input.result.returned_artifacts)
+        .record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            input.invocation_row_id,
+            &input.result.returned_artifacts,
+        )
         .map_err(|err| err.to_string())
 }
 
@@ -101,10 +160,10 @@ fn handle_returned_artifacts_persist_failure(
     input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::returned_artifacts_finalize_request(
-            &input.env.state,
-            input.invocation_row_id,
-        ))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::returned_artifacts_finalize_request(&input.env.state, input.invocation_row_id),
+        )
         .map(|_| ())
         .unwrap_or_else(formatter::emit_finalize_invocation_warning);
     input.guard.mark_finalized();
@@ -116,6 +175,19 @@ fn finalize_regular_completed_attempt(
     success: bool,
     error_category: Option<&str>,
 ) -> Result<(), String> {
+    if let Some(settlement) = input.confirmed_delivery {
+        finalize_confirmed_delivery(
+            &input.env.state,
+            input.invocation_row_id,
+            input.result,
+            success,
+            error_category,
+            input.result.terminal_reason.as_deref(),
+            settlement,
+        )?;
+        input.guard.mark_finalized();
+        return Ok(());
+    }
     let finalize_result = finalize_retained_outcome_with_contention_retry(
         input
             .agent_runtime_services
@@ -140,6 +212,40 @@ fn finalize_regular_completed_attempt(
     Ok(())
 }
 
+pub(super) fn finalize_confirmed_delivery(
+    state: &oulipoly_state::StateDb,
+    invocation_row_id: i64,
+    result: &oulipoly_runtime::executor::ExecutionResult,
+    success: bool,
+    error_category: Option<&str>,
+    terminal_reason: Option<&str>,
+    settlement: ConfirmedDeliverySettlement<'_>,
+) -> Result<(), String> {
+    let delivery_ids = [settlement.delivery_id.to_string()];
+    let acceptance = result.resume_acceptance.as_ref();
+    state.apply_provider_turn_effects(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        oulipoly_state::ProviderTurnEffectInput {
+            invocation_row_id,
+            delivery_ids: &delivery_ids,
+            accept_delivery_if_missing: true,
+            session_id: settlement.session_id,
+            turn_generation_id: settlement.turn_generation_id,
+            submitted_evidence: Some(settlement.submitted_evidence),
+            confirmed_evidence: Some(settlement.confirmed_evidence),
+            observed_at: settlement.observed_at,
+            returned_artifacts: &result.returned_artifacts,
+            resume_acceptance_status: acceptance.map(|value| value.status.db_value()),
+            resume_acceptance_evidence: acceptance.and_then(|value| value.evidence.as_deref()),
+            success,
+            exit_code: result.exit_code,
+            error_category,
+            terminal_reason,
+        },
+    )?;
+    Ok(())
+}
+
 fn handle_completed_success(
     input: &CompletedAttemptInput<'_, '_>,
     error_category: Option<&str>,
@@ -151,11 +257,12 @@ fn handle_completed_success(
             sessions_cfg: &input.env.sessions_cfg,
             providers_cfg: Some(&input.env.providers_cfg),
             provider_name: input.provider_name,
-            external_provider: crate::session_ingest_cli::session_external_provider_identity(
-                input.agent_runtime_services,
-                input.model,
-                input.provider_name,
-            ),
+            external_provider:
+                crate::session_ingest_cli::configured_session_external_provider_identity(
+                    input.agent_runtime_services,
+                    input.model,
+                    input.provider_name,
+                ),
             invocation_row_id: input.invocation_row_id,
             invocation_uuid: &input.invocation.id,
             effective_cwd: Some(input.effective_spawn_cwd),
@@ -168,13 +275,20 @@ fn handle_completed_success(
             },
         },
     );
-    formatter::emit_resume_success_output(
-        &input.invocation.id,
-        input.result.exit_code,
-        error_category,
-        input.result.terminal_reason.as_deref(),
-        &input.result.stdout,
-    );
+    if !crate::run::spooled_success_delivery::settle(
+        &input.env.state,
+        input.invocation_row_id,
+        input.result.output_spool.is_some(),
+        || {
+            formatter::emit_resume_success_output(
+                &input.invocation.id,
+                error_category,
+                input.result,
+            )
+        },
+    ) {
+        return CompletedAttemptControl::Return(1);
+    }
     CompletedAttemptControl::Return(if input.recovered_generic_nonzero {
         0
     } else {

@@ -1,7 +1,9 @@
 //! Declared roles: accessor, predicate, validator.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+#[path = "../../tests/support/provider_vocabulary_source_set.rs"]
+mod provider_vocabulary_source_set;
+use provider_vocabulary_source_set::SourceSet;
 
 const BASELINE_COMMIT: &str = "f0844a90d73c9196fc6fe53d510caf4d2c56c076";
 const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 4628;
@@ -11,7 +13,7 @@ fn s7c_production_wiring_passes_registry_handle_into_migration_service() {
     let wiring = read_source("src-tauri/src/wiring.rs");
     let cli_defaults = source_between(
         &wiring,
-        "pub fn cli_defaults() -> Self",
+        "pub fn cli_defaults() -> Result<Self, String>",
         "pub fn production(",
     );
     let production = source_between(
@@ -111,159 +113,17 @@ fn s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline() {
         MANAGER_BASELINE_PROVIDER_NAME_COUNT, 4628,
         "AGE-245 S7c must preserve the manager-approved provider-name baseline"
     );
-    let current_count = provider_name_occurrence_count(&root, &pattern);
+    let sources = SourceSet::load(&root);
+    let current_count = sources.full_occurrences(&pattern);
+    let count = sources.added_occurrences(Some(BASELINE_COMMIT), &pattern);
     assert!(
         current_count <= MANAGER_BASELINE_PROVIDER_NAME_COUNT,
         "provider-name invariant found {current_count} current occurrence(s), above manager baseline {MANAGER_BASELINE_PROVIDER_NAME_COUNT}"
     );
-    let tracked_added_count =
-        tracked_added_provider_name_occurrences_since_baseline(&root, &pattern);
-    let untracked_added_count = untracked_provider_name_occurrence_count(&root, &pattern);
-    let count = tracked_added_count + untracked_added_count;
     assert!(
         count == 0,
         "provider-name invariant found {count} new provider-name occurrence(s) after AGE-245 baseline"
     );
-}
-
-fn tracked_added_provider_name_occurrences_since_baseline(root: &Path, pattern: &str) -> usize {
-    let output = tracked_diff_output_since_baseline(root);
-    assert_tracked_diff_status(&output);
-    added_provider_name_occurrence_count(output.stdout, pattern)
-}
-
-fn tracked_diff_output_since_baseline(root: &Path) -> Output {
-    Command::new("git")
-        .current_dir(root)
-        .args([
-            "diff",
-            "--unified=0",
-            BASELINE_COMMIT,
-            "--",
-            ".",
-            ":(exclude)src-tauri/target/**",
-            ":(exclude)target/**",
-            ":(exclude)planning/*-gate/**",
-            ":(exclude)planning/wu-e/**",
-            ":(exclude)planning/opencode-contract/**",
-            ":(exclude)planning/s10-moveout/**",
-            ":(exclude)planning/code-quality-sweep/**",
-        ])
-        .output()
-        .expect("git diff must run for AGE-245 S7c provider-name invariant")
-}
-
-fn assert_tracked_diff_status(output: &Output) {
-    assert!(
-        output.status.success(),
-        "git diff failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn added_provider_name_occurrence_count(stdout: Vec<u8>, pattern: &str) -> usize {
-    String::from_utf8(stdout)
-        .expect("git diff stdout utf8")
-        .lines()
-        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
-        .flat_map(|line| provider_name_matches(line, pattern))
-        .count()
-}
-
-fn provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
-    let output = provider_name_occurrence_output(root, pattern);
-    assert_provider_name_occurrence_status(&output);
-    stdout_line_count(output.stdout, "rg stdout utf8")
-}
-
-fn provider_name_occurrence_output(root: &Path, pattern: &str) -> Output {
-    Command::new("rg")
-        .current_dir(root)
-        .args([
-            "--hidden",
-            "-o",
-            pattern,
-            "-g",
-            "!.git/**",
-            "-g",
-            "!src-tauri/target/**",
-            "-g",
-            "!target/**",
-            "-g",
-            "!planning/*-gate/**",
-            "-g",
-            "!planning/wu-e/**",
-            "-g",
-            "!planning/opencode-contract/**",
-            "-g",
-            "!planning/s10-moveout/**",
-        ])
-        .output()
-        .expect("rg must run for AGE-245 S7c provider-name invariant")
-}
-
-fn assert_provider_name_occurrence_status(output: &Output) {
-    assert!(
-        output.status.success() || output.status.code() == Some(1),
-        "rg failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn stdout_line_count(stdout: Vec<u8>, expect_message: &str) -> usize {
-    String::from_utf8(stdout)
-        .expect(expect_message)
-        .lines()
-        .count()
-}
-
-fn untracked_provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
-    let output = Command::new("git")
-        .current_dir(root)
-        .args([
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--",
-            ".",
-        ])
-        .output()
-        .expect("git ls-files must run for AGE-245 S7c provider-name invariant");
-    assert!(
-        output.status.success(),
-        "git ls-files failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .filter_map(|relative| std::str::from_utf8(relative).ok())
-        .filter(|relative| !is_ignored_generated_path(relative))
-        .map(|relative| {
-            let bytes = std::fs::read(root.join(relative))
-                .unwrap_or_else(|error| panic!("read untracked source {relative}: {error}"));
-            provider_name_matches(&String::from_utf8_lossy(&bytes), pattern).count()
-        })
-        .sum()
-}
-
-fn is_ignored_generated_path(relative: &str) -> bool {
-    relative.starts_with("src-tauri/target/")
-        || relative.starts_with("target/")
-        || is_planning_gate_artifact(relative)
-        || relative.starts_with("planning/wu-e/")
-        || relative.starts_with("planning/opencode-contract/")
-        || relative.starts_with("planning/s10-moveout/")
-        || relative.starts_with("planning/code-quality-sweep/")
-}
-
-fn is_planning_gate_artifact(relative: &str) -> bool {
-    relative
-        .strip_prefix("planning/")
-        .and_then(|suffix| suffix.split_once('/'))
-        .is_some_and(|(dir, _)| dir.ends_with("-gate"))
 }
 
 fn read_sources_under(relative: &str) -> Vec<String> {
@@ -327,14 +187,6 @@ fn assert_not_contains(context: &str, source: &str, needle: &str) {
 
 fn real_provider_token(parts: &[&str]) -> String {
     parts.concat()
-}
-
-fn provider_name_matches<'a>(line: &'a str, pattern: &'a str) -> impl Iterator<Item = &'a str> {
-    let left = &pattern[..6];
-    let right = &pattern[7..];
-    line.match_indices(left)
-        .map(|(_, matched)| matched)
-        .chain(line.match_indices(right).map(|(_, matched)| matched))
 }
 
 fn workspace_root() -> PathBuf {

@@ -28,7 +28,7 @@ pub fn load_app_config() -> AppConfig {
 }
 
 pub fn try_load_app_config() -> Result<AppConfig, String> {
-    let config_path = app_config_path();
+    let config_path = app_config_path()?;
     oulipoly_config::app::AppConfig::load(&config_path)
 }
 
@@ -45,14 +45,12 @@ pub fn load_providers_for_models_dir_with(
     repo.load_providers(&providers_path).unwrap_or_default()
 }
 
-fn app_config_path() -> PathBuf {
-    app_config_dir().join("config.toml")
+fn app_config_path() -> Result<PathBuf, String> {
+    app_config_dir().map(|dir| dir.join("config.toml"))
 }
 
-fn app_config_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."))
+fn app_config_dir() -> Result<PathBuf, String> {
+    oulipoly_state::paths::config_dir()
 }
 
 pub(crate) fn providers_config_path_for_models_dir(models_dir: &Path) -> PathBuf {

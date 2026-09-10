@@ -184,7 +184,7 @@ describe("provider settings Configure lifecycle", () => {
 		expect(
 			calls.find((call) => call.command === "delete_provider_settings")?.args,
 		).toMatchObject({
-			modelName: "example-model",
+			accountName: "provider-a",
 			id: "record",
 			version: "opaque-version",
 		});
@@ -344,7 +344,7 @@ describe("provider settings Configure lifecycle", () => {
 		expect(
 			calls.find((call) => call.command === "migrate_provider_settings")?.args,
 		).toEqual({
-			modelName: "example-model",
+			accountName: "provider-a",
 			dryRun: true,
 			legacy: null,
 		});
@@ -374,9 +374,9 @@ async function loadPanel() {
 
 async function chooseTarget() {
 	await waitFor(() => {
-		expect(screen.getByText("Example Model")).toBeTruthy();
+		expect(screen.getByText("Provider A")).toBeTruthy();
 	});
-	fireEvent.click(screen.getByText("Example Model"));
+	fireEvent.click(screen.getByText("Provider A"));
 }
 
 function installHappyPathHandlers(calls: { command: string; args?: any }[]) {
@@ -384,8 +384,8 @@ function installHappyPathHandlers(calls: { command: string; args?: any }[]) {
 		calls.push({ command: "list_provider_settings_targets", args });
 		return Promise.resolve([
 			{
-				modelName: "example-model",
-				displayName: "Example Model",
+				accountName: "provider-a",
+				displayName: "Provider A",
 				settingsSupported: true,
 				schemaId: "example.settings/v1",
 			},

@@ -34,6 +34,7 @@ fn update_session_capture_persists_verified_session_id_and_method() {
     let id = db.start_invocation(&start).unwrap();
 
     db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
         id,
         Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
         "forced_flag_verified",
@@ -73,7 +74,13 @@ fn update_session_capture_none_none_persists_none_marker() {
         .unwrap();
     assert_eq!(before.session_capture_method, None);
 
-    db.update_session_capture(id, None, "none").unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        None,
+        "none",
+    )
+    .unwrap();
 
     let after = db
         .get_invocation_by_uuid(&start.invocation_uuid)
@@ -99,12 +106,27 @@ fn update_session_capture_safe_to_call_multiple_times() {
     };
     let id = db.start_invocation(&start).unwrap();
 
-    db.update_session_capture(id, Some("first"), "forced_flag_verified")
-        .unwrap();
-    db.update_session_capture(id, Some("second"), "stdout_json_event")
-        .unwrap();
-    db.update_session_capture(id, Some("third"), "failed")
-        .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        Some("first"),
+        "forced_flag_verified",
+    )
+    .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        Some("second"),
+        "stdout_json_event",
+    )
+    .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        Some("third"),
+        "failed",
+    )
+    .unwrap();
 
     let row = db
         .get_invocation_by_uuid(&start.invocation_uuid)
@@ -130,8 +152,13 @@ fn update_session_capture_leaves_other_columns_alone() {
         .unwrap()
         .unwrap();
 
-    db.update_session_capture(id, Some("sid"), "forced_flag_verified")
-        .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        Some("sid"),
+        "forced_flag_verified",
+    )
+    .unwrap();
 
     let after = db
         .get_invocation_by_uuid(&start.invocation_uuid)
@@ -158,10 +185,20 @@ fn update_session_capture_dual_id_semantics_for_non_resumed_and_resumed_rows() {
         )
         .unwrap();
 
-    db.update_session_capture(non_resumed, Some("new-provider-session"), "stdout")
-        .unwrap();
-    db.update_session_capture(resumed, Some("attempted-resume-id"), "resumed")
-        .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        non_resumed,
+        Some("new-provider-session"),
+        "stdout",
+    )
+    .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        resumed,
+        Some("attempted-resume-id"),
+        "resumed",
+    )
+    .unwrap();
 
     let non_resumed_row = invocation_capture_projection(&db, non_resumed);
     assert_eq!(non_resumed_row.0.as_deref(), Some("new-provider-session"));
@@ -180,15 +217,33 @@ fn record_legacy_resume_input_session_id_updates_only_resumed_row() {
     let db = test_db();
     let resumed = seed_running_invocation(&db);
     let non_resumed = seed_running_invocation(&db);
-    db.update_session_capture(resumed, Some("active-session"), "resumed")
-        .unwrap();
-    db.update_session_capture(non_resumed, Some("provider-session"), "stdout")
-        .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        resumed,
+        Some("active-session"),
+        "resumed",
+    )
+    .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        non_resumed,
+        Some("provider-session"),
+        "stdout",
+    )
+    .unwrap();
 
-    db.record_legacy_resume_input_session_id(resumed, "attempted-resume")
-        .unwrap();
-    db.record_legacy_resume_input_session_id(non_resumed, "must-not-apply")
-        .unwrap();
+    db.record_legacy_resume_input_session_id(
+        crate::InvocationMutationAuthority::Standalone,
+        resumed,
+        "attempted-resume",
+    )
+    .unwrap();
+    db.record_legacy_resume_input_session_id(
+        crate::InvocationMutationAuthority::Standalone,
+        non_resumed,
+        "must-not-apply",
+    )
+    .unwrap();
 
     let resumed_session = invocation_session_id(&db, resumed);
     let non_resumed_session = invocation_session_id(&db, non_resumed);

@@ -18,6 +18,7 @@
 //!       - model-derived raw field carriers subordinate to provider account parsing
 //! ```
 //!
+use crate::ProviderEndpointConfig;
 use crate::model::{
     ResumeAcceptanceRules, ResumeStrategy, SessionCapture, SessionStorage, ToolRestrictions,
 };
@@ -27,6 +28,10 @@ use std::collections::{BTreeMap, HashMap};
 pub(crate) type RawProvidersToml = HashMap<String, RawEntry>;
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct RawEntry {
+    #[serde(default)]
+    pub(crate) implementation: Option<ProviderEndpointConfig>,
+    #[serde(default)]
+    pub(crate) settings_id: Option<String>,
     #[serde(default)]
     pub(crate) quota_script: Option<String>,
     #[serde(default)]

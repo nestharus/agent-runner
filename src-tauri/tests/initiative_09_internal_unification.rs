@@ -88,7 +88,7 @@ fn t_busy_token_hash_preserved() {
 /// Risk: T-error-path-release — a post-acquire import-replace failure may leave a stuck session lease.
 /// Level: CLI integration.
 /// Source: proposal §4 T-error-path-release; D3.
-/// Observable: forced fail-postimage-verification exits 1; a fresh immediate import-replace on the same session does not exit 13.
+/// Observable: forced fail-postimage-verification exits 16 with retained recovery state; a fresh immediate import-replace reconciles it and does not exit 13.
 /// Residual: covers the forced postimage-verification path, not every possible OS-level write/fsync failure.
 #[test]
 fn t_error_path_release() {
@@ -110,8 +110,8 @@ fn t_error_path_release() {
         .wait_with_output()
         .unwrap();
 
-    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
-    assert_json_error(&failed, "operational-error");
+    assert_eq!(failed.status.code(), Some(16), "{failed:?}");
+    assert_json_error(&failed, "operator-recovery-required");
 
     let fresh_input = canonical_jsonl(
         &prepared.session_id,

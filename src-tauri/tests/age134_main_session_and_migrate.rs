@@ -3,6 +3,8 @@
 //! ## Declared roles
 //! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
 
+mod provider_authority_fixture;
+
 use chrono::{DateTime, Utc};
 use oulipoly_state::{ImportedSessionDisplayMetadataUpsert, StateDb};
 use rusqlite::{Connection, params};
@@ -47,7 +49,10 @@ impl CliFixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env("HOME", &self.data_home);
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
@@ -434,7 +439,7 @@ command = "legacy-command"
 #[test]
 fn age134_migrate_config_turn_script_storage_maps_codex_quotes_paths_and_ignores_unknown() {
     let fixture = CliFixture::new();
-    fs::write(
+    provider_authority_fixture::write_with_explicit_provider_authority(
         fixture.providers_path(),
         r#"[codex]
 command = "codex"
@@ -446,8 +451,7 @@ command = "unknown"
 args = []
 prompt_mode = "arg"
 "#,
-    )
-    .unwrap();
+    );
     fs::write(
         fixture.sessions_path(),
         r#"[codex]

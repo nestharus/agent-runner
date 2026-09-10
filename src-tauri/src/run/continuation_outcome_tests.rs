@@ -79,6 +79,7 @@ fn bind_provider_session(
 ) {
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             row_id,
             &ProviderSessionBinding {
                 provider_session_id: session_id.to_string(),
@@ -92,7 +93,14 @@ fn bind_provider_session(
 
 fn finalize_success(state: &StateDb, row_id: i64) {
     state
-        .finalize_invocation(row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap();
 }
 
@@ -109,11 +117,23 @@ fn finalized_failed_resume_maps_exact_terminal_outcome() {
     );
     fixture
         .state
-        .update_resume_acceptance(row_id, "accepted", Some("matched origin session"))
+        .update_resume_acceptance(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            "accepted",
+            Some("matched origin session"),
+        )
         .unwrap();
     fixture
         .state
-        .finalize_invocation(row_id, false, 0, Some(UNCONFIRMED), Some(UNCONFIRMED))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            false,
+            0,
+            Some(UNCONFIRMED),
+            Some(UNCONFIRMED),
+        )
         .unwrap();
 
     let outcome = super::continuation_outcome::observe_resume_outcome(
@@ -241,7 +261,12 @@ fn resume_observation_rejects_provider_session_mismatch() {
     );
     fixture
         .state
-        .update_resume_acceptance(row_id, "accepted", Some("fixture acceptance"))
+        .update_resume_acceptance(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            "accepted",
+            Some("fixture acceptance"),
+        )
         .unwrap();
     finalize_success(&fixture.state, row_id);
 

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{CompositeInvocationId, InvocationStart, InvocationStatus, StateDb};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -71,7 +73,7 @@ interactive_args = ["model-interactive"]
             self.config_home
                 .join("oulipoly-agent-runner")
                 .join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[{provider_name}]
 command = "{}"
 args = []
@@ -79,7 +81,7 @@ interactive_args = ["launch"]
 prompt_mode = "arg"
 "#,
                 script_path.display()
-            ),
+            )),
         )
         .unwrap();
     }
@@ -104,14 +106,14 @@ args = ["one-shot-only"]
             self.config_home
                 .join("oulipoly-agent-runner")
                 .join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[{provider_name}]
 command = "{}"
 args = []
 prompt_mode = "arg"
 "#,
                 script_path.display()
-            ),
+            )),
         )
         .unwrap();
     }
@@ -124,7 +126,10 @@ prompt_mode = "arg"
             .arg(model_name);
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         if let Some(parent_env) = parent_env {
             cmd.env("OULIPOLY_PARENT_INVOCATION", parent_env);

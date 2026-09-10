@@ -1,5 +1,7 @@
-use crate::provider_registry::{ProviderRegistry, ProviderRegistryError, ProviderRegistryOptions};
-use oulipoly_config::ModelConfig;
+use crate::provider_registry::{
+    ProviderRegistry, ProviderRegistryError, ProviderRegistryHandle, ProviderRegistryOptions,
+};
+use oulipoly_config::{ModelConfig, ProvidersConfig};
 use oulipoly_provider::client::ProviderEnv;
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
@@ -13,12 +15,11 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub struct ProviderSettingsHost {
-    registry: ProviderRegistry,
-    options: ProviderSettingsHostOptions,
+    registry: ProviderRegistryHandle,
     target_cache: Mutex<HashMap<String, ProviderSettingsTarget>>,
 }
 
@@ -29,7 +30,7 @@ pub struct ProviderSettingsHostOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSettingsTarget {
-    pub model_name: String,
+    pub account_name: String,
     pub provider_id: String,
     pub display_name: String,
     pub settings_supported: bool,
@@ -55,11 +56,6 @@ pub struct ProviderSettingsProcessStatus {
 }
 
 impl ProviderSettingsHostOptions {
-    pub fn with_path_entries_from_process_path(mut self) -> Self {
-        self.registry = self.registry.with_path_entries_from_process_path();
-        self
-    }
-
     pub fn with_config_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.registry = self.registry.with_config_root(root);
         self
@@ -72,24 +68,32 @@ impl ProviderSettingsHostOptions {
 }
 
 impl ProviderSettingsHost {
-    pub fn from_model_configs(
+    pub fn from_configs(
         models: &[ModelConfig],
+        providers: &ProvidersConfig,
         options: ProviderSettingsHostOptions,
     ) -> Result<Self, ProviderSettingsError> {
-        let registry = ProviderRegistry::from_model_configs(models, options.registry.clone())?;
-        Ok(Self {
-            registry,
-            options,
-            target_cache: Mutex::new(HashMap::new()),
-        })
+        let registry = ProviderRegistry::from_configs(models, providers, options.registry)?;
+        Ok(Self::with_registry_handle(ProviderRegistryHandle::new(
+            Arc::new(registry),
+        )))
     }
 
-    pub fn rebuild_from_model_configs(
-        &mut self,
+    pub fn with_registry_handle(registry: ProviderRegistryHandle) -> Self {
+        Self {
+            registry,
+            target_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn rebuild_from_configs(
+        &self,
         models: &[ModelConfig],
+        providers: &ProvidersConfig,
+        options: ProviderSettingsHostOptions,
     ) -> Result<(), ProviderSettingsError> {
-        self.registry =
-            ProviderRegistry::from_model_configs(models, self.options.registry.clone())?;
+        let registry = ProviderRegistry::from_configs(models, providers, options.registry)?;
+        self.registry.replace(Arc::new(registry));
         self.target_cache
             .lock()
             .expect("settings target cache should not be poisoned")
@@ -99,67 +103,62 @@ impl ProviderSettingsHost {
 
     pub fn describe_settings_target(
         &self,
-        model_name: &str,
+        account_name: &str,
     ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
-        match self.cached_settings_target(model_name) {
+        match self.cached_settings_target(account_name) {
             Some(target) => Ok(target),
-            None => self.describe_uncached_settings_target(model_name),
+            None => self.describe_uncached_settings_target(account_name),
         }
     }
 
     fn describe_uncached_settings_target(
         &self,
-        model_name: &str,
+        account_name: &str,
     ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
-        let target = self.load_settings_target(model_name)?;
-        self.cache_settings_target(model_name, &target);
+        let target = self.load_settings_target(account_name)?;
+        self.cache_settings_target(account_name, &target);
         Ok(target)
     }
 
-    fn cached_settings_target(&self, model_name: &str) -> Option<ProviderSettingsTarget> {
+    fn cached_settings_target(&self, account_name: &str) -> Option<ProviderSettingsTarget> {
         self.target_cache
             .lock()
             .expect("settings target cache should not be poisoned")
-            .get(model_name)
+            .get(account_name)
             .cloned()
     }
 
     fn load_settings_target(
         &self,
-        model_name: &str,
+        account_name: &str,
     ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
-        let description = self.describe_provider(model_name)?;
-        Ok(settings_target_from_description(model_name, description))
+        let registry = self.registry.current();
+        let endpoint = registry.preflight_account(account_name)?;
+        Ok(settings_target_from_description(
+            account_name,
+            endpoint.capabilities().clone(),
+        ))
     }
 
-    fn cache_settings_target(&self, model_name: &str, target: &ProviderSettingsTarget) {
+    fn cache_settings_target(&self, account_name: &str, target: &ProviderSettingsTarget) {
         self.target_cache
             .lock()
             .expect("settings target cache should not be poisoned")
-            .insert(model_name.to_string(), target.clone());
+            .insert(account_name.to_string(), target.clone());
     }
 
-    pub fn configured_model_names(&self) -> Vec<String> {
-        self.registry.configured_model_names()
-    }
-
-    fn describe_provider(&self, model_name: &str) -> Result<DescribeResult, ProviderSettingsError> {
-        let artifact = self.registry.enabled_artifact_for_model(model_name)?;
-        let client = self.registry.client_factory().client_for(artifact);
-        let request = self.request(EmptyParams {})?;
-        client
-            .invoke_typed::<DescribeResult, _>("describe", request, NoProviderEnv)
-            .map_err(ProviderSettingsError::from)
+    pub fn configured_account_names(&self) -> Vec<String> {
+        self.registry.current().configured_account_names()
     }
 
     pub fn settings_schema(
         &self,
-        model_name: &str,
+        account_name: &str,
         schema_id: &str,
     ) -> Result<SchemaResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Schema,
             SchemaParams {
                 schema_id: schema_id.to_string(),
@@ -169,20 +168,20 @@ impl ProviderSettingsHost {
 
     pub fn settings_list(
         &self,
-        model_name: &str,
+        account_name: &str,
     ) -> Result<SettingsListResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
-        self.call_provider(model_name, SettingsOperation::List, EmptyParams {})
+        self.ensure_settings_supported(account_name)?;
+        self.call_provider(account_name, SettingsOperation::List, EmptyParams {})
     }
 
     pub fn settings_get(
         &self,
-        model_name: &str,
+        account_name: &str,
         id: &str,
     ) -> Result<SettingsGetResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Get,
             SettingsGetParams { id: id.to_string() },
         )
@@ -190,13 +189,13 @@ impl ProviderSettingsHost {
 
     pub fn settings_create(
         &self,
-        model_name: &str,
+        account_name: &str,
         display_name: Option<String>,
         values: SettingsValues,
     ) -> Result<SettingsWriteResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Create,
             SettingsCreateParams {
                 display_name,
@@ -207,14 +206,14 @@ impl ProviderSettingsHost {
 
     pub fn settings_update(
         &self,
-        model_name: &str,
+        account_name: &str,
         id: &str,
         version: &str,
         values: SettingsValues,
     ) -> Result<SettingsWriteResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Update,
             SettingsUpdateParams {
                 id: id.to_string(),
@@ -226,13 +225,13 @@ impl ProviderSettingsHost {
 
     pub fn settings_delete(
         &self,
-        model_name: &str,
+        account_name: &str,
         id: &str,
         version: &str,
     ) -> Result<SettingsDeleteResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Delete,
             SettingsDeleteParams {
                 id: id.to_string(),
@@ -243,12 +242,12 @@ impl ProviderSettingsHost {
 
     pub fn settings_validate(
         &self,
-        model_name: &str,
+        account_name: &str,
         values: SettingsValues,
     ) -> Result<SettingsValidateResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Validate,
             SettingsValidateParams { values },
         )
@@ -256,33 +255,33 @@ impl ProviderSettingsHost {
 
     pub fn settings_migrate(
         &self,
-        model_name: &str,
+        account_name: &str,
         dry_run: bool,
         legacy: Value,
     ) -> Result<SettingsMigrateResult, ProviderSettingsError> {
-        self.ensure_settings_supported(model_name)?;
+        self.ensure_settings_supported(account_name)?;
         self.call_provider(
-            model_name,
+            account_name,
             SettingsOperation::Migrate,
             SettingsMigrateParams { dry_run, legacy },
         )
     }
 
-    fn ensure_settings_supported(&self, model_name: &str) -> Result<(), ProviderSettingsError> {
-        let target = self.settings_support_target(model_name)?;
+    fn ensure_settings_supported(&self, account_name: &str) -> Result<(), ProviderSettingsError> {
+        let target = self.settings_support_target(account_name)?;
         validate_settings_supported(&target)
     }
 
     fn settings_support_target(
         &self,
-        model_name: &str,
+        account_name: &str,
     ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
-        self.describe_settings_target(model_name)
+        self.describe_settings_target(account_name)
     }
 
     fn call_provider<R, Params>(
         &self,
-        model_name: &str,
+        account_name: &str,
         operation: SettingsOperation,
         params: Params,
     ) -> Result<R, ProviderSettingsError>
@@ -290,23 +289,30 @@ impl ProviderSettingsHost {
         R: serde::de::DeserializeOwned,
         Params: Serialize,
     {
-        let artifact = self.registry.enabled_artifact_for_model(model_name)?;
-        let client = self.registry.client_factory().client_for(artifact);
-        let request = self.request(params)?;
-        client
+        let registry = self.registry.current();
+        let endpoint = registry.preflight_account(account_name)?;
+        let provider_instance_id = format!("{}-instance", endpoint.capabilities().provider_id);
+        let request = self.request(registry.as_ref(), &provider_instance_id, params)?;
+        endpoint
+            .client()
             .invoke_typed::<R, _>(operation.as_provider_name(), request, NoProviderEnv)
             .map_err(ProviderSettingsError::from)
     }
 
-    fn request<Params>(&self, params: Params) -> Result<Value, ProviderSettingsError>
+    fn request<Params>(
+        &self,
+        registry: &ProviderRegistry,
+        provider_instance_id: &str,
+        params: Params,
+    ) -> Result<Value, ProviderSettingsError>
     where
         Params: Serialize,
     {
         let mut value = serde_json::to_value(RequestEnvelope {
             contract: CONTRACT_VERSION.to_string(),
             request_id: provider_settings_request_id(),
-            provider_instance_id: Some("provider-settings".to_string()),
-            host: host_context(self.registry.host_options()),
+            provider_instance_id: Some(provider_instance_id.to_string()),
+            host: host_context(registry.host_options()),
             params,
         })
         .map_err(schema_request_error)?;
@@ -337,11 +343,11 @@ fn ensure_host_env_object(value: &mut Value) {
 }
 
 fn settings_target_from_description(
-    model_name: &str,
+    account_name: &str,
     description: DescribeResult,
 ) -> ProviderSettingsTarget {
     ProviderSettingsTarget {
-        model_name: model_name.to_string(),
+        account_name: account_name.to_string(),
         provider_id: description.provider_id,
         display_name: description.display_name,
         settings_supported: description.capabilities.settings,
@@ -412,7 +418,7 @@ impl ProviderSettingsError {
         Self {
             category: "unsupported".into(),
             code: Some("settings_unsupported".into()),
-            message: "provider settings are not supported for this model".into(),
+            message: "provider settings are not supported for this account".into(),
             retryable: Some(false),
             details: Box::new(Value::Object(Map::new())),
             diagnostics: Vec::new().into_boxed_slice(),

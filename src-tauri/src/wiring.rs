@@ -85,16 +85,15 @@ pub struct AgentRuntimeServices {
 }
 
 impl AgentRuntimeServices {
-    pub fn cli_defaults() -> Self {
-        let paths = default_cli_runtime_paths();
+    pub fn cli_defaults() -> Result<Self, String> {
+        let paths = default_cli_runtime_paths()?;
         let provider_registry_options = ProviderRegistryOptions::default()
-            .with_path_entries_from_process_path()
             .with_config_root(paths.config_root.clone())
             .with_data_root(paths.data_root.clone());
         let provider_registry = Arc::new(production_provider_registry(
             &paths,
             provider_registry_options.clone(),
-        ));
+        )?);
         let provider_registry_handle = ProviderRegistryHandle::new(provider_registry.clone());
         let session_lifecycle_service =
             Arc::new(ProductionSessionLifecycleService::with_registry_handle(
@@ -103,7 +102,7 @@ impl AgentRuntimeServices {
         let session_import_service = Arc::new(
             ProductionSessionImportService::with_registry_handle(provider_registry_handle.clone()),
         );
-        Self {
+        Ok(Self {
             state_db_opener: Arc::new(ProductionStateDbOpener),
             app_config: Arc::new(FilesystemAppConfigRepository),
             agent_config: Arc::new(FilesystemAgentConfigRepository),
@@ -145,19 +144,18 @@ impl AgentRuntimeServices {
                 ),
             ),
             session_lock_service: Arc::new(ProductionSessionLockService::default()),
-        }
+        })
     }
 
     pub fn production(paths: RuntimePaths) -> Result<Self, String> {
         prepare_runtime_directories(&paths)?;
         let registry_options = ProviderRegistryOptions::default()
-            .with_path_entries_from_process_path()
             .with_config_root(paths.config_root.clone())
             .with_data_root(paths.data_root.clone());
         let provider_registry = Arc::new(production_provider_registry(
             &paths,
             registry_options.clone(),
-        ));
+        )?);
         let provider_registry_handle = ProviderRegistryHandle::new(provider_registry.clone());
         let session_lifecycle_service =
             Arc::new(ProductionSessionLifecycleService::with_registry_handle(
@@ -213,61 +211,53 @@ impl AgentRuntimeServices {
     }
 }
 
-fn default_cli_runtime_paths() -> RuntimePaths {
-    let config_root = dirs::config_dir()
-        .map(|dir| dir.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
+fn default_cli_runtime_paths() -> Result<RuntimePaths, String> {
+    let config_root = oulipoly_state::paths::config_dir()?;
     let models_dir = config_root.join("models");
-    let data_root = oulipoly_state::paths::data_dir().unwrap_or_else(|_| config_root.clone());
-    RuntimePaths {
+    let data_root = oulipoly_state::paths::data_dir()?;
+    let working_dir = std::env::current_dir()
+        .map_err(|error| format!("Could not resolve current working directory: {error}"))?;
+    Ok(RuntimePaths {
         config_root: config_root.clone(),
         models_dir,
         agents_dir: config_root.join("agents"),
         data_root: data_root.clone(),
         state_db_path: data_root.join("state.db"),
         lock_dir: data_root.join("locks"),
-        working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    }
+        working_dir,
+    })
 }
 
 fn production_provider_registry(
     paths: &RuntimePaths,
     options: ProviderRegistryOptions,
-) -> ProviderRegistry {
-    let fallback_options = options.clone();
-    let providers = load_registry_providers(paths);
-    let models = load_registry_models(paths, &providers);
-    registry_from_model_configs(&models, &providers, options)
-        .unwrap_or_else(|_| empty_provider_registry(fallback_options))
+) -> Result<ProviderRegistry, String> {
+    let providers = load_registry_providers(paths)?;
+    let models = load_registry_models(paths, &providers)?;
+    registry_from_configs(&models, &providers, options).map_err(|error| error.to_string())
 }
 
-fn load_registry_providers(paths: &RuntimePaths) -> config::ProvidersConfig {
-    FilesystemProvidersConfigRepository
-        .load_providers(&paths.config_root.join("providers.toml"))
-        .unwrap_or_default()
+fn load_registry_providers(paths: &RuntimePaths) -> Result<config::ProvidersConfig, String> {
+    FilesystemProvidersConfigRepository.load_providers(&paths.config_root.join("providers.toml"))
 }
 
 fn load_registry_models(
     paths: &RuntimePaths,
     providers: &config::ProvidersConfig,
-) -> std::collections::HashMap<String, config::ModelConfig> {
-    config::load_models(&paths.models_dir, Some(providers)).unwrap_or_default()
+) -> Result<std::collections::HashMap<String, config::ModelConfig>, String> {
+    config::load_models(&paths.models_dir, Some(providers)).map_err(|error| error.to_string())
 }
 
-pub(crate) fn registry_from_model_configs(
+pub(crate) fn registry_from_configs(
     models: &std::collections::HashMap<String, config::ModelConfig>,
     providers: &config::ProvidersConfig,
     options: ProviderRegistryOptions,
 ) -> Result<ProviderRegistry, oulipoly_runtime::provider_registry::ProviderRegistryError> {
-    ProviderRegistry::from_model_configs_with_provider_config(
+    ProviderRegistry::from_configs(
         &models.values().cloned().collect::<Vec<_>>(),
         providers,
         options,
     )
-}
-
-fn empty_provider_registry(options: ProviderRegistryOptions) -> ProviderRegistry {
-    ProviderRegistry::empty(options)
 }
 
 fn prepare_runtime_directories(paths: &RuntimePaths) -> Result<(), String> {
@@ -303,13 +293,15 @@ fn format_runtime_directory_error(label: &str, error: std::io::Error) -> String 
 mod tests {
     use super::*;
     use oulipoly_config::provider_implementation_ref::ProviderImplementationRef;
-    use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProviderEntry};
+    use oulipoly_config::{
+        ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    };
     use std::collections::HashMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn registry_keeps_account_inferred_and_explicit_artifacts_without_spawning_on_build() {
+    fn registry_uses_account_artifact_instead_of_model_or_command_authority() {
         let dir = tempfile::tempdir().expect("tempdir");
         let count = dir.path().join("describe-count");
         let inferred = write_describe_provider(dir.path(), "agent-runner-fixture", &count);
@@ -331,6 +323,10 @@ mod tests {
             entries: HashMap::from([(
                 "account".to_string(),
                 ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "fixture".to_string(),
+                        executable: inferred.display().to_string(),
+                    }),
                     command: Some("fixture5".to_string()),
                     ..Default::default()
                 },
@@ -340,7 +336,7 @@ mod tests {
             (account_model.name.clone(), account_model),
             (explicit_model.name.clone(), explicit_model),
         ]);
-        let registry = registry_from_model_configs(
+        let registry = registry_from_configs(
             &models,
             &providers,
             ProviderRegistryOptions::default().with_path_entries([dir.path().to_path_buf()]),
@@ -362,7 +358,7 @@ mod tests {
         assert_eq!(
             registry
                 .describe_model_provider_instance("account-model", "account")
-                .expect("inferred account artifact")
+                .expect("account-owned artifact")
                 .provider_id,
             "fixture-provider"
         );
@@ -370,13 +366,13 @@ mod tests {
         assert_eq!(
             registry
                 .describe_model_provider_instance("explicit-model", "account")
-                .expect("explicit model artifact")
+                .expect("account-owned artifact must override model authority")
                 .provider_id,
             "fixture-provider"
         );
-        assert_eq!(
-            fs::read_to_string(&explicit_count).expect("explicit count"),
-            "1"
+        assert!(
+            !explicit_count.exists(),
+            "model implementation must not be invoked by production registry wiring"
         );
     }
 

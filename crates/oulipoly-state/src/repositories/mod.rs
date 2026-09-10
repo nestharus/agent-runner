@@ -105,6 +105,7 @@ pub trait InvocationRepository {
     fn start_invocation(&self, start: InvocationStart) -> Result<InvocationRecord, String>;
     fn finalize_invocation(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_uuid: &str,
         status: InvocationStatus,
         exit_code: i32,
@@ -113,12 +114,14 @@ pub trait InvocationRepository {
     ) -> Result<(), String>;
     fn update_session_capture(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_uuid: &str,
         session_id: Option<&str>,
         method: &str,
     ) -> Result<(), String>;
     fn update_resume_acceptance(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_uuid: &str,
         status: &str,
         evidence: Option<&str>,
@@ -136,6 +139,7 @@ impl InvocationRepository for StateDb {
 
     fn finalize_invocation(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_uuid: &str,
         status: InvocationStatus,
         exit_code: i32,
@@ -147,6 +151,7 @@ impl InvocationRepository for StateDb {
         let success = map_terminal_invocation_success(status);
         StateDb::finalize_invocation(
             self,
+            mutation_authority,
             record.id,
             success,
             exit_code,
@@ -157,22 +162,24 @@ impl InvocationRepository for StateDb {
 
     fn update_session_capture(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_uuid: &str,
         session_id: Option<&str>,
         method: &str,
     ) -> Result<(), String> {
         let record = require_invocation(self, invocation_uuid)?;
-        StateDb::update_session_capture(self, record.id, session_id, method)
+        StateDb::update_session_capture(self, mutation_authority, record.id, session_id, method)
     }
 
     fn update_resume_acceptance(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         invocation_uuid: &str,
         status: &str,
         evidence: Option<&str>,
     ) -> Result<(), String> {
         let record = require_invocation(self, invocation_uuid)?;
-        StateDb::update_resume_acceptance(self, record.id, status, evidence)
+        StateDb::update_resume_acceptance(self, mutation_authority, record.id, status, evidence)
     }
 
     fn get_invocation_by_uuid(&self, uuid: &str) -> Result<Option<InvocationRecord>, String> {

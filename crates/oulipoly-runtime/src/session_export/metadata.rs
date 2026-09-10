@@ -10,11 +10,11 @@ pub fn resolve_export_session_metadata(
     session_id: &str,
 ) -> Result<ExportSessionMetadata, ExportError> {
     let state = StateDb::open_default().map_err(|message| ExportError::Operational { message })?;
-    let config_root = default_config_root();
+    let config_root = default_config_root()?;
     let providers_path = config_root.join("providers.toml");
     let sessions_path = config_root.join("sessions.toml");
     let providers_cfg = ProvidersConfig::load(&providers_path).unwrap_or_default();
-    let models_dir = default_models_dir();
+    let models_dir = default_models_dir()?;
     let models = load_models(&models_dir, Some(&providers_cfg)).map_err(|message| {
         ExportError::Operational {
             message: message.to_string(),
@@ -149,14 +149,10 @@ fn metadata_error_to_export_error(err: crate::session_metadata::MetadataError) -
     }
 }
 
-fn default_config_root() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."))
+fn default_config_root() -> Result<PathBuf, ExportError> {
+    oulipoly_state::paths::config_dir().map_err(|message| ExportError::Operational { message })
 }
 
-fn default_models_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner").join("models"))
-        .unwrap_or_else(|| PathBuf::from("models"))
+fn default_models_dir() -> Result<PathBuf, ExportError> {
+    default_config_root().map(|root| root.join("models"))
 }

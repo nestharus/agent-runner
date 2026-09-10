@@ -261,6 +261,7 @@ impl StateDb {
         ran_open_migrations: bool,
         provider_names: &LegacyProviderNames,
     ) -> Result<(), String> {
+        super::provider_launch_lifecycle::validate_launch_schema(conn)?;
         Self::validate_providers_schema(conn)?;
         Self::ensure_invocations_schema(conn, provider_names)?;
         Self::ensure_providers_schema(conn)?;
@@ -330,6 +331,15 @@ impl StateDb {
         snapshot: crate::read_only_snapshot::ReadOnlySnapshot,
     ) -> Result<Self, ReadOnlyOpenError> {
         Self::probe_read_only_schema(&source, &conn)?;
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|error| ReadOnlyOpenError::Operational {
+                message: error.to_string(),
+            })?;
+        if version == 23 {
+            super::provider_launch_lifecycle::validate_launch_schema(&conn)
+                .map_err(|message| ReadOnlyOpenError::Operational { message })?;
+        }
 
         Ok(Self {
             conn,
@@ -663,11 +673,12 @@ impl StateDb {
     }
 
     fn create_state_parent_dir(parent: &Path) -> Result<(), String> {
-        std::fs::create_dir_all(parent).map_err(Self::format_state_directory_create_error)
-    }
-
-    fn format_state_directory_create_error(err: std::io::Error) -> String {
-        format!("Failed to create state directory: {err}")
+        std::fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "Failed to create state directory {}: {err}",
+                parent.display()
+            )
+        })
     }
 
     pub(super) fn run_open_migrations(

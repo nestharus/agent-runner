@@ -21,6 +21,8 @@ pub mod cli;
 mod external_provider;
 #[allow(dead_code)]
 mod output;
+mod output_spool;
+pub mod prompt_acceptance;
 mod provider_specific;
 pub mod providers;
 pub mod terminal_signal;
@@ -32,11 +34,13 @@ use crate::services::{
 use external_provider::context::{ExternalProviderDispatchContext, ExternalProviderDispatchInput};
 pub use oulipoly_agent_messenger::ReturnedArtifactRef;
 use oulipoly_config::{ModelConfig, ProviderConfig};
+use oulipoly_provider::generated::PromptAcceptedMarkerValueV1;
 use oulipoly_state::CompositeInvocationId;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+pub use self::output_spool::ExecutionOutputSpool;
 pub use self::providers::codex::Recognizer as CodexRecognizer;
 pub use self::providers::openai_compat::Recognizer as OpenAiCompatRecognizer;
 pub use self::providers::opencode::Recognizer as OpenCodeRecognizer;
@@ -62,6 +66,11 @@ pub use self::terminal_signal::TerminalSignalRecognizer;
 pub struct ExecutionResult {
     pub stdout: Vec<u8>,
     pub stderr: String,
+    /// External-provider output custody: complete on normal launches, explicitly
+    /// incomplete after live attachment abort or missing final event. Complete-stream APIs reject partial
+    /// custody; failed retention writes `<invocation_uuid>.partial.{stdout,stderr}`.
+    /// `stdout` and `stderr` remain bounded diagnostics when a spool is present.
+    pub output_spool: Option<ExecutionOutputSpool>,
     /// Numeric child-process exit code per `exit_code_from_status`.
     pub exit_code: i32,
     pub provider_index: usize,
@@ -73,18 +82,96 @@ pub struct ExecutionResult {
     /// response. Terminal cleanliness is checked by callers before treating it
     /// as productive completion.
     pub produced_assistant_response: bool,
-    pub submitted_user_turn: Option<SubmittedUserTurn>,
+    pub prompt_acceptance_attestation: Option<PromptAcceptedMarkerValueV1>,
     pub captured_child_invocations: Vec<CapturedChildInvocation>,
     pub returned_artifacts: Vec<ReturnedArtifactRef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubmittedUserTurn {
-    pub provider_session_id: String,
-    pub prompt_sha256: String,
-    pub delivery_nonce: Option<String>,
-    pub source: Option<String>,
-    pub message_id: Option<String>,
+impl ExecutionResult {
+    /// Retain already-produced evidence on the bounded host-finalization failure path.
+    /// Both writes are attempted independently; neither changes terminal success.
+    pub fn retain_failed_finalization_evidence(
+        &self,
+        state: &oulipoly_state::StateDb,
+        invocation_id: i64,
+        invocation_uuid: &str,
+    ) -> Result<(), &'static str> {
+        if !matches!(
+            self.terminal_reason.as_deref(),
+            Some(
+                "runtime_generation_attach_failed"
+                    | "runtime_generation_exit_failed"
+                    | "external_provider_missing_final_exit"
+            )
+        ) {
+            return Ok(());
+        }
+        let artifacts = state.record_returned_artifacts(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_id,
+            &self.returned_artifacts,
+        );
+        let output = self.persist_output_for_invocation(state, invocation_id, invocation_uuid);
+        match (artifacts.is_ok(), output.is_ok()) {
+            (true, true) => Ok(()),
+            (false, true) => {
+                Err("finalization_evidence: artifacts=storage_failure;output=retained")
+            }
+            (true, false) => {
+                Err("finalization_evidence: artifacts=retained;output=storage_failure")
+            }
+            (false, false) => {
+                Err("finalization_evidence: artifacts=storage_failure;output=storage_failure")
+            }
+        }
+    }
+
+    pub fn persist_output_for_invocation(
+        &self,
+        state: &oulipoly_state::StateDb,
+        invocation_id: i64,
+        invocation_uuid: &str,
+    ) -> Result<(), String> {
+        match &self.output_spool {
+            Some(spool) => spool.persist_for_invocation(state, invocation_id, invocation_uuid),
+            None => Ok(()),
+        }
+    }
+
+    pub fn write_stdout_to(&self, writer: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match &self.output_spool {
+            Some(spool) => spool.write_stdout_to(writer),
+            None => writer.write_all(&self.stdout),
+        }
+    }
+
+    pub fn write_stderr_to(&self, writer: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match &self.output_spool {
+            Some(spool) => spool.write_stderr_to(writer),
+            None => writer.write_all(self.stderr.as_bytes()),
+        }
+    }
+
+    pub fn complete_stdout_bytes(&self) -> std::io::Result<Vec<u8>> {
+        match &self.output_spool {
+            Some(spool) => spool.stdout_bytes(),
+            None => Ok(self.stdout.clone()),
+        }
+    }
+
+    pub fn stdout_ends_with_newline(&self) -> bool {
+        match &self.output_spool {
+            Some(spool) => spool.stdout_ends_with_newline(),
+            None => self.stdout.ends_with(b"\n"),
+        }
+    }
+
+    pub fn stdout_is_empty(&self) -> std::io::Result<bool> {
+        match &self.output_spool {
+            Some(spool) => Ok(spool.summary()?.stdout_bytes == 0),
+            None => Ok(self.stdout.is_empty()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,12 +209,21 @@ pub struct SessionCaptureResult {
     pub method: SessionCaptureMethod,
 }
 
+/// Endpoint identity retained from the pinned, authenticated launch client.
+/// Never reconstructed from a registry lookup after execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalProviderSessionAuthority {
+    pub account_name: String,
+    pub provider_instance_id: String,
+    pub settings_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionCaptureMethod {
     None,
     ForcedFlagVerified,
     StdoutJsonEvent,
-    ExternalProviderLaunch,
+    ExternalProviderLaunch(ExternalProviderSessionAuthority),
     Failed(String),
 }
 
@@ -137,7 +233,7 @@ impl SessionCaptureMethod {
             SessionCaptureMethod::None => "none",
             SessionCaptureMethod::ForcedFlagVerified => "forced_flag_verified",
             SessionCaptureMethod::StdoutJsonEvent => "stdout_json_event",
-            SessionCaptureMethod::ExternalProviderLaunch => "external_provider_launch",
+            SessionCaptureMethod::ExternalProviderLaunch(_) => "external_provider_launch",
             SessionCaptureMethod::Failed(_) => "failed",
         }
     }
@@ -194,8 +290,9 @@ impl ExecutorServicePort for RuntimeExecutorService {
         &self,
         request: ExecutorServiceRequest,
     ) -> Result<ExecutorServiceOutput, ServiceError> {
-        let result = if request_model_has_external_provider(&request) {
-            execute_external_provider(self.provider_registry.current(), request)
+        let registry = self.provider_registry.current();
+        let result = if request_has_account_endpoint(&registry, &request) {
+            execute_external_provider(registry, request)
         } else {
             execute_legacy(request)
         }?;
@@ -254,6 +351,7 @@ fn execute_legacy(request: ExecutorServiceRequest) -> Result<ExecutionResult, Se
             extra_inputs,
             parent_invocation_env,
             start_known_provider_session_id,
+            mailbox_delivery_correlation: _,
         }
         | ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
             model,
@@ -319,6 +417,7 @@ fn external_provider_context_from_request(
                 parent_invocation_env,
                 start_known_provider_session_id: None,
                 start_known_provider_session_mode: None,
+                mailbox_delivery_correlation: None,
             }
             .into()
         }
@@ -344,6 +443,7 @@ fn external_provider_context_from_request(
             parent_invocation_env,
             start_known_provider_session_id: None,
             start_known_provider_session_mode: None,
+            mailbox_delivery_correlation: None,
         }
         .into(),
         ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
@@ -357,6 +457,7 @@ fn external_provider_context_from_request(
             extra_inputs,
             parent_invocation_env,
             start_known_provider_session_id,
+            mailbox_delivery_correlation,
         } => ExternalProviderDispatchInput {
             model,
             provider,
@@ -371,6 +472,7 @@ fn external_provider_context_from_request(
             start_known_provider_session_mode: Some(
                 crate::services::ProviderSessionStartMode::Resume,
             ),
+            mailbox_delivery_correlation,
         }
         .into(),
         ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
@@ -398,18 +500,34 @@ fn external_provider_context_from_request(
             start_known_provider_session_mode: Some(
                 crate::services::ProviderSessionStartMode::Create,
             ),
+            mailbox_delivery_correlation: None,
         }
         .into(),
     })
 }
 
-fn request_model_has_external_provider(request: &ExecutorServiceRequest) -> bool {
+fn request_has_account_endpoint(
+    registry: &ProviderRegistry,
+    request: &ExecutorServiceRequest,
+) -> bool {
+    selected_request_account_name(request)
+        .is_some_and(|account_name| registry.has_account_endpoint(account_name))
+}
+
+fn selected_request_account_name(request: &ExecutorServiceRequest) -> Option<&str> {
     match request {
-        ExecutorServiceRequest::Facade { model, .. }
-        | ExecutorServiceRequest::Effective { model, .. }
-        | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId { model, .. }
-        | ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId { model, .. } => {
-            model.provider.is_some()
+        ExecutorServiceRequest::Facade {
+            model,
+            provider_index,
+            ..
+        } => model
+            .providers
+            .get(*provider_index)
+            .map(|provider| provider.name.as_str()),
+        ExecutorServiceRequest::Effective { provider, .. }
+        | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId { provider, .. }
+        | ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId { provider, .. } => {
+            Some(provider.name.as_str())
         }
     }
 }
@@ -526,6 +644,14 @@ pub fn execute_effective_with_inputs_and_env(
 }
 
 // Characterization test for AGE-8 — pins current behavior of executor/mod.rs facade wrappers in this inline test module.
+pub use cli::ipc::return_channel::{ReturnChannel, ReturnChannelSettlement};
+
+pub use external_provider::attempt::{
+    AllocatedProviderLaunchAttempt, ProviderLaunchAttemptFailure, ProviderLaunchAttemptOutcome,
+    ProviderLaunchFailure, ProviderLaunchPromotionSummary, RuntimeSettlementReceipt,
+    execute_allocated_provider_attempt,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

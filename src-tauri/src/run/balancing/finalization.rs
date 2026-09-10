@@ -72,6 +72,36 @@ pub(super) fn finalize_completed_attempt(
     if let Some(control) = handle_returned_artifacts_persist_failure(&mut input) {
         return control;
     }
+    if classification.success
+        && let Err(error) = input.result.persist_output_for_invocation(
+            &input.env.state,
+            input.invocation_row_id,
+            &input.invocation.id,
+        )
+    {
+        formatter::emit_stderr(&format!("failed to persist provider output: {error}"));
+        let finalize_result = finalize_retained_outcome_with_contention_retry(
+            input
+                .agent_runtime_services
+                .invocation_lifecycle_service
+                .as_ref(),
+            mapper::completed_finalize_request(
+                &input.env.state,
+                input.invocation_row_id,
+                false,
+                1,
+                Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
+                Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
+            ),
+        );
+        match finalize_result {
+            Ok(_) => input.guard.mark_finalized(),
+            Err(err) => formatter::emit_finalize_invocation_warning(err),
+        }
+        emit_terminal_persistence_failure_result(&input);
+        mark_balanced_attempt_idle(&input, Some(1));
+        return BalancedLoopControl::Return(Ok(1));
+    }
 
     formatter::emit_unknown_diagnostic_if_settled_unknown(
         &input.env.state,
@@ -212,6 +242,11 @@ fn emit_completed_attempt_finalize_failure(
     err: impl std::fmt::Display,
 ) {
     formatter::emit_finalize_invocation_warning(err);
+    emit_terminal_persistence_failure_result(input);
+    mark_balanced_attempt_idle(input, Some(1));
+}
+
+fn emit_terminal_persistence_failure_result(input: &CompletedAttemptInput<'_, '_, '_>) {
     formatter::emit_failure_result_envelope(mapper::failure_result_envelope_input(
         &input.env.state,
         &input.invocation.id,
@@ -221,7 +256,6 @@ fn emit_completed_attempt_finalize_failure(
         Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
         Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
     ));
-    mark_balanced_attempt_idle(input, Some(1));
 }
 
 fn completed_attempt_result_control(
@@ -242,13 +276,20 @@ fn emit_completed_attempt_success(
     classification: &CompletedAttemptClassification,
 ) -> BalancedLoopControl {
     mark_balanced_successful_attempt_idle_and_recheck(input, input.result.exit_code);
-    formatter::emit_success_output(
-        &input.invocation.id,
-        input.result.exit_code,
-        classification.error_category.as_deref(),
-        input.result.terminal_reason.as_deref(),
-        &input.result.stdout,
-    );
+    if !crate::run::spooled_success_delivery::settle(
+        &input.env.state,
+        input.invocation_row_id,
+        input.result.output_spool.is_some(),
+        || {
+            formatter::emit_success_output(
+                &input.invocation.id,
+                classification.error_category.as_deref(),
+                input.result,
+            )
+        },
+    ) {
+        return BalancedLoopControl::Return(Ok(1));
+    }
     BalancedLoopControl::Return(Ok(if input.recovered_generic_nonzero {
         0
     } else {
@@ -328,7 +369,7 @@ fn mark_balanced_successful_attempt_idle_and_recheck(
     let Some(provider_session_id) = input.zero_turn_provider_session_id else {
         return;
     };
-    if let Err(err) = crate::wake_coordinator::mark_successful_turn_idle_and_recheck(
+    if let Err(err) = crate::wake_coordinator::mark_terminal_attempt_idle_and_recheck(
         provider_session_id,
         &input.invocation.id,
         exit_code,
@@ -419,10 +460,10 @@ fn finalize_returned_artifacts_failure_lifecycle(
     input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::returned_artifacts_finalize_request(
-            &input.env.state,
-            input.invocation_row_id,
-        ))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::returned_artifacts_finalize_request(&input.env.state, input.invocation_row_id),
+        )
         .map(|_| ())
 }
 
@@ -501,6 +542,5 @@ fn record_external_session_metadata(
             model_name: Some(&input.model.name),
             models_dir: Some(input.env.models_dir.to_string_lossy().as_ref()),
             effective_cwd: Some(effective_cwd.as_ref()),
-            selected_auto_wake_max: Some(crate::wake_coordinator::selected_auto_wake_max()),
         })
 }

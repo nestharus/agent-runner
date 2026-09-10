@@ -3,6 +3,7 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 
 use oulipoly_runtime::delivery_evidence::PtyTransportAcknowledgementEvidence;
+use oulipoly_runtime::provider_turn_contract::MAILBOX_BATCH_MAX_ROWS;
 #[cfg(test)]
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, RuntimeGenerationId,
@@ -16,6 +17,7 @@ use oulipoly_state::mailbox::{
 use oulipoly_state::pid_identity::{ProcessIdentityObservation, observe_live_process_identity};
 use oulipoly_state::{DeliveryEvidence, DeliveryEvidenceKind, SessionLifecycleRepository, StateDb};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -27,11 +29,11 @@ use oulipoly_runtime::executor::cli::pty_broker::{
     unlink_control_socket_if_owned,
 };
 
-const MAILBOX_BATCH_MAX_ROWS: usize = 20;
 const MAILBOX_PREFIX_MAX_BYTES: usize = 64 * 1024;
 const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
 const DELIVERY_NONCE_SUFFIX: &str = "]";
-const DELIVERY_NONCE_LENGTH_PLACEHOLDER: &str = "00000000-0000-4000-8000-000000000000";
+const DELIVERY_NONCE_LENGTH_PLACEHOLDER: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 pub(crate) struct PreparedMailboxDelivery {
     pub answer: Option<String>,
@@ -62,6 +64,7 @@ struct PtyRuntimeAuthority {
     control_path: String,
     delivery_invocation_uuid: String,
     turn_generation_id: String,
+    provider_name: String,
 }
 
 #[cfg(unix)]
@@ -110,11 +113,13 @@ fn attempt_pty_mailbox_delivery_inner(
     let control_path = authority.control_path;
     let delivery_invocation_uuid = authority.delivery_invocation_uuid;
     let turn_generation_id = authority.turn_generation_id;
-    let Some(prepared) = (match prepare_pty_mailbox_delivery(
+    let provider_name = authority.provider_name;
+    let Some(prepared) = (match prepare_pty_mailbox_delivery_with_transcript_reconciliation(
         mailbox,
         session_id,
         &delivery_invocation_uuid,
         &turn_generation_id,
+        &provider_name,
     ) {
         Ok(prepared) => prepared,
         Err(err) => {
@@ -320,6 +325,7 @@ fn pty_runtime_authority(
                 control_path,
                 delivery_invocation_uuid: generation.spawn_invocation_uuid.clone(),
                 turn_generation_id: generation.generation_id.to_string(),
+                provider_name: generation.provider_name.clone(),
             })
         }
         Ok(SessionGenerationProjection::Multiple(_)) => Err(pty_status(
@@ -347,6 +353,61 @@ fn pty_runtime_authority(
             Some(err.to_string()),
         )),
     }
+}
+
+#[cfg(unix)]
+fn prepare_pty_mailbox_delivery_with_transcript_reconciliation(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+    delivery_invocation_uuid: &str,
+    turn_generation_id: &str,
+    provider_name: &str,
+) -> Result<Option<PreparedPtyMailboxDelivery>, String> {
+    let prepared = prepare_pty_mailbox_delivery(
+        mailbox,
+        session_id,
+        delivery_invocation_uuid,
+        turn_generation_id,
+    );
+    let uncertain_attempt_id = match &prepared {
+        Ok(Some(prepared))
+            if mailbox.delivery_attempt_submission_started(&prepared.attempt_id)? =>
+        {
+            Some(prepared.attempt_id.as_str())
+        }
+        Err(error) => error.strip_prefix("mailbox_delivery_submission_uncertain:"),
+        _ => None,
+    };
+    let Some(attempt_id) = uncertain_attempt_id else {
+        return prepared;
+    };
+    match reconcile_transcript_confirmed_pty_attempt(mailbox, session_id, provider_name, attempt_id)
+    {
+        Ok(true) => prepare_pty_mailbox_delivery(
+            mailbox,
+            session_id,
+            delivery_invocation_uuid,
+            turn_generation_id,
+        ),
+        Ok(false) => Err(format!(
+            "mailbox_delivery_submission_uncertain:{attempt_id}"
+        )),
+        Err(error) => Err(format!(
+            "mailbox_delivery_submission_uncertain:{attempt_id}; transcript reconciliation failed: {error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn reconcile_transcript_confirmed_pty_attempt(
+    _mailbox: &mut MailboxDb,
+    _session_id: &str,
+    _provider_name: &str,
+    _attempt_id: &str,
+) -> Result<bool, String> {
+    // Historical body substrings are not proof that this delivery attempt was
+    // accepted. Keep the attempt pending until bounded post-anchor evidence exists.
+    Ok(false)
 }
 
 #[cfg(unix)]
@@ -632,12 +693,34 @@ fn reconcile_pty_transport_evidence(
     }
     if !matched {
         let attempt_id = only_attempt_id.expect("an exact obligation was requested");
-        let obligation = mailbox
-            .delivery_evidence_obligation(attempt_id)?
-            .ok_or_else(|| format!("Mailbox evidence obligation {attempt_id} is missing"))?;
-        verify_exact_pty_transport_evidence(&obligation)?;
+        match mailbox.delivery_evidence_obligation(attempt_id)? {
+            Some(obligation) => verify_exact_pty_transport_evidence(&obligation)?,
+            None => verify_retained_pty_transport_evidence(session_id, attempt_id)?,
+        }
     }
     Ok(())
+}
+
+fn verify_retained_pty_transport_evidence(
+    session_id: &str,
+    attempt_id: &str,
+) -> Result<(), String> {
+    let state = StateDb::open_default()?;
+    let evidence_id = format!("pty_transport_ack:{attempt_id}");
+    let evidence = state
+        .delivery_evidence(&evidence_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Mailbox evidence obligation {attempt_id} is missing"))?;
+    if evidence.kind == DeliveryEvidenceKind::PtyTransportAck
+        && evidence.delivery_id == attempt_id
+        && evidence.session_id == session_id
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Retained State evidence for mailbox attempt {attempt_id} conflicts with its exact identity"
+        ))
+    }
 }
 
 fn reconcile_pty_transport_evidence_obligation(
@@ -705,11 +788,19 @@ fn delivery_evidence_identity_matches(
 pub(crate) static DATA_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-fn evidence_clear_barrier_slot()
--> &'static std::sync::Mutex<Option<(String, std::sync::Arc<std::sync::Barrier>)>> {
-    static SLOT: std::sync::OnceLock<
-        std::sync::Mutex<Option<(String, std::sync::Arc<std::sync::Barrier>)>>,
-    > = std::sync::OnceLock::new();
+type EvidenceClearBarrier = Option<(String, std::sync::Arc<std::sync::Barrier>)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static EVIDENCE_CLEAR_BARRIER_REACHED: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+fn evidence_clear_barrier_slot() -> &'static std::sync::Mutex<EvidenceClearBarrier> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<EvidenceClearBarrier>> =
+        std::sync::OnceLock::new();
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
@@ -722,8 +813,19 @@ fn wait_at_evidence_clear_barrier_for_test(attempt_id: &str) {
         .filter(|(expected_attempt_id, _)| expected_attempt_id == attempt_id)
         .map(|(_, barrier)| std::sync::Arc::clone(barrier));
     if let Some(barrier) = barrier {
+        EVIDENCE_CLEAR_BARRIER_REACHED.set(true);
         barrier.wait();
     }
+}
+
+#[cfg(test)]
+fn reset_evidence_clear_barrier_reached() {
+    EVIDENCE_CLEAR_BARRIER_REACHED.set(false);
+}
+
+#[cfg(test)]
+fn evidence_clear_barrier_was_reached() -> bool {
+    EVIDENCE_CLEAR_BARRIER_REACHED.get()
 }
 
 #[cfg(not(test))]
@@ -851,6 +953,7 @@ pub(crate) fn trace_notify_enabled() -> bool {
     )
 }
 
+#[cfg(unix)]
 fn trace_notify_pty_attempt(
     trigger: &str,
     session_id: &str,
@@ -873,6 +976,7 @@ fn trace_notify_pty_attempt(
     }
 }
 
+#[cfg(unix)]
 fn notify_trace_base_decision(diagnostic: &PtyMailboxDeliveryDiagnostic) -> &'static str {
     if diagnostic.submitted {
         "inject"
@@ -881,6 +985,7 @@ fn notify_trace_base_decision(diagnostic: &PtyMailboxDeliveryDiagnostic) -> &'st
     }
 }
 
+#[cfg(unix)]
 fn notify_trace_status(diagnostic: &PtyMailboxDeliveryDiagnostic) -> &str {
     if diagnostic.status == "stale_generation" {
         "connect_error"
@@ -889,6 +994,7 @@ fn notify_trace_status(diagnostic: &PtyMailboxDeliveryDiagnostic) -> &str {
     }
 }
 
+#[cfg(unix)]
 fn notify_trace_control_path_present(diagnostic: &PtyMailboxDeliveryDiagnostic) -> bool {
     diagnostic
         .control_path
@@ -896,12 +1002,14 @@ fn notify_trace_control_path_present(diagnostic: &PtyMailboxDeliveryDiagnostic) 
         .is_some_and(|path| !path.is_empty())
 }
 
+#[cfg(unix)]
 fn notify_trace_remaining_pending(diagnostic: &PtyMailboxDeliveryDiagnostic) -> String {
     diagnostic
         .remaining_pending
         .map_or_else(|| "unknown".to_string(), |value| value.to_string())
 }
 
+#[cfg(unix)]
 fn notify_trace_message(diagnostic: &PtyMailboxDeliveryDiagnostic) -> String {
     diagnostic
         .message
@@ -910,6 +1018,7 @@ fn notify_trace_message(diagnostic: &PtyMailboxDeliveryDiagnostic) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+#[cfg(unix)]
 fn format_notify_trace_record(
     trigger: &str,
     session_id: &str,
@@ -940,14 +1049,17 @@ fn format_notify_trace_record(
     )
 }
 
+#[cfg(unix)]
 fn emit_notify_trace_record(record: &str) {
     eprintln!("{}", format_notify_trace_output(record));
 }
 
+#[cfg(unix)]
 fn format_notify_trace_output(record: &str) -> String {
     format!("oulipoly_notify_trace {record}")
 }
 
+#[cfg(unix)]
 fn notify_trace_summary_reason(status: &str) -> &'static str {
     match status {
         "acked" | "mark_delivered_error" => "control_ack",
@@ -962,30 +1074,86 @@ pub(crate) fn prepare_headless_resume_delivery(
     resolved: &oulipoly_state::ResolvedResume,
     answer: Option<String>,
     models_dir: Option<&Path>,
+    submitted_seq: Option<i64>,
 ) -> Result<PreparedMailboxDelivery, String> {
     let session_id = delivery_session_id(resolved);
     let Some(mut db) = open_mailbox_sidecar()? else {
+        if submitted_seq.is_some() {
+            return Err("explicit resume input mailbox missing; no launch".to_string());
+        }
         return Ok(empty_delivery(answer, session_id));
     };
     record_headless_session_metadata(&mut db, resolved, models_dir)?;
-    if db.notifications_paused(&session_id)? {
-        return Ok(empty_delivery(answer, session_id));
+    let state = StateDb::open_default()?;
+    reconcile_confirmed_headless_deliveries_on(&mut db, &state, &session_id)?;
+    prepare_headless_resume_delivery_on(
+        &mut db,
+        &session_id,
+        &resolved.chain_id,
+        answer,
+        submitted_seq,
+    )
+}
+
+pub(crate) fn prepare_headless_resume_delivery_on(
+    db: &mut MailboxDb,
+    session_id: &str,
+    chain_id: &str,
+    answer: Option<String>,
+    submitted_seq: Option<i64>,
+) -> Result<PreparedMailboxDelivery, String> {
+    // A submission receipt is authority for this exact input, never for the
+    // paused notification backlog. Use the normal nonce/ACK delivery path.
+    if let Some(seq) = submitted_seq {
+        if answer.is_some() {
+            return Err("explicit resume input cannot also have an inline copy; no launch".into());
+        }
+        let row = load_pending_mailbox_rows(db, session_id, Some(chain_id))?
+            .into_iter()
+            .find(|row| {
+                row.seq == seq
+                    && row.kind == SUBMITTED_INPUT_KIND
+                    && mailbox_row_is_deliverable_pending(row)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "explicit resume input {seq} is not pending for the resolved target; no launch"
+                )
+            })?;
+        verify_pending_mailbox_payloads(db, std::slice::from_ref(&row))?;
+        return delivery_for_batch(
+            db,
+            session_id.to_string(),
+            Some(chain_id),
+            MailboxBatch {
+                rows: vec![row],
+                remaining_count: 0,
+            },
+            None,
+            true,
+        );
     }
-    let pending = pending_mailbox_rows(&db, &session_id, Some(&resolved.chain_id))?;
-    delivery_for_pending(session_id, pending, answer)
+    if db.notifications_paused(session_id)? {
+        return Ok(empty_delivery(answer, session_id.to_string()));
+    }
+    let pending = pending_mailbox_rows(db, session_id, Some(chain_id))?;
+    delivery_for_pending(db, session_id.to_string(), Some(chain_id), pending, answer)
 }
 
 pub(crate) fn deliverable_pending_count(session_id: &str) -> Result<usize, String> {
-    let Some(db) = open_mailbox_sidecar()? else {
+    let Some(mut db) = open_mailbox_sidecar()? else {
         return Ok(0);
     };
-    deliverable_pending_count_on(&db, session_id)
+    let state = StateDb::open_default()?;
+    deliverable_pending_count_on(&mut db, &state, session_id)
 }
 
 pub(crate) fn deliverable_pending_count_on(
-    db: &MailboxDb,
+    db: &mut MailboxDb,
+    state: &StateDb,
     session_id: &str,
 ) -> Result<usize, String> {
+    reconcile_confirmed_headless_deliveries_on(db, state, session_id)?;
     if notifications_paused_on(db, session_id)? {
         return Ok(0);
     }
@@ -1042,7 +1210,9 @@ fn deliverable_pending_rows(rows: Vec<MailboxRow>) -> Vec<MailboxRow> {
 }
 
 fn delivery_for_pending(
+    db: &mut MailboxDb,
     session_id: String,
+    chain_id: Option<&str>,
     pending: Vec<MailboxRow>,
     answer: Option<String>,
 ) -> Result<PreparedMailboxDelivery, String> {
@@ -1051,7 +1221,7 @@ fn delivery_for_pending(
     }
 
     let batch = select_batch(&pending);
-    delivery_for_batch(session_id, batch, answer)
+    delivery_for_batch(db, session_id, chain_id, batch, answer, false)
 }
 
 fn open_mailbox_sidecar() -> Result<Option<MailboxDb>, String> {
@@ -1077,9 +1247,12 @@ fn batch_seqs(batch: &MailboxBatch) -> Vec<i64> {
 }
 
 fn delivery_for_batch(
+    db: &mut MailboxDb,
     session_id: String,
+    chain_id: Option<&str>,
     batch: MailboxBatch,
     answer: Option<String>,
+    explicit_input: bool,
 ) -> Result<PreparedMailboxDelivery, String> {
     let seqs = batch_seqs(&batch);
     let requires_turn_confirmation = batch
@@ -1087,6 +1260,23 @@ fn delivery_for_batch(
         .iter()
         .any(|row| row.kind != SUBMITTED_INPUT_KIND);
     let delivery_nonce = new_delivery_nonce();
+    if explicit_input {
+        db.register_explicit_input_delivery_attempt(
+            &delivery_nonce,
+            &session_id,
+            chain_id,
+            seqs[0],
+        )?;
+    } else {
+        db.register_headless_delivery_attempt(
+            &delivery_nonce,
+            &session_id,
+            chain_id,
+            &delivery_nonce,
+            &seqs,
+            batch.remaining_count,
+        )?;
+    }
     let prefix = render_mailbox_prefix(&batch.rows, batch.remaining_count, &delivery_nonce)?;
     Ok(prepared_delivery(
         session_id,
@@ -1096,6 +1286,74 @@ fn delivery_for_batch(
         delivery_nonce,
         requires_turn_confirmation,
     ))
+}
+
+pub(crate) fn bind_headless_resume_delivery_attempt(
+    session_id: &str,
+    delivery_nonce: Option<&str>,
+    seqs: &[i64],
+    invocation_uuid: &str,
+) -> Result<(), String> {
+    if seqs.is_empty() {
+        return Ok(());
+    }
+    let delivery_nonce = delivery_nonce
+        .ok_or_else(|| "headless mailbox delivery is missing its durable nonce".to_string())?;
+    let Some(mut db) = open_mailbox_sidecar()? else {
+        return Err("mailbox sidecar missing while binding headless delivery".to_string());
+    };
+    db.bind_delivery_attempt_invocation(delivery_nonce, session_id, invocation_uuid)
+}
+
+fn reconcile_confirmed_headless_deliveries_on(
+    db: &mut MailboxDb,
+    state: &StateDb,
+    session_id: &str,
+) -> Result<(), String> {
+    for window in db.unresolved_delivery_attempt_windows(session_id)? {
+        let observation_confirmed = db
+            .delivery_observation_confirmation(&window.attempt_id)?
+            .is_some();
+        if !observation_confirmed {
+            let Some(acknowledgement) = state
+                .acknowledgement(&window.attempt_id)
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            if acknowledgement.confirmed_at.is_none() {
+                continue;
+            }
+            if acknowledgement.session_id != window.session_id
+                || acknowledgement.turn_generation_id != window.delivery_invocation_uuid
+            {
+                return Err(format!(
+                    "Confirmed delivery {} conflicts with its mailbox attempt identity",
+                    window.attempt_id
+                ));
+            }
+        }
+        let seqs = window.rows.iter().map(|row| row.seq).collect::<Vec<_>>();
+        let mut chain_ids = window
+            .rows
+            .iter()
+            .filter(|row| row.target_kind.as_deref() == Some("chain"))
+            .filter_map(|row| row.target_id.as_deref());
+        let chain_id = chain_ids.next();
+        if chain_ids.any(|candidate| Some(candidate) != chain_id) {
+            return Err(format!(
+                "Confirmed mailbox delivery attempt {} spans multiple chains",
+                window.attempt_id
+            ));
+        }
+        db.mark_delivered(
+            &window.session_id,
+            chain_id,
+            &seqs,
+            &window.delivery_invocation_uuid,
+        )?;
+    }
+    Ok(())
 }
 
 fn prepared_delivery(
@@ -1172,7 +1430,6 @@ fn headless_session_metadata_upsert<'a>(
         model_name: resolved.model_name.as_deref(),
         models_dir,
         effective_cwd: None,
-        selected_auto_wake_max: None,
     }
 }
 
@@ -1235,6 +1492,21 @@ fn notification_prefix_len(rows: &[MailboxRow], remaining_count: usize) -> usize
     render_mailbox_prefix(rows, remaining_count, DELIVERY_NONCE_LENGTH_PLACEHOLDER)
         .map(|prefix| prefix.len())
         .unwrap_or_else(|_| MAILBOX_PREFIX_MAX_BYTES.saturating_add(1))
+}
+
+/// Only the exact persisted notification window can reconstruct a legacy
+/// envelope. Appended manual text or changed formatting will not match its hash.
+pub(crate) fn legacy_notification_envelope(
+    window: &oulipoly_state::mailbox::MailboxDeliveryWindow,
+) -> Result<Option<String>, String> {
+    if window
+        .rows
+        .iter()
+        .any(|row| row.kind != oulipoly_state::mailbox::AGENT_BASH_COMPLETE_KIND)
+    {
+        return Ok(None);
+    }
+    render_mailbox_prefix(&window.rows, window.remaining_count, &window.attempt_id).map(Some)
 }
 
 fn render_mailbox_prefix(
@@ -1336,7 +1608,7 @@ fn format_submitted_input(index: usize, row: &MailboxRow, payload: &str) -> Stri
 }
 
 fn new_delivery_nonce() -> String {
-    Uuid::new_v4().to_string()
+    format!("{:x}", Sha256::digest(Uuid::new_v4().as_bytes()))
 }
 
 fn compose_answer(prefix: String, answer: Option<String>) -> String {
@@ -1395,12 +1667,89 @@ mod tests {
     }
 
     #[test]
+    fn persisted_observation_confirmation_settles_headless_delivery_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&directory.path().join("state.db")).unwrap();
+        let mut mailbox = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let EnqueueResult::Inserted(row) = mailbox
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "observation-session",
+                handle: "observation-handle",
+                payload_json: "{}",
+                owner_invocation_uuid: Some("owner-invocation"),
+                matched_os_pid: Some(1),
+                matched_os_boot_id: Some("observation-boot"),
+                matched_os_pid_starttime_ticks: Some(1),
+                matched_chain_index: Some(0),
+                state_dir: "/tmp/state",
+                meta_path: "/tmp/meta",
+                log_path: "/tmp/log",
+                rc_path: "/tmp/rc",
+                rc: 0,
+            })
+            .unwrap()
+        else {
+            panic!("expected inserted mailbox row");
+        };
+        mailbox
+            .register_headless_delivery_attempt(
+                "observation-attempt",
+                "observation-session",
+                None,
+                "delivery-invocation",
+                &[row.seq],
+                0,
+            )
+            .unwrap();
+        mailbox
+            .record_delivery_observation_anchor(
+                "observation-attempt",
+                "observation-session",
+                &oulipoly_state::mailbox::MailboxDeliveryObservationAnchor {
+                    provider_name: "provider".to_string(),
+                    provider_instance_id: "provider-instance".to_string(),
+                    settings_id: "settings".to_string(),
+                    provider_session_id: "observation-session".to_string(),
+                    resume_token: Some("opaque-anchor".to_string()),
+                    expected_sha256: "a".repeat(64),
+                },
+            )
+            .unwrap();
+        mailbox
+            .record_delivery_observation_confirmation("observation-attempt", "user-turn")
+            .unwrap();
+
+        assert_eq!(
+            deliverable_pending_count_on(&mut mailbox, &state, "observation-session").unwrap(),
+            0
+        );
+        assert!(
+            mailbox
+                .list_pending("observation-session")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn notification_prefix_includes_delivery_nonce_near_end() {
         let prefix = render_mailbox_prefix(&[], 0, "nonce-123").unwrap();
 
         assert!(
             prefix.contains("[OULIPOLY-DELIVERY nonce-123]\n[END OULIPOLY NOTIFICATIONS]"),
             "{prefix}"
+        );
+    }
+
+    #[test]
+    fn generated_delivery_nonce_matches_observation_protocol_shape() {
+        let nonce = new_delivery_nonce();
+
+        assert_eq!(nonce.len(), 64);
+        assert!(
+            nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         );
     }
 
@@ -1468,18 +1817,29 @@ mod tests {
         ));
         let mut threads = Vec::new();
         for _ in 0..2 {
-            threads.push(std::thread::spawn(|| {
-                let mut mailbox = MailboxDb::open_default().unwrap();
-                reconcile_pty_transport_evidence(
-                    &mut mailbox,
-                    "session-a",
-                    Some("concurrent-attempt"),
-                )
+            let worker_barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                reset_evidence_clear_barrier_reached();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut mailbox = MailboxDb::open_default()?;
+                    reconcile_pty_transport_evidence(
+                        &mut mailbox,
+                        "session-a",
+                        Some("concurrent-attempt"),
+                    )
+                }));
+                if !evidence_clear_barrier_was_reached() {
+                    worker_barrier.wait();
+                }
+                result
             }));
         }
         let results = threads
             .into_iter()
-            .map(|thread| thread.join().unwrap())
+            .map(|thread| match thread.join().unwrap() {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            })
             .collect::<Vec<_>>();
         *evidence_clear_barrier_slot().lock().unwrap() = None;
 
@@ -1498,6 +1858,22 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        drop(state);
+        drop(mailbox);
+        let sidecar = rusqlite::Connection::open(directory.path().join("pid-identity.db")).unwrap();
+        sidecar
+            .execute_batch(
+                "DELETE FROM mailbox_delivery_attempt_items
+                 WHERE attempt_id = 'concurrent-attempt';
+                 DELETE FROM mailbox_delivery_attempts
+                 WHERE attempt_id = 'concurrent-attempt';",
+            )
+            .unwrap();
+        drop(sidecar);
+
+        let mut mailbox = MailboxDb::open_default().unwrap();
+        reconcile_pty_transport_evidence(&mut mailbox, "session-a", Some("concurrent-attempt"))
+            .unwrap();
     }
 
     #[test]
@@ -1572,6 +1948,8 @@ mod tests {
         let sidecar_path = directory.path().join("pid-identity.db");
         let connection = rusqlite::Connection::open(&sidecar_path).unwrap();
         for column in [
+            "headless_submission_state",
+            "observation_progress",
             "evidence_reconciled_at",
             "evidence_observed_at",
             "evidence_turn_generation_id",
@@ -1725,6 +2103,8 @@ mod tests {
             )
             .unwrap();
         for column in [
+            "headless_submission_state",
+            "observation_progress",
             "evidence_reconciled_at",
             "evidence_observed_at",
             "evidence_turn_generation_id",
@@ -1818,6 +2198,7 @@ mod tests {
         assert_eq!(pty_nack_status("broker_rejected"), "protocol_error");
     }
 
+    #[cfg(unix)]
     #[test]
     fn stale_generation_trace_uses_normalized_connect_error_reason() {
         let diagnostic = PtyMailboxDeliveryDiagnostic {

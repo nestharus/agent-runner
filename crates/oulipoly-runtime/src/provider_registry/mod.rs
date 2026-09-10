@@ -9,16 +9,17 @@ mod options;
 
 use artifact_key::{ArtifactKey, artifact_key};
 use cache::DescribeCache;
-pub(crate) use describe::DescribeHostOptions;
-use describe::{describe_provider, describe_provider_with_cancellation};
+use describe::describe_provider;
+pub(crate) use describe::{DescribeHostOptions, describe_provider_client};
 use oulipoly_config::{
-    ModelConfig, ProviderConfig, ProvidersConfig, derive_provider_name,
-    provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, ProvidersConfig, provider_implementation_ref::ProviderImplementationRef,
 };
-use oulipoly_provider::client::CancellationToken;
+use oulipoly_provider::client::ProviderClient;
 use oulipoly_provider::generated::DescribeResult;
+use oulipoly_provider::resolver::ProviderArtifactRef;
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub use client_factory::ProviderClientFactory;
 pub use conversion::{ArtifactKind, RuntimeProviderArtifact};
@@ -32,7 +33,7 @@ pub use options::ProviderRegistryOptions;
 //   - component: oulipoly-runtime::provider_registry
 //     role: adapter
 //     Translates:
-//       - oulipoly_config::ProviderImplementationRef -> runtime provider artifact inventory
+//       - configured account family/executable authority -> runtime provider artifact inventory
 //       - oulipoly_provider resolver/client/generated/error contracts -> registry result/error types
 //       - artifact-bound provider client API -> model-keyed registry lookup API
 //
@@ -42,7 +43,7 @@ pub use options::ProviderRegistryOptions;
 //   - component: oulipoly-runtime::provider_registry
 //     Domain: host-side provider-contract adaptation
 //     Owns:
-//       - implementation-ref conversion
+//       - account/family endpoint construction
 //       - artifact keying and deduplication
 //       - in-process describe cache
 //       - describe request orchestration and error mapping
@@ -51,9 +52,15 @@ pub use options::ProviderRegistryOptions;
 #[derive(Debug)]
 pub struct ProviderRegistry {
     artifacts: BTreeMap<ArtifactKey, RuntimeProviderArtifact>,
+    account_artifacts: HashMap<String, ArtifactKey>,
+    account_families: HashMap<String, String>,
+    account_settings_ids: HashMap<String, String>,
+    family_artifacts: HashMap<String, FamilyArtifact>,
     model_artifacts: HashMap<String, ArtifactKey>,
     model_provider_artifacts: HashMap<ModelProviderKey, ArtifactKey>,
     cache: DescribeCache,
+    endpoint_cache: Mutex<HashMap<String, Arc<PinnedProviderEndpoint>>>,
+    family_endpoint_cache: Mutex<HashMap<String, Arc<PinnedFamilyEndpoint>>>,
     client_factory: ProviderClientFactory,
     host_options: DescribeHostOptions,
 }
@@ -61,37 +68,140 @@ pub struct ProviderRegistry {
 #[derive(Debug)]
 struct ArtifactInventory {
     artifacts: BTreeMap<ArtifactKey, RuntimeProviderArtifact>,
+    account_artifacts: HashMap<String, ArtifactKey>,
+    account_families: HashMap<String, String>,
+    account_settings_ids: HashMap<String, String>,
+    family_artifacts: HashMap<String, FamilyArtifact>,
     model_artifacts: HashMap<String, ArtifactKey>,
     model_provider_artifacts: HashMap<ModelProviderKey, ArtifactKey>,
 }
 
+#[derive(Debug, Clone)]
+struct FamilyArtifact {
+    account_name: String,
+    artifact_key: ArtifactKey,
+}
+
 type ModelProviderKey = (String, String);
+
+#[derive(Debug)]
+pub struct PinnedProviderEndpoint {
+    account_name: String,
+    family: String,
+    settings_id: Option<String>,
+    client: Arc<ProviderClient>,
+    capabilities: DescribeResult,
+}
+
+#[derive(Debug)]
+pub struct PinnedFamilyEndpoint {
+    family: String,
+    client: Arc<ProviderClient>,
+    capabilities: DescribeResult,
+    host_options: DescribeHostOptions,
+}
+
+impl PinnedProviderEndpoint {
+    pub fn client(&self) -> &ProviderClient {
+        self.client.as_ref()
+    }
+
+    pub fn capabilities(&self) -> &DescribeResult {
+        &self.capabilities
+    }
+
+    pub fn account_name(&self) -> &str {
+        &self.account_name
+    }
+
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    pub fn settings_id(&self) -> Result<&str, ProviderRegistryError> {
+        self.settings_id.as_deref().ok_or_else(|| {
+            ProviderRegistryError::AccountSettingsNotConfigured {
+                account_name: self.account_name.clone(),
+            }
+        })
+    }
+
+    pub fn endpoint_identity(&self) -> Result<oulipoly_state::ProviderLaunchEndpoint, String> {
+        Ok(oulipoly_state::ProviderLaunchEndpoint {
+            endpoint_family: self.family.clone(),
+            settings_id: self.settings_id().map_err(|e| e.to_string())?.into(),
+            provider_instance_id: format!("{}-instance", self.capabilities.provider_id),
+            endpoint_identity_sha256: self.client.pinned_executable_identity_sha256()?,
+        })
+    }
+
+    pub fn canonical_executable(&self) -> &Path {
+        self.client
+            .resolved_executable()
+            .expect("preflighted provider endpoint must retain a resolved executable")
+    }
+}
+
+impl PinnedFamilyEndpoint {
+    pub fn client(&self) -> &ProviderClient {
+        self.client.as_ref()
+    }
+
+    pub fn capabilities(&self) -> &DescribeResult {
+        &self.capabilities
+    }
+
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    pub fn host_options(&self) -> &DescribeHostOptions {
+        &self.host_options
+    }
+
+    pub fn canonical_executable(&self) -> &Path {
+        self.client
+            .resolved_executable()
+            .expect("preflighted family endpoint must retain a resolved executable")
+    }
+}
 
 impl ProviderRegistry {
     pub fn from_model_configs(
         models: &[ModelConfig],
         options: ProviderRegistryOptions,
     ) -> Result<Self, ProviderRegistryError> {
-        let inventory = artifact_inventory(configured_provider_refs(models))?;
+        let mut inventory = artifact_inventory(configured_provider_refs(models))?;
+        for model in models {
+            if let Some(model_key) = inventory.model_artifacts.get(&model.name).cloned() {
+                add_model_provider_artifact_keys(&mut inventory, model, model_key);
+            }
+        }
         Ok(Self::from_inventory(inventory, options))
     }
 
-    pub fn from_model_configs_with_provider_config(
+    pub fn from_configs(
         models: &[ModelConfig],
         providers: &ProvidersConfig,
         options: ProviderRegistryOptions,
     ) -> Result<Self, ProviderRegistryError> {
-        let mut inventory = artifact_inventory(configured_provider_refs(models))?;
-        add_provider_instance_artifacts(&mut inventory, models, providers)?;
+        let mut inventory = account_artifact_inventory(providers)?;
+        add_model_account_artifact_keys(&mut inventory, models);
         Ok(Self::from_inventory(inventory, options))
     }
 
     fn from_inventory(inventory: ArtifactInventory, options: ProviderRegistryOptions) -> Self {
         Self {
             artifacts: inventory.artifacts,
+            account_artifacts: inventory.account_artifacts,
+            account_families: inventory.account_families,
+            account_settings_ids: inventory.account_settings_ids,
+            family_artifacts: inventory.family_artifacts,
             model_artifacts: inventory.model_artifacts,
             model_provider_artifacts: inventory.model_provider_artifacts,
             cache: DescribeCache::default(),
+            endpoint_cache: Mutex::new(HashMap::new()),
+            family_endpoint_cache: Mutex::new(HashMap::new()),
             client_factory: ProviderClientFactory::new(options.client),
             host_options: DescribeHostOptions {
                 config_root: options.config_root,
@@ -103,9 +213,15 @@ impl ProviderRegistry {
     pub fn empty(options: ProviderRegistryOptions) -> Self {
         Self {
             artifacts: BTreeMap::new(),
+            account_artifacts: HashMap::new(),
+            account_families: HashMap::new(),
+            account_settings_ids: HashMap::new(),
+            family_artifacts: HashMap::new(),
             model_artifacts: HashMap::new(),
             model_provider_artifacts: HashMap::new(),
             cache: DescribeCache::default(),
+            endpoint_cache: Mutex::new(HashMap::new()),
+            family_endpoint_cache: Mutex::new(HashMap::new()),
             client_factory: ProviderClientFactory::new(options.client),
             host_options: DescribeHostOptions {
                 config_root: options.config_root,
@@ -122,6 +238,41 @@ impl ProviderRegistry {
 
     pub fn configured_artifact_keys(&self) -> Vec<ArtifactKey> {
         self.artifacts.keys().cloned().collect()
+    }
+
+    pub fn configured_account_names(&self) -> Vec<String> {
+        let mut names = self.account_artifacts.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    pub fn artifact_key_for_account(&self, account_name: &str) -> Option<ArtifactKey> {
+        self.account_artifacts.get(account_name).cloned()
+    }
+
+    pub fn has_account_endpoint(&self, account_name: &str) -> bool {
+        self.account_artifacts.contains_key(account_name)
+    }
+
+    pub fn account_settings_id(&self, account_name: &str) -> Result<&str, ProviderRegistryError> {
+        self.account_settings_ids
+            .get(account_name)
+            .map(String::as_str)
+            .ok_or_else(|| ProviderRegistryError::AccountSettingsNotConfigured {
+                account_name: account_name.to_string(),
+            })
+    }
+
+    pub fn configured_family_names(&self) -> Vec<String> {
+        let mut names = self.family_artifacts.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    pub fn artifact_key_for_family(&self, family: &str) -> Option<ArtifactKey> {
+        self.family_artifacts
+            .get(family)
+            .map(|entry| entry.artifact_key.clone())
     }
 
     pub fn artifact_key_for_model(&self, model_name: &str) -> Option<ArtifactKey> {
@@ -151,6 +302,10 @@ impl ProviderRegistry {
             return Some(model_name.to_string());
         }
 
+        self.resolve_model_name_for_provider(provider_name)
+    }
+
+    pub fn resolve_model_name_for_provider(&self, provider_name: &str) -> Option<String> {
         let mut candidates = self
             .model_provider_artifacts
             .iter()
@@ -199,18 +354,125 @@ impl ProviderRegistry {
         self.describe_uncached_model_artifact(model_name, &key)
     }
 
-    pub(crate) fn describe_model_provider_instance_with_cancellation(
+    pub fn preflight_account(
         &self,
-        model_name: &str,
-        provider_name: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<DescribeResult, ProviderRegistryError> {
-        let key = self.lookup_model_provider_artifact_key(model_name, provider_name)?;
-        if let Some(result) = self.cached_describe(&key) {
-            return Ok(result);
-        }
+        account_name: &str,
+    ) -> Result<Arc<PinnedProviderEndpoint>, ProviderRegistryError> {
+        self.preflight_account_with_custody(account_name, None)
+    }
 
-        self.describe_uncached_model_artifact_with_cancellation(model_name, &key, cancellation)
+    pub(crate) fn preflight_account_with_custody(
+        &self,
+        account_name: &str,
+        custody: Option<oulipoly_provider::custody::AttemptActorCustody>,
+    ) -> Result<Arc<PinnedProviderEndpoint>, ProviderRegistryError> {
+        let mut endpoints = self
+            .endpoint_cache
+            .lock()
+            .expect("provider endpoint cache mutex should not be poisoned");
+        if let Some(endpoint) = endpoints.get(account_name) {
+            if let Some(custody) = &custody {
+                custody.record_not_invoked("describe");
+            }
+            return Ok(endpoint.clone());
+        }
+        let key = self.lookup_account_artifact_key(account_name)?;
+        let artifact = match self.lookup_artifact(account_name, &key)? {
+            RuntimeProviderArtifact::Enabled(artifact) => artifact,
+            RuntimeProviderArtifact::RuntimeDisabled(artifact) => {
+                return Err(ProviderRegistryError::RuntimeDisabledArtifact {
+                    kind: "runtime_disabled".to_string(),
+                    artifact,
+                });
+            }
+        };
+        let client = Arc::new(self.client_factory.client_for_attempt(artifact, custody));
+        let capabilities = describe_provider_client(client.as_ref(), &self.host_options)?;
+        self.store_describe(&key, capabilities.clone());
+        let client = Arc::new(
+            client
+                .fork_from_pinned(self.client_factory.base_options())
+                .map_err(|source| ProviderRegistryError::ProviderTransport {
+                    kind: source.transport_kind().into(),
+                    source: Box::new(source),
+                })?,
+        );
+        let endpoint = Arc::new(PinnedProviderEndpoint {
+            account_name: account_name.to_string(),
+            family: self
+                .account_families
+                .get(account_name)
+                .cloned()
+                .expect("configured account endpoint must retain its family"),
+            settings_id: self.account_settings_ids.get(account_name).cloned(),
+            client,
+            capabilities,
+        });
+        endpoints.insert(account_name.to_string(), endpoint.clone());
+        Ok(endpoint)
+    }
+
+    pub fn preflight_family(
+        &self,
+        family: &str,
+    ) -> Result<Arc<PinnedFamilyEndpoint>, ProviderRegistryError> {
+        let mut endpoints = self
+            .family_endpoint_cache
+            .lock()
+            .expect("provider family endpoint cache mutex should not be poisoned");
+        if let Some(endpoint) = endpoints.get(family) {
+            return Ok(endpoint.clone());
+        }
+        let key = self
+            .family_artifacts
+            .get(family)
+            .map(|entry| entry.artifact_key.clone())
+            .ok_or_else(
+                || ProviderRegistryError::FamilyImplementationNotConfigured {
+                    family: family.to_string(),
+                },
+            )?;
+        let artifact = enabled_artifact(
+            self.lookup_artifact(family, &key)?,
+            "family bootstrap endpoint",
+        )?;
+        let endpoint =
+            preflight_family_endpoint(family, artifact, &self.client_factory, &self.host_options)?;
+        self.store_describe(&key, endpoint.capabilities().clone());
+        endpoints.insert(family.to_string(), endpoint.clone());
+        Ok(endpoint)
+    }
+
+    pub fn preflight_bootstrap_family(
+        family: &str,
+        artifact: ProviderArtifactRef,
+        options: ProviderRegistryOptions,
+    ) -> Result<Arc<PinnedFamilyEndpoint>, ProviderRegistryError> {
+        if family.trim().is_empty() {
+            return Err(ProviderRegistryError::FamilyImplementationNotConfigured {
+                family: family.to_string(),
+            });
+        }
+        let host_options = DescribeHostOptions {
+            config_root: options.config_root,
+            data_root: options.data_root,
+        };
+        let factory = ProviderClientFactory::new(options.client);
+        preflight_family_endpoint(family, artifact, &factory, &host_options)
+    }
+
+    fn lookup_account_artifact_key(
+        &self,
+        account_name: &str,
+    ) -> Result<ArtifactKey, ProviderRegistryError> {
+        self.account_artifacts
+            .get(account_name)
+            .cloned()
+            .ok_or_else(
+                || ProviderRegistryError::AccountImplementationNotConfigured {
+                    account_name: account_name.to_string(),
+                },
+            )
     }
 
     fn lookup_artifact_key(&self, model_name: &str) -> Result<ArtifactKey, ProviderRegistryError> {
@@ -233,39 +495,6 @@ impl ProviderRegistry {
             })
     }
 
-    pub(crate) fn enabled_artifact_for_model(
-        &self,
-        model_name: &str,
-    ) -> Result<oulipoly_provider::resolver::ProviderArtifactRef, ProviderRegistryError> {
-        let key = self.lookup_artifact_key(model_name)?;
-        match self.lookup_artifact(model_name, &key)? {
-            RuntimeProviderArtifact::Enabled(artifact) => Ok(artifact),
-            RuntimeProviderArtifact::RuntimeDisabled(artifact) => {
-                Err(ProviderRegistryError::RuntimeDisabledArtifact {
-                    kind: "runtime_disabled".to_string(),
-                    artifact,
-                })
-            }
-        }
-    }
-
-    pub(crate) fn enabled_artifact_for_model_provider(
-        &self,
-        model_name: &str,
-        provider_name: &str,
-    ) -> Result<oulipoly_provider::resolver::ProviderArtifactRef, ProviderRegistryError> {
-        let key = self.lookup_model_provider_artifact_key(model_name, provider_name)?;
-        match self.lookup_artifact(model_name, &key)? {
-            RuntimeProviderArtifact::Enabled(artifact) => Ok(artifact),
-            RuntimeProviderArtifact::RuntimeDisabled(artifact) => {
-                Err(ProviderRegistryError::RuntimeDisabledArtifact {
-                    kind: "runtime_disabled".to_string(),
-                    artifact,
-                })
-            }
-        }
-    }
-
     pub(crate) fn client_factory(&self) -> &ProviderClientFactory {
         &self.client_factory
     }
@@ -283,35 +512,9 @@ impl ProviderRegistry {
         model_name: &str,
         key: &ArtifactKey,
     ) -> Result<DescribeResult, ProviderRegistryError> {
-        self.describe_uncached_model_artifact_inner(model_name, key, None)
-    }
-
-    fn describe_uncached_model_artifact_with_cancellation(
-        &self,
-        model_name: &str,
-        key: &ArtifactKey,
-        cancellation: &CancellationToken,
-    ) -> Result<DescribeResult, ProviderRegistryError> {
-        self.describe_uncached_model_artifact_inner(model_name, key, Some(cancellation))
-    }
-
-    fn describe_uncached_model_artifact_inner(
-        &self,
-        model_name: &str,
-        key: &ArtifactKey,
-        cancellation: Option<&CancellationToken>,
-    ) -> Result<DescribeResult, ProviderRegistryError> {
         match self.lookup_artifact(model_name, key)? {
             RuntimeProviderArtifact::Enabled(artifact) => {
-                let result = match cancellation {
-                    Some(cancellation) => describe_provider_with_cancellation(
-                        &self.client_factory,
-                        artifact,
-                        &self.host_options,
-                        cancellation,
-                    ),
-                    None => describe_provider(&self.client_factory, artifact, &self.host_options),
-                }?;
+                let result = describe_provider(&self.client_factory, artifact, &self.host_options)?;
                 self.store_describe(key, result.clone());
                 Ok(result)
             }
@@ -341,6 +544,37 @@ impl ProviderRegistry {
     }
 }
 
+fn preflight_family_endpoint(
+    family: &str,
+    artifact: ProviderArtifactRef,
+    factory: &ProviderClientFactory,
+    host_options: &DescribeHostOptions,
+) -> Result<Arc<PinnedFamilyEndpoint>, ProviderRegistryError> {
+    let client = Arc::new(factory.client_for(artifact));
+    let capabilities = describe_provider_client(client.as_ref(), host_options)?;
+    Ok(Arc::new(PinnedFamilyEndpoint {
+        family: family.to_string(),
+        client,
+        capabilities,
+        host_options: host_options.clone(),
+    }))
+}
+
+fn enabled_artifact(
+    artifact: RuntimeProviderArtifact,
+    kind: &str,
+) -> Result<ProviderArtifactRef, ProviderRegistryError> {
+    match artifact {
+        RuntimeProviderArtifact::Enabled(artifact) => Ok(artifact),
+        RuntimeProviderArtifact::RuntimeDisabled(artifact) => {
+            Err(ProviderRegistryError::RuntimeDisabledArtifact {
+                kind: kind.to_string(),
+                artifact,
+            })
+        }
+    }
+}
+
 fn configured_provider_refs(
     models: &[ModelConfig],
 ) -> impl Iterator<Item = (&str, &ProviderImplementationRef)> {
@@ -367,24 +601,73 @@ fn artifact_inventory<'a>(
 
     Ok(ArtifactInventory {
         artifacts,
+        account_artifacts: HashMap::new(),
+        account_families: HashMap::new(),
+        account_settings_ids: HashMap::new(),
+        family_artifacts: HashMap::new(),
         model_artifacts,
         model_provider_artifacts: HashMap::new(),
     })
 }
 
-fn add_provider_instance_artifacts(
-    inventory: &mut ArtifactInventory,
-    models: &[ModelConfig],
-    providers: &ProvidersConfig,
-) -> Result<(), ProviderRegistryError> {
-    for model in models {
-        if let Some(model_key) = inventory.model_artifacts.get(&model.name).cloned() {
-            add_model_provider_artifact_keys(inventory, model, model_key);
-            continue;
-        }
-        add_provider_config_artifacts(inventory, model, providers)?;
+fn empty_artifact_inventory() -> ArtifactInventory {
+    ArtifactInventory {
+        artifacts: BTreeMap::new(),
+        account_artifacts: HashMap::new(),
+        account_families: HashMap::new(),
+        account_settings_ids: HashMap::new(),
+        family_artifacts: HashMap::new(),
+        model_artifacts: HashMap::new(),
+        model_provider_artifacts: HashMap::new(),
     }
-    Ok(())
+}
+
+fn account_artifact_inventory(
+    providers: &ProvidersConfig,
+) -> Result<ArtifactInventory, ProviderRegistryError> {
+    let mut inventory = empty_artifact_inventory();
+    let mut account_names = providers.entries.keys().collect::<Vec<_>>();
+    account_names.sort();
+    for account_name in account_names {
+        let entry = providers
+            .get(account_name)
+            .expect("provider account name came from the same config");
+        let implementation = entry.implementation.as_ref().ok_or_else(|| {
+            ProviderRegistryError::AccountImplementationNotConfigured {
+                account_name: account_name.clone(),
+            }
+        })?;
+        let artifact = RuntimeProviderArtifact::Enabled(ProviderArtifactRef::Path {
+            path: PathBuf::from(&implementation.executable),
+        });
+        let key = artifact_key(&artifact);
+        validate_family_artifact(
+            &inventory.family_artifacts,
+            &implementation.family,
+            account_name,
+            &key,
+        )?;
+        inventory.artifacts.entry(key.clone()).or_insert(artifact);
+        inventory
+            .account_artifacts
+            .insert(account_name.clone(), key.clone());
+        inventory
+            .account_families
+            .insert(account_name.clone(), implementation.family.clone());
+        if let Some(settings_id) = &entry.settings_id {
+            inventory
+                .account_settings_ids
+                .insert(account_name.clone(), settings_id.clone());
+        }
+        inventory
+            .family_artifacts
+            .entry(implementation.family.clone())
+            .or_insert_with(|| FamilyArtifact {
+                account_name: account_name.clone(),
+                artifact_key: key,
+            });
+    }
+    Ok(inventory)
 }
 
 fn add_model_provider_artifact_keys(
@@ -400,92 +683,47 @@ fn add_model_provider_artifact_keys(
     }
 }
 
-fn add_provider_config_artifacts(
-    inventory: &mut ArtifactInventory,
-    model: &ModelConfig,
-    providers: &ProvidersConfig,
+fn add_model_account_artifact_keys(inventory: &mut ArtifactInventory, models: &[ModelConfig]) {
+    for model in models {
+        let mut shared_model_key = None;
+        let mut complete_model_mapping = !model.providers.is_empty();
+        for provider in &model.providers {
+            let Some(key) = inventory.account_artifacts.get(&provider.name).cloned() else {
+                complete_model_mapping = false;
+                continue;
+            };
+            inventory
+                .model_provider_artifacts
+                .insert(model_provider_key(&model.name, &provider.name), key.clone());
+            match shared_model_key.as_ref() {
+                None => shared_model_key = Some(key),
+                Some(existing) if existing == &key => {}
+                Some(_) => complete_model_mapping = false,
+            }
+        }
+        if complete_model_mapping && let Some(key) = shared_model_key {
+            inventory.model_artifacts.insert(model.name.clone(), key);
+        }
+    }
+}
+
+fn validate_family_artifact(
+    families: &HashMap<String, FamilyArtifact>,
+    family: &str,
+    account_name: &str,
+    artifact_key: &str,
 ) -> Result<(), ProviderRegistryError> {
-    for provider in &model.providers {
-        let Ok((effective, _)) = providers.effective_provider(provider) else {
-            continue;
-        };
-        let Some(provider_ref) = provider_ref_from_effective_provider(&effective) else {
-            continue;
-        };
-        let artifact = ProviderRegistry::convert_ref(&provider_ref)?;
-        let key = artifact_key(&artifact);
-        inventory.artifacts.entry(key.clone()).or_insert(artifact);
-        inventory
-            .model_provider_artifacts
-            .insert(model_provider_key(&model.name, &provider.name), key);
+    let Some(existing) = families.get(family) else {
+        return Ok(());
+    };
+    if existing.artifact_key == artifact_key {
+        return Ok(());
     }
-    Ok(())
-}
-
-fn provider_ref_from_effective_provider(
-    provider: &ProviderConfig,
-) -> Option<ProviderImplementationRef> {
-    let executable = derive_provider_name(&provider.command, &provider.args);
-    let executable = executable.trim();
-    if executable.is_empty() {
-        return None;
-    }
-    Some(if path_like_executable(executable) {
-        path_provider_ref(executable)
-    } else if is_external_provider_binary(executable) {
-        binary_provider_ref(executable)
-    } else {
-        binary_provider_ref(&session_provider_binary_name(executable))
+    Err(ProviderRegistryError::FamilyImplementationConflict {
+        family: family.to_string(),
+        first_account: existing.account_name.clone(),
+        second_account: account_name.to_string(),
     })
-}
-
-fn is_external_provider_binary(executable: &str) -> bool {
-    executable_basename(executable).starts_with("agent-runner-")
-}
-
-fn session_provider_binary_name(executable: &str) -> String {
-    format!("agent-runner-{}", provider_family_token(executable))
-}
-
-fn provider_family_token(executable: &str) -> String {
-    let basename = executable_basename(executable);
-    let trimmed = basename
-        .trim_end_matches(|ch: char| ch.is_ascii_digit())
-        .trim_end_matches(['-', '_']);
-    if trimmed.is_empty() {
-        basename.to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn executable_basename(executable: &str) -> &str {
-    executable.rsplit(['/', '\\']).next().unwrap_or(executable)
-}
-
-fn path_like_executable(executable: &str) -> bool {
-    let path = Path::new(executable);
-    path.is_absolute() || executable.contains('/') || executable.contains('\\')
-}
-
-fn path_provider_ref(path: &str) -> ProviderImplementationRef {
-    ProviderImplementationRef {
-        path: Some(path.to_string()),
-        crate_name: None,
-        version: None,
-        binary: None,
-        script: None,
-    }
-}
-
-fn binary_provider_ref(binary: &str) -> ProviderImplementationRef {
-    ProviderImplementationRef {
-        path: None,
-        crate_name: None,
-        version: None,
-        binary: Some(binary.to_string()),
-        script: None,
-    }
 }
 
 fn model_provider_key(model_name: &str, provider_name: &str) -> ModelProviderKey {

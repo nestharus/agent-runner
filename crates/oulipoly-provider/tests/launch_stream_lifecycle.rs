@@ -65,7 +65,11 @@ fn launch_timeout_cleans_descendants_and_preserves_stderr_diagnostics() {
         .expect_err("launch timeout should fail");
 
     assert_eq!(error.transport_kind(), "host_timeout");
-    assert_eq!(error.request_id(), Some(REQUEST_ID));
+    assert_eq!(
+        error.request_id(),
+        None,
+        "host timeout has no response envelope"
+    );
     assert!(error.diagnostics().stderr.captured_len <= error.diagnostics().stderr.limit);
     leak_probe.assert_no_descendants();
 }
@@ -107,7 +111,11 @@ fn launch_heartbeat_gap_timeout_kills_process_tree_after_stream_stalls() {
         .expect_err("stalled launch stream should hit the heartbeat gap timeout");
 
     assert_eq!(error.transport_kind(), "host_timeout");
-    assert_eq!(error.request_id(), Some(REQUEST_ID));
+    assert_eq!(
+        error.request_id(),
+        None,
+        "host timeout has no response envelope"
+    );
     leak_probe.assert_no_descendants();
 }
 
@@ -119,7 +127,7 @@ fn launch_client(
         ProviderArtifactRef::Path { path: path.into() },
         ProviderClientOptions::default()
             .with_timeout(Duration::from_secs(5))
-            .with_kill_after_grace(Duration::from_millis(25))
+            .with_kill_after_grace(Duration::from_millis(200))
             .with_cancellation(cancellation),
     )
 }

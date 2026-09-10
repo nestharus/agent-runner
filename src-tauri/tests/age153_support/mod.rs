@@ -1,6 +1,9 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
+#[path = "../provider_authority_fixture.rs"]
+mod provider_authority_fixture;
+
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value};
@@ -72,7 +75,11 @@ impl Age153Fixture {
     }
 
     fn write_providers_toml(&self, body: &str) {
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(body),
+        )
+        .unwrap();
     }
 
     fn write_provider_command_scripts<'a>(
@@ -366,7 +373,26 @@ impl Age153Fixture {
         self.stage_active_provider_session_jsonl(provider);
     }
 
+    pub fn stage_active_session_jsonl(&self, provider: &str) {
+        self.stage_active_provider_session_jsonl(provider);
+    }
+
     pub fn seed_active_chain(&self, provider: &str, model: &str) {
+        self.seed_active_chain_with_authority(
+            provider,
+            model,
+            provider_authority_fixture::FIXTURE_PROVIDER_INSTANCE_ID,
+            provider,
+        );
+    }
+
+    pub fn seed_active_chain_with_authority(
+        &self,
+        provider: &str,
+        model: &str,
+        instance: &str,
+        settings: &str,
+    ) {
         let conn = self.conn();
         conn.execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
@@ -381,6 +407,14 @@ impl Age153Fixture {
             params![CHAIN_ID, provider, SESSION_ID],
         )
         .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd_at(
+            &conn,
+            provider,
+            SESSION_ID,
+            instance,
+            settings,
+            self.dir.path(),
+        );
     }
 
     pub fn run_one_shot(&self, model_name: &str) -> Output {
@@ -433,8 +467,12 @@ impl Age153Fixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env("HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_CONFIG_HOME");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
     }
@@ -756,25 +794,25 @@ pub fn assert_no_terminal_marker_on_stdout(output: &Output) {
     );
 }
 
-pub fn assert_result_envelope_shape(stdout: &str) -> Value {
-    let line = single_result_envelope_line(stdout);
+pub fn assert_result_envelope_shape(stream: &str) -> Value {
+    let line = single_result_envelope_line(stream);
     let value = parse_result_envelope_line(line);
     assert_result_envelope_value_shape(&value);
     value
 }
 
-fn single_result_envelope_line(stdout: &str) -> &str {
-    let lines = result_envelope_lines(stdout);
+fn single_result_envelope_line(stream: &str) -> &str {
+    let lines = result_envelope_lines(stream);
     assert_eq!(
         lines.len(),
         1,
-        "stdout must contain one result envelope:\n{stdout}"
+        "stream must contain one result envelope:\n{stream}"
     );
     lines[0]
 }
 
-fn result_envelope_lines(stdout: &str) -> Vec<&str> {
-    stdout
+fn result_envelope_lines(stream: &str) -> Vec<&str> {
+    stream
         .lines()
         .filter(|line| line.starts_with("OULIPOLY_RESULT="))
         .collect()

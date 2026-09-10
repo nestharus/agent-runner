@@ -58,7 +58,7 @@ pub(crate) fn build_quota_refresh_auth_request(
 fn quota_base_params(identity: &QuotaServiceExternalProviderIdentity) -> QuotaBaseParams {
     QuotaBaseParams {
         settings_id: identity.settings_id.clone(),
-        model_name: Some(identity.model_name.clone()),
+        model_name: None,
         context: Some(quota_context(identity)),
     }
 }

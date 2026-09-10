@@ -1,3 +1,6 @@
+#[path = "../../../test-support/provider_wire_policy.rs"]
+mod provider_wire_policy;
+
 pub mod support {
     pub mod contract_matrix;
 }
@@ -47,7 +50,7 @@ fn provider_name_grep_baseline_does_not_increase() {
     let current_lines = numbered.lines().count();
     let owned_matches = numbered
         .lines()
-        .filter(|line| is_owned_match(line))
+        .filter(|line| is_owned_match(line) && has_denied_vocabulary(line, &pattern))
         .collect::<Vec<_>>();
     assert!(
         current_lines <= BASELINE_LINES || owned_matches.is_empty(),
@@ -85,7 +88,13 @@ fn owned_provider_contract_files_use_only_neutral_provider_vocabulary() {
         }
         let contents = fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("failed reading {}: {err}", path.display()));
-        let lower = contents.to_lowercase();
+        let relative = path.strip_prefix(repo_root()).unwrap().to_str().unwrap();
+        let lower = contents
+            .lines()
+            .map(|line| provider_wire_policy::vocabulary_text(relative, line).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
         for denied in &denylist {
             if lower.contains(denied) {
                 violations.push(format!("{} contains {denied}", path.display()));
@@ -194,4 +203,13 @@ fn strip_line_number(line: &str) -> String {
         return format!("{}:{}", &line[..first_colon], &rest[second_colon + 1..]);
     }
     line.to_owned()
+}
+
+fn has_denied_vocabulary(line: &str, pattern: &str) -> bool {
+    let mut parts = line.trim_start_matches("./").splitn(3, ':');
+    let path = parts.next().unwrap_or_default();
+    let _number = parts.next();
+    let text = provider_wire_policy::vocabulary_text(path, parts.next().unwrap_or_default())
+        .to_lowercase();
+    pattern.split('|').any(|denied| text.contains(denied))
 }

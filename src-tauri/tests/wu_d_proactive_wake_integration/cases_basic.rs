@@ -5,7 +5,7 @@
 //! TEST: proactive wake integration orchestration cases (basic wake/resume flows).
 
 use crate::SESSION;
-use crate::fake_cli::{
+use crate::fake_provider::{
     delayed_agent_bash_provider_script, late_consumed_agent_bash_provider_script,
     mixed_consumed_agent_bash_provider_script, provider_script,
 };
@@ -33,7 +33,8 @@ pub(crate) fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once(
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.seed_outer_caller(OUTER_SESSION, OUTER_INVOCATION, OUTER_EVENT);
-    fixture.write_provider(&delayed_agent_bash_provider_script(&agent_bash_bin()));
+    let agent_bash = fixture.install_agent_bash(&agent_bash_bin());
+    fixture.write_provider(&delayed_agent_bash_provider_script(&agent_bash));
 
     let initial = fixture.run_agent("dispatch delayed nested work");
     assert_delayed_dispatch_exit_code_zero(&fixture, &initial);
@@ -61,7 +62,8 @@ pub(crate) fn polled_completion_after_enqueue_does_not_wake_parent() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.seed_outer_caller(OUTER_SESSION, OUTER_INVOCATION, OUTER_EVENT);
-    fixture.write_provider(&late_consumed_agent_bash_provider_script(&agent_bash_bin()));
+    let agent_bash = fixture.install_agent_bash(&agent_bash_bin());
+    fixture.write_provider(&late_consumed_agent_bash_provider_script(&agent_bash));
 
     let initial = fixture.run_agent("dispatch and poll fast nested work");
     assert_exit_code_zero(&initial);
@@ -76,7 +78,8 @@ pub(crate) fn consumed_completion_preserves_unpolled_completion_wake() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.seed_outer_caller(OUTER_SESSION, OUTER_INVOCATION, OUTER_EVENT);
-    fixture.write_provider(&mixed_consumed_agent_bash_provider_script(&agent_bash_bin()));
+    let agent_bash = fixture.install_agent_bash(&agent_bash_bin());
+    fixture.write_provider(&mixed_consumed_agent_bash_provider_script(&agent_bash));
 
     let initial = fixture.run_agent("dispatch consumed and unpolled nested work");
     assert_exit_code_zero(&initial);
@@ -98,7 +101,12 @@ fn dispatch_handle(fixture: &Fixture, file_name: &str) -> String {
 
 fn parse_dispatch_handle(dispatch: &str) -> String {
     let dispatch: serde_json::Value = serde_json::from_str(dispatch).unwrap();
-    dispatch["handle"].as_str().unwrap().to_string()
+    let handle = dispatch["handle"].as_str().unwrap();
+    assert!(
+        !handle.trim().is_empty(),
+        "dispatch handle must be nonempty"
+    );
+    handle.to_string()
 }
 
 fn assert_delayed_completion_outcome(fixture: &Fixture, session_id: &str, handle: &str) {
@@ -278,17 +286,8 @@ fn format_automatic_delivery_timeout(
 fn agent_bash_bin() -> PathBuf {
     std::env::var_os("AGENT_BASH_BIN")
         .map(PathBuf::from)
-        .or_else(find_agent_bash_in_path)
-        .filter(|path| path.is_file())
-        .expect("AGENT_BASH_BIN must name an agent-bash binary or agent-bash must be on PATH")
-}
-
-fn find_agent_bash_in_path() -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join("agent-bash"))
-            .find(|path| path.is_file())
-    })
+        .filter(|path| path.is_absolute() && path.is_file())
+        .expect("AGENT_BASH_BIN must name the absolute source-qualified agent-bash binary (see .github/actions/install-agent-bash)")
 }
 
 fn invocation_count(fixture: &Fixture) -> i64 {

@@ -3066,6 +3066,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3131,6 +3132,7 @@ dependencies = [
  "sha2",
  "static_assertions",
  "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
@@ -3162,6 +3164,7 @@ dependencies = [
  "tracing",
  "uuid",
  "vt100",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3196,6 +3199,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "toml 1.0.3+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "uuid",

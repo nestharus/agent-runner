@@ -35,6 +35,7 @@ pub struct ProviderProjection {
     pub provider_index: usize,
     pub projections_per_window: Vec<WindowProjection>,
     pub binding_score: Option<f64>,
+    pub turn_count_fresh: bool,
     pub recent_error_count: u32,
 }
 
@@ -118,20 +119,32 @@ fn provider_projection_from_records(
     now: chrono::DateTime<Utc>,
 ) -> ProviderProjection {
     let recent_errors = projection_recent_error_count(model, state, provider_index);
+    let turns = assistant_turns_since_refresh(model, state, quotas, provider_index);
+    let turn_count_fresh =
+        turns.is_some_and(|_| provider_turn_checkpoint_is_fresh(model, state, provider_index));
     if projection_is_recent_error_suppressed(recent_errors) {
-        return suppressed_provider_projection(provider_index, recent_errors);
+        return suppressed_provider_projection(provider_index, recent_errors, turn_count_fresh);
     }
 
-    let turns = assistant_turns_since_refresh(model, state, quotas, provider_index);
     let assembly = projection_assembly_for_provider(
         provider_index,
-        turns,
+        turns.unwrap_or(0),
         quotas,
         windows,
         pool_max_live_windows,
         now,
     );
-    assemble_provider_projection(provider_index, recent_errors, assembly)
+    assemble_provider_projection(provider_index, recent_errors, turn_count_fresh, assembly)
+}
+
+fn provider_turn_checkpoint_is_fresh(
+    model: &ModelConfig,
+    state: &StateDb,
+    provider_index: usize,
+) -> bool {
+    state
+        .canonical_provider_turn_ingest_freshness(&model.providers[provider_index].name)
+        .is_ok_and(|freshness| freshness.is_caught_up())
 }
 
 fn projection_recent_error_count(
@@ -152,11 +165,16 @@ fn projection_is_recent_error_suppressed(recent_errors: i64) -> bool {
     recent_errors >= ERROR_THRESHOLD as i64
 }
 
-fn suppressed_provider_projection(provider_index: usize, recent_errors: i64) -> ProviderProjection {
+fn suppressed_provider_projection(
+    provider_index: usize,
+    recent_errors: i64,
+    turn_count_fresh: bool,
+) -> ProviderProjection {
     ProviderProjection {
         provider_index,
         projections_per_window: Vec::new(),
         binding_score: None,
+        turn_count_fresh,
         recent_error_count: recent_errors as u32,
     }
 }
@@ -166,18 +184,15 @@ fn assistant_turns_since_refresh(
     state: &StateDb,
     quotas: &[Option<QuotaRecord>],
     provider_index: usize,
-) -> u64 {
-    quotas[provider_index]
-        .as_ref()
-        .and_then(|quota| {
-            state
-                .count_assistant_turns_since(
-                    &model.providers[provider_index].name,
-                    quota.refreshed_at.as_ref(),
-                )
-                .ok()
-        })
-        .unwrap_or(0)
+) -> Option<u64> {
+    quotas[provider_index].as_ref().and_then(|quota| {
+        state
+            .count_assistant_turns_since(
+                &model.providers[provider_index].name,
+                quota.refreshed_at.as_ref(),
+            )
+            .ok()
+    })
 }
 
 fn projection_assembly_for_provider(
@@ -283,13 +298,17 @@ fn projected_live_window(
 fn assemble_provider_projection(
     provider_index: usize,
     recent_errors: i64,
+    turn_count_fresh: bool,
     assembly: ProjectionAssembly,
 ) -> ProviderProjection {
-    let binding_score = projection_binding_score(&assembly);
+    let binding_score = turn_count_fresh
+        .then(|| projection_binding_score(&assembly))
+        .flatten();
     ProviderProjection {
         provider_index,
         projections_per_window: assembly.projections,
         binding_score,
+        turn_count_fresh,
         recent_error_count: recent_errors as u32,
     }
 }

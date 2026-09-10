@@ -90,7 +90,7 @@ function TargetButton(props: {
 interface RecordSelectorProps {
 	target: ProviderSettingsTarget | null;
 	records: ProviderSettingsRecordSummary[];
-	onSelect: (modelName: string, id: string) => void;
+	onSelect: (accountName: string, id: string) => void;
 }
 
 function RecordSelector(props: RecordSelectorProps) {
@@ -114,11 +114,11 @@ function RecordSelector(props: RecordSelectorProps) {
 function RecordButton(props: {
 	target: ProviderSettingsTarget | null;
 	record: ProviderSettingsRecordSummary;
-	onSelect: (modelName: string, id: string) => void;
+	onSelect: (accountName: string, id: string) => void;
 }) {
 	function selectRecord() {
 		if (!props.target) return;
-		props.onSelect(props.target.modelName, props.record.id);
+		props.onSelect(props.target.accountName, props.record.id);
 	}
 
 	return (

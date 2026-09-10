@@ -5160,4 +5160,12 @@ New HEAD `bada04a4`; diff(main..bada04a4) sha256 `775c27eb3601b9c4ad52365f38a76e
   (import reordering / struct-field & method-chain wrapping), no semantic change. The brief's gate set
   does NOT include `cargo fmt --check` and the main baseline is fmt-drifted, so this churn is unwanted
   scope pollution. Reverted all 10 via `git checkout --` to keep the PR diff confined to
-  pty_broker/{mod,tui}.rs (the real change) + DECISIONS.md. Verified build/tests after revert.
+   pty_broker/{mod,tui}.rs (the real change) + DECISIONS.md. Verified build/tests after revert.
+
+## AGE-309 — launch-output provider compatibility (2026-08-31)
+
+- **Decision**: `oulipoly.launch_output/v1` is mandatory for external-provider launch dispatch. The host selects `OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1`, and a provider must advertise `capabilities.launch_output_v1: true` and implement the selected extension.
+- **Existing provider installations**: providers that omit the capability or advertise it as false are incompatible with the current host and must be upgraded. Additive JSON parsing does not grant runtime compatibility when a newer host requires a selected extension.
+- **Failure semantics**: the host returns `complete_launch_output_unsupported` before policy evaluation or launch. There is no legacy output path, compatibility shim, fallback, dual-support mode, or feature flag.
+- **Rationale**: complete, duration-independent output custody is required to distinguish successful completion from uncertain transport state. Dispatching without that guarantee would recreate the execution ambiguity AGE-309 removes.
+- **Revisit when**: only through an explicitly versioned replacement contract that preserves complete output custody; not to restore support for providers that lack it.

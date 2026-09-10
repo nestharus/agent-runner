@@ -6,6 +6,7 @@ use oulipoly_config::{
 };
 use oulipoly_state::{InvocationStart, ModelStore, ResolvedResume, StateDb};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,31 @@ pub struct MigrationFixture {
     pub target_projects: PathBuf,
     pub source_workspace: PathBuf,
     pub resume_workspace: PathBuf,
+}
+
+pub struct DataDirEnvGuard {
+    previous: Option<OsString>,
+}
+
+impl DataDirEnvGuard {
+    pub fn set(path: &Path) -> Self {
+        let previous = std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV);
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, path);
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for DataDirEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, previous),
+                None => std::env::remove_var(oulipoly_state::paths::DATA_DIR_ENV),
+            }
+        }
+    }
 }
 
 impl MigrationFixture {
@@ -159,12 +185,21 @@ fn start_source_invocation(db: &StateDb, model: &ModelConfig) -> i64 {
 }
 
 fn capture_source_session(db: &StateDb, invocation_id: i64) {
-    db.update_session_capture(invocation_id, Some(SESSION_ID), "fixture")
-        .unwrap();
+    db.update_session_capture(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+        Some(SESSION_ID),
+        "fixture",
+    )
+    .unwrap();
 }
 
 fn mint_source_chain(db: &StateDb, invocation_id: i64) {
-    db.mint_chain_for_invocation_session(invocation_id).unwrap();
+    db.mint_chain_for_invocation_session(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+    )
+    .unwrap();
 }
 
 fn model_store_for_fixture(model: &ModelConfig) -> ModelStore {

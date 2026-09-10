@@ -16,6 +16,10 @@
 //! ```
 
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
+use oulipoly_runtime::session_authority::{
+    AuthoritativeSessionObservation, SessionAuthorityCommitRequest, SessionAuthorityExpectation,
+    commit_session_authority, verify_session_authority,
+};
 
 use super::finalization::{
     CompletedAttemptControl, CompletedAttemptInput, finalize_completed_attempt,
@@ -115,7 +119,16 @@ fn bind_resume_attempt_session(
     invocation_row_id: i64,
     provider_session_id: &str,
 ) -> Result<(), String> {
+    if input
+        .agent_runtime_services
+        .provider_registry_handle
+        .current()
+        .has_account_endpoint(&provider.name)
+    {
+        return Ok(());
+    }
     input.env.state.bind_invocation_provider_session_start(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         invocation_row_id,
         &mapper::resumed_provider_session_binding(
             provider,
@@ -124,12 +137,91 @@ fn bind_resume_attempt_session(
         ),
     )?;
     if should_record_legacy_resume_input(input.manual_migrate) {
-        input
-            .env
-            .state
-            .record_legacy_resume_input_session_id(invocation_row_id, input.session_id)?;
+        input.env.state.record_legacy_resume_input_session_id(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            input.session_id,
+        )?;
     }
     Ok(())
+}
+
+pub(super) fn commit_resume_session_authority(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &ResumeInvocationAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    result: &oulipoly_runtime::executor::ExecutionResult,
+    account_endpoint_configured: bool,
+) -> Result<(), String> {
+    if !account_endpoint_configured
+        && !matches!(
+            result.session_capture.method,
+            oulipoly_runtime::executor::SessionCaptureMethod::ExternalProviderLaunch(_)
+        )
+    {
+        return Ok(());
+    }
+    let observed_provider_name = result_provider_name(input, result)?;
+    let expectation = SessionAuthorityExpectation {
+        account_name: &provider.name,
+        provider_session_id: Some(&input.resolved.active_session_id),
+    };
+    let authority = match &result.session_capture.method {
+        oulipoly_runtime::executor::SessionCaptureMethod::ExternalProviderLaunch(authority) => {
+            authority
+        }
+        _ => {
+            return verify_session_authority(expectation, None)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+        }
+    };
+    if authority.account_name != observed_provider_name {
+        return Err("external launch endpoint account does not match result account".to_string());
+    }
+    let observed_session_id = result.session_capture.session_id.as_deref();
+    commit_session_authority(SessionAuthorityCommitRequest {
+        state: &input.env.state,
+        invocation_row_id: attempt.invocation_row_id,
+        invocation_uuid: &attempt.invocation.id,
+        expectation,
+        observation: observed_session_id.map(|provider_session_id| {
+            AuthoritativeSessionObservation {
+                account_name: observed_provider_name,
+                provider_session_id,
+            }
+        }),
+        capture_method: result.session_capture.method.db_value(),
+        provider_instance_id: &authority.provider_instance_id,
+        settings_id: &authority.settings_id,
+        resume_input_id: Some(input.session_id.to_string()),
+        provider_session_resolved_account:
+            crate::migration_providers::provider_session_resolved_account(
+                provider,
+                &input.resolved.active_session_id,
+            ),
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn result_provider_name<'a>(
+    input: &'a ResumeAttemptInput<'_>,
+    result: &oulipoly_runtime::executor::ExecutionResult,
+) -> Result<&'a str, String> {
+    let Some(model) = input.resolved.model.as_ref() else {
+        return Ok(&input.resolved.active_provider);
+    };
+    model
+        .providers
+        .get(result.provider_index)
+        .map(|provider| provider.name.as_str())
+        .ok_or_else(|| {
+            format!(
+                "endpoint resume returned provider index {} outside the resolved model pool",
+                result.provider_index
+            )
+        })
 }
 
 fn should_record_legacy_resume_input(manual_migrate: Option<&str>) -> bool {
@@ -143,10 +235,10 @@ pub(super) fn finalize_resume_spawn_error(
     input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::spawn_error_finalize_request(
-            &input.env.state,
-            attempt.invocation_row_id,
-        ))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::spawn_error_finalize_request(&input.env.state, attempt.invocation_row_id),
+        )
         .map_err(|err| err.to_string())?;
     attempt.guard.mark_finalized();
     wake::mark_resume_attempt_idle(
@@ -187,9 +279,45 @@ pub(super) fn finalize_completed_attempt_for_resume(
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &oulipoly_runtime::executor::ExecutionResult,
+    confirmed_delivery: Option<super::finalization::ConfirmedDeliverySettlement<'_>>,
     completion: ResumeCompletionClassification,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    match finalize_completed_attempt(CompletedAttemptInput {
+    let control = finalize_completed_attempt_control_for_resume(
+        input,
+        attempt,
+        provider,
+        provider_session_id,
+        result,
+        confirmed_delivery,
+        &completion,
+    )?;
+    match control {
+        CompletedAttemptControl::Continue => {
+            finalize_retrying_resume(input, attempt, provider_session_id, result)
+        }
+        CompletedAttemptControl::Return(exit_code) if exit_code == 0 => finalize_successful_resume(
+            input,
+            attempt,
+            provider_session_id,
+            exit_code,
+            result.exit_code,
+        ),
+        CompletedAttemptControl::Return(exit_code) => {
+            finalize_failed_resume(input, attempt, provider_session_id, result, exit_code)
+        }
+    }
+}
+
+pub(super) fn finalize_completed_attempt_control_for_resume(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &mut ResumeInvocationAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_session_id: &str,
+    result: &oulipoly_runtime::executor::ExecutionResult,
+    confirmed_delivery: Option<super::finalization::ConfirmedDeliverySettlement<'_>>,
+    completion: &ResumeCompletionClassification,
+) -> Result<CompletedAttemptControl, String> {
+    finalize_completed_attempt(CompletedAttemptInput {
         agent_runtime_services: input.agent_runtime_services,
         env: input.env,
         invocation: &attempt.invocation,
@@ -208,21 +336,8 @@ pub(super) fn finalize_completed_attempt_for_resume(
         max_attempts: input.max_attempts,
         recovered_generic_nonzero: completion.recovered_generic_nonzero,
         terminal_completion_confirmed: completion.terminal_completion_confirmed,
-    })? {
-        CompletedAttemptControl::Continue => {
-            finalize_retrying_resume(input, attempt, provider_session_id, result)
-        }
-        CompletedAttemptControl::Return(exit_code) if exit_code == 0 => finalize_successful_resume(
-            input,
-            attempt,
-            provider_session_id,
-            exit_code,
-            result.exit_code,
-        ),
-        CompletedAttemptControl::Return(exit_code) => {
-            finalize_failed_resume(input, attempt, provider_session_id, result, exit_code)
-        }
-    }
+        confirmed_delivery,
+    })
 }
 
 fn finalize_retrying_resume(
@@ -250,7 +365,7 @@ fn finalize_successful_resume(
     exit_code: i32,
     physical_exit_code: i32,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    wake::complete_successful_mailbox_delivery(
+    wake::settle_accepted_mailbox_delivery_and_recheck(
         input,
         provider_session_id,
         &attempt.invocation.id,

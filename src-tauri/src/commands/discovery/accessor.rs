@@ -18,6 +18,7 @@ use super::predicate;
 use crate::AppState;
 use crate::commands::accessor as command_accessor;
 use oulipoly_runtime::discovery;
+use oulipoly_runtime::provider_registry::ProviderRegistry;
 use oulipoly_state::repositories::{SetupRepository, StateDbOpener};
 use oulipoly_state::{DiscoveredModel, ModelParameter, StateDb};
 use std::path::{Path, PathBuf};
@@ -38,8 +39,14 @@ pub fn open_state_db_at(
     opener.open_at(db_path)
 }
 
-pub fn discover_models_for_cli(cli_name: &str) -> Result<discovery::DiscoveryResult, String> {
-    discovery::discover_models(cli_name)
+pub fn discover_models_for_family(
+    registry: &ProviderRegistry,
+    family: &str,
+) -> Result<discovery::DiscoveryResult, String> {
+    let endpoint = registry
+        .preflight_family(family)
+        .map_err(|error| error.to_string())?;
+    discovery::discover_models(endpoint.as_ref())
 }
 
 pub fn persist_discovery_result(

@@ -31,7 +31,13 @@ pub mod observability;
 pub mod ports;
 pub mod provider_registry;
 pub mod provider_settings;
+/// Target resident-supervisor provider-turn boundary. Its staged activation is
+/// owned by `docs/architecture/provider-turn-lifecycle.md`.
 pub mod provider_turn_adapter;
+pub mod provider_turn_contract;
+mod provider_turn_effect_application;
+mod provider_turn_evidence;
+mod provider_turn_execution;
 pub mod quota;
 pub mod repl_default_provider;
 pub mod rotation_domain;
@@ -39,6 +45,7 @@ pub mod rotation_external_provider;
 pub mod rotation_host_apply;
 pub mod rotation_journal;
 pub mod services;
+pub mod session_authority;
 pub mod session_export;
 pub mod session_external_provider;
 pub mod session_ingress;

@@ -729,8 +729,13 @@ mod tests {
 
         fn set_resume_acceptance(&self, row_id: i64, status: &str, evidence: Option<&str>) {
             let db = self.db();
-            db.update_resume_acceptance(row_id, status, evidence)
-                .unwrap();
+            db.update_resume_acceptance(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                row_id,
+                status,
+                evidence,
+            )
+            .unwrap();
         }
 
         fn seed_chain_segment(&self, chain_id: &str, provider_name: &str, session_id: &str) {

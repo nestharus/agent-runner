@@ -3,8 +3,7 @@
 //! `mapper`, `orchestration`, `accessor`, `formatter`, `validator`, `predicate`, `filter`, `parser`
 
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, ProvidersConfig,
-    provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry, ProvidersConfig,
 };
 use oulipoly_runtime::provider_registry::{
     ProviderRegistry, ProviderRegistryHandle, ProviderRegistryOptions,
@@ -15,6 +14,7 @@ use oulipoly_runtime::services::{
 };
 use oulipoly_state::StateDb;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,37 +29,40 @@ struct FakeProviderFixture {
     log: PathBuf,
 }
 
-fn provider_ref(path: &Path) -> ProviderImplementationRef {
-    ProviderImplementationRef {
-        path: None,
-        crate_name: None,
-        version: None,
-        binary: None,
-        script: Some(path.display().to_string()),
-    }
-}
-
-fn model_config(path: &Path) -> ModelConfig {
+fn model_config() -> ModelConfig {
     ModelConfig {
         name: MODEL_NAME.to_string(),
         prompt_mode: PromptMode::Arg,
         providers: vec![ProviderConfig::model_provider(PROVIDER_NAME, Vec::new())],
         inputs: Vec::new(),
-        provider: Some(provider_ref(path)),
+        provider: None,
     }
 }
 
 fn quota_identity() -> QuotaServiceExternalProviderIdentity {
     QuotaServiceExternalProviderIdentity {
-        model_name: MODEL_NAME.to_string(),
         provider_instance_id: PROVIDER_NAME.to_string(),
         settings_id: SETTINGS_ID.to_string(),
     }
 }
 
 fn quota_service(fixture: &FakeProviderFixture) -> RuntimeQuotaService {
-    let registry = ProviderRegistry::from_model_configs(
-        &[model_config(&fixture.script)],
+    let providers = ProvidersConfig {
+        entries: HashMap::from([(
+            PROVIDER_NAME.to_string(),
+            ProviderEntry {
+                implementation: Some(ProviderEndpointConfig {
+                    family: "neutral-family".to_string(),
+                    executable: fixture.script.display().to_string(),
+                }),
+                settings_id: Some(SETTINGS_ID.to_string()),
+                ..Default::default()
+            },
+        )]),
+    };
+    let registry = ProviderRegistry::from_configs(
+        &[model_config()],
+        &providers,
         ProviderRegistryOptions::default(),
     )
     .expect("registry");
@@ -448,9 +451,9 @@ fn assert_logged_request_identity(fixture: &FakeProviderFixture, subcommand: &st
             .unwrap()
             .starts_with("external-quota-")
     );
-    assert_eq!(request["provider_instance_id"], PROVIDER_NAME);
+    assert_eq!(request["provider_instance_id"], "neutral-instance");
     assert_eq!(request["params"]["settings_id"], SETTINGS_ID);
-    assert_eq!(request["params"]["model_name"], MODEL_NAME);
+    assert!(request["params"]["model_name"].is_null());
 }
 
 fn assert_projection_failed(outcome: RefreshOutcome) {
@@ -521,7 +524,7 @@ fn external_in_flight_returns_before_registry_or_provider_calls() {
 }
 
 #[test]
-fn external_request_envelopes_include_neutral_settings_identity() {
+fn external_request_envelopes_use_selected_account_endpoint_identity() {
     let fixture = success_fixture();
     let (_outcome, _state) = refresh_with_fixture(&fixture);
     for subcommand in ["quota.source", "quota.probe"] {
@@ -542,4 +545,25 @@ fn external_probe_error_refreshes_auth_and_retries_once() {
     let (outcome, _state) = refresh_with_fixture(&fixture);
     assert_retry_updated(outcome);
     assert_retry_call_counts(&fixture);
+}
+
+#[test]
+fn registry_backed_quota_fails_closed_without_explicit_identity() {
+    let fixture = success_fixture();
+    let runtime = refresh_fixture_runtime();
+    let output = quota_service(&fixture)
+        .refresh_quota(QuotaServiceRequest {
+            provider_name: PROVIDER_NAME.to_string(),
+            providers_cfg: &runtime.providers,
+            in_flight: &runtime.in_flight,
+            state: &runtime.state,
+            external_provider: None,
+        })
+        .expect("service output");
+
+    let RefreshOutcome::Failed(reason) = output.outcome else {
+        panic!("quota refresh did not fail closed");
+    };
+    assert_eq!(reason, "external provider quota identity is unavailable");
+    assert_eq!(provider_log(&fixture), "");
 }

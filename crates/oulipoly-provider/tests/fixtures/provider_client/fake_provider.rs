@@ -859,7 +859,8 @@ fn sigterm_exiting_leader_resistant_descendant() -> i32 {
 fn exit_with_pipe_holding_descendant() -> i32 {
     let _ = read_stdin_to_string();
     let mut command = pipe_holding_descendant_command();
-    let _descendant = command.spawn().expect("pipe-holding descendant should spawn");
+    let descendant = command.spawn().expect("pipe-holding descendant should spawn");
+    wait_for_probe_pid("pipe-holder", descendant.id());
     write_stdout(&success_json())
 }
 
@@ -978,6 +979,25 @@ fn write_probe_pid(label: &str) {
     write_pid_file(&root, label, std::process::id());
 }
 
+fn wait_for_probe_pid(label: &str, pid: u32) {
+    let Some(root) = probe_root() else {
+        return;
+    };
+    let path = probe_pid_path(&root, label, pid);
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while std::time::Instant::now() < deadline {
+        if fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            == Some(pid)
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    panic!("pipe-holding descendant {pid} did not report readiness");
+}
+
 fn probe_root() -> Option<std::path::PathBuf> {
     env::var("FAKE_PROVIDER_PROBE_DIR")
         .ok()
@@ -1035,6 +1055,7 @@ fn launch_provider_nonzero_no_final() -> i32 {
 }
 
 fn launch_cancelled_final_event() -> i32 {
+    ignore_sigterm();
     let request_id = read_request_id();
     write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
     thread::sleep(Duration::from_millis(150));

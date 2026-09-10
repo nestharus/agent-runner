@@ -1,86 +1,273 @@
-//! Default agent-runner data path resolution.
+//! Agent-runner runtime path configuration.
 
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub const APP_DATA_DIR_NAME: &str = "oulipoly-agent-runner";
 pub const DATA_DIR_ENV: &str = "OULIPOLY_DATA_DIR";
+pub const CONFIG_HOME_ENV: &str = "OULIPOLY_CONFIG_HOME";
+pub const ADJACENT_PATHS_FILE_NAME: &str = "config.toml";
+const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
 
-pub fn data_dir() -> Result<PathBuf, String> {
-    std::env::var_os(DATA_DIR_ENV)
-        .map(PathBuf::from)
-        .map(absolutize_configured_data_dir)
-        .unwrap_or_else(default_data_dir)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimePathConfiguration {
+    data_dir: PathBuf,
+    config_home: PathBuf,
 }
 
-fn absolutize_configured_data_dir(path: PathBuf) -> Result<PathBuf, String> {
+trait RuntimePathConfigurationProvider {
+    fn data_dir(&self) -> Result<PathBuf, String>;
+    fn config_home(&self) -> Result<PathBuf, String>;
+}
+
+struct AdjacentFileConfigurationProvider {
+    path: PathBuf,
+}
+
+struct EnvironmentConfigurationProvider;
+
+enum SelectedConfigurationProvider {
+    AdjacentFile(AdjacentFileConfigurationProvider),
+    Environment(EnvironmentConfigurationProvider),
+}
+
+impl RuntimePathConfigurationProvider for SelectedConfigurationProvider {
+    fn data_dir(&self) -> Result<PathBuf, String> {
+        match self {
+            Self::AdjacentFile(provider) => provider.data_dir(),
+            Self::Environment(provider) => provider.data_dir(),
+        }
+    }
+
+    fn config_home(&self) -> Result<PathBuf, String> {
+        match self {
+            Self::AdjacentFile(provider) => provider.config_home(),
+            Self::Environment(provider) => provider.config_home(),
+        }
+    }
+}
+
+struct RuntimePathConfigurationProviderFactory;
+
+impl RuntimePathConfigurationProviderFactory {
+    fn for_current_executable() -> Result<SelectedConfigurationProvider, String> {
+        // A live broker has selected its installation before accepting notifications.
+        // Retain that validated location: Linux current_exe() gains " (deleted)"
+        // after replacement, and resolving a replacement symlink would select an
+        // unrelated installation's roots. Do not strip suffixes or trust new bytes.
+        // Only the executable location is pinned; config contents and environment
+        // paths continue to be read by the existing providers on each lookup.
+        static EXECUTABLE: OnceLock<Result<Option<PathBuf>, String>> = OnceLock::new();
+        match EXECUTABLE.get_or_init(resolve_current_executable).as_ref() {
+            Ok(Some(executable)) => Self::for_resolved_executable(executable),
+            Ok(None) => Ok(SelectedConfigurationProvider::Environment(
+                EnvironmentConfigurationProvider,
+            )),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_executable(executable: &Path) -> Result<SelectedConfigurationProvider, String> {
+        Self::for_resolved_executable(&canonical_executable(executable)?)
+    }
+
+    fn for_resolved_executable(executable: &Path) -> Result<SelectedConfigurationProvider, String> {
+        let executable_dir = executable.parent().ok_or_else(|| {
+            format!(
+                "Could not resolve the directory containing executable {}",
+                executable.display()
+            )
+        })?;
+        let path = executable_dir.join(ADJACENT_PATHS_FILE_NAME);
+        match path.try_exists() {
+            Ok(true) => Ok(SelectedConfigurationProvider::AdjacentFile(
+                AdjacentFileConfigurationProvider { path },
+            )),
+            Ok(false) => Ok(SelectedConfigurationProvider::Environment(
+                EnvironmentConfigurationProvider,
+            )),
+            Err(error) => Err(format!(
+                "Could not inspect runtime paths file {}: {error}",
+                path.display()
+            )),
+        }
+    }
+}
+
+fn resolve_current_executable() -> Result<Option<PathBuf>, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not resolve the current executable: {error}"))?;
+    if is_deleted_linux_memfd(&executable) {
+        return Ok(None);
+    }
+    canonical_executable(&executable).map(Some)
+}
+
+fn canonical_executable(executable: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(executable).map_err(|error| {
+        format!(
+            "Could not canonicalize executable {}: {error}",
+            executable.display()
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn is_deleted_linux_memfd(executable: &Path) -> bool {
+    let Some(path) = executable.to_str() else {
+        return false;
+    };
+    path.starts_with("/memfd:") && path.ends_with(" (deleted)") && !executable.exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_deleted_linux_memfd(_executable: &Path) -> bool {
+    false
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdjacentPathConfigurationFile {
+    data_dir: PathBuf,
+    config_home: PathBuf,
+}
+
+impl RuntimePathConfigurationProvider for AdjacentFileConfigurationProvider {
+    fn data_dir(&self) -> Result<PathBuf, String> {
+        self.load().map(|configuration| configuration.data_dir)
+    }
+
+    fn config_home(&self) -> Result<PathBuf, String> {
+        self.load().map(|configuration| configuration.config_home)
+    }
+}
+
+impl AdjacentFileConfigurationProvider {
+    fn load(&self) -> Result<RuntimePathConfiguration, String> {
+        let text = std::fs::read_to_string(&self.path).map_err(|error| {
+            format!(
+                "Could not read runtime paths file {}: {error}",
+                self.path.display()
+            )
+        })?;
+        let configured: AdjacentPathConfigurationFile = toml::from_str(&text).map_err(|error| {
+            format!(
+                "Could not parse runtime paths file {}: {error}",
+                self.path.display()
+            )
+        })?;
+        require_absolute_file_path(&self.path, "data_dir", configured.data_dir).and_then(
+            |data_dir| {
+                require_absolute_file_path(&self.path, "config_home", configured.config_home).map(
+                    |config_home| RuntimePathConfiguration {
+                        data_dir,
+                        config_home,
+                    },
+                )
+            },
+        )
+    }
+}
+
+impl RuntimePathConfigurationProvider for EnvironmentConfigurationProvider {
+    fn data_dir(&self) -> Result<PathBuf, String> {
+        required_environment_path(DATA_DIR_ENV, "application data directory")
+    }
+
+    fn config_home(&self) -> Result<PathBuf, String> {
+        std::env::var_os(CONFIG_HOME_ENV)
+            .filter(|path| !path.is_empty())
+            .or_else(|| std::env::var_os(XDG_CONFIG_HOME_ENV).filter(|path| !path.is_empty()))
+            .ok_or_else(|| {
+                format!(
+                    "{CONFIG_HOME_ENV} is not set; set it to the runner's configuration home, for example: export {CONFIG_HOME_ENV}=/path/to/config-home"
+                )
+            })
+            .map(PathBuf::from)
+            .and_then(|path| absolutize_environment_path(CONFIG_HOME_ENV, path))
+    }
+}
+
+pub fn data_dir() -> Result<PathBuf, String> {
+    RuntimePathConfigurationProviderFactory::for_current_executable()?.data_dir()
+}
+
+pub fn config_dir() -> Result<PathBuf, String> {
+    RuntimePathConfigurationProviderFactory::for_current_executable()?
+        .config_home()
+        .map(|config_home| config_home.join(APP_DATA_DIR_NAME))
+}
+
+fn required_environment_path(name: &str, purpose: &str) -> Result<PathBuf, String> {
+    std::env::var_os(name)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{name} is not set; set it to the runner's {purpose}, for example: export {name}=/path/to/{}",
+                if name == DATA_DIR_ENV {
+                    "oulipoly-data"
+                } else {
+                    "config-home"
+                }
+            )
+        })
+        .map(PathBuf::from)
+        .and_then(|path| absolutize_environment_path(name, path))
+}
+
+fn absolutize_environment_path(name: &str, path: PathBuf) -> Result<PathBuf, String> {
     if path.is_absolute() {
         return Ok(path);
     }
     std::env::current_dir()
         .map(|current_dir| current_dir.join(path))
-        .map_err(|error| format!("Could not resolve relative {DATA_DIR_ENV}: {error}"))
+        .map_err(|error| format!("Could not resolve relative {name}: {error}"))
 }
 
-fn default_data_dir() -> Result<PathBuf, String> {
-    if running_under_test_harness() {
-        return Err(
-            "refusing to resolve the production data dir in a test or bench binary; set \
-             OULIPOLY_DATA_DIR to an isolated temp dir"
-                .to_string(),
-        );
+fn require_absolute_file_path(
+    source: &Path,
+    field: &str,
+    path: PathBuf,
+) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "Runtime paths file {} field {field} must be an absolute path",
+            source.display()
+        ));
     }
-    default_data_dir_unchecked()
-}
-
-fn default_data_dir_unchecked() -> Result<PathBuf, String> {
-    let data_dir =
-        dirs::data_dir().ok_or_else(|| "Could not determine data directory".to_string())?;
-    Ok(data_dir.join(APP_DATA_DIR_NAME))
-}
-
-fn running_under_test_harness() -> bool {
-    cfg!(test)
-        || std::env::current_exe()
-            .map(|path| path_has_deps_component(&path))
-            .unwrap_or(false)
-}
-
-fn path_has_deps_component(path: &Path) -> bool {
-    path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::Normal(name) if name == std::ffi::OsStr::new("deps")
-        )
-    })
+    Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::path::Path;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     struct EnvGuard {
         _lock: MutexGuard<'static, ()>,
         old_oulipoly_data_dir: Option<OsString>,
-        old_xdg_data_home: Option<OsString>,
+        old_oulipoly_config_home: Option<OsString>,
     }
 
     impl EnvGuard {
-        fn set(oulipoly_data_dir: Option<&Path>, xdg_data_home: Option<&Path>) -> Self {
+        fn set(oulipoly_data_dir: Option<&Path>, oulipoly_config_home: Option<&Path>) -> Self {
             let lock = env_lock()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let old_oulipoly_data_dir = std::env::var_os(DATA_DIR_ENV);
-            let old_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+            let old_oulipoly_config_home = std::env::var_os(CONFIG_HOME_ENV);
             unsafe {
                 set_or_remove(DATA_DIR_ENV, oulipoly_data_dir);
-                set_or_remove("XDG_DATA_HOME", xdg_data_home);
+                set_or_remove(CONFIG_HOME_ENV, oulipoly_config_home);
             }
             Self {
                 _lock: lock,
                 old_oulipoly_data_dir,
-                old_xdg_data_home,
+                old_oulipoly_config_home,
             }
         }
     }
@@ -89,73 +276,163 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 restore_env(DATA_DIR_ENV, self.old_oulipoly_data_dir.take());
-                restore_env("XDG_DATA_HOME", self.old_xdg_data_home.take());
+                restore_env(CONFIG_HOME_ENV, self.old_oulipoly_config_home.take());
             }
         }
     }
 
     #[test]
-    fn deps_component_marks_cargo_test_binary_path() {
-        let path = Path::new("/repo/target/debug/deps/foo-abc123");
+    fn environment_provider_requires_an_explicit_data_root() {
+        let _guard = EnvGuard::set(None, None);
 
-        assert!(path_has_deps_component(path));
+        assert!(EnvironmentConfigurationProvider.data_dir().is_err());
     }
 
     #[test]
-    fn production_binary_paths_do_not_mark_test_binary() {
-        for path in [
-            Path::new("/home/nes/.local/bin/agents"),
-            Path::new("/repo/target/release/agents"),
-        ] {
-            assert!(!path_has_deps_component(path));
-        }
-    }
-
-    #[test]
-    fn data_dir_refuses_production_default_under_test_without_override() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard::set(None, Some(dir.path()));
-
-        let error = data_dir().unwrap_err();
-
-        assert!(
-            error.contains("refusing to resolve the production data dir in a test or bench binary"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn data_dir_override_bypasses_test_guard_and_default_open_uses_it() {
+    fn environment_provider_resolves_both_explicit_roots() {
         let dir = tempfile::tempdir().unwrap();
         let data_root = dir.path().join("isolated-data");
-        let _guard = EnvGuard::set(Some(&data_root), None);
-
-        assert_eq!(data_dir().unwrap(), data_root);
-        let _db = crate::StateDb::open_default().unwrap();
-        assert!(data_root.join("state.db").exists());
-    }
-
-    #[test]
-    fn relative_data_dir_override_is_pinned_to_one_absolute_source_path() {
-        let relative = Path::new("target/age299-relative-data");
-        let _guard = EnvGuard::set(Some(relative), None);
+        let config_home = dir.path().join("isolated-config");
+        let _guard = EnvGuard::set(Some(&data_root), Some(&config_home));
 
         assert_eq!(
-            data_dir().unwrap(),
-            std::env::current_dir().unwrap().join(relative)
+            EnvironmentConfigurationProvider.data_dir().unwrap(),
+            data_root
+        );
+        assert_eq!(
+            EnvironmentConfigurationProvider.config_home().unwrap(),
+            config_home
         );
     }
 
     #[test]
-    fn unchecked_default_keeps_xdg_fallback_shape_for_production() {
+    fn factory_prefers_an_adjacent_file_over_environment() {
         let dir = tempfile::tempdir().unwrap();
-        let xdg = dir.path().join("xdg-data");
-        let _guard = EnvGuard::set(None, Some(&xdg));
+        let executable = dir.path().join("agents");
+        std::fs::write(&executable, "fixture").unwrap();
+        let file_data = dir.path().join("file-data");
+        let file_config = dir.path().join("file-config");
+        let env_data = dir.path().join("env-data");
+        let env_config = dir.path().join("env-config");
+        let _guard = EnvGuard::set(Some(&env_data), Some(&env_config));
+        std::fs::write(
+            dir.path().join(ADJACENT_PATHS_FILE_NAME),
+            format!(
+                "data_dir = {:?}\nconfig_home = {:?}\n",
+                file_data.display().to_string(),
+                file_config.display().to_string()
+            ),
+        )
+        .unwrap();
 
-        assert_eq!(
-            default_data_dir_unchecked().unwrap(),
-            xdg.join(APP_DATA_DIR_NAME)
+        let selected =
+            RuntimePathConfigurationProviderFactory::for_executable(&executable).unwrap();
+
+        assert_eq!(selected.data_dir().unwrap(), file_data);
+        assert_eq!(selected.config_home().unwrap(), file_config);
+    }
+
+    #[test]
+    fn malformed_adjacent_file_does_not_fall_back_to_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("agents");
+        std::fs::write(&executable, "fixture").unwrap();
+        let env_data = dir.path().join("env-data");
+        let env_config = dir.path().join("env-config");
+        let _guard = EnvGuard::set(Some(&env_data), Some(&env_config));
+        std::fs::write(
+            dir.path().join(ADJACENT_PATHS_FILE_NAME),
+            "data_dir = [not-valid",
+        )
+        .unwrap();
+
+        let error = RuntimePathConfigurationProviderFactory::for_executable(&executable)
+            .unwrap()
+            .data_dir()
+            .unwrap_err();
+
+        assert!(
+            error.contains("Could not parse runtime paths file"),
+            "{error}"
         );
+    }
+
+    #[test]
+    fn factory_uses_environment_when_the_adjacent_file_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("agents");
+        std::fs::write(&executable, "fixture").unwrap();
+        let env_data = dir.path().join("env-data");
+        let env_config = dir.path().join("env-config");
+        let _guard = EnvGuard::set(Some(&env_data), Some(&env_config));
+
+        let selected =
+            RuntimePathConfigurationProviderFactory::for_executable(&executable).unwrap();
+
+        assert_eq!(selected.data_dir().unwrap(), env_data);
+        assert_eq!(selected.config_home().unwrap(), env_config);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deleted_memfd_is_the_only_non_filesystem_executable_fallback() {
+        assert!(is_deleted_linux_memfd(Path::new(
+            "/memfd:agent-bash-delivery-helper (deleted)"
+        )));
+        assert!(!is_deleted_linux_memfd(Path::new(
+            "/tmp/agent-bash-delivery-helper (deleted)"
+        )));
+        assert!(!is_deleted_linux_memfd(Path::new("/memfd:live-helper")));
+    }
+
+    #[test]
+    fn adjacent_file_requires_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("agents");
+        std::fs::write(&executable, "fixture").unwrap();
+        std::fs::write(
+            dir.path().join(ADJACENT_PATHS_FILE_NAME),
+            "data_dir = \"relative-data\"\nconfig_home = \"/absolute-config\"\n",
+        )
+        .unwrap();
+
+        let error = RuntimePathConfigurationProviderFactory::for_executable(&executable)
+            .unwrap()
+            .data_dir()
+            .unwrap_err();
+
+        assert!(
+            error.contains("field data_dir must be an absolute path"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unvalidated_deleted_path_cannot_select_a_replacement_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let replacement = dir.path().join("agents");
+        std::fs::write(&replacement, "replacement").unwrap();
+        std::fs::write(
+            dir.path().join(ADJACENT_PATHS_FILE_NAME),
+            "data_dir = \"/wrong-data\"\nconfig_home = \"/wrong-config\"\n",
+        )
+        .unwrap();
+        let deleted = dir.path().join("agents (deleted)");
+        let error = RuntimePathConfigurationProviderFactory::for_executable(&deleted)
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("Could not canonicalize executable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn literal_deleted_suffix_on_an_existing_executable_is_validated_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("agents (deleted)");
+        std::fs::write(&executable, "fixture").unwrap();
+        assert_eq!(canonical_executable(&executable).unwrap(), executable);
     }
 
     fn env_lock() -> &'static Mutex<()> {

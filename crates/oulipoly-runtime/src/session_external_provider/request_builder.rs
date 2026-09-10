@@ -35,7 +35,7 @@ pub(crate) fn build_export_request(
         host_options,
         JsonObject::new(),
         request_id,
-    ))
+    )?)
 }
 
 pub(crate) fn build_replace_request(
@@ -51,7 +51,7 @@ pub(crate) fn build_replace_request(
         input,
         host_options,
         request_id,
-    ))
+    )?)
 }
 
 pub(crate) fn build_recovery_replace_request(
@@ -67,7 +67,7 @@ pub(crate) fn build_recovery_replace_request(
         recovery,
         host_options,
         request_id,
-    ))
+    )?)
 }
 
 fn session_request_envelope(
@@ -76,7 +76,7 @@ fn session_request_envelope(
     host_options: &DescribeHostOptions,
     mut extra: JsonObject,
     request_id: String,
-) -> RequestEnvelope<SessionBaseParams> {
+) -> Result<RequestEnvelope<SessionBaseParams>, ExternalSessionProviderError> {
     extra.insert(
         "model_name".to_string(),
         Value::String(identity.model_name.clone()),
@@ -85,17 +85,17 @@ fn session_request_envelope(
         "provider_name".to_string(),
         Value::String(identity.provider_name.clone()),
     );
-    RequestEnvelope {
+    Ok(RequestEnvelope {
         contract: CONTRACT_VERSION.to_string(),
         request_id,
-        provider_instance_id: Some(provider_instance_id(identity)),
+        provider_instance_id: Some(provider_instance_id(identity)?.to_string()),
         host: host_context(host_options),
         params: SessionBaseParams {
             settings_id: identity.settings_id.clone(),
             session_id: session_id.map(str::to_string),
             extra,
         },
-    }
+    })
 }
 
 fn host_context(host_options: &DescribeHostOptions) -> HostContext {
@@ -123,12 +123,12 @@ fn replace_request_envelope(
     input: &PreparedReplaceInput,
     host_options: &DescribeHostOptions,
     request_id: String,
-) -> RequestEnvelope<SessionReplaceParams> {
+) -> Result<RequestEnvelope<SessionReplaceParams>, ExternalSessionProviderError> {
     let _canonical_input_len = input.bytes.len();
-    RequestEnvelope {
+    Ok(RequestEnvelope {
         contract: CONTRACT_VERSION.to_string(),
         request_id,
-        provider_instance_id: Some(provider_instance_id(identity)),
+        provider_instance_id: Some(provider_instance_id(identity)?.to_string()),
         host: host_context(host_options),
         params: SessionReplaceParams {
             settings_id: identity.settings_id.clone(),
@@ -151,7 +151,7 @@ fn replace_request_envelope(
             recovery_id: None,
             extra: JsonObject::new(),
         },
-    }
+    })
 }
 
 fn recovery_replace_request_envelope(
@@ -160,12 +160,12 @@ fn recovery_replace_request_envelope(
     recovery: RecoveryReplaceRequest<'_>,
     host_options: &DescribeHostOptions,
     request_id: String,
-) -> RequestEnvelope<SessionReplaceParams> {
+) -> Result<RequestEnvelope<SessionReplaceParams>, ExternalSessionProviderError> {
     let canonical_transcript = Some(recovery_canonical_transcript(recovery.input));
-    RequestEnvelope {
+    Ok(RequestEnvelope {
         contract: CONTRACT_VERSION.to_string(),
         request_id,
-        provider_instance_id: Some(provider_instance_id(identity)),
+        provider_instance_id: Some(provider_instance_id(identity)?.to_string()),
         host: host_context(host_options),
         params: SessionReplaceParams {
             settings_id: identity.settings_id.clone(),
@@ -183,7 +183,7 @@ fn recovery_replace_request_envelope(
             recovery_id: recovery.recovery_id.map(str::to_string),
             extra: JsonObject::new(),
         },
-    }
+    })
 }
 
 fn recovery_canonical_transcript(

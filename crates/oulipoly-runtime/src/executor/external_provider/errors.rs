@@ -10,6 +10,7 @@ pub(crate) enum ExternalProviderDispatchError {
     RuntimeDisabledCrate,
     ProviderTransport {
         category: String,
+        diagnostic: Option<String>,
     },
     ProviderProtocol {
         category: String,
@@ -40,6 +41,17 @@ impl ExternalProviderDispatchError {
     pub(crate) fn provider_transport_failure(category: impl Into<String>) -> Self {
         Self::ProviderTransport {
             category: category.into(),
+            diagnostic: None,
+        }
+    }
+
+    pub(crate) fn provider_transport_diagnostic(
+        category: impl Into<String>,
+        diagnostic: String,
+    ) -> Self {
+        Self::ProviderTransport {
+            category: category.into(),
+            diagnostic: Some(diagnostic),
         }
     }
 

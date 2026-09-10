@@ -26,6 +26,7 @@ fn base_s1_schema_14_without_capability_upgrades_but_cannot_admit_new_authority(
     let authority = fixture_authority();
     let error = state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &authority,
             ADMISSION_ID,
             completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
@@ -58,6 +59,7 @@ fn base_s1_schema_14_obligations_require_typed_operator_recovery_before_registra
     assert!(state.get_invocation_by_uuid(ROOT_UUID).unwrap().is_some());
     let error = state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &fixture_authority(),
             "post-upgrade-admission",
             completion_registration("post-upgrade-event", ROOT_UUID, OWNER_SESSION_ID),
@@ -113,6 +115,7 @@ fn sibling_state_databases_cannot_register_into_one_sidecar_authority() {
 
     alternate
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &alternate_authority,
             "alternate-state-admission",
             completion_registration("alternate-state-event", ROOT_UUID, OWNER_SESSION_ID),
@@ -138,7 +141,14 @@ fn sibling_state_databases_cannot_register_into_one_sidecar_authority() {
         1
     );
     canonical
-        .finalize_invocation(canonical_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            canonical_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap();
 }
 
@@ -154,6 +164,7 @@ fn completion_admission_rejects_foreign_capability_and_fabricated_session() {
 
     let foreign_error = state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &foreign_authority,
             "foreign-capability-admission",
             completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
@@ -163,6 +174,7 @@ fn completion_admission_rejects_foreign_capability_and_fabricated_session() {
 
     let session_error = state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &owner_authority,
             "fabricated-session-admission",
             completion_registration(EVENT_ID, ROOT_UUID, "fabricated-session"),
@@ -190,10 +202,20 @@ fn caller_bound_capability_preserves_only_exact_immutable_replay() {
     let registration = completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID);
 
     state
-        .register_completion_event_with_authority(&authority, ADMISSION_ID, registration)
+        .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            &authority,
+            ADMISSION_ID,
+            registration,
+        )
         .unwrap();
     state
-        .register_completion_event_with_authority(&authority, ADMISSION_ID, registration)
+        .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            &authority,
+            ADMISSION_ID,
+            registration,
+        )
         .unwrap();
 
     assert_eq!(
@@ -229,6 +251,7 @@ fn admitted_completion_authority_refuses_missing_replaced_and_wrong_generation_s
         start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &authority,
             ADMISSION_ID,
             completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
@@ -239,7 +262,14 @@ fn admitted_completion_authority_refuses_missing_replaced_and_wrong_generation_s
         .sidecar_generation()
         .unwrap();
     state
-        .finalize_invocation(invocation_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap();
 
     let missing_uuid = "55555555-5555-4555-8555-555555555555";
@@ -247,6 +277,7 @@ fn admitted_completion_authority_refuses_missing_replaced_and_wrong_generation_s
         start_authorized_invocation(&state, missing_uuid, "session-missing-sidecar");
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &missing_authority,
             "admission-missing-sidecar",
             completion_registration(
@@ -261,7 +292,14 @@ fn admitted_completion_authority_refuses_missing_replaced_and_wrong_generation_s
 
     let state = StateDb::open(&state_path).unwrap();
     let missing_error = state
-        .finalize_invocation(missing_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            missing_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap_err();
     assert!(
         missing_error.contains("process_integrity"),
@@ -280,7 +318,14 @@ fn admitted_completion_authority_refuses_missing_replaced_and_wrong_generation_s
         .unwrap();
     assert_ne!(replaced_generation, matching_generation);
     let mismatch_error = state
-        .finalize_invocation(missing_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            missing_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap_err();
     assert!(
         mismatch_error.contains("process_integrity"),
@@ -308,6 +353,7 @@ fn admitted_completion_authority_refuses_a_renamed_sidecar_until_exact_authority
         start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &authority,
             ADMISSION_ID,
             completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
@@ -316,7 +362,14 @@ fn admitted_completion_authority_refuses_a_renamed_sidecar_until_exact_authority
     std::fs::rename(&sidecar_path, &renamed_sidecar_path).unwrap();
 
     let error = state
-        .finalize_invocation(invocation_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap_err();
     assert!(error.contains("process_integrity"), "{error}");
     assert!(error.contains("sidecar is missing"), "{error}");
@@ -324,7 +377,14 @@ fn admitted_completion_authority_refuses_a_renamed_sidecar_until_exact_authority
 
     std::fs::rename(&renamed_sidecar_path, &sidecar_path).unwrap();
     state
-        .finalize_invocation(invocation_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap();
 }
 
@@ -344,6 +404,7 @@ fn finalization_rejects_a_post_a_same_generation_snapshot_after_b_is_admitted() 
 
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &a_authority,
             ADMISSION_ID,
             completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
@@ -358,6 +419,7 @@ fn finalization_rejects_a_post_a_same_generation_snapshot_after_b_is_admitted() 
 
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &b_authority,
             "admission-age299-s2-b",
             completion_registration(B_EVENT_ID, B_UUID, B_SESSION_ID),
@@ -383,7 +445,14 @@ fn finalization_rejects_a_post_a_same_generation_snapshot_after_b_is_admitted() 
     );
 
     let error = state
-        .finalize_invocation(a_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            a_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap_err();
 
     assert!(error.contains("process_integrity"), "{error}");
@@ -404,7 +473,14 @@ fn finalization_rejects_a_post_a_same_generation_snapshot_after_b_is_admitted() 
     std::fs::rename(&post_b_snapshot, &sidecar_path).unwrap();
     assert_eq!(std::fs::read(&sidecar_path).unwrap(), post_b_bytes);
     state
-        .finalize_invocation(a_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            a_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap();
 }
 
@@ -432,7 +508,14 @@ fn admitted_completion_authority_refuses_an_absent_event_in_the_matching_sidecar
     );
 
     let error = state
-        .finalize_invocation(invocation_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap_err();
     assert!(error.contains("process_integrity"), "{error}");
     assert!(
@@ -453,6 +536,7 @@ fn admitted_completion_authority_refuses_present_event_with_wrong_owner_or_sessi
             start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
         state
             .register_completion_event_with_authority(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 &authority,
                 ADMISSION_ID,
                 completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
@@ -473,7 +557,14 @@ fn admitted_completion_authority_refuses_present_event_with_wrong_owner_or_sessi
         );
 
         let error = state
-            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                invocation_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap_err();
 
         assert!(error.contains("process_integrity"), "{error}");
@@ -502,6 +593,7 @@ fn finalization_refuses_missing_mismatched_or_drifted_materialization_summaries(
             start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
         state
             .register_completion_event_with_authority(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 &authority,
                 ADMISSION_ID,
                 completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
@@ -536,7 +628,14 @@ fn finalization_refuses_missing_mismatched_or_drifted_materialization_summaries(
         drop(connection);
 
         let error = state
-            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                invocation_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap_err();
 
         assert!(error.contains("process_integrity"), "{mutation}: {error}");
@@ -553,6 +652,7 @@ fn schema_17_upgrade_backfills_only_an_exact_proven_materialization_summary() {
         start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &authority,
             ADMISSION_ID,
             completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
@@ -562,7 +662,19 @@ fn schema_17_upgrade_backfills_only_an_exact_proven_materialization_summary() {
     let connection = rusqlite::Connection::open(&state_path).unwrap();
     connection
         .execute_batch(
-            "DROP TRIGGER trg_invocation_completion_materialization_summary_continuity_insert;
+            "PRAGMA foreign_keys=OFF;
+             DROP TABLE provider_launch_transition_replays;
+             DROP TABLE provider_logical_launches;
+             DROP TABLE provider_launch_attempts;
+             DROP INDEX idx_session_turns_canonical_text_sha256;
+             DROP TABLE session_turn_ingest_streams;
+             ALTER TABLE session_turns DROP COLUMN canonical_text_digest_verified;
+             ALTER TABLE session_turns DROP COLUMN canonical_text_sha256;
+             ALTER TABLE session_turns DROP COLUMN body_bytes;
+             ALTER TABLE session_turns DROP COLUMN body_sha256;
+             ALTER TABLE session_turns DROP COLUMN body_state;
+             ALTER TABLE session_turns DROP COLUMN ingest_digest;
+             DROP TRIGGER trg_invocation_completion_materialization_summary_continuity_insert;
              DROP TABLE invocation_completion_materialization_summary;
              DROP INDEX idx_invocations_parent_running_created;
              DROP INDEX idx_invocations_running_parent;
@@ -586,7 +698,14 @@ fn schema_17_upgrade_backfills_only_an_exact_proven_materialization_summary() {
     assert_eq!(summary.1, 1);
     assert_eq!(summary.2.len(), 64);
     state
-        .finalize_invocation(invocation_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap();
 }
 
@@ -600,6 +719,7 @@ fn sidecar_repair_does_not_synthesize_summary_from_malformed_listener_identity()
         start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &authority,
             ADMISSION_ID,
             completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
@@ -627,7 +747,14 @@ fn sidecar_repair_does_not_synthesize_summary_from_malformed_listener_identity()
     assert_eq!(summary_count, 0);
 
     let error = state
-        .finalize_invocation(invocation_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap_err();
     assert!(error.contains("process_integrity"), "{error}");
     assert_running(&state, ROOT_UUID);
@@ -647,7 +774,14 @@ fn migrated_recovery_obligation_refuses_matching_listener_without_continuity_pro
     let invocation_row_id = state.get_invocation_by_uuid(ROOT_UUID).unwrap().unwrap().id;
 
     let error = state
-        .finalize_invocation(invocation_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap_err();
 
     assert!(
@@ -666,7 +800,14 @@ fn invocation_without_admitted_completion_authority_keeps_existing_absence_seman
     assert!(!MailboxDb::path_for_state_db(&state_path).exists());
 
     state
-        .finalize_invocation(invocation_row_id, true, 0, None, None)
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap();
 }
 
@@ -731,6 +872,7 @@ fn start_authorized_invocation(
         .unwrap();
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             start.invocation_row_id,
             &ProviderSessionBinding {
                 provider_session_id: session_id.to_string(),

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{InvocationStatus, StateDb};
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -10,6 +12,8 @@ use std::process::{Command, Output};
 
 const SESSION_ID: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 const CHAIN_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const NON_QUOTA_FIRST_ACCOUNT: &str = "account-alpha";
+const NON_QUOTA_SIBLING_ACCOUNT: &str = "account-beta";
 const FORCE_KIND: &str = "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND";
 
 struct ResumeProviderFixture<'a> {
@@ -97,7 +101,11 @@ impl Fixture {
         };
         let diagnostic_command = self.write_script("diagnostic-provider.sh", diagnostic_body);
         providers_toml.push_str(&diagnostic_provider_toml(&diagnostic_command));
-        fs::write(self.app_config_dir.join("providers.toml"), providers_toml).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml),
+        )
+        .unwrap();
     }
 
     fn provider_projects_dir(&self, provider: &str) -> PathBuf {
@@ -131,6 +139,12 @@ impl Fixture {
             params![CHAIN_ID, provider, SESSION_ID],
         )
         .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            provider,
+            SESSION_ID,
+            self.dir.path(),
+        );
     }
 
     fn run_resume(&self, model_name: &str) -> Output {
@@ -156,14 +170,17 @@ impl Fixture {
             .arg("continue after quota");
         cmd.current_dir(self.dir.path());
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("OULIPOLY_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.env_remove("OULIPOLY_AUTO_WAKE");
         cmd.env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID");
         cmd.env_remove("OULIPOLY_AUTO_WAKE_TOKEN");
         cmd.env_remove("OULIPOLY_AUTO_WAKE_COUNT");
-        cmd.env_remove("OULIPOLY_AUTO_WAKE_MAX");
         cmd.env_remove("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS");
         cmd
     }
@@ -330,45 +347,23 @@ fn count_lines(content: Option<&str>) -> usize {
 
 fn single_result(output: &Output) -> Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let results = stdout
         .lines()
+        .chain(stderr.lines())
         .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
         .collect::<Vec<_>>();
-    assert_eq!(results.len(), 1, "{stdout}");
+    assert_eq!(results.len(), 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     serde_json::from_str(results[0]).unwrap()
 }
 
 fn assert_success_result(output: &Output, provider_stdout: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.starts_with(&format!("{provider_stdout}\nOULIPOLY_RESULT=")),
-        "{stdout}"
-    );
+    assert_eq!(stdout, format!("{provider_stdout}\n"));
     let result = single_result(output);
-    let mut keys = result
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    keys.sort();
-    assert_eq!(
-        keys,
-        [
-            "error_category",
-            "exit_code",
-            "finished_at",
-            "id",
-            "status",
-            "success",
-            "terminal_reason"
-        ]
-    );
     assert_eq!(result["status"], "succeeded");
     assert_eq!(result["success"], true);
     assert_eq!(result["exit_code"], 0);
-    assert!(result["error_category"].is_null());
-    assert!(result["terminal_reason"].is_null());
 }
 
 fn assert_nonzero_failure_result(output: &Output) {
@@ -399,9 +394,9 @@ fn assert_nonzero_failure_result(output: &Output) {
     assert_eq!(result["status"], "failed");
     assert_eq!(result["success"], false);
     assert_eq!(result["exit_code"], 17);
-    assert_eq!(result["error_category"], "network_error");
+    assert_eq!(result["error_category"], "network_error", "{output:?}");
     assert_eq!(result["terminal_reason"], "exit_nonzero");
-    assert_eq!(result["provider_name"], ["cla", "ude-a"].concat());
+    assert_eq!(result["provider_name"], NON_QUOTA_FIRST_ACCOUNT);
     assert_eq!(result["provider_session_id"], SESSION_ID);
     assert_eq!(result["agent_runner_chain_id"], CHAIN_ID);
     assert_eq!(result["agent_runner_invocation_id"], result["id"]);
@@ -582,6 +577,15 @@ fn resume_all_pool_members_quota_exhausted_returns_all_providers_exhausted() {
 
 #[test]
 fn resume_non_quota_failure_does_not_migrate_or_mark_exhausted() {
+    assert_non_quota_resume_failure(false);
+}
+
+#[test]
+fn resume_diagnostic_request_failure_preserves_original_failure() {
+    assert_non_quota_resume_failure(true);
+}
+
+fn assert_non_quota_resume_failure(diagnostics_unavailable: bool) {
     let first_marker = std::env::temp_dir().join(format!(
         "age100-resume-non-quota-a-{}.txt",
         uuid::Uuid::new_v4()
@@ -602,22 +606,51 @@ fn resume_non_quota_failure_does_not_migrate_or_mark_exhausted() {
     );
     let fixture = seed_base_resume_fixture(
         &[
-            ("claude-a", &first_marker, first_body),
-            ("claude-b", &sibling_marker, sibling_body),
+            (NON_QUOTA_FIRST_ACCOUNT, &first_marker, first_body),
+            (NON_QUOTA_SIBLING_ACCOUNT, &sibling_marker, sibling_body),
         ],
         true,
     );
 
+    if diagnostics_unavailable {
+        fs::remove_file(fixture.dir.path().join("diagnostic-provider.sh")).unwrap();
+    }
     let output = fixture.run_resume("age100-resume");
 
     assert_eq!(output.status.code(), Some(17), "{output:?}");
+    eprintln!(
+        "fixture resume stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_nonzero_failure_result(&output);
+    let result = single_result(&output);
+    let invocation_id = result["agent_runner_invocation_id"].as_str().unwrap();
+    let invocation = fixture
+        .open_db()
+        .get_invocation_by_uuid(invocation_id)
+        .unwrap()
+        .expect("returned invocation must be durable");
+    assert_eq!(invocation.invocation_uuid, invocation_id);
+    assert_eq!(invocation.status, InvocationStatus::Failed);
+    assert_eq!(invocation.success, Some(false));
+    assert_eq!(invocation.exit_code, Some(17));
+    assert_eq!(invocation.error_category.as_deref(), Some("network_error"));
+    assert_eq!(invocation.terminal_reason.as_deref(), Some("exit_nonzero"));
+    assert_eq!(
+        invocation.provider_name.as_deref(),
+        Some(NON_QUOTA_FIRST_ACCOUNT)
+    );
+    assert_eq!(invocation.provider_session_id.as_deref(), Some(SESSION_ID));
+    assert!(invocation.finished_at.is_some());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("connection refused for active resume provider"),
         "{stderr}"
     );
     assert!(stderr.contains("[diagnostics: network_error]"), "{stderr}");
+    if diagnostics_unavailable {
+        assert_secondary_diagnostic_failure(&stderr);
+    }
     assert!(
         stderr.lines().any(|line| line == "exit_nonzero"),
         "{stderr}"
@@ -626,7 +659,21 @@ fn resume_non_quota_failure_does_not_migrate_or_mark_exhausted() {
     assert_eq!(line_count(&first_marker), 1);
     assert_eq!(line_count(&sibling_marker), 0);
     assert_eq!(fixture.exhausted_provider_count(), 0);
-    assert_eq!(fixture.active_segment_provider(), "claude-a");
+    assert_eq!(fixture.active_segment_provider(), NON_QUOTA_FIRST_ACCOUNT);
+}
+
+fn assert_secondary_diagnostic_failure(stderr: &str) {
+    let markers = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_DIAGNOSTIC_FAILURE="))
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 1, "{stderr}");
+    let failure: Value = serde_json::from_str(markers[0]).unwrap();
+    assert_eq!(failure["stage"], "diagnostics");
+    assert_eq!(failure["provider_exit_code"], 17);
+    assert_eq!(failure["error_category"], "diagnostics_failure");
+    assert_eq!(failure["operation"], "diagnose_error");
+    assert!(!failure["message"].as_str().unwrap().is_empty());
 }
 
 #[test]

@@ -60,6 +60,7 @@ fn bound_invocation(db: &StateDb) -> (String, String) {
         .start_invocation(&invocation_start(&invocation_uuid))
         .unwrap();
     db.bind_invocation_provider_session_start(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         row_id,
         &ProviderSessionBinding {
             provider_session_id: provider_session_id.clone(),
@@ -95,8 +96,13 @@ fn post_run_ingest_preserves_start_bound_provider_id() {
         .unwrap();
     let weaker_id = Uuid::new_v4().to_string();
 
-    db.update_session_capture(row.id, Some(&weaker_id), "turn_script")
-        .unwrap();
+    db.update_session_capture(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        row.id,
+        Some(&weaker_id),
+        "turn_script",
+    )
+    .unwrap();
 
     let row = db
         .get_invocation_by_uuid(&invocation_uuid)

@@ -37,13 +37,27 @@ fn age132_invocation_artifact_contract_and_warning_only_failure_paths() {
     let id = start_artifact_invocation(&db, invocation_uuid);
     assert_invocation_artifact(dir.path(), invocation_uuid);
 
-    db.finalize_invocation(id, false, 42, Some("rate_limit"), Some("limited"))
-        .unwrap();
+    db.finalize_invocation(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        false,
+        42,
+        Some("rate_limit"),
+        Some("limited"),
+    )
+    .unwrap();
     assert_result_artifact(dir.path(), invocation_uuid);
 
     let (failing, id) = failing_artifact_invocation();
     failing
-        .finalize_invocation(id, true, 0, None, None)
+        .finalize_invocation(
+            crate::InvocationMutationAuthority::Standalone,
+            id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap();
     assert_invocation_status(&failing, id, "succeeded");
 }
@@ -52,7 +66,14 @@ fn finalized_memory_invocation() -> (StateDb, i64) {
     let memory = StateDb::open(Path::new(":memory:")).unwrap();
     let memory_id = start_artifact_invocation(&memory, &Uuid::new_v4().to_string());
     memory
-        .finalize_invocation(memory_id, true, 0, None, None)
+        .finalize_invocation(
+            crate::InvocationMutationAuthority::Standalone,
+            memory_id,
+            true,
+            0,
+            None,
+            None,
+        )
         .unwrap();
     (memory, memory_id)
 }
@@ -183,31 +204,47 @@ fn age132_returned_artifacts_validate_identity_bounds_and_rollback_failed_retry(
         })
         .unwrap();
     let good = returned_artifact_ref(invocation_uuid, "alpha.txt", 1);
-    db.record_returned_artifacts(id, std::slice::from_ref(&good))
-        .unwrap();
+    db.record_returned_artifacts(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        std::slice::from_ref(&good),
+    )
+    .unwrap();
 
     let mut bad_workflow = returned_artifact_ref(invocation_uuid, "bad-workflow.txt", 1);
     bad_workflow.store_address.workflow_run_id = "not-return-namespace".to_string();
     assert!(
-        db.record_returned_artifacts(id, &[bad_workflow])
-            .unwrap_err()
-            .contains("workflow_run_id")
+        db.record_returned_artifacts(
+            crate::InvocationMutationAuthority::Standalone,
+            id,
+            &[bad_workflow]
+        )
+        .unwrap_err()
+        .contains("workflow_run_id")
     );
 
     let mut bad_version = returned_artifact_ref(invocation_uuid, "bad-version.txt", 1);
     bad_version.version_id = "store://wrong-version".to_string();
     assert!(
-        db.record_returned_artifacts(id, &[bad_version])
-            .unwrap_err()
-            .contains("version_id mismatch")
+        db.record_returned_artifacts(
+            crate::InvocationMutationAuthority::Standalone,
+            id,
+            &[bad_version]
+        )
+        .unwrap_err()
+        .contains("version_id mismatch")
     );
 
     let mut overflow = returned_artifact_ref(invocation_uuid, "overflow.txt", 1);
     overflow.content_len = u64::MAX;
     assert!(
-        db.record_returned_artifacts(id, &[overflow])
-            .unwrap_err()
-            .contains("content_len exceeds SQLite INTEGER range")
+        db.record_returned_artifacts(
+            crate::InvocationMutationAuthority::Standalone,
+            id,
+            &[overflow]
+        )
+        .unwrap_err()
+        .contains("content_len exceeds SQLite INTEGER range")
     );
     assert_eq!(db.list_returned_artifacts(id).unwrap(), vec![good]);
 }

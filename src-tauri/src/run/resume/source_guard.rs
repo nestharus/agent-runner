@@ -126,15 +126,23 @@ mod tests {
             resume_diagnostics_fallback_position(),
             "run_resume diagnostics fallback",
         );
+        assert_present_position(
+            production_block_after(
+                orchestration_source(),
+                "fn apply_resume_terminal_disposition(",
+            )
+            .find("handle_terminal_signal_disposition"),
+            "run_resume typed terminal-signal disposition",
+        );
     }
 
     fn resume_signal_precedence_positions() -> OrderedPositions {
         let run_resume = production_block_after(
             orchestration_source(),
-            "fn handle_resume_attempt_terminal_signal(",
+            "fn handle_ordinary_resume_attempt_terminal_signal(",
         );
         ordered_positions(
-            run_resume.find("handle_terminal_signal_disposition"),
+            run_resume.find("resume_terminal_disposition_outcome"),
             run_resume.find("finalize_completed_attempt"),
         )
     }
@@ -175,11 +183,19 @@ mod tests {
         let disposition_token = disposition_token(disposition);
         let disposition_idx = body.find(&disposition_token);
         let branch = disposition_idx.map(|idx| disposition_branch_source(&body[idx..]));
+        let finalization_source = branch.map(|source| {
+            if source.contains("finalize_terminal_disposition(") {
+                production_block_after(disposition_source(), "fn finalize_terminal_disposition(")
+            } else {
+                source
+            }
+        });
         guard_evidence(
             disposition_idx.is_some(),
-            branch.and_then(|source| source.find("finalize_invocation")),
-            branch.and_then(|source| source.find("guard.mark_finalized()")),
-            branch.is_some_and(|source| source.contains("finalize_invocation_from_guard")),
+            finalization_source.and_then(|source| source.find("finalize_invocation")),
+            finalization_source.and_then(|source| source.find("guard.mark_finalized()")),
+            finalization_source
+                .is_some_and(|source| source.contains("finalize_invocation_from_guard")),
         )
     }
 

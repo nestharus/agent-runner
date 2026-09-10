@@ -80,7 +80,14 @@ fn client_timeout_kills_descendants_observed_by_probe() {
         .expect_err("sleeping process tree should time out");
 
     assert_eq!(error.transport_kind(), "host_timeout");
-    assert_eq!(error.request_id(), Some(REQUEST_ID));
+    match &error {
+        oulipoly_provider::error::ProviderClientError::Transport { .. } => assert_eq!(
+            error.request_id(),
+            None,
+            "no fabricated response ID on host-only failure"
+        ),
+        _ => assert_eq!(error.request_id(), Some(REQUEST_ID)),
+    }
     leak_probe.assert_no_descendants();
 }
 
@@ -113,7 +120,14 @@ fn client_cancellation_kills_descendants_observed_by_probe() {
         .expect("cancellation thread should complete");
 
     assert_eq!(error.transport_kind(), "host_cancelled");
-    assert_eq!(error.request_id(), Some(REQUEST_ID));
+    match &error {
+        oulipoly_provider::error::ProviderClientError::Transport { .. } => assert_eq!(
+            error.request_id(),
+            None,
+            "no fabricated response ID on host-only failure"
+        ),
+        _ => assert_eq!(error.request_id(), Some(REQUEST_ID)),
+    }
     assert!(error.diagnostics().process_was_force_killed);
     assert!(error.diagnostics().process_was_reaped);
     leak_probe.assert_no_descendants();
@@ -141,7 +155,14 @@ fn client_cancellation_gracefully_reaps_sigterm_respecting_provider() {
         .expect_err("cancelled SIGTERM-respecting process should return cancellation");
 
     assert_eq!(error.transport_kind(), "host_cancelled");
-    assert_eq!(error.request_id(), Some(REQUEST_ID));
+    match &error {
+        oulipoly_provider::error::ProviderClientError::Transport { .. } => assert_eq!(
+            error.request_id(),
+            None,
+            "no fabricated response ID on host-only failure"
+        ),
+        _ => assert_eq!(error.request_id(), Some(REQUEST_ID)),
+    }
     assert!(!error.diagnostics().process_was_force_killed);
     assert!(error.diagnostics().process_was_reaped);
 }

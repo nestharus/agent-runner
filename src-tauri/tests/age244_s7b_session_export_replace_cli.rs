@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 const EXTERNAL_MODEL: &str = "provider-a-model";
 const EXTERNAL_PROVIDER: &str = "provider-a-account";
+const EXTERNAL_PROVIDER_INSTANCE: &str = "provider-a-instance";
 
 #[test]
 fn export_cli_external_provider_model_reaches_session_export_dispatch() {
@@ -37,12 +38,20 @@ fn export_cli_external_provider_model_reaches_session_export_dispatch() {
         false,
         None,
     );
+    fixture.set_provider_authority(EXTERNAL_PROVIDER, &provider_path);
     fixture.seed_active_chain(
         fixtures::initiative_06_export::CHAIN_A,
         EXTERNAL_PROVIDER,
         SESSION_A,
         EXTERNAL_MODEL,
         "2026-05-01T00:00:00Z",
+    );
+    fixtures::provider_authority::bind_session_authority_at(
+        &fixture.conn(),
+        EXTERNAL_PROVIDER,
+        SESSION_A,
+        EXTERNAL_PROVIDER_INSTANCE,
+        EXTERNAL_PROVIDER,
     );
 
     let output = fixture.run_export(SESSION_A, &[]);
@@ -246,6 +255,7 @@ fn external_replace_fixture(mode: &str) -> ExternalReplaceFixture {
         &cwd_script,
         &transcript_script,
     );
+    fixture.set_provider_authority(EXTERNAL_PROVIDER, &provider_path);
     fixture.write_sessions_with_locator_path(EXTERNAL_PROVIDER, &jsonl_path);
     fixture.seed_active_chain(
         REPLACE_CHAIN_A,
@@ -253,6 +263,13 @@ fn external_replace_fixture(mode: &str) -> ExternalReplaceFixture {
         SESSION_A,
         MODEL,
         "2026-04-17T08:00:00Z",
+    );
+    fixtures::provider_authority::bind_session_authority_at(
+        &fixture.conn(),
+        EXTERNAL_PROVIDER,
+        SESSION_A,
+        EXTERNAL_PROVIDER_INSTANCE,
+        EXTERNAL_PROVIDER,
     );
     fixture.seed_turns_with_metadata(EXTERNAL_PROVIDER, SESSION_A, &jsonl_path);
     ExternalReplaceFixture {
@@ -295,6 +312,7 @@ fn external_export_with_builtin_fallback_fixture(mode: &str) -> ExternalExportFa
         true,
         None,
     );
+    fixture.set_provider_authority(EXTERNAL_PROVIDER, &provider_path);
     fixture.write_sessions_with_locator_path(EXTERNAL_PROVIDER, &fallback_path);
     fixture.seed_active_chain(
         fixtures::initiative_06_export::CHAIN_A,
@@ -302,6 +320,13 @@ fn external_export_with_builtin_fallback_fixture(mode: &str) -> ExternalExportFa
         SESSION_A,
         EXTERNAL_MODEL,
         "2026-05-01T00:00:00Z",
+    );
+    fixtures::provider_authority::bind_session_authority_at(
+        &fixture.conn(),
+        EXTERNAL_PROVIDER,
+        SESSION_A,
+        EXTERNAL_PROVIDER_INSTANCE,
+        EXTERNAL_PROVIDER,
     );
     ExternalExportFallbackFixture {
         fixture,

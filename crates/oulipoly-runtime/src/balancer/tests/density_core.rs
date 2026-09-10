@@ -33,6 +33,7 @@ fn score_by_density_skips_past_reset_windows() {
     ];
     db.upsert_quota_refresh("a", &a_windows).unwrap();
     db.set_window_delta_for_test("a", 0, 0.01, 22).unwrap();
+    mark_provider_turn_count_caught_up(&db, "a");
 
     // Provider `b`: heavily-used 7d window, nothing past-reset.
     seed_windows_with_deltas(&db, "b", &[(0.85, 24 * 7, 0.01, 22)]);

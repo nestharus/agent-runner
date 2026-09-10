@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 7;
+pub(super) const CURRENT_VERSION: i64 = 13;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -82,6 +82,36 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 7,
         owner: SidecarEntity::SessionAdmission,
         apply: ensure_session_admission_launcher_identity_schema,
+    },
+    MigrationStep {
+        target_version: 8,
+        owner: SidecarEntity::WakeAndSessionMetadata,
+        apply: ensure_wake_sweep_progress_schema,
+    },
+    MigrationStep {
+        target_version: 9,
+        owner: SidecarEntity::SessionAdmission,
+        apply: ensure_session_admission_scaling_indexes,
+    },
+    MigrationStep {
+        target_version: 10,
+        owner: SidecarEntity::PayloadRetention,
+        apply: ensure_terminal_history_retention_schema,
+    },
+    MigrationStep {
+        target_version: 11,
+        owner: SidecarEntity::PayloadRetention,
+        apply: ensure_terminal_payload_lookup_indexes,
+    },
+    MigrationStep {
+        target_version: 12,
+        owner: SidecarEntity::MailboxDelivery,
+        apply: ensure_mailbox_delivery_settlement_schema,
+    },
+    MigrationStep {
+        target_version: 13,
+        owner: SidecarEntity::MailboxDelivery,
+        apply: migrate_headless_observation_fence,
     },
 ];
 
@@ -246,12 +276,30 @@ fn ensure_session_admission_launcher_identity_schema(conn: &Connection) -> Resul
     super::ensure_session_admission_launcher_identity_schema(conn)
 }
 
+fn ensure_session_admission_scaling_indexes(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(super::session_admission_scaling_indexes_definition())
+        .map_err(|err| format!("Failed to ensure session admission scaling indexes: {err}"))
+}
+
+fn ensure_terminal_history_retention_schema(conn: &Connection) -> Result<(), String> {
+    super::ensure_terminal_history_retention_schema(conn)
+}
+
+fn ensure_terminal_payload_lookup_indexes(conn: &Connection) -> Result<(), String> {
+    super::ensure_terminal_payload_lookup_indexes(conn)
+}
+
 fn ensure_wake_and_session_metadata_schema(conn: &Connection) -> Result<(), String> {
     super::ensure_session_runtime_columns(conn)
 }
 
 fn ensure_wake_process_identity_schema(conn: &Connection) -> Result<(), String> {
     super::ensure_wake_claim_process_identity_columns(conn)
+}
+
+fn ensure_wake_sweep_progress_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(super::wake_sweep_progress_schema_definition())
+        .map_err(|err| format!("Failed to ensure wake sweep progress schema: {err}"))
 }
 
 fn ensure_runtime_creator_identity_schema(conn: &Connection) -> Result<(), String> {
@@ -481,4 +529,9 @@ fn session_has_nonterminal_generation(conn: &Connection, session_id: &str) -> Re
 fn sidecar_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|err| format!("Failed to read PID mailbox sidecar schema version: {err}"))
+}
+
+fn migrate_headless_observation_fence(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("0013_headless_observation_fence.sql"))
+        .map_err(|err| format!("Failed to migrate headless observation fence: {err}"))
 }

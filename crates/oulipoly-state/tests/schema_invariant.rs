@@ -365,14 +365,7 @@ fn declaration_carriers_present_in_source() {
         ),
         (
             "crates/oulipoly-runtime/src/sessions/mod.rs",
-            &[
-                "orchestration",
-                "parser",
-                "validator",
-                "mapper",
-                "formatter",
-                "predicate",
-            ][..],
+            &["accessor", "formatter", "orchestration", "validator"][..],
         ),
         (
             "crates/oulipoly-config/src/sessions.rs",
@@ -430,9 +423,9 @@ fn declaration_carriers_present_in_source() {
             "crates/oulipoly-runtime/src/sessions/mod.rs",
             &[
                 "## Intrinsic-surface declarations",
-                "Domain: session_turn_ingest",
-                "adapter-script scan/ingest",
-                "ScanReport.new_turns",
+                "Domain: session_transcript_location",
+                "transcript locator script dispatch",
+                "exact single-path stdout validation",
             ][..],
         ),
         (

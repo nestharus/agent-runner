@@ -9,9 +9,10 @@
 //! predicates, assertion validators, and test orchestration.
 
 use oulipoly_config::{
-    InputDef, InputType, ModelConfig, PromptMode, ProviderConfig,
-    provider_implementation_ref::ProviderImplementationRef,
+    InputDef, InputType, ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig,
+    ProviderEntry, ProvidersConfig, provider_implementation_ref::ProviderImplementationRef,
 };
+use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_runtime::executor;
 use oulipoly_runtime::executor::cli::{self, EffectiveExecuteRequest};
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
@@ -27,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-const SELECTED_PROVIDER_SETTINGS_ID: &str = "provider-a-account";
+const SELECTED_PROVIDER_SETTINGS_ID: &str = "provider-a-settings-record";
 const GENERIC_PARENT_ENV_VALUE: &str = "unicode-\u{2603}";
 const OPENAI_KEY_VALUE: &str = "ambient-openai-secret-for-provider-policy";
 const OPENAI_BASE_URL_VALUE: &str = "https://ambient-openai.example.invalid";
@@ -35,6 +36,31 @@ const CHILD_CUSTODY_FAULT_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_FAULT";
 const CHILD_CUSTODY_READY_FILE_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE";
 const CHILD_PID_FILE_ENV: &str = "OULIPOLY_CHILD_PID_FILE";
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+fn auto_wake_environment_names() -> Vec<&'static str> {
+    AutoWakeEnvironmentVariable::ALL
+        .into_iter()
+        .map(AutoWakeEnvironmentVariable::name)
+        .collect()
+}
+
+fn runner_private_environment_names() -> Vec<&'static str> {
+    auto_wake_environment_names()
+        .into_iter()
+        .chain([
+            oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+            "OULIPOLY_PARENT_INVOCATION",
+        ])
+        .collect()
+}
+
+fn assert_test_catalog_extension() {
+    assert!(
+        AutoWakeEnvironmentVariable::ALL.contains(&AutoWakeEnvironmentVariable::TEST_SENTINEL),
+        "external-provider tests must extend the production catalog"
+    );
+}
 
 struct ScriptFixture {
     _dir: tempfile::TempDir,
@@ -45,6 +71,7 @@ struct ExternalFixture {
     _dir: tempfile::TempDir,
     provider_path: PathBuf,
     order_path: PathBuf,
+    process_env_record_path: PathBuf,
     policy_record_path: PathBuf,
     launch_record_path: PathBuf,
     legacy_record_path: PathBuf,
@@ -62,6 +89,7 @@ enum PolicyMode {
     Accept,
     Reject,
     Transform,
+    PrivateEnvTransform,
     HybridShape,
 }
 
@@ -78,6 +106,8 @@ enum LaunchMode {
     CancelledFinal,
     UnknownTerminalWithQuotaText,
     HostCancelledBeforeFinal,
+    LargeOutput,
+    LiveAttachmentStorageFailure,
 }
 
 #[derive(Debug, Default)]
@@ -120,10 +150,23 @@ impl Drop for EnvScope {
 }
 
 fn env_lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
+    env_mutex().lock().unwrap_or_else(|err| err.into_inner())
+}
+
+fn env_mutex() -> &'static Mutex<()> {
+    ENV_LOCK.get_or_init(|| {
+        let data_dir = TEST_DATA_DIR.get_or_init(|| tempfile::tempdir().expect("test data dir"));
+        if std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV).is_none() {
+            unsafe {
+                std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, data_dir.path());
+            }
+        }
+        Mutex::new(())
+    })
+}
+
+fn ensure_test_data_dir() {
+    let _ = env_mutex();
 }
 
 fn set_env(key: &str, value: Option<&std::ffi::OsStr>) {
@@ -138,6 +181,7 @@ fn set_env(key: &str, value: Option<&std::ffi::OsStr>) {
 }
 
 fn fixture_script(body: &str) -> ScriptFixture {
+    ensure_test_data_dir();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("provider.sh");
     write_executable(
@@ -161,26 +205,6 @@ fn provider_ref_path(path: &Path) -> ProviderImplementationRef {
         version: None,
         binary: None,
         script: None,
-    }
-}
-
-fn provider_ref_binary(name: &str) -> ProviderImplementationRef {
-    ProviderImplementationRef {
-        path: None,
-        crate_name: None,
-        version: None,
-        binary: Some(name.to_string()),
-        script: None,
-    }
-}
-
-fn provider_ref_script(path: &Path) -> ProviderImplementationRef {
-    ProviderImplementationRef {
-        path: None,
-        crate_name: None,
-        version: None,
-        binary: None,
-        script: Some(path.display().to_string()),
     }
 }
 
@@ -333,7 +357,32 @@ fn dispatch_registry_for_models_with_options(
     models: &[ModelConfig],
     options: ProviderRegistryOptions,
 ) -> ProviderRegistry {
-    ProviderRegistry::from_model_configs(models, options)
+    let providers = ProvidersConfig {
+        entries: models
+            .iter()
+            .filter_map(|model| {
+                let provider_ref = model.provider.as_ref()?;
+                let executable = provider_ref
+                    .path
+                    .as_ref()
+                    .or(provider_ref.binary.as_ref())
+                    .or(provider_ref.script.as_ref())?;
+                let account = model.providers.first()?.name.clone();
+                Some((
+                    account,
+                    ProviderEntry {
+                        implementation: Some(ProviderEndpointConfig {
+                            family: "provider-a-family".to_string(),
+                            executable: executable.clone(),
+                        }),
+                        settings_id: Some(SELECTED_PROVIDER_SETTINGS_ID.to_string()),
+                        ..ProviderEntry::default()
+                    },
+                ))
+            })
+            .collect(),
+    };
+    ProviderRegistry::from_configs(models, &providers, options)
         .expect("dispatch registry should construct from test models")
 }
 
@@ -427,8 +476,10 @@ fn make_external_fixture(
     policy_mode: PolicyMode,
     launch_mode: LaunchMode,
 ) -> ExternalFixture {
+    ensure_test_data_dir();
     let dir = tempfile::tempdir().expect("tempdir");
     let order_path = dir.path().join("order.txt");
+    let process_env_record_path = dir.path().join("process-env.jsonl");
     let policy_record_path = dir.path().join("policy-request.json");
     let launch_record_path = dir.path().join("launch-request.json");
     let legacy_record_path = dir.path().join("legacy-record.txt");
@@ -450,6 +501,7 @@ fn make_external_fixture(
             policy_mode,
             launch_mode,
             &order_path,
+            &process_env_record_path,
             &policy_record_path,
             &launch_record_path,
         ),
@@ -459,11 +511,81 @@ fn make_external_fixture(
         _dir: dir,
         provider_path,
         order_path,
+        process_env_record_path,
         policy_record_path,
         launch_record_path,
         legacy_record_path,
         legacy_trap_path,
     }
+}
+
+fn make_describe_replacing_external_fixture() -> ExternalFixture {
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let replacement_path = fixture._dir.path().join("replacement-provider.sh");
+    write_executable(
+        &replacement_path,
+        &format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf 'replacement artifact invoked' > {}\nexit 77\n",
+            shell_quote(&fixture.legacy_record_path)
+        ),
+    );
+    let body = fs::read_to_string(&fixture.provider_path).expect("provider source");
+    let describe_start = "def describe(request):\n    response";
+    let replacement = format!(
+        "def describe(request):\n    os.replace({}, {})\n    response",
+        serde_json::to_string(&replacement_path.display().to_string()).unwrap(),
+        serde_json::to_string(&fixture.provider_path.display().to_string()).unwrap(),
+    );
+    let body = body.replacen(describe_start, &replacement, 1);
+    let body = body.replacen("\"terminal\": False", "\"terminal\": True", 1);
+    assert_ne!(body, fs::read_to_string(&fixture.provider_path).unwrap());
+    write_executable(&fixture.provider_path, &body);
+    fixture
+}
+
+fn enable_terminal_capability(fixture: &ExternalFixture) {
+    let body = fs::read_to_string(&fixture.provider_path).expect("provider source");
+    let body = body.replacen("\"terminal\": False", "\"terminal\": True", 1);
+    assert_ne!(
+        body,
+        fs::read_to_string(&fixture.provider_path).expect("provider source")
+    );
+    write_executable(&fixture.provider_path, &body);
+}
+
+fn enable_prompt_acceptance_capability(fixture: &ExternalFixture) {
+    let body = fs::read_to_string(&fixture.provider_path).expect("provider source");
+    let body = body.replacen(
+        "\"launch\": CAP_LAUNCH,",
+        "\"launch\": CAP_LAUNCH,\n            \"prompt_acceptance_v1\": True,",
+        1,
+    );
+    assert_ne!(
+        body,
+        fs::read_to_string(&fixture.provider_path).expect("provider source")
+    );
+    write_executable(&fixture.provider_path, &body);
+}
+
+fn disable_launch_output_capability(fixture: &ExternalFixture) {
+    let body = fs::read_to_string(&fixture.provider_path).expect("provider source");
+    let body = body.replacen(
+        "\"launch_output_v1\": True",
+        "\"launch_output_v1\": False",
+        1,
+    );
+    assert_ne!(
+        body,
+        fs::read_to_string(&fixture.provider_path).expect("provider source")
+    );
+    write_executable(&fixture.provider_path, &body);
 }
 
 fn shell_quote(path: &Path) -> String {
@@ -475,6 +597,7 @@ fn fake_provider_body(
     policy_mode: PolicyMode,
     launch_mode: LaunchMode,
     order_path: &Path,
+    process_env_record_path: &Path,
     policy_record_path: &Path,
     launch_record_path: &Path,
 ) -> String {
@@ -483,6 +606,7 @@ fn fake_provider_body(
         policy_mode_wire(policy_mode),
         launch_mode_wire(launch_mode),
         order_path,
+        process_env_record_path,
         policy_record_path,
         launch_record_path,
     )
@@ -493,6 +617,7 @@ fn policy_mode_wire(policy_mode: PolicyMode) -> &'static str {
         PolicyMode::Accept => "accept",
         PolicyMode::Reject => "reject",
         PolicyMode::Transform => "transform",
+        PolicyMode::PrivateEnvTransform => "private_env_transform",
         PolicyMode::HybridShape => "hybrid_shape",
     }
 }
@@ -510,6 +635,8 @@ fn launch_mode_wire(launch_mode: LaunchMode) -> &'static str {
         LaunchMode::CancelledFinal => "cancelled_final",
         LaunchMode::UnknownTerminalWithQuotaText => "unknown_terminal_with_quota_text",
         LaunchMode::HostCancelledBeforeFinal => "host_cancelled_before_final",
+        LaunchMode::LargeOutput => "large_output",
+        LaunchMode::LiveAttachmentStorageFailure => "live_attachment_storage_failure",
     }
 }
 
@@ -518,18 +645,30 @@ fn fake_provider_script_body(
     policy_mode: &str,
     launch_mode: &str,
     order_path: &Path,
+    process_env_record_path: &Path,
     policy_record_path: &Path,
     launch_record_path: &Path,
 ) -> String {
+    let runner_private_env_names = AutoWakeEnvironmentVariable::ALL
+        .into_iter()
+        .map(AutoWakeEnvironmentVariable::name)
+        .chain([
+            oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+            "OULIPOLY_PARENT_INVOCATION",
+        ])
+        .collect::<Vec<_>>();
     format!(
         r#"#!/usr/bin/env python3
 import json
+import base64
+import hashlib
 import os
 import pathlib
 import sys
 
 CONTRACT = "oulipoly.provider/v1"
 ORDER = pathlib.Path({order_path})
+PROCESS_ENV_RECORD = pathlib.Path({process_env_record_path})
 POLICY_RECORD = pathlib.Path({policy_record_path})
 LAUNCH_RECORD = pathlib.Path({launch_record_path})
 CAP_POLICY = {cap_policy}
@@ -539,7 +678,14 @@ LAUNCH_MODE = {launch_mode}
 
 PID_FILE = os.environ.get("OULIPOLY_CHILD_PID_FILE")
 READY_FILE = os.environ.get("OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE")
-if PID_FILE and READY_FILE:
+SUBCOMMAND = sys.argv[1] if len(sys.argv) > 1 else ""
+RUNNER_PRIVATE_ENV_NAMES = {runner_private_env_names}
+with PROCESS_ENV_RECORD.open("a") as stream:
+    stream.write(json.dumps({{
+        "subcommand": SUBCOMMAND,
+        "env": {{name: os.environ[name] for name in RUNNER_PRIVATE_ENV_NAMES if name in os.environ}},
+    }}, sort_keys=True) + "\n")
+if PID_FILE and READY_FILE and SUBCOMMAND == "launch":
     pathlib.Path(PID_FILE).write_text(str(os.getpid()))
     pathlib.Path(READY_FILE).touch()
 
@@ -580,6 +726,7 @@ def describe(request):
         "preferred_contract": CONTRACT,
         "capabilities": {{
             "launch": CAP_LAUNCH,
+            "launch_output_v1": True,
             "policy": CAP_POLICY,
             "quota": False,
             "session": False,
@@ -618,8 +765,28 @@ def policy(request):
         result["env"] = {{"POLICY_TRANSFORM_COUNT": "1"}}
         result["stdin"] = "stdin-from-policy"
         result["prompt"] = "prompt-from-policy"
+    if POLICY_MODE == "private_env_transform":
+        result["env"] = {{name: "policy-private" for name in RUNNER_PRIVATE_ENV_NAMES}}
+        result["env"].update({{
+            "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY": "policy-private",
+            "OULIPOLY_PARENT_INVOCATION": json.dumps({{
+                "source": "policy-private",
+                "id": "22222222-2222-4222-8222-222222222222",
+                "_oulipoly_completion_registration_authority": "cd" * 32,
+            }}),
+        }})
     response(request, result)
     clear_custody_readiness()
+
+def terminal_classify(request):
+    append_order("terminal.classify")
+    response(request, {{
+        "terminal_signal": {{
+            "kind": "clean_exit",
+            "evidence": "selected provider terminal classification",
+            "observed_at_unix_ms": 2005
+        }}
+    }})
 
 def hybrid_policy_result(request):
     params = request.get("params", {{}})
@@ -629,7 +796,7 @@ def hybrid_policy_result(request):
     argv = launch.get("argv", [])
     prompt = model.get("inputs", {{}}).get("prompt")
     diagnostics = []
-    if params.get("settings_id") != request.get("provider_instance_id"):
+    if params.get("settings_id") != {selected_provider_settings_id}:
         diagnostics.append({{"severity": "error", "code": "unexpected_settings_id", "message": str(params.get("settings_id"))}})
     if argv[:len(expected_prefix)] != expected_prefix:
         diagnostics.append({{"severity": "error", "code": "unexpected_argv_prefix", "message": json.dumps(argv)}})
@@ -662,10 +829,45 @@ def exit_event(request, seq, code, signal):
         "session": {{"provider_session_id": "example-session"}}
     }}
 
+def output_completion_event(request, seq, stdout_chunks, stderr_chunks):
+    stdout = b"".join(base64.b64decode(chunk) for chunk in stdout_chunks)
+    stderr = b"".join(base64.b64decode(chunk) for chunk in stderr_chunks)
+    return {{
+        "contract": CONTRACT,
+        "request_id": request_id(request),
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
+        "kind": "marker",
+        "name": "oulipoly.launch_output_complete/v1",
+        "value": {{
+            "protocol": "oulipoly.launch_output/v1",
+            "stdout": {{"bytes": len(stdout), "sha256": hashlib.sha256(stdout).hexdigest()}},
+            "stderr": {{"bytes": len(stderr), "sha256": hashlib.sha256(stderr).hexdigest()}},
+            "data_event_count": len(stdout_chunks) + len(stderr_chunks),
+        }},
+    }}
+
 def launch(_request):
     append_order("launch")
     LAUNCH_RECORD.write_text(json.dumps(_request, sort_keys=True))
     reqid = request_id(_request)
+    if LAUNCH_MODE == "live_attachment_storage_failure":
+        import sqlite3
+        # Controlled fixture-only trigger: actual attachment SQL fails after child binding.
+        db = sqlite3.connect(pathlib.Path(os.environ["OULIPOLY_DATA_DIR"]) / "pid-identity.db")
+        db.execute("CREATE TRIGGER reject_fixture_attachment BEFORE UPDATE OF session_id ON runtime_generation BEGIN SELECT RAISE(ABORT, 'fixture storage fault'); END")
+        db.commit()
+        db.close()
+        # Return an authentic artifact produced in the controlled fixture store.
+        ref = json.loads((LAUNCH_RECORD.parent / "produced-ref.json").read_text())
+        pathlib.Path(_request["params"]["env"]["OULIPOLY_RETURN_CHANNEL"]).write_text(json.dumps(ref) + "\n")
+        write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 1, "time_unix_ms": 1001, "kind": "stdout", "data_base64": "AAH/"}})
+        write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 2, "time_unix_ms": 1002, "kind": "stderr", "data_base64": "ZXJy//4="}})
+        write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 3, "time_unix_ms": 1003, "kind": "marker", "name": "oulipoly.provider_session", "value": {{"provider_session_id": "example-session"}}}})
+        # No output completion or exit event: the host must retain only partial evidence.
+        import time
+        time.sleep(5)
+        return 0
     if LAUNCH_MODE == "malformed_protocol":
         sys.stdout.write("{{not-json}}\n")
         sys.stdout.flush()
@@ -686,48 +888,62 @@ def launch(_request):
         return 8
     if LAUNCH_MODE == "cancelled_final":
         write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 1, "time_unix_ms": 1001, "kind": "stdout", "data_base64": "YQ=="}})
+        write_jsonl(output_completion_event(_request, 2, ["YQ=="], []))
         write_jsonl({{
             "contract": CONTRACT,
             "request_id": reqid,
-            "seq": 2,
-            "time_unix_ms": 1002,
+            "seq": 3,
+            "time_unix_ms": 1003,
             "kind": "exit",
             "status": {{"kind": "cancelled"}},
-            "terminal_signal": {{"kind": "cancelled", "evidence": "fake-provider cancellation", "observed_at_unix_ms": 1002}},
+            "terminal_signal": {{"kind": "cancelled", "evidence": "fake-provider cancellation", "observed_at_unix_ms": 1003}},
             "session": {{"provider_session_id": "example-session"}}
         }})
         return 0
     if LAUNCH_MODE == "unknown_terminal_with_quota_text":
         write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 1, "time_unix_ms": 1001, "kind": "stderr", "data_base64": "cXVvdGFfZXhoYXVzdGVkX2luYmFuZA=="}})
-        write_jsonl(exit_event(_request, 2, 0, "unknown"))
+        write_jsonl(output_completion_event(_request, 2, [], ["cXVvdGFfZXhoYXVzdGVkX2luYmFuZA=="]))
+        write_jsonl(exit_event(_request, 3, 0, "unknown"))
         return 0
     if LAUNCH_MODE == "host_cancelled_before_final":
         import time
         time.sleep(5)
         return 0
+    if LAUNCH_MODE == "large_output":
+        chunk = base64.b64encode(b"x" * 8192).decode()
+        for seq in range(1, 257):
+            write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": seq, "time_unix_ms": 1000 + seq, "kind": "stdout", "data_base64": chunk}})
+        write_jsonl(output_completion_event(_request, 257, [chunk] * 256, []))
+        write_jsonl(exit_event(_request, 258, 0, "clean_exit"))
+        return 0
     code = 9 if LAUNCH_MODE == "nonzero_final" else 0
     write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 1, "time_unix_ms": 1001, "kind": "stdout", "data_base64": "AAH/"}})
     write_jsonl({{"contract": CONTRACT, "request_id": reqid, "seq": 2, "time_unix_ms": 1002, "kind": "stderr", "data_base64": "ZXJy//4="}})
-    write_jsonl(exit_event(_request, 3, code, "nonzero_exit" if code else "clean_exit"))
+    write_jsonl(output_completion_event(_request, 3, ["AAH/"], ["ZXJy//4="]))
+    write_jsonl(exit_event(_request, 4, code, "nonzero_exit" if code else "clean_exit"))
     return 6 if LAUNCH_MODE == "provider_nonzero_after_final" else 0
 
 def main():
-    subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
     request = read_request()
-    if subcommand == "describe":
+    if SUBCOMMAND == "describe":
         describe(request)
         return 0
-    if subcommand == "policy.evaluate":
+    if SUBCOMMAND == "policy.evaluate":
         policy(request)
         return 0
-    if subcommand == "launch":
+    if SUBCOMMAND == "launch":
         return launch(request)
+    if SUBCOMMAND == "terminal.classify":
+        terminal_classify(request)
+        return 0
     return 64
 
 if __name__ == "__main__":
     raise SystemExit(main())
 "#,
         order_path = serde_json::to_string(&order_path.display().to_string()).unwrap(),
+        process_env_record_path =
+            serde_json::to_string(&process_env_record_path.display().to_string()).unwrap(),
         policy_record_path =
             serde_json::to_string(&policy_record_path.display().to_string()).unwrap(),
         launch_record_path =
@@ -736,6 +952,9 @@ if __name__ == "__main__":
         cap_launch = py_bool(capabilities.launch),
         policy_mode = serde_json::to_string(policy_mode).unwrap(),
         launch_mode = serde_json::to_string(launch_mode).unwrap(),
+        runner_private_env_names = serde_json::to_string(&runner_private_env_names).unwrap(),
+        selected_provider_settings_id =
+            serde_json::to_string(SELECTED_PROVIDER_SETTINGS_ID).unwrap(),
     )
 }
 
@@ -749,6 +968,10 @@ fn read_json(path: &Path) -> serde_json::Value {
 
 fn read_json_text(path: &Path) -> String {
     fs::read_to_string(path).expect("record should exist")
+}
+
+fn read_json_lines(path: &Path) -> Vec<Value> {
+    read_json_text(path).lines().map(parse_json_value).collect()
 }
 
 fn parse_json_value(text: &str) -> serde_json::Value {
@@ -829,10 +1052,11 @@ fn runtime_executor_dispatch_no_ref_preserves_legacy_bytes_with_unrelated_regist
 printf 'err:%b:%s\n' '\376' "$1" >&2"#,
     );
     let unrelated = fixture_script("printf 'unrelated external provider should not run\\n'");
-    let unrelated_model = model_with_provider_ref(
+    let mut unrelated_model = model_with_provider_ref(
         "unused-provider-command",
         Some(provider_ref_path(&unrelated.path)),
     );
+    unrelated_model.providers[0].name = "unrelated-provider-account".to_string();
     let registry = dispatch_registry_for_models(&[unrelated_model]);
     assert_eq!(registry.configured_artifact_keys().len(), 1);
 
@@ -882,8 +1106,9 @@ fn runtime_executor_dispatch_no_ref_does_not_construct_or_invoke_provider_client
         counter = shell_quote(counter.path()),
         json = "{\"contract\":\"oulipoly.provider/v1\",\"request_id\":\"request-example-001\",\"ok\":true,\"result\":{}}"
     ));
-    let unrelated_model =
+    let mut unrelated_model =
         model_with_provider_ref("unused", Some(provider_ref_path(&external.path)));
+    unrelated_model.providers[0].name = "unrelated-provider-account".to_string();
     let registry = dispatch_registry_for_models(&[unrelated_model]);
     assert_eq!(registry.configured_artifact_keys().len(), 1);
 
@@ -918,14 +1143,14 @@ fn runtime_executor_dispatch_no_ref_does_not_construct_or_invoke_provider_client
 }
 
 #[test]
-fn external_provider_runtime_disabled_crate_fails_before_provider_call() {
+fn model_scoped_crate_reference_does_not_create_account_endpoint_authority() {
     let legacy = fixture_script("printf 'legacy fallback\\n'; exit 77");
     let model = crate_external_model(&legacy);
     let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
 
-    let error = execute_dispatch_aware_result(
-        registry,
-        ExecutorServiceRequest::Facade {
+    assert!(registry.configured_artifact_keys().is_empty());
+    let result = executor::RuntimeExecutorService::new(Arc::new(registry))
+        .execute(ExecutorServiceRequest::Facade {
             model,
             provider_index: 0,
             prompt: "prompt-value".to_string(),
@@ -933,11 +1158,12 @@ fn external_provider_runtime_disabled_crate_fails_before_provider_call() {
             models_dir: None,
             extra_inputs: HashMap::new(),
             parent_invocation_env: None,
-        },
-    )
-    .expect_err("crate provider refs must fail before legacy fallback or provider invocation");
+        })
+        .expect("parse-only model reference must not create external endpoint authority")
+        .result;
 
-    assert!(error.to_string().contains("runtime-disabled"));
+    assert_eq!(result.exit_code, 77);
+    assert_eq!(result.stdout, b"legacy fallback\n");
 }
 
 #[test]
@@ -961,6 +1187,31 @@ fn external_provider_missing_policy_or_launch_capability_fails_without_builtin_f
         assert!(!fixture.legacy_record_path.exists());
         assert!(!fixture.launch_record_path.exists());
     }
+}
+
+#[test]
+fn external_provider_missing_launch_output_capability_requires_provider_upgrade() {
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    disable_launch_output_capability(&fixture);
+
+    let error = execute_external_fixture(&fixture)
+        .expect_err("launch_output_v1 is mandatory for external-provider dispatch");
+
+    assert!(
+        error
+            .to_string()
+            .contains("complete_launch_output_unsupported")
+    );
+    assert!(!fixture.policy_record_path.exists());
+    assert!(!fixture.launch_record_path.exists());
+    assert!(!fixture.legacy_record_path.exists());
 }
 
 #[test]
@@ -1012,6 +1263,24 @@ fn external_provider_policy_evaluate_runs_before_launch_and_uses_selected_provid
 }
 
 #[test]
+fn external_dispatch_keeps_the_capability_advertiser_after_path_replacement() {
+    let fixture = make_describe_replacing_external_fixture();
+
+    let result = execute_external_fixture(&fixture)
+        .expect("the selected capability advertiser should perform policy and launch");
+
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        ["policy.evaluate", "launch", "terminal.classify"]
+    );
+    assert_eq!(result.stdout, vec![0, 1, 255]);
+    assert!(
+        !fixture.legacy_record_path.exists(),
+        "the replacement artifact must not inherit negotiated authority"
+    );
+}
+
+#[test]
 fn external_provider_policy_request_passes_hybrid_launch_shape() {
     let fixture = make_external_fixture(
         Capabilities {
@@ -1031,10 +1300,7 @@ fn external_provider_policy_request_passes_hybrid_launch_shape() {
         policy["params"]["settings_id"],
         SELECTED_PROVIDER_SETTINGS_ID
     );
-    assert_eq!(
-        policy["provider_instance_id"],
-        SELECTED_PROVIDER_SETTINGS_ID
-    );
+    assert_eq!(policy["provider_instance_id"], "fake-provider-instance");
     assert_eq!(
         launch["command"],
         fixture.legacy_trap_path.display().to_string()
@@ -1086,6 +1352,11 @@ fn external_provider_launch_request_carries_selected_settings_id_and_effective_i
     assert_launch_argv_tail(&launch_argv);
     assert_effective_input_flags(&launch_argv);
     assert_no_arg_mode_stdin(&launch);
+    assert_eq!(
+        launch["params"]["output_delivery"]["protocol"],
+        "oulipoly.launch_output/v1"
+    );
+    assert_eq!(launch["host"]["env"]["OULIPOLY_HOST_LAUNCH_OUTPUT_V1"], "1");
 }
 
 fn explicit_working_dir(fixture: &ExternalFixture) -> PathBuf {
@@ -1105,7 +1376,11 @@ fn effective_extra_inputs() -> HashMap<String, Vec<String>> {
 }
 
 fn parent_invocation_env() -> String {
-    "parent-provider-a-invocation".to_string()
+    serde_json::json!({
+        "source": "parent-provider-a",
+        "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    })
+    .to_string()
 }
 
 struct TestTempPath {
@@ -1531,6 +1806,171 @@ fn external_provider_launch_env_inherits_application_agnostic_parent_entries() {
 }
 
 #[test]
+fn external_provider_launch_env_removes_runner_private_entries() {
+    assert_test_catalog_extension();
+    let private_names = runner_private_environment_names();
+    let _lock = env_lock();
+    let inherited = private_names
+        .iter()
+        .map(|name| (*name, Some("inherited-private")))
+        .collect::<Vec<_>>();
+    let _env = EnvScope::set_optional(&inherited);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let mut model = external_model(&fixture);
+    model.providers[0].environment = private_names
+        .iter()
+        .map(|name| (name.to_string(), "configured-private".to_string()))
+        .collect();
+
+    execute_external_model_effective(model, None, HashMap::new(), None)
+        .expect("external dispatch should remove runner-private entries");
+
+    let policy = read_json(&fixture.policy_record_path);
+    let launch = read_json(&fixture.launch_record_path);
+    for env in provider_launch_envs(&policy, &launch) {
+        for name in &private_names {
+            assert!(
+                env.get(*name).is_none(),
+                "runner-private {name} must not cross the provider boundary"
+            );
+        }
+    }
+}
+
+#[test]
+fn external_provider_subcommands_do_not_inherit_runner_private_authority() {
+    assert_test_catalog_extension();
+    let private_names = runner_private_environment_names();
+    let _lock = env_lock();
+    let invocation = oulipoly_state::CompositeInvocationId {
+        source: "fixture-provider".to_string(),
+        id: "11111111-1111-4111-8111-111111111111".to_string(),
+    };
+    let authority =
+        oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+            "ab".repeat(32),
+        )
+        .expect("valid completion registration authority");
+    let parent_environment = authority
+        .invocation_launch_environment(&invocation)
+        .expect("parent launch environment");
+    let mut inherited = auto_wake_environment_names()
+        .into_iter()
+        .map(|name| (name, Some("inherited-private")))
+        .collect::<Vec<_>>();
+    inherited.push((
+        oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+        Some(authority.process_environment_value()),
+    ));
+    inherited.push((
+        "OULIPOLY_PARENT_INVOCATION",
+        Some(parent_environment.as_str()),
+    ));
+    let _env = EnvScope::set_optional(&inherited);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    enable_terminal_capability(&fixture);
+
+    execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(parent_environment))
+        .expect("external dispatch should sanitize every provider subprocess");
+
+    let records = read_json_lines(&fixture.process_env_record_path);
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["subcommand"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["describe", "policy.evaluate", "launch", "terminal.classify"]
+    );
+    for record in records {
+        let process_env = json_object(&record["env"]);
+        for name in &private_names {
+            assert!(
+                process_env.get(*name).is_none(),
+                "provider {} inherited runner-private {name}",
+                record["subcommand"]
+            );
+        }
+    }
+}
+
+#[test]
+fn external_provider_policy_cannot_reintroduce_runner_private_launch_authority() {
+    assert_test_catalog_extension();
+    let auto_wake_names = auto_wake_environment_names();
+    let _lock = env_lock();
+    let invocation = oulipoly_state::CompositeInvocationId {
+        source: "fixture-provider".to_string(),
+        id: "11111111-1111-4111-8111-111111111111".to_string(),
+    };
+    let authority =
+        oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+            "ab".repeat(32),
+        )
+        .expect("valid completion registration authority");
+    let parent_environment = authority
+        .invocation_launch_environment(&invocation)
+        .expect("parent launch environment");
+    let _env = EnvScope::set_optional(&[
+        ("OULIPOLY_AUTO_WAKE", Some("1")),
+        (
+            "OULIPOLY_PARENT_INVOCATION",
+            Some(parent_environment.as_str()),
+        ),
+        (
+            oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+            Some(authority.process_environment_value()),
+        ),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::PrivateEnvTransform,
+        LaunchMode::Success,
+    );
+
+    execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(parent_environment))
+        .expect("external dispatch should reject policy private-carrier delegation");
+
+    let launch = read_json(&fixture.launch_record_path);
+    let launch_env = json_object(&launch["params"]["env"]);
+    for name in auto_wake_names {
+        assert!(
+            launch_env.get(name).is_none(),
+            "policy reintroduced runner-private {name}"
+        );
+    }
+    assert_eq!(
+        launch_env[oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV],
+        authority.process_environment_value(),
+        "typed launch authority must override policy output"
+    );
+    let parent_identity = launch_env["OULIPOLY_PARENT_INVOCATION"]
+        .as_str()
+        .expect("parent identity text");
+    assert_eq!(
+        serde_json::from_str::<Value>(parent_identity).expect("parent identity"),
+        serde_json::to_value(invocation).expect("expected parent identity")
+    );
+    assert!(!parent_identity.contains("_oulipoly_completion_registration_authority"));
+}
+
+#[test]
 fn external_provider_launch_env_applies_configured_removals_then_overlays() {
     const REMOVED_ENV: &str = "CONFIG_REMOVED_ENV";
     const OVERLAID_ENV: &str = "CONFIG_OVERLAID_ENV";
@@ -1915,8 +2355,11 @@ fn external_provider_policy_request_preserves_provider_owned_settings_id() {
     .expect("external dispatch should preserve the provider-owned settings identity");
 
     let request = read_json(&fixture.policy_record_path);
-    assert_eq!(request["provider_instance_id"], "opencode");
-    assert_eq!(request["params"]["settings_id"], "opencode");
+    assert_eq!(request["provider_instance_id"], "fake-provider-instance");
+    assert_eq!(
+        request["params"]["settings_id"],
+        SELECTED_PROVIDER_SETTINGS_ID
+    );
     assert_eq!(request["params"]["launch"]["command"], "opencode1");
     assert_eq!(
         request["params"]["launch"]["argv"][0],
@@ -1967,58 +2410,60 @@ fn external_provider_policy_transform_applies_once_and_no_legacy_double_policy()
 }
 
 #[test]
-fn external_provider_enabled_binary_and_script_refs_dispatch_without_legacy_fallback() {
-    for kind in ["binary", "script"] {
-        let fixture = make_external_fixture(
-            Capabilities {
-                policy: true,
-                launch: true,
-            },
-            PolicyMode::Accept,
-            LaunchMode::Success,
-        );
-        let provider_ref = match kind {
-            "binary" => provider_ref_binary(
-                fixture
-                    .provider_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .expect("provider path should have utf8 file name"),
-            ),
-            "script" => provider_ref_script(&fixture.provider_path),
-            _ => unreachable!("test only covers binary and script refs"),
-        };
-        let model = external_model_with_ref(&fixture, provider_ref);
-        let registry = dispatch_registry_for_models_with_options(
-            std::slice::from_ref(&model),
-            ProviderRegistryOptions::default().with_path_entries([fixture
-                .provider_path
-                .parent()
-                .expect("provider parent")
-                .to_path_buf()]),
-        );
+fn explicit_account_endpoint_dispatches_without_legacy_fallback() {
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let result = execute_external_fixture(&fixture)
+        .expect("explicit account endpoint should dispatch through provider");
 
-        let result = execute_dispatch_aware_result(
-            registry,
-            ExecutorServiceRequest::Facade {
-                model,
-                provider_index: 0,
-                prompt: "prompt-value".to_string(),
-                working_dir: None,
-                models_dir: None,
-                extra_inputs: HashMap::new(),
-                parent_invocation_env: None,
-            },
-        )
-        .expect("enabled binary/script refs should dispatch through provider");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        ["policy.evaluate", "launch"]
+    );
+    assert!(!fixture.legacy_record_path.exists());
+}
 
-        assert_eq!(result.exit_code, 0);
-        assert_eq!(
-            order_lines(&fixture.order_path),
-            ["policy.evaluate", "launch"]
-        );
-        assert!(!fixture.legacy_record_path.exists());
-    }
+#[test]
+fn explicit_account_endpoint_receives_negotiated_prompt_acceptance() {
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    enable_prompt_acceptance_capability(&fixture);
+    let model = external_model(&fixture);
+    let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
+
+    let result = execute_dispatch_aware_result(
+        registry,
+        ExecutorServiceRequest::Facade {
+            model,
+            provider_index: 0,
+            prompt: "prompt-value".to_string(),
+            working_dir: None,
+            models_dir: None,
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: None,
+        },
+    )
+    .expect("script provider should remain dispatchable");
+
+    assert_eq!(result.exit_code, 0);
+    assert!(
+        read_json(&fixture.launch_record_path)["params"]["prompt_acceptance"].is_object(),
+        "the explicit account endpoint pins executable identity before prompt-acceptance negotiation"
+    );
+    assert!(!fixture.legacy_record_path.exists());
 }
 
 #[test]
@@ -2039,7 +2484,38 @@ fn external_provider_launch_preserves_stdout_bytes_and_maps_stderr_boundary() {
         result.stderr, "err\u{fffd}\u{fffd}",
         "stderr bytes should cross the existing lossy String boundary deliberately"
     );
+    let output = result.output_spool.as_ref().expect("sealed output spool");
+    assert_eq!(output.stdout_bytes().expect("complete stdout"), [0, 1, 255]);
+    assert_eq!(
+        output.stderr_bytes().expect("complete stderr"),
+        [b'e', b'r', b'r', 0xff, 0xfe]
+    );
     assert_eq!(result.exit_code, 0);
+}
+
+#[test]
+fn external_provider_launch_spools_output_beyond_diagnostic_retention() {
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::LargeOutput,
+    );
+
+    let result = execute_external_fixture(&fixture).expect("large external launch should succeed");
+    let output = result.output_spool.as_ref().expect("sealed output spool");
+    let summary = output.summary().expect("output summary");
+
+    assert_eq!(summary.stdout_bytes, 2 * 1024 * 1024);
+    assert_eq!(summary.stderr_bytes, 0);
+    assert_eq!(summary.data_event_count, 256);
+    assert_eq!(result.stdout.len(), 1024 * 1024);
+    assert_eq!(
+        output.stdout_bytes().expect("complete stdout"),
+        vec![b'x'; 2 * 1024 * 1024]
+    );
 }
 
 #[test]
@@ -2162,7 +2638,7 @@ fn external_provider_launch_host_cancelled_before_final_uses_cancellation_fallba
     );
     let model = external_model(&fixture);
     let cancellation = oulipoly_provider::client::CancellationToken::new();
-    cancellation.cancel_after(Duration::from_millis(50));
+    cancellation.cancel_after(Duration::from_secs(2));
     let client_options = oulipoly_provider::client::ProviderClientOptions::default()
         .with_cancellation(Some(cancellation));
     let registry = dispatch_registry_for_models_with_options(
@@ -2248,4 +2724,319 @@ fn external_provider_launch_minimal_terminal_scope_uses_final_event_not_standalo
         Some(&oulipoly_runtime::executor::terminal_signal::TerminalSignalKind::Unknown),
         "S6a must not run standalone terminal.classify over launch stderr text"
     );
+}
+
+#[test]
+fn live_attachment_error_dispatch_retains_partial_output_and_new_return_reference() {
+    use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
+    use sha2::{Digest, Sha256};
+    let _lock = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let pid_path = dir.path().join("provider.pid");
+    let ready_path = dir.path().join("provider.ready");
+    let data_text = data_dir.to_string_lossy();
+    let pid_text = pid_path.to_string_lossy();
+    let ready_text = ready_path.to_string_lossy();
+    let _env = EnvScope::set_optional(&[
+        ("OULIPOLY_DATA_DIR", Some(&data_text)),
+        (CHILD_CUSTODY_FAULT_ENV, None),
+        (CHILD_CUSTODY_READY_FILE_ENV, Some(&ready_text)),
+        (CHILD_PID_FILE_ENV, Some(&pid_text)),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::LiveAttachmentStorageFailure,
+    );
+    let uuid = "76767676-7676-4676-8676-767676767676";
+    // Initialize only this temporary fixture store using the owner's unchanged schema
+    // asset embedded in its source, without adding a runtime dependency or schema.
+    let store_source = include_str!("../../oulipoly-agent-store/src/lib.rs");
+    let schema = store_source
+        .split("fn install_schema(")
+        .nth(1)
+        .unwrap()
+        .split("r#\"")
+        .nth(1)
+        .unwrap()
+        .split("\"#")
+        .next()
+        .unwrap();
+    let version_sql = store_source
+        .split("fn initialize_schema_version(")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .nth(1)
+        .unwrap();
+    let store_connection = Connection::open(dir.path().join("artifact-store.db")).unwrap();
+    store_connection.execute_batch(schema).unwrap();
+    store_connection.execute(version_sql, []).unwrap();
+    drop(store_connection);
+    let artifact =
+        oulipoly_agent_messenger::return_artifact(oulipoly_agent_messenger::ReturnRequest {
+            db_path: dir.path().join("artifact-store.db"),
+            invocation_uuid: uuid.parse().unwrap(),
+            name: oulipoly_agent_messenger::ReturnName::new("fixture").unwrap(),
+            source: oulipoly_agent_messenger::ReturnSource::InlineBytes(
+                b"authentic-produced-artifact".to_vec(),
+            ),
+            format_hint: None,
+            verdict_line: None,
+            return_channel: None,
+        })
+        .unwrap();
+    fs::write(
+        fixture._dir.path().join("produced-ref.json"),
+        serde_json::to_vec(&artifact).unwrap(),
+    )
+    .unwrap();
+    let invocation = serde_json::json!({"source": "fixture", "id": uuid}).to_string();
+    let result =
+        execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(invocation))
+            .expect("typed failed result must survive observer transport failure");
+    assert_eq!(result.exit_code, -1);
+    assert_eq!(
+        result.terminal_reason.as_deref(),
+        Some("runtime_generation_attach_failed")
+    );
+    assert_eq!(
+        result.session_capture.session_id.as_deref(),
+        Some("example-session")
+    );
+    let launch = read_json(&fixture.launch_record_path);
+    let oulipoly_runtime::executor::SessionCaptureMethod::ExternalProviderLaunch(authority) =
+        &result.session_capture.method
+    else {
+        panic!("attachment failure must retain exact external endpoint authority");
+    };
+    assert_eq!(
+        authority.account_name,
+        external_model(&fixture).providers[0].name
+    );
+    assert_eq!(
+        authority.provider_instance_id,
+        launch["provider_instance_id"]
+    );
+    assert_eq!(authority.settings_id, launch["params"]["settings_id"]);
+    let signal = result.terminal_signal.as_ref().unwrap();
+    assert_eq!(signal.kind, TerminalSignalKind::SpawnError);
+    assert!(
+        signal.evidence.contains("cause=StorageFailure"),
+        "{}",
+        signal.evidence
+    );
+    assert!(
+        signal.evidence.contains("cleanup=Ok(Applied)"),
+        "{}",
+        signal.evidence
+    );
+    assert!(signal.evidence.contains("output=incomplete"));
+    assert!(!signal.evidence.contains("fixture storage fault"));
+    assert!(!result.produced_assistant_response);
+    assert!(result.prompt_acceptance_attestation.is_none());
+    let spool = result.output_spool.as_ref().unwrap();
+    assert_eq!(
+        spool.incomplete_output_bytes().unwrap(),
+        (vec![0, 1, 255], vec![101, 114, 114, 255, 254])
+    );
+    assert!(spool.summary().is_err());
+    assert!(result.complete_stdout_bytes().is_err());
+    assert!(result.write_stdout_to(&mut Vec::new()).is_err());
+    assert_eq!(result.returned_artifacts.len(), 1);
+    let stored = oulipoly_agent_messenger::show_returned(
+        oulipoly_agent_messenger::ShowReturnedRequest::VersionId {
+            db_path: dir.path().join("artifact-store.db"),
+            version_id: result.returned_artifacts[0].version_id.clone(),
+        },
+    )
+    .unwrap();
+    let payload = stored.content;
+    assert_eq!(payload, b"authentic-produced-artifact");
+    assert_eq!(result.returned_artifacts.len(), 1);
+    let reference = &result.returned_artifacts[0];
+    assert_eq!(reference.sha256, format!("{:x}", Sha256::digest(&payload)));
+    assert_eq!(reference.content_len, payload.len() as u64);
+    let state = oulipoly_state::StateDb::open(&data_dir.join("state.db")).unwrap();
+    let id = state
+        .start_invocation(&oulipoly_state::InvocationStart {
+            invocation_uuid: uuid.into(),
+            model_name: "fixture".into(),
+            provider_name: "provider-a".into(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    assert!(state.list_returned_artifacts(id).unwrap().is_empty());
+    result
+        .retain_failed_finalization_evidence(&state, id, uuid)
+        .unwrap();
+    assert_eq!(
+        state.list_returned_artifacts(id).unwrap(),
+        result.returned_artifacts
+    );
+    let paths = state
+        .invocation_output_artifact_paths(&format!("{uuid}.partial"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(fs::read(paths.stdout).unwrap(), [0, 1, 255]);
+    assert_eq!(fs::read(paths.stderr).unwrap(), [101, 114, 114, 255, 254]);
+    let complete_paths = state
+        .invocation_output_artifact_paths(uuid)
+        .unwrap()
+        .unwrap();
+    assert!(!complete_paths.stdout.exists());
+    let count: i64 = state
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM invocation_output_deliveries WHERE invocation_id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "partial output must not become complete delivery evidence"
+    );
+    let pid = fs::read_to_string(pid_path)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    assert_external_child_reaped(pid);
+    assert_external_terminal_generation(
+        &data_dir,
+        uuid,
+        "abnormal_termination",
+        Some(i64::from(pid)),
+    );
+    let conn = Connection::open(data_dir.join("pid-identity.db")).unwrap();
+    let session: Option<String> = conn
+        .query_row(
+            "SELECT session_id FROM runtime_generation WHERE spawn_invocation_uuid=?1",
+            [uuid],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        session.is_none(),
+        "rejected attachment must not mutate protected row"
+    );
+    let launch: Value =
+        serde_json::from_slice(&fs::read(&fixture.launch_record_path).unwrap()).unwrap();
+    assert!(
+        !Path::new(
+            launch["params"]["env"]["OULIPOLY_RETURN_CHANNEL"]
+                .as_str()
+                .unwrap()
+        )
+        .exists()
+    );
+}
+
+#[test]
+fn standalone_verified_missing_final_retains_binary_prefix_and_reports_storage_failure() {
+    let _lock = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let data_text = data_dir.to_string_lossy();
+    let _env = EnvScope::set_optional(&[
+        ("OULIPOLY_DATA_DIR", Some(&data_text)),
+        (CHILD_CUSTODY_FAULT_ENV, None),
+        (CHILD_CUSTODY_READY_FILE_ENV, None),
+        (CHILD_PID_FILE_ENV, None),
+    ]);
+    for blocked in [false, true] {
+        let fixture = make_external_fixture(
+            Capabilities {
+                policy: true,
+                launch: true,
+            },
+            PolicyMode::Accept,
+            LaunchMode::MissingFinal,
+        );
+        let original = "        write_jsonl({\"contract\": CONTRACT, \"request_id\": reqid, \"seq\": 1, \"time_unix_ms\": 1001, \"kind\": \"stdout\", \"data_base64\": \"YQ==\"})\n        return 0";
+        let replacement = r#"        write_jsonl({"contract": CONTRACT, "request_id": reqid, "seq": 1, "time_unix_ms": 1001, "kind": "marker", "name": "oulipoly.provider_session", "value": {"provider_session_id": "example-session"}})
+        write_jsonl({"contract": CONTRACT, "request_id": reqid, "seq": 2, "time_unix_ms": 1002, "kind": "stdout", "data_base64": "AAH/"})
+        write_jsonl({"contract": CONTRACT, "request_id": reqid, "seq": 3, "time_unix_ms": 1003, "kind": "stderr", "data_base64": "ZXJy//4="})
+        return 0"#;
+        let body = fs::read_to_string(&fixture.provider_path).unwrap();
+        assert!(body.contains(original));
+        fs::write(
+            &fixture.provider_path,
+            body.replacen(original, replacement, 1),
+        )
+        .unwrap();
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let parent = serde_json::json!({"source":"fixture","id":uuid}).to_string();
+        let state = oulipoly_state::StateDb::open(&data_dir.join("state.db")).unwrap();
+        let id = state
+            .start_invocation(&oulipoly_state::InvocationStart {
+                invocation_uuid: uuid.clone(),
+                model_name: "fixture".into(),
+                provider_name: "provider-a".into(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let paths = state
+            .invocation_output_artifact_paths(&format!("{uuid}.partial"))
+            .unwrap()
+            .unwrap();
+        if blocked {
+            fs::create_dir(&paths.stdout).unwrap();
+        }
+        let result =
+            execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(parent))
+                .unwrap();
+        assert_eq!(
+            result.terminal_reason.as_deref(),
+            Some("external_provider_missing_final_exit")
+        );
+        assert_eq!(
+            result.session_capture.session_id.as_deref(),
+            Some("example-session")
+        );
+        assert_eq!(
+            result
+                .output_spool
+                .as_ref()
+                .unwrap()
+                .incomplete_output_bytes()
+                .unwrap(),
+            (vec![0, 1, 255], vec![101, 114, 114, 255, 254])
+        );
+        assert!(result.complete_stdout_bytes().is_err());
+        assert!(!result.produced_assistant_response);
+        let retention = result.retain_failed_finalization_evidence(&state, id, &uuid);
+        eprintln!(
+            "standalone missing-final blocked={blocked} result={result:?} retention={retention:?}"
+        );
+        if blocked {
+            assert_eq!(
+                retention,
+                Err("finalization_evidence: artifacts=retained;output=storage_failure")
+            );
+        } else {
+            retention.unwrap();
+            assert_eq!(fs::read(paths.stdout).unwrap(), [0, 1, 255]);
+            assert_eq!(fs::read(paths.stderr).unwrap(), [101, 114, 114, 255, 254]);
+        }
+        let count: i64 = state
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM invocation_output_deliveries WHERE invocation_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(!fixture.legacy_record_path.exists());
+    }
 }

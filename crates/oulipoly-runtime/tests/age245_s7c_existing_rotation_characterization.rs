@@ -153,10 +153,18 @@ impl Fixture {
             })
             .expect("start invocation");
         self.state
-            .update_session_capture(invocation_id, Some(SESSION_ID), "fixture")
+            .update_session_capture(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                invocation_id,
+                Some(SESSION_ID),
+                "fixture",
+            )
             .expect("capture");
         self.state
-            .mint_chain_for_invocation_session(invocation_id)
+            .mint_chain_for_invocation_session(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                invocation_id,
+            )
             .expect("mint chain");
         let chain_id = self
             .state

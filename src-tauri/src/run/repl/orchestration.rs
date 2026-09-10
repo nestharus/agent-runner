@@ -54,7 +54,6 @@ pub(crate) fn run_repl(
         return Ok(1);
     };
     validator::validate_provider_repl_capability(&provider)?;
-
     let mut attempt = start_repl_invocation(
         agent_runtime_services,
         &prepared.env,

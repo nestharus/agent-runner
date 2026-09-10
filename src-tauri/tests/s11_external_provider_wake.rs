@@ -4,8 +4,10 @@
 //!
 //! Roles: orchestration, formatter, accessor, parser, validator.
 //!
-//! TEST: external-provider runtime fixtures for session ingestion, submitted
-//! turn acceptance, and policy diagnostics.
+//! TEST: external-provider runtime fixtures for session ingestion, prompt
+//! acceptance, and policy diagnostics.
+
+mod provider_authority_fixture;
 
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow};
 use rusqlite::{Connection, OptionalExtension};
@@ -78,7 +80,10 @@ impl Fixture {
             .env("XDG_DATA_HOME", &self.data_home)
             .env("HOME", &self.home_dir)
             .env("S11_WORK_DIR", &self.work_dir)
-            .env_remove("OULIPOLY_DATA_DIR")
+            .env(
+                "OULIPOLY_DATA_DIR",
+                self.data_home.join("oulipoly-agent-runner"),
+            )
             .env_remove("OULIPOLY_AUTO_WAKE")
             .env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID")
             .env_remove("OULIPOLY_AUTO_WAKE_TOKEN")
@@ -144,12 +149,16 @@ args = []
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
-                r#"[{provider}]
+            provider_authority_fixture::with_explicit_provider_authority_at(
+                &format!(
+                    r#"[{provider}]
 command = "fixture-opencode"
 args = []
 prompt_mode = "arg"
 "#
+                ),
+                "s11-external-provider",
+                &provider_path,
             ),
         )
         .unwrap();
@@ -260,7 +269,7 @@ turn_script = {}
             .query_row(
                 "SELECT resume_acceptance_status, resume_acceptance_evidence
                  FROM invocations
-                 WHERE session_capture_method = 'resumed'
+                 WHERE resume_input_id IS NOT NULL
                  ORDER BY id DESC
                  LIMIT 1",
                 [],
@@ -277,7 +286,7 @@ turn_script = {}
             .query_row(
                 "SELECT provider_name, provider_session_id
                  FROM invocations
-                 WHERE session_capture_method = 'resumed'
+                 WHERE resume_input_id IS NOT NULL
                  ORDER BY id DESC
                  LIMIT 1",
                 [],
@@ -297,6 +306,20 @@ turn_script = {}
             .unwrap()
     }
 
+    fn latest_terminal_outcome(&self) -> (String, i32, String) {
+        Connection::open(self.state_path())
+            .unwrap()
+            .query_row(
+                "SELECT status, exit_code, terminal_reason
+                 FROM invocations
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
     fn mailbox_row(&self, seq: i64) -> MailboxRow {
         self.mailbox()
             .list_mailbox(SESSION, true)
@@ -304,6 +327,18 @@ turn_script = {}
             .into_iter()
             .find(|row| row.seq == seq)
             .unwrap()
+    }
+
+    fn recorded_resume_prompts(&self) -> Vec<String> {
+        let path = self.work_dir.join("resume-prompts.jsonl");
+        if !path.exists() {
+            return Vec::new();
+        }
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     fn assert_xdg_isolated(&self) {
@@ -365,6 +400,24 @@ fn assert_unconfirmed_resume(output: &Output) {
 }
 
 #[test]
+fn nested_external_provider_cannot_inherit_parent_live_session_binding() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    let output = fixture.run_agent_with_env(
+        "launch child with its own invocation authority",
+        &[
+            ("S11_CHECK_LIVE_BINDING_ISOLATION", "1"),
+            ("OULIPOLY_LIVE_SESSION_BIND_SOCKET", "/parent-owner.sock"),
+            ("OULIPOLY_LIVE_SESSION_BIND_TOKEN", "parent-owner-token"),
+        ],
+    );
+    assert_success(&output);
+    let child_invocation = fs::read_to_string(fixture.work_dir.join("child-invocation")).unwrap();
+    assert_eq!(child_invocation, fixture.latest_invocation_uuid());
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
 fn external_provider_runtime_uses_ingested_session_when_launch_capture_missing() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
@@ -395,23 +448,20 @@ fn external_provider_runtime_uses_ingested_session_when_launch_capture_missing()
 }
 
 #[test]
-fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_delivery_nonce() {
+fn prompt_acceptance_hash_accepts_exact_and_rejects_mismatch_without_delivery_nonce() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
     assert_success(&fixture.run_agent_with_env("seed manual resume", &[]));
 
     let output = fixture.run_resume_with_env(
         "manual exact payload",
-        &[("S11_EMIT_SUBMITTED_TURN_MARKER", "1")],
+        &[("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1")],
     );
     assert_unconfirmed_resume(&output);
-    let (status, evidence) = fixture.latest_resume_acceptance();
-    assert_eq!(status.as_deref(), Some("accepted"));
-    assert!(
-        evidence
-            .as_deref()
-            .is_some_and(|value| value.contains("exact session and prompt SHA-256")),
-        "{evidence:?}"
+    assert_eq!(
+        fixture.latest_resume_acceptance(),
+        (None, None),
+        "exact-prompt acceptance must not adopt the session-resume acceptance identity"
     );
 
     let fixture = Fixture::new();
@@ -420,7 +470,7 @@ fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_deliver
     let output = fixture.run_resume_with_env(
         "manual hash mismatch",
         &[
-            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
         ],
     );
@@ -433,47 +483,568 @@ fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_deliver
 }
 
 #[test]
-fn accepted_owner_session_consumes_detached_child_completion_despite_ingest_evidence_loss() {
+fn prompt_acceptance_marker_requires_declared_capability() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    assert_success(&fixture.run_agent_with_env(
+        "seed undeclared attestation",
+        &[("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY", "1")],
+    ));
+
+    let output = fixture.run_resume_with_env(
+        "manual undeclared attestation",
+        &[
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+            ("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY", "1"),
+        ],
+    );
+
+    assert_unconfirmed_resume(&output);
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
+}
+
+#[test]
+fn bounded_post_anchor_user_observation_confirms_mailbox_without_attestation_or_turn_script() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let resumed = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_READ_TURNS_DELAY_MS", "2500"),
+        ],
+    );
+
+    assert_eq!(resumed.status.code(), Some(1), "{resumed:?}");
+    let delivered = fixture.mailbox_row(notification.seq);
+    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
+    let evidence: (Option<String>, Option<String>, Option<String>) =
+        Connection::open(fixture.sidecar_path())
+            .unwrap()
+            .query_row(
+                "SELECT observation_anchor_token, observation_expected_sha256,
+                        observation_confirmed_turn_id
+                 FROM mailbox_delivery_attempts
+                 ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert!(evidence.0.is_some());
+    assert_eq!(evidence.1.as_deref().map(str::len), Some(64));
+    assert!(evidence.2.is_some());
+}
+
+#[test]
+fn accepted_owner_session_consumes_detached_child_completion_without_history_scan() {
     for provider in OPENCODE_PROVIDERS {
         assert_owner_session_consumes_detached_child_completion(provider);
     }
+}
+
+#[test]
+fn accepted_manual_prompt_nonzero_has_one_typed_terminal_outcome() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    assert_success(&fixture.run_agent_with_env("seed manual failure", &[]));
+
+    let output = fixture.run_resume_with_env(
+        "accepted manual payload",
+        &[
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_EXIT_NONZERO", "1"),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(29), "{output:?}");
+    let result = result_envelope(&output);
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["exit_code"], 29);
+    assert_eq!(
+        result["terminal_reason"],
+        "resume_prompt_accepted_provider_failed"
+    );
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn missing_final_exit_does_not_settle_mismatched_prompt_acceptance() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let resumed = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+            ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_OMIT_EXIT_EVENT", "1"),
+        ],
+    );
+
+    assert_ne!(resumed.status.code(), Some(0), "{resumed:?}");
+    let pending = fixture.mailbox_row(notification.seq);
+    assert!(pending.delivered_at.is_none(), "{pending:?}");
+    assert_eq!(pending.delivery_attempts, 1);
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn trusted_prompt_acceptance_settles_mailbox_delivery_after_provider_nonzero() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let resumed = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_EXIT_NONZERO", "1"),
+        ],
+    );
+
+    assert_eq!(resumed.status.code(), Some(29), "{resumed:?}");
+    let result = result_envelope(&resumed);
+    let invocation_uuid = result["id"].as_str().unwrap();
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["exit_code"], 29);
+    assert_eq!(
+        result["terminal_reason"],
+        "resume_prompt_accepted_provider_failed"
+    );
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
+    let delivered = fixture.mailbox_row(notification.seq);
+    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
+    assert_eq!(delivered.delivery_attempts, 1);
+    assert_eq!(
+        delivered.delivered_by_invocation_uuid.as_deref(),
+        Some(invocation_uuid)
+    );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn trusted_prompt_acceptance_settles_mailbox_delivery_when_final_exit_is_missing() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let resumed = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_OMIT_EXIT_EVENT", "1"),
+        ],
+    );
+
+    assert_ne!(resumed.status.code(), Some(0), "{resumed:?}");
+    let result = result_envelope(&resumed);
+    let invocation_uuid = result["id"].as_str().unwrap();
+    assert_eq!(result["status"], "failed");
+    assert_ne!(result["exit_code"], 0);
+    assert_eq!(
+        result["terminal_reason"],
+        "resume_prompt_accepted_provider_failed"
+    );
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains("missing_final_exit;provider_process=exited:0"),
+        "{stderr}"
+    );
+    let delivered = fixture.mailbox_row(notification.seq);
+    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
+    assert_eq!(delivered.delivery_attempts, 1);
+    assert_eq!(
+        delivered.delivered_by_invocation_uuid.as_deref(),
+        Some(invocation_uuid)
+    );
+
+    assert_success(&fixture.run_resume_with_env(
+        "continue after child completion",
+        &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
+    ));
+    assert_eq!(fixture.mailbox_row(notification.seq).delivery_attempts, 1);
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn absent_prompt_acceptance_is_reconciled_before_nonzero_and_missing_exit_replay() {
+    for (label, failure_environment) in [
+        (
+            "provider-nonzero",
+            [("S11_NO_ASSISTANT_RESULT", "1"), ("S11_EXIT_NONZERO", "1")],
+        ),
+        (
+            "missing-final-exit",
+            [
+                ("S11_NO_ASSISTANT_RESULT", "1"),
+                ("S11_OMIT_EXIT_EVENT", "1"),
+            ],
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.write_external_provider();
+        fixture.remove_turn_script_fallback();
+        assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+        let owner_invocation_uuid = fixture.latest_invocation_uuid();
+        let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+        let failed = fixture.run_resume_with_env("continue owning workflow", &failure_environment);
+        assert_ne!(failed.status.code(), Some(0), "{label}: {failed:?}");
+        let (status, exit_code, terminal_reason) = fixture.latest_terminal_outcome();
+        assert_eq!(status, "failed", "{label}");
+        assert_ne!(exit_code, 0, "{label}");
+        assert_ne!(
+            terminal_reason, "resume_prompt_accepted_provider_failed",
+            "{label}: absent acceptance must not select the trusted terminal path"
+        );
+        let pending = fixture.mailbox_row(notification.seq);
+        assert!(pending.delivered_at.is_none(), "{label}: {pending:?}");
+        assert_eq!(pending.delivery_attempts, 1, "{label}: {pending:?}");
+
+        assert_success(&fixture.run_resume_with_env(
+            "retry pending detached child",
+            &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
+        ));
+        let delivered = fixture.mailbox_row(notification.seq);
+        assert!(delivered.delivered_at.is_some(), "{label}: {delivered:?}");
+        assert_eq!(delivered.delivery_attempts, 2, "{label}: {delivered:?}");
+        let prompts = fixture.recorded_resume_prompts();
+        assert_eq!(prompts.len(), 2, "{label}: {prompts:#?}");
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|prompt| prompt.contains("age291-detached-child"))
+                .count(),
+            1,
+            "{label}: bounded observation must suppress duplicate delivery: {prompts:#?}"
+        );
+        fixture.assert_xdg_isolated();
+    }
+}
+
+#[test]
+fn wrong_prompt_acceptance_session_and_nonce_are_reconciled_before_replay() {
+    for (label, mismatch_environment, failure_environment) in [
+        (
+            "wrong-session-provider-nonzero",
+            "S11_MARKER_SESSION_MISMATCH",
+            "S11_EXIT_NONZERO",
+        ),
+        (
+            "wrong-session-missing-final-exit",
+            "S11_MARKER_SESSION_MISMATCH",
+            "S11_OMIT_EXIT_EVENT",
+        ),
+        (
+            "wrong-nonce-provider-nonzero",
+            "S11_MARKER_DELIVERY_NONCE_MISMATCH",
+            "S11_EXIT_NONZERO",
+        ),
+        (
+            "wrong-nonce-missing-final-exit",
+            "S11_MARKER_DELIVERY_NONCE_MISMATCH",
+            "S11_OMIT_EXIT_EVENT",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.write_external_provider();
+        fixture.remove_turn_script_fallback();
+        assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+        let owner_invocation_uuid = fixture.latest_invocation_uuid();
+        let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+        let failed = fixture.run_resume_with_env(
+            "continue owning workflow",
+            &[
+                ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+                (mismatch_environment, "1"),
+                ("S11_NO_ASSISTANT_RESULT", "1"),
+                (failure_environment, "1"),
+            ],
+        );
+        assert_ne!(failed.status.code(), Some(0), "{label}: {failed:?}");
+        let result = result_envelope(&failed);
+        assert_eq!(result["status"], "failed", "{label}");
+        assert_ne!(
+            result["terminal_reason"], "resume_prompt_accepted_provider_failed",
+            "{label}: mismatched correlation must not select the trusted terminal path"
+        );
+        let pending = fixture.mailbox_row(notification.seq);
+        assert!(pending.delivered_at.is_none(), "{label}: {pending:?}");
+        assert_eq!(pending.delivery_attempts, 1, "{label}: {pending:?}");
+
+        assert_success(&fixture.run_resume_with_env(
+            "retry pending detached child",
+            &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
+        ));
+        let delivered = fixture.mailbox_row(notification.seq);
+        assert!(delivered.delivered_at.is_some(), "{label}: {delivered:?}");
+        assert_eq!(delivered.delivery_attempts, 2, "{label}: {delivered:?}");
+        let prompts = fixture.recorded_resume_prompts();
+        assert_eq!(prompts.len(), 2, "{label}: {prompts:#?}");
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|prompt| prompt.contains("age291-detached-child"))
+                .count(),
+            1,
+            "{label}: bounded observation must suppress duplicate delivery: {prompts:#?}"
+        );
+        fixture.assert_xdg_isolated();
+    }
+}
+
+#[test]
+fn trusted_prompt_acceptance_survives_mailbox_projection_failure_without_replay() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let connection = Connection::open(fixture.sidecar_path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_accepted_mailbox_projection
+             BEFORE UPDATE OF delivered_at ON mailbox
+             WHEN NEW.delivered_at IS NOT NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced accepted mailbox projection failure');
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let first = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_EXIT_NONZERO", "1"),
+        ],
+    );
+    let first_result = result_envelope(&first);
+    let first_invocation_uuid = first_result["id"].as_str().unwrap();
+    assert_eq!(
+        first_result["terminal_reason"],
+        "resume_prompt_accepted_provider_failed"
+    );
+    let pending = fixture.mailbox_row(notification.seq);
+    assert!(pending.delivered_at.is_none(), "{pending:?}");
+    let durable = Connection::open(fixture.state_path())
+        .unwrap()
+        .query_row(
+            "SELECT status, exit_code, terminal_reason,
+                    EXISTS(
+                        SELECT 1 FROM session_delivery_acknowledgements
+                        WHERE turn_generation_id = invocations.invocation_uuid
+                          AND confirmed_at IS NOT NULL
+                    )
+             FROM invocations
+             WHERE invocation_uuid = ?1",
+            [first_invocation_uuid],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        durable,
+        (
+            "failed".to_string(),
+            29,
+            "resume_prompt_accepted_provider_failed".to_string(),
+            true,
+        )
+    );
+
+    Connection::open(fixture.sidecar_path())
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_accepted_mailbox_projection;")
+        .unwrap();
+    assert_success(&fixture.run_resume_with_env(
+        "continue after projection recovery",
+        &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
+    ));
+
+    let delivered = fixture.mailbox_row(notification.seq);
+    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
+    assert_eq!(
+        delivered.delivered_by_invocation_uuid.as_deref(),
+        Some(first_invocation_uuid)
+    );
+    let prompts = fixture.recorded_resume_prompts();
+    assert_eq!(prompts.len(), 2, "{prompts:#?}");
+    assert!(prompts[0].contains("age291-detached-child"), "{prompts:#?}");
+    assert!(
+        !prompts[1].contains("age291-detached-child"),
+        "{prompts:#?}"
+    );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn ordinary_completion_survives_mailbox_projection_failure_without_replay() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let connection = Connection::open(fixture.sidecar_path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_ordinary_mailbox_projection
+             BEFORE UPDATE OF delivered_at ON mailbox
+             WHEN NEW.delivered_at IS NOT NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced ordinary mailbox projection failure');
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let first = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
+    );
+    assert_eq!(first.status.code(), Some(1), "{first:?}");
+    assert_payload_then_success_envelope(
+        &first,
+        "owner consumed detached child result and continued\n",
+    );
+    let first_invocation_uuid = fixture.latest_invocation_uuid();
+    let pending = fixture.mailbox_row(notification.seq);
+    assert!(pending.delivered_at.is_none(), "{pending:?}");
+    let durable = Connection::open(fixture.state_path())
+        .unwrap()
+        .query_row(
+            "SELECT status, exit_code,
+                    EXISTS(
+                        SELECT 1 FROM session_delivery_acknowledgements
+                        WHERE turn_generation_id = invocations.invocation_uuid
+                          AND confirmed_at IS NOT NULL
+                    )
+             FROM invocations
+             WHERE invocation_uuid = ?1",
+            [first_invocation_uuid.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(durable, ("succeeded".to_string(), 0, true));
+
+    Connection::open(fixture.sidecar_path())
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_ordinary_mailbox_projection;")
+        .unwrap();
+    assert_success(&fixture.run_resume_with_env(
+        "continue after projection recovery",
+        &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
+    ));
+
+    let delivered = fixture.mailbox_row(notification.seq);
+    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
+    assert_eq!(
+        delivered.delivered_by_invocation_uuid.as_deref(),
+        Some(first_invocation_uuid.as_str())
+    );
+    let prompts = fixture.recorded_resume_prompts();
+    assert_eq!(prompts.len(), 2, "{prompts:#?}");
+    assert!(prompts[0].contains("age291-detached-child"), "{prompts:#?}");
+    assert!(
+        !prompts[1].contains("age291-detached-child"),
+        "{prompts:#?}"
+    );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn delivery_nonce_does_not_override_a_mismatched_prompt_hash() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let resumed = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+            ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_EXIT_NONZERO", "1"),
+        ],
+    );
+
+    assert_eq!(resumed.status.code(), Some(29), "{resumed:?}");
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
+    let pending = fixture.mailbox_row(notification.seq);
+    assert!(pending.delivered_at.is_none(), "{pending:?}");
 }
 
 fn assert_owner_session_consumes_detached_child_completion(provider: &'static str) {
     let positive = Fixture::with_provider(provider);
     positive.write_external_provider();
     positive.remove_turn_script_fallback();
-    let owner = positive.run_agent_with_env(
-        "owner waits for detached child",
-        &[("S11_READ_TURNS_STDOUT_LIMIT", "1")],
-    );
+    let owner = positive.run_agent_with_env("owner waits for detached child", &[]);
     assert_success(&owner);
-    let owner_stderr = String::from_utf8_lossy(&owner.stderr);
-    assert!(
-        owner_stderr.contains("session.read_turns: stdout_limit_exceeded"),
-        "incident ingest condition missing from owning log:\n{owner_stderr}"
-    );
     let owner_invocation_uuid = positive.latest_invocation_uuid();
     let notification = positive.seed_detached_child_completion(&owner_invocation_uuid);
 
     let resumed = positive.run_resume_with_env(
         "continue owning workflow",
         &[
-            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1"),
-            ("S11_READ_TURNS_STDOUT_LIMIT", "1"),
         ],
     );
-    let resumed_result = result_envelope(&resumed);
-    let resumed_invocation_uuid = resumed_result["id"].as_str().unwrap();
-    let resumed_stderr = String::from_utf8_lossy(&resumed.stderr);
-    let (acceptance, evidence) = positive.latest_resume_acceptance();
-    assert_eq!(acceptance.as_deref(), Some("accepted"));
-    assert_eq!(
-        evidence.as_deref(),
-        Some("validated submitted user turn: exact session and delivery nonce")
+    assert_success(&resumed);
+    assert_payload_then_success_envelope(
+        &resumed,
+        "owner consumed detached child result and continued\n",
     );
-    assert_eq!(resumed_result["exit_code"], 0);
+    let resumed_invocation_uuid = positive.latest_invocation_uuid();
+    let resumed_stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert_eq!(
+        positive.latest_resume_acceptance(),
+        (None, None),
+        "prompt acceptance and session-resume acceptance are distinct durable entities"
+    );
     let (provider_name, provider_session_id) = positive.latest_resumed_provider_identity();
     assert_eq!(provider_session_id, SESSION);
     assert_eq!(provider_name, provider);
@@ -486,9 +1057,9 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
     assert_eq!(delivered.delivery_attempts, 1);
     assert_eq!(
         delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(resumed_invocation_uuid)
+        Some(resumed_invocation_uuid.as_str())
     );
-    let trace = positive.run_trace(resumed_invocation_uuid);
+    let trace = positive.run_trace(&resumed_invocation_uuid);
     assert_success(&trace);
     let trace: Value = serde_json::from_slice(&trace.stdout).unwrap();
     assert_eq!(trace["root"]["session"]["transcript_state"], "no_locator");
@@ -506,9 +1077,8 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
     let unconfirmed = no_assistant.run_resume_with_env(
         "continue owning workflow",
         &[
-            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_NO_ASSISTANT_RESULT", "1"),
-            ("S11_READ_TURNS_STDOUT_LIMIT", "1"),
         ],
     );
     let unconfirmed_result = result_envelope(&unconfirmed);
@@ -530,7 +1100,7 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
     let later_resume = no_assistant.run_resume_with_env(
         "continue after child completion",
         &[
-            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1"),
         ],
     );
@@ -550,9 +1120,6 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
         String::from_utf8_lossy(&resumed.stdout),
         resumed_stderr,
     );
-    assert_eq!(resumed_result["status"], "succeeded");
-    assert_eq!(resumed_result["success"], true);
-    assert!(resumed_result["error_category"].is_null());
 }
 
 #[test]
@@ -587,10 +1154,12 @@ import hashlib
 import json
 import os
 import pathlib
-import re
 import sys
+import time
 
 CONTRACT = "oulipoly.provider/v1"
+PROMPT_ACCEPTANCE = "oulipoly.prompt_acceptance/v1"
+PROMPT_ACCEPTED_MARKER = "oulipoly.prompt_accepted/v1"
 SESSION = "ses_s11externalwake"
 
 def request_id(request):
@@ -605,24 +1174,29 @@ def envelope(request, result):
     }
 
 def describe(request):
+    capabilities = {
+        "launch": True,
+        "launch_output_v1": True,
+        "policy": True,
+        "quota": False,
+        "session": True,
+        "session_turn_pages_v1": True,
+        "terminal": False,
+        "rotation": False,
+        "discovery": False,
+        "settings": False,
+        "setup_brain": False,
+        "setup": False,
+        "migration": False,
+    }
+    if os.environ.get("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY") != "1":
+        capabilities["prompt_acceptance_v1"] = True
     return envelope(request, {
         "provider_id": "s11-external-provider-runtime-fixture",
         "display_name": "S11 External Provider Runtime Fixture",
         "contract_versions": [CONTRACT],
         "preferred_contract": CONTRACT,
-        "capabilities": {
-            "launch": True,
-            "policy": True,
-            "quota": False,
-            "session": True,
-            "terminal": False,
-            "rotation": False,
-            "discovery": False,
-            "settings": False,
-            "setup_brain": False,
-            "setup": False,
-            "migration": False,
-        },
+        "capabilities": capabilities,
     })
 
 def policy_evaluate(request):
@@ -642,7 +1216,10 @@ def policy_evaluate(request):
         })
     return envelope(request, {
         "accepted": True,
-        "env": {},
+        "env": {
+            "OULIPOLY_LIVE_SESSION_BIND_SOCKET": "/policy-parent-owner.sock",
+            "OULIPOLY_LIVE_SESSION_BIND_TOKEN": "policy-parent-owner-token",
+        } if os.environ.get("S11_CHECK_LIVE_BINDING_ISOLATION") == "1" else {},
         "stdin": None,
         "prompt": None,
         "diagnostics": [],
@@ -673,26 +1250,34 @@ def provider_session_marker_event(request, seq, session_id):
         "value": {"provider_session_id": session_id},
     }
 
-def submitted_turn_marker_event(request, seq, session_id, prompt):
+def prompt_acceptance_marker_event(request, seq, session_id, prompt):
     prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    acceptance = request.get("params", {}).get("prompt_acceptance", {})
+    if os.environ.get("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY") != "1":
+        assert acceptance.get("protocol") == PROMPT_ACCEPTANCE
+        assert acceptance.get("prompt_sha256") == prompt_sha
     if os.environ.get("S11_MARKER_PROMPT_SHA_MISMATCH") == "1":
         prompt_sha = hashlib.sha256(b"different payload").hexdigest()
     value = {
+        "protocol": PROMPT_ACCEPTANCE,
         "provider_session_id": session_id,
         "prompt_sha256": prompt_sha,
         "source": "s11.fixture",
-        "message_id": "msg-s11-submitted",
+        "message_id": "msg-s11-prompt-accepted",
     }
-    match = re.search(r"^\[OULIPOLY-DELIVERY ([^\]]+)\]$", prompt, re.MULTILINE)
-    if match:
-        value["delivery_nonce"] = match.group(1)
+    if os.environ.get("S11_MARKER_SESSION_MISMATCH") == "1":
+        value["provider_session_id"] = "ses_s11-wrong-session"
+    if acceptance.get("delivery_nonce"):
+        value["delivery_nonce"] = acceptance["delivery_nonce"]
+    if os.environ.get("S11_MARKER_DELIVERY_NONCE_MISMATCH") == "1":
+        value["delivery_nonce"] = "s11-wrong-delivery-nonce"
     return {
         "contract": CONTRACT,
         "request_id": request_id(request),
         "seq": seq,
         "time_unix_ms": 1000 + seq,
         "kind": "marker",
-        "name": "oulipoly.submitted_user_turn",
+        "name": PROMPT_ACCEPTED_MARKER,
         "value": value,
     }
 
@@ -707,17 +1292,41 @@ def produced_assistant_response_marker_event(request, seq):
         "value": True,
     }
 
+def launch_output_complete_event(request, seq, stdout_payloads):
+    stdout = "".join(stdout_payloads).encode("utf-8")
+    return {
+        "contract": CONTRACT,
+        "request_id": request_id(request),
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
+        "kind": "marker",
+        "name": "oulipoly.launch_output_complete/v1",
+        "value": {
+            "protocol": "oulipoly.launch_output/v1",
+            "stdout": {
+                "bytes": len(stdout),
+                "sha256": hashlib.sha256(stdout).hexdigest(),
+            },
+            "stderr": {
+                "bytes": 0,
+                "sha256": hashlib.sha256(b"").hexdigest(),
+            },
+            "data_event_count": len(stdout_payloads),
+        },
+    }
+
 def exit_event(request, seq, session_id):
+    code = 29 if os.environ.get("S11_EXIT_NONZERO") == "1" else 0
     event = {
         "contract": CONTRACT,
         "request_id": request_id(request),
         "seq": seq,
         "time_unix_ms": 1000 + seq,
         "kind": "exit",
-        "status": {"kind": "exited", "code": 0},
+        "status": {"kind": "exited", "code": code},
         "terminal_signal": {
-            "kind": "clean_exit",
-            "evidence": "fixture clean exit",
+            "kind": "nonzero_exit" if code else "clean_exit",
+            "evidence": "fixture nonzero exit" if code else "fixture clean exit",
             "observed_at_unix_ms": 1000 + seq,
         },
     }
@@ -733,7 +1342,13 @@ def launch(request):
     known = params.get("session", {}).get("known_provider_session_id")
     prompt = params.get("model", {}).get("inputs", {}).get("prompt", "")
     if known:
+        prompt_log = pathlib.Path(os.environ["S11_WORK_DIR"]).joinpath("resume-prompts.jsonl")
+        with prompt_log.open("a") as stream:
+            stream.write(json.dumps(prompt, separators=(",", ":")) + "\n")
         seq = 1
+        emit(provider_session_marker_event(request, seq, known))
+        seq += 1
+        stdout_payloads = []
         produced_assistant_response = False
         if os.environ.get("S11_NO_ASSISTANT_RESULT") != "1":
             text = "resumed\n"
@@ -742,44 +1357,34 @@ def launch(request):
                 pathlib.Path(os.environ["S11_WORK_DIR"]).joinpath("affirmative-result").write_text(text)
                 produced_assistant_response = True
             emit(stdout_event(request, seq, text))
+            stdout_payloads.append(text)
             seq += 1
-        if os.environ.get("S11_EMIT_SUBMITTED_TURN_MARKER") == "1":
-            emit(submitted_turn_marker_event(request, seq, known, prompt))
+        if os.environ.get("S11_EMIT_PROMPT_ACCEPTANCE_MARKER") == "1":
+            emit(prompt_acceptance_marker_event(request, seq, known, prompt))
             seq += 1
         if produced_assistant_response:
             emit(produced_assistant_response_marker_event(request, seq))
             seq += 1
-        emit(exit_event(request, seq, known))
+        emit(launch_output_complete_event(request, seq, stdout_payloads))
+        seq += 1
+        if os.environ.get("S11_OMIT_EXIT_EVENT") != "1":
+            emit(exit_event(request, seq, known))
         return
     session_id = None if os.environ.get("S11_OMIT_EXIT_SESSION") == "1" else SESSION
     seq = 1
     if session_id:
         emit(provider_session_marker_event(request, seq, session_id))
         seq += 1
-    emit(stdout_event(request, seq, "initial\n"))
+    initial = "initial\n"
+    emit(stdout_event(request, seq, initial))
+    seq += 1
+    emit(launch_output_complete_event(request, seq, [initial]))
     emit(exit_event(request, seq + 1, session_id))
 
 def session_id_from_request(request):
     params = request.get("params", {})
     extra = params.get("extra", {})
     return params.get("session_id") or extra.get("start_bound_provider_session_id") or SESSION
-
-def read_turns(request):
-    if os.environ.get("S11_READ_TURNS_STDOUT_LIMIT") == "1":
-        sys.stdout.write("x" * (2 * 1024 * 1024))
-        return None
-    session_id = session_id_from_request(request)
-    return envelope(request, {
-        "turns": [{
-            "session_id": session_id,
-            "turn_id": "turn-s11-external-runtime",
-            "role": "assistant",
-            "timestamp": "2026-06-06T00:00:00Z",
-            "body": [{"type": "text", "text": "fixture turn"}],
-        }],
-        "turn_count": 1,
-        "complete": True,
-    })
 
 def capture(request):
     return envelope(request, {
@@ -788,9 +1393,81 @@ def capture(request):
         "artifacts": [],
     })
 
+def session_turn_page(request):
+    params = request.get("params", {})
+    projection = params.get("turn_projection")
+    start_mode = params.get("start_mode")
+    prompt_log = pathlib.Path(os.environ["S11_WORK_DIR"]).joinpath("resume-prompts.jsonl")
+    prompts = []
+    if prompt_log.exists():
+        prompts = [json.loads(line) for line in prompt_log.read_text().splitlines() if line]
+    provider_instance_id = request.get("provider_instance_id")
+    settings_id = params.get("settings_id")
+    if start_mode == "tail":
+        turns = []
+        resume_token = "s11-anchor:" + str(len(prompts))
+        snapshot_id = "s11-tail:" + str(len(prompts))
+    elif projection == "user_observation":
+        after_token = params.get("after_token") or "s11-anchor:0"
+        start = int(after_token.rsplit(":", 1)[1])
+        selected = prompts[start:start + params.get("max_turns", 1)]
+        turns = []
+        for offset, prompt in enumerate(selected):
+            normalized = prompt.replace("\r\n", "\n").replace("\r", "\n").strip()
+            turns.append({
+                "session_id": SESSION,
+                "turn_id": "s11-observed-user-" + str(start + offset + 1),
+                "snapshot_sequence": offset,
+                "timestamp": "2026-08-30T12:00:00Z",
+                "role": "user",
+                "parent_turn_id": None,
+                "is_sidechain": False,
+                "is_compaction_boundary": False,
+                "body_state": "omitted_oversize",
+                "body": None,
+                "body_bytes": len(normalized.encode("utf-8")),
+                "body_sha256": None,
+                "canonical_text_sha256": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+            })
+        resume_token = "s11-anchor:" + str(len(prompts))
+        snapshot_id = "s11-observation:" + str(len(prompts))
+    else:
+        turns = []
+        resume_token = "s11-canonical:" + str(len(prompts))
+        snapshot_id = "s11-canonical-snapshot:" + str(len(prompts))
+    return envelope(request, {
+        "read_protocol": "oulipoly.session_turn_pages/v1",
+        "provider_instance_id": provider_instance_id,
+        "settings_id": settings_id,
+        "session_id": SESSION,
+        "turn_projection": projection,
+        "snapshot_id": snapshot_id,
+        "page_index": 0,
+        "page_start_sequence": 0,
+        "turns": turns,
+        "page_turn_count": len(turns),
+        "source_bytes_examined": sum(len(json.dumps(turn)) for turn in turns),
+        "scan_progress": False,
+        "snapshot_complete": True,
+        "next_page_token": None,
+        "resume_token": resume_token,
+        "source_final": False,
+        "warnings": [],
+    })
+
 def main():
     subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
     request = json.loads(sys.stdin.read() or "{}")
+    if os.environ.get("S11_CHECK_LIVE_BINDING_ISOLATION") == "1":
+        params = request.get("params", {})
+        environments = [os.environ, request.get("host", {}).get("env", {}),
+                        params.get("env", {}), params.get("launch", {}).get("env", {})]
+        for environment in environments:
+            for key in ("OULIPOLY_LIVE_SESSION_BIND_SOCKET", "OULIPOLY_LIVE_SESSION_BIND_TOKEN"):
+                assert key not in environment, f"{subcommand} inherited {key}"
+        if subcommand == "launch":
+            identity = json.loads(params["env"]["OULIPOLY_PARENT_INVOCATION"])
+            pathlib.Path(os.environ["S11_WORK_DIR"]).joinpath("child-invocation").write_text(identity["id"])
     if subcommand == "describe":
         print(json.dumps(describe(request)))
         return 0
@@ -800,13 +1477,12 @@ def main():
     if subcommand == "launch":
         launch(request)
         return 0
-    if subcommand == "session.read_turns":
-        result = read_turns(request)
-        if result is not None:
-            print(json.dumps(result))
-        return 0
     if subcommand == "session.capture":
         print(json.dumps(capture(request)))
+        return 0
+    if subcommand == "session.read_turns":
+        time.sleep(int(os.environ.get("S11_READ_TURNS_DELAY_MS", "0")) / 1000)
+        print(json.dumps(session_turn_page(request)))
         return 0
     print(json.dumps({
         "contract": request.get("contract", CONTRACT),
@@ -853,8 +1529,10 @@ fn assert_success(output: &Output) {
 
 fn result_envelope(output: &Output) -> Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let lines = stdout
         .lines()
+        .chain(stderr.lines())
         .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -863,9 +1541,21 @@ fn result_envelope(output: &Output) -> Value {
         "expected one result envelope: status={:?}\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
         stdout,
-        String::from_utf8_lossy(&output.stderr)
+        stderr
     );
     serde_json::from_str(lines[0]).unwrap()
+}
+
+fn assert_payload_then_success_envelope(output: &Output, payload: &str) {
+    assert!(
+        payload.ends_with('\n'),
+        "payload fixture must end with a newline"
+    );
+    assert_eq!(output.stdout, payload.as_bytes());
+    let envelope = result_envelope(output);
+    assert_eq!(envelope["status"], "succeeded");
+    assert_eq!(envelope["success"], true);
+    assert_eq!(envelope["exit_code"], 0);
 }
 
 fn terminal_signal_marker(stderr: &str) -> Value {

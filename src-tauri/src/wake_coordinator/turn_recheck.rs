@@ -1,236 +1,92 @@
+//! Coordinates the distinct terminal-attempt and failed-automatic-wake rechecks.
+//!
 //! ## Declared roles
 //!
-//! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
+//! `mapper`, `orchestration`
 
-use super::auto_wake_env::{
-    AutoWakeEnv, auto_wake_cap_reached, auto_wake_max_for_session, current_auto_wake,
-    current_auto_wake_count, emit_auto_wake_cap_reached, release_current_auto_wake_claim,
-    sleep_before_failed_auto_wake_retry,
-};
-use super::diagnostics::{WakeDiagnostic, auto_wake_cap_diagnostic, storage_error_diagnostic};
+use super::auto_wake_env::{AutoWakeEnv, current_auto_wake};
+use super::diagnostics::{WakeDiagnostic, storage_error_diagnostic};
 use super::idle::mark_session_idle_after_turn;
+use super::retry_cadence::sleep_before_failed_auto_wake_retry;
+use super::wake_claim::release_current_auto_wake_claim;
 use super::wake_start::{StartWakeInput, start_wake_chain};
-use oulipoly_state::mailbox::MailboxDb;
+use oulipoly_state::{StateDb, mailbox::MailboxDb};
 
-pub(crate) fn mark_successful_turn_idle_and_recheck(
+pub(crate) fn mark_terminal_attempt_idle_and_recheck(
     session_id: &str,
     invocation_uuid: &str,
     exit_code: i32,
 ) -> Result<WakeDiagnostic, String> {
     mark_session_idle_after_turn(session_id, invocation_uuid, Some(exit_code))?;
-    Ok(successful_turn_recheck(session_id))
+    Ok(terminal_attempt_recheck(session_id))
+}
+
+fn terminal_attempt_recheck(session_id: &str) -> WakeDiagnostic {
+    let pending_count = match turn_end_pending_count(session_id) {
+        Ok(count) => count,
+        Err(err) => return storage_error_diagnostic(err),
+    };
+    let auto_wake = current_auto_wake();
+    if pending_count == 0 {
+        release_current_auto_wake_claim(session_id, auto_wake.as_ref());
+        return WakeDiagnostic::status("no_pending");
+    }
+    start_wake_chain(StartWakeInput {
+        session_id,
+        reason: "turn_end_recheck",
+        auto_wake_count: following_auto_wake_chronology_count(auto_wake.as_ref()),
+        renew_token: auto_wake.as_ref().map(|wake| wake.token.as_str()),
+    })
 }
 
 pub(crate) fn recheck_after_failed_auto_wake(session_id: &str) -> WakeDiagnostic {
     let Some(auto_wake) = current_auto_wake() else {
         return WakeDiagnostic::status("not_auto_wake");
     };
-    release_current_auto_wake_claim(session_id, Some(&auto_wake));
-    failed_auto_wake_recheck(session_id, &auto_wake)
-}
-
-fn successful_turn_recheck(session_id: &str) -> WakeDiagnostic {
-    trigger_turn_end_recheck(session_id)
-}
-
-fn trigger_turn_end_recheck(session_id: &str) -> WakeDiagnostic {
     let pending_count = match turn_end_pending_count(session_id) {
         Ok(count) => count,
-        Err(err) => return storage_error_diagnostic(err),
-    };
-    let auto_wake = current_auto_wake();
-    let auto_wake_max = match auto_wake_max_for_session(session_id) {
-        Ok(value) => value,
-        Err(err) => return storage_error_diagnostic(err),
-    };
-    let current_count = current_auto_wake_count(auto_wake.as_ref());
-    apply_turn_end_recheck_decision(
-        session_id,
-        auto_wake.as_ref(),
-        turn_end_recheck_decision(
-            session_id,
-            RecheckConditions {
-                no_pending: no_pending(pending_count),
-                cap_reached: auto_wake_cap_reached(current_count, auto_wake_max),
-            },
-            current_count,
-            auto_wake_max,
-            auto_wake.as_ref(),
-        ),
-    )
-}
-
-fn failed_auto_wake_recheck(session_id: &str, auto_wake: &AutoWakeEnv) -> WakeDiagnostic {
-    let pending_count = match turn_end_pending_count(session_id) {
-        Ok(count) => count,
-        Err(err) => return storage_error_diagnostic(err),
-    };
-    let auto_wake_max = match auto_wake_max_for_session(session_id) {
-        Ok(value) => value,
-        Err(err) => return storage_error_diagnostic(err),
-    };
-    apply_failed_auto_wake_recheck_decision(
-        session_id,
-        auto_wake,
-        failed_auto_wake_recheck_decision(
-            session_id,
-            RecheckConditions {
-                no_pending: no_pending(pending_count),
-                cap_reached: auto_wake_cap_reached(auto_wake.count, auto_wake_max),
-            },
-            auto_wake,
-            auto_wake_max,
-        ),
-    )
-}
-
-enum TurnEndRecheckDecision<'a> {
-    NoPending,
-    CapReached { current_count: i64, max_count: i64 },
-    Start(StartWakeInput<'a>),
-}
-
-struct RecheckConditions {
-    no_pending: bool,
-    cap_reached: bool,
-}
-
-fn turn_end_recheck_decision<'a>(
-    session_id: &'a str,
-    conditions: RecheckConditions,
-    current_count: i64,
-    auto_wake_max: i64,
-    auto_wake: Option<&'a AutoWakeEnv>,
-) -> TurnEndRecheckDecision<'a> {
-    if conditions.no_pending {
-        return TurnEndRecheckDecision::NoPending;
-    }
-    let max_count = auto_wake_max;
-    if conditions.cap_reached {
-        return TurnEndRecheckDecision::CapReached {
-            current_count,
-            max_count,
-        };
-    }
-    TurnEndRecheckDecision::Start(turn_end_start_wake_input(
-        session_id,
-        current_count,
-        auto_wake,
-    ))
-}
-
-fn turn_end_start_wake_input<'a>(
-    session_id: &'a str,
-    current_count: i64,
-    auto_wake: Option<&'a AutoWakeEnv>,
-) -> StartWakeInput<'a> {
-    StartWakeInput {
-        session_id,
-        reason: "turn_end_recheck",
-        auto_wake_count: current_count + 1,
-        renew_token: auto_wake.map(|wake| wake.token.as_str()),
-    }
-}
-
-fn apply_turn_end_recheck_decision(
-    session_id: &str,
-    auto_wake: Option<&AutoWakeEnv>,
-    decision: TurnEndRecheckDecision<'_>,
-) -> WakeDiagnostic {
-    match decision {
-        TurnEndRecheckDecision::NoPending => {
-            release_current_auto_wake_claim(session_id, auto_wake);
-            no_pending_diagnostic()
+        Err(err) => {
+            release_current_auto_wake_claim(session_id, Some(&auto_wake));
+            return storage_error_diagnostic(err);
         }
-        TurnEndRecheckDecision::CapReached {
-            current_count,
-            max_count,
-        } => {
-            release_current_auto_wake_claim(session_id, auto_wake);
-            cap_reached_diagnostic(session_id, current_count, max_count)
-        }
-        TurnEndRecheckDecision::Start(input) => start_wake_chain(input),
+    };
+    if pending_count == 0 {
+        release_current_auto_wake_claim(session_id, Some(&auto_wake));
+        return WakeDiagnostic::status("no_pending");
     }
-}
-
-enum FailedAutoWakeRecheckDecision<'a> {
-    NoPending,
-    CapReached { current_count: i64, max_count: i64 },
-    Retry(StartWakeInput<'a>),
-}
-
-fn failed_auto_wake_recheck_decision<'a>(
-    session_id: &'a str,
-    conditions: RecheckConditions,
-    auto_wake: &'a AutoWakeEnv,
-    auto_wake_max: i64,
-) -> FailedAutoWakeRecheckDecision<'a> {
-    if conditions.no_pending {
-        return FailedAutoWakeRecheckDecision::NoPending;
-    }
-    let max_count = auto_wake_max;
-    if conditions.cap_reached {
-        return FailedAutoWakeRecheckDecision::CapReached {
-            current_count: auto_wake.count,
-            max_count,
-        };
-    }
-    FailedAutoWakeRecheckDecision::Retry(failed_auto_wake_retry_input(session_id, auto_wake))
-}
-
-fn failed_auto_wake_retry_input<'a>(
-    session_id: &'a str,
-    auto_wake: &'a AutoWakeEnv,
-) -> StartWakeInput<'a> {
-    StartWakeInput {
+    sleep_before_failed_auto_wake_retry(&auto_wake);
+    let diagnostic = start_wake_chain(StartWakeInput {
         session_id,
         reason: "wake_failure_retry",
-        auto_wake_count: auto_wake.count + 1,
-        renew_token: None,
-    }
+        auto_wake_count: following_auto_wake_chronology_count(Some(&auto_wake)),
+        renew_token: Some(&auto_wake.token),
+    });
+    release_current_auto_wake_claim(session_id, Some(&auto_wake));
+    diagnostic
 }
 
-fn apply_failed_auto_wake_recheck_decision(
-    session_id: &str,
-    auto_wake: &AutoWakeEnv,
-    decision: FailedAutoWakeRecheckDecision<'_>,
-) -> WakeDiagnostic {
-    match decision {
-        FailedAutoWakeRecheckDecision::NoPending => no_pending_diagnostic(),
-        FailedAutoWakeRecheckDecision::CapReached {
-            current_count,
-            max_count,
-        } => cap_reached_diagnostic(session_id, current_count, max_count),
-        FailedAutoWakeRecheckDecision::Retry(input) => {
-            sleep_before_failed_auto_wake_retry(auto_wake.count);
-            start_wake_chain(input)
-        }
-    }
+fn following_auto_wake_chronology_count(auto_wake: Option<&AutoWakeEnv>) -> i64 {
+    auto_wake
+        .map(|wake| wake.chronological_attempt_count)
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 fn turn_end_pending_count(session_id: &str) -> Result<usize, String> {
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(0);
     };
-    turn_end_pending_count_on(&mut db, session_id)
+    let state = StateDb::open_default()?;
+    turn_end_pending_count_on(&mut db, &state, session_id)
 }
 
-fn turn_end_pending_count_on(db: &mut MailboxDb, session_id: &str) -> Result<usize, String> {
+fn turn_end_pending_count_on(
+    db: &mut MailboxDb,
+    state: &StateDb,
+    session_id: &str,
+) -> Result<usize, String> {
     super::consumed_completion::reconcile_late_consumed_completions_on(db, session_id)?;
-    crate::mailbox_delivery::deliverable_pending_count_on(db, session_id)
-}
-
-fn no_pending_diagnostic() -> WakeDiagnostic {
-    WakeDiagnostic::status("no_pending")
-}
-
-fn cap_reached_diagnostic(session_id: &str, current_count: i64, max_count: i64) -> WakeDiagnostic {
-    emit_auto_wake_cap_reached(session_id, current_count, max_count);
-    auto_wake_cap_diagnostic(current_count)
-}
-
-fn no_pending(pending_count: usize) -> bool {
-    pending_count == 0
+    crate::mailbox_delivery::deliverable_pending_count_on(db, state, session_id)
 }
 
 #[cfg(test)]
@@ -239,13 +95,65 @@ mod tests {
     use crate::wake_coordinator::consumed_completion::ConsumedCompletionFixture;
 
     #[test]
+    fn terminal_attempt_recheck_ignores_former_cap_at_five() {
+        let auto_wake = AutoWakeEnv {
+            token: "turn-end-token".to_string(),
+            chronological_attempt_count: 5,
+            retry_base_milliseconds: 1_000,
+        };
+
+        assert_eq!(following_auto_wake_chronology_count(Some(&auto_wake)), 6);
+    }
+
+    #[test]
+    fn failed_auto_wake_recheck_ignores_former_cap_at_five() {
+        let auto_wake = AutoWakeEnv {
+            token: "failed-wake-token".to_string(),
+            chronological_attempt_count: 5,
+            retry_base_milliseconds: 1_000,
+        };
+
+        assert_eq!(following_auto_wake_chronology_count(Some(&auto_wake)), 6);
+    }
+
+    #[test]
+    fn terminal_attempt_recheck_advances_near_maximum_chronology() {
+        let auto_wake = AutoWakeEnv {
+            token: "turn-end-boundary-token".to_string(),
+            chronological_attempt_count: i64::MAX - 1,
+            retry_base_milliseconds: 1_000,
+        };
+
+        assert_eq!(
+            following_auto_wake_chronology_count(Some(&auto_wake)),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn failed_auto_wake_recheck_saturates_maximum_chronology() {
+        let auto_wake = AutoWakeEnv {
+            token: "failed-wake-boundary-token".to_string(),
+            chronological_attempt_count: i64::MAX,
+            retry_base_milliseconds: 1_000,
+        };
+
+        assert_eq!(
+            following_auto_wake_chronology_count(Some(&auto_wake)),
+            i64::MAX
+        );
+    }
+
+    #[test]
     fn turn_end_pending_count_reconciles_late_consumption() {
         let fixture = ConsumedCompletionFixture::new();
         fixture.mark_consumed();
         let mut db = fixture.mailbox();
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
 
         assert_eq!(
-            turn_end_pending_count_on(&mut db, ConsumedCompletionFixture::SESSION_ID).unwrap(),
+            turn_end_pending_count_on(&mut db, &state, ConsumedCompletionFixture::SESSION_ID)
+                .unwrap(),
             0
         );
         assert!(
@@ -268,9 +176,11 @@ mod tests {
     fn turn_end_pending_count_keeps_unconsumed_completion_pending() {
         let fixture = ConsumedCompletionFixture::new();
         let mut db = fixture.mailbox();
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
 
         assert_eq!(
-            turn_end_pending_count_on(&mut db, ConsumedCompletionFixture::SESSION_ID).unwrap(),
+            turn_end_pending_count_on(&mut db, &state, ConsumedCompletionFixture::SESSION_ID)
+                .unwrap(),
             1
         );
         let listener = db

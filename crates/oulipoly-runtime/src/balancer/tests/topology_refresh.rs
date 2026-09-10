@@ -24,11 +24,9 @@ fn topology_probe_refreshes_incomplete_cached_provider_before_density() {
         ("a", repaired_a_script.as_str()),
         ("b", "printf '%s' '{\"windows\":[]}'"),
     ]);
-    let sessions_cfg = SessionsConfig::default();
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 
@@ -62,11 +60,9 @@ fn topology_probe_respects_cooldown_for_persistent_short_topology() {
         ("a", would_repair_a_script),
         ("b", "printf '%s' '{\"windows\":[]}'"),
     ]);
-    let sessions_cfg = SessionsConfig::default();
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 
@@ -97,11 +93,9 @@ fn routing_refreshes_stale_quota_after_thirty_seconds_before_scoring() {
     let exhausted_a_script =
         format!(r#"printf '%s' '{{"windows":[{{"used_percent":100,"resets_at":"{resets}"}}]}}'"#);
     let providers_cfg = providers_config_with_scripts(&[("a", exhausted_a_script.as_str())]);
-    let sessions_cfg = SessionsConfig::default();
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 
@@ -140,11 +134,9 @@ fn routing_uses_cached_quota_inside_thirty_second_ttl() {
     .unwrap();
     let script_cmd = format!("sh {}", script.display());
     let providers_cfg = providers_config_with_scripts(&[("a", script_cmd.as_str())]);
-    let sessions_cfg = SessionsConfig::default();
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 
@@ -168,11 +160,9 @@ fn routing_refresh_failure_falls_back_to_cached_quota() {
         .unwrap();
 
     let providers_cfg = providers_config_with_scripts(&[("a", "exit 1")]);
-    let sessions_cfg = SessionsConfig::default();
     let in_flight = InFlight::new();
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 

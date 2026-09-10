@@ -61,8 +61,15 @@ fn finalize_invocation_sets_terminal_fields() {
     };
     let id = db.start_invocation(&start).unwrap();
 
-    db.finalize_invocation(id, false, 7, None, Some("exit_nonzero"))
-        .unwrap();
+    db.finalize_invocation(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        false,
+        7,
+        None,
+        Some("exit_nonzero"),
+    )
+    .unwrap();
 
     let row = db
         .get_invocation_by_uuid(&start.invocation_uuid)
@@ -96,6 +103,7 @@ fn finalize_invocation_updates_provider_aggregate_stats() {
 
     let failed_id = db.start_invocation(&failed).unwrap();
     db.finalize_invocation(
+        crate::InvocationMutationAuthority::Standalone,
         failed_id,
         false,
         1,
@@ -104,8 +112,15 @@ fn finalize_invocation_updates_provider_aggregate_stats() {
     )
     .unwrap();
     let succeeded_id = db.start_invocation(&succeeded).unwrap();
-    db.finalize_invocation(succeeded_id, true, 0, None, None)
-        .unwrap();
+    db.finalize_invocation(
+        crate::InvocationMutationAuthority::Standalone,
+        succeeded_id,
+        true,
+        0,
+        None,
+        None,
+    )
+    .unwrap();
 
     let provider = db
         .get_provider("test-model", "fixture-provider")
@@ -142,9 +157,24 @@ fn finalize_invocation_skips_provider_aggregate_for_null_provider_name() {
         ids.push(db.conn.last_insert_rowid());
     }
 
-    db.finalize_invocation(ids[0], true, 0, None, None).unwrap();
-    db.finalize_invocation(ids[1], false, 1, Some("rate_limit"), Some("429"))
-        .unwrap();
+    db.finalize_invocation(
+        crate::InvocationMutationAuthority::Standalone,
+        ids[0],
+        true,
+        0,
+        None,
+        None,
+    )
+    .unwrap();
+    db.finalize_invocation(
+        crate::InvocationMutationAuthority::Standalone,
+        ids[1],
+        false,
+        1,
+        Some("rate_limit"),
+        Some("429"),
+    )
+    .unwrap();
 
     let provider_rows = provider_rows_for_model(&db, "legacy-model");
     assert_eq!(provider_rows, 0);
@@ -154,7 +184,14 @@ fn finalize_invocation_skips_provider_aggregate_for_null_provider_name() {
 fn finalize_invocation_errors_for_missing_row() {
     let db = test_db();
     let err = db
-        .finalize_invocation(99, false, 1, Some("rate_limit"), None)
+        .finalize_invocation(
+            crate::InvocationMutationAuthority::Standalone,
+            99,
+            false,
+            1,
+            Some("rate_limit"),
+            None,
+        )
         .unwrap_err();
     assert!(err.contains("99"));
 }
@@ -170,11 +207,19 @@ fn finalize_invocation_errors_when_called_twice() {
         parent_invocation_id: None,
     };
     let id = db.start_invocation(&start).unwrap();
-    db.finalize_invocation(id, true, 0, None, Some("exit_zero"))
-        .unwrap();
+    db.finalize_invocation(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        true,
+        0,
+        None,
+        Some("exit_zero"),
+    )
+    .unwrap();
 
     let err = db
         .finalize_invocation(
+            crate::InvocationMutationAuthority::Standalone,
             id,
             false,
             -1,

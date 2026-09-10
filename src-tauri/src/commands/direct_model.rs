@@ -55,8 +55,8 @@ struct CliExecutionContextParts {
 }
 
 fn load_cli_execution_context_parts(cli: &Cli) -> Result<CliExecutionContextParts, String> {
-    let providers_cfg = load_providers_config();
-    let models_dir = crate::cli::paths::resolve_models_dir(cli);
+    let providers_cfg = load_providers_config()?;
+    let models_dir = crate::cli::paths::resolve_models_dir(cli)?;
     let models = load_cli_models(&models_dir, &providers_cfg)?;
     let extra_inputs = parse_cli_extra_inputs(cli)?;
     Ok(cli_execution_context_parts(
@@ -78,9 +78,11 @@ fn cli_execution_context_parts(
     }
 }
 
-fn load_providers_config() -> ProvidersConfig {
-    ProvidersConfig::load(&crate::cli::paths::default_config_root().join("providers.toml"))
-        .unwrap_or_default()
+fn load_providers_config() -> Result<ProvidersConfig, String> {
+    Ok(
+        ProvidersConfig::load(&crate::cli::paths::default_config_root()?.join("providers.toml"))
+            .unwrap_or_default(),
+    )
 }
 
 fn load_cli_models(
@@ -140,6 +142,16 @@ pub(crate) fn run_direct_model_cli(
         emit_direct_model_prompt_resolution_failure(model, err);
     })?;
     dispatch_direct_model_balancing(agent_runtime_services, &context, model, &prompt)
+}
+
+pub(crate) fn validate_direct_model_cli_context(cli: &Cli, model_name: &str) -> Result<(), String> {
+    let providers_cfg = load_providers_config()?;
+    let context = load_direct_model_context(cli, model_name)?;
+    let model = load_direct_model(&context, model_name)?;
+    for provider in &model.providers {
+        providers_cfg.runtime_provider(&provider.name)?;
+    }
+    Ok(())
 }
 
 fn load_direct_model_context(cli: &Cli, model_name: &str) -> Result<CliExecutionContext, String> {

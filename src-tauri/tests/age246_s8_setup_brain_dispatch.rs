@@ -179,12 +179,7 @@ print(json.dumps(envelope(result)))
             .iter()
             .map(|record| record["operation"].as_str().expect("operation"))
             .collect::<Vec<_>>(),
-        [
-            "describe",
-            "setup_brain.turn",
-            "describe",
-            "setup_brain.turn"
-        ]
+        ["describe", "setup_brain.turn", "setup_brain.turn"]
     );
     assert_eq!(
         records[1].pointer("/request/params/settings_id"),
@@ -200,7 +195,7 @@ print(json.dumps(envelope(result)))
             .is_none()
     );
     assert_eq!(
-        records[3].pointer("/request/params/conversation_id"),
+        records[2].pointer("/request/params/conversation_id"),
         Some(&json!("conv-neutral-1"))
     );
     assert!(

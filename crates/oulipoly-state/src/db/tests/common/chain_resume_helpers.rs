@@ -183,8 +183,13 @@ pub(in crate::db::tests) fn seed_invocation_for_session(
     let id = db
         .start_invocation(&session_seed_invocation_start(model_name, provider_name))
         .unwrap();
-    db.update_session_capture(id, Some(session_id), "fixture")
-        .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        Some(session_id),
+        "fixture",
+    )
+    .unwrap();
     db.conn
         .execute(
             "UPDATE invocations SET created_at = ?1, finished_at = ?1 WHERE id = ?2",

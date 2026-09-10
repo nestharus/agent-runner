@@ -5,10 +5,9 @@
 //! - formatter
 //! - mapper
 //! - orchestration
-//! - parser
 //! - predicate
 //!
-//! Role set: { accessor, filter, formatter, mapper, orchestration, parser, predicate }
+//! Role set: { accessor, filter, formatter, mapper, orchestration, predicate }
 //!
 //! ## Intrinsic-surface declarations
 //!
@@ -25,14 +24,9 @@
 //!         via `use super::*`, subordinate to this domain: DateTime, SessionTurnCounts, StateDb, Utc, params, sqlite
 //!       - external contract symbols referenced by this concern via its `use`
 //!         declarations, intrinsic and subordinate to this persistence domain: DateTime, Utc
-//!       - intrinsic JSON and iterator carriers this concern uses to parse and
-//!         canonicalize stored session-turn bodies and to gate empty chunk
-//!         streams, subordinate to this domain: serde_json (serde_json::Value,
-//!         serde_json::from_str, serde_json::Value::Array, serde_json::Value::as_str)
-//!         and std::iter::Peekable
 //! ```
 //!
-//! Session-turn count and user-body query helpers.
+//! Session-turn count query helpers.
 
 use super::*;
 use chrono::{DateTime, Utc};
@@ -43,23 +37,6 @@ const SESSION_TURN_COUNTS_SQL: &str = "SELECT
                     COUNT(CASE WHEN is_sidechain = 1 THEN 1 END) AS sidechain
                  FROM session_turns
                  WHERE provider_name = ?1 AND session_id = ?2";
-
-const SESSION_USER_TURN_BODIES_SQL: &str = "SELECT body
-                 FROM session_turns
-                 WHERE provider_name = ?1
-                   AND session_id = ?2
-                   AND role = 'user'
-                   AND body IS NOT NULL";
-
-const SESSION_USER_TURN_SUBSTRING_SQL: &str = "SELECT EXISTS(
-                    SELECT 1
-                    FROM session_turns
-                    WHERE provider_name = ?1
-                      AND session_id = ?2
-                      AND role = 'user'
-                      AND body IS NOT NULL
-                      AND instr(body, ?3) > 0
-                )";
 
 impl StateDb {
     pub fn count_session_turns(
@@ -169,186 +146,5 @@ impl StateDb {
 
     pub(super) fn session_turn_count_error(e: sqlite::Error) -> String {
         format!("Failed to count session turns: {e}")
-    }
-
-    pub fn has_session_user_text_turn(
-        &self,
-        provider_name: &str,
-        session_id: &str,
-        text: &str,
-    ) -> Result<bool, String> {
-        let bodies = self.load_session_user_turn_bodies(provider_name, session_id)?;
-        Ok(Self::session_user_turn_bodies_contain(&bodies, text))
-    }
-
-    fn load_session_user_turn_bodies(
-        &self,
-        provider_name: &str,
-        session_id: &str,
-    ) -> Result<Vec<String>, String> {
-        let mut stmt = self
-            .conn
-            .prepare(SESSION_USER_TURN_BODIES_SQL)
-            .map_err(Self::format_session_user_turn_lookup_prepare_error)?;
-        let rows = stmt
-            .query_map(
-                sqlite::params![provider_name, session_id],
-                Self::session_user_turn_body,
-            )
-            .map_err(Self::format_session_user_turn_lookup_query_error)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(Self::format_session_user_turn_body_read_error)
-    }
-
-    fn session_user_turn_bodies_contain(bodies: &[String], text: &str) -> bool {
-        for body in bodies {
-            if Self::session_user_turn_body_matches(body, text) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn format_session_user_turn_lookup_prepare_error(e: sqlite::Error) -> String {
-        format!("Failed to prepare session user turn lookup: {e}")
-    }
-
-    fn format_session_user_turn_lookup_query_error(e: sqlite::Error) -> String {
-        format!("Failed to query session user turns: {e}")
-    }
-
-    fn format_session_user_turn_body_read_error(e: sqlite::Error) -> String {
-        format!("Failed to read session user turn body: {e}")
-    }
-
-    pub fn has_session_user_turn_containing(
-        &self,
-        provider_name: &str,
-        session_id: &str,
-        needle: &str,
-    ) -> Result<bool, String> {
-        if Self::session_user_turn_needle_is_empty(needle) {
-            return Ok(false);
-        }
-        let found = self.session_user_turn_substring_exists(provider_name, session_id, needle)?;
-        Ok(Self::sqlite_exists_value_is_true(found))
-    }
-
-    fn session_user_turn_needle_is_empty(needle: &str) -> bool {
-        needle.is_empty()
-    }
-
-    fn session_user_turn_substring_exists(
-        &self,
-        provider_name: &str,
-        session_id: &str,
-        needle: &str,
-    ) -> Result<i64, String> {
-        self.conn
-            .query_row(
-                SESSION_USER_TURN_SUBSTRING_SQL,
-                sqlite::params![provider_name, session_id, needle],
-                Self::map_session_user_turn_substring_exists_row,
-            )
-            .map_err(Self::format_session_user_turn_substring_query_error)
-    }
-
-    fn map_session_user_turn_substring_exists_row(row: &sqlite::Row<'_>) -> sqlite::Result<i64> {
-        row.get(0)
-    }
-
-    fn sqlite_exists_value_is_true(found: i64) -> bool {
-        found != 0
-    }
-
-    fn format_session_user_turn_substring_query_error(e: sqlite::Error) -> String {
-        format!("Failed to query session user turn substring: {e}")
-    }
-
-    pub(super) fn session_user_turn_body(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
-        row.get(0)
-    }
-
-    pub(super) fn session_user_turn_body_matches(body: &str, text: &str) -> bool {
-        Self::session_turn_body_has_exact_text(body, text)
-    }
-
-    pub(super) fn session_turn_body_has_exact_text(body: &str, text: &str) -> bool {
-        Self::parse_session_turn_body(body)
-            .as_ref()
-            .is_some_and(|value| Self::parsed_session_turn_body_has_exact_text(value, text))
-    }
-
-    pub(super) fn parse_session_turn_body(body: &str) -> Option<serde_json::Value> {
-        serde_json::from_str::<serde_json::Value>(body).ok()
-    }
-
-    pub(super) fn parsed_session_turn_body_has_exact_text(
-        body: &serde_json::Value,
-        text: &str,
-    ) -> bool {
-        Self::canonical_body_has_exact_text(body, text)
-    }
-
-    pub(super) fn canonical_body_has_exact_text(body: &serde_json::Value, text: &str) -> bool {
-        let serde_json::Value::Array(chunks) = body else {
-            return false;
-        };
-        let canonical_text =
-            Self::canonical_text_from_chunks(Self::session_turn_text_chunks(chunks));
-        Self::canonical_text_equals(canonical_text.as_deref(), text)
-    }
-
-    pub(super) fn session_turn_text_chunks(
-        chunks: &[serde_json::Value],
-    ) -> impl Iterator<Item = &serde_json::Value> + '_ {
-        chunks
-            .iter()
-            .filter(|chunk| Self::session_turn_chunk_is_text(chunk))
-    }
-
-    pub(super) fn canonical_text_from_chunks<'a>(
-        chunks: impl Iterator<Item = &'a serde_json::Value>,
-    ) -> Option<String> {
-        Self::format_canonical_text(Self::session_turn_text_values(chunks))
-    }
-
-    pub(super) fn session_turn_text_values<'a>(
-        chunks: impl Iterator<Item = &'a serde_json::Value>,
-    ) -> impl Iterator<Item = &'a str> {
-        chunks.flat_map(Self::session_turn_chunk_text)
-    }
-
-    pub(super) fn session_turn_chunk_text(chunk: &serde_json::Value) -> Option<&str> {
-        chunk.get("text").and_then(serde_json::Value::as_str)
-    }
-
-    /// Produce the canonical text for a turn's text chunks, or `None` when there
-    /// are no text chunks. `None` is distinct from `Some(String::new())`: the
-    /// latter means text chunks were present but each carried empty text.
-    pub(super) fn format_canonical_text<'a>(
-        texts: impl Iterator<Item = &'a str>,
-    ) -> Option<String> {
-        let mut texts = texts.peekable();
-        Self::has_text_chunk(&mut texts).then(|| Self::fold_canonical_text(texts))
-    }
-
-    fn has_text_chunk<'a>(texts: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>) -> bool {
-        texts.peek().is_some()
-    }
-
-    fn fold_canonical_text<'a>(texts: impl Iterator<Item = &'a str>) -> String {
-        texts.collect()
-    }
-
-    pub(super) fn canonical_text_equals(candidate: Option<&str>, text: &str) -> bool {
-        candidate == Some(text)
-    }
-
-    pub(super) fn session_turn_chunk_is_text(chunk: &serde_json::Value) -> bool {
-        chunk
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|chunk_type| chunk_type == "text")
     }
 }

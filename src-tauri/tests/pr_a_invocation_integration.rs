@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{
     CompositeInvocationId, InvocationStart, InvocationStatus, ProviderSessionBinding, StateDb,
 };
@@ -61,7 +63,7 @@ name = "fixture-provider"
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[fixture-provider]
 command = "{}"
 args = []
@@ -72,7 +74,7 @@ kind = "forced_flag_verified"
 flag = "--session-id"
 "#,
                 script_path.display()
-            ),
+            )),
         )
         .unwrap();
 
@@ -108,7 +110,10 @@ flag = "--session-id"
             .arg("ping");
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         if let Some(value) = parent_env {
             cmd.env("OULIPOLY_PARENT_INVOCATION", value);
@@ -172,34 +177,64 @@ fn configure_agent_bash_env(
     );
     command.env(
         "AGENT_BASH_AGENT_RUNNER_BIN",
-        env!("CARGO_BIN_EXE_oulipoly-agent-runner"),
+        fixture._dir.path().join("runner/oulipoly-agent-runner"),
     );
-    command.env_remove("OULIPOLY_DATA_DIR");
+    command.env("AGENT_BASH_BIN", fixture._dir.path().join("agent-bash"));
+    command.env(
+        "OULIPOLY_DATA_DIR",
+        fixture.data_home.join("oulipoly-agent-runner"),
+    );
 }
 
 fn agent_bash_bin_from_env() -> PathBuf {
     let value = std::env::var_os(AGENT_BASH_BIN_ENV)
         .map(PathBuf::from)
-        .or_else(find_agent_bash_in_path)
         .unwrap_or_else(|| {
-            panic!("{AGENT_BASH_BIN_ENV} must point to an agent-bash binary or agent-bash must be on PATH")
+            panic!("{AGENT_BASH_BIN_ENV} must name the absolute source-qualified agent-bash binary (see .github/actions/install-agent-bash)")
         });
     assert_agent_bash_bin(&value);
     value
 }
 
-fn find_agent_bash_in_path() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("agent-bash"))
-        .find(|path| path.is_file())
-}
-
 fn assert_agent_bash_bin(path: &Path) {
     assert!(
-        path.is_file(),
-        "{AGENT_BASH_BIN_ENV} must point to an agent-bash binary"
+        path.is_absolute() && path.is_file(),
+        "{AGENT_BASH_BIN_ENV} must point to an absolute agent-bash binary"
     );
+}
+
+fn isolated_agent_bash_bin(fixture: &Fixture, source: &Path) -> PathBuf {
+    let target = fixture._dir.path().join("agent-bash");
+    fs::copy(source, &target).unwrap();
+    let mut permissions = fs::metadata(&target).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&target, permissions).unwrap();
+    let runner_dir = fixture._dir.path().join("runner");
+    fs::create_dir_all(&runner_dir).unwrap();
+    let runner = runner_dir.join("oulipoly-agent-runner");
+    let source_runner = env!("CARGO_BIN_EXE_oulipoly-agent-runner");
+    if fs::hard_link(source_runner, &runner).is_err() {
+        fs::copy(source_runner, &runner).unwrap();
+    }
+    fs::write(
+        fixture._dir.path().join("agent-bash.toml"),
+        format!(
+            "state_root = {:?}\nagent_runner_bin = {:?}\n",
+            fixture.state_home().join("agent-bash"),
+            runner,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        runner_dir.join("config.toml"),
+        format!(
+            "data_dir = {:?}\nconfig_home = {:?}\n",
+            fixture.data_home.join("oulipoly-agent-runner"),
+            fixture.config_home,
+        ),
+    )
+    .unwrap();
+    target
 }
 
 fn parse_invocation(stderr: &str) -> CompositeInvocationId {
@@ -229,7 +264,10 @@ fn run_trace_json(fixture: &Fixture, invocation_uuid: &str) -> Value {
     cmd.arg("trace").arg(invocation_uuid).arg("--json");
     cmd.env("XDG_CONFIG_HOME", &fixture.config_home);
     cmd.env("XDG_DATA_HOME", &fixture.data_home);
-    cmd.env_remove("OULIPOLY_DATA_DIR");
+    cmd.env(
+        "OULIPOLY_DATA_DIR",
+        fixture.data_home.join("oulipoly-agent-runner"),
+    );
     let output = cmd.output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     serde_json::from_slice(&output.stdout).unwrap()
@@ -349,8 +387,8 @@ fn resolves_parent_env_and_overwrites_child_subprocess_env() {
 
 #[test]
 fn nested_agent_bash_rejects_unattested_synthetic_completion_owner() {
-    let agent_bash_bin = agent_bash_bin_from_env();
     let fixture = Fixture::new();
+    let agent_bash_bin = isolated_agent_bash_bin(&fixture, &agent_bash_bin_from_env());
     let parent = CompositeInvocationId {
         source: "fixture-provider".to_string(),
         id: "aaaaaaaa-0000-4000-8000-000000000010".to_string(),
@@ -368,6 +406,7 @@ fn nested_agent_bash_rejects_unattested_synthetic_completion_owner() {
         .unwrap();
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             started.invocation_row_id,
             &ProviderSessionBinding {
                 provider_session_id: owner_session_id.to_string(),
@@ -500,14 +539,14 @@ fn direct_provider_spawn_error_finalizes_failed_row_with_spawn_error_reason() {
             .config_home
             .join("oulipoly-agent-runner")
             .join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"[fixture-provider]
 command = "{}"
 args = []
 prompt_mode = "arg"
 "#,
             missing_command.display()
-        ),
+        )),
     )
     .unwrap();
 
@@ -523,7 +562,7 @@ prompt_mode = "arg"
 
     assert_eq!(row.status, InvocationStatus::Failed);
     assert_eq!(row.success, Some(false));
-    assert_eq!(row.exit_code, Some(-1));
+    assert_eq!(row.exit_code, Some(1));
     assert_eq!(row.error_category.as_deref(), Some("spawn_error"));
     assert_eq!(row.terminal_reason.as_deref(), Some("spawn_error"));
     assert!(row.finished_at.is_some());
@@ -588,8 +627,15 @@ exit 7"#
     ));
     let child_id = seed_running_child_for_first_parent(&fixture, child_uuid);
     let db = fixture.open_db();
-    db.finalize_invocation(child_id, false, 7, None, Some("exit_nonzero"))
-        .unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        child_id,
+        false,
+        7,
+        None,
+        Some("exit_nonzero"),
+    )
+    .unwrap();
 
     let output = fixture.run(None);
 

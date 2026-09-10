@@ -92,6 +92,7 @@ fn age132_resolve_resume_rejections_and_wrong_id_context_are_typed() {
         .unwrap();
     wrong_id_db
         .bind_invocation_provider_session_start(
+            crate::InvocationMutationAuthority::Standalone,
             id,
             &ProviderSessionBinding {
                 provider_session_id: SESSION_A.to_string(),
@@ -235,8 +236,13 @@ fn age132_timestamp_policies_preserve_strict_forgiving_and_fallback_callers() {
             parent_invocation_id: None,
         })
         .unwrap();
-    db.update_session_capture(id, Some(SESSION_A), "verified")
-        .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        id,
+        Some(SESSION_A),
+        "verified",
+    )
+    .unwrap();
     db.conn
         .execute(
             "UPDATE invocations SET created_at = 'not-a-timestamp' WHERE id = ?1",
@@ -244,7 +250,8 @@ fn age132_timestamp_policies_preserve_strict_forgiving_and_fallback_callers() {
         )
         .unwrap();
     let before = Utc::now();
-    db.mint_chain_for_invocation_session(id).unwrap();
+    db.mint_chain_for_invocation_session(crate::InvocationMutationAuthority::Standalone, id)
+        .unwrap();
     let after = Utc::now();
     let raw_started = chain_segment_started_at_raw(&db, "provider-a", SESSION_A);
     let started_at = parse_test_timestamp_utc(&raw_started);

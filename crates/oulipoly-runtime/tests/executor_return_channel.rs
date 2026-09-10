@@ -64,6 +64,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use uuid::Uuid;
 
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+
 struct FixtureScript {
     _dir: tempfile::TempDir,
     path: PathBuf,
@@ -109,6 +111,13 @@ fn locked_env() -> MutexGuard<'static, ()> {
 }
 
 fn fixture_script(body: &str) -> FixtureScript {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("provider.sh");
     std::fs::write(

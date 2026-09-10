@@ -1,10 +1,11 @@
 //! Declared roles: formatter
 
-use oulipoly_runtime::diagnostics::Diagnosis;
+use oulipoly_runtime::diagnostics::{Diagnosis, non_quota_failure_diagnosis};
 
 pub(super) fn render_diagnostics_result(
     diagnosis: Result<Diagnosis, String>,
     provider_exit_code: i32,
+    provider_output: &str,
 ) -> Option<String> {
     match diagnosis {
         Ok(diagnosis) => {
@@ -15,7 +16,9 @@ pub(super) fn render_diagnostics_result(
             emit_diagnostics_failure(&e);
             let failure = super::mapper::diagnostics_failure(&e, provider_exit_code);
             emit_diagnostics_failure_marker(&failure);
-            None
+            let original = non_quota_failure_diagnosis(provider_output, provider_exit_code)?;
+            emit_diagnostics_success(&original);
+            Some(diagnostics_category_name(&original))
         }
     }
 }
@@ -60,6 +63,42 @@ fn diagnostics_category_name(diagnosis: &Diagnosis) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_request_failure_preserves_original_network_category() {
+        let category = render_diagnostics_result(
+            Err("external provider protocol failed: registry_lookup".to_string()),
+            17,
+            "connection refused for active resume provider",
+        );
+        assert_eq!(category.as_deref(), Some("network_error"));
+    }
+
+    #[test]
+    fn secondary_error_text_cannot_classify_original_or_infer_exhaustion() {
+        for original in [
+            "unclassified failure",
+            "quota exceeded; HTTP 429 rate limited",
+        ] {
+            assert_eq!(
+                render_diagnostics_result(Err("connection refused".to_string()), 17, original),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn successful_diagnosis_keeps_its_category() {
+        let category = render_diagnostics_result(
+            Ok(Diagnosis {
+                category: oulipoly_runtime::diagnostics::ErrorCategory::ProviderProtocol,
+                summary: "primary protocol error".to_string(),
+            }),
+            17,
+            "connection refused",
+        );
+        assert_eq!(category.as_deref(), Some("provider_protocol"));
+    }
 
     #[test]
     fn diagnostic_failure_marker_records_secondary_operation_separately() {

@@ -264,6 +264,7 @@ fn finalize_provider_invocation(
     stderr_snippet: Option<&str>,
 ) {
     db.finalize_invocation(
+        crate::InvocationMutationAuthority::Standalone,
         id,
         success,
         provider_invocation_exit_code(success),

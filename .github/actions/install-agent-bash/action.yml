@@ -5,5 +5,6 @@ runs:
   steps:
     - shell: bash
       run: |
-        cargo install --git https://github.com/nestharus/agent-bash-tool --rev 2a435c4909d184bbac28873fcfb8afb72861ec2c --locked --root "$RUNNER_TEMP/agent-bash" agent-bash-tool
+        # Requires root/tree completion, explicit delivery, consume, and live owner attestation.
+        cargo install --git https://github.com/nestharus/agent-bash-tool --rev 1e88d3e1d0af710d1476fdab1c105014406c28db --locked --root "$RUNNER_TEMP/agent-bash" agent-bash-tool
         echo "AGENT_BASH_BIN=$RUNNER_TEMP/agent-bash/bin/agent-bash" >> "$GITHUB_ENV"

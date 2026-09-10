@@ -2,6 +2,8 @@
 //!
 //! `validator`, `mapper`, `accessor`
 
+mod provider_authority_fixture;
+
 use agent_runner_lib::{AppState, derive_pools, save_model_inner, update_pool_inner};
 use oulipoly_config::{self as config, ModelConfig, PromptMode, ProviderConfig};
 use std::collections::HashMap;
@@ -40,12 +42,14 @@ fn model_with_provider_args(name: &str, provider_name: &str, args: &[&str]) -> M
 fn write_codex_providers(root: &Path) {
     std::fs::write(
         root.join("providers.toml"),
-        r#"
+        provider_authority_fixture::with_explicit_provider_authority(
+            r#"
 [codex]
 command = "codex"
 args = ["exec", "-c", "sandbox=workspace-write"]
 interactive_args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
 "#,
+        ),
     )
     .unwrap();
 }

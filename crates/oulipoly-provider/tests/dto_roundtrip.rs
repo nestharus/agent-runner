@@ -5,10 +5,93 @@ pub mod support {
 use oulipoly_provider::generated as dto;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use support::contract_matrix::{
     LAUNCH_EVENT_ROWS, NON_LAUNCH_ROWS, fixtures, launch_event_fixture, launch_fixture,
     non_launch_fixture,
 };
+
+#[test]
+fn terminal_unavailable_requires_request_selection_and_preserves_legacy_terminal_kinds() {
+    let mut host: dto::HostContext = serde_json::from_value(json!({"app":"fixture-host"})).unwrap();
+    assert!(!dto::host_requested_terminal_unavailable_v1(&host));
+    for value in ["", "0", "true"] {
+        host.env
+            .insert(dto::HOST_TERMINAL_UNAVAILABLE_V1_ENV.into(), value.into());
+        assert!(!dto::host_requested_terminal_unavailable_v1(&host));
+    }
+    host.env
+        .insert(dto::HOST_TERMINAL_UNAVAILABLE_V1_ENV.into(), "1".into());
+    assert!(dto::host_requested_terminal_unavailable_v1(&host));
+    for kind in [
+        "provider_unavailable",
+        "clean_exit",
+        "nonzero_exit",
+        "unknown",
+        "cancelled",
+    ] {
+        assert_json_round_trip::<dto::TerminalSignal>(&json!({
+            "kind":kind, "observed_at_unix_ms":0
+        }));
+    }
+}
+
+#[test]
+fn prompt_acceptance_capability_requires_explicit_v1_host_selection() {
+    let mut host = dto::HostContext {
+        app: "older-host".to_string(),
+        app_version: None,
+        platform: None,
+        working_directory: None,
+        config_root: None,
+        data_root: None,
+        env: BTreeMap::new(),
+        deadline_unix_ms: None,
+    };
+
+    assert!(!dto::host_requested_prompt_acceptance_v1(&host));
+    host.env.insert(
+        dto::HOST_PROMPT_ACCEPTANCE_V1_ENV.to_string(),
+        dto::HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE.to_string(),
+    );
+    assert!(dto::host_requested_prompt_acceptance_v1(&host));
+}
+
+#[test]
+fn describe_fixture_binds_prompt_acceptance_to_host_selection() {
+    let fixtures = fixtures();
+    for (request_name, response_name) in [
+        ("request", "success_response"),
+        ("legacy_request", "legacy_success_response"),
+    ] {
+        let request: dto::DescribeRequest =
+            serde_json::from_value(non_launch_fixture(&fixtures, "describe", request_name).clone())
+                .unwrap();
+        let response: dto::DescribeResponse = serde_json::from_value(
+            non_launch_fixture(&fixtures, "describe", response_name).clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            dto::host_requested_prompt_acceptance_v1(&request.host),
+            response.result.capabilities.prompt_acceptance_v1
+        );
+    }
+}
+
+#[test]
+fn prompt_acceptance_attestation_has_a_named_provider_contract_dto() {
+    let value = json!({
+        "protocol": dto::PROMPT_ACCEPTANCE_V1,
+        "provider_session_id": "session-1",
+        "prompt_sha256": "a".repeat(64),
+        "delivery_nonce": "delivery-1",
+        "source": "fixture",
+        "message_id": "message-1"
+    });
+
+    assert_json_round_trip::<dto::PromptAcceptedMarkerValueV1>(&value);
+}
 
 #[test]
 fn dto_roundtrip_covers_every_s2_contract_type() {

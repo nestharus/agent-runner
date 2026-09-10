@@ -96,6 +96,7 @@ fn bind_invocation_provider_session_start_persists_resolved_account_identity() {
     let id = db.start_invocation(&start).unwrap();
 
     db.bind_invocation_provider_session_start(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         id,
         &ProviderSessionBinding {
             provider_session_id: "provider-session-a".to_string(),

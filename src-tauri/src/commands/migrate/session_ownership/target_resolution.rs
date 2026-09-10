@@ -56,7 +56,7 @@ pub(crate) fn prove_provider(target: &TargetResolution) -> Result<(), DryRunErro
 fn load_target_config(
     models_dir_override: Option<&Path>,
 ) -> Result<LoadedTargetConfig, DryRunError> {
-    let models_dir = resolved_models_dir(models_dir_override);
+    let models_dir = resolved_models_dir(models_dir_override)?;
     let providers_path = providers_path_for_models_dir(&models_dir);
     let providers_cfg = ProvidersConfig::load(&providers_path)
         .map_err(|err| DryRunError::new(format!("failed to load providers config: {err}")))?;
@@ -68,10 +68,10 @@ fn load_target_config(
     })
 }
 
-fn resolved_models_dir(models_dir_override: Option<&Path>) -> PathBuf {
+fn resolved_models_dir(models_dir_override: Option<&Path>) -> Result<PathBuf, DryRunError> {
     models_dir_override
         .map(Path::to_path_buf)
-        .unwrap_or_else(default_models_dir)
+        .map_or_else(|| default_models_dir().map_err(DryRunError::new), Ok)
 }
 
 fn select_target_model<'a>(

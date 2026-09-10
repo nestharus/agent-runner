@@ -5,6 +5,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  OULIPOLY_DATA_DIR: ${{ github.workspace }}/target/ci-data
+  OULIPOLY_DATA_HOME: ${{ github.workspace }}/target/ci-data-home
+  XDG_CONFIG_HOME: ${{ github.workspace }}/target/ci-config-home
+  XDG_DATA_HOME: ${{ github.workspace }}/target/ci-xdg-data
+  XDG_CACHE_HOME: ${{ github.workspace }}/target/ci-cache
 
 jobs:
   prepare-matrix:
@@ -48,6 +53,8 @@ jobs:
         crate: ${{ fromJSON(needs.prepare-matrix.outputs.libs) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -68,6 +75,8 @@ jobs:
         client: ${{ fromJSON(needs.prepare-matrix.outputs.clients) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -107,11 +116,33 @@ jobs:
       - run: cargo test -p oulipoly-state read_only_snapshot
       - run: cargo test -p oulipoly-state pid_identity::tests
 
+  rust-native-wake:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-wake-${{ runner.os }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: cargo test -p oulipoly-agent-runner --test age330_native_delivery_domain -- --nocapture
+      - run: cargo test -p oulipoly-agent-runner --lib wake_coordinator::admission::tests::native_memory_observer_matches_host_and_drives_default_admission -- --exact --nocapture
+      - run: cargo test -p oulipoly-agent-runner --lib wake_coordinator::admission::tests::unavailable_memory_observation_returns_visible_error_without_stranding_queue -- --exact
+      - run: cargo test -p oulipoly-agent-runner --test age309_native_wake_domain native_count_five_startup_sweep_reaches_one_detached_provider_turn -- --exact --nocapture
+
   rust-integration:
-    needs: [rust-lib-check, rust-client-check, rust-state-windows, rust-state-macos]
+    needs: [rust-lib-check, rust-client-check, rust-state-windows, rust-state-macos, rust-native-wake]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt

@@ -10,12 +10,11 @@
 //!     Owns:
 //!       - ExternalProviderDispatchContext carrier fields
 //!       - ExternalProviderDispatchInput carrier fields
-//!       - AccountSelection carrier fields
 //!       - settings_id derivation invariant
 //!       - provider session start intent fields
 //! ```
 
-use crate::services::ProviderSessionStartMode;
+use crate::services::{MailboxDeliveryCorrelation, ProviderSessionStartMode};
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -33,7 +32,9 @@ pub(crate) struct ExternalProviderDispatchContext {
     pub(crate) parent_invocation_env: Option<String>,
     pub(crate) start_known_provider_session_id: Option<String>,
     pub(crate) start_known_provider_session_mode: Option<ProviderSessionStartMode>,
+    pub(crate) mailbox_delivery_correlation: Option<MailboxDeliveryCorrelation>,
     pub(crate) settings_id: String,
+    pub(crate) attempt: Option<std::sync::Arc<super::attempt::AttemptExecution>>,
 }
 
 #[derive(Clone)]
@@ -49,11 +50,11 @@ pub(crate) struct ExternalProviderDispatchInput {
     pub(crate) parent_invocation_env: Option<String>,
     pub(crate) start_known_provider_session_id: Option<String>,
     pub(crate) start_known_provider_session_mode: Option<ProviderSessionStartMode>,
+    pub(crate) mailbox_delivery_correlation: Option<MailboxDeliveryCorrelation>,
 }
 
 impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
     fn from(input: ExternalProviderDispatchInput) -> Self {
-        let settings_id = provider_settings_id(&input.provider);
         Self {
             model: input.model,
             provider: input.provider,
@@ -66,33 +67,18 @@ impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
             parent_invocation_env: input.parent_invocation_env,
             start_known_provider_session_id: input.start_known_provider_session_id,
             start_known_provider_session_mode: input.start_known_provider_session_mode,
-            settings_id,
+            mailbox_delivery_correlation: input.mailbox_delivery_correlation,
+            settings_id: String::new(),
+            attempt: None,
         }
     }
-}
-
-/// One pool account to attempt during FIX #32 transport-timeout rotation.
-#[derive(Debug, Clone)]
-pub(crate) struct AccountSelection {
-    pub(crate) provider: ProviderConfig,
-    pub(crate) provider_index: usize,
 }
 
 impl ExternalProviderDispatchContext {
-    /// Re-target this dispatch context at a different pool account, recomputing
-    /// the per-account `settings_id`. All other fields (prompt, inputs, working
-    /// dir, parent linkage) are account-independent and carried verbatim.
-    pub(crate) fn with_account(&self, account: AccountSelection) -> Self {
-        let settings_id = provider_settings_id(&account.provider);
+    pub(crate) fn with_settings_id(&self, settings_id: &str) -> Self {
         Self {
-            provider: account.provider,
-            provider_index: account.provider_index,
-            settings_id,
+            settings_id: settings_id.to_string(),
             ..self.clone()
         }
     }
-}
-
-fn provider_settings_id(provider: &ProviderConfig) -> String {
-    provider.name.clone()
 }

@@ -243,7 +243,7 @@ impl TranscriptLocator for SessionsConfigLocator {
     fn locate_jsonl(&self, request: &TranscriptRequest) -> Result<LocatedTranscript, LocatorError> {
         let entry = require_sessions_config_entry(request)?;
         let locator = require_sessions_transcript_locator(entry, &request.session_id)?;
-        let state_dir = resolve_state_dir(entry, request.provider);
+        let state_dir = resolve_state_dir(entry, request.provider)?;
         create_state_dir(&state_dir)?;
         let stdout = run_sessions_transcript_locator(locator, &state_dir, &request.session_id)?;
         let path = parse_sessions_locator_stdout(&stdout)?;
@@ -650,19 +650,27 @@ fn decode_stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-fn resolve_state_dir(entry: &SessionSourceEntry, provider_name: &str) -> PathBuf {
-    configured_state_dir(entry).unwrap_or_else(|| default_state_dir(provider_name))
+fn resolve_state_dir(
+    entry: &SessionSourceEntry,
+    provider_name: &str,
+) -> Result<PathBuf, LocatorError> {
+    configured_state_dir(entry)
+        .map(Ok)
+        .unwrap_or_else(|| default_state_dir(provider_name))
 }
 
 fn configured_state_dir(entry: &SessionSourceEntry) -> Option<PathBuf> {
     entry.state_dir.clone()
 }
 
-fn default_state_dir(provider_name: &str) -> PathBuf {
+fn default_state_dir(provider_name: &str) -> Result<PathBuf, LocatorError> {
     oulipoly_state::paths::data_dir()
-        .unwrap_or_else(|_| PathBuf::from(".").join(oulipoly_state::paths::APP_DATA_DIR_NAME))
-        .join("sessions")
-        .join(provider_name)
+        .map(|path| path.join("sessions").join(provider_name))
+        .map_err(|message| LocatorError::Io {
+            kind: StdIoErrorKind::NotFound,
+            path: PathBuf::from(oulipoly_state::paths::DATA_DIR_ENV),
+            message,
+        })
 }
 
 pub(super) fn single_jsonl_match(

@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
 #[path = "../../crates/oulipoly-state/tests/fixtures/mod.rs"]
 mod state_fixtures;
 
@@ -60,7 +61,10 @@ impl CliFixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
     }
@@ -88,10 +92,10 @@ impl CliFixture {
         .unwrap();
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 "[fixture-provider]\ncommand = {:?}\nargs = []\nprompt_mode = \"arg\"\n",
                 script.to_string_lossy()
-            ),
+            )),
         )
         .unwrap();
         marker
@@ -368,6 +372,7 @@ fn age_299_s2_rebuild_backs_up_resets_and_readmits_state_sidecar_continuity() {
         start_authorized_invocation(&state, first_uuid, "age299-s2-rebuild-first-session");
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &first_start.completion_registration_authority,
             "age299-s2-rebuild-first-admission",
             completion_registration(
@@ -440,6 +445,7 @@ fn age_299_s2_rebuild_backs_up_resets_and_readmits_state_sidecar_continuity() {
     );
     fresh_state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &second_start.completion_registration_authority,
             "age299-s2-rebuild-second-admission",
             completion_registration(
@@ -472,6 +478,7 @@ fn age_299_s2_rebuild_sidecar_writer_contention_is_nondestructive_and_retryable(
     );
     state
         .register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             &invocation_start.completion_registration_authority,
             "age299-s2-rebuild-contention-admission",
             completion_registration(
@@ -964,6 +971,7 @@ fn start_authorized_invocation(
         .unwrap();
     state
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             start.invocation_row_id,
             &ProviderSessionBinding {
                 provider_session_id: session_id.to_string(),

@@ -5,6 +5,8 @@
 //! ## Declared roles
 //! `orchestration`, `validator`
 
+mod provider_authority_fixture;
+
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::{InvocationStatus, ProviderSessionBinding, StateDb};
 use rusqlite::{Connection, params};
@@ -175,10 +177,10 @@ impl Fixture {
         .unwrap();
         fs::write(
             app_config.join("providers.toml"),
-            format!(
-                "[{PROVIDER}]\ncommand = {:?}\nargs = []\ninteractive_args = []\nprompt_mode = \"arg\"\n\n[{PROVIDER}.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
+                "[{PROVIDER}]\ncommand = {:?}\nargs = []\ninteractive_args = []\nprompt_mode = \"arg\"\n\n[{PROVIDER}.resume]\nkind = \"flag\"\nflag = \"--resume\"\n\n[{PROVIDER}.session_capture]\nkind = \"stdout_json_event\"\njson_args = [\"--age299-json\"]\nevent_type = \"age299_session\"\nevent_id_path = \"session_id\"\n",
                 script.display().to_string()
-            ),
+            )),
         )
         .unwrap();
         fs::write(
@@ -238,6 +240,12 @@ impl Fixture {
                 params![CHAIN_ID, PROVIDER, SESSION_ID],
             )
             .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &connection,
+            PROVIDER,
+            SESSION_ID,
+            self.root.path(),
+        );
     }
 
     fn spawn(&self, carrier: Carrier) -> CarrierChild {
@@ -277,7 +285,10 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
             .env("HOME", &self.data_home)
-            .env_remove("OULIPOLY_DATA_DIR")
+            .env(
+                "OULIPOLY_DATA_DIR",
+                self.data_home.join("oulipoly-agent-runner"),
+            )
             .env_remove("OULIPOLY_PARENT_INVOCATION")
             .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
             .env_remove("AGENT_BASH_OWNER_SESSION_ID")
@@ -370,7 +381,14 @@ fn all_success_carriers_refuse_damaged_sidecar_then_finalize_retained_outcome_af
             .unwrap()
             .unwrap();
         restored_state
-            .finalize_invocation(row.id, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                row.id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         let finalized = restored_state
             .get_invocation_by_uuid(&invocation_uuid)
@@ -516,17 +534,30 @@ fn prepare_registered_carrier(carrier: Carrier) -> (Fixture, CarrierChild, Strin
     if !matches!(carrier, Carrier::DefaultProviderRepl)
         && running.provider_session_id.as_deref() != Some(SESSION_ID)
     {
+        assert!(fixture.root.path().is_absolute());
+        let workspace = fixture.root.path().display().to_string();
         state
             .bind_invocation_provider_session_start(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 running.id,
                 &ProviderSessionBinding {
                     provider_session_id: SESSION_ID.to_string(),
                     capture_method: "age299_s2_production_binary_fixture",
                     resume_input_id: None,
-                    provider_session_resolved_account: Some(PROVIDER.to_string()),
+                    // This field is the bound workspace path, not the account label.
+                    provider_session_resolved_account: Some(workspace.clone()),
                 },
             )
             .unwrap();
+        let seeded_workspace: String = state
+            .connection()
+            .query_row(
+                "SELECT provider_session_resolved_account FROM invocations WHERE id = ?1",
+                [running.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seeded_workspace, workspace);
     }
     drop(state);
     fs::write(&fixture.bind, b"bind\n").unwrap();
@@ -697,6 +728,7 @@ while [ ! -f {bind:?} ]; do sleep 0.01; done
 touch {registered:?}
 while [ ! -f {release:?} ]; do sleep 0.01; done
 printf '%s\n' 'retained provider stdout'
+printf '%s\n' '{{"type":"age299_session","session_id":"age299-s2-live-session"}}'
 exit 0
 "#,
     )

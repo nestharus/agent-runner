@@ -27,6 +27,8 @@ use crate::services::{
     TerminalClassification, TerminalClassifyServiceRequest,
 };
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
+use oulipoly_provider::client::ProviderClient;
+use oulipoly_provider::generated::DescribeResult;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -49,6 +51,7 @@ pub enum ErrorCategory {
     HungSubprocess,
     ResumeSessionMismatch,
     ProviderProtocol,
+    ProviderUnavailable,
     DiagnosticsFailure,
     Unknown,
 }
@@ -64,6 +67,7 @@ impl ErrorCategory {
             ErrorCategory::HungSubprocess => "hung_subprocess",
             ErrorCategory::ResumeSessionMismatch => "resume_session_mismatch",
             ErrorCategory::ProviderProtocol => "provider_protocol",
+            ErrorCategory::ProviderUnavailable => "provider_unavailable",
             ErrorCategory::DiagnosticsFailure => "diagnostics_failure",
             ErrorCategory::Unknown => "unknown",
         }
@@ -160,6 +164,15 @@ pub fn classify_terminal_with_registry(
     request: TerminalClassifyServiceRequest,
 ) -> Result<TerminalClassification, ServiceError> {
     external_provider::classify_terminal(registry, request)
+}
+
+pub(crate) fn classify_terminal_with_client(
+    registry: &ProviderRegistry,
+    client: &ProviderClient,
+    describe: &DescribeResult,
+    request: TerminalClassifyServiceRequest,
+) -> Result<TerminalClassification, ServiceError> {
+    external_provider::classify_terminal_with_client(registry, client, describe, request)
 }
 
 pub fn canonical_terminal_reason_for_kind(kind: TerminalSignalKind) -> Option<&'static str> {
@@ -305,6 +318,7 @@ fn map_error_category_token(token: &str) -> ErrorCategory {
         "hung_subprocess" => ErrorCategory::HungSubprocess,
         "resume_session_mismatch" => ErrorCategory::ResumeSessionMismatch,
         "provider_protocol" => ErrorCategory::ProviderProtocol,
+        "provider_unavailable" => ErrorCategory::ProviderUnavailable,
         "diagnostics_failure" => ErrorCategory::DiagnosticsFailure,
         _ => ErrorCategory::Unknown,
     }
@@ -406,6 +420,21 @@ fn is_cli_version_mismatch_heuristic(lower: &str) -> bool {
 
 fn is_network_error_heuristic(lower: &str) -> bool {
     lower.contains("connection") || lower.contains("timeout") || lower.contains("dns")
+}
+
+/// Recover a known non-quota diagnosis from the original failed attempt when
+/// secondary diagnostic work is unavailable. Never classify secondary errors or
+/// grant quota authority through this fallback.
+pub fn non_quota_failure_diagnosis(stderr: &str, exit_code: i32) -> Option<Diagnosis> {
+    let diagnosis = heuristic_diagnosis(stderr, exit_code);
+    matches!(
+        diagnosis.category,
+        ErrorCategory::AuthExpired
+            | ErrorCategory::ResumeSessionMismatch
+            | ErrorCategory::CliVersionMismatch
+            | ErrorCategory::NetworkError
+    )
+    .then_some(diagnosis)
 }
 
 fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:oulipoly:terminal-unavailable:v1",
+  "title": "Oulipoly Terminal Unavailable v1 Extension",
+  "description": "A native model service is temporarily unavailable. This is distinct from account quota exhaustion and rate limiting, and does not authorize replay or account exhaustion.",
+  "$comment": "Selected only by host.env.OULIPOLY_HOST_TERMINAL_UNAVAILABLE_V1=1 in the current request. Extends the terminal_signal in a launch exit or terminal.classify result; it does not replace envelope validation. Unselected providers must emit their existing nonzero_exit fallback with bounded evidence. The pinned provider/v1 base snapshot is unchanged.",
+  "type": "object",
+  "properties": {
+    "kind": { "const": "provider_unavailable" },
+    "evidence": { "type": "string", "maxLength": 1024 },
+    "observed_at_unix_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    }
+  },
+  "required": ["kind", "observed_at_unix_ms"],
+  "additionalProperties": false
+}

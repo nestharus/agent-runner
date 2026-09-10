@@ -46,6 +46,7 @@ fn rc1_migrated_transcript_must_be_honorable_from_resume_working_dir() {
 
     let target_provider = &model.providers[1];
     let strategy = target_provider.resume.as_ref().unwrap();
+    let _data_dir = DataDirEnvGuard::set(&fixture.dir.path().join("runtime-data"));
     let result = execute_resume(
         target_provider,
         1,

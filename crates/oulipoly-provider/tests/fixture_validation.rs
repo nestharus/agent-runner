@@ -9,6 +9,25 @@ use support::contract_matrix::{
 };
 
 #[test]
+fn provider_unavailable_validates_on_launch_and_terminal_classify_without_weakening_enums() {
+    let fixtures = fixtures();
+    let mut exit = launch_event_fixture(&fixtures, "exit").clone();
+    exit["terminal_signal"]["kind"] = json!("provider_unavailable");
+    validate_against_def("launch", "LaunchExitEvent", &exit);
+    let mut classified =
+        non_launch_fixture(&fixtures, "terminal.classify", "success_response").clone();
+    classified["result"]["terminal_signal"]["kind"] = json!("provider_unavailable");
+    validate_against_def("terminal", "TerminalClassifyResponse", &classified);
+    let registry = oulipoly_provider::schemas::SchemaRegistry::new();
+    classified["result"]["terminal_signal"]["kind"] = json!("unrecognized_terminal_kind");
+    assert!(
+        registry
+            .validate_response("terminal.classify", &classified)
+            .is_err()
+    );
+}
+
+#[test]
 fn schema_validation_fixtures_cover_expected_matrix() {
     let fixtures = fixtures();
     for row in NON_LAUNCH_ROWS {

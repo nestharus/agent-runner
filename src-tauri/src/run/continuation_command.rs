@@ -83,7 +83,7 @@ impl ResumeExecution<'_> {
         &self,
         reserved: &ReservedRun,
         _context: &ValidatedContinuation,
-    ) -> Result<(), ContinuationBlock> {
+    ) -> Result<bool, ContinuationBlock> {
         let mut prepared = self.prepare()?;
         run_prepared_resume(
             self.agent_runtime_services,
@@ -93,8 +93,8 @@ impl ResumeExecution<'_> {
             self.session_id,
             Some(self.working_dir),
         )
-        .map(|_| ())
-        .map_err(invocation_failed)
+        .map_err(invocation_failed)?;
+        Ok(prepared.provider_prompt_accepted())
     }
 
     fn prepare(&self) -> Result<super::resume::PreparedHeadlessResumeExecution, ContinuationBlock> {
@@ -162,7 +162,10 @@ pub(in crate::run) fn execute_with_callbacks(
     request: FreshContinuationRequest,
     store_state: StateDb,
     observation_state: &StateDb,
-    resume_execution: impl FnMut(&ReservedRun, &ValidatedContinuation) -> Result<(), ContinuationBlock>,
+    resume_execution: impl FnMut(
+        &ReservedRun,
+        &ValidatedContinuation,
+    ) -> Result<bool, ContinuationBlock>,
     fresh_execution: impl FnMut(
         &ReservedRun,
         &ValidatedContinuation,
@@ -263,20 +266,27 @@ fn load_target_model(
     ContinuationBlock,
 > {
     let providers = load_provider_configuration()?;
-    let models_dir = resolve_models_directory(models_dir_override);
+    let models_dir = resolve_models_directory(models_dir_override)?;
     let models = load_model_configuration(&models_dir, &providers).map_err(invocation_failed)?;
     let model = require_target_model(target_model, &models)?;
     Ok(target_model_configuration(model, models, models_dir))
 }
 
 fn load_provider_configuration() -> Result<ProvidersConfig, ContinuationBlock> {
-    ProvidersConfig::load(&default_config_root().join("providers.toml")).map_err(invocation_failed)
+    ProvidersConfig::load(
+        &default_config_root()
+            .map_err(invocation_failed)?
+            .join("providers.toml"),
+    )
+    .map_err(invocation_failed)
 }
 
-fn resolve_models_directory(models_dir_override: Option<&Path>) -> PathBuf {
+fn resolve_models_directory(
+    models_dir_override: Option<&Path>,
+) -> Result<PathBuf, ContinuationBlock> {
     models_dir_override
         .map(Path::to_path_buf)
-        .unwrap_or_else(default_models_dir)
+        .map_or_else(|| default_models_dir().map_err(invocation_failed), Ok)
 }
 
 fn load_model_configuration(

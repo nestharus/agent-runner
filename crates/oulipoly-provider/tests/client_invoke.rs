@@ -9,11 +9,16 @@ use oulipoly_provider::resolver::ProviderArtifactRef;
 use oulipoly_provider::schemas::SchemaRegistry;
 use serde_json::json;
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 use support::provider_client::{
-    REQUEST_ID, describe_request, executable_script, fake_provider_source,
-    read_recorded_invocation, schema_request, settings_list_request, temp_fixture_dir,
+    REQUEST_ID, describe_request, describe_success_response, executable_script,
+    fake_provider_source, read_recorded_invocation, schema_request, settings_list_request,
+    temp_fixture_dir,
     testkit::{FakeProvider, FakeProviderMode},
 };
 
@@ -305,6 +310,129 @@ fn invoke_script_uses_artifact_then_single_subcommand_arg() {
     assert_eq!(result["ok"], true);
     assert_eq!(client.last_invocation_argv().len(), 2);
     assert_eq!(client.last_invocation_argv()[1], "describe");
+}
+
+#[cfg(unix)]
+#[test]
+fn invoke_accepts_execute_only_native_provider() {
+    let fake = FakeProvider::compile(fake_provider_source());
+    let native_provider = fake.native_path();
+    let mut permissions = fs::metadata(&native_provider)
+        .expect("native provider metadata")
+        .permissions();
+    permissions.set_mode(0o111);
+    fs::set_permissions(&native_provider, permissions).expect("chmod native provider");
+    let client = client_for(native_provider);
+
+    let result: DescribeResult = client
+        .invoke_typed(
+            "describe",
+            describe_request(),
+            FakeProviderMode::Success.env(),
+        )
+        .expect("execute permission alone should keep a native provider available");
+
+    assert_eq!(result.provider_id, "fake-provider");
+    fake.cleanup();
+}
+
+#[cfg(unix)]
+#[test]
+fn invoke_script_preserves_configured_path_for_sibling_resources() {
+    let directory = temp_fixture_dir("script-location");
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let configured = directory.join("provider.sh");
+    let observed_path = directory.join("observed-path.txt");
+    let response_path = directory.join("response.json");
+    fs::write(
+        &response_path,
+        serde_json::to_vec(&describe_success_response()).expect("serialize describe response"),
+    )
+    .expect("write sibling response");
+    write_location_dependent_provider_script(&configured);
+    let client = ProviderClient::new(
+        ProviderArtifactRef::Script {
+            path: configured.clone(),
+        },
+        ProviderClientOptions::default(),
+    );
+
+    let result: DescribeResult = client
+        .invoke_typed(
+            "describe",
+            describe_request(),
+            vec![(
+                "PROVIDER_OBSERVED_PATH".to_owned(),
+                observed_path.as_os_str().to_os_string(),
+            )],
+        )
+        .expect("pinned script should load resources beside its configured path");
+
+    assert_eq!(result.provider_id, "fake-provider");
+    assert_eq!(
+        fs::read_to_string(&observed_path).expect("read observed script path"),
+        configured.to_string_lossy()
+    );
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn client_pins_executable_that_advertised_capabilities_across_invocations() {
+    let directory = temp_fixture_dir("pinned-provider-identity");
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let configured = directory.join("provider.sh");
+    let replacement = directory.join("replacement.sh");
+    write_describe_provider_script(&configured, "selected-provider");
+    write_describe_provider_script(&replacement, "replacement-provider");
+    let client = ProviderClient::new(
+        ProviderArtifactRef::Script {
+            path: configured.clone(),
+        },
+        ProviderClientOptions::default(),
+    );
+
+    let selected: DescribeResult = client
+        .invoke_typed("describe", describe_request(), [])
+        .expect("selected artifact should describe");
+    fs::rename(&replacement, &configured).expect("replace configured artifact");
+    let after_replacement: DescribeResult = client
+        .invoke_typed("describe", describe_request(), [])
+        .expect("pinned selected artifact should remain executable");
+
+    assert_eq!(selected.provider_id, "selected-provider");
+    assert_eq!(after_replacement.provider_id, "selected-provider");
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[cfg(unix)]
+fn write_describe_provider_script(path: &Path, provider_id: &str) {
+    let mut response = describe_success_response();
+    response["result"]["provider_id"] = json!(provider_id);
+    response["result"]["display_name"] = json!(provider_id);
+    fs::write(
+        path,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{}'\n",
+            serde_json::to_string(&response).expect("serialize describe response")
+        ),
+    )
+    .expect("write provider script");
+    let mut permissions = fs::metadata(path).expect("provider metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod provider script");
+}
+
+#[cfg(unix)]
+fn write_location_dependent_provider_script(path: &Path) {
+    fs::write(
+        path,
+        "#!/bin/sh\nprintf '%s' \"$0\" > \"$PROVIDER_OBSERVED_PATH\"\n[ \"$1\" = describe ] || exit 2\ncat >/dev/null\nscript_dir=$(CDPATH= cd \"$(dirname \"$0\")\" && pwd)\ncat \"$script_dir/response.json\"\n",
+    )
+    .expect("write location-dependent provider script");
+    let mut permissions = fs::metadata(path).expect("provider metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod provider script");
 }
 
 fn client_for(path: impl Into<std::path::PathBuf>) -> ProviderClient {

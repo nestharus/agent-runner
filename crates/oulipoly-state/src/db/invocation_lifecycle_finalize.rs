@@ -75,29 +75,46 @@ struct FinalizeInvocationWrite<'a> {
 impl StateDb {
     pub fn finalize_invocation(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         id: i64,
         success: bool,
         exit_code: i32,
         error_category: Option<&str>,
         terminal_reason: Option<&str>,
     ) -> Result<(), String> {
-        self.finalize_invocation_untyped(id, success, exit_code, error_category, terminal_reason)
+        self.finalize_invocation_untyped(
+            mutation_authority,
+            id,
+            success,
+            exit_code,
+            error_category,
+            terminal_reason,
+        )
     }
 
     pub fn finalize_invocation_typed(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         id: i64,
         success: bool,
         exit_code: i32,
         error_category: Option<&str>,
         terminal_reason: Option<&str>,
     ) -> Result<(), InvocationFinalizeError> {
-        self.finalize_invocation_untyped(id, success, exit_code, error_category, terminal_reason)
-            .map_err(InvocationFinalizeError::classify)
+        self.finalize_invocation_untyped(
+            mutation_authority,
+            id,
+            success,
+            exit_code,
+            error_category,
+            terminal_reason,
+        )
+        .map_err(InvocationFinalizeError::classify)
     }
 
     fn finalize_invocation_untyped(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         id: i64,
         success: bool,
         exit_code: i32,
@@ -108,6 +125,7 @@ impl StateDb {
         let timer = lc_log_adapter::start_timer();
         let finished_at = Self::current_rfc3339_timestamp();
         let transaction_result = self.finalize_invocation_transaction(
+            mutation_authority,
             id,
             success,
             exit_code,
@@ -278,8 +296,11 @@ impl StateDb {
         lifecycle_terminal_status(success).to_string()
     }
 
+    // Mandatory authority accompanies the existing terminal/admission transaction inputs.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn finalize_invocation_transaction(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         id: i64,
         success: bool,
         exit_code: i32,
@@ -288,6 +309,7 @@ impl StateDb {
         finished_at: &str,
     ) -> Result<FinalizeInvocationRow, String> {
         self.finalize_invocation_transaction_on(
+            mutation_authority,
             id,
             success,
             FinalizeInvocationWrite {
@@ -303,6 +325,7 @@ impl StateDb {
 
     fn finalize_invocation_transaction_on<BeforeValidation, AfterValidation>(
         &self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
         id: i64,
         success: bool,
         write: FinalizeInvocationWrite<'_>,
@@ -317,6 +340,11 @@ impl StateDb {
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
                 .map_err(|error| Self::format_finalize_begin_transaction_error(id, error))?;
 
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &tx,
+            id,
+            mutation_authority,
+        )?;
         let invocation = Self::load_invocation_for_finalize(&tx, id)?;
         Self::validate_invocation_is_running(id, &invocation.status)?;
         if success {
@@ -728,6 +756,7 @@ mod tests {
             .unwrap();
         state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-finalize-contention-admission",
                 CompletionEventRegistrationInput {
                     event_id: EVENT_ID,
@@ -756,7 +785,14 @@ mod tests {
         });
 
         state
-            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .finalize_invocation(
+                crate::InvocationMutationAuthority::Standalone,
+                invocation_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         releaser.join().unwrap();
         assert_eq!(
@@ -777,7 +813,14 @@ mod tests {
             crate::mailbox::MailboxAuthorityFence::acquire_exclusive(&sidecar_path).unwrap();
 
         let error = state
-            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .finalize_invocation(
+                crate::InvocationMutationAuthority::Standalone,
+                invocation_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap_err();
 
         assert!(
@@ -816,6 +859,7 @@ mod tests {
             .unwrap();
         state
             .register_completion_event_with_obligation(
+                crate::InvocationMutationAuthority::Standalone,
                 "age299-s2-finalize-fence-admission",
                 CompletionEventRegistrationInput {
                     event_id: EVENT_ID,
@@ -858,6 +902,7 @@ mod tests {
 
         state
             .finalize_invocation_transaction_on(
+                crate::InvocationMutationAuthority::Standalone,
                 invocation_row_id,
                 true,
                 FinalizeInvocationWrite {
@@ -915,6 +960,7 @@ mod tests {
                 let event_id = format!("age299-s2-mature-owner-event-{ordinal}");
                 state
                     .register_completion_event_with_obligation(
+                        crate::InvocationMutationAuthority::Standalone,
                         &format!("age299-s2-mature-owner-admission-{ordinal}"),
                         CompletionEventRegistrationInput {
                             event_id: &event_id,
@@ -935,7 +981,14 @@ mod tests {
             crate::mailbox::begin_completion_finalization_vm_count();
 
             state
-                .finalize_invocation(invocation_row_id, true, 0, None, None)
+                .finalize_invocation(
+                    crate::InvocationMutationAuthority::Standalone,
+                    invocation_row_id,
+                    true,
+                    0,
+                    None,
+                    None,
+                )
                 .unwrap();
             let vm_steps = crate::mailbox::end_completion_finalization_vm_count();
 

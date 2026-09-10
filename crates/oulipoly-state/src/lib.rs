@@ -54,6 +54,7 @@ pub type StateDbError = String;
 pub use crate::schema::{CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION};
 pub use chain_segments::ChainSegmentRow;
 pub use db::DbError;
+pub use db::InvocationOutputArtifactPaths;
 #[cfg(feature = "test-support")]
 pub use db::InvocationQueryProgressPause;
 pub use db::LegacyProviderNames;
@@ -79,9 +80,10 @@ pub use db::{
     QuotaWindowInput,
 };
 pub use db::{
-    BackfillReport, ChainPreview, ModelStore, ProviderSessionBinding, RESUME_INPUT_MAX_LEN,
-    ResolvedResume, ResumeError, ResumeInputMatch, ResumeNativeCandidate, SessionMarkerPayload,
-    TurnPreview, WrongIdKindInput,
+    BackfillReport, ChainPreview, FinalizedProviderSessionAuthority, ModelStore,
+    ProviderSessionAuthorityCommit, ProviderSessionBinding, RESUME_INPUT_MAX_LEN, ResolvedResume,
+    ResumeError, ResumeInputMatch, ResumeNativeCandidate, SessionMarkerPayload,
+    StoredProviderSessionAuthority, TurnPreview, WrongIdKindInput,
 };
 pub use db::{
     COMPLETION_REGISTRATION_AUTHORITY_ENV, COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD,
@@ -102,6 +104,11 @@ pub use db::{
 };
 pub use db::{InvocationFinalizeError, InvocationRecord, InvocationStart, InvocationStatus};
 pub use db::{ProviderTurnEffectInput, ProviderTurnEffectWrite};
+pub use db::{
+    SESSION_TURN_PAGES_PROTOCOL, SessionTurnIngestFreshness, SessionTurnIngestStream,
+    SessionTurnIngestStreamKey, SessionTurnPageApply, SessionTurnPageApplyOutcome,
+    SessionTurnPageBodyState, SessionTurnPageTurnIngest, SessionTurnStreamProjection,
+};
 pub use db::{
     SessionTurnReplacement, SessionTurnRestoreRow, SessionTurnsReplacement, SessionTurnsRestore,
 };
@@ -199,6 +206,16 @@ pub mod age_32_connection_boundary_doctest {
     /// ```
     pub struct StateDbRawConnectionEscapeMustNotCompile;
 }
+
+pub use db::{
+    BeginProviderLaunchRequest, InvocationMutationAuthority, ProviderLaunchActorSettlement,
+    ProviderLaunchAttemptAllocation, ProviderLaunchCandidate, ProviderLaunchChannelSettlement,
+    ProviderLaunchCustodyProof, ProviderLaunchEndpoint, ProviderLaunchFailureRecord,
+    ProviderLaunchLease, ProviderLaunchOwnerFence, ProviderLaunchPromotion,
+    ProviderLaunchRecoveryDisposition, ProviderLaunchStartMode, ProviderLaunchTerminalResult,
+    RotatableLaunchFailureKind,
+};
+pub use db::{ProviderLaunchRecoveryJoin, ProviderLaunchRequestIdentity};
 
 #[cfg(test)]
 mod age160_root_reexport_tests {

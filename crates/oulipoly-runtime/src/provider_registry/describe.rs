@@ -1,8 +1,11 @@
 use super::{ProviderClientFactory, ProviderRegistryError};
-use oulipoly_provider::client::{CancellationToken, ProviderEnv};
+use oulipoly_provider::client::{ProviderClient, ProviderEnv};
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
-    CONTRACT_VERSION, DescribeRequest, DescribeResult, EmptyParams, HostContext,
+    CONTRACT_VERSION, DescribeRequest, DescribeResult, EmptyParams, HOST_LAUNCH_OUTPUT_V1_ENV,
+    HOST_LAUNCH_OUTPUT_V1_ENV_VALUE, HOST_PROMPT_ACCEPTANCE_V1_ENV,
+    HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE, HOST_SESSION_TURN_PAGES_V1_ENV,
+    HOST_SESSION_TURN_PAGES_V1_ENV_VALUE, HostContext,
 };
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use serde_json::Value;
@@ -21,33 +24,47 @@ pub fn describe_provider(
     host_options: &DescribeHostOptions,
 ) -> Result<DescribeResult, ProviderRegistryError> {
     let client = factory.client_for(artifact);
-    invoke_describe(client, host_options)
+    describe_provider_client(&client, host_options)
 }
 
-pub fn describe_provider_with_cancellation(
-    factory: &ProviderClientFactory,
-    artifact: ProviderArtifactRef,
-    host_options: &DescribeHostOptions,
-    cancellation: &CancellationToken,
-) -> Result<DescribeResult, ProviderRegistryError> {
-    let client = factory.client_for_with_cancellation(artifact, cancellation);
-    invoke_describe(client, host_options)
-}
-
-fn invoke_describe(
-    client: oulipoly_provider::client::ProviderClient,
+pub(crate) fn describe_provider_client(
+    client: &ProviderClient,
     host_options: &DescribeHostOptions,
 ) -> Result<DescribeResult, ProviderRegistryError> {
-    let request = describe_request(host_options)?;
+    let identity = oulipoly_provider::custody::GeneratedRequestIdentity::new(
+        oulipoly_provider::custody::ProviderOperation::Describe,
+        "provider-registry-",
+    );
+    let request = describe_request(host_options, identity.wire_request_id.clone())?;
+    if let Some(custody) = &client.options().attempt_custody {
+        custody.record_request(identity);
+    }
     client
         .invoke_typed::<DescribeResult, _>("describe", request, NoProviderEnv)
         .map_err(map_describe_error)
 }
 
-fn describe_request(_host_options: &DescribeHostOptions) -> Result<Value, ProviderRegistryError> {
+fn describe_request(
+    _host_options: &DescribeHostOptions,
+    wire_request_id: String,
+) -> Result<Value, ProviderRegistryError> {
+    let env = BTreeMap::from([
+        (
+            HOST_PROMPT_ACCEPTANCE_V1_ENV.to_string(),
+            HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE.to_string(),
+        ),
+        (
+            HOST_LAUNCH_OUTPUT_V1_ENV.to_string(),
+            HOST_LAUNCH_OUTPUT_V1_ENV_VALUE.to_string(),
+        ),
+        (
+            HOST_SESSION_TURN_PAGES_V1_ENV.to_string(),
+            HOST_SESSION_TURN_PAGES_V1_ENV_VALUE.to_string(),
+        ),
+    ]);
     serde_json::to_value(DescribeRequest {
         contract: CONTRACT_VERSION.to_string(),
-        request_id: format!("provider-registry-{}", uuid::Uuid::new_v4()),
+        request_id: wire_request_id,
         provider_instance_id: Some("provider-registry".to_string()),
         host: HostContext {
             app: "oulipoly-agent-runner".to_string(),
@@ -56,7 +73,7 @@ fn describe_request(_host_options: &DescribeHostOptions) -> Result<Value, Provid
             working_directory: None,
             config_root: None,
             data_root: None,
-            env: BTreeMap::new(),
+            env,
             deadline_unix_ms: None,
         },
         params: EmptyParams {},

@@ -105,7 +105,6 @@ impl Fixture {
                 model_name: Some("model-read-only"),
                 models_dir: Some("/models/read-only"),
                 effective_cwd: Some("/work/read-only"),
-                selected_auto_wake_max: Some(5),
             })
             .unwrap();
         drop(mailbox);

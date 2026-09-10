@@ -25,7 +25,7 @@ pub(in crate::run::balancing) fn completed_session_ingest_request<'a>(
         sessions_cfg: &input.env.sessions_cfg,
         providers_cfg: Some(&input.env.providers_cfg),
         provider_name: input.provider_name,
-        external_provider: crate::session_ingest_cli::session_external_provider_identity(
+        external_provider: crate::session_ingest_cli::configured_session_external_provider_identity(
             input.agent_runtime_services,
             Some(input.model),
             input.provider_name,

@@ -2,7 +2,8 @@
 
 use chrono::{DateTime, Utc};
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    ProvidersConfig, provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_provider::generated::CONTRACT_VERSION;
 use oulipoly_runtime::provider_registry::{
@@ -61,8 +62,9 @@ impl Fixture {
     }
 
     fn registry(&self) -> ProviderRegistry {
-        ProviderRegistry::from_model_configs(
+        ProviderRegistry::from_configs(
             &[model("model-a", "provider-a", &self.provider_path)],
+            &providers(&[("provider-a", &self.provider_path, SETTINGS_A)]),
             ProviderRegistryOptions::default()
                 .with_config_root(self.dir.path().join("config"))
                 .with_data_root(self.dir.path().join("data")),
@@ -117,8 +119,12 @@ fn duplicate_provider_session_owner_fixture() -> DuplicateProviderSessionOwnerFi
         .providers
         .push(ProviderConfig::model_provider("opencode", Vec::new()));
     let import_model = model("import-model", "opencode", &runtime.provider_path);
-    let registry = ProviderRegistry::from_model_configs(
+    let registry = ProviderRegistry::from_configs(
         &[owner_model.clone(), import_model],
+        &providers(&[
+            ("opencode3", &runtime.provider_path, "opencode3"),
+            ("opencode", &runtime.provider_path, "opencode"),
+        ]),
         ProviderRegistryOptions::default()
             .with_config_root(runtime.dir.path().join("config"))
             .with_data_root(runtime.dir.path().join("data")),
@@ -143,6 +149,7 @@ fn duplicate_provider_session_owner_fixture() -> DuplicateProviderSessionOwnerFi
     runtime
         .db
         .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             invocation_id,
             &ProviderSessionBinding {
                 provider_session_id: INCIDENT_SESSION_ID.to_string(),
@@ -154,7 +161,14 @@ fn duplicate_provider_session_owner_fixture() -> DuplicateProviderSessionOwnerFi
         .unwrap();
     runtime
         .db
-        .finalize_invocation(invocation_id, true, 0, None, Some("exit_zero"))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_id,
+            true,
+            0,
+            None,
+            Some("exit_zero"),
+        )
         .unwrap();
 
     let service = ProductionSessionImportService::with_registry_handle(
@@ -287,12 +301,7 @@ fn provider_error_or_missing_capability_does_not_abort_other_provider_import() {
                 reason: "session_enumerate_capability_missing: provider describe did not advertise session.enumerate capability".to_string(),
             },
         ),
-        (
-            "describe-non-session",
-            SessionImportProviderStatus::Skipped {
-                reason: "session_provider_describe_unavailable: provider transport failed: provider_process_nonzero".to_string(),
-            },
-        ),
+        ("describe-non-session", SessionImportProviderStatus::Failed),
         ("enumerate-error", SessionImportProviderStatus::Failed),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -306,11 +315,15 @@ fn provider_error_or_missing_capability_does_not_abort_other_provider_import() {
             write_fake_provider_script(dir.path(), "bad-provider", &bad_mode_path, dir.path());
         let good_provider =
             write_fake_provider_script(dir.path(), "good-provider", &good_mode_path, dir.path());
-        let registry = ProviderRegistry::from_model_configs(
+        let registry = ProviderRegistry::from_configs(
             &[
                 model("model-a", "provider-a", &bad_provider),
                 model("model-b", "provider-b", &good_provider),
             ],
+            &providers(&[
+                ("provider-a", &bad_provider, SETTINGS_A),
+                ("provider-b", &good_provider, SETTINGS_B),
+            ]),
             ProviderRegistryOptions::default()
                 .with_config_root(dir.path().join("config"))
                 .with_data_root(dir.path().join("data")),
@@ -355,11 +368,15 @@ fn fake_provider_import_lists_sessions_and_resume_resolves_provider_native_id() 
     );
     let opencode_provider =
         write_fake_provider_script(dir.path(), "fake-opencode", &opencode_mode_path, dir.path());
-    let registry = ProviderRegistry::from_model_configs(
+    let registry = ProviderRegistry::from_configs(
         &[
             model("provider-a-model", &provider_a_name, &provider_a_binary),
             model("opencode-model", "opencode", &opencode_provider),
         ],
+        &providers(&[
+            (&provider_a_name, &provider_a_binary, SETTINGS_A),
+            ("opencode", &opencode_provider, SETTINGS_B),
+        ]),
         ProviderRegistryOptions::default()
             .with_config_root(dir.path().join("config"))
             .with_data_root(dir.path().join("data")),
@@ -454,6 +471,27 @@ fn model(name: &str, provider_name: &str, provider_path: &Path) -> ModelConfig {
     }
 }
 
+fn providers(entries: &[(&str, &Path, &str)]) -> ProvidersConfig {
+    ProvidersConfig {
+        entries: entries
+            .iter()
+            .map(|(provider_name, provider_path, settings_id)| {
+                (
+                    (*provider_name).to_string(),
+                    ProviderEntry {
+                        implementation: Some(ProviderEndpointConfig {
+                            family: (*provider_name).to_string(),
+                            executable: provider_path.display().to_string(),
+                        }),
+                        settings_id: Some((*settings_id).to_string()),
+                        ..ProviderEntry::default()
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
 fn chain_segment_count(conn: &Connection) -> i64 {
     conn.query_row("SELECT COUNT(*) FROM session_chain_segments", [], |row| {
         row.get(0)
@@ -543,6 +581,7 @@ def describe():
             "policy": False,
             "quota": False,
             "session": True,
+            "session_turn_pages_v1": True,
             "session_enumerate": mode != "no-enumerate-capability",
             "terminal": False,
             "rotation": False,
@@ -575,7 +614,7 @@ def enumerate_sessions():
         sessions = [session("relative-session", "Relative", "relative/path", 1)]
     elif mode == "owned":
         sessions = [session("owned-session", "Owned", CWD, 2)]
-    elif mode == "one":
+    elif mode == "one" or mode.startswith("paging-"):
         sessions = [session("native-one", "Native one", CWD, 3)]
     elif mode == "provider-a-one":
         sessions = [session("provider-a-native", "Provider A native", CWD, 3)]
@@ -604,6 +643,22 @@ if subcommand == "describe":
     response = describe()
 elif subcommand == "session.enumerate":
     response = enumerate_sessions()
+elif subcommand == "session.read_turns":
+    with MODE_PATH.with_suffix(".calls").open("a") as calls:
+        calls.write(json.dumps(request) + "\n")
+    if mode.startswith("paging-"):
+        response = error(mode[len("paging-"):])
+    else:
+        response = envelope({{
+            "read_protocol": "oulipoly.session_turn_pages/v1",
+            "provider_instance_id": "fake-provider-instance",
+            "settings_id": "settings-a", "session_id": "native-one",
+            "turn_projection": "canonical_ingest", "snapshot_id": "synthetic-snapshot",
+            "page_index": 0, "page_start_sequence": 0, "turns": [], "page_turn_count": 0,
+            "source_bytes_examined": 0, "scan_progress": False, "snapshot_complete": True,
+            "next_page_token": None, "resume_token": "synthetic-resume", "source_final": False,
+            "warnings": [],
+        }})
 else:
     response = error("unsupported_subcommand")
 
@@ -621,4 +676,142 @@ fn json_string(path: &Path) -> String {
 
 fn guarded_provider_name(parts: &[&str]) -> String {
     parts.concat()
+}
+
+fn import_backfill(fixture: &Fixture) -> oulipoly_runtime::services::SessionImportReport {
+    let targets = [target("model-a", "provider-a", SETTINGS_A)];
+    let mut req = request(&fixture.db, &targets, Utc::now());
+    req.backfill_turns = true;
+    fixture.service().import_sessions(req).unwrap().report
+}
+
+fn paging_calls(fixture: &Fixture) -> usize {
+    fs::read_to_string(fixture.mode_path.with_extension("calls"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+fn imported_stream_key() -> oulipoly_state::SessionTurnIngestStreamKey {
+    oulipoly_state::SessionTurnIngestStreamKey {
+        provider_name: "provider-a".into(),
+        provider_instance_id: "fake-provider-instance".into(),
+        settings_id: SETTINGS_A.into(),
+        session_id: "native-one".into(),
+        projection: oulipoly_state::SessionTurnStreamProjection::CanonicalIngest,
+    }
+}
+
+#[test]
+fn stopped_backfill_reports_retained_reason_across_reimport_and_provider_restoration() {
+    for reason in [
+        "session_turn_staging_capacity_exceeded",
+        "session_turn_paging_paused",
+        "session_turn_record_ceiling_exceeded",
+        "session_turn_page_budget_too_small",
+        "codex_rollout_capacity",
+    ] {
+        let fixture = Fixture::new("one");
+        let targets = [target("model-a", "provider-a", SETTINGS_A)];
+        fixture
+            .service()
+            .import_sessions(request(&fixture.db, &targets, Utc::now()))
+            .unwrap();
+        // Disposable partially imported stream: opaque synthetic tokens only.
+        fixture
+            .conn()
+            .execute(
+                "UPDATE session_turn_ingest_streams SET checkpoint_generation=7,
+            snapshot_id='retained-snapshot', next_page_token='retained-page',
+            expected_page_index=3, expected_turn_sequence=18, committed_page_count=3,
+            committed_turn_count=18",
+                [],
+            )
+            .unwrap();
+        fixture.set_mode(&format!("paging-{reason}"));
+        let first = import_backfill(&fixture);
+        assert_eq!(paging_calls(&fixture), 1);
+        assert!(first.providers[0].warnings[0].contains("is stopped"));
+        let retained = fixture
+            .db
+            .session_turn_ingest_stream(&imported_stream_key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.status, "unsupported");
+        assert_eq!(retained.last_error.as_deref(), Some(reason));
+        for mode in [
+            format!("paging-{reason}"),
+            format!("paging-{reason}"),
+            "one".into(),
+        ] {
+            fixture.set_mode(&mode);
+            let report = import_backfill(&fixture);
+            assert_eq!(report.totals.turns_backfilled, 0);
+            assert_eq!(report.providers[0].warnings.len(), 1);
+            let warning = &report.providers[0].warnings[0];
+            assert!(
+                warning.contains("is stopped") && warning.contains(reason),
+                "{warning}"
+            );
+            assert!(
+                warning.contains("authorized explicit recovery"),
+                "{warning}"
+            );
+            assert!(!warning.contains("retryable"), "{warning}");
+            assert_eq!(paging_calls(&fixture), 1);
+            assert_eq!(
+                fixture
+                    .db
+                    .session_turn_ingest_stream(&imported_stream_key())
+                    .unwrap()
+                    .unwrap(),
+                retained
+            );
+        }
+    }
+}
+
+#[test]
+fn transient_backfill_retries_and_leased_backfill_is_distinct() {
+    let fixture = Fixture::new("paging-session_turn_page_io");
+    let first = import_backfill(&fixture);
+    assert!(first.providers[0].warnings[0].contains("retryable"));
+    assert_eq!(paging_calls(&fixture), 1);
+    fixture.set_mode("one");
+    // Time control is confined to this disposable state DB.
+    fixture
+        .conn()
+        .execute(
+            "UPDATE session_turn_ingest_streams SET next_attempt_at='2000-01-01T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+    let restored = import_backfill(&fixture);
+    assert!(
+        restored.providers[0].warnings.is_empty(),
+        "{:?}",
+        restored.providers[0]
+    );
+    assert_eq!(paging_calls(&fixture), 2);
+    fixture.conn().execute("UPDATE session_turn_ingest_streams SET status='active', lease_owner='other-worker', lease_expires_at='2999-01-01T00:00:00Z'", []).unwrap();
+    let leased = import_backfill(&fixture);
+    assert!(leased.providers[0].warnings[0].contains("is leased"));
+    assert!(!leased.providers[0].warnings[0].contains("stopped"));
+    assert_eq!(paging_calls(&fixture), 2);
+}
+
+#[test]
+fn quarantined_backfill_does_not_publish_untrusted_stored_error() {
+    let fixture = Fixture::new("one");
+    let targets = [target("model-a", "provider-a", SETTINGS_A)];
+    fixture
+        .service()
+        .import_sessions(request(&fixture.db, &targets, Utc::now()))
+        .unwrap();
+    fixture.conn().execute("UPDATE session_turn_ingest_streams SET status='quarantined', last_error='PRIVATE arbitrary provider message'", []).unwrap();
+    let report = import_backfill(&fixture);
+    assert!(report.providers[0].warnings.is_empty());
+    assert!(report.providers[0].errors[0].contains("quarantined"));
+    assert!(!report.providers[0].errors[0].contains("PRIVATE"));
+    assert_eq!(paging_calls(&fixture), 0);
 }

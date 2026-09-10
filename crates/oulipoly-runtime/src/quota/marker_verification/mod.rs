@@ -12,7 +12,7 @@
 //!     Translates:
 //!       - oulipoly_state marker quota contract (`StateDb`, `QuotaRecord`, `get_quota`, `get_windows`, `clear_provider_unavailable`)
 //!       - oulipoly_runtime quota refresh contract (`RefreshOutcome`, `refresh_provider_for_routing`, `InFlight`)
-//!       - oulipoly_config provider/session config contract (`ProvidersConfig`, `SessionsConfig`)
+//!       - oulipoly_config provider config contract (`ProvidersConfig`)
 //! ```
 //!
 //! Stale `next_available_at` (the AGE-163 working-set "provider is
@@ -36,7 +36,7 @@ mod tests;
 use crate::quota::{InFlight, refresh_provider_for_routing};
 use chrono::{DateTime, Utc};
 pub use config::release_slack_secs;
-use oulipoly_config::{ProvidersConfig, SessionsConfig};
+use oulipoly_config::ProvidersConfig;
 use oulipoly_state::{QuotaRecord, QuotaWindow, StateDb};
 
 /// Verify a possibly-stale `next_available_at` marker against the live
@@ -47,7 +47,6 @@ use oulipoly_state::{QuotaRecord, QuotaWindow, StateDb};
 pub fn verify_or_clear_marker(
     state: &StateDb,
     providers_cfg: &ProvidersConfig,
-    sessions_cfg: &SessionsConfig,
     in_flight: &InFlight,
     provider_name: &str,
     now: DateTime<Utc>,
@@ -66,14 +65,7 @@ pub fn verify_or_clear_marker(
         verify_against_cached_windows(state, provider_name, now);
         return;
     }
-    refresh_and_verify_under_lock(
-        state,
-        providers_cfg,
-        sessions_cfg,
-        in_flight,
-        provider_name,
-        now,
-    );
+    refresh_and_verify_under_lock(state, providers_cfg, in_flight, provider_name, now);
 }
 
 fn read_quota(state: &StateDb, provider_name: &str) -> Option<QuotaRecord> {
@@ -94,7 +86,6 @@ fn read_windows(state: &StateDb, provider_name: &str) -> Vec<QuotaWindow> {
 fn refresh_and_verify_under_lock(
     state: &StateDb,
     providers_cfg: &ProvidersConfig,
-    sessions_cfg: &SessionsConfig,
     in_flight: &InFlight,
     provider_name: &str,
     now: DateTime<Utc>,
@@ -106,8 +97,7 @@ fn refresh_and_verify_under_lock(
         verify_against_cached_windows(state, provider_name, now);
         return;
     }
-    let outcome =
-        refresh_provider_for_routing(provider_name, providers_cfg, sessions_cfg, in_flight, state);
+    let outcome = refresh_provider_for_routing(provider_name, providers_cfg, in_flight, state);
     if health::refresh_outcome_observes_fresh_or_inflight_data(&outcome) {
         verify_against_cached_windows(state, provider_name, now);
     }

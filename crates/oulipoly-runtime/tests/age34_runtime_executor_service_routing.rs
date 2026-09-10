@@ -9,7 +9,9 @@ use oulipoly_runtime::services::{
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 struct FixtureScript {
     _dir: tempfile::TempDir,
@@ -17,6 +19,13 @@ struct FixtureScript {
 }
 
 fn fixture_script(body: &str) -> FixtureScript {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("provider.sh");
     std::fs::write(

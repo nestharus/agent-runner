@@ -99,53 +99,53 @@ export function listProviderSettingsTargets(): Promise<
 }
 
 export function getProviderSettingsSchema(
-	modelName: string,
+	accountName: string,
 	schemaId: string,
 ): Promise<ProviderSettingsSchema> {
 	return tauriInvoke<ProviderSettingsSchema>("get_provider_settings_schema", {
-		modelName,
+		accountName,
 		schemaId,
 	});
 }
 
 export function listProviderSettings(
-	modelName: string,
+	accountName: string,
 ): Promise<ProviderSettingsList> {
 	return tauriInvoke<ProviderSettingsList>("list_provider_settings", {
-		modelName,
+		accountName,
 	});
 }
 
 export function getProviderSettings(
-	modelName: string,
+	accountName: string,
 	id: string,
 ): Promise<ProviderSettingsGet> {
 	return tauriInvoke<ProviderSettingsGet>("get_provider_settings", {
-		modelName,
+		accountName,
 		id,
 	});
 }
 
 export function createProviderSettings(
-	modelName: string,
+	accountName: string,
 	displayName: string | null,
 	values: Record<string, unknown>,
 ): Promise<ProviderSettingsWrite> {
 	return tauriInvoke<ProviderSettingsWrite>("create_provider_settings", {
-		modelName,
+		accountName,
 		displayName,
 		values,
 	});
 }
 
 export function updateProviderSettings(
-	modelName: string,
+	accountName: string,
 	id: string,
 	version: string,
 	values: Record<string, unknown>,
 ): Promise<ProviderSettingsWrite> {
 	return tauriInvoke<ProviderSettingsWrite>("update_provider_settings", {
-		modelName,
+		accountName,
 		id,
 		version,
 		values,
@@ -153,34 +153,34 @@ export function updateProviderSettings(
 }
 
 export function deleteProviderSettings(
-	modelName: string,
+	accountName: string,
 	id: string,
 	version: string,
 ): Promise<ProviderSettingsDelete> {
 	return tauriInvoke<ProviderSettingsDelete>("delete_provider_settings", {
-		modelName,
+		accountName,
 		id,
 		version,
 	});
 }
 
 export function validateProviderSettings(
-	modelName: string,
+	accountName: string,
 	values: Record<string, unknown>,
 ): Promise<ProviderSettingsValidate> {
 	return tauriInvoke<ProviderSettingsValidate>("validate_provider_settings", {
-		modelName,
+		accountName,
 		values,
 	});
 }
 
 export function migrateProviderSettings(
-	modelName: string,
+	accountName: string,
 	dryRun: boolean,
 	legacy: Record<string, unknown> | null,
 ): Promise<ProviderSettingsMigrate> {
 	return tauriInvoke<ProviderSettingsMigrate>("migrate_provider_settings", {
-		modelName,
+		accountName,
 		dryRun,
 		legacy,
 	});

@@ -15,10 +15,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const AGE35_PROVIDER_A: &str = "age35-a";
 const AGE35_PROVIDER_B: &str = "age35-b";
 const AGE35_MODEL: &str = "age35-model";
+
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 struct ScriptFixture {
     _dir: tempfile::TempDir,
@@ -62,6 +65,13 @@ struct TopologyDriftHarness {
 
 impl ScriptFixture {
     fn new() -> Self {
+        TEST_DATA_DIR.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("test data dir");
+            unsafe {
+                std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+            }
+            dir
+        });
         Self {
             _dir: tempfile::tempdir().unwrap(),
         }
@@ -369,8 +379,8 @@ fn assert_live_route_side_effects(db: &StateDb, label: &str) {
         );
         assert_eq!(
             db.count_assistant_turns_since(provider, None).unwrap(),
-            1,
-            "live routing should scan session turns for {provider} in {label}"
+            0,
+            "live routing must not scan session turns for {provider} in {label}"
         );
     }
 }
@@ -498,12 +508,11 @@ fn read_log_lines(log_path: &Path) -> Vec<String> {
 
 fn balance_context<'a>(
     providers_cfg: &'a ProvidersConfig,
-    sessions_cfg: &'a SessionsConfig,
+    _sessions_cfg: &'a SessionsConfig,
     in_flight: &'a InFlight,
 ) -> BalanceContext<'a> {
     BalanceContext {
         providers_cfg,
-        sessions_cfg,
         in_flight,
     }
 }
@@ -730,7 +739,7 @@ fn opencode_five_account_harness() -> RouteHarness {
 }
 
 #[test]
-fn age_35_select_provider_with_balance_context_refreshes_stale_quotas_and_scans_sessions() {
+fn age_35_select_provider_with_balance_context_refreshes_stale_quotas_without_turn_scans() {
     let harness = live_route_harness();
 
     let selected = select_with_context(&harness);
@@ -768,7 +777,7 @@ fn age_222_select_provider_degrades_cached_window_read_errors_to_empty_windows()
 }
 
 #[test]
-fn age_222_routing_refresh_inputs_calls_refresh_then_scan_per_provider_and_ignores_failures() {
+fn age_222_routing_refresh_inputs_refreshes_quota_without_running_turn_scripts() {
     let (harness, log_path) = refresh_failure_order_harness();
 
     let selected = select_with_context(&harness);
@@ -776,22 +785,17 @@ fn age_222_routing_refresh_inputs_calls_refresh_then_scan_per_provider_and_ignor
     assert_selected_index(
         selected,
         0,
-        "routing should continue with cached/missing state after refresh and scan failures",
+        "routing should continue with cached/missing state after quota refresh failures",
     );
     assert_log_lines(
         &log_path,
-        &[
-            "quota:age222-order-a",
-            "scan:age222-order-a",
-            "quota:age222-order-b",
-            "scan:age222-order-b",
-        ],
-        "refresh_routing_inputs currently performs stale routing refresh, then session scan, in provider order",
+        &["quota:age222-order-a", "quota:age222-order-b"],
+        "refresh_routing_inputs must not execute configured turn scripts",
     );
 }
 
 #[test]
-fn age_222_routing_verifies_marker_before_scan_and_next_provider() {
+fn age_222_routing_verifies_marker_before_refreshing_next_provider() {
     let (harness, log_path) = marker_order_harness();
 
     let selected = select_with_context(&harness);
@@ -800,13 +804,8 @@ fn age_222_routing_verifies_marker_before_scan_and_next_provider() {
     assert_marker_cleared(&harness.db, "age222-marker-a");
     assert_log_lines(
         &log_path,
-        &[
-            "marker-refresh:age222-marker-a",
-            "scan:age222-marker-a",
-            "quota:age222-marker-b",
-            "scan:age222-marker-b",
-        ],
-        "routing currently verifies provider A's marker before scanning A or advancing to provider B",
+        &["marker-refresh:age222-marker-a", "quota:age222-marker-b"],
+        "routing must verify provider A's marker without executing either turn script",
     );
 }
 

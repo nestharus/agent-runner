@@ -28,7 +28,7 @@ pub(crate) struct RefreshFileLock {
 
 impl RefreshFileLock {
     pub(crate) fn acquire_blocking(provider_name: &str) -> Result<Self, String> {
-        let path = provider_lock_path(provider_name);
+        let path = provider_lock_path(provider_name)?;
         ensure_lock_directory(&path)?;
         let file = open_lock_file(&path)?;
         lock_file(&file, &path)?;
@@ -85,16 +85,16 @@ fn flock_error(path: &Path, err: &std::io::Error) -> String {
     format!("failed to flock {}: {err}", path.display())
 }
 
-fn provider_lock_path(provider_name: &str) -> PathBuf {
-    usage_lock_dir().join(provider_lock_file_name(provider_name))
+fn provider_lock_path(provider_name: &str) -> Result<PathBuf, String> {
+    usage_lock_dir().map(|dir| dir.join(provider_lock_file_name(provider_name)))
 }
 
 fn provider_lock_file_name(provider_name: &str) -> String {
     format!("{}.lock", sanitize_lock_name(provider_name))
 }
 
-pub(super) fn usage_lock_dir() -> PathBuf {
-    lock_paths::app_data_dir().join("usage-refresh-locks")
+pub(super) fn usage_lock_dir() -> Result<PathBuf, String> {
+    lock_paths::app_data_dir().map(|dir| dir.join("usage-refresh-locks"))
 }
 
 pub(super) fn sanitize_lock_name(name: &str) -> String {

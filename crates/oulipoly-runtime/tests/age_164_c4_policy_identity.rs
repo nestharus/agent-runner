@@ -40,10 +40,41 @@ use oulipoly_config::{
     ClaudeRestrictions, CodexRestrictions, ModelConfig, PromptMode, ProviderConfig,
     ToolRestrictionKind, ToolRestrictions,
 };
-use oulipoly_runtime::executor::cli::{execute, provider_name, shell_split};
+use oulipoly_runtime::executor::{
+    ExecutionResult,
+    cli::{execute as runtime_execute, provider_name, shell_split},
+};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+fn execute(
+    model: &ModelConfig,
+    provider_index: usize,
+    prompt: &str,
+    cwd: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    parent_invocation_env: Option<&str>,
+) -> Result<ExecutionResult, String> {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
+    runtime_execute(
+        model,
+        provider_index,
+        prompt,
+        cwd,
+        extra_inputs,
+        parent_invocation_env,
+    )
+}
 
 fn argv_dump_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();

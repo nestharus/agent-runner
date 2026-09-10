@@ -5,6 +5,9 @@ use oulipoly_runtime::executor::cli::execute_interactive_with_result;
 use oulipoly_runtime::executor::terminal_signal::TerminalSignal;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 struct SignalCase {
@@ -48,6 +51,13 @@ fn interactive_provider(name: &str, command: &Path) -> ProviderConfig {
 }
 
 fn terminal_signal_for(provider: &ProviderConfig) -> TerminalSignal {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
     execute_interactive_with_result(provider, None, None, None)
         .expect("interactive execution")
         .terminal_signal

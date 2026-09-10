@@ -38,7 +38,6 @@ impl EnvSnapshot {
                 "OULIPOLY_AUTO_WAKE_SESSION_ID",
                 "OULIPOLY_AUTO_WAKE_TOKEN",
                 "OULIPOLY_AUTO_WAKE_COUNT",
-                "OULIPOLY_AUTO_WAKE_MAX",
             ]
             .into_iter()
             .map(|name| (name, std::env::var_os(name)))
@@ -81,7 +80,6 @@ impl Fixture {
             std::env::remove_var("OULIPOLY_AUTO_WAKE_SESSION_ID");
             std::env::remove_var("OULIPOLY_AUTO_WAKE_TOKEN");
             std::env::remove_var("OULIPOLY_AUTO_WAKE_COUNT");
-            std::env::remove_var("OULIPOLY_AUTO_WAKE_MAX");
         }
         Self { dir }
     }
@@ -119,7 +117,7 @@ impl Fixture {
         assert!(matches!(result, EnqueueResult::Inserted(_)));
     }
 
-    fn seed_runtime(&self, db: &mut MailboxDb, wake_max: i64, wake_count: i64) {
+    fn seed_runtime(&self, db: &mut MailboxDb, wake_count: i64) {
         db.wake_sessions()
             .upsert_session_metadata(SessionMetadataUpsert {
                 session_id: SESSION,
@@ -129,7 +127,6 @@ impl Fixture {
                 model_name: Some(MODEL),
                 models_dir: None,
                 effective_cwd: None,
-                selected_auto_wake_max: Some(wake_max),
             })
             .unwrap();
         rusqlite::Connection::open(MailboxDb::default_path().unwrap())
@@ -155,7 +152,7 @@ impl Fixture {
 }
 
 #[test]
-fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
+fn notify_wake_preserves_generation_and_live_claim_authority() {
     let _env_lock = mailbox_delivery::DATA_DIR_ENV_LOCK.lock().unwrap();
     let _env_snapshot = EnvSnapshot::capture();
     let generation_fixture = Fixture::new();
@@ -199,38 +196,10 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
     ));
     generation_fixture.assert_pending_without_spawn_attempt(&generation_db, &generation);
 
-    let cap_fixture = Fixture::new();
-    let mut cap_db = cap_fixture.mailbox();
-    cap_fixture.seed_pending(&mut cap_db, "h-cap");
-    cap_fixture.seed_runtime(&mut cap_db, 3, 3);
-
-    let cap = wake_coordinator::trigger_notify_wake(SESSION);
-
-    assert_eq!(cap.status, "auto_wake_cap_reached");
-    assert!(!cap.attempted);
-    assert_eq!(cap.auto_wake_count, Some(3));
-    assert!(cap.claim_token.is_none());
-    assert!(cap.wake_pid.is_none());
-    assert!(
-        cap_db
-            .wake_session_reader()
-            .wake_claim(SESSION)
-            .unwrap()
-            .is_none()
-    );
-    let cap_runtime = cap_db
-        .wake_session_reader()
-        .session_metadata(SESSION)
-        .unwrap()
-        .unwrap();
-    assert_eq!(cap_runtime.selected_auto_wake_max, Some(3));
-    assert_eq!(cap_runtime.auto_wake_count, 3);
-    cap_fixture.assert_pending_without_spawn_attempt(&cap_db, &cap);
-
     let claim_fixture = Fixture::new();
     let mut claim_db = claim_fixture.mailbox();
     claim_fixture.seed_pending(&mut claim_db, "h-claim");
-    claim_fixture.seed_runtime(&mut claim_db, 8, 0);
+    claim_fixture.seed_runtime(&mut claim_db, 0);
     let claim_token = "acr329-live-claim";
     let acquired = claim_db
         .wake_sessions()
@@ -274,7 +243,6 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
         .session_metadata(SESSION)
         .unwrap()
         .unwrap();
-    assert_eq!(claim_runtime.selected_auto_wake_max, Some(8));
     assert_eq!(claim_runtime.auto_wake_count, 4);
     claim_fixture.assert_pending_without_spawn_attempt(&claim_db, &in_flight);
 }

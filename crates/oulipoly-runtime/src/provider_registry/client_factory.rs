@@ -1,8 +1,12 @@
+use crate::executor::cli::spawn_identity::PARENT_INVOCATION_ENV;
+use crate::executor::cli::{LIVE_SESSION_BIND_SOCKET_ENV, LIVE_SESSION_BIND_TOKEN_ENV};
+use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_provider::client::{
     CancellationToken, ProcessSpawnObserver, ProviderClient, ProviderClientOptions,
 };
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use oulipoly_provider::stream::LaunchEventObserver;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct ProviderClientFactory {
@@ -11,38 +15,78 @@ pub struct ProviderClientFactory {
 
 impl ProviderClientFactory {
     pub fn new(options: ProviderClientOptions) -> Self {
-        Self { options }
+        Self {
+            options: options.with_environment_removals(provider_process_environment_removals()),
+        }
+    }
+
+    pub(crate) fn base_options(&self) -> ProviderClientOptions {
+        self.options.clone().with_attempt_custody(None)
     }
 
     pub fn client_for(&self, artifact: ProviderArtifactRef) -> ProviderClient {
         ProviderClient::new(artifact, self.options.clone())
     }
 
-    pub(crate) fn client_for_with_cancellation(
+    pub(crate) fn client_for_attempt(
         &self,
         artifact: ProviderArtifactRef,
-        cancellation: &CancellationToken,
+        custody: Option<oulipoly_provider::custody::AttemptActorCustody>,
     ) -> ProviderClient {
-        ProviderClient::new(
-            artifact,
+        ProviderClient::new(artifact, self.options.clone().with_attempt_custody(custody))
+    }
+
+    pub(crate) fn client_from_pinned_with_observers(
+        &self,
+        pinned: &ProviderClient,
+        spawn_observer: Option<ProcessSpawnObserver>,
+        launch_event_observer: Option<LaunchEventObserver>,
+        custody: Option<oulipoly_provider::custody::AttemptActorCustody>,
+    ) -> Result<ProviderClient, oulipoly_provider::error::ProviderClientError> {
+        pinned.fork_from_pinned(
+            self.options
+                .clone()
+                .with_attempt_custody(custody)
+                .with_spawn_observer(spawn_observer)
+                .with_launch_event_observer(launch_event_observer),
+        )
+    }
+
+    pub(crate) fn client_from_pinned_with_cancellation(
+        &self,
+        pinned: &ProviderClient,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderClient, oulipoly_provider::error::ProviderClientError> {
+        pinned.fork_from_pinned(
             self.options
                 .clone()
                 .with_cancellation(Some(cancellation.clone())),
         )
     }
 
-    pub(crate) fn client_for_with_observers(
+    pub(crate) fn client_from_pinned_with_cancellation_and_timeout(
         &self,
-        artifact: ProviderArtifactRef,
-        spawn_observer: Option<ProcessSpawnObserver>,
-        launch_event_observer: Option<LaunchEventObserver>,
-    ) -> ProviderClient {
-        ProviderClient::new(
-            artifact,
+        pinned: &ProviderClient,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<ProviderClient, oulipoly_provider::error::ProviderClientError> {
+        pinned.fork_from_pinned(
             self.options
                 .clone()
-                .with_spawn_observer(spawn_observer)
-                .with_launch_event_observer(launch_event_observer),
+                .with_cancellation(Some(cancellation.clone()))
+                .with_timeout(timeout),
         )
     }
+}
+
+fn provider_process_environment_removals() -> impl Iterator<Item = &'static str> {
+    AutoWakeEnvironmentVariable::ALL
+        .into_iter()
+        .map(AutoWakeEnvironmentVariable::name)
+        .chain([
+            oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+            PARENT_INVOCATION_ENV,
+            LIVE_SESSION_BIND_SOCKET_ENV,
+            LIVE_SESSION_BIND_TOKEN_ENV,
+        ])
 }

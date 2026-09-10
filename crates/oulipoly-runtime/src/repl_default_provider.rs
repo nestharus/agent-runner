@@ -13,7 +13,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::executor::cli::InteractiveLiveSessionBinding;
-use crate::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
+use crate::provider_registry::{
+    PinnedProviderEndpoint, ProviderRegistry, ProviderRegistryError, ProviderRegistryOptions,
+};
 use crate::services::{
     LauncherServiceOutput, LauncherServicePort, LauncherServiceRequest, ServiceError,
 };
@@ -33,9 +35,7 @@ pub struct RuntimeServices<O: StateDbOpener = ProductionStateDbOpener> {
 
 impl RuntimeServices<ProductionStateDbOpener> {
     pub fn production(working_dir: Option<PathBuf>) -> Result<Self, String> {
-        let config_root = dirs::config_dir()
-            .map(|path| path.join("oulipoly-agent-runner"))
-            .unwrap_or_else(|| PathBuf::from("oulipoly-agent-runner"));
+        let config_root = oulipoly_state::paths::config_dir()?;
 
         Ok(Self {
             config_root,
@@ -160,15 +160,22 @@ where
         .and_then(Path::parent)
         .unwrap_or(services.config_root.as_path());
     let provider_registry = Arc::new(
-        ProviderRegistry::from_model_configs_with_provider_config(
+        ProviderRegistry::from_configs(
             std::slice::from_ref(&carrier_model),
             &providers,
             ProviderRegistryOptions::default()
-                .with_path_entries_from_process_path()
                 .with_config_root(&services.config_root)
                 .with_data_root(registry_data_root),
         )
-        .map_err(|err| err.to_string())?,
+        .map_err(|error| match &error {
+            ProviderRegistryError::AccountImplementationNotConfigured { account_name } => {
+                format!(
+                    "provider account {account_name} implementation preflight failed for {}/{account_name}: {error}",
+                    carrier_model.name,
+                )
+            }
+            _ => error.to_string(),
+        })?,
     );
 
     let state = match services.state_db_path.as_ref() {
@@ -176,12 +183,18 @@ where
         None => services.state_db_opener.open_default(),
     }?;
 
+    // Match the current headless/model-REPL initial routing preparation.
+    let in_flight = crate::quota::InFlight::new();
+    let ctx = crate::balancer::BalanceContext {
+        providers_cfg: &providers,
+        in_flight: &in_flight,
+    };
     let provider_index = services
         .routing_service
         .select_route(RoutingServiceRequest {
             model: &carrier_model,
             state: &state,
-            ctx: None,
+            ctx: Some(&ctx),
         })
         .map_err(|error| error.to_string())?
         .provider_index;
@@ -195,6 +208,22 @@ where
         .ok_or_else(|| format!("selected provider index {provider_index} is out of bounds"))?;
     let (provider, _prompt_mode) = providers.runtime_provider(member_name)?;
     let selected_provider_name = provider.name.clone();
+    let provider_endpoint = provider_registry
+        .preflight_account(&selected_provider_name)
+        .map_err(|error| {
+            format!(
+                "provider account {selected_provider_name} implementation preflight failed for {}/{selected_provider_name}: {error}",
+                carrier_model.name,
+            )
+        })?;
+    if !provider_endpoint.capabilities().capabilities.session {
+        return Err(format!(
+            "provider account {selected_provider_name} implementation preflight failed: provider describe did not advertise session capability"
+        ));
+    }
+    provider_endpoint
+        .settings_id()
+        .map_err(|error| error.to_string())?;
     let launch_provider = ProviderConfig {
         name: carrier_model.name.clone(),
         ..provider
@@ -209,6 +238,7 @@ where
             provider_index,
             carrier_model: &carrier_model,
             provider_registry,
+            provider_endpoint,
             state_db_path: state_db_path.as_deref(),
             launch_provider: &launch_provider,
             launcher,
@@ -225,6 +255,7 @@ struct RegisteredDefaultProviderReplInput<'a, O: StateDbOpener> {
     provider_index: usize,
     carrier_model: &'a ModelConfig,
     provider_registry: Arc<ProviderRegistry>,
+    provider_endpoint: Arc<PinnedProviderEndpoint>,
     state_db_path: Option<&'a Path>,
     launch_provider: &'a ProviderConfig,
     launcher: &'a dyn InteractiveLauncher,
@@ -329,17 +360,23 @@ fn default_provider_live_session_binding<O: StateDbOpener>(
     invocation_uuid: &str,
 ) -> Option<InteractiveLiveSessionBinding> {
     let state_db_path = input.state_db_path?;
+    let settings_id = input.provider_endpoint.settings_id().ok()?;
     Some(InteractiveLiveSessionBinding {
         registry: Arc::clone(&input.provider_registry),
+        endpoint: Arc::clone(&input.provider_endpoint),
         identity: SessionProviderIdentity {
             model_name: input.carrier_model.name.clone(),
             provider_name: input.provider_name.to_string(),
-            provider_instance_id: None,
-            settings_id: input.provider_name.to_string(),
+            provider_instance_id: Some(format!(
+                "{}-instance",
+                input.provider_endpoint.capabilities().provider_id
+            )),
+            settings_id: settings_id.to_string(),
         },
         state_db_path: state_db_path.to_path_buf(),
         invocation_row_id,
         invocation_uuid: invocation_uuid.to_string(),
+        expected_provider_session_id: None,
         effective_cwd: default_provider_effective_cwd(input.services.working_dir.as_deref()),
     })
 }
@@ -392,14 +429,17 @@ fn finalize_default_provider_spawn_error(
     invocation_row_id: i64,
 ) -> Result<(), String> {
     lifecycle
-        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-            state,
-            invocation_row_id,
-            success: false,
-            exit_code: 1,
-            error_category: Some("spawn_error"),
-            terminal_reason: Some("spawn_error"),
-        })
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            InvocationLifecycleFinalizeRequest {
+                state,
+                invocation_row_id,
+                success: false,
+                exit_code: 1,
+                error_category: Some("spawn_error"),
+                terminal_reason: Some("spawn_error"),
+            },
+        )
         .map(|_| ())
         .map_err(|err| err.to_string())
 }
@@ -410,14 +450,17 @@ fn finalize_default_provider_live_session_error(
     invocation_row_id: i64,
 ) -> Result<(), String> {
     lifecycle
-        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-            state,
-            invocation_row_id,
-            success: false,
-            exit_code: 1,
-            error_category: Some(LIVE_SESSION_IDENTITY_UNAVAILABLE),
-            terminal_reason: Some(LIVE_SESSION_IDENTITY_UNAVAILABLE),
-        })
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            InvocationLifecycleFinalizeRequest {
+                state,
+                invocation_row_id,
+                success: false,
+                exit_code: 1,
+                error_category: Some(LIVE_SESSION_IDENTITY_UNAVAILABLE),
+                terminal_reason: Some(LIVE_SESSION_IDENTITY_UNAVAILABLE),
+            },
+        )
         .map(|_| ())
         .map_err(|err| err.to_string())
 }
@@ -604,9 +647,10 @@ mod tests {
     use crate::services::{LauncherServicePort, LauncherServiceRequest};
     use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
     use rusqlite::Connection;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::OnceLock;
 
     fn runtime_services(config_root: PathBuf) -> RuntimeServices {
         RuntimeServices {
@@ -647,12 +691,77 @@ mod tests {
     }
 
     fn provider_fixture(name: &str) -> String {
+        let implementation = repl_test_provider_path()
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
         format!(
             r#"[{name}]
 command = "printf"
 interactive_args = ["ok"]
+settings_id = "{name}-settings"
+
+[{name}.implementation]
+family = "historical-test-fixture"
+executable = "{implementation}"
 "#
         )
+    }
+
+    pub(super) fn repl_test_provider_path() -> &'static Path {
+        static PROVIDER: OnceLock<PathBuf> = OnceLock::new();
+        PROVIDER
+            .get_or_init(|| {
+                let dir = std::env::temp_dir().join(format!(
+                    "oulipoly-default-repl-provider-{}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let path = dir.join("provider.py");
+                std::fs::write(
+                    &path,
+                    r#"#!/usr/bin/env python3
+import json
+import sys
+
+request = json.load(sys.stdin)
+print(json.dumps({
+    "contract": request["contract"],
+    "request_id": request["request_id"],
+    "ok": True,
+    "result": {
+        "provider_id": "default-repl-test",
+        "display_name": "Default REPL Test",
+        "contract_versions": ["oulipoly.provider/v1"],
+        "preferred_contract": "oulipoly.provider/v1",
+        "capabilities": {
+            "launch": False,
+            "policy": False,
+            "quota": False,
+            "session": True,
+            "session_enumerate": False,
+            "terminal": False,
+            "rotation": False,
+            "discovery": False,
+            "settings": False,
+            "setup_brain": False,
+            "setup": False,
+            "migration": False
+        }
+    }
+}))
+"#,
+                )
+                .unwrap();
+                #[cfg(unix)]
+                {
+                    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                    permissions.set_mode(0o755);
+                    std::fs::set_permissions(&path, permissions).unwrap();
+                }
+                path
+            })
+            .as_path()
     }
 
     fn load_providers(root: &Path, contents: &str) -> ProvidersConfig {
@@ -671,6 +780,11 @@ interactive_args = ["ok"]
     #[derive(Default)]
     struct RecordingLauncher {
         calls: RefCell<Vec<LauncherCall>>,
+    }
+
+    struct PreflightAssertingLauncher {
+        marker: PathBuf,
+        launched: Cell<bool>,
     }
 
     impl InteractiveLauncher for RecordingLauncher {
@@ -693,7 +807,27 @@ interactive_args = ["ok"]
         }
     }
 
-    fn successful_interactive_result() -> crate::executor::cli::InteractiveExecutionResult {
+    impl InteractiveLauncher for PreflightAssertingLauncher {
+        fn launch(
+            &self,
+            _provider: &ProviderConfig,
+            _working_dir: Option<&Path>,
+            _parent_invocation_env: Option<&str>,
+            _state_db_path: Option<&Path>,
+            _live_session_binding: Option<InteractiveLiveSessionBinding>,
+        ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
+            assert_eq!(
+                std::fs::read_to_string(&self.marker).unwrap(),
+                "described",
+                "provider describe preflight must complete before native launch"
+            );
+            self.launched.set(true);
+            Ok(successful_interactive_result())
+        }
+    }
+
+    pub(super) fn successful_interactive_result() -> crate::executor::cli::InteractiveExecutionResult
+    {
         crate::executor::cli::InteractiveExecutionResult {
             exit_code: 0,
             terminal_reason: None,
@@ -713,6 +847,7 @@ interactive_args = ["ok"]
         session_id: String,
         exit_code: i32,
         terminal_reason: String,
+        spawn_error: bool,
     }
 
     impl InteractiveLauncher for CapturingTerminalLauncher {
@@ -725,15 +860,38 @@ interactive_args = ["ok"]
             live_session_binding: Option<InteractiveLiveSessionBinding>,
         ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
             let binding = live_session_binding.expect("live-session binding context");
-            StateDb::open(&binding.state_db_path)?.bind_invocation_provider_session_start(
-                binding.invocation_row_id,
-                &ProviderSessionBinding {
-                    provider_session_id: self.session_id.clone(),
+            let state = StateDb::open(&binding.state_db_path)?;
+            crate::session_authority::commit_session_authority(
+                crate::session_authority::SessionAuthorityCommitRequest {
+                    state: &state,
+                    invocation_row_id: binding.invocation_row_id,
+                    invocation_uuid: &binding.invocation_uuid,
+                    expectation: crate::session_authority::SessionAuthorityExpectation {
+                        account_name: &binding.identity.provider_name,
+                        provider_session_id: None,
+                    },
+                    observation: Some(crate::session_authority::AuthoritativeSessionObservation {
+                        account_name: binding.endpoint.account_name(),
+                        provider_session_id: &self.session_id,
+                    }),
                     capture_method: "provider_live_report",
+                    provider_instance_id: binding.identity.provider_instance_id.as_deref().unwrap(),
+                    settings_id: &binding.identity.settings_id,
                     resume_input_id: None,
-                    provider_session_resolved_account: Some(binding.identity.settings_id.clone()),
+                    provider_session_resolved_account: Some(
+                        binding
+                            .state_db_path
+                            .parent()
+                            .unwrap()
+                            .display()
+                            .to_string(),
+                    ),
                 },
-            )?;
+            )
+            .map_err(|error| error.to_string())?;
+            if self.spawn_error {
+                return Err("controlled post-capture launcher failure".into());
+            }
             Ok(crate::executor::cli::InteractiveExecutionResult {
                 exit_code: self.exit_code,
                 terminal_reason: Some(self.terminal_reason.clone()),
@@ -787,11 +945,6 @@ interactive_args = ["ok"]
         .unwrap()
     }
 
-    fn single_string_column(db_path: &Path, sql: &str) -> String {
-        let conn = Connection::open(db_path).unwrap();
-        conn.query_row(sql, [], |row| row.get(0)).unwrap()
-    }
-
     #[cfg(unix)]
     fn toml_path(path: &Path) -> String {
         path.to_string_lossy()
@@ -812,6 +965,55 @@ interactive_args = ["ok"]
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
         (dir, path)
+    }
+
+    #[cfg(unix)]
+    fn preflight_provider_script(dir: &Path, marker: &Path) -> PathBuf {
+        let path = dir.join("preflight-provider.py");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+request = json.load(sys.stdin)
+pathlib.Path({marker:?}).write_text("described")
+print(json.dumps({{
+    "contract": request["contract"],
+    "request_id": request["request_id"],
+    "ok": True,
+    "result": {{
+        "provider_id": "preflight-test",
+        "display_name": "Preflight Test",
+        "contract_versions": ["oulipoly.provider/v1"],
+        "preferred_contract": "oulipoly.provider/v1",
+        "capabilities": {{
+            "launch": False,
+            "policy": False,
+            "quota": False,
+            "session": True,
+            "session_enumerate": False,
+            "terminal": False,
+            "rotation": False,
+            "discovery": False,
+            "settings": False,
+            "setup_brain": False,
+            "setup": False,
+            "migration": False
+        }}
+    }}
+}}))
+"#,
+                marker = marker.display().to_string()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
     }
 
     #[cfg(unix)]
@@ -873,6 +1075,11 @@ exit 17"#,
 
     #[test]
     fn production_services_match_known_baseline_for_none_and_some_project() {
+        let config_home = tempfile::tempdir().unwrap();
+        let _env = crate::quota::marker_verification::test_support::EnvGuard::set(
+            oulipoly_state::paths::CONFIG_HOME_ENV,
+            config_home.path(),
+        );
         let without_project = RuntimeServices::production(None).unwrap();
 
         assert!(
@@ -1109,6 +1316,74 @@ interactive_args = ["ok"]
     }
 
     #[test]
+    fn missing_account_implementation_prevents_default_provider_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        StateDb::open(&state_path).unwrap();
+        write_config(temp.path(), r#"default_provider = "fixture""#);
+        write_providers(
+            temp.path(),
+            r#"[fixture]
+command = "printf"
+interactive_args = ["ok"]
+"#,
+        );
+        let launcher = RecordingLauncher::default();
+
+        let error = run_repl_with_default_provider_with_launcher(
+            runtime_services_with_state(temp.path().to_path_buf(), state_path),
+            &launcher,
+        )
+        .expect_err("missing account implementation must fail before launch");
+
+        assert!(error.contains("provider account fixture implementation preflight failed"));
+        assert!(error.contains("<provider-family:fixture>/fixture"));
+        assert!(
+            error.contains("provider account has no explicit implementation endpoint: fixture")
+        );
+        assert!(launcher.calls.borrow().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_account_implementation_is_preflighted_before_native_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        let marker = temp.path().join("describe.marker");
+        StateDb::open(&state_path).unwrap();
+        let implementation = preflight_provider_script(temp.path(), &marker);
+        write_config(temp.path(), r#"default_provider = "fixture""#);
+        write_providers(
+            temp.path(),
+            &format!(
+                r#"[fixture]
+command = "printf"
+interactive_args = ["ok"]
+settings_id = "fixture-settings"
+
+[fixture.implementation]
+family = "fixture"
+executable = "{}"
+"#,
+                toml_path(&implementation)
+            ),
+        );
+        let launcher = PreflightAssertingLauncher {
+            marker,
+            launched: Cell::new(false),
+        };
+
+        let code = run_repl_with_default_provider_with_launcher(
+            runtime_services_with_state(temp.path().to_path_buf(), state_path),
+            &launcher,
+        )
+        .expect("valid account implementation should launch after preflight");
+
+        assert_eq!(code, 0);
+        assert!(launcher.launched.get());
+    }
+
+    #[test]
     fn preserves_selected_provider_environment_for_interactive_launch() {
         let temp = tempfile::tempdir().unwrap();
         let state_path = temp.path().join("state.db");
@@ -1116,12 +1391,20 @@ interactive_args = ["ok"]
         write_config(temp.path(), r#"default_provider = "opencode""#);
         write_providers(
             temp.path(),
-            r#"[opencode]
+            &format!(
+                r#"[opencode]
 command = "printf"
 interactive_args = ["ok"]
-environment = { XDG_DATA_HOME = "/tmp/opencode-profile" }
+environment = {{ XDG_DATA_HOME = "/tmp/opencode-profile" }}
 unset_environment = ["OPENAI_API_KEY"]
+settings_id = "opencode-settings"
+
+[opencode.implementation]
+family = "opencode"
+executable = "{}"
 "#,
+                repl_test_provider_path().display()
+            ),
         );
         let launcher = RecordingLauncher::default();
 
@@ -1223,7 +1506,7 @@ unset_environment = ["OPENAI_API_KEY"]
 
     #[cfg(unix)]
     #[test]
-    fn registers_ingested_session_chain() {
+    fn legacy_turn_script_does_not_register_a_session_chain_synchronously() {
         const SESSION_ID: &str = "session-from-new-repl";
 
         let temp = tempfile::tempdir().unwrap();
@@ -1256,30 +1539,15 @@ turn_script = "{}"
 
         assert_eq!(code, 0);
         assert_eq!(table_count(&state_path, "invocations"), 1);
-        assert_eq!(table_count(&state_path, "session_chains"), 1);
-        assert_eq!(table_count(&state_path, "session_chain_segments"), 1);
+        assert_eq!(table_count(&state_path, "session_chains"), 0);
+        assert_eq!(table_count(&state_path, "session_chain_segments"), 0);
         let (model_name, provider_name, status, provider_session_id, capture_method) =
             invocation_row(&state_path);
         assert_eq!(model_name, "<unknown>");
         assert_eq!(provider_name, "generic");
         assert_eq!(status, "succeeded");
-        assert_eq!(provider_session_id.as_deref(), Some(SESSION_ID));
-        assert_eq!(capture_method.as_deref(), Some("turn_script"));
-        assert_eq!(
-            single_string_column(&state_path, "SELECT model_name FROM session_chains"),
-            "<unknown>"
-        );
-        assert_eq!(
-            single_string_column(
-                &state_path,
-                "SELECT provider_name FROM session_chain_segments"
-            ),
-            "generic"
-        );
-        assert_eq!(
-            single_string_column(&state_path, "SELECT session_id FROM session_chain_segments"),
-            SESSION_ID
-        );
+        assert_eq!(provider_session_id, None);
+        assert_eq!(capture_method, None);
     }
 
     #[test]
@@ -1295,6 +1563,7 @@ turn_script = "{}"
                 session_id: session_id.clone(),
                 exit_code,
                 terminal_reason: terminal_reason.to_string(),
+                spawn_error: false,
             };
 
             let code = run_repl_with_default_provider_with_launcher(
@@ -1309,6 +1578,54 @@ turn_script = "{}"
             assert_eq!(status, "failed");
             assert_eq!(provider_session_id.as_deref(), Some(session_id.as_str()));
             assert_eq!(capture_method.as_deref(), Some("provider_live_report"));
+        }
+    }
+
+    #[test]
+    fn age345_default_repl_retains_authority_after_already_bound_success_and_launcher_error() {
+        for spawn_error in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let state_path = temp.path().join("state.db");
+            StateDb::open(&state_path).unwrap();
+            write_config(temp.path(), r#"default_provider = "generic""#);
+            write_providers(temp.path(), &provider_fixture("generic"));
+            let launcher = CapturingTerminalLauncher {
+                session_id: "age345-retained-session".into(),
+                exit_code: 0,
+                terminal_reason: "completed".into(),
+                spawn_error,
+            };
+            let result = run_repl_with_default_provider_with_launcher(
+                runtime_services_with_state(temp.path().to_path_buf(), state_path.clone()),
+                &launcher,
+            );
+            if spawn_error {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "controlled post-capture launcher failure"
+                );
+            } else {
+                assert_eq!(result.unwrap(), 0);
+            }
+            let state = StateDb::open(&state_path).unwrap();
+            let chain = state
+                .chain_id_for_segment("generic", &launcher.session_id)
+                .unwrap()
+                .unwrap();
+            let authority = state
+                .active_provider_session_authority(&chain)
+                .unwrap()
+                .unwrap();
+            assert_eq!(authority.settings_id, "generic-settings");
+            assert_eq!(
+                table_count(&state_path, "invocation_provider_session_authority"),
+                1
+            );
+            assert_eq!(table_count(&state_path, "invocations"), 1);
+            let (_, _, status, native, method) = invocation_row(&state_path);
+            assert_eq!(status, if spawn_error { "failed" } else { "succeeded" });
+            assert_eq!(native.as_deref(), Some(launcher.session_id.as_str()));
+            assert_eq!(method.as_deref(), Some("provider_live_report"));
         }
     }
 
@@ -1331,6 +1648,7 @@ turn_script = "{}"
             .unwrap();
         state
             .bind_invocation_provider_session_start(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 invocation_row_id,
                 &ProviderSessionBinding {
                     provider_session_id: SESSION_ID.to_string(),
@@ -1348,6 +1666,7 @@ turn_script = "{}"
 
         state
             .transition_invocation_provider_session_capture_method(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
                 invocation_row_id,
                 SESSION_ID,
                 crate::executor::cli::PENDING_LIVE_SESSION_CAPTURE_METHOD,
@@ -1417,3 +1736,7 @@ default_provider = "claude"
         assert_eq!(launcher.calls.borrow().len(), 1);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "repl_default_provider_routing_tests.rs"]
+mod routing_tests;

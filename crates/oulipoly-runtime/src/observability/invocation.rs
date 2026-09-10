@@ -32,8 +32,8 @@ use crate::observability::state_access::{process_identity_ref, storage_diagnosti
 use oulipoly_core::CancellationToken;
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow};
-use oulipoly_state::{InvocationChildrenPage, InvocationRecord, InvocationStatus, StateDb};
-use std::collections::HashSet;
+use oulipoly_state::{InvocationRecord, InvocationStatus, StateDb};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(crate) struct InvocationProjection {
     pub(crate) root_invocation_uuid: Option<String>,
@@ -42,6 +42,7 @@ pub(crate) struct InvocationProjection {
     pub(crate) nodes: Vec<MonitorNode>,
     pub(crate) diagnostics: Vec<MonitorDiagnostic>,
     pub(crate) invocation_count: usize,
+    pub(crate) live_coverage_incomplete: bool,
 }
 
 pub(crate) fn project_invocations(
@@ -49,6 +50,7 @@ pub(crate) fn project_invocations(
     pid: Option<&PidIdentityDb>,
     mailbox: Option<&MailboxDb>,
     root: &ObservabilityRoot,
+    agent_bash_owner_seeds: &HashSet<String>,
     limits: SnapshotLimits,
     cancellation: &CancellationToken,
 ) -> InvocationProjection {
@@ -71,13 +73,13 @@ pub(crate) fn project_invocations(
     let mut projection =
         invocation_projection(root_invocation_uuid, active_session_id.clone(), diagnostics);
     if let Some(record) = root_record {
-        build_invocation_tree(
+        project_root_reachable_graph(
             state,
             pid,
             mailbox,
             record,
-            None,
             active_session_id,
+            agent_bash_owner_seeds,
             limits,
             cancellation,
             &mut projection,
@@ -107,6 +109,7 @@ fn invocation_projection(
         nodes: Vec::new(),
         diagnostics,
         invocation_count: 0,
+        live_coverage_incomplete: false,
     }
 }
 
@@ -118,6 +121,7 @@ fn empty_projection(root: &ObservabilityRoot) -> InvocationProjection {
         nodes: Vec::new(),
         diagnostics: Vec::new(),
         invocation_count: 0,
+        live_coverage_incomplete: false,
     }
 }
 
@@ -147,326 +151,462 @@ pub(crate) fn resolved_invocation_session_id(record: &InvocationRecord) -> Optio
         .or_else(|| record.session_id.clone())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_invocation_tree(
-    state: &StateDb,
-    pid: Option<&PidIdentityDb>,
-    mailbox: Option<&MailboxDb>,
-    record: InvocationRecord,
-    parent_uuid: Option<String>,
-    active_session_id: Option<String>,
-    limits: SnapshotLimits,
-    cancellation: &CancellationToken,
-    projection: &mut InvocationProjection,
-) {
-    let mut visited = HashSet::from([record.id]);
-    build_invocation_node(
-        state,
-        pid,
-        mailbox,
-        record,
-        parent_uuid,
-        active_session_id,
-        0,
-        limits,
-        cancellation,
-        &mut visited,
-        projection,
-    );
+#[derive(Default)]
+struct InvocationGraph {
+    records: HashMap<String, InvocationRecord>,
+    parents: HashMap<String, String>,
+    mandatory: HashSet<String>,
+}
+
+struct StateSeedPath {
+    records: Vec<InvocationRecord>,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_invocation_node(
+fn project_root_reachable_graph(
     state: &StateDb,
     pid: Option<&PidIdentityDb>,
     mailbox: Option<&MailboxDb>,
-    record: InvocationRecord,
-    parent_uuid: Option<String>,
+    root_record: InvocationRecord,
     active_session_id: Option<String>,
-    depth: usize,
+    agent_bash_owner_seeds: &HashSet<String>,
     limits: SnapshotLimits,
     cancellation: &CancellationToken,
-    visited: &mut HashSet<i64>,
     projection: &mut InvocationProjection,
 ) {
-    if cancellation.is_cancelled() {
-        return;
-    }
-    if invocation_node_limit_reached(projection, limits) {
-        push_invocation_truncated_diagnostic(projection);
-        return;
-    }
-    record_invocation_entry(projection, &record);
-    let selected_pid = selected_pid_row(pid, &record.invocation_uuid, &mut projection.diagnostics);
-    push_invocation_record_node(
-        projection,
-        &record,
-        parent_uuid.as_deref(),
-        active_session_id.as_deref(),
-        &selected_pid,
-    );
-    push_selected_process_node(projection, &record, selected_pid);
-    if !should_read_invocation_children(depth, limits) {
-        return;
-    }
-    let Some(children) = invocation_children(
+    let mut seeds = invocation_live_seeds(
         state,
+        pid,
         mailbox,
-        &record,
-        limits.include_terminal,
-        limits
-            .max_invocation_nodes
-            .saturating_sub(projection.invocation_count),
+        active_session_id.as_deref(),
+        agent_bash_owner_seeds,
         cancellation,
         &mut projection.diagnostics,
-    ) else {
-        return;
-    };
-    visit_invocation_children(
+    );
+    seeds.insert(root_record.invocation_uuid.clone());
+    let mut paths = seed_paths(state, seeds, cancellation, &mut projection.diagnostics);
+    add_delivery_owner_paths(
         state,
-        pid,
         mailbox,
-        record.invocation_uuid.clone(),
-        active_session_id,
-        depth,
-        limits,
         cancellation,
-        visited,
+        &mut paths,
+        &mut projection.diagnostics,
+    );
+    let mut graph = root_reachable_state_graph(&root_record, &paths);
+    attach_root_reachable_delivery_paths(
+        mailbox,
+        &paths,
+        cancellation,
+        &mut graph,
+        &mut projection.diagnostics,
+    );
+    if limits.include_terminal {
+        append_terminal_history(
+            state,
+            mailbox,
+            limits.max_invocation_nodes,
+            cancellation,
+            &mut graph,
+            &mut projection.diagnostics,
+        );
+    }
+    project_invocation_graph(
+        pid,
+        &root_record.invocation_uuid,
+        active_session_id.as_deref(),
+        limits,
+        graph,
         projection,
-        children,
     );
 }
 
-fn invocation_node_limit_reached(
-    projection: &InvocationProjection,
-    limits: SnapshotLimits,
-) -> bool {
-    projection.invocation_count >= limits.max_invocation_nodes
-}
-
-fn push_invocation_truncated_diagnostic(projection: &mut InvocationProjection) {
-    projection
-        .diagnostics
-        .push(invocation_truncated_diagnostic());
-}
-
-fn record_invocation_entry(projection: &mut InvocationProjection, record: &InvocationRecord) {
-    projection.invocation_count += 1;
-    projection
-        .invocation_uuids
-        .insert(record.invocation_uuid.clone());
-}
-
-fn push_invocation_record_node(
-    projection: &mut InvocationProjection,
-    record: &InvocationRecord,
-    parent_uuid: Option<&str>,
-    active_session_id: Option<&str>,
-    selected_pid: &Option<(PidIdentityRow, LivenessStatus)>,
-) {
-    projection.nodes.push(invocation_node(
-        record,
-        parent_uuid,
-        active_session_id,
-        selected_pid,
-    ));
-}
-
-fn push_selected_process_node(
-    projection: &mut InvocationProjection,
-    record: &InvocationRecord,
-    selected_pid: Option<(PidIdentityRow, LivenessStatus)>,
-) {
-    if let Some((row, liveness)) = selected_pid {
-        projection.nodes.push(process_node(record, &row, liveness));
-    }
-}
-
-fn should_read_invocation_children(depth: usize, limits: SnapshotLimits) -> bool {
-    depth < limits.invocation_subtree_depth
-}
-
-fn invocation_children(
+fn invocation_live_seeds(
     state: &StateDb,
+    pid: Option<&PidIdentityDb>,
     mailbox: Option<&MailboxDb>,
-    record: &InvocationRecord,
-    include_terminal: bool,
-    remaining_nodes: usize,
+    session_id: Option<&str>,
+    agent_bash_owner_seeds: &HashSet<String>,
     cancellation: &CancellationToken,
     diagnostics: &mut Vec<MonitorDiagnostic>,
-) -> Option<Vec<InvocationRecord>> {
-    match read_invocation_children(
-        state,
-        record.id,
-        remaining_nodes,
-        !include_terminal,
-        cancellation,
-    ) {
-        Ok(page) => {
-            if cancellation.is_cancelled() {
-                return None;
+) -> HashSet<String> {
+    let mut seeds = agent_bash_owner_seeds.clone();
+    match state.list_running_invocations_with_cancel(cancellation) {
+        Ok(records) => seeds.extend(records.into_iter().map(|record| record.invocation_uuid)),
+        Err(error) => diagnostics.push(storage_diagnostic("invocation:running-seeds-read", error)),
+    }
+    if let Some(pid) = pid {
+        match pid.list_identities() {
+            Ok(rows) => seeds.extend(rows.into_iter().filter_map(|row| {
+                (pid_row_liveness(&row) == LivenessStatus::VerifiedLive)
+                    .then_some(row.invocation_uuid)
+            })),
+            Err(error) => {
+                diagnostics.push(storage_diagnostic("pid-identity:live-seeds-read", error))
             }
-            if page.has_more_children {
-                diagnostics.push(invocation_truncated_diagnostic());
-            }
-            if page.live_coverage_incomplete {
-                diagnostics.push(invocation_live_coverage_diagnostic());
-            }
-            let mut children = page.children;
-            append_delivery_invocation_children(
-                state,
-                mailbox,
-                record,
-                remaining_nodes.saturating_sub(children.len()),
-                cancellation,
-                &mut children,
-                diagnostics,
-            );
-            order_invocation_children(&mut children, include_terminal);
-            children.truncate(remaining_nodes);
-            Some(children)
-        }
-        Err(err) => {
-            push_invocation_children_read_diagnostic(diagnostics, err);
-            None
         }
     }
+    if let (Some(mailbox), Some(session_id)) = (mailbox, session_id) {
+        match mailbox.list_pending(session_id) {
+            Ok(rows) => seeds.extend(rows.into_iter().filter_map(|row| row.owner_invocation_uuid)),
+            Err(error) => diagnostics.push(storage_diagnostic(
+                "mailbox:pending-owner-seeds-read",
+                error,
+            )),
+        }
+        match mailbox.wake_session_reader().wake_claim(session_id) {
+            Ok(Some(claim)) => seeds.extend(claim.wake_invocation_uuid),
+            Ok(None) => {}
+            Err(error) => diagnostics.push(storage_diagnostic(
+                "mailbox:wake-invocation-seed-read",
+                error,
+            )),
+        }
+    }
+    seeds
 }
 
-fn append_delivery_invocation_children(
+fn seed_paths(
+    state: &StateDb,
+    seeds: HashSet<String>,
+    cancellation: &CancellationToken,
+    diagnostics: &mut Vec<MonitorDiagnostic>,
+) -> Vec<StateSeedPath> {
+    let mut paths = Vec::new();
+    for seed in seeds {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if let Some(path) = state_seed_path(state, &seed, cancellation, diagnostics) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn add_delivery_owner_paths(
     state: &StateDb,
     mailbox: Option<&MailboxDb>,
-    record: &InvocationRecord,
-    limit: usize,
     cancellation: &CancellationToken,
-    children: &mut Vec<InvocationRecord>,
+    paths: &mut Vec<StateSeedPath>,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) {
-    if limit == 0 {
-        return;
-    }
     let Some(mailbox) = mailbox else {
         return;
     };
-    let child_uuids =
-        match mailbox.list_delivery_invocation_children(&record.invocation_uuid, limit) {
-            Ok(uuids) => uuids,
-            Err(err) => {
-                diagnostics.push(storage_diagnostic("invocation:delivery-children-read", err));
-                return;
-            }
-        };
-    let mut child_ids = children
+    let edges = match mailbox.list_delivery_invocation_edges() {
+        Ok(edges) => edges,
+        Err(error) => {
+            diagnostics.push(storage_diagnostic("invocation:delivery-edges-read", error));
+            return;
+        }
+    };
+    let mut known_seeds = paths
         .iter()
-        .map(|child| child.id)
+        .filter_map(|path| path.records.first())
+        .map(|record| record.invocation_uuid.clone())
         .collect::<HashSet<_>>();
-    for uuid in child_uuids {
+    loop {
         if cancellation.is_cancelled() {
             return;
         }
-        match state.get_invocation_by_uuid(&uuid) {
-            Ok(Some(child)) if child.id != record.id && child_ids.insert(child.id) => {
-                children.push(child);
-            }
-            Ok(_) => {}
-            Err(err) => {
-                diagnostics.push(storage_diagnostic("invocation:delivery-child-read", err));
+        let membership = path_membership(paths);
+        let owners = edges
+            .iter()
+            .filter(|edge| membership.contains_key(&edge.delivered_by_invocation_uuid))
+            .map(|edge| edge.owner_invocation_uuid.clone())
+            .filter(|owner| known_seeds.insert(owner.clone()))
+            .collect::<Vec<_>>();
+        if owners.is_empty() {
+            return;
+        }
+        for owner in owners {
+            if let Some(path) = state_seed_path(state, &owner, cancellation, diagnostics) {
+                paths.push(path);
             }
         }
     }
 }
 
-fn read_invocation_children(
+fn state_seed_path(
     state: &StateDb,
-    record_id: i64,
-    limit: usize,
-    prioritize_running: bool,
+    seed: &str,
     cancellation: &CancellationToken,
-) -> Result<InvocationChildrenPage, String> {
-    if prioritize_running {
-        state.list_invocation_children_with_running_descendants_bounded_page_with_cancel(
-            record_id,
-            limit,
-            cancellation,
-        )
-    } else {
-        state.list_invocation_children_bounded_page_with_cancel(
-            record_id,
-            limit,
-            false,
-            cancellation,
-        )
-    }
-}
-
-fn order_invocation_children(children: &mut [InvocationRecord], include_terminal: bool) {
-    if include_terminal {
-        return;
-    }
-    prioritize_running_candidates(children);
-}
-
-fn prioritize_running_candidates(children: &mut [InvocationRecord]) {
-    children.sort_by_key(|record| record.status != InvocationStatus::Running);
-}
-
-fn push_invocation_children_read_diagnostic(
     diagnostics: &mut Vec<MonitorDiagnostic>,
-    message: String,
-) {
-    diagnostics.push(storage_diagnostic("invocation:children-read", message));
+) -> Option<StateSeedPath> {
+    let mut current = match state.get_invocation_by_uuid(seed) {
+        Ok(record) => record?,
+        Err(error) => {
+            diagnostics.push(storage_diagnostic("invocation:seed-read", error));
+            return None;
+        }
+    };
+    let mut records = Vec::new();
+    let mut visited = HashSet::new();
+    loop {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        if !visited.insert(current.id) {
+            diagnostics.push(invocation_cycle_diagnostic(&current.invocation_uuid));
+            break;
+        }
+        let parent_id = current.parent_invocation_id;
+        records.push(current);
+        let Some(parent_id) = parent_id else {
+            break;
+        };
+        current = match state.get_invocation_by_id(parent_id) {
+            Ok(Some(parent)) => parent,
+            Ok(None) => {
+                diagnostics.push(invocation_missing_parent_diagnostic(
+                    &records.last().unwrap().invocation_uuid,
+                    parent_id,
+                ));
+                break;
+            }
+            Err(error) => {
+                diagnostics.push(storage_diagnostic("invocation:ancestor-read", error));
+                break;
+            }
+        };
+    }
+    Some(StateSeedPath { records })
+}
+
+fn root_reachable_state_graph(root: &InvocationRecord, paths: &[StateSeedPath]) -> InvocationGraph {
+    let mut graph = InvocationGraph::default();
+    graph
+        .records
+        .insert(root.invocation_uuid.clone(), root.clone());
+    graph.mandatory.insert(root.invocation_uuid.clone());
+    for path in paths {
+        let Some(root_index) = path.records.iter().position(|record| record.id == root.id) else {
+            continue;
+        };
+        include_state_path_segment(&mut graph, path, root_index);
+    }
+    graph
+}
+
+fn include_state_path_segment(graph: &mut InvocationGraph, path: &StateSeedPath, top: usize) {
+    for index in 0..=top {
+        let record = &path.records[index];
+        graph
+            .records
+            .insert(record.invocation_uuid.clone(), record.clone());
+        graph.mandatory.insert(record.invocation_uuid.clone());
+        if index < top {
+            graph.parents.insert(
+                record.invocation_uuid.clone(),
+                path.records[index + 1].invocation_uuid.clone(),
+            );
+        }
+    }
+}
+
+fn path_membership(paths: &[StateSeedPath]) -> HashMap<String, Vec<(usize, usize)>> {
+    let mut membership: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    for (path_index, path) in paths.iter().enumerate() {
+        for (record_index, record) in path.records.iter().enumerate() {
+            membership
+                .entry(record.invocation_uuid.clone())
+                .or_default()
+                .push((path_index, record_index));
+        }
+    }
+    membership
 }
 
 #[allow(clippy::too_many_arguments)]
-fn visit_invocation_children(
-    state: &StateDb,
-    pid: Option<&PidIdentityDb>,
+fn attach_root_reachable_delivery_paths(
     mailbox: Option<&MailboxDb>,
-    parent_invocation_uuid: String,
-    active_session_id: Option<String>,
-    depth: usize,
-    limits: SnapshotLimits,
+    paths: &[StateSeedPath],
     cancellation: &CancellationToken,
-    visited: &mut HashSet<i64>,
-    projection: &mut InvocationProjection,
-    children: Vec<InvocationRecord>,
+    graph: &mut InvocationGraph,
+    diagnostics: &mut Vec<MonitorDiagnostic>,
 ) {
-    for child in children {
-        if cancellation.is_cancelled() {
-            return;
-        }
-        if child_was_visited(visited, child.id) {
+    let Some(mailbox) = mailbox else {
+        return;
+    };
+    let membership = path_membership(paths);
+    let mut pending = graph.records.keys().cloned().collect::<VecDeque<_>>();
+    let mut visited = HashSet::new();
+    while let Some(owner_uuid) = pending.pop_front() {
+        if cancellation.is_cancelled() || !visited.insert(owner_uuid.clone()) {
             continue;
         }
-        let child_id = child.id;
-        remember_visited_child(visited, child_id);
-        build_invocation_node(
-            state,
-            pid,
-            mailbox,
-            child,
-            Some(parent_invocation_uuid.clone()),
-            active_session_id.clone(),
-            depth + 1,
-            limits,
-            cancellation,
-            visited,
-            projection,
-        );
-        forget_visited_child(visited, child_id);
+        let child_uuids = match mailbox.list_delivery_invocation_children(&owner_uuid, usize::MAX) {
+            Ok(children) => children,
+            Err(error) => {
+                diagnostics.push(storage_diagnostic(
+                    "invocation:delivery-children-read",
+                    error,
+                ));
+                continue;
+            }
+        };
+        for child_uuid in child_uuids {
+            if graph.records.contains_key(&child_uuid) {
+                continue;
+            }
+            let Some(occurrences) = membership.get(&child_uuid) else {
+                continue;
+            };
+            let before = graph.records.len();
+            for (path_index, child_index) in occurrences {
+                include_state_path_segment(graph, &paths[*path_index], *child_index);
+            }
+            graph.parents.insert(child_uuid.clone(), owner_uuid.clone());
+            if graph.records.len() > before {
+                for uuid in graph.records.keys() {
+                    if !visited.contains(uuid) {
+                        pending.push_back(uuid.clone());
+                    }
+                }
+            }
+        }
     }
 }
 
-fn child_was_visited(visited: &HashSet<i64>, child_id: i64) -> bool {
-    visited.contains(&child_id)
+fn append_terminal_history(
+    state: &StateDb,
+    mailbox: Option<&MailboxDb>,
+    cap: usize,
+    cancellation: &CancellationToken,
+    graph: &mut InvocationGraph,
+    diagnostics: &mut Vec<MonitorDiagnostic>,
+) {
+    if graph.records.len() >= cap {
+        return;
+    }
+    let mut parents = graph.records.keys().cloned().collect::<VecDeque<_>>();
+    let mut expanded = HashSet::new();
+    while let Some(parent_uuid) = parents.pop_front() {
+        if cancellation.is_cancelled() || graph.records.len() >= cap {
+            return;
+        }
+        if !expanded.insert(parent_uuid.clone()) {
+            continue;
+        }
+        let Some(parent) = graph.records.get(&parent_uuid).cloned() else {
+            continue;
+        };
+        let remaining = cap.saturating_sub(graph.records.len());
+        let lookahead = remaining
+            .saturating_add(graph.records.len())
+            .saturating_add(1);
+        let mut children = match state.list_invocation_children_bounded(parent.id, lookahead, false)
+        {
+            Ok(children) => children,
+            Err(error) => {
+                diagnostics.push(storage_diagnostic("invocation:children-read", error));
+                Vec::new()
+            }
+        };
+        if let Some(mailbox) = mailbox {
+            match mailbox.list_delivery_invocation_children(&parent_uuid, usize::MAX) {
+                Ok(uuids) => {
+                    for uuid in uuids {
+                        if let Ok(Some(record)) = state.get_invocation_by_uuid(&uuid) {
+                            children.push(record);
+                        }
+                    }
+                }
+                Err(error) => diagnostics.push(storage_diagnostic(
+                    "invocation:delivery-children-read",
+                    error,
+                )),
+            }
+        }
+        children.retain(|record| !graph.records.contains_key(&record.invocation_uuid));
+        children.sort_by_key(|record| (record.created_at, record.id));
+        children.dedup_by_key(|record| record.id);
+        if children.len() > remaining {
+            diagnostics.push(invocation_truncated_diagnostic());
+        }
+        for child in children.into_iter().take(remaining) {
+            let child_uuid = child.invocation_uuid.clone();
+            if graph.records.contains_key(&child_uuid) {
+                continue;
+            }
+            graph
+                .parents
+                .insert(child_uuid.clone(), parent_uuid.clone());
+            graph.records.insert(child_uuid.clone(), child);
+            parents.push_back(child_uuid);
+        }
+    }
 }
 
-fn remember_visited_child(visited: &mut HashSet<i64>, child_id: i64) {
-    visited.insert(child_id);
+fn project_invocation_graph(
+    pid: Option<&PidIdentityDb>,
+    root_uuid: &str,
+    active_session_id: Option<&str>,
+    limits: SnapshotLimits,
+    graph: InvocationGraph,
+    projection: &mut InvocationProjection,
+) {
+    let children = graph_children(&graph.parents);
+    let mut pending = VecDeque::from([(root_uuid.to_string(), 0_usize)]);
+    let mut visited = HashSet::new();
+    while let Some((uuid, depth)) = pending.pop_front() {
+        let mandatory = graph.mandatory.contains(&uuid);
+        if depth > limits.invocation_subtree_depth
+            || projection.invocation_count >= limits.max_invocation_nodes
+        {
+            if mandatory {
+                projection.live_coverage_incomplete = true;
+            }
+            continue;
+        }
+        if !visited.insert(uuid.clone()) {
+            continue;
+        }
+        let Some(record) = graph.records.get(&uuid) else {
+            continue;
+        };
+        projection.invocation_count += 1;
+        projection.invocation_uuids.insert(uuid.clone());
+        let selected_pid = selected_pid_row(pid, &uuid, &mut projection.diagnostics);
+        projection.nodes.push(invocation_node(
+            record,
+            graph.parents.get(&uuid).map(String::as_str),
+            active_session_id,
+            &selected_pid,
+        ));
+        if let Some((row, liveness)) = selected_pid {
+            projection.nodes.push(process_node(record, &row, liveness));
+        }
+        if let Some(child_uuids) = children.get(&uuid) {
+            for child_uuid in child_uuids {
+                pending.push_back((child_uuid.clone(), depth + 1));
+            }
+        }
+    }
+    if graph.mandatory.len() > projection.invocation_count
+        || graph.mandatory.len() > limits.max_invocation_nodes
+    {
+        projection.live_coverage_incomplete = true;
+    }
+    if projection.live_coverage_incomplete {
+        projection
+            .diagnostics
+            .push(invocation_live_coverage_diagnostic());
+    }
 }
 
-fn forget_visited_child(visited: &mut HashSet<i64>, child_id: i64) {
-    visited.remove(&child_id);
+fn graph_children(parents: &HashMap<String, String>) -> HashMap<String, Vec<String>> {
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for (child, parent) in parents {
+        children
+            .entry(parent.clone())
+            .or_default()
+            .push(child.clone());
+    }
+    for child_uuids in children.values_mut() {
+        child_uuids.sort();
+    }
+    children
 }
 
 fn selected_pid_row(
@@ -652,120 +792,28 @@ fn invocation_truncated_diagnostic() -> MonitorDiagnostic {
 fn invocation_live_coverage_diagnostic() -> MonitorDiagnostic {
     MonitorDiagnostic {
         code: "truncated:invocation-live-coverage".to_string(),
-        severity: MonitorDiagnosticSeverity::Warning,
-        message: "bounded live-descendant scan saturated; active descendants may be omitted"
-            .to_string(),
+        severity: MonitorDiagnosticSeverity::Error,
+        message: "root-reachable live closure exceeded the hard node/depth cap; live coverage and running totals are incomplete and require pagination".to_string(),
         node_id: None,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use oulipoly_state::InvocationStart;
-
-    #[test]
-    fn invocation_children_never_materializes_the_lookahead_row() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = StateDb::open(&directory.path().join("state.db")).unwrap();
-        let root_id = start_invocation(&state, "70000000-0000-4000-8000-000000000000", None);
-        for index in 1..=3 {
-            start_invocation(
-                &state,
-                &format!("70000000-0000-4000-8000-{index:012}"),
-                Some(root_id),
-            );
-        }
-        let root = state
-            .get_invocation_by_uuid("70000000-0000-4000-8000-000000000000")
-            .unwrap()
-            .unwrap();
-        let mut diagnostics = Vec::new();
-
-        let children = invocation_children(
-            &state,
-            None,
-            &root,
-            true,
-            2,
-            &CancellationToken::new(),
-            &mut diagnostics,
-        )
-        .unwrap();
-
-        assert_eq!(children.len(), 2);
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, "truncated:invocation-nodes");
+fn invocation_missing_parent_diagnostic(child_uuid: &str, parent_id: i64) -> MonitorDiagnostic {
+    MonitorDiagnostic {
+        code: "invocation:missing-parent".to_string(),
+        severity: MonitorDiagnosticSeverity::Warning,
+        message: format!(
+            "invocation {child_uuid} references missing durable parent row {parent_id}; it was not promoted to a root"
+        ),
+        node_id: Some(invocation_node_id(child_uuid)),
     }
+}
 
-    #[test]
-    fn invocation_children_disclose_saturated_live_coverage() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = StateDb::open(&directory.path().join("state.db")).unwrap();
-        let root_id = start_invocation(&state, "71000000-0000-4000-8000-000000000000", None);
-        for index in 0..8 {
-            let child_id = start_invocation(
-                &state,
-                &format!("71000000-0000-4000-8001-{index:012}"),
-                Some(root_id),
-            );
-            state
-                .finalize_invocation(child_id, true, 0, None, None)
-                .unwrap();
-        }
-        let hidden_ancestor_id = start_invocation(
-            &state,
-            "72000000-0000-4000-8000-000000000000",
-            Some(root_id),
-        );
-        state
-            .finalize_invocation(hidden_ancestor_id, true, 0, None, None)
-            .unwrap();
-        start_invocation(
-            &state,
-            "73000000-0000-4000-8000-000000000000",
-            Some(hidden_ancestor_id),
-        );
-        let root = state
-            .get_invocation_by_uuid("71000000-0000-4000-8000-000000000000")
-            .unwrap()
-            .unwrap();
-        let mut diagnostics = Vec::new();
-
-        let children = invocation_children(
-            &state,
-            None,
-            &root,
-            false,
-            2,
-            &CancellationToken::new(),
-            &mut diagnostics,
-        )
-        .unwrap();
-
-        assert_eq!(children.len(), 2);
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "truncated:invocation-nodes")
-        );
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "truncated:invocation-live-coverage"
-                && diagnostic
-                    .message
-                    .contains("active descendants may be omitted")
-        }));
-    }
-
-    fn start_invocation(state: &StateDb, uuid: &str, parent_invocation_id: Option<i64>) -> i64 {
-        state
-            .start_invocation(&InvocationStart {
-                invocation_uuid: uuid.to_string(),
-                model_name: "model-a".to_string(),
-                provider_name: "provider-a".to_string(),
-                provider_index: 0,
-                parent_invocation_id,
-            })
-            .unwrap()
+fn invocation_cycle_diagnostic(uuid: &str) -> MonitorDiagnostic {
+    MonitorDiagnostic {
+        code: "invocation:ancestor-cycle".to_string(),
+        severity: MonitorDiagnosticSeverity::Error,
+        message: format!("durable invocation ancestry contains a cycle at {uuid}"),
+        node_id: Some(invocation_node_id(uuid)),
     }
 }

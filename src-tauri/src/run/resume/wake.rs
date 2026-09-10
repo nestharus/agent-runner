@@ -1,28 +1,54 @@
 //! ## Declared roles
 //!
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`
+//!
+//! ## Lifecycle relationship
+//!
+//! This module currently owns production resume evidence acquisition and
+//! mailbox/wake projection. It remains compatible with the target
+//! `ProviderTurnAdapter` until AGE-278 performs the joined cutover; the exact
+//! domain boundary and retirement criteria are owned by
+//! `docs/architecture/provider-turn-lifecycle.md`.
 
+use oulipoly_provider::client::CancellationToken;
 use oulipoly_runtime::executor;
+use oulipoly_runtime::executor::prompt_acceptance::{
+    ExpectedPromptAcceptance, ValidatedPromptAcceptance, promote_prompt_acceptance_attestation,
+};
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
-use oulipoly_runtime::sessions;
+use oulipoly_runtime::session_provider::{
+    SessionProviderIdentity, SessionProviderPageCursor, SessionProviderReadPageRequest,
+    SessionProviderTurnProjection, read_turn_page,
+};
+use oulipoly_state::mailbox::{MailboxDb, MailboxDeliveryObservationAnchor};
 use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
 
 use super::lifecycle::ResumeInvocationAttempt;
 use super::orchestration::{ResumeAttemptInput, ResumeAttemptLoopControl};
 use super::{formatter, mapper};
 use crate::zero_turn_orchestration::ZeroTurnAction;
 
+const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+const OBSERVATION_DEADLINE: Duration = Duration::from_secs(30);
+const OBSERVATION_MAX_PAGES: usize = 16;
+const OBSERVATION_MAX_PENDING_ATTEMPTS: usize = 4;
+const OBSERVATION_MAX_TURNS: u64 = 64;
+const OBSERVATION_MAX_RESPONSE_BYTES: u64 = 128 * 1024;
+const OBSERVATION_MAX_SOURCE_BYTES: u64 = 512 * 1024;
+
 #[derive(Clone, Copy)]
-pub(super) struct ResumeCompletionEvidence {
+pub(super) struct ResumeCompletionEvidence<'a> {
     pub(super) zero_turn_action: ZeroTurnAction,
     pub(super) recovered_generic_nonzero: bool,
-    pub(super) submitted_turn_confirmation: Option<ValidatedSubmittedUserTurn>,
+    pub(super) prompt_acceptance_confirmation: Option<&'a ValidatedPromptAcceptance>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MailboxDeliveryOutcome {
     Absent,
     Confirmed,
+    ConfirmedPromptAcceptance(ValidatedPromptAcceptance),
     Unconfirmed,
 }
 
@@ -61,15 +87,256 @@ pub(super) fn prepare_headless_resume_delivery(
     resolved: &oulipoly_state::ResolvedResume,
     answer: Option<String>,
     models_dir: Option<&std::path::Path>,
+    submitted_seq: Option<i64>,
 ) -> Result<crate::mailbox_delivery::PreparedMailboxDelivery, String> {
-    crate::mailbox_delivery::prepare_headless_resume_delivery(resolved, answer, models_dir)
+    crate::mailbox_delivery::prepare_headless_resume_delivery(
+        resolved,
+        answer,
+        models_dir,
+        submitted_seq,
+    )
+}
+
+pub(super) fn reconcile_pending_headless_delivery_observations(
+    agent_runtime_services: &crate::wiring::AgentRuntimeServices,
+    resolved: &oulipoly_state::ResolvedResume,
+    effective_cwd: &std::path::Path,
+) -> Result<(), String> {
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
+        return Ok(());
+    };
+    prepare_legacy_observation_recovery(&db, resolved)?;
+    let registry = agent_runtime_services.provider_registry_handle.current();
+    for pending in db.pending_delivery_observations(
+        &resolved.active_session_id,
+        OBSERVATION_MAX_PENDING_ATTEMPTS,
+    )? {
+        let anchor = pending.anchor;
+        let Some(provider_identity) = crate::session_ingest_cli::session_external_provider_identity(
+            agent_runtime_services,
+            resolved.model.as_ref(),
+            &anchor.provider_name,
+        ) else {
+            continue;
+        };
+        let identity = SessionProviderIdentity {
+            model_name: provider_identity.model_name,
+            provider_name: provider_identity.provider_name,
+            provider_instance_id: provider_identity.provider_instance_id,
+            settings_id: provider_identity.settings_id,
+        };
+        let Some(provider_instance_id) = identity.provider_instance_id.as_deref() else {
+            continue;
+        };
+        if provider_instance_id != anchor.provider_instance_id
+            || identity.settings_id != anchor.settings_id
+            || anchor.provider_session_id != resolved.active_session_id
+        {
+            continue;
+        }
+        if let Err(error) = confirm_delivery_observation(
+            &db,
+            &pending.attempt_id,
+            registry.as_ref(),
+            identity,
+            effective_cwd,
+            &anchor,
+        ) {
+            formatter::emit_stderr(&format!(
+                "Warning: Bounded recovery observation failed for {}: {error}",
+                anchor.provider_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_legacy_observation_recovery(
+    db: &MailboxDb,
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<(), String> {
+    let candidates = db.legacy_delivery_observation_candidates(
+        &resolved.active_session_id,
+        OBSERVATION_MAX_PENDING_ATTEMPTS,
+    )?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let state = oulipoly_state::StateDb::open_default()?;
+    for window in candidates {
+        let Some(invocation) = state.get_invocation_by_uuid(&window.delivery_invocation_uuid)?
+        else {
+            continue;
+        };
+        if invocation.provider_session_id.as_deref() != Some(window.session_id.as_str()) {
+            continue;
+        }
+        let Some(provider_name) = invocation.provider_name else {
+            continue;
+        };
+        let Some(authority) = state.invocation_provider_session_authority(invocation.id)? else {
+            continue;
+        };
+        let Some(envelope) = crate::mailbox_delivery::legacy_notification_envelope(&window)? else {
+            continue;
+        };
+        db.record_legacy_delivery_observation_identity(
+            &window.attempt_id,
+            &window.session_id,
+            &MailboxDeliveryObservationAnchor {
+                provider_name,
+                provider_instance_id: authority.provider_instance_id,
+                settings_id: authority.settings_id,
+                provider_session_id: window.session_id.clone(),
+                resume_token: None,
+                expected_sha256: normalized_text_sha256(&envelope),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn bind_headless_resume_delivery_attempt(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    invocation_uuid: &str,
+) -> Result<(), String> {
+    crate::mailbox_delivery::bind_headless_resume_delivery_attempt(
+        input.mailbox_session_id,
+        input.mailbox_delivery_nonce,
+        input.mailbox_delivery_seqs,
+        invocation_uuid,
+    )?;
+    persist_pre_delivery_observation_anchor(input, provider)
+}
+
+pub(super) fn begin_headless_delivery_submission(
+    input: &ResumeAttemptInput<'_>,
+    invocation_uuid: &str,
+) -> Result<(), String> {
+    if input.mailbox_delivery_seqs.is_empty() {
+        return Ok(());
+    }
+    let attempt_id = input
+        .mailbox_delivery_nonce
+        .ok_or_else(|| "headless delivery missing nonce".to_string())?;
+    let db = MailboxDb::open_default_if_exists()?
+        .ok_or_else(|| "headless delivery sidecar missing".to_string())?;
+    db.begin_headless_delivery_submission(
+        attempt_id,
+        input.mailbox_session_id,
+        invocation_uuid,
+        input.mailbox_delivery_requires_turn_confirmation,
+    )
+}
+
+fn persist_pre_delivery_observation_anchor(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+) -> Result<(), String> {
+    if !input.mailbox_delivery_requires_turn_confirmation || input.mailbox_delivery_seqs.is_empty()
+    {
+        return Ok(());
+    }
+    let attempt_id = input
+        .mailbox_delivery_nonce
+        .ok_or_else(|| "headless mailbox delivery is missing its durable nonce".to_string())?;
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
+        return Err("mailbox sidecar missing while anchoring headless delivery".to_string());
+    };
+    if db.delivery_observation_anchor(attempt_id)?.is_some() {
+        return Ok(());
+    }
+    match capture_pre_delivery_observation_anchor(input, provider) {
+        Ok(anchor) => {
+            db.record_delivery_observation_anchor(attempt_id, input.mailbox_session_id, &anchor)
+        }
+        Err(error) => {
+            db.record_delivery_observation_anchor_failure(
+                attempt_id,
+                input.mailbox_session_id,
+                &error,
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn capture_pre_delivery_observation_anchor(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+) -> Result<MailboxDeliveryObservationAnchor, String> {
+    let attempt_id = input
+        .mailbox_delivery_nonce
+        .ok_or_else(|| "headless mailbox delivery is missing its durable nonce".to_string())?;
+    let answer = input
+        .answer
+        .filter(|answer| !answer.trim().is_empty())
+        .ok_or_else(|| "mailbox_delivery_observation_answer_missing".to_string())?;
+    let identity = observation_identity(input, provider)?;
+    let provider_instance_id = identity
+        .provider_instance_id
+        .clone()
+        .ok_or_else(|| "session_provider_instance_identity_missing".to_string())?;
+    let registry = input
+        .agent_runtime_services
+        .provider_registry_handle
+        .current();
+    let cancellation = CancellationToken::new();
+    let page = read_turn_page(SessionProviderReadPageRequest {
+        registry: &registry,
+        identity: identity.clone(),
+        session_id: input.mailbox_session_id,
+        effective_cwd: Some(input.effective_spawn_cwd),
+        projection: SessionProviderTurnProjection::UserObservation,
+        expected_delivery_nonce: Some(attempt_id),
+        cursor: SessionProviderPageCursor::Tail,
+        expected_page_index: 0,
+        expected_turn_sequence: 0,
+        max_turns: OBSERVATION_MAX_TURNS,
+        max_response_bytes: OBSERVATION_MAX_RESPONSE_BYTES,
+        max_source_bytes: OBSERVATION_MAX_SOURCE_BYTES,
+        max_inline_body_bytes: 0,
+        cancellation: &cancellation,
+        timeout: OBSERVATION_TIMEOUT,
+    })
+    .map_err(|error| error.to_string())?;
+    let resume_token = page
+        .resume_token
+        .ok_or_else(|| "mailbox_delivery_observation_anchor_missing".to_string())?;
+    Ok(MailboxDeliveryObservationAnchor {
+        provider_name: identity.provider_name,
+        provider_instance_id,
+        settings_id: identity.settings_id,
+        provider_session_id: input.mailbox_session_id.to_string(),
+        resume_token: Some(resume_token),
+        expected_sha256: normalized_text_sha256(answer),
+    })
+}
+
+fn observation_identity(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+) -> Result<SessionProviderIdentity, String> {
+    let identity = crate::session_ingest_cli::session_external_provider_identity(
+        input.agent_runtime_services,
+        input.resolved.model.as_ref(),
+        &provider.name,
+    )
+    .ok_or_else(|| "mailbox_delivery_observation_provider_unavailable".to_string())?;
+    Ok(SessionProviderIdentity {
+        model_name: identity.model_name,
+        provider_name: identity.provider_name,
+        provider_instance_id: identity.provider_instance_id,
+        settings_id: identity.settings_id,
+    })
 }
 
 pub(super) fn ingest_mailbox_delivery_confirmation_turn_if_needed(
     input: &ResumeAttemptInput<'_>,
     provider: &oulipoly_config::ProviderConfig,
     result: &executor::ExecutionResult,
-    completion_evidence: ResumeCompletionEvidence,
+    completion_evidence: ResumeCompletionEvidence<'_>,
 ) {
     let errors = ingest_mailbox_delivery_confirmation_turn_silently_if_needed(
         input,
@@ -84,23 +351,10 @@ fn ingest_mailbox_delivery_confirmation_turn_silently_if_needed(
     input: &ResumeAttemptInput<'_>,
     provider: &oulipoly_config::ProviderConfig,
     result: &executor::ExecutionResult,
-    completion_evidence: ResumeCompletionEvidence,
+    completion_evidence: ResumeCompletionEvidence<'_>,
 ) -> Vec<String> {
-    if !mailbox_delivery_requires_turn_confirmation(
-        input,
-        result,
-        completion_evidence.recovered_generic_nonzero,
-    ) || mailbox_delivery_turn_confirmed(input, &provider.name, completion_evidence)
-    {
-        return Vec::new();
-    }
-    let report = sessions::scan_provider_session(
-        &provider.name,
-        &input.env.sessions_cfg,
-        &input.env.state,
-        &input.resolved.active_session_id,
-    );
-    report.errors
+    let _ = (input, provider, result, completion_evidence);
+    Vec::new()
 }
 
 fn emit_session_ingest_warnings(provider_name: &str, errors: &[String]) {
@@ -116,7 +370,7 @@ pub(super) fn resolve_mailbox_delivery_outcome(
     input: &ResumeAttemptInput<'_>,
     provider: &oulipoly_config::ProviderConfig,
     result: &executor::ExecutionResult,
-    completion_evidence: ResumeCompletionEvidence,
+    completion_evidence: ResumeCompletionEvidence<'_>,
 ) -> MailboxDeliveryOutcome {
     if input.mailbox_delivery_seqs.is_empty() {
         return MailboxDeliveryOutcome::Absent;
@@ -128,8 +382,10 @@ pub(super) fn resolve_mailbox_delivery_outcome(
         completion_evidence,
     );
     emit_session_ingest_warnings(&provider.name, &errors);
-    if mailbox_delivery_unconfirmed(input, &provider.name, result, completion_evidence) {
+    if mailbox_delivery_unconfirmed(input, provider, result, completion_evidence) {
         MailboxDeliveryOutcome::Unconfirmed
+    } else if let Some(acceptance) = completion_evidence.prompt_acceptance_confirmation {
+        MailboxDeliveryOutcome::ConfirmedPromptAcceptance(acceptance.clone())
     } else {
         MailboxDeliveryOutcome::Confirmed
     }
@@ -141,9 +397,9 @@ pub(super) fn handle_unconfirmed_mailbox_delivery_if_needed(
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &executor::ExecutionResult,
-    completion_evidence: ResumeCompletionEvidence,
+    completion_evidence: ResumeCompletionEvidence<'_>,
 ) -> Result<Option<ResumeAttemptLoopControl>, String> {
-    if !mailbox_delivery_unconfirmed(input, &provider.name, result, completion_evidence) {
+    if !mailbox_delivery_unconfirmed(input, provider, result, completion_evidence) {
         return Ok(None);
     }
     record_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")?;
@@ -154,15 +410,15 @@ pub(super) fn handle_unconfirmed_mailbox_delivery_if_needed(
 
 fn mailbox_delivery_unconfirmed(
     input: &ResumeAttemptInput<'_>,
-    provider_name: &str,
+    provider: &oulipoly_config::ProviderConfig,
     result: &executor::ExecutionResult,
-    completion_evidence: ResumeCompletionEvidence,
+    completion_evidence: ResumeCompletionEvidence<'_>,
 ) -> bool {
     mailbox_delivery_requires_turn_confirmation(
         input,
         result,
         completion_evidence.recovered_generic_nonzero,
-    ) && !mailbox_delivery_turn_confirmed(input, provider_name, completion_evidence)
+    ) && !mailbox_delivery_turn_confirmed(input, provider, completion_evidence)
 }
 
 fn mailbox_delivery_requires_turn_confirmation(
@@ -178,102 +434,297 @@ fn mailbox_delivery_requires_turn_confirmation(
 
 fn mailbox_delivery_turn_confirmed(
     input: &ResumeAttemptInput<'_>,
-    provider_name: &str,
-    completion_evidence: ResumeCompletionEvidence,
+    provider: &oulipoly_config::ProviderConfig,
+    completion_evidence: ResumeCompletionEvidence<'_>,
 ) -> bool {
-    matches!(
-        completion_evidence.zero_turn_action,
-        ZeroTurnAction::Continue
-    ) || completion_evidence.submitted_turn_confirmation.is_some()
-        || ingested_user_turn_confirms_mailbox_delivery(input, provider_name)
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum ValidatedSubmittedUserTurn {
-    DeliveryNonce,
-    PromptSha256,
-}
-
-impl ValidatedSubmittedUserTurn {
-    fn evidence(self) -> &'static str {
-        match self {
-            Self::DeliveryNonce => {
-                "validated submitted user turn: exact session and delivery nonce"
-            }
-            Self::PromptSha256 => "validated submitted user turn: exact session and prompt SHA-256",
+    if completion_evidence.prompt_acceptance_confirmation.is_some() {
+        return true;
+    }
+    match confirm_mailbox_delivery_from_anchor(input, provider) {
+        Ok(confirmed) => confirmed,
+        Err(error) => {
+            formatter::emit_stderr(&format!(
+                "Warning: Bounded mailbox delivery observation failed for {}: {error}",
+                provider.name
+            ));
+            false
         }
     }
 }
 
-pub(super) fn validate_submitted_user_turn(
+fn confirm_mailbox_delivery_from_anchor(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+) -> Result<bool, String> {
+    let Some(attempt_id) = input.mailbox_delivery_nonce else {
+        return Ok(false);
+    };
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
+        return Ok(false);
+    };
+    if db.delivery_observation_confirmation(attempt_id)?.is_some() {
+        return Ok(true);
+    }
+    let Some(anchor) = db.delivery_observation_anchor(attempt_id)? else {
+        return Ok(false);
+    };
+    let answer = input.answer.unwrap_or_default();
+    if anchor.provider_name != provider.name
+        || anchor.provider_session_id != input.mailbox_session_id
+        || anchor.expected_sha256 != normalized_text_sha256(answer)
+    {
+        return Ok(false);
+    }
+    let identity = observation_identity(input, provider)?;
+    let provider_instance_id = identity
+        .provider_instance_id
+        .clone()
+        .ok_or_else(|| "session_provider_instance_identity_missing".to_string())?;
+    if provider_instance_id != anchor.provider_instance_id
+        || identity.settings_id != anchor.settings_id
+    {
+        return Ok(false);
+    }
+    let registry = input
+        .agent_runtime_services
+        .provider_registry_handle
+        .current();
+    confirm_delivery_observation(
+        &db,
+        attempt_id,
+        registry.as_ref(),
+        identity,
+        input.effective_spawn_cwd,
+        &anchor,
+    )
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ObservationProgress {
+    snapshot_id: Option<String>,
+    page_token: Option<String>,
+    after_token: Option<String>,
+    page_index: u64,
+    turn_sequence: u64,
+    matching_turn_id: Option<String>,
+    matching_turns: u64,
+    complete: bool,
+}
+
+impl ObservationProgress {
+    fn cursor(
+        &self,
+        anchor: &MailboxDeliveryObservationAnchor,
+    ) -> Result<SessionProviderPageCursor, String> {
+        match (&self.snapshot_id, &self.page_token) {
+            (Some(snapshot_id), Some(page_token)) => Ok(SessionProviderPageCursor::Continuation {
+                snapshot_id: snapshot_id.clone(),
+                page_token: page_token.clone(),
+            }),
+            (None, None) => Ok(SessionProviderPageCursor::Beginning {
+                after_token: self
+                    .after_token
+                    .clone()
+                    .or_else(|| anchor.resume_token.clone()),
+            }),
+            _ => Err("mailbox observation checkpoint incomplete".into()),
+        }
+    }
+}
+
+fn confirm_delivery_observation(
+    db: &MailboxDb,
+    attempt_id: &str,
+    registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
+    identity: SessionProviderIdentity,
+    effective_cwd: &std::path::Path,
+    anchor: &MailboxDeliveryObservationAnchor,
+) -> Result<bool, String> {
+    let cancellation = CancellationToken::new();
+    observe_delivery_with(
+        db,
+        attempt_id,
+        anchor,
+        |cursor, page_index, turn_sequence, remaining| {
+            read_turn_page(SessionProviderReadPageRequest {
+                registry,
+                identity: identity.clone(),
+                session_id: &anchor.provider_session_id,
+                effective_cwd: Some(effective_cwd),
+                projection: SessionProviderTurnProjection::UserObservation,
+                expected_delivery_nonce: Some(attempt_id),
+                cursor,
+                expected_page_index: page_index,
+                expected_turn_sequence: turn_sequence,
+                max_turns: OBSERVATION_MAX_TURNS,
+                max_response_bytes: OBSERVATION_MAX_RESPONSE_BYTES,
+                max_source_bytes: OBSERVATION_MAX_SOURCE_BYTES,
+                max_inline_body_bytes: 0,
+                cancellation: &cancellation,
+                timeout: remaining.min(OBSERVATION_TIMEOUT),
+            })
+            .map_err(|error| error.to_string())
+        },
+    )
+}
+
+// The production reader validates account/session/nonce-bound opaque pages.
+// Keeping the scan driver separate permits deterministic offline fault/restart
+// tests without launching a provider or admitting a second semantic prompt.
+fn observe_delivery_with(
+    db: &MailboxDb,
+    attempt_id: &str,
+    anchor: &MailboxDeliveryObservationAnchor,
+    mut read: impl FnMut(
+        SessionProviderPageCursor,
+        u64,
+        u64,
+        Duration,
+    ) -> Result<
+        oulipoly_runtime::session_provider::SessionProviderReadPageResult,
+        String,
+    >,
+) -> Result<bool, String> {
+    if db.delivery_observation_confirmation(attempt_id)?.is_some() {
+        return Ok(true);
+    }
+    let deadline = Instant::now() + OBSERVATION_DEADLINE;
+    let mut stored = db.delivery_observation_progress(attempt_id)?;
+    let mut progress: ObservationProgress = stored
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|err| format!("invalid observation checkpoint: {err}"))?
+        .unwrap_or_default();
+    for _ in 0..OBSERVATION_MAX_PAGES {
+        if progress.matching_turns > 1 {
+            return Ok(false);
+        }
+        if progress.complete {
+            if progress.matching_turns == 1 {
+                db.record_delivery_observation_confirmation(
+                    attempt_id,
+                    progress
+                        .matching_turn_id
+                        .as_deref()
+                        .ok_or("observation match id missing")?,
+                )?;
+                return Ok(true);
+            }
+            // A completed empty snapshot is not proof of non-submission. Scan
+            // future append-only evidence from its opaque resume token, never
+            // create another attempt or rescan the old snapshot.
+            progress.complete = false;
+            progress.snapshot_id = None;
+            progress.page_token = None;
+            progress.page_index = 0;
+            progress.turn_sequence = 0;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let page = match read(
+            progress.cursor(anchor)?,
+            progress.page_index,
+            progress.turn_sequence,
+            remaining,
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                db.record_delivery_observation_error(attempt_id, &error)?;
+                return Err(error);
+            }
+        };
+        if page.provider_instance_id != anchor.provider_instance_id
+            || page.settings_id != anchor.settings_id
+            || page.session_id != anchor.provider_session_id
+            || page.projection != SessionProviderTurnProjection::UserObservation
+            || page.page_index != progress.page_index
+            || page.page_start_sequence != progress.turn_sequence
+            || progress
+                .snapshot_id
+                .as_ref()
+                .is_some_and(|snapshot| snapshot != &page.snapshot_id)
+        {
+            return Err("mailbox observation identity/position mismatch".into());
+        }
+        for turn in page.turns.iter().filter(|turn| turn.role == "user") {
+            if turn.canonical_text_sha256.as_deref() == Some(anchor.expected_sha256.as_str()) {
+                progress.matching_turns = progress.matching_turns.saturating_add(1);
+                progress
+                    .matching_turn_id
+                    .get_or_insert_with(|| turn.turn_id.clone());
+            }
+        }
+        progress.complete = page.snapshot_complete;
+        if page.snapshot_complete {
+            progress.after_token = Some(
+                page.resume_token
+                    .ok_or("mailbox observation resume token missing")?,
+            );
+            progress.snapshot_id = None;
+            progress.page_token = None;
+        } else {
+            progress.page_index = page
+                .page_index
+                .checked_add(1)
+                .ok_or("observation page overflow")?;
+            progress.turn_sequence = page
+                .page_start_sequence
+                .checked_add(page.page_turn_count)
+                .ok_or("observation sequence overflow")?;
+            progress.snapshot_id = Some(page.snapshot_id);
+            progress.page_token = Some(
+                page.next_page_token
+                    .ok_or("mailbox observation page token missing")?,
+            );
+        }
+        let next = serde_json::to_string(&progress).map_err(|err| err.to_string())?;
+        db.advance_delivery_observation_progress(attempt_id, stored.as_deref(), &next)?;
+        stored = Some(next);
+        if progress.complete {
+            if progress.matching_turns == 1 {
+                db.record_delivery_observation_confirmation(
+                    attempt_id,
+                    progress
+                        .matching_turn_id
+                        .as_deref()
+                        .ok_or("observation match id missing")?,
+                )?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+    }
+    Ok(false)
+}
+
+pub(super) fn validated_prompt_acceptance_for_resume(
     input: &ResumeAttemptInput<'_>,
     result: &executor::ExecutionResult,
-) -> Option<ValidatedSubmittedUserTurn> {
-    let submitted = result.submitted_user_turn.as_ref()?;
+) -> Option<ValidatedPromptAcceptance> {
+    let attestation = result.prompt_acceptance_attestation.as_ref()?;
     let answer = input.answer?;
-    if submitted.provider_session_id != input.resolved.active_session_id {
-        return None;
-    }
-    validate_submitted_user_turn_payload(input, submitted, answer)
+    let prompt_sha256 = sha256_hex(answer.as_bytes());
+    promote_prompt_acceptance_attestation(
+        ExpectedPromptAcceptance {
+            provider_session_id: &input.resolved.active_session_id,
+            prompt_sha256: &prompt_sha256,
+            delivery_nonce: input.mailbox_delivery_nonce,
+        },
+        attestation,
+    )
 }
 
-fn validate_submitted_user_turn_payload(
-    input: &ResumeAttemptInput<'_>,
-    submitted: &executor::SubmittedUserTurn,
-    answer: &str,
-) -> Option<ValidatedSubmittedUserTurn> {
-    if let Some(delivery_nonce) = input.mailbox_delivery_nonce {
-        return (submitted.delivery_nonce.as_deref() == Some(delivery_nonce))
-            .then_some(ValidatedSubmittedUserTurn::DeliveryNonce);
-    }
-    (submitted.prompt_sha256 == sha256_hex(answer.as_bytes()))
-        .then_some(ValidatedSubmittedUserTurn::PromptSha256)
-}
-
-pub(super) fn project_validated_submitted_turn_acceptance(
-    result: &mut executor::ExecutionResult,
-    confirmation: Option<ValidatedSubmittedUserTurn>,
-) {
-    if result.resume_acceptance.is_some() {
-        return;
-    }
-    let Some(confirmation) = confirmation else {
-        return;
-    };
-    result.resume_acceptance = Some(executor::ResumeAcceptanceResult {
-        status: executor::ResumeAcceptanceStatus::Accepted,
-        evidence: Some(confirmation.evidence().to_string()),
-    });
-}
-
-fn ingested_user_turn_confirms_mailbox_delivery(
-    input: &ResumeAttemptInput<'_>,
-    provider_name: &str,
-) -> bool {
-    if let Some(delivery_nonce) = input.mailbox_delivery_nonce {
-        return input
-            .env
-            .state
-            .has_session_user_turn_containing(
-                provider_name,
-                &input.resolved.active_session_id,
-                delivery_nonce,
-            )
-            .unwrap_or(false);
-    }
-    let Some(answer) = input.answer else {
-        return false;
-    };
-    input
-        .env
-        .state
-        .has_session_user_text_turn(provider_name, &input.resolved.active_session_id, answer)
-        .unwrap_or(false)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn normalized_text_sha256(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    sha256_hex(normalized.trim().as_bytes())
 }
 
 fn finalize_unconfirmed_mailbox_delivery(
@@ -287,14 +738,17 @@ fn finalize_unconfirmed_mailbox_delivery(
     input
         .agent_runtime_services
         .invocation_lifecycle_service
-        .finalize_invocation(mapper::finalize_request(
-            &input.env.state,
-            attempt.invocation_row_id,
-            false,
-            1,
-            Some("mailbox_delivery_unconfirmed"),
-            result.terminal_reason.as_deref(),
-        ))
+        .finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            mapper::finalize_request(
+                &input.env.state,
+                attempt.invocation_row_id,
+                false,
+                1,
+                Some("mailbox_delivery_unconfirmed"),
+                result.terminal_reason.as_deref(),
+            ),
+        )
         .map_err(|err| err.to_string())?;
     attempt.guard.mark_finalized();
     Ok(())
@@ -334,7 +788,7 @@ pub(super) fn mark_resume_attempt_idle(
     )
 }
 
-pub(super) fn complete_successful_mailbox_delivery(
+pub(super) fn settle_accepted_mailbox_delivery_and_recheck(
     input: &ResumeAttemptInput<'_>,
     provider_session_id: &str,
     invocation_uuid: &str,
@@ -346,7 +800,7 @@ pub(super) fn complete_successful_mailbox_delivery(
         input.mailbox_delivery_seqs,
         invocation_uuid,
     )?;
-    let _ = crate::wake_coordinator::mark_successful_turn_idle_and_recheck(
+    let _ = crate::wake_coordinator::mark_terminal_attempt_idle_and_recheck(
         provider_session_id,
         invocation_uuid,
         exit_code,
@@ -354,7 +808,7 @@ pub(super) fn complete_successful_mailbox_delivery(
     Ok(())
 }
 
-pub(super) fn settle_age270_mailbox_delivery_outcome(
+pub(super) fn settle_clean_exit_mailbox_delivery_outcome(
     input: &ResumeAttemptInput<'_>,
     provider_session_id: &str,
     invocation_uuid: &str,
@@ -366,15 +820,27 @@ pub(super) fn settle_age270_mailbox_delivery_outcome(
         MailboxDeliveryOutcome::Absent => {
             mark_resume_attempt_idle(provider_session_id, invocation_uuid, Some(shell_exit_code))
         }
-        MailboxDeliveryOutcome::Confirmed => complete_successful_mailbox_delivery(
+        MailboxDeliveryOutcome::Confirmed => settle_accepted_mailbox_delivery_and_recheck(
             input,
             provider_session_id,
             invocation_uuid,
             physical_exit_code,
         ),
+        MailboxDeliveryOutcome::ConfirmedPromptAcceptance(acceptance) => {
+            settle_accepted_mailbox_delivery_and_recheck(
+                input,
+                acceptance.provider_session_id(),
+                invocation_uuid,
+                physical_exit_code,
+            )
+        }
         MailboxDeliveryOutcome::Unconfirmed => {
             record_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")?;
             mark_resume_attempt_idle(provider_session_id, invocation_uuid, Some(shell_exit_code))
         }
     }
 }
+
+#[cfg(test)]
+#[path = "observation_tests.rs"]
+mod observation_tests;

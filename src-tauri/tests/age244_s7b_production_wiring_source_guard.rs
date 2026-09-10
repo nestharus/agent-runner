@@ -48,28 +48,33 @@ fn s7b_production_export_and_import_replace_use_external_provider_identity_resol
 }
 
 #[test]
-fn s7b_shared_external_provider_identity_resolver_uses_production_state_without_registry_describe()
-{
+fn s7b_shared_identity_resolver_requires_persisted_explicit_account_authority() {
     let source = read_source("src-tauri/src/commands/session_external_provider_identity.rs");
 
     for needle in [
         "pub(crate) fn resolve_session_external_provider_identity(",
         "Result<Option<SessionServiceExternalProviderIdentity>, String>",
-        "access_resolved_session_for_external_identity(session_id)?",
+        "access_default_state_for_identity().map_err(identity_operational_error)?",
         "StateDb::open_default().map_err(",
-        "ProvidersConfig::load(&default_config_root().join(\"providers.toml\"))",
-        "load_models(&default_models_dir(), Some(providers))\n        .map_err(",
+        "ProvidersConfig::load(&default_config_root()?.join(\"providers.toml\"))",
+        "load_models(&default_models_dir()?, Some(providers))\n        .map_err(",
         "match state.resolve_resume(models, session_id, None)",
         "Err(ResumeError::NoChainFound { .. })",
         "Err(ResumeError::WrongIdKind { .. })",
-        "Err(ResumeError::Ambiguous { .. }) => Ok(None)",
-        "Err(error) => Err(format!(\"failed to resolve session: {error:?}\"))",
-        "if model.provider.is_none()",
+        "Err(ResumeError::Ambiguous { input, .. })",
+        "SessionExternalProviderIdentityError::AmbiguousSession { input }",
+        "Err(error) => Err(SessionExternalProviderIdentityError::Operational",
         "validate_external_provider_name(provider_name)?",
+        "active_provider_session_authority(&resolved.chain_id)",
+        "authority.as_ref()",
+        "let Some(provider) = providers.get(provider_name)",
+        "if provider.implementation.is_none()",
+        "let authority = authority.ok_or_else(",
+        "provider session has no persisted endpoint authority",
         "SessionServiceExternalProviderIdentity {",
         "provider_name: provider_name.to_string()",
-        "provider_instance_id: None",
-        "settings_id: default_settings_id()",
+        "provider_instance_id: Some(authority.provider_instance_id.clone())",
+        "settings_id: authority.settings_id.clone()",
     ] {
         assert_contains("session_external_provider_identity.rs", &source, needle);
     }
@@ -86,7 +91,7 @@ fn s7b_shared_external_provider_identity_resolver_uses_production_state_without_
 }
 
 #[test]
-fn s7b_runtime_seam_enriches_external_identity_from_registry_describe() {
+fn s7b_runtime_seam_enriches_identity_from_selected_account_endpoint() {
     let adapter = read_source("crates/oulipoly-runtime/src/session_external_provider/mod.rs");
     let identity = read_source("crates/oulipoly-runtime/src/session_external_provider/identity.rs");
     let formatter =
@@ -95,7 +100,17 @@ fn s7b_runtime_seam_enriches_external_identity_from_registry_describe() {
     assert_contains(
         "session_external_provider/mod.rs",
         &adapter,
-        "provider_registry_accessor::describe_provider(registry.as_ref(), &identity)",
+        "provider_registry_accessor::preflight_provider(registry.as_ref(), &identity)",
+    );
+    assert_contains(
+        "session_external_provider/mod.rs",
+        &adapter,
+        "let describe = endpoint.capabilities();",
+    );
+    assert_contains(
+        "session_external_provider/mod.rs",
+        &adapter,
+        "let settings_id = endpoint",
     );
     assert_contains(
         "session_external_provider/mod.rs",
@@ -124,7 +139,8 @@ fn s7b_command_surfaces_preserve_builtin_output_and_error_rendering() {
         "fn unwrap_export_output",
     );
     for needle in [
-        "Err(message) => return Ok(handle_export_error(&ExportError::Operational { message }))",
+        "SessionExternalProviderIdentityError::AmbiguousSession { input }",
+        "SessionExternalProviderIdentityError::Operational { message }",
         "unwrap_export_output(service_output.result)",
         "write_session_export_output(&output)",
     ] {
@@ -164,12 +180,12 @@ fn s7b_cli_defaults_builds_populated_default_path_provider_registry() {
     let wiring = read_source("src-tauri/src/wiring.rs");
     let cli_defaults = source_between(
         &wiring,
-        "pub fn cli_defaults() -> Self",
+        "pub fn cli_defaults() -> Result<Self, String>",
         "pub fn production(",
     );
 
     for needle in [
-        "let paths = default_cli_runtime_paths();",
+        "let paths = default_cli_runtime_paths()?;",
         "ProviderRegistryOptions::default()",
         ".with_config_root(paths.config_root.clone())",
         ".with_data_root(paths.data_root.clone())",
@@ -187,11 +203,11 @@ fn s7b_cli_defaults_builds_populated_default_path_provider_registry() {
 }
 
 #[test]
-fn s10_production_provider_registries_populate_path_entries_from_process_path() {
+fn production_provider_registries_use_only_account_configured_endpoint_authority() {
     let wiring = read_source("src-tauri/src/wiring.rs");
     let cli_defaults = source_between(
         &wiring,
-        "pub fn cli_defaults() -> Self",
+        "pub fn cli_defaults() -> Result<Self, String>",
         "pub fn production(",
     );
     let production = source_between(
@@ -204,26 +220,62 @@ fn s10_production_provider_registries_populate_path_entries_from_process_path() 
         ("wiring.rs::cli_defaults", cli_defaults),
         ("wiring.rs::production", production),
     ] {
-        assert_contains(context, source, ".with_path_entries_from_process_path()");
+        assert_not_contains(context, source, ".with_path_entries_from_process_path()");
     }
+
+    let production_registry = source_between(
+        &wiring,
+        "fn production_provider_registry(",
+        "fn load_registry_providers(",
+    );
+    assert_contains(
+        "wiring.rs::production_provider_registry",
+        production_registry,
+        "let providers = load_registry_providers(paths)?;",
+    );
+    assert_contains(
+        "wiring.rs::production_provider_registry",
+        production_registry,
+        "registry_from_configs(&models, &providers, options)",
+    );
+    assert_not_contains(
+        "wiring.rs::production_provider_registry",
+        production_registry,
+        "ProviderRegistry::from_model_configs(",
+    );
 
     let locate_export =
         read_source("src-tauri/src/commands/session_locate_export/orchestration.rs");
-    assert_contains(
+    assert_not_contains(
         "session_locate_export/orchestration.rs::build_session_locate_provider_registry",
         &locate_export,
         ".with_path_entries_from_process_path()",
     );
+    assert_contains(
+        "session_locate_export/orchestration.rs::build_session_locate_provider_registry",
+        &locate_export,
+        "ProviderRegistry::from_configs(",
+    );
 
     let app_state = read_source("src-tauri/src/app_state.rs");
-    assert_contains(
+    assert_not_contains(
         "app_state.rs::provider_registry_options",
         &app_state,
         ".with_path_entries_from_process_path()",
     );
+    assert_not_contains(
+        "app_state.rs::provider settings construction",
+        &app_state,
+        "ProviderSettingsHost::from_model_configs",
+    );
+    assert_not_contains(
+        "app_state.rs::provider settings construction",
+        &app_state,
+        "EMPTY_PROVIDER_SETTINGS_HOST_EXPECT_MESSAGE",
+    );
 
     let provider_settings = read_source("src-tauri/src/commands/provider_settings.rs");
-    assert_contains(
+    assert_not_contains(
         "provider_settings.rs::host_options",
         &provider_settings,
         ".with_path_entries_from_process_path()",

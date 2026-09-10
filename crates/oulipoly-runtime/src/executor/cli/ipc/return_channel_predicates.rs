@@ -21,16 +21,3 @@ pub(super) fn return_channel_dir_cleanup_should_warn(err: &std::io::Error) -> bo
     err.kind() != std::io::ErrorKind::NotFound
         && err.kind() != std::io::ErrorKind::DirectoryNotEmpty
 }
-
-pub(super) fn return_channel_record_line(line: &str) -> Option<&str> {
-    let trimmed = line.trim();
-    if return_channel_line_is_empty(trimmed) {
-        None
-    } else {
-        Some(trimmed)
-    }
-}
-
-fn return_channel_line_is_empty(line: &str) -> bool {
-    line.is_empty()
-}

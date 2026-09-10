@@ -1,13 +1,26 @@
 //! ## Declared roles
 //!
 //! `mapper`, `orchestration`, `predicate`
+//!
+//! ## Lifecycle relationship
+//!
+//! This module is the current production authority for headless resume outcome
+//! classification and settlement. `ProviderTurnAdapter` is the target
+//! resident-supervisor boundary, not another active path. Their staged
+//! migration contract is owned by
+//! `docs/architecture/provider-turn-lifecycle.md`.
 
 use oulipoly_runtime::executor;
+use oulipoly_runtime::executor::prompt_acceptance::ValidatedPromptAcceptance;
 
-use super::disposition::{ResumeTerminalDispositionInput, handle_terminal_signal_disposition};
+use super::disposition::{
+    ResumeLoopControl, ResumeTerminalDispositionInput, handle_terminal_signal_disposition,
+};
+use super::finalization::ConfirmedDeliverySettlement;
 use super::lifecycle::{
     BoundResumeAttempt, ResumeCompletionClassification, ResumeInvocationAttempt,
-    finalize_completed_attempt_for_resume, record_resume_acceptance_if_present,
+    finalize_completed_attempt_control_for_resume, finalize_completed_attempt_for_resume,
+    record_resume_acceptance_if_present,
 };
 use super::orchestration::{ResumeAttemptInput, ResumeAttemptLoopControl};
 use super::{formatter, mapper, wake};
@@ -22,24 +35,33 @@ use crate::terminal_outcome_adapter::{
 };
 use crate::zero_turn_orchestration::{ZeroTurnAction, next_action};
 
+const ACCEPTED_PROMPT_PROVIDER_FAILED_TERMINAL_REASON: &str =
+    "resume_prompt_accepted_provider_failed";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Age270MailboxEligibility {
+enum CleanExitMailboxResolutionEligibility {
     Ineligible,
-    PreMutationCleanExit,
+    PreCompletionFailureCleanExit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Age270MailboxProvenance {
+struct CleanExitMailboxResolutionProvenance {
     physical_clean_exit_candidate: bool,
     effective_clean_exit_candidate: bool,
-    age270_failure_applied: bool,
+    completion_failure_applied: bool,
 }
 
 struct ResumeAttemptClassification {
     zero_turn_action: ZeroTurnAction,
     recovered_generic_nonzero: bool,
     terminal_completion_confirmed: bool,
-    age270_mailbox_provenance: Age270MailboxProvenance,
+    clean_exit_mailbox_resolution_provenance: CleanExitMailboxResolutionProvenance,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfirmedPromptAcceptanceFailure {
+    physical_exit_code: i32,
+    prompt_acceptance: ValidatedPromptAcceptance,
 }
 
 pub(super) fn resume_attempts_exhausted(attempts: usize, max_attempts: usize) -> bool {
@@ -59,6 +81,13 @@ fn nonzero_resume_exit_code(last_exit_code: i32) -> i32 {
     }
 }
 
+fn current_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 pub(super) fn handle_resume_attempt_result(
     input: &mut ResumeAttemptInput<'_>,
     bound_attempt: &mut BoundResumeAttempt<'_>,
@@ -72,27 +101,48 @@ pub(super) fn handle_resume_attempt_result(
         &bound_attempt.zero_turn_baseline,
         result,
     );
-    let submitted_turn_confirmation = wake::validate_submitted_user_turn(input, result);
-    wake::project_validated_submitted_turn_acceptance(result, submitted_turn_confirmation);
+    let prompt_acceptance_confirmation =
+        wake::validated_prompt_acceptance_for_resume(input, result);
+    if prompt_acceptance_confirmation.is_some() {
+        *input.provider_prompt_accepted = true;
+    }
+    let confirmed_prompt_acceptance_failure = classify_confirmed_prompt_acceptance_failure(
+        result.exit_code,
+        prompt_acceptance_confirmation.as_ref(),
+        classification.recovered_generic_nonzero,
+    );
+    if let Some(failure) = confirmed_prompt_acceptance_failure {
+        return apply_confirmed_prompt_acceptance_failure(
+            input,
+            &mut bound_attempt.attempt,
+            provider,
+            &bound_attempt.provider_session_id,
+            result,
+            classification,
+            failure,
+        );
+    }
     record_resume_acceptance_if_present(input, bound_attempt.attempt.invocation_row_id, result)?;
     emit_captured_child_marker_lines(&result.captured_child_invocations);
     let completion_evidence = wake::ResumeCompletionEvidence {
         zero_turn_action: classification.zero_turn_action,
         recovered_generic_nonzero: classification.recovered_generic_nonzero,
-        submitted_turn_confirmation,
+        prompt_acceptance_confirmation: prompt_acceptance_confirmation.as_ref(),
     };
-    let provenance = classification.age270_mailbox_provenance;
-    let mailbox_delivery_outcome = match age270_mailbox_eligibility_for_classification(
-        provenance.physical_clean_exit_candidate,
-        provenance.effective_clean_exit_candidate,
-        provenance.age270_failure_applied,
+    let clean_exit_provenance = classification.clean_exit_mailbox_resolution_provenance;
+    // A completion failure may replace a physically clean result. Only the
+    // exact clean pre-failure provenance may still resolve mailbox evidence.
+    let mailbox_delivery_outcome = match clean_exit_mailbox_resolution_eligibility(
+        clean_exit_provenance.physical_clean_exit_candidate,
+        clean_exit_provenance.effective_clean_exit_candidate,
+        clean_exit_provenance.completion_failure_applied,
     ) {
-        Age270MailboxEligibility::Ineligible => None,
-        Age270MailboxEligibility::PreMutationCleanExit => Some(
+        CleanExitMailboxResolutionEligibility::Ineligible => None,
+        CleanExitMailboxResolutionEligibility::PreCompletionFailureCleanExit => Some(
             wake::resolve_mailbox_delivery_outcome(input, provider, result, completion_evidence),
         ),
     };
-    handle_resume_attempt_terminal_signal(
+    handle_ordinary_resume_attempt_terminal_signal(
         input,
         &mut bound_attempt.attempt,
         provider,
@@ -102,6 +152,20 @@ pub(super) fn handle_resume_attempt_result(
         classification.terminal_completion_confirmed,
         mailbox_delivery_outcome,
     )
+}
+
+fn classify_confirmed_prompt_acceptance_failure(
+    physical_exit_code: i32,
+    confirmation: Option<&ValidatedPromptAcceptance>,
+    recovered_generic_nonzero: bool,
+) -> Option<ConfirmedPromptAcceptanceFailure> {
+    if physical_exit_code == 0 || recovered_generic_nonzero {
+        return None;
+    }
+    Some(ConfirmedPromptAcceptanceFailure {
+        physical_exit_code,
+        prompt_acceptance: confirmation?.clone(),
+    })
 }
 
 fn apply_resume_attempt_classification(
@@ -126,13 +190,13 @@ fn apply_resume_attempt_classification(
         provider_confirmed_assistant_response || completion.accepted_provider_turn;
     let zero_turn_classification = completion.classification;
     apply_zero_turn_classification_to_result(result, provider_name, &zero_turn_classification);
-    let mut age270_failure_applied = false;
+    let mut completion_failure_applied = false;
     if completion.incomplete_tool_boundary {
         apply_incomplete_tool_boundary_failure(result, provider_name);
-        age270_failure_applied = true;
+        completion_failure_applied = true;
     } else if effective_clean_exit_candidate && !terminal_completion_confirmed {
         apply_unconfirmed_resume_completion_failure(result, provider_name);
-        age270_failure_applied = true;
+        completion_failure_applied = true;
     }
     let action = next_action(
         input.zero_turn_confirmation,
@@ -146,24 +210,25 @@ fn apply_resume_attempt_classification(
     ResumeAttemptClassification {
         zero_turn_action: action,
         recovered_generic_nonzero: completion.recovered_generic_nonzero,
-        terminal_completion_confirmed: terminal_completion_confirmed && !age270_failure_applied,
-        age270_mailbox_provenance: Age270MailboxProvenance {
+        terminal_completion_confirmed: terminal_completion_confirmed && !completion_failure_applied,
+        clean_exit_mailbox_resolution_provenance: CleanExitMailboxResolutionProvenance {
             physical_clean_exit_candidate,
             effective_clean_exit_candidate,
-            age270_failure_applied,
+            completion_failure_applied,
         },
     }
 }
 
-fn age270_mailbox_eligibility_for_classification(
+fn clean_exit_mailbox_resolution_eligibility(
     physical_clean_exit_candidate: bool,
     effective_clean_exit_candidate: bool,
-    age270_failure_applied: bool,
-) -> Age270MailboxEligibility {
-    if physical_clean_exit_candidate && effective_clean_exit_candidate && age270_failure_applied {
-        Age270MailboxEligibility::PreMutationCleanExit
+    completion_failure_applied: bool,
+) -> CleanExitMailboxResolutionEligibility {
+    if physical_clean_exit_candidate && effective_clean_exit_candidate && completion_failure_applied
+    {
+        CleanExitMailboxResolutionEligibility::PreCompletionFailureCleanExit
     } else {
-        Age270MailboxEligibility::Ineligible
+        CleanExitMailboxResolutionEligibility::Ineligible
     }
 }
 
@@ -213,40 +278,50 @@ fn apply_unconfirmed_resume_completion_failure(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_resume_attempt_terminal_signal(
+fn handle_ordinary_resume_attempt_terminal_signal(
     input: &ResumeAttemptInput<'_>,
     attempt: &mut ResumeInvocationAttempt<'_>,
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &executor::ExecutionResult,
-    completion_evidence: wake::ResumeCompletionEvidence,
+    completion_evidence: wake::ResumeCompletionEvidence<'_>,
     terminal_completion_confirmed: bool,
     mailbox_delivery_outcome: Option<wake::MailboxDeliveryOutcome>,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    let terminal_signal_disposition = terminal_signal_disposition_for_result(
-        &input.env.state,
-        &attempt.invocation.id,
-        &provider.name,
+    let confirmed_delivery_evidence = ordinary_confirmed_delivery_evidence(
+        input,
+        result,
+        completion_evidence,
+        terminal_completion_confirmed,
+        mailbox_delivery_outcome.as_ref(),
+    )?;
+    let turn_generation_id = attempt.invocation.id.clone();
+    let confirmed_delivery = match confirmed_delivery_evidence.as_ref() {
+        Some(evidence) => Some(ConfirmedDeliverySettlement {
+            delivery_id: input.mailbox_delivery_nonce.ok_or_else(|| {
+                "confirmed mailbox delivery is missing its delivery nonce".to_string()
+            })?,
+            session_id: input.mailbox_session_id,
+            turn_generation_id: &turn_generation_id,
+            submitted_evidence: &evidence.submitted,
+            confirmed_evidence: &evidence.confirmed,
+            observed_at: current_unix_millis(),
+        }),
+        None => None,
+    };
+    let outcome = resume_terminal_disposition_outcome(
+        input,
+        attempt,
+        provider,
         provider_session_id,
         result,
-        completion_evidence.zero_turn_action,
-        completion_evidence.recovered_generic_nonzero,
-    );
-    let disposition_control = handle_terminal_signal_disposition(ResumeTerminalDispositionInput {
-        agent_runtime_services: input.agent_runtime_services,
-        env: input.env,
-        invocation_id: &attempt.invocation.id,
-        invocation_row_id: attempt.invocation_row_id,
-        guard: &mut attempt.guard,
-        provider_name: &provider.name,
-        provider_session_id,
-        result,
-        terminal_signal_disposition,
-        zero_turn_action: completion_evidence.zero_turn_action,
+        completion_evidence,
+        confirmed_delivery,
+    )?;
+    let completion = ResumeCompletionClassification {
         recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
-    })?;
-    let outcome =
-        mapper::resume_terminal_disposition_outcome(disposition_control, result.exit_code);
+        terminal_completion_confirmed,
+    };
     apply_resume_terminal_disposition_effects(
         input,
         attempt,
@@ -281,17 +356,167 @@ fn handle_resume_attempt_terminal_signal(
         provider,
         provider_session_id,
         result,
-        ResumeCompletionClassification {
-            recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
-            terminal_completion_confirmed,
-        },
+        confirmed_delivery,
+        completion,
     )
 }
 
+struct ConfirmedDeliveryEvidence {
+    submitted: String,
+    confirmed: String,
+}
+
+fn ordinary_confirmed_delivery_evidence(
+    input: &ResumeAttemptInput<'_>,
+    result: &executor::ExecutionResult,
+    completion_evidence: wake::ResumeCompletionEvidence<'_>,
+    terminal_completion_confirmed: bool,
+    mailbox_delivery_outcome: Option<&wake::MailboxDeliveryOutcome>,
+) -> Result<Option<ConfirmedDeliveryEvidence>, String> {
+    let completed_success = completion_evidence.recovered_generic_nonzero
+        || super::predicate::completed_attempt_success(result, terminal_completion_confirmed);
+    let delivery_confirmed = matches!(
+        mailbox_delivery_outcome,
+        Some(
+            wake::MailboxDeliveryOutcome::Confirmed
+                | wake::MailboxDeliveryOutcome::ConfirmedPromptAcceptance(_)
+        )
+    );
+    if input.mailbox_delivery_seqs.is_empty() || (!completed_success && !delivery_confirmed) {
+        return Ok(None);
+    }
+
+    let submitted = completion_evidence
+        .prompt_acceptance_confirmation
+        .map(|acceptance| acceptance.prompt_sha256().to_string())
+        .or_else(|| {
+            input
+                .answer
+                .map(|answer| wake::sha256_hex(answer.as_bytes()))
+        })
+        .ok_or_else(|| "confirmed mailbox delivery is missing its composed prompt".to_string())?;
+    let confirmed = completion_evidence
+        .prompt_acceptance_confirmation
+        .map(|acceptance| {
+            format!(
+                "{};prompt_sha256={}",
+                acceptance.protocol(),
+                acceptance.prompt_sha256()
+            )
+        })
+        .unwrap_or_else(|| format!("ordinary_resume_delivery_confirmed;prompt_sha256={submitted}"));
+    Ok(Some(ConfirmedDeliveryEvidence {
+        submitted,
+        confirmed,
+    }))
+}
+
+fn resume_terminal_disposition_outcome(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &mut ResumeInvocationAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_session_id: &str,
+    result: &executor::ExecutionResult,
+    completion_evidence: wake::ResumeCompletionEvidence<'_>,
+    confirmed_delivery: Option<ConfirmedDeliverySettlement<'_>>,
+) -> Result<ResumeTerminalDispositionOutcome, String> {
+    let disposition_control = apply_resume_terminal_disposition(
+        input,
+        attempt,
+        provider,
+        provider_session_id,
+        result,
+        completion_evidence,
+        confirmed_delivery,
+    )?;
+    Ok(mapper::resume_terminal_disposition_outcome(
+        disposition_control,
+        result.exit_code,
+    ))
+}
+
+fn apply_resume_terminal_disposition(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &mut ResumeInvocationAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_session_id: &str,
+    result: &executor::ExecutionResult,
+    completion_evidence: wake::ResumeCompletionEvidence<'_>,
+    confirmed_delivery: Option<ConfirmedDeliverySettlement<'_>>,
+) -> Result<ResumeLoopControl, String> {
+    let terminal_signal_disposition = terminal_signal_disposition_for_result(
+        &input.env.state,
+        &attempt.invocation.id,
+        &provider.name,
+        provider_session_id,
+        result,
+        completion_evidence.zero_turn_action,
+        completion_evidence.recovered_generic_nonzero,
+    );
+    handle_terminal_signal_disposition(ResumeTerminalDispositionInput {
+        agent_runtime_services: input.agent_runtime_services,
+        env: input.env,
+        invocation_id: &attempt.invocation.id,
+        invocation_row_id: attempt.invocation_row_id,
+        guard: &mut attempt.guard,
+        provider_name: &provider.name,
+        provider_session_id,
+        result,
+        terminal_signal_disposition,
+        zero_turn_action: completion_evidence.zero_turn_action,
+        recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
+        confirmed_delivery,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum ResumeTerminalDispositionOutcome {
     Continue(i32),
     Return(i32),
     CompletedAttempt,
+}
+
+enum ConfirmedPromptAcceptanceTerminalOutcome {
+    InvocationFinalized { shell_exit_code: i32 },
+    RequiresCompletedAttemptFinalization,
+}
+
+struct ConfirmedPromptAcceptanceTerminalEvidence<'a> {
+    completion: wake::ResumeCompletionEvidence<'a>,
+    physical_exit_code: i32,
+    delivery: Option<ConfirmedDeliverySettlement<'a>>,
+}
+
+fn confirmed_prompt_acceptance_terminal_outcome(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &mut ResumeInvocationAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_session_id: &str,
+    result: &executor::ExecutionResult,
+    evidence: ConfirmedPromptAcceptanceTerminalEvidence<'_>,
+) -> Result<ConfirmedPromptAcceptanceTerminalOutcome, String> {
+    let control = apply_resume_terminal_disposition(
+        input,
+        attempt,
+        provider,
+        provider_session_id,
+        result,
+        evidence.completion,
+        evidence.delivery,
+    )?;
+    Ok(match control {
+        ResumeLoopControl::Continue => {
+            ConfirmedPromptAcceptanceTerminalOutcome::InvocationFinalized {
+                shell_exit_code: nonzero_resume_exit_code(evidence.physical_exit_code),
+            }
+        }
+        ResumeLoopControl::Return(shell_exit_code) => {
+            ConfirmedPromptAcceptanceTerminalOutcome::InvocationFinalized { shell_exit_code }
+        }
+        ResumeLoopControl::CompletedAttempt => {
+            ConfirmedPromptAcceptanceTerminalOutcome::RequiresCompletedAttemptFinalization
+        }
+    })
 }
 
 fn apply_resume_terminal_disposition_effects(
@@ -303,17 +528,21 @@ fn apply_resume_terminal_disposition_effects(
     mailbox_delivery_outcome: Option<wake::MailboxDeliveryOutcome>,
 ) -> Result<(), String> {
     if let Some(mailbox_delivery_outcome) = mailbox_delivery_outcome {
-        let ResumeTerminalDispositionOutcome::Return(shell_exit_code) = outcome else {
-            return Err(
-                "AGE-270 mailbox outcome requires a terminal Return disposition".to_string(),
-            );
+        let shell_exit_code = match outcome {
+            ResumeTerminalDispositionOutcome::Return(shell_exit_code) => *shell_exit_code,
+            ResumeTerminalDispositionOutcome::CompletedAttempt => return Ok(()),
+            ResumeTerminalDispositionOutcome::Continue(_) => {
+                return Err(
+                    "confirmed mailbox submission cannot continue provider routing".to_string(),
+                );
+            }
         };
-        return wake::settle_age270_mailbox_delivery_outcome(
+        return wake::settle_clean_exit_mailbox_delivery_outcome(
             input,
             provider_session_id,
             &attempt.invocation.id,
             result.exit_code,
-            *shell_exit_code,
+            shell_exit_code,
             mailbox_delivery_outcome,
         );
     }
@@ -327,6 +556,101 @@ fn apply_resume_terminal_disposition_effects(
         &wake::failed_delivery_error(result, fallback),
     )?;
     wake::mark_resume_attempt_idle(provider_session_id, &attempt.invocation.id, Some(exit_code))
+}
+
+fn apply_confirmed_prompt_acceptance_failure(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &mut ResumeInvocationAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_session_id: &str,
+    result: &mut executor::ExecutionResult,
+    classification: ResumeAttemptClassification,
+    failure: ConfirmedPromptAcceptanceFailure,
+) -> Result<ResumeAttemptLoopControl, String> {
+    result.terminal_reason = Some(ACCEPTED_PROMPT_PROVIDER_FAILED_TERMINAL_REASON.to_string());
+    record_resume_acceptance_if_present(input, attempt.invocation_row_id, result)?;
+    emit_captured_child_marker_lines(&result.captured_child_invocations);
+    let completion_evidence = wake::ResumeCompletionEvidence {
+        zero_turn_action: classification.zero_turn_action,
+        recovered_generic_nonzero: classification.recovered_generic_nonzero,
+        prompt_acceptance_confirmation: Some(&failure.prompt_acceptance),
+    };
+    let turn_generation_id = attempt.invocation.id.clone();
+    let confirmed_evidence = format!(
+        "{};prompt_sha256={}",
+        failure.prompt_acceptance.protocol(),
+        failure.prompt_acceptance.prompt_sha256()
+    );
+    let confirmed_delivery = if input.mailbox_delivery_seqs.is_empty() {
+        None
+    } else {
+        Some(ConfirmedDeliverySettlement {
+            delivery_id: input.mailbox_delivery_nonce.ok_or_else(|| {
+                "trusted mailbox prompt acceptance is missing its delivery nonce".to_string()
+            })?,
+            session_id: input.mailbox_session_id,
+            turn_generation_id: &turn_generation_id,
+            submitted_evidence: failure.prompt_acceptance.prompt_sha256(),
+            confirmed_evidence: &confirmed_evidence,
+            observed_at: current_unix_millis(),
+        })
+    };
+    let outcome = confirmed_prompt_acceptance_terminal_outcome(
+        input,
+        attempt,
+        provider,
+        provider_session_id,
+        result,
+        ConfirmedPromptAcceptanceTerminalEvidence {
+            completion: completion_evidence,
+            physical_exit_code: failure.physical_exit_code,
+            delivery: confirmed_delivery,
+        },
+    )?;
+    let shell_exit_code = match outcome {
+        ConfirmedPromptAcceptanceTerminalOutcome::InvocationFinalized { shell_exit_code } => {
+            shell_exit_code
+        }
+        ConfirmedPromptAcceptanceTerminalOutcome::RequiresCompletedAttemptFinalization => {
+            wake::ingest_mailbox_delivery_confirmation_turn_if_needed(
+                input,
+                provider,
+                result,
+                completion_evidence,
+            );
+            // Generic completion finalization owns durable effects and output.
+            // Exact prompt acceptance owns this path's stopping contract, so its
+            // ordinary provider-routing recommendation is not transported.
+            let _ordinary_route = finalize_completed_attempt_control_for_resume(
+                input,
+                attempt,
+                provider,
+                provider_session_id,
+                result,
+                confirmed_delivery,
+                &ResumeCompletionClassification {
+                    recovered_generic_nonzero: classification.recovered_generic_nonzero,
+                    terminal_completion_confirmed: classification.terminal_completion_confirmed,
+                },
+            )?;
+            nonzero_resume_exit_code(failure.physical_exit_code)
+        }
+    };
+    if input.mailbox_delivery_seqs.is_empty() {
+        wake::mark_resume_attempt_idle(
+            failure.prompt_acceptance.provider_session_id(),
+            &attempt.invocation.id,
+            Some(shell_exit_code),
+        )?;
+    } else {
+        wake::settle_accepted_mailbox_delivery_and_recheck(
+            input,
+            failure.prompt_acceptance.provider_session_id(),
+            &attempt.invocation.id,
+            failure.physical_exit_code,
+        )?;
+    }
+    Ok(ResumeAttemptLoopControl::Return(shell_exit_code))
 }
 
 fn terminal_disposition_loop_control(
@@ -400,8 +724,13 @@ fn emit_recovered_resume_terminal_signal_marker(
 #[cfg(test)]
 mod tests {
     use super::{
-        Age270MailboxEligibility, age270_mailbox_eligibility_for_classification,
+        CleanExitMailboxResolutionEligibility as MailboxEligibility,
         apply_incomplete_tool_boundary_failure, apply_unconfirmed_resume_completion_failure,
+        classify_confirmed_prompt_acceptance_failure, clean_exit_mailbox_resolution_eligibility,
+    };
+    use oulipoly_provider::generated::{PROMPT_ACCEPTANCE_V1, PromptAcceptedMarkerValueV1};
+    use oulipoly_runtime::executor::prompt_acceptance::{
+        ExpectedPromptAcceptance, ValidatedPromptAcceptance, promote_prompt_acceptance_attestation,
     };
     use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
     use oulipoly_runtime::executor::{
@@ -412,6 +741,7 @@ mod tests {
         ExecutionResult {
             stdout: b"tool output".to_vec(),
             stderr: String::new(),
+            output_spool: None,
             exit_code: 0,
             provider_index: 0,
             session_capture: SessionCaptureResult {
@@ -422,10 +752,30 @@ mod tests {
             terminal_reason: None,
             terminal_signal: None,
             produced_assistant_response: true,
-            submitted_user_turn: None,
+            prompt_acceptance_attestation: None,
             captured_child_invocations: Vec::new(),
             returned_artifacts: Vec::new(),
         }
+    }
+
+    fn validated_prompt_acceptance(delivery_nonce: Option<&str>) -> ValidatedPromptAcceptance {
+        let attestation = PromptAcceptedMarkerValueV1 {
+            protocol: PROMPT_ACCEPTANCE_V1.to_string(),
+            provider_session_id: "session-1".to_string(),
+            prompt_sha256: "prompt-hash".to_string(),
+            delivery_nonce: delivery_nonce.map(str::to_string),
+            source: None,
+            message_id: None,
+        };
+        promote_prompt_acceptance_attestation(
+            ExpectedPromptAcceptance {
+                provider_session_id: "session-1",
+                prompt_sha256: "prompt-hash",
+                delivery_nonce,
+            },
+            &attestation,
+        )
+        .expect("test attestation must promote")
     }
 
     #[test]
@@ -476,28 +826,47 @@ mod tests {
     }
 
     #[test]
-    fn age270_mailbox_eligibility_requires_physical_effective_and_applied_provenance() {
+    fn clean_exit_mailbox_resolution_requires_physical_effective_and_applied_provenance() {
         let rows = [
-            (false, false, false, Age270MailboxEligibility::Ineligible),
-            (false, false, true, Age270MailboxEligibility::Ineligible),
-            (false, true, false, Age270MailboxEligibility::Ineligible),
-            (false, true, true, Age270MailboxEligibility::Ineligible),
-            (true, false, false, Age270MailboxEligibility::Ineligible),
-            (true, false, true, Age270MailboxEligibility::Ineligible),
-            (true, true, false, Age270MailboxEligibility::Ineligible),
+            (false, false, false, MailboxEligibility::Ineligible),
+            (false, false, true, MailboxEligibility::Ineligible),
+            (false, true, false, MailboxEligibility::Ineligible),
+            (false, true, true, MailboxEligibility::Ineligible),
+            (true, false, false, MailboxEligibility::Ineligible),
+            (true, false, true, MailboxEligibility::Ineligible),
+            (true, true, false, MailboxEligibility::Ineligible),
             (
                 true,
                 true,
                 true,
-                Age270MailboxEligibility::PreMutationCleanExit,
+                MailboxEligibility::PreCompletionFailureCleanExit,
             ),
         ];
         for (physical, effective, applied, expected) in rows {
             assert_eq!(
-                age270_mailbox_eligibility_for_classification(physical, effective, applied),
+                clean_exit_mailbox_resolution_eligibility(physical, effective, applied),
                 expected,
                 "unexpected eligibility for P={physical}, E={effective}, A={applied}"
             );
         }
+    }
+
+    #[test]
+    fn confirmed_prompt_acceptance_failure_is_classified_once() {
+        let mailbox_acceptance = validated_prompt_acceptance(Some("delivery-1"));
+        let failure =
+            classify_confirmed_prompt_acceptance_failure(29, Some(&mailbox_acceptance), false)
+                .expect("validated nonzero mailbox acceptance must classify as a failure outcome");
+        assert_eq!(failure.prompt_acceptance, mailbox_acceptance);
+        assert_eq!(failure.physical_exit_code, 29);
+        assert!(
+            classify_confirmed_prompt_acceptance_failure(
+                29,
+                Some(&validated_prompt_acceptance(None)),
+                true,
+            )
+            .is_none(),
+            "recovered generic nonzero is not a confirmed prompt-acceptance failure"
+        );
     }
 }

@@ -67,8 +67,18 @@ use oulipoly_runtime::executor::{ResumeAcceptanceStatus, SessionCaptureMethod};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 fn script(body: &str) -> (tempfile::TempDir, PathBuf) {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("provider.sh");
     std::fs::write(&path, provider_script_body(body)).unwrap();

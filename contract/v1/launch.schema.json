@@ -15,7 +15,14 @@
         "working_directory": { "type": "string", "minLength": 1 },
         "env": { "$ref": "common.schema.json#/$defs/StringMap" },
         "stdin": { "$ref": "common.schema.json#/$defs/BytePayload" },
-        "session": { "$ref": "#/$defs/LaunchSession" }
+        "session": { "$ref": "#/$defs/LaunchSession" },
+        "prompt_acceptance": {
+          "description": "Present only when the host has one authoritative exact-prompt fact after policy evaluation. The host omits this property when policy changes argv, stdin, or prompt bytes.",
+          "$ref": "#/$defs/PromptAcceptanceRequestV1"
+        },
+        "output_delivery": {
+          "$ref": "#/$defs/LaunchOutputRequestV1"
+        }
       },
       "required": ["settings_id", "mode", "model", "argv", "working_directory"],
       "additionalProperties": false
@@ -32,6 +39,59 @@
         "start_mode": ["known_provider_session_id"]
       },
       "additionalProperties": true
+    },
+    "PromptAcceptanceRequestV1": {
+      "type": "object",
+      "description": "Host request for provider attestation after the provider submits the exact launch prompt. A provider may consume this extension only when it advertises capabilities.prompt_acceptance_v1. After exact submission it emits an oulipoly.prompt_accepted/v1 marker correlated by the launch event request_id.",
+      "properties": {
+        "protocol": { "const": "oulipoly.prompt_acceptance/v1" },
+        "prompt_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "delivery_nonce": { "type": "string", "minLength": 1 }
+      },
+      "required": ["protocol", "prompt_sha256"],
+      "additionalProperties": false
+    },
+    "PromptAcceptedMarkerValueV1": {
+      "type": "object",
+      "description": "Provider attestation that the exact launch prompt identified by prompt_sha256 was submitted to provider_session_id. delivery_nonce, when requested, identifies the mailbox delivery contained in that same prompt. This v1 shape is evolved by a new protocol and capability version rather than changing these semantics in place.",
+      "properties": {
+        "protocol": { "const": "oulipoly.prompt_acceptance/v1" },
+        "provider_session_id": { "type": "string", "minLength": 1 },
+        "prompt_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "delivery_nonce": { "type": "string", "minLength": 1 },
+        "source": { "type": "string" },
+        "message_id": { "type": "string" }
+      },
+      "required": ["protocol", "provider_session_id", "prompt_sha256"],
+      "additionalProperties": false
+    },
+    "LaunchOutputRequestV1": {
+      "type": "object",
+      "properties": {
+        "protocol": { "const": "oulipoly.launch_output/v1" }
+      },
+      "required": ["protocol"],
+      "additionalProperties": false
+    },
+    "LaunchOutputChannelSummaryV1": {
+      "type": "object",
+      "properties": {
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      },
+      "required": ["bytes", "sha256"],
+      "additionalProperties": false
+    },
+    "LaunchOutputCompleteMarkerValueV1": {
+      "type": "object",
+      "properties": {
+        "protocol": { "const": "oulipoly.launch_output/v1" },
+        "stdout": { "$ref": "#/$defs/LaunchOutputChannelSummaryV1" },
+        "stderr": { "$ref": "#/$defs/LaunchOutputChannelSummaryV1" },
+        "data_event_count": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["protocol", "stdout", "stderr", "data_event_count"],
+      "additionalProperties": false
     },
     "LaunchRequest": {
       "allOf": [
@@ -67,6 +127,7 @@
     },
     "LaunchMarkerEvent": {
       "type": "object",
+      "description": "Generic launch marker. Reserved prompt-acceptance and launch-output-completion names have strict value shapes; all other names retain generic marker semantics.",
       "properties": {
         "contract": { "$ref": "common.schema.json#/$defs/ContractVersion" },
         "request_id": { "$ref": "common.schema.json#/$defs/RequestId" },
@@ -77,6 +138,26 @@
         "value": true
       },
       "required": ["contract", "request_id", "seq", "time_unix_ms", "kind", "name", "value"],
+      "allOf": [
+        {
+          "if": {
+            "properties": { "name": { "const": "oulipoly.prompt_accepted/v1" } },
+            "required": ["name"]
+          },
+          "then": {
+            "properties": { "value": { "$ref": "#/$defs/PromptAcceptedMarkerValueV1" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "name": { "const": "oulipoly.launch_output_complete/v1" } },
+            "required": ["name"]
+          },
+          "then": {
+            "properties": { "value": { "$ref": "#/$defs/LaunchOutputCompleteMarkerValueV1" } }
+          }
+        }
+      ],
       "additionalProperties": false
     },
     "LaunchHeartbeatEvent": {

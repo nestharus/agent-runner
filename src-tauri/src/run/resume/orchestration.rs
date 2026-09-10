@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use super::{execution, lifecycle, terminal, wake};
+use super::{execution, formatter, lifecycle, terminal, wake};
 use crate::migration_providers::ResumeExecutionEnvironment;
 use crate::run::reservation::ReservedRun;
 use crate::wiring;
@@ -197,6 +197,7 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
             ),
             effective_spawn_cwd: &input.prepared.effective_spawn_cwd,
             zero_turn_confirmation: &mut zero_turn_confirmation,
+            provider_prompt_accepted: &mut input.prepared.provider_prompt_accepted,
         })? {
             ResumeAttemptLoopControl::Continue(exit_code) => last_exit_code = exit_code,
             ResumeAttemptLoopControl::Return(exit_code) => return Ok(exit_code),
@@ -222,6 +223,7 @@ pub(super) struct ResumeAttemptInput<'a> {
     pub(super) parent_invocation_id: Option<i64>,
     pub(super) effective_spawn_cwd: &'a Path,
     pub(super) zero_turn_confirmation: &'a mut ZeroTurnConfirmationState,
+    pub(super) provider_prompt_accepted: &'a mut bool,
 }
 
 pub(super) enum ResumeAttemptLoopControl {
@@ -238,16 +240,28 @@ fn run_resume_attempt(
     };
     let provider_index = target.provider_index;
     let provider = target.provider;
-    let strategy = match resolve_resume_attempt_strategy(input.resolved, &provider) {
+    let account_endpoint_configured = input
+        .agent_runtime_services
+        .provider_registry_handle
+        .current()
+        .has_account_endpoint(&provider.name);
+    let strategy = match resolve_resume_attempt_strategy(&provider, account_endpoint_configured) {
         Ok(strategy) => strategy,
         Err(exit_code) => return Ok(ResumeAttemptLoopControl::Return(exit_code)),
     };
     let mut bound_attempt =
         lifecycle::setup_bound_resume_attempt(&input, &provider, provider_index)?;
+    wake::bind_headless_resume_delivery_attempt(
+        &input,
+        &provider,
+        &bound_attempt.attempt.invocation.id,
+    )?;
     let _admission = crate::wake_coordinator::admit_session_launch(
         &bound_attempt.attempt.invocation.id,
         Some(&bound_attempt.provider_session_id),
     )?;
+
+    wake::begin_headless_delivery_submission(&input, &bound_attempt.attempt.invocation.id)?;
 
     let mut result = match execution::execute_resume_attempt_command(
         &input,
@@ -258,12 +272,21 @@ fn run_resume_attempt(
         strategy,
     ) {
         Ok(result) => result,
-        Err(_spawn_err) => {
+        Err(spawn_err) => {
+            formatter::emit_resume_spawn_error(&spawn_err);
             wake::record_failed_mailbox_delivery_attempt(&input, "resume_spawn_error")?;
             lifecycle::finalize_resume_spawn_error(&input, &mut bound_attempt.attempt)?;
             return Ok(ResumeAttemptLoopControl::Return(1));
         }
     };
+
+    lifecycle::commit_resume_session_authority(
+        &input,
+        &bound_attempt.attempt,
+        &provider,
+        &result,
+        account_endpoint_configured,
+    )?;
 
     terminal::handle_resume_attempt_result(&mut input, &mut bound_attempt, &provider, &mut result)
 }
@@ -282,9 +305,9 @@ fn prepare_resume_attempt_target(
     execution::prepare_resume_attempt_target(input)
 }
 
-fn resolve_resume_attempt_strategy<'a>(
-    resolved: &oulipoly_state::ResolvedResume,
-    provider: &'a oulipoly_config::ProviderConfig,
-) -> Result<Option<&'a oulipoly_config::ResumeStrategy>, i32> {
-    execution::resume_attempt_strategy_for_target(resolved, provider)
+fn resolve_resume_attempt_strategy(
+    provider: &oulipoly_config::ProviderConfig,
+    account_endpoint_configured: bool,
+) -> Result<Option<&oulipoly_config::ResumeStrategy>, i32> {
+    execution::resume_attempt_strategy_for_target(provider, account_endpoint_configured)
 }

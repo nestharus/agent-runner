@@ -22,9 +22,12 @@ mod error_formatter;
 mod error_mapper;
 mod errors;
 mod launch_result_mapper;
+mod output_spool_observer;
 mod policy_transform;
 mod request_builder;
 mod terminal_cancel_mapper;
 mod terminal_classify_handoff;
 
 pub(crate) use dispatch::dispatch;
+
+pub mod attempt;

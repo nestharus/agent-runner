@@ -24,10 +24,22 @@ fn trace_inline_transcript_embeds_db_stored_turn_bodies() {
             parent_invocation_id: None,
         })
         .unwrap();
-    db.update_session_capture(invocation_id, Some(SESSION_ID), "fixture")
-        .unwrap();
-    db.finalize_invocation(invocation_id, true, 0, None, None)
-        .unwrap();
+    db.update_session_capture(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+        Some(SESSION_ID),
+        "fixture",
+    )
+    .unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+        true,
+        0,
+        None,
+        None,
+    )
+    .unwrap();
 
     let report = trace_invocation(
         &db,

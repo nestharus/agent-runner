@@ -13,7 +13,9 @@ use oulipoly_state::pid_identity::{PidIdentityDb, ProcessIdentity, read_live_pro
 use oulipoly_state::{InvocationRecord, InvocationStatus, StateDb};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::Path;
 
 use crate::mailbox_delivery::PtyMailboxDeliveryDiagnostic;
@@ -239,11 +241,20 @@ fn register_completion_event(
         rc_path: &paths.rc_path,
     };
     if args.repair_admitted {
-        state.repair_admitted_completion_event(&admission_id, registration)
+        state.repair_admitted_completion_event(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            &admission_id,
+            registration,
+        )
     } else {
         let authority =
             oulipoly_state::CompletionRegistrationAuthority::from_process_environment()?;
-        state.register_completion_event_with_authority(&authority, &admission_id, registration)
+        state.register_completion_event_with_authority(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            &authority,
+            &admission_id,
+            registration,
+        )
     }
 }
 
@@ -288,26 +299,149 @@ fn trigger_completion_event(
         .completion_event(args.handle)?
         .ok_or_else(|| format!("Completion event {} is not registered", args.handle))?;
     let listeners = mailbox.completion_event_listeners(args.handle)?;
-    let payload_json = render_payload_json(&payload_value(
+    let payload_json = render_payload_json(&completion_payload_identity(payload_value(
         &metadata,
         args.handle,
         rc,
         &event,
         &listeners,
         &paths,
-    ))?;
-    let result = mailbox.trigger_completion_event(CompletionEventTriggerInput {
-        event_id: args.handle,
-        payload_json: &payload_json,
-        state_dir: &paths.state_dir,
-        meta_path: &paths.meta_path,
-        log_path: &paths.log_path,
-        rc_path: &paths.rc_path,
-        rc,
-        consumed: args.consumed,
-    })?;
+    )))?;
+    let result = trigger_completion_event_payload(
+        &mut mailbox,
+        &event,
+        CompletionEventTriggerInput {
+            event_id: args.handle,
+            payload_json: &payload_json,
+            state_dir: &paths.state_dir,
+            meta_path: &paths.meta_path,
+            log_path: &paths.log_path,
+            rc_path: &paths.rc_path,
+            rc,
+            consumed: args.consumed,
+        },
+    )?;
     let (delivery, wake) = deliver_and_wake_event_listeners(&mut mailbox, &result.mailbox_rows);
     Ok((result, delivery, wake))
+}
+
+fn trigger_completion_event_payload(
+    mailbox: &mut MailboxDb,
+    event: &CompletionEventRow,
+    input: CompletionEventTriggerInput<'_>,
+) -> Result<CompletionEventTriggerResult, String> {
+    let payload_json = completion_replay_payload(event, input.payload_json)?;
+    match mailbox.trigger_completion_event(CompletionEventTriggerInput {
+        payload_json: &payload_json,
+        ..input
+    }) {
+        Err(error) if event.state == "pending" => {
+            // Another callback may have committed after our initial read. Recheck
+            // its immutable snapshot once; the state layer still checks the SHA,
+            // workload rc and registered source inside its transaction.
+            let current = mailbox.completion_event(input.event_id)?;
+            let Some(current) = current.filter(|row| row.state == "triggered") else {
+                return Err(error);
+            };
+            let payload_json = completion_replay_payload(&current, input.payload_json)?;
+            mailbox.trigger_completion_event(CompletionEventTriggerInput {
+                payload_json: &payload_json,
+                ..input
+            })
+        }
+        result => result,
+    }
+}
+
+fn completion_replay_payload(
+    event: &CompletionEventRow,
+    payload_json: &str,
+) -> Result<String, String> {
+    if event.state != "triggered" || completion_payload_matches(event, payload_json) {
+        // Exact retries can still republish a payload reclaimed after delivery.
+        return Ok(payload_json.to_string());
+    }
+    let path = event.payload_file_path.as_deref().ok_or_else(|| {
+        format!(
+            "Completion event {} has no retained payload path",
+            event.event_id
+        )
+    })?;
+    let byte_len = event
+        .payload_byte_len
+        .and_then(|len| u64::try_from(len).ok())
+        .ok_or_else(|| {
+            format!(
+                "Completion event {} has invalid retained payload length",
+                event.event_id
+            )
+        })?;
+    // Bound the read before checking the digest. A replaced file must not cause
+    // allocation beyond the committed size; the extra byte detects excess data.
+    let mut original = String::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(byte_len + 1).read_to_string(&mut original))
+        .map_err(|err| {
+            format!(
+                "Failed to read completion event {} retained payload: {err}",
+                event.event_id
+            )
+        })?;
+    if !completion_payload_matches(event, &original) {
+        return Err(format!(
+            "Completion event {} retained payload integrity mismatch",
+            event.event_id
+        ));
+    }
+    let stored: Value = serde_json::from_str(&original)
+        .map_err(|err| format!("Failed to parse retained completion payload: {err}"))?;
+    let incoming: Value = serde_json::from_str(payload_json)
+        .map_err(|err| format!("Failed to parse completion payload: {err}"))?;
+    if completion_payload_identity(stored) != completion_payload_identity(incoming) {
+        return Err(format!(
+            "Completion event {} was already triggered with a different payload",
+            event.event_id
+        ));
+    }
+    // Preserve the original snapshot and the state layer's exact immutable-byte
+    // guard, including for events recorded before delivery-aware comparison.
+    Ok(original)
+}
+
+fn completion_payload_matches(event: &CompletionEventRow, payload: &str) -> bool {
+    event.payload_byte_len == i64::try_from(payload.len()).ok()
+        && event.payload_sha256.as_deref()
+            == Some(format!("{:x}", Sha256::digest(payload.as_bytes())).as_str())
+}
+
+fn completion_payload_identity(mut payload: Value) -> Value {
+    if payload["schema_version"] != 2 || payload["kind"] != "agent_bash_complete" {
+        return payload;
+    }
+    if let Some(meta) = payload.get_mut("meta").and_then(Value::as_object_mut) {
+        // Agent Bash writes the helper outcome after this callback returns.
+        // Only its documented delivery bookkeeping is mutable: preserve all
+        // workload, owner, provenance and unknown fields for conflict detection.
+        meta.remove("updated_at_unix_ms");
+        if let Some(delivery) = meta.get_mut("delivery").and_then(Value::as_object_mut) {
+            for field in [
+                "attempted",
+                "exit_code",
+                "error",
+                "error_code",
+                "retryable",
+                "retry_count",
+                "skipped",
+                "lifecycle",
+            ] {
+                delivery.remove(field);
+            }
+            if delivery.is_empty() {
+                meta.remove("delivery");
+            }
+        }
+    }
+    payload
 }
 
 fn deliver_and_wake_event_listeners(
@@ -458,12 +592,15 @@ fn bind_verified_live_owner_session(
     owner: &OwnerBinding,
 ) -> Result<(), String> {
     state.bind_invocation_provider_session_start(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         record.id,
         &oulipoly_state::ProviderSessionBinding {
             provider_session_id: owner.session_id.clone(),
             capture_method: "completion_registration_live_pid",
             resume_input_id: None,
-            provider_session_resolved_account: record.provider_name.clone(),
+            // Live PID ancestry attests the session, not its workspace. Keep any
+            // retained workspace; launch authority supplies it when still unknown.
+            provider_session_resolved_account: record.provider_session_resolved_account.clone(),
         },
     )
 }
@@ -635,14 +772,192 @@ fn render_error(handle: &str, json: bool, message: String) -> Result<i32, String
 
 #[cfg(test)]
 mod tests {
-    use super::{completion_obligation_admission_id, notify_path_strings};
+    use super::{
+        completion_obligation_admission_id, completion_payload_identity, notify_path_strings,
+        trigger_completion_event_payload,
+    };
+    use oulipoly_state::mailbox::{CompletionEventTriggerInput, MailboxDb};
+    use serde_json::json;
     use std::path::Path;
+
+    #[test]
+    fn live_owner_registration_does_not_invent_workspace_authority() {
+        assert_live_owner_workspace_binding(None);
+    }
+
+    #[test]
+    fn live_owner_registration_preserves_retained_workspace_authority() {
+        assert_live_owner_workspace_binding(Some("/fixture/workspace"));
+    }
+
+    fn assert_live_owner_workspace_binding(retained_workspace: Option<&str>) {
+        use oulipoly_state::{
+            InvocationMutationAuthority, InvocationStart, ProviderSessionAuthorityCommit,
+            ProviderSessionBinding, StateDb,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let owner = super::OwnerBinding {
+            session_id: "fixture-session".to_string(),
+            invocation_uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+        };
+        let row_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: owner.invocation_uuid.clone(),
+                model_name: "fixture-model".to_string(),
+                provider_name: "fixture-account".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        // Seed only the retained-workspace case; the other starts unbound.
+        if let Some(workspace) = retained_workspace {
+            state
+                .bind_invocation_provider_session_start(
+                    InvocationMutationAuthority::Standalone,
+                    row_id,
+                    &ProviderSessionBinding {
+                        provider_session_id: owner.session_id.clone(),
+                        capture_method: "provider_live_report_pending",
+                        resume_input_id: None,
+                        provider_session_resolved_account: Some(workspace.to_string()),
+                    },
+                )
+                .unwrap();
+        }
+        let before = state
+            .get_invocation_by_uuid(&owner.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        super::bind_verified_live_owner_session(&state, &before, &owner).unwrap();
+        let registered = state
+            .get_invocation_by_uuid(&owner.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registered.provider_session_id.as_deref(),
+            Some(owner.session_id.as_str())
+        );
+        assert_eq!(
+            registered.provider_session_resolved_account.as_deref(),
+            retained_workspace
+        );
+
+        let binding = ProviderSessionBinding {
+            provider_session_id: owner.session_id.clone(),
+            capture_method: "external_provider_launch",
+            resume_input_id: None,
+            provider_session_resolved_account: Some("/fixture/workspace".to_string()),
+        };
+        let commit = ProviderSessionAuthorityCommit {
+            invocation_uuid: &owner.invocation_uuid,
+            provider_name: "fixture-account",
+            binding: &binding,
+            provider_instance_id: "fixture-instance",
+            settings_id: "fixture-settings",
+        };
+        state
+            .commit_invocation_provider_session_authority(
+                InvocationMutationAuthority::Standalone,
+                row_id,
+                &commit,
+            )
+            .unwrap();
+        let conflicting_binding = ProviderSessionBinding {
+            provider_session_resolved_account: Some("/different/workspace".to_string()),
+            ..binding.clone()
+        };
+        let error = state
+            .commit_invocation_provider_session_authority(
+                InvocationMutationAuthority::Standalone,
+                row_id,
+                &ProviderSessionAuthorityCommit {
+                    binding: &conflicting_binding,
+                    ..commit
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("workspace mismatch"), "{error}");
+        let after = state
+            .get_invocation_by_uuid(&owner.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.provider_session_resolved_account,
+            binding.provider_session_resolved_account
+        );
+    }
 
     #[test]
     fn completion_obligation_admission_id_disambiguates_delimiters_in_components() {
         assert_ne!(
             completion_obligation_admission_id("a", "b:owner:c"),
             completion_obligation_admission_id("a:owner:b", "c")
+        );
+    }
+
+    #[test]
+    fn completion_replay_rechecks_a_concurrently_triggered_legacy_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut mailbox = MailboxDb::open(&path).unwrap();
+        rusqlite::Connection::open(&path).unwrap().execute(
+            "INSERT INTO completion_event (
+                event_id, kind, state, delivery_mode, state_dir, meta_path, log_path, rc_path, created_at
+             ) VALUES ('concurrent', 'agent_bash_complete', 'pending', 'sync',
+                       '/state', '/state/meta.json', '/state/log', '/state/rc', '2026-09-04T00:00:00Z')",
+            [],
+        ).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO completion_event_listener (
+                event_id, listener_id, session_id, owner_invocation_uuid, active, created_at
+             ) VALUES ('concurrent', 'listener', 'session',
+                       '11111111-1111-4111-8111-111111111111', 0, '2026-09-04T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let stale_event = mailbox.completion_event("concurrent").unwrap().unwrap();
+        let legacy_payload = json!({
+            "schema_version": 2,
+            "kind": "agent_bash_complete",
+            "handle": "concurrent",
+            "rc": 7,
+            "meta": {
+                "workload_pid": 1234,
+                "updated_at_unix_ms": 100,
+                "delivery": {"attempted": true, "exit_code": null, "lifecycle": "provisional_transfer"},
+            },
+        });
+        let original = serde_json::to_string(&legacy_payload).unwrap();
+        let input = CompletionEventTriggerInput {
+            event_id: "concurrent",
+            payload_json: &original,
+            state_dir: "/state",
+            meta_path: "/state/meta.json",
+            log_path: "/state/log",
+            rc_path: "/state/rc",
+            rc: 7,
+            consumed: false,
+        };
+        let first = mailbox.trigger_completion_event(input).unwrap();
+        let incoming = serde_json::to_string(&completion_payload_identity(legacy_payload)).unwrap();
+        let replay = trigger_completion_event_payload(
+            &mut mailbox,
+            &stale_event,
+            CompletionEventTriggerInput {
+                payload_json: &incoming,
+                ..input
+            },
+        )
+        .unwrap();
+        assert!(!replay.triggered);
+        assert_eq!(replay.event, first.event);
+        assert_eq!(
+            std::fs::read_to_string(replay.event.payload_file_path.as_deref().unwrap()).unwrap(),
+            original
         );
     }
 

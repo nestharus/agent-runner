@@ -150,8 +150,15 @@ impl StateDb {
     ) -> u64 {
         prior
             .map(|p| {
-                self.count_assistant_turns_since(provider_name, p.refreshed_at.as_ref())
-                    .unwrap_or(p.calls_since_refresh)
+                let turn_count_is_fresh = self
+                    .canonical_provider_turn_ingest_freshness(provider_name)
+                    .is_ok_and(|freshness| freshness.is_caught_up());
+                if turn_count_is_fresh {
+                    self.count_assistant_turns_since(provider_name, p.refreshed_at.as_ref())
+                        .unwrap_or(p.calls_since_refresh)
+                } else {
+                    p.calls_since_refresh
+                }
             })
             .unwrap_or(0)
     }

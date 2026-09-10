@@ -40,7 +40,7 @@ fn acquire_session_lock(
     ttl_ms: u64,
 ) -> Result<SessionLockSuccess, SessionLockFailure> {
     let state = open_default_state_for_lock()?;
-    let providers_cfg = load_default_providers_config();
+    let providers_cfg = load_default_providers_config()?;
     let models = load_default_models_for_lock(&providers_cfg)?;
     reject_recent_ambiguous_resume(&state, session_id).map_err(SessionLockFailure::Resume)?;
     let resolved = <StateDb as ResumeRepository>::resolve_resume(&state, &models, session_id, None)
@@ -67,14 +67,16 @@ fn open_default_state_for_lock() -> Result<StateDb, SessionLockFailure> {
         .map_err(|message| SessionLockFailure::Lock(LockError::Operational { message }))
 }
 
-fn load_default_providers_config() -> ProvidersConfig {
-    ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default()
+fn load_default_providers_config() -> Result<ProvidersConfig, SessionLockFailure> {
+    let config_root = default_config_root()?;
+    Ok(ProvidersConfig::load(&config_root.join("providers.toml")).unwrap_or_default())
 }
 
 fn load_default_models_for_lock(
     providers_cfg: &ProvidersConfig,
 ) -> Result<oulipoly_state::ModelStore, SessionLockFailure> {
-    load_models(&default_models_dir(), Some(providers_cfg)).map_err(|message| {
+    let models_dir = default_models_dir()?;
+    load_models(&models_dir, Some(providers_cfg)).map_err(|message| {
         SessionLockFailure::Lock(LockError::Operational {
             message: message.to_string(),
         })
@@ -168,22 +170,17 @@ fn release_session_lease(
         .map_err(SessionLockFailure::Lock)
 }
 
-fn default_config_root() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."))
+fn default_config_root() -> Result<PathBuf, SessionLockFailure> {
+    oulipoly_state::paths::config_dir()
+        .map_err(|message| SessionLockFailure::Lock(LockError::Operational { message }))
 }
 
-fn default_models_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner").join("models"))
-        .unwrap_or_else(|| PathBuf::from("models"))
+fn default_models_dir() -> Result<PathBuf, SessionLockFailure> {
+    default_config_root().map(|root| root.join("models"))
 }
 
 fn default_lock_dir() -> Result<PathBuf, LockError> {
     oulipoly_state::paths::data_dir()
         .map(|dir| dir.join("locks"))
-        .map_err(|_| LockError::Operational {
-            message: "Could not determine data directory".to_string(),
-        })
+        .map_err(|message| LockError::Operational { message })
 }

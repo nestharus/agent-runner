@@ -31,11 +31,13 @@
 mod cases_basic;
 mod cases_batch_sweep;
 mod cases_wake_backlog;
-mod fake_cli;
+mod fake_provider;
 mod fixtures;
 mod liveness;
 mod model_config;
 mod parse;
+#[path = "../provider_authority_fixture.rs"]
+mod provider_authority_fixture;
 mod state_mailbox;
 mod test_guard;
 mod validators;
@@ -72,8 +74,8 @@ fn manual_resume_race_is_safe() {
 }
 
 #[test]
-fn batch_cap_followup_wake() {
-    cases_batch_sweep::batch_cap_followup_wake();
+fn persisted_count_at_five_allows_turn_end_followup_wake() {
+    cases_batch_sweep::persisted_count_at_five_allows_turn_end_followup_wake();
 }
 
 #[test]
@@ -107,32 +109,46 @@ fn wake_sweep_does_not_disturb_live_identity_matched_claim() {
 }
 
 #[test]
-fn wake_sweep_does_not_rewake_consumed_pending_mailbox() {
-    cases_batch_sweep::wake_sweep_does_not_rewake_consumed_pending_mailbox();
+fn wake_sweep_does_not_treat_pre_anchor_prose_as_consumption() {
+    cases_batch_sweep::wake_sweep_does_not_treat_pre_anchor_prose_as_consumption();
 }
 
 #[test]
-fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
-    cases_batch_sweep::wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox();
+fn wake_sweep_retries_twice_unconfirmed_pending_mailbox() {
+    cases_batch_sweep::wake_sweep_retries_twice_unconfirmed_pending_mailbox();
 }
 
 #[test]
-fn environment_empty_sweep_uses_persisted_wake_max_beyond_five() {
-    cases_batch_sweep::environment_empty_sweep_uses_persisted_wake_max_beyond_five();
+fn failed_auto_wake_retains_retry_ownership_during_backoff() {
+    cases_batch_sweep::failed_auto_wake_retains_retry_ownership_during_backoff();
 }
 
 #[test]
-fn persisted_wake_max_caps_sweep_at_selected_value() {
-    cases_batch_sweep::persisted_wake_max_caps_sweep_at_selected_value();
+fn maximum_chronology_and_delivery_attempts_stay_eligible_across_rechecks() {
+    cases_batch_sweep::maximum_chronology_and_delivery_attempts_stay_eligible_across_rechecks();
 }
 
 #[test]
-fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox() {
-    cases_wake_backlog::wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox(
-    );
+fn repeated_failed_wakes_keep_oldest_batch_owned_past_terminal_budget() {
+    cases_batch_sweep::repeated_failed_wakes_keep_oldest_batch_owned_past_terminal_budget();
+}
+
+#[test]
+fn maximum_persisted_count_allows_startup_sweep_delivery() {
+    cases_batch_sweep::maximum_persisted_count_allows_startup_sweep_delivery();
+}
+
+#[test]
+fn wake_sweep_retries_twice_unconfirmed_oldest_with_newer_mailbox() {
+    cases_wake_backlog::wake_sweep_retries_twice_unconfirmed_oldest_with_newer_mailbox();
 }
 
 #[test]
 fn wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_debris() {
     cases_wake_backlog::wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_debris();
+}
+
+#[test]
+fn wake_sweep_eventually_reaches_startable_session_between_paused_edges() {
+    cases_wake_backlog::wake_sweep_eventually_reaches_startable_session_between_paused_edges();
 }

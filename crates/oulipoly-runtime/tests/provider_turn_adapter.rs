@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use chrono::{TimeZone, Utc};
@@ -14,10 +14,11 @@ use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, Stor
 use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ResumeAcceptanceRules, ResumeKind, ResumeStrategy,
 };
+use oulipoly_provider::generated::{PROMPT_ACCEPTANCE_V1, PromptAcceptedMarkerValueV1};
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 use oulipoly_runtime::executor::{
     CapturedChildInvocation, ExecutionResult, ResumeAcceptanceResult, ResumeAcceptanceStatus,
-    SessionCaptureMethod, SessionCaptureResult, SubmittedUserTurn, TerminalSignal,
+    SessionCaptureMethod, SessionCaptureResult, TerminalSignal,
 };
 use oulipoly_runtime::provider_turn_adapter::{
     CliResumeRequest, EffectWrite, EvidenceStrength, FencedProviderEvidence, InvocationOwnership,
@@ -27,6 +28,7 @@ use oulipoly_runtime::provider_turn_adapter::{
     ProviderTurnEffects, ProviderTurnExecutionRequest, ProviderTurnExecutor, ProviderTurnLaunch,
     classify_provider_evidence, prompt_sha256,
 };
+use oulipoly_runtime::provider_turn_contract::MAILBOX_BATCH_MAX_ROWS;
 use oulipoly_runtime::services::{
     ExecutorServiceOutput, ExecutorServicePort, ExecutorServiceRequest, ServiceError,
 };
@@ -45,6 +47,8 @@ const SESSION: &str = "provider-session-a";
 const PARENT_UUID: &str = "11111111-1111-1111-1111-111111111111";
 const FIRST_UUID: &str = "22222222-2222-2222-2222-222222222222";
 const SECOND_UUID: &str = "33333333-3333-3333-3333-333333333333";
+
+static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 type AdapterTurn = TurnRequest<ProviderTurnLaunch, ProviderTurnCallerResult>;
 type AdapterSupervisor = SessionSupervisor<ProviderTurnLaunch, ProviderTurnCallerResult>;
@@ -264,6 +268,7 @@ fn external_request(start_mode: &str) -> ProviderTurnExecutionRequest {
             extra_inputs,
             parent_invocation_env: None,
             start_known_provider_session_id: session,
+            mailbox_delivery_correlation: None,
         },
         "create" => ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
             model,
@@ -362,6 +367,7 @@ fn execution_result(
     ExecutionResult {
         stdout: vec![b'r', b'a', b'w', 0, 255],
         stderr: "stderr-exact".to_string(),
+        output_spool: None,
         exit_code: 0,
         provider_index: 4,
         session_capture: SessionCaptureResult {
@@ -375,7 +381,8 @@ fn execution_result(
         terminal_reason: None,
         terminal_signal: None,
         produced_assistant_response,
-        submitted_user_turn: Some(SubmittedUserTurn {
+        prompt_acceptance_attestation: Some(PromptAcceptedMarkerValueV1 {
+            protocol: PROMPT_ACCEPTANCE_V1.to_string(),
             provider_session_id: session_id.to_string(),
             prompt_sha256: prompt_sha256(prompt),
             delivery_nonce: nonce.map(str::to_string),
@@ -485,7 +492,7 @@ fn resident_owner_publishes_exact_results_and_accepts_a_later_turn() {
             .submitted_evidence
             .as_deref()
             .unwrap()
-            .contains("submitted_user_turn")
+            .contains("prompt_acceptance_attestation")
     );
     assert!(
         acknowledgement
@@ -898,8 +905,12 @@ fn malformed_mailbox_batches_report_exact_fences_without_executing() {
         (
             MailboxBatchIdentity {
                 session_id: SESSION.to_string(),
-                delivery_ids: (1..=21).map(|index| format!("delivery-{index}")).collect(),
-                sequences: (1..=21).collect(),
+                delivery_ids: (1..=MAILBOX_BATCH_MAX_ROWS + 1)
+                    .map(|index| format!("delivery-{index}"))
+                    .collect(),
+                sequences: (1..=MAILBOX_BATCH_MAX_ROWS + 1)
+                    .map(|sequence| sequence as i64)
+                    .collect(),
                 delivery_nonce: Some("nonce".to_string()),
             },
             "mailbox batch bounds",
@@ -1004,13 +1015,14 @@ fn evidence_strength_is_conservative_exact_fenced_and_monotonic() {
             EvidenceStrength::Informational,
         ),
         (
-            ProviderEvidence::SubmittedUserTurn {
+            ProviderEvidence::PromptAcceptanceAttestation(PromptAcceptedMarkerValueV1 {
+                protocol: PROMPT_ACCEPTANCE_V1.to_string(),
                 provider_session_id: SESSION.to_string(),
                 prompt_sha256: prompt_hash.clone(),
                 delivery_nonce: None,
                 source: None,
                 message_id: None,
-            },
+            }),
             EvidenceStrength::Submitted,
         ),
         (
@@ -1094,13 +1106,14 @@ fn evidence_strength_is_conservative_exact_fenced_and_monotonic() {
     ] {
         let evidence = FencedProviderEvidence {
             fence: fence.clone(),
-            evidence: ProviderEvidence::SubmittedUserTurn {
+            evidence: ProviderEvidence::PromptAcceptanceAttestation(PromptAcceptedMarkerValueV1 {
+                protocol: PROMPT_ACCEPTANCE_V1.to_string(),
                 provider_session_id: SESSION.to_string(),
                 prompt_sha256: submitted_prompt_hash,
                 delivery_nonce: Some("delivery-nonce".to_string()),
                 source: None,
                 message_id: None,
-            },
+            }),
         };
         assert_eq!(
             classify_provider_evidence(
@@ -1114,6 +1127,48 @@ fn evidence_strength_is_conservative_exact_fenced_and_monotonic() {
             expected
         );
     }
+
+    let wrong_protocol = FencedProviderEvidence {
+        fence: fence.clone(),
+        evidence: ProviderEvidence::PromptAcceptanceAttestation(PromptAcceptedMarkerValueV1 {
+            protocol: "oulipoly.prompt_acceptance/v2".to_string(),
+            provider_session_id: SESSION.to_string(),
+            prompt_sha256: prompt_hash.clone(),
+            delivery_nonce: None,
+            source: None,
+            message_id: None,
+        }),
+    };
+    assert_eq!(
+        classify_provider_evidence(&fence, SESSION, Some(&prompt_hash), None, &wrong_protocol,)
+            .unwrap(),
+        EvidenceStrength::Informational,
+        "a different attestation protocol cannot become trusted evidence"
+    );
+
+    let nonce_without_expected_prompt = FencedProviderEvidence {
+        fence: fence.clone(),
+        evidence: ProviderEvidence::PromptAcceptanceAttestation(PromptAcceptedMarkerValueV1 {
+            protocol: PROMPT_ACCEPTANCE_V1.to_string(),
+            provider_session_id: SESSION.to_string(),
+            prompt_sha256: prompt_hash.clone(),
+            delivery_nonce: Some("delivery-nonce".to_string()),
+            source: None,
+            message_id: None,
+        }),
+    };
+    assert_eq!(
+        classify_provider_evidence(
+            &fence,
+            SESSION,
+            None,
+            Some("delivery-nonce"),
+            &nonce_without_expected_prompt,
+        )
+        .unwrap(),
+        EvidenceStrength::Informational,
+        "a nonce cannot promote an attestation without the exact expected prompt hash"
+    );
 
     let wrong_session = FencedProviderEvidence {
         fence: fence.clone(),
@@ -1147,7 +1202,7 @@ fn confirmation_only_evidence_advances_both_required_acknowledgement_stages() {
     let parent = seed_invocation(&state, PARENT_UUID, None);
     let invocation = seed_invocation(&state, FIRST_UUID, Some(parent.invocation_row_id));
     let mut result = execution_result(SESSION, "prompt", None, true, Vec::new());
-    result.submitted_user_turn = None;
+    result.prompt_acceptance_attestation = None;
     result.resume_acceptance = None;
     let executor = QueueExecutor::new([complete_outcome(result)]);
     let mut adapter = ProviderTurnAdapter::new(executor);
@@ -1193,7 +1248,7 @@ fn confirmation_only_evidence_advances_both_required_acknowledgement_stages() {
 #[test]
 fn execution_status_does_not_overstate_unconfirmed_or_failure_evidence() {
     let mut unconfirmed = execution_result(SESSION, "prompt", None, false, Vec::new());
-    unconfirmed.submitted_user_turn = None;
+    unconfirmed.prompt_acceptance_attestation = None;
     unconfirmed.resume_acceptance = Some(ResumeAcceptanceResult {
         status: ResumeAcceptanceStatus::Unconfirmed,
         evidence: Some("exit zero without affirmative resume evidence".to_string()),
@@ -1240,6 +1295,13 @@ fn execution_status_does_not_overstate_unconfirmed_or_failure_evidence() {
 
 #[test]
 fn production_executors_preserve_cli_grammar_and_external_request_contracts() {
+    TEST_DATA_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test data dir");
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        dir
+    });
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("fake-provider.sh");
     let args_path = dir.path().join("args.txt");

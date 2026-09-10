@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use chrono::{Duration, Utc};
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{InvocationStart, InvocationStatus, StateDb};
@@ -50,14 +52,14 @@ name = "fixture-provider"
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[fixture-provider]
 command = "{}"
 args = []
 prompt_mode = "arg"
 "#,
                 script_path.display()
-            ),
+            )),
         )
         .unwrap();
 
@@ -97,8 +99,15 @@ prompt_mode = "arg"
                 parent_invocation_id: None,
             })
             .unwrap();
-        db.finalize_invocation(root_id, true, 0, None, None)
-            .unwrap();
+        db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            root_id,
+            true,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
 
         let child_id = db
             .start_invocation(&InvocationStart {
@@ -110,6 +119,7 @@ prompt_mode = "arg"
             })
             .unwrap();
         db.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
             child_id,
             false,
             7,
@@ -181,7 +191,10 @@ prompt_mode = "arg"
         cmd.args(extra_args);
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.output().unwrap()
     }
 
@@ -192,7 +205,10 @@ prompt_mode = "arg"
         cmd.args(extra_args);
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.output().unwrap()
     }
 
@@ -205,7 +221,10 @@ prompt_mode = "arg"
             .arg("ping");
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.output().unwrap()
     }
 }
@@ -400,10 +419,17 @@ fn default_cli_flow_still_runs_without_subcommand() {
     let output = fixture.run_default_execution();
 
     assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("fixture-response\n"), "{stdout}");
-    assert!(stdout.contains("OULIPOLY_RESULT="), "{stdout}");
+    assert_eq!(output.stdout, b"fixture-response\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{stderr}");
+    let result: Value = serde_json::from_str(lines[0]).expect("parse result envelope");
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(result["success"], true);
+    assert_eq!(result["exit_code"], 0);
     assert!(stderr.contains("OULIPOLY_INVOCATION="), "{stderr}");
 }
 

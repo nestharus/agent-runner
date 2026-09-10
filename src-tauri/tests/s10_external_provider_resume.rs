@@ -33,6 +33,8 @@
 //!       - invocation session/outcome database assertions
 //! ```
 
+mod provider_authority_fixture;
+
 mod age153_support;
 
 use age153_support::assert_result_envelope_shape;
@@ -198,8 +200,12 @@ impl Fixture {
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("OULIPOLY_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
     }
@@ -234,7 +240,11 @@ impl Fixture {
             .join("providers.toml");
         let mut providers = fs::read_to_string(&providers_path).unwrap();
         providers.push_str(&mismatched_provider_config_toml());
-        fs::write(providers_path, providers).unwrap();
+        fs::write(
+            providers_path,
+            provider_authority_fixture::with_explicit_provider_authority(&providers),
+        )
+        .unwrap();
     }
 
     fn provider_ref_transcript_dir(&self) -> PathBuf {
@@ -423,6 +433,7 @@ fn materialize_fixture(root: &Path, paths: &FixturePaths, options: ProviderOptio
     write_model_config(&paths.models_dir, &provider_path);
     write_providers_config(
         &paths.app_config_dir,
+        &provider_path,
         options
             .session_storage
             .then_some(paths.projects_dir.as_path()),
@@ -496,10 +507,18 @@ prompt_mode = "arg"
     )
 }
 
-fn write_providers_config(app_config_dir: &Path, storage_projects_dir: Option<&Path>) {
+fn write_providers_config(
+    app_config_dir: &Path,
+    provider_path: &Path,
+    storage_projects_dir: Option<&Path>,
+) {
     fs::write(
         app_config_dir.join("providers.toml"),
-        providers_config_toml(storage_projects_dir),
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            &providers_config_toml(storage_projects_dir),
+            "s10-external-provider",
+            provider_path,
+        ),
     )
     .unwrap();
 }
@@ -790,6 +809,40 @@ fn assert_unconfirmed_resume(output: &Output) {
 }
 
 #[test]
+fn age345_runner_launch_and_resume_persist_the_launch_request_endpoint() {
+    let fixture = Fixture::new();
+    assert_success(&fixture.run_launch());
+    assert_unconfirmed_resume(&fixture.run_resume());
+    let records = fixture.records();
+    let launches = records_for_subcommand(&records, "launch");
+    assert_eq!(launches.len(), 2);
+    let conn = open_invocation_db(&fixture.data_home.join("oulipoly-agent-runner/state.db"));
+    let mut stmt = conn.prepare("SELECT a.provider_instance_id, a.settings_id, i.provider_session_id FROM invocations i JOIN invocation_provider_session_authority a ON a.invocation_id = i.id ORDER BY i.id").unwrap();
+    let authorities: Vec<(String, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(authorities.len(), 2);
+    for (authority, launch) in authorities.iter().zip(launches) {
+        assert_eq!(
+            authority.0,
+            launch["request"]["provider_instance_id"].as_str().unwrap()
+        );
+        assert_eq!(
+            authority.1,
+            launch["request"]["params"]["settings_id"].as_str().unwrap()
+        );
+        assert_eq!(authority.2, SESSION_ID);
+    }
+    let segment_authority: (String, String) = conn.query_row("SELECT provider_instance_id, settings_id FROM session_chain_segment_provider_authority", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(
+        segment_authority,
+        (authorities[0].0.clone(), authorities[0].1.clone())
+    );
+}
+
+#[test]
 fn external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd() {
     let fixture = Fixture::new();
 
@@ -1019,7 +1072,63 @@ fn external_launch_session_id_alias_persists_external_capture_method_without_ses
 
     let rows = fixture.invocation_session_rows();
     assert_eq!(rows.len(), 1, "rows: {rows:?}");
-    assert_external_launch_session_capture_row(&rows[0]);
+    assert_external_launch_session_capture_row(&rows[0], "external_provider_launch");
+}
+
+#[test]
+fn external_provider_unavailable_persists_failure_without_replay_or_quota_mutation() {
+    for raw_code in [0, 1] {
+        for resume in [false, true] {
+            let fixture = Fixture::new();
+            if resume {
+                assert_success(&fixture.run_launch());
+            }
+            let launches_before = records_for_subcommand(&fixture.records(), "launch").len();
+            let raw_code_text = raw_code.to_string();
+            let env = [
+                ("S10_PROVIDER_UNAVAILABLE", "1"),
+                ("S10_PROVIDER_UNAVAILABLE_EXIT_CODE", raw_code_text.as_str()),
+            ];
+            let output = if resume {
+                fixture.run_resume_with_env(&env)
+            } else {
+                fixture.run_launch_with_env(&env)
+            };
+            assert!(!output.status.success(), "{output:?}");
+            let result = assert_result_envelope_shape(&String::from_utf8_lossy(&output.stdout));
+            assert_eq!(result["status"], "failed");
+            assert_eq!(result["error_category"], "provider_unavailable");
+            assert_eq!(result["terminal_reason"], "provider_unavailable");
+            let row = fixture.latest_invocation_outcome();
+            assert_eq!(row.status, "failed");
+            assert_eq!(row.success, 0);
+            assert_eq!(row.exit_code, if raw_code == 0 { -1 } else { raw_code });
+            assert_eq!(row.terminal_reason.as_deref(), Some("provider_unavailable"));
+            let conn = open_invocation_db(&fixture.db_path());
+            let category: String = conn.query_row(
+            "SELECT error_category FROM invocations WHERE provider_name = ?1 ORDER BY id DESC LIMIT 1",
+            [PROVIDER], |row| row.get(0),
+        ).unwrap();
+            assert_eq!(category, "provider_unavailable");
+            let quota_mutations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM provider_quotas WHERE exhausted_at IS NOT NULL OR next_available_at IS NOT NULL OR failure_class IS NOT NULL",
+            [], |row| row.get(0),
+        ).unwrap();
+            assert_eq!(quota_mutations, 0);
+            let records = fixture.records();
+            let launches = records_for_subcommand(&records, "launch");
+            assert_eq!(
+                launches.len(),
+                launches_before + 1,
+                "request must not be replayed"
+            );
+            assert_eq!(
+                launches.last().unwrap()["request"]["host"]["env"]["OULIPOLY_HOST_TERMINAL_UNAVAILABLE_V1"],
+                "1"
+            );
+            assert_no_rotation_or_migration_provider_calls(&records);
+        }
+    }
 }
 
 #[test]
@@ -1039,7 +1148,7 @@ fn external_provider_resume_terminal_error_exit_zero_finalizes_as_failed() {
 
     let output = fixture.run_resume_with_env(&[("S10_PROVIDER_ERROR_EXIT_ZERO", "1")]);
 
-    assert_failed_terminal_error_process(&output);
+    assert_failed_terminal_error_output(&output);
     assert_latest_invocation_failed_with_terminal_error(&fixture);
 }
 
@@ -1057,30 +1166,36 @@ fn external_provider_launch_stream_over_capture_limit_finalizes_succeeded() {
 
 fn assert_external_launch_session_capture_rows(rows: &[InvocationSessionRow]) {
     assert_eq!(rows.len(), 2, "rows: {rows:?}");
-    assert_external_launch_session_capture_row(&rows[0]);
+    assert_external_launch_session_capture_row(&rows[0], "provider_session_capture");
 
     let resume = &rows[1];
     assert_eq!(resume.session_id.as_deref(), Some(SESSION_ID));
-    assert_eq!(resume.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(
+        resume.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
     assert_eq!(resume.provider_session_id.as_deref(), Some(SESSION_ID));
     assert_eq!(resume.resume_input_id.as_deref(), Some(SESSION_ID));
     assert_eq!(
         resume.provider_session_capture_method.as_deref(),
-        Some("resumed")
+        Some("external_provider_launch")
     );
 }
 
-fn assert_external_launch_session_capture_row(launch: &InvocationSessionRow) {
+fn assert_external_launch_session_capture_row(
+    launch: &InvocationSessionRow,
+    expected_capture_method: &str,
+) {
     assert_eq!(launch.session_id.as_deref(), Some(SESSION_ID));
     assert_eq!(
         launch.session_capture_method.as_deref(),
-        Some("external_provider_launch")
+        Some(expected_capture_method)
     );
     assert_eq!(launch.provider_session_id.as_deref(), Some(SESSION_ID));
     assert_eq!(launch.resume_input_id.as_deref(), None);
     assert_eq!(
         launch.provider_session_capture_method.as_deref(),
-        Some("external_provider_launch")
+        Some(expected_capture_method)
     );
 }
 
@@ -1114,12 +1229,41 @@ fn combined_output(output: &Output) -> String {
 
 fn assert_failed_terminal_error_output(output: &Output) {
     assert_failed_terminal_error_process(output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation_id = single_invocation_id(&stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let result = assert_result_envelope_shape(&stdout);
+    assert_eq!(result["id"], invocation_id);
+    assert_eq!(result["agent_runner_invocation_id"], invocation_id);
     assert_eq!(result["status"], "failed");
     assert_eq!(result["success"], false);
     assert_eq!(result["exit_code"], -1);
+    assert_eq!(result["error_category"], INCIDENT_TERMINAL_REASON);
     assert_eq!(result["terminal_reason"], INCIDENT_TERMINAL_REASON);
+    assert_eq!(result["provider_name"], PROVIDER);
+    assert_eq!(result["provider_session_id"], SESSION_ID);
+    assert!(
+        result["agent_runner_chain_id"].as_str().is_some(),
+        "{result}"
+    );
+    assert!(result["finished_at"].as_str().is_some(), "{result}");
+}
+
+fn single_invocation_id(stderr: &str) -> String {
+    let lines: Vec<_> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_INVOCATION="))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "terminal-error execution must emit one invocation identity:\n{stderr}"
+    );
+    let value: Value = serde_json::from_str(lines[0]).expect("parse invocation identity");
+    value["id"]
+        .as_str()
+        .expect("invocation identity id")
+        .to_string()
 }
 
 fn assert_failed_terminal_error_process(output: &Output) {
@@ -1201,6 +1345,7 @@ fn external_provider_script(record_path: &Path, options: ProviderOptions) -> Str
     format!(
         r#"#!/usr/bin/env python3
 import base64
+import hashlib
 import json
 import os
 import pathlib
@@ -1243,6 +1388,7 @@ def describe():
         "preferred_contract": CONTRACT,
         "capabilities": {{
             "launch": True,
+            "launch_output_v1": True,
             "policy": True,
             "quota": False,
             "session": {session_capability},
@@ -1273,7 +1419,10 @@ def launch_payload():
     return request.get("params", {{}}).get("model", {{}}).get("inputs", {{}}).get("prompt", "")
 
 def launch_stdout_data(payload):
-    return base64.b64encode(("answer:" + payload + "\n").encode("utf-8")).decode("ascii")
+    return base64.b64encode(launch_stdout_bytes(payload)).decode("ascii")
+
+def launch_stdout_bytes(payload):
+    return ("answer:" + payload + "\n").encode("utf-8")
 
 def launch_stdout_event(seq, payload):
     return {{
@@ -1316,8 +1465,25 @@ def launch_exit_event(seq, terminal_signal):
         "session": launch_session_state(),
     }}
 
-def provider_error_exit_event():
-    return launch_exit_event(2, launch_terminal_signal("unknown", {incident_terminal_reason}, 2))
+def launch_output_complete_event(seq, payload):
+    stdout = launch_stdout_bytes(payload)
+    return {{
+        "contract": CONTRACT,
+        "request_id": request_id(),
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
+        "kind": "marker",
+        "name": "oulipoly.launch_output_complete/v1",
+        "value": {{
+            "protocol": "oulipoly.launch_output/v1",
+            "stdout": {{"bytes": len(stdout), "sha256": hashlib.sha256(stdout).hexdigest()}},
+            "stderr": {{"bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()}},
+            "data_event_count": 1,
+        }},
+    }}
+
+def provider_error_exit_event(seq):
+    return launch_exit_event(seq, launch_terminal_signal("unknown", {incident_terminal_reason}, seq))
 
 def clean_exit_event(seq):
     return launch_exit_event(seq, launch_terminal_signal("clean_exit", "fixture clean exit", seq))
@@ -1341,32 +1507,27 @@ def emit_long_launch_heartbeats():
         emit(launch_heartbeat_event(seq, detail))
 
 def launch():
-    emit(launch_stdout_event(1, launch_payload()))
-    if launch_error_exit_requested():
-        emit(provider_error_exit_event())
+    payload = launch_payload()
+    emit(launch_stdout_event(1, payload))
+    if os.environ.get("S10_PROVIDER_UNAVAILABLE") == "1":
+        selected = request.get("host", {{}}).get("env", {{}}).get("OULIPOLY_HOST_TERMINAL_UNAVAILABLE_V1") == "1"
+        kind = "provider_unavailable" if selected else "unknown"
+        emit(launch_output_complete_event(2, payload))
+        event = launch_exit_event(3, launch_terminal_signal(kind, "upstream temporarily unavailable", 3))
+        event["status"]["code"] = int(os.environ.get("S10_PROVIDER_UNAVAILABLE_EXIT_CODE", "0"))
+        emit(event)
         return
-    exit_seq = 2
+    if launch_error_exit_requested():
+        emit(launch_output_complete_event(2, payload))
+        emit(provider_error_exit_event(3))
+        return
     if launch_long_stream_requested():
         emit_long_launch_heartbeats()
-        exit_seq = 702
-    emit(clean_exit_event(exit_seq))
-
-def read_turns():
-    params = request.get("params", {{}})
-    extra = params.get("extra", {{}})
-    session_id = params.get("session_id") or extra.get("start_bound_provider_session_id") or extra.get("pinned_target") or SESSION_ID
-    turn_id = "turn-" + extra.get("invocation_uuid", "fixture")[:8]
-    return envelope({{
-        "turns": [{{
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "role": "assistant",
-            "timestamp": "2026-06-01T00:00:00Z",
-            "body": [{{"type": "text", "text": "fixture turn"}}],
-        }}],
-        "turn_count": 1,
-        "complete": True,
-    }})
+        emit(launch_output_complete_event(702, payload))
+        emit(clean_exit_event(703))
+        return
+    emit(launch_output_complete_event(2, payload))
+    emit(clean_exit_event(3))
 
 def capture():
     params = request.get("params", {{}})
@@ -1383,8 +1544,6 @@ elif subcommand == "policy.evaluate":
     print(json.dumps(policy_evaluate()))
 elif subcommand == "launch":
     launch()
-elif subcommand == "session.read_turns":
-    print(json.dumps(read_turns()))
 elif subcommand == "session.capture":
     print(json.dumps(capture()))
 else:

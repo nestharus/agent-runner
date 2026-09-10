@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 const PROVIDER_A_MODEL: &str = "provider-a-model";
 const PROVIDER_A_ACCOUNT: &str = "provider-a-account";
 const PROVIDER_A_INSTANCE: &str = "provider-a-instance";
-const PROVIDER_A_SETTINGS: &str = "provider-a-test-settings";
 
 #[test]
 fn locate_cli_dispatches_external_provider_locate_and_preserves_request_shape() {
@@ -248,7 +247,7 @@ fn historical_ref_locate_uses_external_path_and_rejects_local_success_on_error()
 }
 
 #[test]
-fn historical_no_ref_locate_uses_local_storage_and_ignores_unrelated_external_model() {
+fn historical_endpoint_account_without_persisted_authority_fails_closed() {
     let prepared = historical_no_ref_locate_fixture();
     let record_path = prepared.fixture.root().join("provider-a-records.jsonl");
     let provider_path = write_cli_provider_a_script(
@@ -268,16 +267,11 @@ fn historical_no_ref_locate_uses_local_storage_and_ignores_unrelated_external_mo
         .fixture
         .run_locate(&prepared.session_id, &["--json"]);
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert!(output.stderr.is_empty(), "{output:?}");
-    let stdout = parse_stdout_json(&output);
-    assert_eq!(stdout["session_id"], prepared.session_id);
-    assert_eq!(stdout["chain_id"], prepared.chain_id);
-    assert_eq!(stdout["provider_name"], prepared.provider_name);
-    assert_eq!(stdout["storage_type"], native_storage_kind());
-    assert_eq!(
-        stdout["jsonl_path"],
-        prepared.transcript_path.display().to_string()
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("session_provider_authority_unavailable"),
+        "{output:?}"
     );
     assert!(provider_records(&record_path).is_empty());
 }
@@ -310,12 +304,14 @@ fn external_provider_locate_fixture(mode: &str) -> ExternalLocateFixture {
         write_cli_provider_a_script(fixture.root(), mode, &record_path, &transcript_path);
     fixture.write_external_model(PROVIDER_A_MODEL, PROVIDER_A_ACCOUNT, &provider_path);
     fixture.write_provider(PROVIDER_A_ACCOUNT, StorageKind::None, false, None);
-    fixture.seed_active_chain(
+    fixture.set_provider_authority(PROVIDER_A_ACCOUNT, &provider_path);
+    fixture.seed_active_chain_at(
         CHAIN_A,
         PROVIDER_A_ACCOUNT,
         SESSION_A,
         PROVIDER_A_MODEL,
         "2026-05-01T00:00:00Z",
+        (PROVIDER_A_INSTANCE, PROVIDER_A_ACCOUNT),
     );
     ExternalLocateFixture {
         fixture,
@@ -345,13 +341,15 @@ fn historical_ref_locate_fixture(mode: &str) -> HistoricalLocateFixture {
         true,
         None,
     );
+    fixture.set_provider_authority(&provider_name, &provider_path);
     fixture.write_sessions_with_locator_path(&provider_name, &local_path);
-    fixture.seed_active_chain(
+    fixture.seed_active_chain_at(
         CHAIN_A,
         &provider_name,
         SESSION_A,
         &model_name,
         "2026-01-15T00:00:00Z",
+        (PROVIDER_A_INSTANCE, &provider_name),
     );
     HistoricalLocateFixture {
         fixture,
@@ -379,7 +377,7 @@ fn historical_no_ref_locate_fixture() -> HistoricalLocateFixture {
         true,
         None,
     );
-    fixture.seed_active_chain(
+    fixture.seed_active_chain_without_authority(
         CHAIN_A,
         &provider_name,
         SESSION_A,
@@ -424,10 +422,6 @@ fn real_provider_token(parts: &[&str]) -> String {
     parts.concat()
 }
 
-fn native_storage_kind() -> String {
-    format!("{}_code", real_provider_token(&["cla", "ude"]))
-}
-
 fn assert_historical_locate_request_shape(
     records: &[Value],
     model_name: &str,
@@ -440,7 +434,7 @@ fn assert_historical_locate_request_shape(
     assert_eq!(locate_records.len(), 1, "{records:?}");
     let request = &locate_records[0]["request"];
     assert_eq!(request["provider_instance_id"], PROVIDER_A_INSTANCE);
-    assert_eq!(request["params"]["settings_id"], PROVIDER_A_SETTINGS);
+    assert_eq!(request["params"]["settings_id"], provider_name);
     assert_eq!(request["params"]["model_name"], model_name);
     assert_eq!(request["params"]["provider_name"], provider_name);
     assert_eq!(request["params"]["session_id"], SESSION_A);
@@ -463,7 +457,7 @@ fn assert_external_locate_request_shape(records: &[Value]) {
     assert_eq!(locate_records.len(), 1, "{records:?}");
     let request = &locate_records[0]["request"];
     assert_eq!(request["provider_instance_id"], PROVIDER_A_INSTANCE);
-    assert_eq!(request["params"]["settings_id"], PROVIDER_A_SETTINGS);
+    assert_eq!(request["params"]["settings_id"], PROVIDER_A_ACCOUNT);
     assert_eq!(request["params"]["model_name"], PROVIDER_A_MODEL);
     assert_eq!(request["params"]["provider_name"], PROVIDER_A_ACCOUNT);
     assert_eq!(request["params"]["session_id"], SESSION_A);

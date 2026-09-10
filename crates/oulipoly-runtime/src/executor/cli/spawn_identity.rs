@@ -22,8 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
-const AUTO_WAKE_ENV: &str = "OULIPOLY_AUTO_WAKE";
-const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
+pub(crate) const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
 const CHILD_CUSTODY_TEST_FAULT_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_FAULT";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +55,28 @@ pub(crate) struct SpawnIdentityContext {
 }
 
 impl SpawnIdentityContext {
+    pub(crate) fn for_allocated_attempt(
+        lease: &oulipoly_state::ProviderLaunchLease,
+        mailbox_path: PathBuf,
+        model: String,
+        cwd: Option<&Path>,
+        models_dir: Option<&Path>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            generation_id: RuntimeGenerationId::parse(&lease.runtime_generation_uuid.to_string())
+                .map_err(|e| e.to_string())?,
+            invocation_uuid: lease.owner.invocation_uuid.to_string(),
+            provider_name: lease.candidate.account_name.clone(),
+            model_name: Some(model),
+            session_id: None,
+            mode: SpawnRuntimeMode::Headless,
+            pty_control_path: None,
+            effective_cwd: cwd.map(|p| p.to_string_lossy().into_owned()),
+            models_dir: models_dir.map(|p| p.to_string_lossy().into_owned()),
+            mailbox_db_path: Some(mailbox_path),
+        })
+    }
+
     pub(super) fn invocation_uuid(&self) -> &str {
         &self.invocation_uuid
     }
@@ -101,9 +122,9 @@ pub(crate) fn context_from_parent_invocation_env(
 }
 
 pub(crate) fn provider_parent_invocation_env(current: Option<&str>) -> Option<String> {
-    let auto_wake = std::env::var(AUTO_WAKE_ENV).ok().as_deref() == Some("1");
-    let inherited = std::env::var(PARENT_INVOCATION_ENV).ok();
-    provider_parent_invocation_env_for(current, auto_wake, inherited.as_deref())
+    // The provider process is the immediate capability caller. Durable invocation
+    // parentage, rather than inherited process state, records wake ancestry.
+    current.map(str::to_string)
 }
 
 pub(crate) fn split_invocation_launch_environment(
@@ -140,20 +161,6 @@ pub(crate) fn split_invocation_launch_environment(
         value.to_string()
     };
     Ok((identity, authority))
-}
-
-fn provider_parent_invocation_env_for(
-    current: Option<&str>,
-    auto_wake: bool,
-    inherited: Option<&str>,
-) -> Option<String> {
-    if auto_wake
-        && let Some(inherited) = inherited
-        && CompositeInvocationId::parse_env_value(inherited).is_ok()
-    {
-        return Some(inherited.to_string());
-    }
-    current.map(str::to_string)
 }
 
 fn parse_parent_invocation_env(
@@ -310,11 +317,8 @@ impl<'a> ChildGenerationCustody<'a> {
         if !self.exit_observed {
             return Err("Cannot complete child generation before observing exit".to_string());
         }
-        mark_runtime_generation_orderly_completed(
-            self.context,
-            exit_code,
-            compatibility_exit_code,
-        )?;
+        mark_runtime_generation_orderly_completed(self.context, exit_code, compatibility_exit_code)
+            .map_err(|error| error.to_string())?;
         self.generation_completed = true;
         #[cfg(unix)]
         self.signal_guard.take();
@@ -432,6 +436,21 @@ pub(crate) fn register_runtime_generation_starting(
     let Some(context) = context else {
         return Ok(());
     };
+    register_generation_starting(context, false)
+}
+
+/// Allocation is single-use execution authority. Existing rows are evidence for
+/// non-executing reconciliation, never permission to run policy/launch again.
+pub(crate) fn register_allocated_runtime_generation_starting(
+    context: &SpawnIdentityContext,
+) -> Result<(), String> {
+    register_generation_starting(context, true)
+}
+
+fn register_generation_starting(
+    context: &SpawnIdentityContext,
+    fresh_only: bool,
+) -> Result<(), String> {
     let mut db = context.open_mailbox()?;
     recover_stale_session_generations(&mut db, context)?;
     match db
@@ -449,7 +468,11 @@ pub(crate) fn register_runtime_generation_starting(
         })
         .map_err(|err| err.to_string())?
     {
-        GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_) => Ok(()),
+        GenerationMutation::Applied(_) => Ok(()),
+        GenerationMutation::AlreadyApplied(_) if !fresh_only => Ok(()),
+        GenerationMutation::AlreadyApplied(_) => {
+            Err("allocated_runtime_generation_already_exists".into())
+        }
         GenerationMutation::Rejected(rejection) => Err(format!(
             "Runtime generation starting registration rejected: {rejection:?}"
         )),
@@ -554,34 +577,76 @@ pub(crate) fn record_child_identity(
     }
 }
 
+/// Bounded diagnostics: never carry database paths, SQL, or provider/session strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GenerationOperationError {
+    Rejected(oulipoly_state::mailbox::GenerationRejection),
+    ContextMismatch,
+    InvalidSession,
+    MissingGeneration,
+    StorageFailure,
+    Unknown,
+}
+
+impl std::fmt::Display for GenerationOperationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GenerationOperationOutcome {
+    NotRequired,
+    Applied,
+    AlreadyApplied,
+}
+
+fn generation_operation_outcome<T>(
+    mutation: GenerationMutation<T>,
+) -> Result<GenerationOperationOutcome, GenerationOperationError> {
+    match mutation {
+        GenerationMutation::Applied(_) => Ok(GenerationOperationOutcome::Applied),
+        GenerationMutation::AlreadyApplied(_) => Ok(GenerationOperationOutcome::AlreadyApplied),
+        GenerationMutation::Rejected(reason) => Err(GenerationOperationError::Rejected(reason)),
+    }
+}
+
 pub(crate) fn backfill_captured_session_id(
     context: Option<&SpawnIdentityContext>,
     generation: Option<&RunningRuntimeGeneration>,
     session_id: &str,
 ) -> Result<(), String> {
-    let (Some(context), Some(generation)) = (context, generation) else {
-        return Ok(());
+    attach_captured_session_id(context, generation, session_id)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn attach_captured_session_id(
+    context: Option<&SpawnIdentityContext>,
+    generation: Option<&RunningRuntimeGeneration>,
+    session_id: &str,
+) -> Result<GenerationOperationOutcome, GenerationOperationError> {
+    let Some(context) = context else {
+        return Ok(GenerationOperationOutcome::NotRequired);
     };
-    if generation.generation_id != context.generation_id {
-        return Err("Captured session generation does not match its spawn context".to_string());
+    if session_id.is_empty() {
+        return Err(GenerationOperationError::InvalidSession);
     }
-    let mut db = context.open_mailbox()?;
-    match db
+    let generation = generation.ok_or(GenerationOperationError::MissingGeneration)?;
+    if generation.generation_id != context.generation_id {
+        return Err(GenerationOperationError::ContextMismatch);
+    }
+    let mut db = context
+        .open_mailbox()
+        .map_err(|_| GenerationOperationError::StorageFailure)?;
+    let mutation = db
         .runtime_lifecycle()
         .attach_runtime_generation_session(AttachRuntimeGenerationSession {
             fence: generation_fence(context),
             session_id,
         })
-        .map_err(|err| err.to_string())?
-    {
-        GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_) => {}
-        GenerationMutation::Rejected(rejection) => {
-            return Err(format!(
-                "Runtime generation session attachment rejected: {rejection:?}"
-            ));
-        }
-    }
-    Ok(())
+        .map_err(|_| GenerationOperationError::StorageFailure)?;
+    generation_operation_outcome(mutation)
 }
 
 fn warn_child_identity_record_failed(context: &SpawnIdentityContext, child_id: u32, err: &str) {
@@ -613,12 +678,14 @@ pub(crate) fn mark_runtime_generation_orderly_completed(
     context: Option<&SpawnIdentityContext>,
     exit_code: Option<i32>,
     compatibility_exit_code: Option<i32>,
-) -> Result<(), String> {
+) -> Result<(), GenerationOperationError> {
     let Some(context) = context else {
         return Ok(());
     };
     let drain_request_id = DrainRequestId::new();
-    let mut db = context.open_mailbox()?;
+    let mut db = context
+        .open_mailbox()
+        .map_err(|_| GenerationOperationError::StorageFailure)?;
     let handoff = match db
         .runtime_lifecycle()
         .request_runtime_generation_drain(RequestRuntimeGenerationDrain {
@@ -626,23 +693,22 @@ pub(crate) fn mark_runtime_generation_orderly_completed(
             drain_request_id: &drain_request_id,
             requested_by_invocation_uuid: &context.invocation_uuid,
         })
-        .map_err(|err| err.to_string())?
+        .map_err(|_| GenerationOperationError::StorageFailure)?
     {
         DrainRequestResult::Installed(_, handoff)
         | DrainRequestResult::AlreadyInstalled(_, handoff) => handoff,
         DrainRequestResult::Rejected(rejection) => {
-            return Err(format!(
-                "Runtime generation drain request rejected: {rejection:?}"
-            ));
+            return Err(GenerationOperationError::Rejected(rejection));
         }
     };
     if matches!(handoff, DrainHandoff::ClaimOutstanding { .. }) {
         drop(db);
-        return exit_runtime_generation(
+        return exit_runtime_generation_outcome(
             Some(context),
             RuntimeTerminalReason::AbnormalTermination,
             exit_code,
-        );
+        )
+        .map(|_| ());
     }
     match db
         .runtime_lifecycle()
@@ -650,22 +716,21 @@ pub(crate) fn mark_runtime_generation_orderly_completed(
             fence: generation_fence(context),
             drain_request_id: &drain_request_id,
         })
-        .map_err(|err| err.to_string())?
+        .map_err(|_| GenerationOperationError::StorageFailure)?
     {
         DrainAdvanceResult::Advanced(_) | DrainAdvanceResult::AlreadyDraining(_) => {}
         DrainAdvanceResult::WaitingOnClaim(_) => {
             drop(db);
-            return exit_runtime_generation(
+            return exit_runtime_generation_outcome(
                 Some(context),
                 RuntimeTerminalReason::AbnormalTermination,
                 exit_code,
-            );
+            )
+            .map(|_| ());
         }
         DrainAdvanceResult::AlreadyExited(_) => return Ok(()),
         DrainAdvanceResult::Rejected(rejection) => {
-            return Err(format!(
-                "Runtime generation drain advance rejected: {rejection:?}"
-            ));
+            return Err(GenerationOperationError::Rejected(rejection));
         }
     }
     match db
@@ -676,15 +741,18 @@ pub(crate) fn mark_runtime_generation_orderly_completed(
             exit_code,
             compatibility_exit_code,
         })
-        .map_err(|err| err.to_string())?
+        .map_err(|_| GenerationOperationError::StorageFailure)?
     {
         DrainFinishResult::Finished(_) | DrainFinishResult::AlreadyExited(_) => Ok(()),
-        DrainFinishResult::NotDraining(actual) => Err(format!(
-            "Runtime generation was {actual:?} while finishing orderly drain"
+        DrainFinishResult::NotDraining(actual) => Err(GenerationOperationError::Rejected(
+            oulipoly_state::mailbox::GenerationRejection::IllegalPredecessor {
+                expected: RuntimeLifecycleState::Draining,
+                actual,
+            },
         )),
-        DrainFinishResult::Rejected(rejection) => Err(format!(
-            "Runtime generation drain finish rejected: {rejection:?}"
-        )),
+        DrainFinishResult::Rejected(rejection) => {
+            Err(GenerationOperationError::Rejected(rejection))
+        }
     }
 }
 
@@ -693,24 +761,31 @@ fn exit_runtime_generation(
     reason: RuntimeTerminalReason,
     exit_code: Option<i32>,
 ) -> Result<(), String> {
+    exit_runtime_generation_outcome(context, reason, exit_code)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn exit_runtime_generation_outcome(
+    context: Option<&SpawnIdentityContext>,
+    reason: RuntimeTerminalReason,
+    exit_code: Option<i32>,
+) -> Result<GenerationOperationOutcome, GenerationOperationError> {
     let Some(context) = context else {
-        return Ok(());
+        return Ok(GenerationOperationOutcome::NotRequired);
     };
-    let mut db = context.open_mailbox()?;
-    match db
+    let mut db = context
+        .open_mailbox()
+        .map_err(|_| GenerationOperationError::StorageFailure)?;
+    let mutation = db
         .runtime_lifecycle()
         .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
             fence: generation_fence(context),
             reason,
             exit_code,
         })
-        .map_err(|err| err.to_string())?
-    {
-        GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_) => Ok(()),
-        GenerationMutation::Rejected(rejection) => {
-            Err(format!("Runtime generation exit rejected: {rejection:?}"))
-        }
-    }
+        .map_err(|_| GenerationOperationError::StorageFailure)?;
+    generation_operation_outcome(mutation)
 }
 
 fn generation_fence(context: &SpawnIdentityContext) -> RuntimeGenerationFence<'_> {
@@ -729,30 +804,170 @@ mod tests {
     use super::*;
 
     const CURRENT: &str = r#"{"source":"opencode3","id":"11111111-1111-4111-8111-111111111111"}"#;
-    const OWNER: &str = r#"{"source":"opencode3","id":"22222222-2222-4222-8222-222222222222"}"#;
+
+    fn attachment_fixture(path: &Path) -> (SpawnIdentityContext, RunningRuntimeGeneration) {
+        let context = context_from_parent_invocation_env(
+            Some(CURRENT),
+            "fixture",
+            None,
+            None,
+            SpawnRuntimeMode::Headless,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_mailbox_db_path(path.to_path_buf());
+        register_runtime_generation_starting(Some(&context)).unwrap();
+        // Attachment fences are independent of OS liveness. No provider is launched.
+        let generation = RunningRuntimeGeneration {
+            generation_id: context.generation_id.clone(),
+            spawned_os_pid: 123,
+            exact_process_identity: ProcessIdentity {
+                os_pid: 123,
+                os_boot_id: "fixture".into(),
+                os_pid_starttime_ticks: 1,
+            },
+        };
+        (context, generation)
+    }
 
     #[test]
-    fn auto_wake_provider_keeps_inherited_semantic_owner() {
+    fn attachment_outcomes_preserve_replay_session_and_invocation_fences() {
+        use oulipoly_state::mailbox::GenerationRejection;
+        let dir = tempfile::tempdir().unwrap();
+        let (context, generation) = attachment_fixture(&dir.path().join("pid-identity.db"));
         assert_eq!(
-            provider_parent_invocation_env_for(Some(CURRENT), true, Some(OWNER)).as_deref(),
-            Some(OWNER)
+            attach_captured_session_id(Some(&context), Some(&generation), "session-a"),
+            Ok(GenerationOperationOutcome::Applied)
+        );
+        assert_eq!(
+            attach_captured_session_id(Some(&context), Some(&generation), "session-a"),
+            Ok(GenerationOperationOutcome::AlreadyApplied)
+        );
+        assert_eq!(
+            attach_captured_session_id(Some(&context), Some(&generation), "session-b"),
+            Err(GenerationOperationError::Rejected(
+                GenerationRejection::SessionConflict
+            ))
+        );
+        let mut stale = context.clone();
+        stale.invocation_uuid = "22222222-2222-4222-8222-222222222222".into();
+        assert_eq!(
+            attach_captured_session_id(Some(&stale), Some(&generation), "session-a"),
+            Err(GenerationOperationError::Rejected(
+                GenerationRejection::FenceMismatch
+            ))
+        );
+        assert_eq!(
+            exit_runtime_generation_outcome(
+                Some(&stale),
+                RuntimeTerminalReason::StartupFailed,
+                None
+            ),
+            Err(GenerationOperationError::Rejected(
+                GenerationRejection::FenceMismatch
+            ))
+        );
+        let db = context.open_mailbox().unwrap();
+        let row = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&context.generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("session-a"));
+        assert_eq!(row.lifecycle_state, RuntimeLifecycleState::Starting);
+        drop(db);
+        assert_eq!(
+            exit_runtime_generation_outcome(
+                Some(&context),
+                RuntimeTerminalReason::StartupFailed,
+                None
+            ),
+            Ok(GenerationOperationOutcome::Applied)
+        );
+        assert_eq!(
+            exit_runtime_generation_outcome(
+                Some(&context),
+                RuntimeTerminalReason::StartupFailed,
+                None
+            ),
+            Ok(GenerationOperationOutcome::AlreadyApplied)
         );
     }
 
     #[test]
-    fn ordinary_provider_uses_current_invocation() {
+    fn attachment_and_cleanup_storage_failure_are_safe_and_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut context, generation) = attachment_fixture(&dir.path().join("pid-identity.db"));
+        let blocker = dir.path().join("secret-token-path");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        context.mailbox_db_path = Some(blocker.join("pid-identity.db"));
+        let attachment =
+            attach_captured_session_id(Some(&context), Some(&generation), "secret-session");
+        let cleanup = exit_runtime_generation_outcome(
+            Some(&context),
+            RuntimeTerminalReason::StartupFailed,
+            None,
+        );
+        assert_eq!(attachment, Err(GenerationOperationError::StorageFailure));
+        assert_eq!(cleanup, Err(GenerationOperationError::StorageFailure));
+        assert!(!format!("{attachment:?};{cleanup:?}").contains("secret"));
         assert_eq!(
-            provider_parent_invocation_env_for(Some(CURRENT), false, Some(OWNER)).as_deref(),
+            attach_captured_session_id(Some(&context), None, "session"),
+            Err(GenerationOperationError::MissingGeneration)
+        );
+        let mut foreign = generation.clone();
+        foreign.generation_id = RuntimeGenerationId::new();
+        assert_eq!(
+            attach_captured_session_id(Some(&context), Some(&foreign), "session"),
+            Err(GenerationOperationError::ContextMismatch)
+        );
+    }
+
+    #[test]
+    fn provider_launch_uses_current_capability_owner() {
+        assert_eq!(
+            provider_parent_invocation_env(Some(CURRENT)).as_deref(),
             Some(CURRENT)
         );
     }
 
     #[test]
-    fn auto_wake_rejects_malformed_inherited_owner() {
+    fn provider_launch_preserves_current_authority_for_private_transport() {
+        let invocation = CompositeInvocationId {
+            source: "opencode3".to_string(),
+            id: "11111111-1111-4111-8111-111111111111".to_string(),
+        };
+        let authority =
+            oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+                "ab".repeat(32),
+            )
+            .unwrap();
+        let current = authority
+            .invocation_launch_environment(&invocation)
+            .unwrap();
+
+        let selected = provider_parent_invocation_env(Some(&current)).unwrap();
+        let (observable_identity, transported_authority) =
+            split_invocation_launch_environment(&selected).unwrap();
+
         assert_eq!(
-            provider_parent_invocation_env_for(Some(CURRENT), true, Some("not-json")).as_deref(),
-            Some(CURRENT)
+            CompositeInvocationId::parse_env_value(&observable_identity).unwrap(),
+            invocation
         );
+        assert!(
+            !observable_identity
+                .contains(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD)
+        );
+        assert_eq!(
+            transported_authority.as_deref(),
+            Some(authority.process_environment_value())
+        );
+    }
+
+    #[test]
+    fn provider_without_current_invocation_has_no_capability_owner() {
+        assert_eq!(provider_parent_invocation_env(None), None);
     }
 
     #[test]

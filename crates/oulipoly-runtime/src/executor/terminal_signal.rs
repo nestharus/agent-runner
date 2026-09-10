@@ -100,7 +100,7 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(139)
     }
 
-    fn all_kinds() -> [TerminalSignalKind; 9] {
+    fn all_kinds() -> [TerminalSignalKind; 10] {
         [
             TerminalSignalKind::CleanExit,
             TerminalSignalKind::NonzeroExit,
@@ -109,6 +109,7 @@ mod tests {
             TerminalSignalKind::QuotaExhaustedInband,
             TerminalSignalKind::MaybeQuotaExhausted,
             TerminalSignalKind::RateLimited,
+            TerminalSignalKind::ProviderUnavailable,
             TerminalSignalKind::ProlongedSilence,
             TerminalSignalKind::Unknown,
         ]
@@ -189,6 +190,7 @@ mod tests {
             TerminalSignalKind::MaybeQuotaExhausted => "maybe_quota_exhausted",
             TerminalSignalKind::RateLimited => "rate_limited",
             TerminalSignalKind::ProviderStorageContention => "provider_storage_contention",
+            TerminalSignalKind::ProviderUnavailable => "provider_unavailable",
             TerminalSignalKind::ProlongedSilence => "prolonged_silence",
             TerminalSignalKind::Unknown => "unknown",
         }
@@ -252,6 +254,10 @@ mod tests {
                 "maybe_quota_exhausted",
             ),
             (TerminalSignalKind::RateLimited, "rate_limited"),
+            (
+                TerminalSignalKind::ProviderUnavailable,
+                "provider_unavailable",
+            ),
             (TerminalSignalKind::ProlongedSilence, "prolonged_silence"),
             (TerminalSignalKind::Unknown, "unknown"),
         ];

@@ -28,7 +28,15 @@ fn record_invocation(db: &StateDb, model_name: &str, provider_name: &str, provid
             parent_invocation_id: None,
         })
         .unwrap();
-    db.finalize_invocation(id, true, 0, None, None).unwrap();
+    db.finalize_invocation(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        id,
+        true,
+        0,
+        None,
+        None,
+    )
+    .unwrap();
 }
 
 // Risk: RC-1 fallback identity (claude pool 0% while claude2/claude3 absorb routing) | level: unit

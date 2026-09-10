@@ -42,12 +42,24 @@ pub(crate) fn effective_resume_spawn_cwd(
     resume_input: &str,
     working_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
+    let workspace_root = resume_workspace_root(state, providers_cfg, resolved);
+    if resolved_uses_external_provider(providers_cfg, resolved) {
+        return workspace_root.map_err(|error| {
+            crate::commands::session_locate_export::metadata_error_message(&error)
+        });
+    }
     let fallback = effective_spawn_cwd(working_dir)?;
-    resolve_resume_spawn_cwd_or_fallback(
-        resume_workspace_root(state, providers_cfg, resolved),
-        resume_input,
-        fallback,
-    )
+    resolve_resume_spawn_cwd_or_fallback(workspace_root, resume_input, fallback)
+}
+
+fn resolved_uses_external_provider(
+    providers_cfg: &ProvidersConfig,
+    resolved: &ResolvedResume,
+) -> bool {
+    providers_cfg
+        .get(&resolved.active_provider)
+        .and_then(|provider| provider.implementation.as_ref())
+        .is_some()
 }
 
 fn resume_workspace_root(

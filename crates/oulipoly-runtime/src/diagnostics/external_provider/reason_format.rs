@@ -9,6 +9,7 @@ pub(crate) fn fixed_reason_for_kind(kind: TerminalSignalKind) -> Option<&'static
         TerminalSignalKind::MaybeQuotaExhausted => Some("maybe_quota_exhausted"),
         TerminalSignalKind::RateLimited => Some("rate_limited"),
         TerminalSignalKind::ProviderStorageContention => Some("provider_storage_contention"),
+        TerminalSignalKind::ProviderUnavailable => Some("provider_unavailable"),
         TerminalSignalKind::ProlongedSilence => Some("bounded_silence"),
         TerminalSignalKind::NonzeroExit => Some("exit_nonzero"),
         TerminalSignalKind::SignalExit => Some("signal_exit"),

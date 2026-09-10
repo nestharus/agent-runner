@@ -19,7 +19,7 @@
 
 use chrono::{Duration, Utc};
 use oulipoly_config::{
-    ModelConfig, ProviderConfig, ProviderEntry, ProvidersConfig, SessionsConfig, model::PromptMode,
+    ModelConfig, ProviderConfig, ProviderEntry, ProvidersConfig, model::PromptMode,
 };
 use oulipoly_runtime::balancer::{BalanceContext, select_provider};
 use oulipoly_runtime::quota::InFlight;
@@ -156,12 +156,10 @@ fn age162_select_provider_with_refresh_context_picks_healthy_sibling_over_window
             ..ProviderEntry::default()
         },
     );
-    let sessions_cfg = SessionsConfig::default();
     let in_flight = InFlight::new();
 
     let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
 

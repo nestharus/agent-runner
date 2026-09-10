@@ -283,9 +283,10 @@ mod tests {
     use crate::session_metadata::TranscriptLookupMode;
     use crate::session_provider::{self, SessionProviderIdentity, SessionProviderLocateRequest};
     use oulipoly_config::{
-        ModelConfig, PromptMode, ProviderConfig,
-        provider_implementation_ref::ProviderImplementationRef,
+        ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+        ProvidersConfig,
     };
+    use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::SystemTime;
@@ -424,23 +425,28 @@ else:
     }
 
     fn blocking_provider_registry(provider_path: &Path) -> ProviderRegistry {
-        ProviderRegistry::from_model_configs(
-            &[ModelConfig {
-                name: "model-a".to_string(),
-                prompt_mode: PromptMode::Arg,
-                providers: vec![ProviderConfig::model_provider("provider-a", Vec::new())],
-                inputs: Vec::new(),
-                provider: Some(ProviderImplementationRef {
-                    path: Some(provider_path.display().to_string()),
-                    crate_name: None,
-                    version: None,
-                    binary: None,
-                    script: None,
-                }),
-            }],
-            ProviderRegistryOptions::default(),
-        )
-        .unwrap()
+        let models = [ModelConfig {
+            name: "model-a".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider("provider-a", Vec::new())],
+            inputs: Vec::new(),
+            provider: None,
+        }];
+        let providers = ProvidersConfig {
+            entries: HashMap::from([(
+                "provider-a".to_string(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "provider-a".to_string(),
+                        executable: provider_path.display().to_string(),
+                    }),
+                    settings_id: Some("provider-a-settings".to_string()),
+                    ..Default::default()
+                },
+            )]),
+        };
+        ProviderRegistry::from_configs(&models, &providers, ProviderRegistryOptions::default())
+            .unwrap()
     }
 
     fn blocking_provider_identity() -> SessionProviderIdentity {

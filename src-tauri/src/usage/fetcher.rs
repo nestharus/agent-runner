@@ -135,7 +135,7 @@ struct RefreshFileLock {
 
 impl RefreshFileLock {
     fn claim(account_id: &str) -> Result<Option<Self>, String> {
-        let dir = usage_lock_dir();
+        let dir = usage_lock_dir()?;
         fs::create_dir_all(&dir)
             .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
         let path = dir.join(format!("{}.lock", quota::sanitize_lock_key(account_id)));
@@ -162,8 +162,8 @@ impl Drop for RefreshFileLock {
     }
 }
 
-fn usage_lock_dir() -> PathBuf {
-    quota::lock_app_data_dir().join("usage-refresh-locks")
+fn usage_lock_dir() -> Result<PathBuf, String> {
+    quota::lock_app_data_dir().map(|dir| dir.join("usage-refresh-locks"))
 }
 
 fn create_lock_file(path: &Path) -> Result<Option<File>, io::Error> {

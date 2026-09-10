@@ -29,14 +29,17 @@ pub fn finalize_retained_outcome_with_contention_retry(
         1
     };
     for attempt in 1..=attempts {
-        let result = service.finalize_invocation(InvocationLifecycleFinalizeRequest {
-            state,
-            invocation_row_id,
-            success,
-            exit_code,
-            error_category,
-            terminal_reason,
-        });
+        let result = service.finalize_invocation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            InvocationLifecycleFinalizeRequest {
+                state,
+                invocation_row_id,
+                success,
+                exit_code,
+                error_category,
+                terminal_reason,
+            },
+        );
         match result {
             Err(ServiceError::Contention { .. }) if attempt < attempts => {
                 std::thread::sleep(SUCCESS_FINALIZE_RETRY_DELAY);

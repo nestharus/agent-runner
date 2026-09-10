@@ -29,26 +29,27 @@
 //! bytes feed a `vt100` parser that backs the top pane, while `ratatui` owns the
 //! screen so the monitor pane is protected from provider escape codes.
 
+#[path = "tui_control.rs"]
+mod tui_control;
+use tui_control::{ControlProgressIo, ControlWorker};
+
 use super::cancel::{
     CancelRequest, cancel_outcome_message, cancel_request_for_node, execute_cancel,
 };
-use super::outbound_observer::{
-    ObservedUserTurn, OutboundObservation, OutboundObservationIdentity, OutboundObservationResult,
-    OutboundObserverSource, OutboundObserverWorker,
-};
 #[cfg(test)]
-use super::seed_test_mailbox_delivery;
+use super::outbound_observer::ObservedUserTurn;
+use super::outbound_observer::{
+    OutboundObservation, OutboundObservationIdentity, OutboundObservationPhase,
+    OutboundObservationResult, OutboundObserverSource, OutboundObserverWorker,
+};
 use super::snapshot_worker::{MonitorSnapshotProvider, MonitorSnapshotWorker};
+use super::terminal_protocol::TerminalParser;
 use super::transcript_view::project_transcript_tail;
+use super::tui_profile::Profile;
 use super::{
-    ChildOutputState, ControlPayloadOutcome, ControlSocket, INJECT_WAIT_LIMIT, InputLineState,
-    PendingChildInput, RELAY_BUFFER_BYTES, begin_control_payload_submission,
-    flush_pending_child_input, is_pty_eof_error, poll_fds, poll_master_fd, poll_relay_fds,
-    poll_single_fd, prepare_control_payload, pty_delivery_ack_message, pty_delivery_test_fault,
-    pty_delivery_uncertain_message, queue_control_injection, read_control_request, read_fd,
-    readable, send_signal_to_child_group, set_pty_winsize, settle_control_payload,
-    submission_uncertain_outcome, terminal_winsize, validate_peer_uid, winsize_eq, writable,
-    write_control_response,
+    ChildOutputState, ControlSocket, InputLineState, PendingChildInput, RELAY_BUFFER_BYTES,
+    flush_pending_child_input, is_pty_eof_error, poll_master_fd, poll_relay_fds, poll_single_fd,
+    read_fd, readable, send_signal_to_child_group, set_pty_winsize, terminal_winsize, winsize_eq,
 };
 use crate::executor::cli::spawn_identity::ChildGenerationCustody;
 use crate::observability::{
@@ -71,11 +72,11 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::UnixStream;
 use std::process::ExitStatus;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -98,6 +99,10 @@ pub(super) const FOREGROUND_RENDER_FPS: u64 = 60;
 pub(super) const BACKGROUND_RENDER_FPS: u64 = 10;
 /// Bounded PTY reads folded into one relay iteration before publishing a frame.
 const MAX_COALESCED_PTY_READS: usize = 8;
+/// Batch per-cell terminal commands into frame writes; Ratatui flushes after each draw.
+const RENDER_BUFFER_BYTES: usize = 64 * 1024;
+
+type TuiTerminal = Terminal<CrosstermBackend<BufWriter<File>>>;
 
 /// Bracketed-paste delimiters (DECSET 2004) the broker wraps an injected notification in
 /// when the child has advertised the mode, so the body is treated as pasted content and
@@ -236,6 +241,7 @@ enum MonitorCommand {
     ToggleInspect,
     RequestCancel,
     RequestOutboundRetry,
+    RequestObservationRecovery,
     RequestOutboundDiscard,
     ConfirmAction,
     AbortAction,
@@ -358,6 +364,7 @@ enum BottomKey {
     Inspect,
     Cancel,
     RetryOutbound,
+    RecoverObservation,
     DiscardOutbound,
     Confirm,
     Abort,
@@ -420,11 +427,46 @@ enum TailFileReadError {
 #[derive(Debug)]
 struct InputRouter {
     focus: Focus,
+    pending_sequence: Vec<u8>,
+    sequence_started: Option<Instant>,
+    bracketed_paste: bool,
+    paste_marker_matched: usize,
 }
+
+const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
+const MAX_INPUT_SEQUENCE_BYTES: usize = 64;
 
 impl InputRouter {
     fn new() -> Self {
-        Self { focus: Focus::Top }
+        Self {
+            focus: Focus::Top,
+            pending_sequence: Vec::new(),
+            sequence_started: None,
+            bracketed_paste: false,
+            paste_marker_matched: 0,
+        }
+    }
+
+    fn sequence_expired(&self, now: Instant) -> bool {
+        self.sequence_started
+            .is_some_and(|started| now.duration_since(started) >= INPUT_SEQUENCE_TIMEOUT)
+    }
+
+    fn observe_paste_marker_byte(&mut self, byte: u8) {
+        let marker = if self.bracketed_paste {
+            BRACKETED_PASTE_END
+        } else {
+            BRACKETED_PASTE_START
+        };
+        self.paste_marker_matched = if byte == marker[self.paste_marker_matched] {
+            self.paste_marker_matched + 1
+        } else {
+            usize::from(byte == marker[0])
+        };
+        if self.paste_marker_matched == marker.len() {
+            self.bracketed_paste = !self.bracketed_paste;
+            self.paste_marker_matched = 0;
+        }
     }
 
     /// Keyboard-only routing helper. Production input always flows through
@@ -450,6 +492,9 @@ impl InputRouter {
 
     fn route_top_byte(&mut self, byte: u8, routed: &mut RoutedInput) -> usize {
         routed.forward.push(byte);
+        // Typing returns to the tail. Preserve wheel events that follow this key
+        // in the same read, while superseding wheel events before it.
+        routed.top_scroll_lines = 0;
         1
     }
 
@@ -574,6 +619,10 @@ fn parse_bottom_key(bytes: &[u8]) -> ParsedBottomKey {
             key: BottomKey::Cancel,
             consumed: 1,
         },
+        [0x07, ..] => ParsedBottomKey {
+            key: BottomKey::RecoverObservation,
+            consumed: 1,
+        },
         [0x10, ..] => ParsedBottomKey {
             key: BottomKey::RetryOutbound,
             consumed: 1,
@@ -659,6 +708,9 @@ fn bottom_key_route(key: BottomKey) -> BottomInputRoute {
         BottomKey::Collapse => BottomInputRoute::Command(MonitorCommand::Collapse),
         BottomKey::Inspect => BottomInputRoute::Command(MonitorCommand::ToggleInspect),
         BottomKey::Cancel => BottomInputRoute::Command(MonitorCommand::RequestCancel),
+        BottomKey::RecoverObservation => {
+            BottomInputRoute::Command(MonitorCommand::RequestObservationRecovery)
+        }
         BottomKey::RetryOutbound => BottomInputRoute::Command(MonitorCommand::RequestOutboundRetry),
         BottomKey::DiscardOutbound => {
             BottomInputRoute::Command(MonitorCommand::RequestOutboundDiscard)
@@ -1273,8 +1325,12 @@ enum OutboundStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OutboundBaseline {
     identity: OutboundObservationIdentity,
-    generation: u64,
-    turn_ids: BTreeSet<String>,
+    _anchor: String,
+    expected_sha256: String,
+    latest_observation_generation: u64,
+    matching_turns: u64,
+    observed_turns: u64,
+    saw_unmatchable_turn: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1447,16 +1503,42 @@ impl OutboundQueue {
         true
     }
 
+    // Sending owns the pre-send interval too: do not idle/reactivate demand
+    // between body/submit drainage and Sent, which would acquire a newer Tail.
     fn observation_needed(&self) -> bool {
         self.messages.iter().any(|message| {
             matches!(
                 message.status,
                 OutboundStatus::Queued
+                    | OutboundStatus::Sending
                     | OutboundStatus::Sent
                     | OutboundStatus::Ambiguous
                     | OutboundStatus::Retrying
             )
         })
+    }
+
+    fn awaiting_tail_anchor(&self) -> bool {
+        self.next_sendable_id().is_some_and(|id| {
+            self.message(id)
+                .and_then(|message| message.detail.as_deref())
+                == Some("awaiting_tail_anchor")
+        })
+    }
+
+    fn awaiting_post_anchor_observation(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|message| message.status == OutboundStatus::Sent)
+    }
+
+    fn require_generation(&mut self, generation: u64) {
+        self.minimum_generation = self.minimum_generation.max(generation);
+        if let Some(id) = self.next_sendable_id()
+            && let Some(message) = self.message_mut(id)
+        {
+            message.minimum_generation = message.minimum_generation.max(generation);
+        }
     }
 
     fn oldest_ambiguous_id(&self) -> Option<u64> {
@@ -1509,9 +1591,6 @@ fn apply_outbound_observation(
     let OutboundObservationResult::Available(observation) = result else {
         return false;
     };
-    if !observation.complete {
-        return false;
-    }
     let mut dirty = false;
     let sent_ids: Vec<u64> = outbound
         .messages
@@ -1536,62 +1615,61 @@ fn apply_outbound_observation_to_message(
     observation: &OutboundObservation,
     now: Instant,
 ) -> bool {
-    let Some(message) = outbound.message(id).cloned() else {
-        return false;
-    };
-    let Some(baseline) = message.baseline.as_ref() else {
-        return false;
-    };
-    if baseline.identity != observation.identity || observation.generation < baseline.generation {
+    if !matches!(observation.phase, OutboundObservationPhase::PostAnchorPage) {
         return false;
     }
-    let candidates = candidate_turns_after_baseline(observation, baseline);
-    if candidates.is_empty() {
-        return false;
-    }
-    let matches = exact_matching_turn_count(&message.body, candidates.iter().copied());
-    match matches {
-        1 => outbound.set_status(id, OutboundStatus::Consumed, now, None),
-        0 => {
-            let detail = if candidates.iter().any(|turn| turn.body.is_none()) {
-                "new_user_turn_unmatchable"
-            } else {
-                "new_user_turn_did_not_match"
-            };
-            outbound.set_status(id, OutboundStatus::Ambiguous, now, Some(detail.to_string()))
+    let resolution = {
+        let Some(message) = outbound.message_mut(id) else {
+            return false;
+        };
+        let Some(baseline) = message.baseline.as_mut() else {
+            return false;
+        };
+        if baseline.identity != observation.identity
+            || observation.generation <= baseline.latest_observation_generation
+        {
+            return false;
         }
-        _ => outbound.set_status(
-            id,
-            OutboundStatus::Ambiguous,
-            now,
-            Some("duplicate_matching_user_turns".to_string()),
-        ),
-    }
-}
-
-fn candidate_turns_after_baseline<'a>(
-    observation: &'a OutboundObservation,
-    baseline: &OutboundBaseline,
-) -> Vec<&'a ObservedUserTurn> {
-    observation
-        .user_turns
-        .iter()
-        .filter(|turn| !baseline.turn_ids.contains(&turn.turn_id))
-        .collect()
-}
-
-fn exact_matching_turn_count<'a>(
-    body: &str,
-    turns: impl Iterator<Item = &'a ObservedUserTurn>,
-) -> usize {
-    let wanted = normalize_message_body(body);
-    turns
-        .filter(|turn| {
-            turn.body
-                .as_deref()
-                .is_some_and(|body| normalize_message_body(body) == wanted)
-        })
-        .count()
+        baseline.latest_observation_generation = observation.generation;
+        for turn in &observation.user_turns {
+            baseline.observed_turns = baseline.observed_turns.saturating_add(1);
+            match turn.canonical_text_sha256.as_deref() {
+                Some(digest) if digest == baseline.expected_sha256 => {
+                    baseline.matching_turns = baseline.matching_turns.saturating_add(1);
+                }
+                Some(_) => {}
+                None => baseline.saw_unmatchable_turn = true,
+            }
+        }
+        if baseline.matching_turns > 1 {
+            Some((
+                OutboundStatus::Ambiguous,
+                Some("duplicate_matching_user_turns".to_string()),
+            ))
+        } else if !observation.snapshot_complete {
+            None
+        } else if baseline.matching_turns == 1 {
+            Some((OutboundStatus::Consumed, None))
+        } else if baseline.observed_turns > 0 {
+            Some((
+                OutboundStatus::Ambiguous,
+                Some(
+                    if baseline.saw_unmatchable_turn {
+                        "new_user_turn_unmatchable"
+                    } else {
+                        "new_user_turn_did_not_match"
+                    }
+                    .to_string(),
+                ),
+            ))
+        } else {
+            None
+        }
+    };
+    let Some((status, detail)) = resolution else {
+        return false;
+    };
+    outbound.set_status(id, status, now, detail)
 }
 
 fn normalize_message_body(body: &str) -> String {
@@ -1599,6 +1677,11 @@ fn normalize_message_body(body: &str) -> String {
         .replace('\r', "\n")
         .trim()
         .to_string()
+}
+
+fn normalized_message_sha256(body: &str) -> String {
+    let normalized = normalize_message_body(body);
+    format!("{:x}", Sha256::digest(normalized.as_bytes()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1680,6 +1763,9 @@ struct MonitorPane {
     pending_outbound_recovery: Option<PendingOutboundRecovery>,
     outbound_recovery_request: Option<PendingOutboundRecovery>,
     outbound_recovery_feedback: Option<String>,
+    observation_stop: Option<(u64, &'static str)>,
+    pending_observation_recovery: Option<(u64, &'static str)>,
+    observation_recovery_request: Option<(u64, &'static str)>,
 }
 
 impl MonitorPane {
@@ -1703,6 +1789,9 @@ impl MonitorPane {
             pending_outbound_recovery: None,
             outbound_recovery_request: None,
             outbound_recovery_feedback: None,
+            observation_stop: None,
+            pending_observation_recovery: None,
+            observation_recovery_request: None,
         }
     }
 
@@ -1935,6 +2024,12 @@ impl MonitorPane {
                 self.request_cancel();
                 false
             }
+            MonitorCommand::RequestObservationRecovery => {
+                self.pending_cancel = None;
+                self.pending_outbound_recovery = None;
+                self.pending_observation_recovery = self.observation_stop;
+                false
+            }
             MonitorCommand::RequestOutboundRetry => {
                 self.request_outbound_recovery(OutboundRecoveryAction::Retry);
                 false
@@ -1967,6 +2062,7 @@ impl MonitorPane {
         self.last_inspect_refresh = None;
         self.pending_cancel = None;
         self.pending_outbound_recovery = None;
+        self.pending_observation_recovery = None;
     }
 
     fn selected_node(&self) -> Option<&MonitorNode> {
@@ -1983,10 +2079,12 @@ impl MonitorPane {
     fn request_cancel(&mut self) {
         self.cancel_feedback = None;
         self.pending_outbound_recovery = None;
+        self.pending_observation_recovery = None;
         self.pending_cancel = self.selected_cancelable_node().map(node_id);
     }
 
     fn request_outbound_recovery(&mut self, action: OutboundRecoveryAction) {
+        self.pending_observation_recovery = None;
         self.outbound_recovery_feedback = None;
         self.pending_cancel = None;
         self.pending_outbound_recovery = self
@@ -2012,6 +2110,15 @@ impl MonitorPane {
     }
 
     fn confirm_action(&mut self) {
+        if let Some(pending) = self.pending_observation_recovery.take() {
+            if self.observation_stop == Some(pending) {
+                self.observation_recovery_request = Some(pending);
+            } else {
+                self.outbound_recovery_feedback =
+                    Some("observation stop changed; recovery not applied".into());
+            }
+            return;
+        }
         if let Some(pending) = self.pending_outbound_recovery.take() {
             if self.outbound.oldest_ambiguous_id() == Some(pending.message_id) {
                 self.outbound_recovery_request = Some(pending);
@@ -2034,6 +2141,7 @@ impl MonitorPane {
     fn abort_action(&mut self) {
         self.pending_cancel = None;
         self.pending_outbound_recovery = None;
+        self.pending_observation_recovery = None;
     }
 
     fn take_cancel_request(&mut self) -> Option<CancelRequest> {
@@ -2047,6 +2155,7 @@ impl MonitorPane {
     fn record_outbound_recovery_feedback(&mut self, message: String) {
         self.outbound_recovery_feedback = Some(message);
         self.pending_outbound_recovery = None;
+        self.pending_observation_recovery = None;
     }
 
     fn record_cancel_feedback(&mut self, message: String) {
@@ -3281,8 +3390,8 @@ fn render_status_row(
     let hint = status_hint(pane, focus, overlay_constrained);
     let summary = format!(
         " OBS  {} · {}",
-        monitor_summary_text(pane),
         view_mode_word(pane.view_mode),
+        monitor_summary_text(pane),
     );
     let label = if hint.is_empty() {
         pad_to_width(summary, area.width)
@@ -3309,6 +3418,16 @@ fn status_hint(pane: &MonitorPane, focus: Focus, overlay_constrained: bool) -> S
 
 fn bottom_status_hint(pane: &MonitorPane, overlay_constrained: bool) -> String {
     let protected_suffix = overlay_constrained.then_some("input viewport protected");
+    if let Some((_, reason)) = pane.pending_observation_recovery {
+        let resolution = if reason == "session_turn_paging_paused" {
+            "compatible forward paging has been restored"
+        } else {
+            "the reported capacity cause has been resolved"
+        };
+        return format!(
+            "confirm authorized observer recovery: {resolution}; Ctrl+Y = attest and rearm · Ctrl+N = abort; no message resend"
+        );
+    }
     if let Some(pending) = pane.pending_outbound_recovery {
         let action = match pending.action {
             OutboundRecoveryAction::Retry => {
@@ -3329,6 +3448,11 @@ fn bottom_status_hint(pane: &MonitorPane, overlay_constrained: bool) -> String {
             .map(|suffix| format!(" · {suffix}"))
             .unwrap_or_default();
         return format!("confirm cancel: y = SIGTERM · n = abort{protected_suffix}");
+    }
+    if let Some((_, reason)) = pane.observation_stop {
+        return format!(
+            "observation stopped: {reason} · Ctrl+G = recovery after resolution (not message retry)"
+        );
     }
     if let Some(message_id) = pane.outbound.oldest_ambiguous_id() {
         let suffix = protected_suffix
@@ -3361,7 +3485,7 @@ fn monitor_summary_text(pane: &MonitorPane) -> String {
     match pane.snapshot.as_ref() {
         None => "starting…".to_string(),
         Some(snapshot) => format!(
-            "{} · {} proc · {} bash running · {} mailbox pending · {} diag",
+            "{} · {} running nodes · {} bash running · {} mailbox pending · {} diag",
             status_word(snapshot.summary.status),
             snapshot.summary.running_nodes,
             snapshot.summary.running_agent_bash_count,
@@ -3692,8 +3816,12 @@ fn format_tui_terminal_clone_error(err: io::Error) -> String {
     format!("Failed to clone terminal for TUI: {err}")
 }
 
-fn new_tui_terminal(writer: File) -> io::Result<Terminal<CrosstermBackend<File>>> {
-    Terminal::new(CrosstermBackend::new(writer))
+fn new_tui_terminal(writer: File) -> io::Result<TuiTerminal> {
+    Terminal::new(new_tui_backend(writer))
+}
+
+fn new_tui_backend<W: Write>(writer: W) -> CrosstermBackend<BufWriter<W>> {
+    CrosstermBackend::new(BufWriter::with_capacity(RENDER_BUFFER_BYTES, writer))
 }
 
 fn format_tui_terminal_init_error(err: io::Error) -> String {
@@ -3717,6 +3845,7 @@ struct PublishedRenderSnapshot {
 
 #[derive(Default)]
 struct RenderShared {
+    profile: Profile,
     state: Mutex<RenderState>,
     clipboard: Mutex<Vec<String>>,
     shutdown: AtomicBool,
@@ -3782,7 +3911,7 @@ impl RenderShared {
         }
     }
 
-    fn wait_until(&self, deadline: Instant) {
+    fn wait_until(&self, deadline: Instant, observed_generation: u64) {
         if self.shutdown_requested() {
             return;
         }
@@ -3791,6 +3920,11 @@ impl RenderShared {
             return;
         }
         let guard = lock_or_recover(&self.state);
+        // A publish between the caller's snapshot read and this lock must not
+        // lose its wakeup and wait out the old background frame deadline.
+        if guard.generation != observed_generation || self.shutdown_requested() {
+            return;
+        }
         match self.wake.wait_timeout(guard, deadline - now) {
             Ok((guard, _)) => drop(guard),
             Err(poisoned) => drop(poisoned.into_inner()),
@@ -3841,7 +3975,10 @@ struct RenderThread {
 
 impl RenderThread {
     fn start(writer: File) -> Result<Self, String> {
-        let shared = Arc::new(RenderShared::default());
+        let shared = Arc::new(RenderShared {
+            profile: Profile::from_env(),
+            ..RenderShared::default()
+        });
         let thread_shared = Arc::clone(&shared);
         let (ready_tx, ready_rx) = mpsc::channel();
         let join = thread::Builder::new()
@@ -3934,7 +4071,7 @@ fn report_render_ready_error(
 
 fn run_render_loop(
     shared: &RenderShared,
-    terminal: &mut Terminal<CrosstermBackend<File>>,
+    terminal: &mut TuiTerminal,
     alt: &mut AltScreenGuard,
 ) -> Result<(), String> {
     let mut next_frame = Instant::now();
@@ -3945,7 +4082,11 @@ fn run_render_loop(
             render_latest_snapshot(shared, terminal, alt)?;
             return Ok(());
         }
-        if let Some(published) = shared.latest_published()
+        let published = shared.latest_published();
+        let observed_generation = published
+            .as_ref()
+            .map_or(0, |published| published.generation);
+        if let Some(published) = &published
             && published.generation != last_rendered_generation
         {
             next_frame =
@@ -3953,7 +4094,7 @@ fn run_render_loop(
         }
         let now = Instant::now();
         if now < next_frame {
-            shared.wait_until(next_frame);
+            shared.wait_until(next_frame, observed_generation);
             continue;
         }
         let Some(published) = shared.latest_published() else {
@@ -3978,7 +4119,7 @@ fn unrendered_publish_deadline(
 
 fn render_latest_snapshot(
     shared: &RenderShared,
-    terminal: &mut Terminal<CrosstermBackend<File>>,
+    terminal: &mut TuiTerminal,
     alt: &mut AltScreenGuard,
 ) -> Result<(), String> {
     if let Some(snapshot) = shared.latest_snapshot() {
@@ -3989,10 +4130,12 @@ fn render_latest_snapshot(
 
 fn render_snapshot(
     shared: &RenderShared,
-    terminal: &mut Terminal<CrosstermBackend<File>>,
+    terminal: &mut TuiTerminal,
     alt: &mut AltScreenGuard,
     snapshot: &RenderSnapshot,
 ) -> Result<(), String> {
+    let _timing = shared.profile.measure("render.draw");
+    shared.profile.record_count("render.frames", 1);
     for text in shared.drain_clipboard_copies() {
         alt.copy_to_clipboard(&text)?;
     }
@@ -4053,12 +4196,13 @@ pub(super) fn relay_until_exit_observed(
     let master_fd = master.as_raw_fd();
     let renderer = RenderThread::start(writer)?;
     let publisher = renderer.publisher();
+    let profile = publisher.shared.profile.clone();
 
     let mut pane = MonitorPane::new();
     let snapshot_worker = MonitorSnapshotWorker::start(monitor, root, pane.refresh_interval())?;
     let outbound_worker = OutboundObserverWorker::start(outbound_source)?;
     let initial = child_pane_winsize(real_fd, &pane, TypingProtection::for_focus(Focus::Top));
-    let mut parser = vt100::Parser::new(initial.ws_row, initial.ws_col, TOP_PANE_SCROLLBACK_ROWS);
+    let mut parser = TerminalParser::new(initial.ws_row, initial.ws_col, TOP_PANE_SCROLLBACK_ROWS);
     let mut top_scrollback: usize = 0;
     let mut selection: Option<TopSelection> = None;
     let mut clipboard = String::new();
@@ -4069,7 +4213,11 @@ pub(super) fn relay_until_exit_observed(
     let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
     let mut pending_child_input = PendingChildInput::new();
     let mut deferred_child_input = PendingChildInput::new();
+    let mut input_queue_timing = None;
     let mut outbound_release_gate = OutboundReleaseGate::default();
+    let mut control_worker = control
+        .map(|control| ControlWorker::start(control, profile.clone()))
+        .transpose()?;
     let mut status = None;
     publish_render_snapshot(
         &publisher,
@@ -4082,6 +4230,7 @@ pub(super) fn relay_until_exit_observed(
     );
 
     while status.is_none() {
+        let _iteration = profile.measure("relay.iteration");
         publisher.check_error()?;
         let mut dirty = false;
         let mut priority = RenderPriority::Background;
@@ -4094,11 +4243,26 @@ pub(super) fn relay_until_exit_observed(
         mark_render_dirty(
             &mut dirty,
             &mut priority,
-            pane.refresh_detail_if_due(Instant::now()),
+            {
+                let _timing = profile.measure("monitor.detail_refresh");
+                pane.refresh_detail_if_due(Instant::now())
+            },
             RenderPriority::Background,
         );
+        progress_control_submission(
+            control_worker.as_mut(),
+            &mut ControlProgressIo {
+                master_fd,
+                child_pid: Some(custody.child().id()),
+                parser: &parser,
+                input: &mut line_state,
+                output: &child_output_state,
+                pending: &mut pending_child_input,
+                outbound_active: pane.outbound.active.is_some(),
+            },
+        );
         release_deferred_child_input(
-            pane.outbound.active.is_some(),
+            pane.outbound.active.is_some() || control_owns_child_input(&control_worker),
             &mut line_state,
             &mut pending_child_input,
             &mut deferred_child_input,
@@ -4129,19 +4293,43 @@ pub(super) fn relay_until_exit_observed(
                 &outbound_release_gate,
                 parser.screen().bracketed_paste(),
                 &outbound_worker,
+                control_blocks_outbound(&control_worker),
             ),
             RenderPriority::Interactive,
         );
         let release_gate_was_awaiting_output = outbound_release_gate.awaiting_child_output();
-        let ready = poll_relay_fds(
-            real_fd,
-            master_fd,
-            control.map(ControlSocket::fd),
-            !pending_child_input.is_empty(),
-        )?;
+        parser.append_replies(&mut pending_child_input);
+        let poll_timing = profile.measure("relay.poll");
+        let ready = poll_relay_fds(real_fd, master_fd, None, !pending_child_input.is_empty())?;
+        drop(poll_timing);
         if ready.pty_writable {
+            let _timing = profile.measure("input.write");
             flush_pending_child_input(master_fd, &mut pending_child_input)?;
+            if pending_child_input.is_empty() && deferred_child_input.is_empty() {
+                drop(input_queue_timing.take());
+            }
             outbound_release_gate.observe_pending_write_drained(pending_child_input.is_empty());
+            progress_control_submission(
+                control_worker.as_mut(),
+                &mut ControlProgressIo {
+                    master_fd,
+                    child_pid: Some(custody.child().id()),
+                    parser: &parser,
+                    input: &mut line_state,
+                    output: &child_output_state,
+                    pending: &mut pending_child_input,
+                    outbound_active: pane.outbound.active.is_some(),
+                },
+            );
+            // User keys held behind the control paste are older than any queued
+            // pseudo-editor prompt. Release them before considering another send.
+            release_deferred_child_input(
+                pane.outbound.active.is_some() || control_owns_child_input(&control_worker),
+                &mut line_state,
+                &mut pending_child_input,
+                &mut deferred_child_input,
+                &mut outbound_release_gate,
+            );
             mark_render_dirty(
                 &mut dirty,
                 &mut priority,
@@ -4152,15 +4340,18 @@ pub(super) fn relay_until_exit_observed(
                     &outbound_release_gate,
                     parser.screen().bracketed_paste(),
                     &outbound_worker,
+                    control_blocks_outbound(&control_worker),
                 ),
                 RenderPriority::Interactive,
             );
         }
-        if ready.real_input {
+        if ready.real_input || router.sequence_expired(Instant::now()) {
+            let _timing = profile.measure("input.forward");
             let mut input_io = RealInputForwardIo {
                 real_fd,
                 router: &mut router,
                 pane: &pane,
+                control_active: control_owns_child_input(&control_worker),
                 mouse_request: mouse_request_from_screen(parser.screen()),
                 line_state: &mut line_state,
                 pending_child_input: &mut pending_child_input,
@@ -4168,11 +4359,14 @@ pub(super) fn relay_until_exit_observed(
                 outbound_release_gate: &mut outbound_release_gate,
                 buffer: &mut buffer,
             };
-            let mut routed = forward_real_input(&mut input_io)?;
+            let mut routed = forward_real_input(&mut input_io, ready.real_input, &profile)?;
             let scroll_lines = routed.top_scroll_lines;
             // Sending keystrokes to the child snaps the view back to the live tail, like
             // a terminal jumps to the prompt when you start typing.
             let typed_to_child = !routed.forward.is_empty();
+            if typed_to_child && input_queue_timing.is_none() {
+                input_queue_timing = Some(profile.measure("input.queue_to_write"));
+            }
             let right_click = routed.right_click;
             let gestures = std::mem::take(&mut routed.top_mouse);
             let input_priority = routed_input_render_priority(
@@ -4198,6 +4392,7 @@ pub(super) fn relay_until_exit_observed(
                     &outbound_release_gate,
                     parser.screen().bracketed_paste(),
                     &outbound_worker,
+                    control_blocks_outbound(&control_worker),
                 ),
                 RenderPriority::Interactive,
             );
@@ -4208,7 +4403,8 @@ pub(super) fn relay_until_exit_observed(
                     top_scrollback = 0;
                 }
                 mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
-            } else if scroll_lines != 0 {
+            }
+            if scroll_lines != 0 {
                 // Keep the selection — its highlight follows the content as we scroll.
                 top_scrollback = apply_top_scroll(top_scrollback, scroll_lines);
                 mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
@@ -4236,7 +4432,8 @@ pub(super) fn relay_until_exit_observed(
                     pending_child_input: &mut pending_child_input,
                     deferred_child_input: &mut deferred_child_input,
                     outbound_release_gate: &mut outbound_release_gate,
-                    outbound_active: pane.outbound.active.is_some(),
+                    outbound_active: pane.outbound.active.is_some()
+                        || control_owns_child_input(&control_worker),
                 };
                 mark_render_dirty(
                     &mut dirty,
@@ -4252,28 +4449,26 @@ pub(super) fn relay_until_exit_observed(
                 );
             }
         }
+        let output_timing = ready.pty_output.then(|| profile.measure("pty.parse"));
         if ready.pty_output && pump_pty_output_burst(master_fd, &mut parser, &mut buffer)? {
             child_output_state.observe_child_output();
             outbound_release_gate
                 .observe_child_output(release_gate_was_awaiting_output, Instant::now());
             mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
         }
-        if ready.control
-            && let Some(control) = control
-        {
-            let mut control_io = ControlInjectionIo {
+        drop(output_timing);
+        progress_control_submission(
+            control_worker.as_mut(),
+            &mut ControlProgressIo {
                 master_fd,
-                parser: &mut parser,
-                line_state: &mut line_state,
-                child_output_state: &mut child_output_state,
-                pending_child_input: &mut pending_child_input,
-                outbound_release_gate: &mut outbound_release_gate,
-                buffer: &mut buffer,
                 child_pid: Some(custody.child().id()),
-            };
-            let _ = service_control(control, &mut control_io);
-            mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
-        }
+                parser: &parser,
+                input: &mut line_state,
+                output: &child_output_state,
+                pending: &mut pending_child_input,
+                outbound_active: pane.outbound.active.is_some(),
+            },
+        );
         // Re-assert the scrollback view each frame (clamped to retained history) so it
         // survives child output and resizes; reading it back keeps our offset honest.
         protection = typing_protection(router.focus, &line_state);
@@ -4310,6 +4505,7 @@ pub(super) fn relay_until_exit_observed(
             .map_err(format_interactive_child_poll_error)?;
     }
 
+    drop(control_worker);
     drain_pty_output(master_fd, &mut parser, &mut buffer)?;
     parser.screen_mut().set_scrollback(top_scrollback);
     let _ = pane.adopt_snapshot(snapshot_worker.latest_snapshot());
@@ -4367,7 +4563,7 @@ fn apply_sizing(
     child_pid: u32,
     pane: &MonitorPane,
     protection: TypingProtection,
-    parser: &mut vt100::Parser,
+    parser: &mut TerminalParser,
     applied: &mut Option<(libc::winsize, u16)>,
 ) -> bool {
     let Some(full) = read_terminal_winsize(real_fd) else {
@@ -4406,7 +4602,7 @@ fn sizing_already_applied(
     })
 }
 
-fn resize_virtual_terminal(parser: &mut vt100::Parser, child: &libc::winsize) {
+fn resize_virtual_terminal(parser: &mut TerminalParser, child: &libc::winsize) {
     parser.screen_mut().set_size(child.ws_row, child.ws_col);
 }
 
@@ -4430,6 +4626,7 @@ struct RealInputForwardIo<'a> {
     real_fd: RawFd,
     router: &'a mut InputRouter,
     pane: &'a MonitorPane,
+    control_active: bool,
     mouse_request: MouseRequest,
     line_state: &'a mut InputLineState,
     pending_child_input: &'a mut PendingChildInput,
@@ -4438,10 +4635,20 @@ struct RealInputForwardIo<'a> {
     buffer: &'a mut [u8],
 }
 
-fn forward_real_input(io: &mut RealInputForwardIo<'_>) -> Result<RoutedInput, String> {
-    match read_real_input(io.real_fd, io.buffer) {
-        Ok(0) => Ok(RoutedInput::default()),
+fn forward_real_input(
+    io: &mut RealInputForwardIo<'_>,
+    read_ready: bool,
+    profile: &Profile,
+) -> Result<RoutedInput, String> {
+    let read_result = if read_ready {
+        read_real_input(io.real_fd, io.buffer)
+    } else {
+        Ok(0)
+    };
+    match read_result {
         Ok(n) => {
+            profile.record_count("input.bytes_read", n as u64);
+            let _routing = profile.measure("input.route");
             let full = terminal_winsize_with_fallback(read_terminal_winsize(io.real_fd));
             let protection = typing_protection(io.router.focus, io.line_state);
             let routed = route_real_input_with_protection(
@@ -4457,7 +4664,7 @@ fn forward_real_input(io: &mut RealInputForwardIo<'_>) -> Result<RoutedInput, St
                 io.pending_child_input,
                 io.deferred_child_input,
                 io.outbound_release_gate,
-                io.pane.outbound.active.is_some(),
+                io.pane.outbound.active.is_some() || io.control_active,
                 &routed,
             );
             Ok(routed)
@@ -4501,6 +4708,34 @@ fn route_mouse_aware_input(
     winsize: &libc::winsize,
     protection: TypingProtection,
 ) -> RoutedInput {
+    route_mouse_aware_input_at(
+        bytes,
+        router,
+        pane,
+        mouse_request,
+        winsize,
+        protection,
+        Instant::now(),
+    )
+}
+
+fn route_mouse_aware_input_at(
+    bytes: &[u8],
+    router: &mut InputRouter,
+    pane: &MonitorPane,
+    mouse_request: MouseRequest,
+    winsize: &libc::winsize,
+    protection: TypingProtection,
+    now: Instant,
+) -> RoutedInput {
+    let expire_partial = router.sequence_expired(now);
+    let mut buffered = std::mem::take(&mut router.pending_sequence);
+    let bytes = if buffered.is_empty() {
+        bytes
+    } else {
+        buffered.extend_from_slice(bytes);
+        buffered.as_slice()
+    };
     let areas = pane_areas_for_winsize(winsize, pane, protection);
     let mut routed = RoutedInput {
         pseudo_input_width: Some(expanded_bottom_layout(areas.bottom, pane).input.width),
@@ -4508,7 +4743,23 @@ fn route_mouse_aware_input(
     };
     let mut i = 0;
     while i < bytes.len() {
-        if let Some(parsed) = parse_mouse_event(&bytes[i..]) {
+        let remaining = &bytes[i..];
+        let sequence_len = if router.bracketed_paste {
+            // Paste bytes pass immediately. Track the closing marker separately
+            // so even a delayed fragment cannot leave mouse routing disabled.
+            Some(1)
+        } else {
+            terminal_input_sequence_len(remaining)
+        };
+        if sequence_len.is_none() && !expire_partial {
+            router.pending_sequence.extend_from_slice(remaining);
+            router.sequence_started.get_or_insert(now);
+            return routed;
+        }
+        let input = &remaining[..sequence_len.unwrap_or(remaining.len())];
+        if !router.bracketed_paste
+            && let Some(parsed) = parse_mouse_event(input)
+        {
             route_mouse_event(
                 parsed.event,
                 areas,
@@ -4519,10 +4770,52 @@ fn route_mouse_aware_input(
             );
             i += parsed.consumed;
         } else {
-            i += router.route_next_input(&bytes[i..], &mut routed);
+            // Track both markers across forwarded chunks, including an opening
+            // marker whose initial Escape already passed the short CSI timeout.
+            for &byte in input {
+                router.observe_paste_marker_byte(byte);
+            }
+            let mut consumed = 0;
+            while consumed < input.len() {
+                consumed += router.route_next_input(&input[consumed..], &mut routed);
+            }
+            i += consumed;
+        }
+        router.sequence_started = None;
+    }
+    router.sequence_started = None;
+    routed
+}
+
+/// Bound the only ambiguous prefixes that may contain broker-owned mouse input.
+/// Ordinary keys pass immediately; incomplete Escape/CSI gets one short timeout.
+fn terminal_input_sequence_len(bytes: &[u8]) -> Option<usize> {
+    if bytes[0] != 0x1b {
+        return Some(1);
+    }
+    if bytes.len() == 1 {
+        return None;
+    }
+    if bytes[1] != b'[' {
+        return Some(1);
+    }
+    if bytes.starts_with(b"\x1b[M") {
+        return (bytes.len() >= 6).then_some(6);
+    }
+    for (i, byte) in bytes
+        .iter()
+        .enumerate()
+        .skip(2)
+        .take(MAX_INPUT_SEQUENCE_BYTES - 2)
+    {
+        if (0x40..=0x7e).contains(byte) {
+            return Some(i + 1);
+        }
+        if !(0x20..=0x3f).contains(byte) {
+            return Some(1);
         }
     }
-    routed
+    (bytes.len() >= MAX_INPUT_SEQUENCE_BYTES).then_some(1)
 }
 
 fn route_mouse_event(
@@ -5051,7 +5344,8 @@ fn apply_routed_to_pane(
     );
     let force_refresh = apply_routed_commands(pane, &routed.commands);
     let cancelled = run_pending_cancel(pane);
-    let recovered = run_pending_outbound_recovery(pane, outbound_worker);
+    let observation_recovered = run_pending_observation_recovery(pane, outbound_worker);
+    let recovered = run_pending_outbound_recovery(pane, outbound_worker) || observation_recovered;
     snapshot_worker.set_interval(pane.refresh_interval());
     if pane_refresh_required(force_refresh, cancelled || recovered) {
         snapshot_worker.request_refresh();
@@ -5108,6 +5402,7 @@ fn monitor_command_is_interactive(command: &MonitorCommand) -> bool {
             | MonitorCommand::ToggleList
             | MonitorCommand::ToggleInspect
             | MonitorCommand::RequestCancel
+            | MonitorCommand::RequestObservationRecovery
             | MonitorCommand::RequestOutboundRetry
             | MonitorCommand::RequestOutboundDiscard
             | MonitorCommand::ConfirmAction
@@ -5142,6 +5437,38 @@ fn run_pending_cancel(pane: &mut MonitorPane) -> bool {
     true
 }
 
+fn run_pending_observation_recovery(
+    pane: &mut MonitorPane,
+    worker: &OutboundObserverWorker,
+) -> bool {
+    let Some((generation, reason)) = pane.observation_recovery_request.take() else {
+        return false;
+    };
+    // Ctrl+Y attests resolution and authority for this exact observer stop, not
+    // permission to retry/discard any queued or ambiguously delivered message.
+    let resolution = if reason == "session_turn_paging_paused" {
+        super::outbound_observer::ObservationResolution::PagingRestored
+    } else {
+        super::outbound_observer::ObservationResolution::CapacityResolved
+    };
+    match worker.rearm_after_resolution(generation, reason, resolution) {
+        Ok(floor) => {
+            pane.outbound.require_generation(floor);
+            pane.observation_stop = None;
+            pane.record_outbound_recovery_feedback(
+                "observer rearmed; waiting for fresh evidence; no message resent".into(),
+            );
+            true
+        }
+        Err(error) => {
+            pane.record_outbound_recovery_feedback(format!(
+                "observer recovery not applied: {error}"
+            ));
+            false
+        }
+    }
+}
+
 fn run_pending_outbound_recovery(pane: &mut MonitorPane, worker: &OutboundObserverWorker) -> bool {
     let Some(request) = pane.take_outbound_recovery_request() else {
         return false;
@@ -5167,7 +5494,7 @@ fn run_pending_outbound_recovery(pane: &mut MonitorPane, worker: &OutboundObserv
 /// arrived (requiring a redraw).
 fn pump_pty_output(
     master_fd: RawFd,
-    parser: &mut vt100::Parser,
+    parser: &mut TerminalParser,
     buffer: &mut [u8],
 ) -> Result<bool, String> {
     let output = read_pty_output(master_fd, buffer).map_err(format_pty_output_read_error)?;
@@ -5176,7 +5503,7 @@ fn pump_pty_output(
 
 fn pump_pty_output_burst(
     master_fd: RawFd,
-    parser: &mut vt100::Parser,
+    parser: &mut TerminalParser,
     buffer: &mut [u8],
 ) -> Result<bool, String> {
     let mut saw_output = false;
@@ -5212,7 +5539,7 @@ fn format_pty_output_coalesce_poll_error(err: io::Error) -> String {
 /// Drain any buffered child output into the virtual terminal after exit.
 fn drain_pty_output(
     master_fd: RawFd,
-    parser: &mut vt100::Parser,
+    parser: &mut TerminalParser,
     buffer: &mut [u8],
 ) -> Result<(), String> {
     while poll_single_fd(master_fd)? {
@@ -5249,7 +5576,7 @@ fn pty_read_error_is_eof(err: &io::Error) -> bool {
     is_pty_eof_error(err)
 }
 
-fn process_pty_output(parser: &mut vt100::Parser, buffer: &[u8], output: PtyOutput) -> bool {
+fn process_pty_output(parser: &mut TerminalParser, buffer: &[u8], output: PtyOutput) -> bool {
     if !pty_output_has_bytes(&output) {
         return false;
     }
@@ -5268,7 +5595,7 @@ fn pty_output_bytes<'a>(buffer: &'a [u8], output: &PtyOutput) -> &'a [u8] {
     }
 }
 
-fn process_pty_bytes(parser: &mut vt100::Parser, bytes: &[u8]) {
+fn process_pty_bytes(parser: &mut TerminalParser, bytes: &[u8]) {
     parser.process(bytes);
 }
 
@@ -5292,13 +5619,15 @@ fn current_render_selection(
 
 fn publish_render_snapshot(
     publisher: &RenderPublisher,
-    parser: &vt100::Parser,
+    parser: &TerminalParser,
     focus: Focus,
     pane: &MonitorPane,
     selection: Option<SelectionSpan>,
     typing_protection: TypingProtection,
     priority: RenderPriority,
 ) {
+    let _timing = publisher.shared.profile.measure("render.snapshot");
+    publisher.shared.profile.record_count("render.snapshots", 1);
     publisher.publish(RenderSnapshot::capture_with_typing_protection_and_priority(
         parser.screen(),
         focus,
@@ -5362,11 +5691,21 @@ fn pump_outbound_queue_from_worker(
     release_gate: &OutboundReleaseGate,
     bracketed_paste: bool,
     worker: &OutboundObserverWorker,
+    control_active: bool,
 ) -> bool {
+    if control_active {
+        return false;
+    }
     if let Some(generation_floor) = worker.set_demand(pane.outbound.observation_needed()) {
         pane.outbound.minimum_generation = pane.outbound.minimum_generation.max(generation_floor);
     }
     let latest = worker.latest_result();
+    pane.observation_stop = match latest.as_deref() {
+        Some(OutboundObservationResult::Stopped { generation, reason }) => {
+            Some((*generation, *reason))
+        }
+        _ => None,
+    };
     let now = Instant::now();
     let dirty = pump_outbound_queue_with_gate(
         pane,
@@ -5377,6 +5716,18 @@ fn pump_outbound_queue_from_worker(
         latest.as_deref(),
         now,
     );
+    // Page effects must enter confirmation before the source may advance again.
+    // Control mode returns above without acknowledging, backpressuring the worker.
+    if let Some(result) = latest.as_deref() {
+        worker.acknowledge(result);
+    }
+    if pane.outbound.awaiting_tail_anchor() {
+        let generation_floor = worker.request_fresh_generation();
+        pane.outbound.require_generation(generation_floor);
+    }
+    if pane.outbound.awaiting_post_anchor_observation() {
+        worker.observe_after_anchor();
+    }
     let _ = worker.set_demand(pane.outbound.observation_needed());
     dirty
 }
@@ -5544,7 +5895,7 @@ fn start_next_outbound_message(
         .map(|message| message.minimum_generation)
         .unwrap_or_default()
         .max(outbound.minimum_generation);
-    let baseline = match observation_baseline(observation, minimum_generation) {
+    let baseline = match observation_baseline(observation, minimum_generation, &body) {
         Ok(baseline) => baseline,
         Err(detail) => {
             return outbound.set_status(
@@ -5573,9 +5924,13 @@ fn start_next_outbound_message(
 fn observation_baseline(
     result: Option<&OutboundObservationResult>,
     minimum_generation: u64,
+    body: &str,
 ) -> Result<OutboundBaseline, String> {
     match result {
         None => Err("awaiting_outbound_observation".to_string()),
+        Some(OutboundObservationResult::Stopped { reason, .. }) => Err(format!(
+            "outbound_observation_stopped:{reason}; resolve cause and obtain authorized explicit observer recovery; no automatic retry"
+        )),
         Some(OutboundObservationResult::Unavailable { detail, .. }) => Err(detail.clone()),
         Some(OutboundObservationResult::Failed { detail, .. }) => {
             Err(format!("outbound_observation_failed:{detail}"))
@@ -5585,14 +5940,25 @@ fn observation_baseline(
         {
             Err("awaiting_fresh_observation".to_string())
         }
-        Some(OutboundObservationResult::Available(observation)) if !observation.complete => {
+        Some(OutboundObservationResult::Available(observation))
+            if !observation.snapshot_complete =>
+        {
             Err("awaiting_complete_observation".to_string())
         }
-        Some(OutboundObservationResult::Available(observation)) => Ok(OutboundBaseline {
-            identity: observation.identity.clone(),
-            generation: observation.generation,
-            turn_ids: observation.turn_ids.clone(),
-        }),
+        Some(OutboundObservationResult::Available(observation)) => {
+            let OutboundObservationPhase::TailAnchor { resume_token } = &observation.phase else {
+                return Err("awaiting_tail_anchor".to_string());
+            };
+            Ok(OutboundBaseline {
+                identity: observation.identity.clone(),
+                _anchor: resume_token.clone(),
+                expected_sha256: normalized_message_sha256(body),
+                latest_observation_generation: observation.generation,
+                matching_turns: 0,
+                observed_turns: 0,
+                saw_unmatchable_turn: false,
+            })
+        }
     }
 }
 
@@ -5605,109 +5971,25 @@ fn queue_outbound_submit_delimiter(
 }
 
 /// Render one frame to the real terminal.
-fn draw_snapshot(
-    terminal: &mut Terminal<CrosstermBackend<File>>,
-    snapshot: &RenderSnapshot,
-) -> Result<(), String> {
+fn draw_snapshot(terminal: &mut TuiTerminal, snapshot: &RenderSnapshot) -> Result<(), String> {
     terminal
         .draw(|frame| render_snapshot_frame(frame, snapshot))
         .map(|_| ())
         .map_err(|err| format!("Failed to render TUI frame: {err}"))
 }
 
-struct ControlInjectionIo<'a> {
-    master_fd: RawFd,
-    parser: &'a mut vt100::Parser,
-    line_state: &'a mut InputLineState,
-    child_output_state: &'a mut ChildOutputState,
-    pending_child_input: &'a mut PendingChildInput,
-    outbound_release_gate: &'a mut OutboundReleaseGate,
-    buffer: &'a mut [u8],
-    child_pid: Option<u32>,
-}
-
-/// Inject a control-socket notification immediately; the agent harness queues it.
-fn service_control(control: &ControlSocket, io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
-    let mut stream = accept_control_stream(control).map_err(format_control_accept_error)?;
-    let response = inject_control_payload(&mut stream, io, control);
-    let (ack, message) = control_response_message(response);
-    super::trace_notify_gate_decision(
-        control,
-        io.master_fd,
-        io.child_pid,
-        io.line_state,
-        io.child_output_state,
-        if ack { "inject" } else { "skip" },
-        &message,
-    );
-    write_tui_control_response(&mut stream, ack, &message)
-        .map_err(format_control_response_write_error)
-}
-
-fn accept_control_stream(control: &ControlSocket) -> io::Result<UnixStream> {
-    control.listener.accept().map(|(stream, _)| stream)
-}
-
-fn format_control_accept_error(err: io::Error) -> String {
-    format!("Failed to accept PTY control connection: {err}")
-}
-
-fn control_response_message(response: Result<ControlPayloadOutcome, String>) -> (bool, String) {
-    match response {
-        Ok(ControlPayloadOutcome::Accepted(Some(delivery_nonce))) => {
-            (true, pty_delivery_ack_message(&delivery_nonce))
-        }
-        Ok(ControlPayloadOutcome::Accepted(None)) => (true, "ok".to_string()),
-        Ok(ControlPayloadOutcome::SubmissionUncertain(delivery_nonce)) => {
-            (true, pty_delivery_uncertain_message(&delivery_nonce))
-        }
-        Err(message) => (false, message),
+fn progress_control_submission(worker: Option<&mut ControlWorker>, io: &mut ControlProgressIo<'_>) {
+    if let Some(worker) = worker {
+        worker.progress(io, Instant::now());
     }
 }
 
-fn write_tui_control_response(stream: &mut UnixStream, ack: bool, message: &str) -> io::Result<()> {
-    write_control_response(stream, ack, message)
+fn control_owns_child_input(worker: &Option<ControlWorker>) -> bool {
+    worker.as_ref().is_some_and(ControlWorker::owns_child_input)
 }
 
-fn format_control_response_write_error(err: io::Error) -> String {
-    format!("Failed to write PTY control response: {err}")
-}
-
-fn inject_control_payload(
-    stream: &mut UnixStream,
-    io: &mut ControlInjectionIo<'_>,
-    control: &ControlSocket,
-) -> Result<ControlPayloadOutcome, String> {
-    validate_control_peer(stream)?;
-    let session_id = control
-        .session_id()
-        .ok_or_else(|| "awaiting_session_identity".to_string())?;
-    let mut payload = prepare_control_payload(
-        read_tui_control_payload(stream)?,
-        Some((&session_id, control.invocation_uuid())),
-    )?;
-    if payload.bytes.is_empty() {
-        if payload.submission_uncertain {
-            return Ok(submission_uncertain_outcome(&payload));
-        }
-        return settle_control_payload(&payload);
-    }
-    validate_control_input_ready(
-        io.parser.screen().bracketed_paste(),
-        io.parser.screen().alternate_screen(),
-        control.age(),
-    )?;
-    let bracketed_paste = io.parser.screen().bracketed_paste();
-    pty_delivery_test_fault("tui_pre_submission")?;
-    begin_control_payload_submission(&mut payload)?;
-    if let Err(error) = submit_control_payload(io, &payload.bytes, bracketed_paste) {
-        return if payload.submission_started {
-            Ok(submission_uncertain_outcome(&payload))
-        } else {
-            Err(error)
-        };
-    }
-    settle_control_payload(&payload)
+fn control_blocks_outbound(worker: &Option<ControlWorker>) -> bool {
+    worker.as_ref().is_some_and(ControlWorker::blocks_outbound)
 }
 
 fn validate_control_input_ready(
@@ -5722,96 +6004,6 @@ fn validate_control_input_ready(
     } else {
         Err("unsafe_provider_starting".to_string())
     }
-}
-
-fn validate_control_peer(stream: &UnixStream) -> Result<(), String> {
-    validate_peer_uid(stream)
-}
-
-fn read_tui_control_payload(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
-    read_control_request(stream)
-}
-
-fn submit_control_payload(
-    io: &mut ControlInjectionIo<'_>,
-    payload: &[u8],
-    bracketed_paste: bool,
-) -> Result<(), String> {
-    queue_control_injection(io.pending_child_input, payload, bracketed_paste, false);
-    drain_control_payload(io, ControlSubmitDrainPhase::Body)?;
-    // Let the child commit the body to its input buffer before Enter. Ink-style TUIs may
-    // batch a raw control write as a paste even before they advertise bracketed-paste mode.
-    std::thread::sleep(CONTROL_SUBMIT_DELAY);
-    io.pending_child_input.enqueue(b"\r");
-    io.line_state.mark_submitted();
-    drain_control_payload(io, ControlSubmitDrainPhase::Delimiter)
-}
-
-#[derive(Clone, Copy)]
-enum ControlSubmitDrainPhase {
-    Body,
-    Delimiter,
-}
-
-impl ControlSubmitDrainPhase {
-    fn token(self) -> &'static str {
-        match self {
-            Self::Body => "body",
-            Self::Delimiter => "delimiter",
-        }
-    }
-}
-
-fn drain_control_payload(
-    io: &mut ControlInjectionIo<'_>,
-    phase: ControlSubmitDrainPhase,
-) -> Result<(), String> {
-    pty_delivery_test_fault(&format!("tui_{}_drain", phase.token()))?;
-    let start = Instant::now();
-    while !io.pending_child_input.is_empty() {
-        if start.elapsed() >= INJECT_WAIT_LIMIT {
-            return Err(format!("control_submit_{}_drain_timeout", phase.token()));
-        }
-        let ready = poll_control_submit_pty(io.master_fd)
-            .map_err(|err| format!("control_submit_{}_drain_failed:{err}", phase.token()))?;
-        if ready.pty_writable {
-            flush_pending_child_input(io.master_fd, io.pending_child_input)
-                .map_err(|err| format!("control_submit_{}_drain_failed:{err}", phase.token()))?;
-        }
-        if ready.pty_output {
-            if pump_pty_output(io.master_fd, io.parser, io.buffer)
-                .map_err(|err| format!("control_submit_{}_drain_failed:{err}", phase.token()))?
-            {
-                io.child_output_state.observe_child_output();
-                io.outbound_release_gate
-                    .observe_child_output(false, Instant::now());
-            } else {
-                return Err(format!("control_submit_{}_pty_closed", phase.token()));
-            }
-        }
-    }
-    Ok(())
-}
-
-struct ControlSubmitReady {
-    pty_output: bool,
-    pty_writable: bool,
-}
-
-fn poll_control_submit_pty(master_fd: RawFd) -> Result<ControlSubmitReady, String> {
-    let mut pollfd = poll_master_fd(master_fd, true);
-    poll_fds(
-        std::slice::from_mut(&mut pollfd),
-        format_control_submit_poll_error,
-    )?;
-    Ok(ControlSubmitReady {
-        pty_output: readable(pollfd.revents),
-        pty_writable: writable(pollfd.revents),
-    })
-}
-
-fn format_control_submit_poll_error(err: io::Error) -> String {
-    format!("Failed to poll PTY before control submit: {err}")
 }
 
 /// The bytes to inject for a control payload. When the child advertised bracketed-paste
@@ -5843,7 +6035,6 @@ fn child_input_for_real_read(forward: &[u8]) -> Vec<u8> {
 mod tests {
     use super::super::{PtyPair, configure_child_pty};
     use super::*;
-    use oulipoly_state::mailbox::MailboxDb;
     use oulipoly_state::{InvocationStart, StateDb};
     use ratatui::backend::TestBackend;
     use std::ffi::OsString;
@@ -5855,12 +6046,12 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    struct DataDirOverride {
+    pub(super) struct DataDirOverride {
         prior: Option<OsString>,
     }
 
     impl DataDirOverride {
-        fn install(path: &std::path::Path) -> Self {
+        pub(super) fn install(path: &std::path::Path) -> Self {
             let prior = std::env::var_os("OULIPOLY_DATA_DIR");
             unsafe {
                 std::env::set_var("OULIPOLY_DATA_DIR", path);
@@ -6055,7 +6246,7 @@ mod tests {
 
     #[test]
     fn child_bracketed_paste_mode_is_mirrored_only_for_agent_input() {
-        let mut parser = vt100::Parser::new(10, 20, 0);
+        let mut parser = TerminalParser::new(10, 20, 0);
         parser.process(b"\x1b[?2004h");
         let pane = MonitorPane::new();
 
@@ -6103,7 +6294,7 @@ mod tests {
 
     #[test]
     fn vt100_mouse_mode_mirrors_to_terminal_decsets_and_restore() {
-        let mut parser = vt100::Parser::new(10, 20, 0);
+        let mut parser = TerminalParser::new(10, 20, 0);
         parser.process(b"\x1b[?1006h\x1b[?1002h");
         let enabled = mouse_request_from_screen(parser.screen());
         assert_eq!(enabled.mode, vt100::MouseProtocolMode::ButtonMotion);
@@ -6511,162 +6702,6 @@ mod tests {
     }
 
     #[test]
-    fn control_submit_drains_body_then_final_delimiter_before_returning() {
-        for bracketed_paste in [false, true] {
-            let (mut read_end, write_end) = pipe_files();
-            let mut parser = vt100::Parser::new(10, 20, 0);
-            let mut line_state = InputLineState::default();
-            let mut child_output_state = ChildOutputState::default();
-            let mut pending_child_input = PendingChildInput::new();
-            let mut outbound_release_gate = OutboundReleaseGate::default();
-            let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
-            let mut io = ControlInjectionIo {
-                master_fd: write_end.as_raw_fd(),
-                parser: &mut parser,
-                line_state: &mut line_state,
-                child_output_state: &mut child_output_state,
-                pending_child_input: &mut pending_child_input,
-                outbound_release_gate: &mut outbound_release_gate,
-                buffer: &mut buffer,
-                child_pid: None,
-            };
-
-            let started = Instant::now();
-            submit_control_payload(&mut io, b"body", bracketed_paste).expect("submit payload");
-
-            assert!(started.elapsed() >= CONTROL_SUBMIT_DELAY);
-            assert!(pending_child_input.is_empty());
-            let expected = [
-                control_payload_bytes(b"body", bracketed_paste).as_slice(),
-                b"\r",
-            ]
-            .concat();
-            let mut received = vec![0_u8; expected.len()];
-            read_end
-                .read_exact(&mut received)
-                .expect("body and delimiter should drain before submit returns");
-            assert_eq!(received, expected);
-        }
-
-        let (_read_end, _write_end) = pipe_files();
-        let mut parser = vt100::Parser::new(10, 20, 0);
-        let mut line_state = InputLineState::default();
-        let mut child_output_state = ChildOutputState::default();
-        let mut pending_child_input = PendingChildInput::new();
-        pending_child_input.enqueue(b"\r");
-        let mut outbound_release_gate = OutboundReleaseGate::default();
-        let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
-        let mut io = ControlInjectionIo {
-            master_fd: -1,
-            parser: &mut parser,
-            line_state: &mut line_state,
-            child_output_state: &mut child_output_state,
-            pending_child_input: &mut pending_child_input,
-            outbound_release_gate: &mut outbound_release_gate,
-            buffer: &mut buffer,
-            child_pid: None,
-        };
-        let error = drain_control_payload(&mut io, ControlSubmitDrainPhase::Delimiter)
-            .expect_err("a delimiter drain failure must not report success");
-        assert!(error.starts_with("control_submit_delimiter_"), "{error}");
-    }
-
-    #[test]
-    fn tui_retains_one_submission_when_confirmation_fails_after_body_and_enter_drain() {
-        let _env_lock = crate::test_support::lock_env();
-        let dir = tempfile::tempdir().unwrap();
-        let _data_dir = DataDirOverride::install(dir.path());
-        let attempt_id = "tui-fault-attempt";
-        let path = seed_test_mailbox_delivery(dir.path(), attempt_id);
-        let fault = rusqlite::Connection::open(&path).unwrap();
-        fault
-            .execute_batch(
-                "CREATE TRIGGER fail_tui_confirmation
-                 BEFORE UPDATE OF acknowledged_at ON mailbox_delivery_attempts
-                 BEGIN SELECT RAISE(FAIL, 'injected TUI confirmation failure'); END;",
-            )
-            .unwrap();
-        let envelope = format!("notify\n[OULIPOLY-DELIVERY {attempt_id}]");
-        let mut payload = prepare_control_payload(envelope.into_bytes(), None).unwrap();
-        let (child_peer, master) = pipe_files();
-        let mut parser = vt100::Parser::new(10, 20, 0);
-        let mut line_state = InputLineState::default();
-        let mut child_output_state = ChildOutputState::default();
-        let mut pending_child_input = PendingChildInput::new();
-        let mut outbound_release_gate = OutboundReleaseGate::default();
-        let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
-        let mut io = ControlInjectionIo {
-            master_fd: master.as_raw_fd(),
-            parser: &mut parser,
-            line_state: &mut line_state,
-            child_output_state: &mut child_output_state,
-            pending_child_input: &mut pending_child_input,
-            outbound_release_gate: &mut outbound_release_gate,
-            buffer: &mut buffer,
-            child_pid: None,
-        };
-
-        begin_control_payload_submission(&mut payload).unwrap();
-        submit_control_payload(&mut io, &payload.bytes, false).unwrap();
-        assert_eq!(
-            control_response_message(settle_control_payload(&payload)),
-            (true, pty_delivery_uncertain_message(attempt_id))
-        );
-        let mut retained = MailboxDb::open(&path).unwrap();
-        let window = retained
-            .delivery_attempt_window(attempt_id)
-            .unwrap()
-            .unwrap();
-        assert!(window.submission_started_at.is_some());
-        assert!(window.acknowledged_at.is_none());
-        assert!(window.resolved_at.is_none());
-        assert_eq!(window.rows.len(), 1);
-        assert!(
-            retained
-                .register_or_reuse_delivery_attempt(
-                    "replacement",
-                    "session-a",
-                    "invocation-b",
-                    "generation-b",
-                    &[window.rows[0].seq],
-                    0,
-                )
-                .unwrap_err()
-                .contains("mailbox_delivery_submission_uncertain:tui-fault-attempt")
-        );
-        drop(retained);
-        fault
-            .execute_batch("DROP TRIGGER fail_tui_confirmation")
-            .unwrap();
-        let retry = prepare_control_payload(
-            format!("notify\n[OULIPOLY-DELIVERY {attempt_id}]").into_bytes(),
-            None,
-        )
-        .unwrap();
-        assert!(retry.bytes.is_empty());
-        assert_eq!(
-            settle_control_payload(&retry),
-            Ok(ControlPayloadOutcome::SubmissionUncertain(
-                attempt_id.to_string()
-            ))
-        );
-        set_nonblocking(child_peer.as_raw_fd());
-        let mut submitted = Vec::new();
-        drain_available(child_peer.as_raw_fd(), &mut submitted).unwrap();
-        let submitted = String::from_utf8(submitted).unwrap();
-        assert_eq!(
-            submitted
-                .matches(&format!("[OULIPOLY-DELIVERY {attempt_id}]"))
-                .count(),
-            1,
-            "{submitted}"
-        );
-        assert!(submitted.ends_with('\r'));
-        let db = MailboxDb::open(&path).unwrap();
-        assert_eq!(db.list_pending("session-a").unwrap().len(), 1);
-    }
-
-    #[test]
     fn control_input_waits_for_harness_readiness_without_terminal_idle_checks() {
         assert_eq!(
             validate_control_input_ready(false, true, Duration::from_secs(30)),
@@ -6786,16 +6821,9 @@ mod tests {
                 OutboundObservation {
                     identity: outbound_identity(),
                     generation: 1,
-                    complete: false,
-                    turn_count: 1,
-                    turn_ids: ["old".to_string()].into_iter().collect(),
-                    user_turns: vec![ObservedUserTurn {
-                        turn_id: "old".to_string(),
-                        timestamp: DateTime::parse_from_rfc3339("2026-05-01T00:00:01Z")
-                            .unwrap()
-                            .with_timezone(&Utc),
-                        body: Some("hello".to_string()),
-                    }],
+                    phase: OutboundObservationPhase::PostAnchorPage,
+                    snapshot_complete: false,
+                    user_turns: vec![],
                 },
             ))),
             Some(OutboundObservationResult::Unavailable {
@@ -7121,7 +7149,7 @@ mod tests {
         let mut pane = sent_pane("hello", ["old"], now);
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
-        let observed = available_observation(2, [("old", Some("hello")), ("new", Some("hello"))]);
+        let observed = available_observation(2, [("new", Some("hello"))]);
 
         assert!(pump_outbound_queue(
             &mut pane,
@@ -7136,19 +7164,32 @@ mod tests {
     }
 
     #[test]
+    fn matching_evidence_across_bounded_pages_settles_only_at_snapshot_completion() {
+        let now = Instant::now();
+        let mut pane = sent_pane("hello", [], now);
+
+        apply_outbound_observation(
+            &mut pane.outbound,
+            &post_anchor_observation(2, false, [("new", Some("hello"))]),
+            now,
+        );
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sent));
+
+        assert!(apply_outbound_observation(
+            &mut pane.outbound,
+            &post_anchor_observation(3, true, []),
+            now,
+        ));
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Consumed));
+    }
+
+    #[test]
     fn duplicate_or_transformed_turns_mark_sent_message_ambiguous() {
         let now = Instant::now();
         let mut duplicate = sent_pane("hello", ["old"], now);
         assert!(apply_outbound_observation(
             &mut duplicate.outbound,
-            &available_observation(
-                2,
-                [
-                    ("old", Some("hello")),
-                    ("new-1", Some("hello")),
-                    ("new-2", Some("hello")),
-                ],
-            ),
+            &available_observation(2, [("new-1", Some("hello")), ("new-2", Some("hello")),],),
             now,
         ));
         assert_eq!(
@@ -7159,7 +7200,7 @@ mod tests {
         let mut transformed = sent_pane("hello", ["old"], now);
         assert!(apply_outbound_observation(
             &mut transformed.outbound,
-            &available_observation(2, [("old", Some("hello")), ("new", Some("HELLO"))],),
+            &available_observation(2, [("new", Some("HELLO"))],),
             now,
         ));
         assert_eq!(
@@ -7168,14 +7209,7 @@ mod tests {
         );
         assert!(apply_outbound_observation(
             &mut transformed.outbound,
-            &available_observation(
-                3,
-                [
-                    ("old", Some("hello")),
-                    ("new", Some("HELLO")),
-                    ("late", Some("hello")),
-                ],
-            ),
+            &available_observation(3, [("late", Some("hello")),],),
             now,
         ));
         assert_eq!(
@@ -7315,7 +7349,7 @@ mod tests {
             &mut pending,
             &mut line_state,
             false,
-            Some(&available_observation(2, [("possibly-old", Some("first"))])),
+            Some(&available_observation(2, [])),
             now,
         );
         assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
@@ -7331,7 +7365,7 @@ mod tests {
         pane.outbound.enqueue("second".to_string());
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
-        let baseline = available_observation(1, [("old", Some("first"))]);
+        let baseline = available_observation(1, []);
 
         pump_outbound_queue(
             &mut pane,
@@ -7364,7 +7398,7 @@ mod tests {
         assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
         assert!(pending.is_empty());
 
-        let consumed = available_observation(2, [("old", Some("first")), ("new", Some("first"))]);
+        let consumed = available_observation(2, [("new", Some("first"))]);
         pump_outbound_queue(
             &mut pane,
             &mut pending,
@@ -7375,6 +7409,17 @@ mod tests {
         );
 
         assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Consumed));
+        assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
+        assert!(pending.is_empty());
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            Some(&available_observation(3, [])),
+            now,
+        );
         assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Sending));
     }
 
@@ -7386,7 +7431,7 @@ mod tests {
 
     fn sent_pane<const N: usize>(
         body: &str,
-        baseline_ids: [&str; N],
+        _baseline_ids: [&str; N],
         sent_at: Instant,
     ) -> MonitorPane {
         let mut pane = queued_pane(body, sent_at);
@@ -7394,8 +7439,12 @@ mod tests {
             1,
             OutboundBaseline {
                 identity: outbound_identity(),
-                generation: 1,
-                turn_ids: baseline_ids.into_iter().map(str::to_string).collect(),
+                _anchor: "anchor-1".to_string(),
+                expected_sha256: normalized_message_sha256(body),
+                latest_observation_generation: 1,
+                matching_turns: 0,
+                observed_turns: 0,
+                saw_unmatchable_turn: false,
             },
         );
         pane.outbound
@@ -7415,20 +7464,34 @@ mod tests {
         }
     }
 
-    fn available_observation<const N: usize>(
+    pub(super) fn available_observation<const N: usize>(
         generation: u64,
         turns: [(&str, Option<&str>); N],
     ) -> OutboundObservationResult {
-        let turn_ids = turns
-            .iter()
-            .map(|(turn_id, _)| (*turn_id).to_string())
-            .collect();
+        if !turns.is_empty() {
+            return post_anchor_observation(generation, true, turns);
+        }
         OutboundObservationResult::Available(Box::new(OutboundObservation {
             identity: outbound_identity(),
             generation,
-            complete: true,
-            turn_count: turns.len() as u64,
-            turn_ids,
+            phase: OutboundObservationPhase::TailAnchor {
+                resume_token: format!("anchor-{generation}"),
+            },
+            snapshot_complete: true,
+            user_turns: Vec::new(),
+        }))
+    }
+
+    fn post_anchor_observation<const N: usize>(
+        generation: u64,
+        snapshot_complete: bool,
+        turns: [(&str, Option<&str>); N],
+    ) -> OutboundObservationResult {
+        OutboundObservationResult::Available(Box::new(OutboundObservation {
+            identity: outbound_identity(),
+            generation,
+            phase: OutboundObservationPhase::PostAnchorPage,
+            snapshot_complete,
             user_turns: turns
                 .into_iter()
                 .map(|(turn_id, body)| ObservedUserTurn {
@@ -7436,7 +7499,7 @@ mod tests {
                     timestamp: DateTime::parse_from_rfc3339("2026-05-01T00:00:01Z")
                         .unwrap()
                         .with_timezone(&Utc),
-                    body: body.map(str::to_string),
+                    canonical_text_sha256: body.map(normalized_message_sha256),
                 })
                 .collect(),
         }))
@@ -7627,7 +7690,7 @@ mod tests {
 
     #[test]
     fn extract_selection_text_reads_screen_range_and_trims() {
-        let mut parser = vt100::Parser::new(4, 20, 0);
+        let mut parser = TerminalParser::new(4, 20, 0);
         parser.process(b"hello\r\nworld wide");
         let span = SelectionSpan {
             start: (0, 0),
@@ -7673,7 +7736,7 @@ mod tests {
         let backend = TestBackend::new(20, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         // top pane is 5 rows (10 - persistent overlay rows), 20 cols.
-        let mut parser = vt100::Parser::new(5, 20, 0);
+        let mut parser = TerminalParser::new(5, 20, 0);
         parser.process(b"hello world");
         let screen_owner = parser;
         let screen = screen_owner.screen();
@@ -7691,7 +7754,7 @@ mod tests {
 
     #[test]
     fn render_cadence_tracks_overlay_focus() {
-        let parser = vt100::Parser::new(5, 80, 0);
+        let parser = TerminalParser::new(5, 80, 0);
         let background =
             RenderSnapshot::capture(parser.screen(), Focus::Top, &MonitorPane::new(), None);
         assert_eq!(snapshot_render_fps(&background), BACKGROUND_RENDER_FPS);
@@ -7754,7 +7817,7 @@ mod tests {
 
     #[test]
     fn child_output_priority_reaches_foreground_without_bottom_focus() {
-        let parser = vt100::Parser::new(5, 80, 0);
+        let parser = TerminalParser::new(5, 80, 0);
         let snapshot = RenderSnapshot::capture_with_typing_protection_and_priority(
             parser.screen(),
             Focus::Top,
@@ -7769,7 +7832,7 @@ mod tests {
 
     #[test]
     fn interactive_publish_deadline_preempts_stale_background_wait() {
-        let parser = vt100::Parser::new(5, 80, 0);
+        let parser = TerminalParser::new(5, 80, 0);
         let pane = MonitorPane::new();
         let background = RenderSnapshot::capture_with_typing_protection_and_priority(
             parser.screen(),
@@ -7806,7 +7869,7 @@ mod tests {
 
     #[test]
     fn background_publish_deadline_remains_throttled() {
-        let parser = vt100::Parser::new(5, 80, 0);
+        let parser = TerminalParser::new(5, 80, 0);
         let snapshot =
             RenderSnapshot::capture(parser.screen(), Focus::Top, &MonitorPane::new(), None);
         let last_frame = Instant::now();
@@ -7824,7 +7887,7 @@ mod tests {
     fn child_output_burst_coalescing_preserves_final_screen_state() {
         let (read_end, mut write_end) = pipe_files();
         write_end.write_all(b"abcdef").unwrap();
-        let mut parser = vt100::Parser::new(1, 20, 0);
+        let mut parser = TerminalParser::new(1, 20, 0);
         let mut buffer = [0_u8; 2];
 
         assert!(pump_pty_output_burst(read_end.as_raw_fd(), &mut parser, &mut buffer).unwrap());
@@ -7855,6 +7918,260 @@ mod tests {
         assert_eq!(routed_priority(&routed), RenderPriority::Interactive);
     }
 
+    fn route_test_input_at(router: &mut InputRouter, bytes: &[u8], now: Instant) -> RoutedInput {
+        route_mouse_aware_input_at(
+            bytes,
+            router,
+            &MonitorPane::new(),
+            MouseRequest::disabled(),
+            &minimum_terminal_winsize(),
+            TypingProtection::for_focus(Focus::Top),
+            now,
+        )
+    }
+
+    #[test]
+    fn typing_and_wheel_in_one_read_preserve_event_order() {
+        let mut router = InputRouter::new();
+        let now = Instant::now();
+        let key_then_wheel = route_test_input_at(&mut router, b"a\x1b[<64;4;3M", now);
+        assert_eq!(key_then_wheel.forward, b"a");
+        assert_eq!(key_then_wheel.top_scroll_lines, TOP_SCROLL_STEP);
+        let wheel_then_key = route_test_input_at(&mut router, b"\x1b[<64;4;3Ma", now);
+        assert_eq!(wheel_then_key.forward, b"a");
+        assert_eq!(wheel_then_key.top_scroll_lines, 0);
+        let interleaved = route_test_input_at(&mut router, b"\x1b[<64;4;3Ma\x1b[<64;4;3M", now);
+        assert_eq!(interleaved.forward, b"a");
+        assert_eq!(interleaved.top_scroll_lines, TOP_SCROLL_STEP);
+    }
+
+    #[test]
+    fn split_mouse_reports_never_leak_as_keystrokes() {
+        for sequence in [b"\x1b[<64;4;3M".as_slice(), b"\x1b[M`$#".as_slice()] {
+            for split in 1..sequence.len() {
+                let mut router = InputRouter::new();
+                let now = Instant::now();
+                let first = route_test_input_at(&mut router, &sequence[..split], now);
+                assert!(first.forward.is_empty(), "split {split}");
+                assert_eq!(first.top_scroll_lines, 0);
+                let second = route_test_input_at(&mut router, &sequence[split..], now);
+                assert!(second.forward.is_empty(), "split {split}");
+                assert_eq!(second.top_scroll_lines, TOP_SCROLL_STEP);
+                assert!(router.pending_sequence.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_typing_is_immediate_and_partial_escape_has_bounded_wait() {
+        let mut router = InputRouter::new();
+        let now = Instant::now();
+        let first = route_test_input_at(&mut router, b"hello\x1b", now);
+        assert_eq!(first.forward, b"hello");
+        assert!(!router.sequence_expired(now));
+        let before = route_test_input_at(&mut router, b"", now + INPUT_SEQUENCE_TIMEOUT / 2);
+        assert!(before.forward.is_empty());
+        let after = route_test_input_at(&mut router, b"", now + INPUT_SEQUENCE_TIMEOUT);
+        assert_eq!(after.forward, b"\x1b");
+        assert!(router.pending_sequence.is_empty());
+        assert!(!router.sequence_expired(now + INPUT_SEQUENCE_TIMEOUT));
+    }
+
+    #[test]
+    fn bottom_pane_keys_decode_across_read_boundaries() {
+        for sequence in [b"\x1b[A".as_slice(), b"\x1b[13;5u".as_slice()] {
+            for split in 1..sequence.len() {
+                let now = Instant::now();
+                let mut whole_router = InputRouter::new();
+                whole_router.focus = Focus::Bottom;
+                let whole = route_test_input_at(&mut whole_router, sequence, now);
+                let mut router = InputRouter::new();
+                router.focus = Focus::Bottom;
+                let first = route_test_input_at(&mut router, &sequence[..split], now);
+                assert!(first.commands.is_empty());
+                assert!(first.pseudo_input.is_empty());
+                let second = route_test_input_at(&mut router, &sequence[split..], now);
+                assert_eq!(second, whole);
+                assert!(second.forward.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_escape_cannot_hold_unbounded_input() {
+        let mut router = InputRouter::new();
+        let mut bytes = b"\x1b[<".to_vec();
+        bytes.extend(vec![b'1'; MAX_INPUT_SEQUENCE_BYTES * 2]);
+        let routed = route_test_input_at(&mut router, &bytes, Instant::now());
+        assert_eq!(routed.forward, bytes);
+        assert!(router.pending_sequence.is_empty());
+    }
+
+    #[test]
+    fn partial_sequence_timeout_also_expires_during_continuous_input() {
+        let mut router = InputRouter::new();
+        let now = Instant::now();
+        assert!(
+            route_test_input_at(&mut router, b"\x1b[", now)
+                .forward
+                .is_empty()
+        );
+        let routed = route_test_input_at(&mut router, b"1", now + INPUT_SEQUENCE_TIMEOUT);
+        assert_eq!(routed.forward, b"\x1b[1");
+        assert!(router.pending_sequence.is_empty());
+    }
+
+    #[test]
+    fn bracketed_paste_preserves_mouse_shaped_text_across_reads() {
+        let mut router = InputRouter::new();
+        let now = Instant::now();
+        let first = route_test_input_at(&mut router, b"\x1b[200~text\x1b[<64;4;3M\x1b[20", now);
+        assert_eq!(first.forward, b"\x1b[200~text\x1b[<64;4;3M\x1b[20");
+        assert_eq!(first.top_scroll_lines, 0);
+        let second = route_test_input_at(&mut router, b"1~\x1b[<64;4;3M", now);
+        assert_eq!(second.forward, b"1~");
+        assert_eq!(second.top_scroll_lines, TOP_SCROLL_STEP);
+    }
+
+    #[test]
+    fn paste_payload_cannot_consume_the_paste_terminator() {
+        let mut router = InputRouter::new();
+        let routed = route_test_input_at(
+            &mut router,
+            b"\x1b[200~\x1b[M\x1b[201~\x1b[<64;4;3M",
+            Instant::now(),
+        );
+        assert_eq!(routed.forward, b"\x1b[200~\x1b[M\x1b[201~");
+        assert_eq!(routed.top_scroll_lines, TOP_SCROLL_STEP);
+        assert!(!router.bracketed_paste);
+    }
+
+    #[test]
+    fn delayed_paste_terminator_fragments_leave_wheel_routing_enabled() {
+        for split in 1..BRACKETED_PASTE_END.len() {
+            let mut router = InputRouter::new();
+            let now = Instant::now();
+            route_test_input_at(&mut router, BRACKETED_PASTE_START, now);
+            let first = route_test_input_at(&mut router, &BRACKETED_PASTE_END[..split], now);
+            assert_eq!(first.forward, BRACKETED_PASTE_END[..split]);
+            assert!(router.pending_sequence.is_empty());
+            let second = route_test_input_at(
+                &mut router,
+                &BRACKETED_PASTE_END[split..],
+                now + Duration::from_secs(1),
+            );
+            assert_eq!(second.forward, BRACKETED_PASTE_END[split..]);
+            let wheel =
+                route_test_input_at(&mut router, b"\x1b[<64;4;3M", now + Duration::from_secs(1));
+            assert_eq!(wheel.top_scroll_lines, TOP_SCROLL_STEP);
+            assert!(wheel.forward.is_empty());
+        }
+    }
+
+    #[test]
+    fn opening_paste_marker_survives_an_expired_escape_prefix() {
+        for split in 1..BRACKETED_PASTE_START.len() {
+            let mut router = InputRouter::new();
+            let now = Instant::now();
+            route_test_input_at(&mut router, &BRACKETED_PASTE_START[..split], now);
+            let first = route_test_input_at(&mut router, b"", now + INPUT_SEQUENCE_TIMEOUT);
+            assert_eq!(first.forward, BRACKETED_PASTE_START[..split]);
+            let remainder = [&BRACKETED_PASTE_START[split..], b"\x1b[<64;4;3M"].concat();
+            let second = route_test_input_at(&mut router, &remainder, now + Duration::from_secs(1));
+            assert_eq!(second.forward, remainder);
+            assert_eq!(second.top_scroll_lines, 0);
+            assert!(router.bracketed_paste);
+        }
+    }
+
+    #[test]
+    fn renderer_does_not_sleep_after_a_publish_races_with_wait() {
+        let shared = RenderShared::default();
+        let parser = TerminalParser::new(5, 80, 0);
+        shared.publish(RenderSnapshot::capture(
+            parser.screen(),
+            Focus::Top,
+            &MonitorPane::new(),
+            None,
+        ));
+        let observed_generation = shared.latest_published().unwrap().generation;
+        shared.publish(RenderSnapshot::capture(
+            parser.screen(),
+            Focus::Top,
+            &MonitorPane::new(),
+            None,
+        ));
+        let started = Instant::now();
+        shared.wait_until(started + Duration::from_secs(2), observed_generation);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[derive(Clone, Default)]
+    struct RenderWriteRecord {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingRenderWriter(Arc<Mutex<RenderWriteRecord>>);
+
+    impl Write for RecordingRenderWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut record = lock_or_recover(&self.0);
+            record.bytes.extend_from_slice(bytes);
+            record.writes += 1;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            lock_or_recover(&self.0).flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn buffered_render_preserves_frame_bytes_and_flushes_without_per_cell_writes() {
+        let mut parser = TerminalParser::new(48, 160, 0);
+        for row in 1..=48 {
+            parser.process(format!("\x1b[{row};1H{}", "x".repeat(160)).as_bytes());
+        }
+        let snapshot =
+            RenderSnapshot::capture(parser.screen(), Focus::Top, &MonitorPane::new(), None);
+        let options = ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 160, 50)),
+        };
+        let unbuffered_writer = RecordingRenderWriter::default();
+        let mut unbuffered = Terminal::with_options(
+            CrosstermBackend::new(unbuffered_writer.clone()),
+            options.clone(),
+        )
+        .unwrap();
+        let buffered_writer = RecordingRenderWriter::default();
+        let mut buffered =
+            Terminal::with_options(new_tui_backend(buffered_writer.clone()), options).unwrap();
+
+        unbuffered
+            .draw(|frame| render_snapshot_frame(frame, &snapshot))
+            .unwrap();
+        buffered
+            .draw(|frame| render_snapshot_frame(frame, &snapshot))
+            .unwrap();
+
+        // Inspect before dropping the terminals: draw itself must flush the complete
+        // frame, so later AltScreenGuard mode writes cannot overtake buffered output.
+        let unbuffered = lock_or_recover(&unbuffered_writer.0).clone();
+        let buffered = lock_or_recover(&buffered_writer.0).clone();
+        assert_eq!(buffered.bytes, unbuffered.bytes);
+        assert!(
+            unbuffered.writes > 7_000,
+            "fixture must exercise a full repaint"
+        );
+        assert!(buffered.writes <= 2, "frame must be batched before writing");
+        assert!(buffered.flushes > 0, "draw must flush before returning");
+        assert_eq!(buffered.flushes, unbuffered.flushes);
+    }
+
     #[test]
     fn render_thread_keeps_drawing_while_processing_side_is_busy() {
         let _terminal_lock = lock_terminal_render_test();
@@ -7883,7 +8200,7 @@ mod tests {
         let publisher = renderer.publisher();
         let mut pane = MonitorPane::new();
         pane.expand();
-        let mut parser = vt100::Parser::new(10, 80, 0);
+        let mut parser = TerminalParser::new(10, 80, 0);
         parser.process(b"responsive input echo");
         publish_render_snapshot(
             &publisher,
@@ -8049,7 +8366,7 @@ mod tests {
     // forwards typed input through the mux to the child, propagates the child's
     // exit status, and paints the collapsed monitor row to the real terminal.
     #[test]
-    fn observed_relay_gives_child_a_tty_forwards_input_and_renders_monitor() {
+    fn observed_relay_answers_cursor_queries_forwards_input_and_renders_monitor() {
         let _terminal_lock = lock_terminal_render_test();
         let outer = open_outer_pty(24, 80);
         make_raw(outer.slave.as_raw_fd());
@@ -8064,7 +8381,7 @@ mod tests {
 
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(
-            r#"[ -t 0 ] || exit 7; IFS= read -r -t 5 line || exit 6; [ "$line" = "ping" ] && exit 42 || exit 8"#,
+            r#"[ -t 0 ] || exit 7; printf '\033[3;7H\033[6n'; IFS= read -r -s -N 6 -t 2 reply || exit 9; [ "$reply" = $'\033[3;7R' ] || exit 10; printf READY_FOR_INPUT; IFS= read -r -t 5 line || exit 6; [ "$line" = "ping" ] && exit 42 || exit 8"#,
         );
         configure_child_pty(&mut cmd, &pty).expect("configure child pty");
         let child = cmd.spawn().expect("spawn child");
@@ -8097,7 +8414,8 @@ mod tests {
         });
 
         // Read rendered frames continuously (so the PTY buffer never blocks the
-        // relay) and inject the line once the child has had time to reach `read`.
+        // relay) and inject only after the child verifies its cursor reply. A
+        // wall-clock delay can race a slow startup and corrupt the six-byte reply.
         set_nonblocking(outer.master.as_raw_fd());
         let mut rendered = Vec::new();
         let mut buf = [0_u8; 8192];
@@ -8109,7 +8427,11 @@ mod tests {
             {
                 rendered.extend_from_slice(&buf[..n]);
             }
-            if !injected && start.elapsed() >= Duration::from_millis(200) {
+            if !injected
+                && rendered
+                    .windows(b"READY_FOR_INPUT".len())
+                    .any(|w| w == b"READY_FOR_INPUT")
+            {
                 (&outer.master).write_all(b"ping\n").expect("write input");
                 injected = true;
             }
@@ -8135,7 +8457,7 @@ mod tests {
         assert_eq!(
             status.code(),
             Some(42),
-            "child must observe a tty (-t 0) and receive the forwarded line through the mux"
+            "child must receive its own cursor query reply and the forwarded line through the mux"
         );
         let stripped = strip_ansi(&rendered);
         assert!(
@@ -8256,7 +8578,14 @@ mod tests {
             Some(root_id),
         );
         state
-            .finalize_invocation(ancestor_id, true, 0, None, None)
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                ancestor_id,
+                true,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         start_monitor_invocation(
             &state,
@@ -8269,7 +8598,16 @@ mod tests {
                 &format!("34000000-0000-0000-0000-{index:012}"),
                 Some(root_id),
             );
-            state.finalize_invocation(id, true, 0, None, None).unwrap();
+            state
+                .finalize_invocation(
+                    oulipoly_state::InvocationMutationAuthority::Standalone,
+                    id,
+                    true,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
         }
         let unrelated_root =
             start_monitor_invocation(&state, "35000000-0000-0000-0000-000000000000", None);
@@ -8366,7 +8704,7 @@ mod tests {
         };
         let termios = tty_termios(outer.slave.as_raw_fd());
         let pty = PtyPair::open(&initial, &termios).expect("inner pty");
-        let mut parser = vt100::Parser::new(10, 10, 0);
+        let mut parser = TerminalParser::new(10, 10, 0);
         let mut applied = None;
 
         // Collapsed: child PTY reserves the persistent overlay rows (30 -> 25).
@@ -8609,6 +8947,9 @@ mod tests {
             pending_outbound_recovery: None,
             outbound_recovery_request: None,
             outbound_recovery_feedback: None,
+            observation_stop: None,
+            pending_observation_recovery: None,
+            observation_recovery_request: None,
         }
     }
 
@@ -8780,7 +9121,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut pane = MonitorPane::new();
         pane.expand();
-        let parser = vt100::Parser::new(INPUT_SAFE_TOP_PANE_MIN_ROWS, 80, 0);
+        let parser = TerminalParser::new(INPUT_SAFE_TOP_PANE_MIN_ROWS, 80, 0);
         terminal
             .draw(|frame| {
                 render_frame_with_typing_protection(
@@ -8815,7 +9156,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut pane = MonitorPane::new();
         pane.expand();
-        let mut parser = vt100::Parser::new(INPUT_SAFE_TOP_PANE_MIN_ROWS, 80, 0);
+        let mut parser = TerminalParser::new(INPUT_SAFE_TOP_PANE_MIN_ROWS, 80, 0);
         parser.process(b"\x1b[12;1Hcomposer line one\x1b[13;1Hcomposer line two\x1b[14;19H");
 
         terminal
@@ -8852,7 +9193,7 @@ mod tests {
         let mut snapshot = empty_snapshot();
         snapshot.summary = snapshot_summary(MonitorStatus::Running, 2, 1, 3, 0);
         let pane = pane_with(snapshot, true, 0);
-        let parser = vt100::Parser::new(5, 80, 0);
+        let parser = TerminalParser::new(5, 80, 0);
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Top, &pane, None))
             .unwrap();
@@ -9268,7 +9609,7 @@ mod tests {
             "compiling crate".to_string(),
             "running 12 tests".to_string(),
         ];
-        let parser = vt100::Parser::new(11, 60, 0);
+        let parser = TerminalParser::new(11, 60, 0);
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
@@ -9427,7 +9768,7 @@ mod tests {
 
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        let parser = vt100::Parser::new(15, 80, 0);
+        let parser = TerminalParser::new(15, 80, 0);
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
@@ -9530,7 +9871,7 @@ mod tests {
         pane.inspect = vec!["prepared detail sentinel".to_string()];
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        let parser = vt100::Parser::new(11, 60, 0);
+        let parser = TerminalParser::new(11, 60, 0);
 
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
@@ -9658,7 +9999,7 @@ mod tests {
             ),
         ];
         let pane = pane_with(snapshot, false, 1);
-        let parser = vt100::Parser::new(11, 80, 0);
+        let parser = TerminalParser::new(11, 80, 0);
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
@@ -9686,7 +10027,7 @@ mod tests {
         let mut pane = pane_with(snapshot, true, 0);
         pane.pseudo_input.buffer = "draft".to_string();
         pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
-        let parser = vt100::Parser::new(15, 80, 0);
+        let parser = TerminalParser::new(15, 80, 0);
 
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Top, &pane, None))
@@ -9716,7 +10057,7 @@ mod tests {
         let mut pane = pane_with(snapshot, false, 0);
         pane.pseudo_input.buffer = "draft".to_string();
         pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
-        let parser = vt100::Parser::new(12, 80, 0);
+        let parser = TerminalParser::new(12, 80, 0);
 
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
@@ -9779,7 +10120,7 @@ mod tests {
         let mut snapshot = empty_snapshot();
         snapshot.summary = snapshot_summary(MonitorStatus::Running, 3, 2, 1, 0);
         let pane = pane_with(snapshot, true, 0);
-        let parser = vt100::Parser::new(15, 80, 0);
+        let parser = TerminalParser::new(15, 80, 0);
 
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
@@ -9787,7 +10128,10 @@ mod tests {
 
         let text = screen_text(terminal.backend().buffer(), 20, 80);
         assert!(text.contains("OBS"), "{text}");
-        assert!(text.contains("running · 3 proc · 2 bash running"), "{text}");
+        assert!(
+            text.contains("running · 3 running nodes · 2 bash running"),
+            "{text}"
+        );
         assert!(!text.contains("Enter queue"), "{text}");
         assert!(!text.contains("Ctrl+Enter"), "{text}");
         assert!(!text.contains("Ctrl+F"), "{text}");
@@ -9921,7 +10265,7 @@ mod tests {
         ];
         let mut pane = pane_with(snapshot, false, 0);
         pane.view_mode = MonitorViewMode::Tree;
-        let parser = vt100::Parser::new(11, 80, 0);
+        let parser = TerminalParser::new(11, 80, 0);
 
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
@@ -10475,3 +10819,304 @@ mod tests {
         assert!(pane.snapshot.is_some());
     }
 }
+
+#[cfg(all(test, unix))]
+mod host_observer_tests {
+    use super::super::outbound_observer::{ObservationResolution, fixtures::ObserverFixture};
+    use super::*;
+
+    fn pump(
+        pane: &mut MonitorPane,
+        pending: &mut PendingChildInput,
+        line: &mut InputLineState,
+        fixture: &ObserverFixture,
+    ) {
+        pump_outbound_queue_from_worker(
+            pane,
+            pending,
+            line,
+            &OutboundReleaseGate::default(),
+            false,
+            &fixture.worker,
+            false,
+        );
+    }
+
+    #[test]
+    fn queued_observation_stops_until_exact_authorized_resolution() {
+        for (reason, resolution, wrong_resolution) in [
+            (
+                "session_turn_staging_capacity_exceeded",
+                ObservationResolution::CapacityResolved,
+                ObservationResolution::PagingRestored,
+            ),
+            (
+                "session_turn_paging_paused",
+                ObservationResolution::PagingRestored,
+                ObservationResolution::CapacityResolved,
+            ),
+        ] {
+            let mut fixture = ObserverFixture::new(reason);
+            let mut pane = MonitorPane::new();
+            pane.outbound.enqueue("synthetic queued message".into());
+            let mut pending = PendingChildInput::new();
+            let mut line = InputLineState::default();
+            pump(&mut pane, &mut pending, &mut line, &fixture);
+            assert!(fixture.tick());
+            let (generation, stopped_reason) = fixture.stopped();
+            assert_eq!(stopped_reason, reason);
+            let cursor = fixture.cursor();
+            for _ in 0..400 {
+                pump(&mut pane, &mut pending, &mut line, &fixture);
+                assert!(!fixture.tick());
+            }
+            assert_eq!(fixture.calls().len(), 1);
+            assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
+            let message = pane.outbound.message(1).unwrap();
+            assert_eq!(message.body, "synthetic queued message");
+            assert!(message.baseline.is_none() && message.sent_at.is_none());
+            assert!(message.detail.as_deref().unwrap().contains(reason));
+            assert!(
+                !message
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("untrusted provider message")
+            );
+            assert!(pending.is_empty() && pane.outbound.active.is_none());
+            fixture.set_mode("restored");
+            fixture.worker.set_demand(false);
+            fixture.worker.set_demand(true);
+            fixture.worker.request_fresh_generation();
+            for _ in 0..400 {
+                pump(&mut pane, &mut pending, &mut line, &fixture);
+                assert!(!fixture.tick());
+            }
+            assert_eq!(fixture.cursor(), cursor);
+            assert_eq!(fixture.calls().len(), 1);
+            assert!(
+                fixture
+                    .worker
+                    .rearm_after_resolution(generation + 1, reason, resolution)
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .worker
+                    .rearm_after_resolution(generation, reason, wrong_resolution)
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .worker
+                    .rearm_after_resolution(
+                        generation,
+                        "session_turn_page_budget_too_small",
+                        resolution,
+                    )
+                    .is_err()
+            );
+            assert!(!fixture.tick());
+            let mut router = InputRouter::new();
+            router.focus = Focus::Bottom;
+            assert_eq!(
+                router.route_input(&[0x07]).commands,
+                vec![MonitorCommand::RequestObservationRecovery]
+            );
+            pane.apply(MonitorCommand::RequestObservationRecovery);
+            let hint = bottom_status_hint(&pane, false);
+            assert!(
+                hint.contains("authorized observer recovery") && hint.contains("no message resend")
+            );
+            pane.apply(MonitorCommand::AbortAction);
+            assert!(!run_pending_observation_recovery(
+                &mut pane,
+                &fixture.worker
+            ));
+            assert!(!fixture.tick());
+            pane.apply(MonitorCommand::RequestObservationRecovery);
+            pane.apply(MonitorCommand::ConfirmAction);
+            assert!(run_pending_observation_recovery(&mut pane, &fixture.worker));
+            assert!(!run_pending_observation_recovery(
+                &mut pane,
+                &fixture.worker
+            ));
+            assert!(
+                fixture
+                    .worker
+                    .rearm_after_resolution(generation, reason, resolution)
+                    .is_err()
+            );
+            pump(&mut pane, &mut pending, &mut line, &fixture);
+            assert!(pending.is_empty());
+            assert!(fixture.tick());
+            assert_eq!(fixture.calls().len(), 2);
+            let latest = fixture.worker.latest_result().unwrap();
+            let OutboundObservationResult::Available(observation) = latest.as_ref() else {
+                panic!("{latest:?}");
+            };
+            // An old successful generation cannot supply the newly required baseline.
+            let mut stale = observation.clone();
+            stale.generation = generation;
+            pump_outbound_queue(
+                &mut pane,
+                &mut pending,
+                &mut line,
+                false,
+                Some(&OutboundObservationResult::Available(stale)),
+                Instant::now(),
+            );
+            assert!(pending.is_empty());
+            assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
+            pump(&mut pane, &mut pending, &mut line, &fixture);
+            assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
+            let bytes = pending.pending_len();
+            assert!(bytes > 0);
+            for _ in 0..10 {
+                pump(&mut pane, &mut pending, &mut line, &fixture);
+            }
+            assert_eq!(
+                pending.pending_len(),
+                bytes,
+                "no duplicate enqueue or confirmation"
+            );
+            assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
+        }
+    }
+
+    #[test]
+    fn confirmed_observer_recovery_rejects_a_superseded_stop() {
+        let reason = "session_turn_paging_paused";
+        let mut fixture = ObserverFixture::new(reason);
+        let mut pane = MonitorPane::new();
+        pane.outbound.enqueue("synthetic queued message".into());
+        let mut pending = PendingChildInput::new();
+        let mut line = InputLineState::default();
+        pump(&mut pane, &mut pending, &mut line, &fixture);
+        assert!(fixture.tick());
+        pump(&mut pane, &mut pending, &mut line, &fixture);
+        pane.apply(MonitorCommand::RequestObservationRecovery);
+        pane.apply(MonitorCommand::ConfirmAction);
+        let old = fixture.stopped();
+        // Another explicitly authorized recovery was attempted before the saved
+        // confirmation executes. Still-refusing paging creates a fresh stop.
+        fixture
+            .worker
+            .rearm_after_resolution(old.0, old.1, ObservationResolution::PagingRestored)
+            .unwrap();
+        assert!(fixture.tick());
+        let current = fixture.stopped();
+        assert!(current.0 > old.0);
+        assert!(!run_pending_observation_recovery(
+            &mut pane,
+            &fixture.worker
+        ));
+        for _ in 0..400 {
+            assert!(!fixture.tick());
+        }
+        assert_eq!(fixture.stopped(), current);
+        assert_eq!(fixture.calls().len(), 2);
+        assert!(pending.is_empty());
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
+    }
+
+    #[test]
+    fn observation_transient_neighbor_keeps_automatic_retry() {
+        let mut fixture = ObserverFixture::new("session_turn_page_io");
+        let mut pane = MonitorPane::new();
+        pane.outbound.enqueue("synthetic queued message".into());
+        let mut pending = PendingChildInput::new();
+        let mut line = InputLineState::default();
+        pump(&mut pane, &mut pending, &mut line, &fixture);
+        assert!(fixture.tick());
+        pump(&mut pane, &mut pending, &mut line, &fixture);
+        assert!(fixture.tick());
+        assert_eq!(fixture.calls().len(), 2);
+        assert!(pending.is_empty());
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
+        fixture.set_mode("restored");
+        pump(&mut pane, &mut pending, &mut line, &fixture);
+        assert!(fixture.tick());
+        pump(&mut pane, &mut pending, &mut line, &fixture);
+        assert_eq!(fixture.calls().len(), 3);
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
+    }
+
+    #[test]
+    fn observation_stop_retains_partial_cursor_and_sent_confirmation_baseline() {
+        for (reason, resolution) in [
+            (
+                "session_turn_staging_capacity_exceeded",
+                ObservationResolution::CapacityResolved,
+            ),
+            (
+                "session_turn_paging_paused",
+                ObservationResolution::PagingRestored,
+            ),
+        ] {
+            let mut fixture = ObserverFixture::new("restored");
+            fixture.worker.set_demand(true);
+            assert!(fixture.tick());
+            let latest = fixture.worker.latest_result().unwrap();
+            let mut pane = MonitorPane::new();
+            pane.outbound.enqueue("synthetic already sent".into());
+            let baseline =
+                observation_baseline(Some(latest.as_ref()), 1, "synthetic already sent").unwrap();
+            pane.outbound.mark_sending(1, baseline.clone());
+            let sent_at = Instant::now();
+            pane.outbound
+                .set_status(1, OutboundStatus::Sent, sent_at, None);
+            pane.outbound.enqueue("synthetic second".into());
+            fixture.worker.acknowledge(&latest);
+            fixture.worker.observe_after_anchor();
+            assert!(fixture.tick());
+            assert!(fixture.cursor().contains("Continuation"));
+            let cursor = fixture.cursor();
+            let mut pending = PendingChildInput::new();
+            let mut line = InputLineState::default();
+            pump(&mut pane, &mut pending, &mut line, &fixture);
+            let baseline = pane.outbound.message(1).unwrap().baseline.clone().unwrap();
+            fixture.set_mode(reason);
+            assert!(fixture.tick());
+            let stopped = fixture.stopped();
+            for _ in 0..400 {
+                pump(&mut pane, &mut pending, &mut line, &fixture);
+                assert!(!fixture.tick());
+            }
+            assert_eq!(fixture.calls().len(), 3);
+            assert_eq!(fixture.cursor(), cursor);
+            assert_eq!(
+                pane.outbound.message(1).unwrap().baseline.as_ref(),
+                Some(&baseline)
+            );
+            assert_eq!(pane.outbound.message(1).unwrap().sent_at, Some(sent_at));
+            assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sent));
+            assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
+            assert!(pending.is_empty());
+            fixture.set_mode("restored");
+            fixture
+                .worker
+                .rearm_after_resolution(stopped.0, stopped.1, resolution)
+                .unwrap();
+            assert!(fixture.tick());
+            let calls = fixture.calls();
+            assert_eq!(calls.len(), 4);
+            assert_eq!(
+                calls[2]["params"], calls[3]["params"],
+                "same refused continuation and nonce resumed"
+            );
+            pump(&mut pane, &mut pending, &mut line, &fixture);
+            assert!(pending.is_empty());
+            assert_eq!(
+                pane.outbound.status(1),
+                Some(OutboundStatus::Sent),
+                "empty page is not confirmation"
+            );
+            assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "outbound_delivery_tests.rs"]
+mod outbound_delivery_tests;

@@ -6,10 +6,13 @@ use crate::provider_registry::ProviderRegistryOptions;
 use crate::test_support::lock_env;
 use chrono::Utc;
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ResumeKind, ResumeStrategy,
-    SessionSourceEntry, provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry, ResumeKind,
+    ResumeStrategy, SessionSourceEntry, provider_implementation_ref::ProviderImplementationRef,
 };
-use oulipoly_state::{InvocationStart, ProviderSessionBinding};
+use oulipoly_state::{
+    FinalizedProviderSessionAuthority, ImportedSessionDisplayMetadataUpsert, InvocationStart,
+    ProviderSessionBinding,
+};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::OnceLock;
@@ -116,9 +119,29 @@ fn state_with_model_session(model: &ModelConfig, provider_name: &str, session_id
             parent_invocation_id: None,
         })
         .unwrap();
-    db.update_session_capture(invocation_id, Some(session_id), "fixture")
-        .unwrap();
-    db.mint_chain_for_invocation_session(invocation_id).unwrap();
+    db.update_session_capture(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+        Some(session_id),
+        "fixture",
+    )
+    .unwrap();
+    db.mint_chain_for_invocation_session(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+    )
+    .unwrap();
+    db.commit_finalized_provider_session_authority(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        invocation_id,
+        &FinalizedProviderSessionAuthority {
+            provider_session_id: session_id,
+            capture_method: "provider_session_capture",
+            provider_instance_id: &provider_fixture_instance_id(),
+            settings_id: &provider_fixture_settings_id(),
+        },
+    )
+    .unwrap();
     db
 }
 
@@ -268,6 +291,7 @@ fn providers_cfg_with_builtin_storage(
         provider_name.to_string(),
         ProviderEntry {
             command: Some("provider-fixture".to_string()),
+            settings_id: Some(provider_fixture_settings_id()),
             resume: Some(ResumeStrategy {
                 kind: ResumeKind::Flag,
                 flag: Some("--resume".to_string()),
@@ -435,6 +459,7 @@ fn seed_provider_session_resolved_account(
         })
         .unwrap();
     db.bind_invocation_provider_session_start(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         invocation_row_id,
         &ProviderSessionBinding {
             provider_session_id: session_id.to_string(),
@@ -724,7 +749,7 @@ fn configured_locator_takes_jsonl_precedence_over_conflicting_claude_storage_sca
 }
 
 #[test]
-fn provider_ref_metadata_lookup_dispatches_provider_locate_not_builtin_reader() {
+fn account_endpoint_metadata_lookup_dispatches_provider_locate_not_builtin_reader() {
     let dir = tempfile::tempdir().unwrap();
     let model_name = "provider-ref-opus";
     let provider_name = builtin_source_name();
@@ -741,12 +766,31 @@ fn provider_ref_metadata_lookup_dispatches_provider_locate_not_builtin_reader() 
     std::fs::write(&provider_jsonl_path, "{\"source\":\"provider\"}\n").unwrap();
     let record_path = dir.path().join("provider-records.jsonl");
     let provider = write_recording_session_provider(&record_path, &provider_jsonl_path);
-    let model = provider_ref_builtin_model(model_name, &provider.path);
+    let model = legacy_builtin_model(model_name);
     let models = model_store_with(model.clone());
     let db = state_with_model_session(&model, &provider_name, session_id);
-    let providers = providers_cfg_with_builtin_storage(&provider_name, projects_dir);
-    let registry = ProviderRegistry::from_model_configs(
+    db.upsert_imported_session_display_metadata(&ImportedSessionDisplayMetadataUpsert {
+        provider_name: provider_name.clone(),
+        provider_session_id: session_id.to_string(),
+        title: None,
+        cwd: Some(workspace.display().to_string()),
+        turn_count: None,
+        provider_updated_at: None,
+        seen_at: Utc::now(),
+    })
+    .unwrap();
+    let mut providers = providers_cfg_with_builtin_storage(&provider_name, projects_dir);
+    providers
+        .entries
+        .get_mut(&provider_name)
+        .unwrap()
+        .implementation = Some(ProviderEndpointConfig {
+        family: provider_name.clone(),
+        executable: provider.path.display().to_string(),
+    });
+    let registry = ProviderRegistry::from_configs(
         &[model],
+        &providers,
         ProviderRegistryOptions::default()
             .with_config_root(dir.path().join("config-root"))
             .with_data_root(dir.path().join("data-root")),

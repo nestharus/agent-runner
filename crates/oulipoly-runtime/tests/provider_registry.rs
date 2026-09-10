@@ -1,7 +1,8 @@
 //! Declared roles: accessor, predicate, validator, parser, mapper, formatter, orchestration.
 
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+    ProvidersConfig,
     provider_implementation_ref::{ProviderImplementationRef, ProviderImplementationRefError},
 };
 use oulipoly_provider::generated::{
@@ -15,6 +16,7 @@ use oulipoly_runtime::provider_registry::{
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn model(name: &str, provider: Option<ProviderImplementationRef>) -> ModelConfig {
     ModelConfig {
@@ -112,9 +114,12 @@ fn describe_result(provider_id: &str) -> DescribeResult {
         preferred_contract: CONTRACT_VERSION.to_string(),
         capabilities: DescribeCapabilities {
             launch: true,
+            prompt_acceptance_v1: false,
+            launch_output_v1: false,
             policy: false,
             quota: false,
             session: false,
+            session_turn_pages_v1: false,
             session_enumerate: false,
             terminal: false,
             rotation: false,
@@ -741,55 +746,261 @@ fn enabled_ref_flavors_resolve_describe_and_parse_capability_description() {
     assert_eq!(read_count(&script_count), 1);
 }
 
+#[cfg(unix)]
 #[test]
-fn binary_ref_resolves_from_process_path_entries() {
+fn account_path_authority_ignores_unsafe_command_inference_without_weakening_resolver() {
+    use std::collections::HashMap;
+    use std::os::unix::fs::symlink;
+
     let temp = tempfile::tempdir().unwrap();
-    let count = temp.path().join("process-path-count");
-    write_fake_provider_script(
+    let path_root = temp.path().join("path-root");
+    fs::create_dir(&path_root).unwrap();
+    let count = temp.path().join("account-path-count");
+    let provider = write_fake_provider_script(
         temp.path(),
-        "agent-runner-fixture",
+        "outside-provider",
         &count,
-        Ok("path-provider"),
+        Ok("account-provider"),
     );
-    let path_env = std::env::join_paths([temp.path()]).expect("fixture PATH should join");
+    symlink(&provider, path_root.join("agent-runner-opencode")).unwrap();
 
-    let registry = registry_from_single_ref(
-        binary_ref("agent-runner-fixture"),
-        ProviderRegistryOptions::default().with_path_entries_from_path_env(Some(path_env)),
+    let account_model = ModelConfig {
+        name: "opencode-model".to_string(),
+        prompt_mode: PromptMode::Arg,
+        providers: vec![ProviderConfig::model_provider("opencode5", Vec::new())],
+        inputs: Vec::new(),
+        provider: Some(binary_ref("agent-runner-opencode")),
+    };
+    let providers = ProvidersConfig {
+        entries: HashMap::from([(
+            "opencode5".to_string(),
+            ProviderEntry {
+                implementation: Some(ProviderEndpointConfig {
+                    family: "opencode".to_string(),
+                    executable: provider.display().to_string(),
+                }),
+                command: Some("opencode5".to_string()),
+                ..Default::default()
+            },
+        )]),
+    };
+    let options = ProviderRegistryOptions::default().with_path_entries([path_root.clone()]);
+
+    let registry = ProviderRegistry::from_configs(
+        std::slice::from_ref(&account_model),
+        &providers,
+        options.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        registry.artifact_key_for_model_provider("opencode-model", "opencode5"),
+        Some(format!("path:{}", provider.display()))
+    );
+    assert_eq!(
+        registry
+            .describe_model_provider_instance("opencode-model", "opencode5")
+            .unwrap()
+            .provider_id,
+        "account-provider"
     );
 
-    let result = registry
+    let unsafe_error = registry_from_single_ref(binary_ref("agent-runner-opencode"), options)
         .describe_model_provider("example-model")
-        .expect("binary provider should resolve through PATH-derived entries");
-    assert_eq!(result.provider_id, "path-provider");
-    assert_eq!(read_count(&count), 1);
+        .expect_err("the escaping PATH symlink must remain unsafe for binary authority");
+    assert_transport_kind(unsafe_error, "unsafe_binary");
 }
 
+#[cfg(unix)]
 #[test]
-fn absent_binary_from_process_path_entries_preserves_missing_artifact() {
+fn account_preflight_retains_one_canonical_executable_for_related_calls() {
+    use std::collections::HashMap;
+
     let temp = tempfile::tempdir().unwrap();
-    let path_env = std::env::join_paths([temp.path()]).expect("fixture PATH should join");
-
-    let error = registry_from_single_ref(
-        binary_ref("agent-runner-fixture"),
-        ProviderRegistryOptions::default().with_path_entries_from_path_env(Some(path_env)),
+    let configured_count = temp.path().join("configured-count");
+    let replacement_count = temp.path().join("replacement-count");
+    let configured = write_fake_provider_script(
+        temp.path(),
+        "configured-provider",
+        &configured_count,
+        Ok("selected-provider"),
+    );
+    let replacement = write_fake_provider_script(
+        temp.path(),
+        "replacement-provider",
+        &replacement_count,
+        Ok("replacement-provider"),
+    );
+    let providers = ProvidersConfig {
+        entries: HashMap::from([(
+            "provider-a".to_string(),
+            ProviderEntry {
+                implementation: Some(ProviderEndpointConfig {
+                    family: "fixture-family".to_string(),
+                    executable: "configured-provider".to_string(),
+                }),
+                settings_id: Some("fixture-settings".to_string()),
+                command: Some("must-not-select-an-implementation".to_string()),
+                ..Default::default()
+            },
+        )]),
+    };
+    let registry = ProviderRegistry::from_configs(
+        &[model("example-model", None)],
+        &providers,
+        ProviderRegistryOptions::default().with_config_root(temp.path()),
     )
-    .describe_model_provider("example-model")
-    .expect_err("absent binary should remain a missing artifact");
+    .unwrap();
 
-    assert_transport_kind(error, "missing_artifact");
+    let endpoint = registry.preflight_account("provider-a").unwrap();
+    let cached = registry.preflight_account("provider-a").unwrap();
+    assert!(Arc::ptr_eq(&endpoint, &cached));
+    assert_eq!(endpoint.account_name(), "provider-a");
+    assert_eq!(endpoint.family(), "fixture-family");
+    assert_eq!(endpoint.settings_id().unwrap(), "fixture-settings");
+    assert_eq!(
+        endpoint.canonical_executable(),
+        configured.canonicalize().unwrap()
+    );
+    assert_eq!(read_count(&configured_count), 1);
+
+    fs::rename(&replacement, &configured).unwrap();
+    let after_replacement: DescribeResult = endpoint
+        .client()
+        .invoke_typed(
+            "describe",
+            serde_json::json!({
+                "contract": CONTRACT_VERSION,
+                "request_id": "related-call-after-preflight",
+                "host": {"app": "oulipoly-agent-runner", "env": {}},
+                "params": {}
+            }),
+            [],
+        )
+        .unwrap();
+    assert_eq!(after_replacement.provider_id, "selected-provider");
+    assert_eq!(read_count(&configured_count), 2);
+    assert_eq!(read_count(&replacement_count), 0);
 }
 
 #[test]
-fn unset_process_path_entries_preserves_missing_artifact_without_panic() {
-    let error = registry_from_single_ref(
-        binary_ref("agent-runner-fixture"),
-        ProviderRegistryOptions::default().with_path_entries_from_path_env(None),
-    )
-    .describe_model_provider("example-model")
-    .expect_err("unset PATH should not resolve binary provider refs");
+fn registry_includes_unreferenced_accounts_and_keeps_shared_family_endpoints_account_scoped() {
+    use std::collections::HashMap;
 
-    assert_transport_kind(error, "missing_artifact");
+    let temp = tempfile::tempdir().unwrap();
+    let count = temp.path().join("shared-count");
+    let executable = write_fake_provider_script(
+        temp.path(),
+        "shared-provider",
+        &count,
+        Ok("shared-provider"),
+    );
+    let endpoint = ProviderEndpointConfig {
+        family: "shared-family".to_string(),
+        executable: executable.display().to_string(),
+    };
+    let providers = ProvidersConfig {
+        entries: HashMap::from([
+            (
+                "provider-a".to_string(),
+                ProviderEntry {
+                    implementation: Some(endpoint.clone()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "unreferenced-account".to_string(),
+                ProviderEntry {
+                    implementation: Some(endpoint),
+                    ..Default::default()
+                },
+            ),
+        ]),
+    };
+    let registry = ProviderRegistry::from_configs(
+        &[model("example-model", None)],
+        &providers,
+        ProviderRegistryOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        registry.configured_account_names(),
+        vec!["provider-a", "unreferenced-account"]
+    );
+    assert_eq!(registry.configured_family_names(), vec!["shared-family"]);
+    assert_eq!(
+        registry.artifact_key_for_account("provider-a"),
+        registry.artifact_key_for_account("unreferenced-account")
+    );
+    let first = registry.preflight_account("provider-a").unwrap();
+    let second = registry.preflight_account("unreferenced-account").unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    let family = registry.preflight_family("shared-family").unwrap();
+    let cached_family = registry.preflight_family("shared-family").unwrap();
+    assert!(Arc::ptr_eq(&family, &cached_family));
+    assert_eq!(family.family(), "shared-family");
+    assert_eq!(
+        family.canonical_executable(),
+        executable.canonicalize().unwrap()
+    );
+    assert_eq!(read_count(&count), 3);
+}
+
+#[test]
+fn registry_rejects_missing_or_conflicting_account_family_authority() {
+    use std::collections::HashMap;
+
+    let missing = ProvidersConfig {
+        entries: HashMap::from([("provider-a".to_string(), ProviderEntry::default())]),
+    };
+    let missing_error = ProviderRegistry::from_configs(
+        &[model("example-model", None)],
+        &missing,
+        ProviderRegistryOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        missing_error,
+        ProviderRegistryError::AccountImplementationNotConfigured { account_name }
+            if account_name == "provider-a"
+    ));
+
+    let conflicting = ProvidersConfig {
+        entries: HashMap::from([
+            (
+                "provider-a".to_string(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "shared-family".to_string(),
+                        executable: "/first/provider".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
+                "provider-b".to_string(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "shared-family".to_string(),
+                        executable: "/second/provider".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ]),
+    };
+    let conflict_error = ProviderRegistry::from_configs(
+        &[model("example-model", None)],
+        &conflicting,
+        ProviderRegistryOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        conflict_error,
+        ProviderRegistryError::FamilyImplementationConflict { family, .. }
+            if family == "shared-family"
+    ));
 }
 
 #[test]
@@ -1263,6 +1474,11 @@ fn describe_request_envelope_matches_provider_contract() {
         Some("oulipoly-agent-runner")
     );
     assert_eq!(
+        request["host"]["env"]["OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1"].as_str(),
+        Some("1"),
+        "new hosts must select the v1-compatible prompt-acceptance extension before a provider advertises it"
+    );
+    assert_eq!(
         request["host"]["config_root"].as_str(),
         None,
         "describe must not disclose host config roots to provider subprocesses"
@@ -1620,6 +1836,9 @@ fn assert_lifecycle_provider_registry_refs_are_s7a_only(lifecycle_source: &str) 
             ".provider_registry",
             ".ok_or_else(external_provider_registry_unavailable)?",
             "registry: &'a crate::provider_registry::ProviderRegistry,",
+            "registry: &crate::provider_registry::ProviderRegistry,",
+            ".map_err(|error| external_provider_registry_error(error.to_string()))?;",
+            "fn external_provider_registry_error(message: String) -> ServiceError {",
             "fn external_provider_registry_unavailable() -> ServiceError {",
             "message: \"session_provider_registry_unavailable\".to_string(),",
         ],
@@ -1715,12 +1934,12 @@ fn assert_lifecycle_provider_registry_dispatch_terms(lifecycle_source: &str) {
     for expected in [
         "SessionServiceExternalProviderIdentity",
         "session_provider",
-        "session.read_turns",
         "session.capture",
+        "enqueue_session_turn_ingest_stream",
     ] {
         assert!(
             lifecycle_source.contains(expected),
-            "services/session_lifecycle.rs may reference provider registry only for AGE-243 S7a read/capture dispatch: {expected}"
+            "services/session_lifecycle.rs must retain bounded capture and ingest enqueue dispatch: {expected}"
         );
     }
 }

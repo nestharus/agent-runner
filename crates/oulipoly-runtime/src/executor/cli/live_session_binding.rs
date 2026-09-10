@@ -4,14 +4,19 @@
 use super::spawn_identity::{
     RunningRuntimeGeneration, SpawnIdentityContext, backfill_captured_session_id,
 };
-use crate::provider_registry::ProviderRegistry;
+use crate::provider_registry::{PinnedProviderEndpoint, ProviderRegistry};
 #[cfg(unix)]
 use crate::services::emit_live_session_marker;
+#[cfg(unix)]
+use crate::session_authority::{
+    AuthoritativeSessionObservation, SessionAuthorityCommitRequest, SessionAuthorityExpectation,
+    commit_session_authority,
+};
 use crate::session_provider::SessionProviderIdentity;
 #[cfg(unix)]
-use crate::session_provider::{SessionProviderLiveCaptureRequest, capture_live_report};
+use crate::session_provider::{SessionProviderLiveCaptureRequest, capture_live_report_with_client};
 #[cfg(unix)]
-use oulipoly_state::{InvocationStatus, ProviderSessionBinding, StateDb};
+use oulipoly_state::StateDb;
 #[cfg(unix)]
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -37,10 +42,8 @@ use std::thread::{self, JoinHandle};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-const SOCKET_ENV: &str = "OULIPOLY_LIVE_SESSION_BIND_SOCKET";
-#[cfg(unix)]
-const TOKEN_ENV: &str = "OULIPOLY_LIVE_SESSION_BIND_TOKEN";
+pub(crate) const SOCKET_ENV: &str = "OULIPOLY_LIVE_SESSION_BIND_SOCKET";
+pub(crate) const TOKEN_ENV: &str = "OULIPOLY_LIVE_SESSION_BIND_TOKEN";
 #[cfg(unix)]
 const PROTOCOL_VERSION: u8 = 1;
 #[cfg(unix)]
@@ -60,12 +63,14 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
-pub(crate) struct InteractiveLiveSessionBinding {
+pub struct InteractiveLiveSessionBinding {
     pub registry: Arc<ProviderRegistry>,
+    pub endpoint: Arc<PinnedProviderEndpoint>,
     pub identity: SessionProviderIdentity,
     pub state_db_path: PathBuf,
     pub invocation_row_id: i64,
     pub invocation_uuid: String,
+    pub expected_provider_session_id: Option<String>,
     pub effective_cwd: Option<PathBuf>,
 }
 
@@ -259,13 +264,18 @@ fn handle_live_session_report(
         .map_err(|err| format!("Failed to configure live-session report write timeout: {err}"))?;
     let report = read_report(stream)?;
     validate_report(&report, context, token)?;
-    let capture = capture_live_report(SessionProviderLiveCaptureRequest {
-        registry: context.registry.as_ref(),
-        identity: context.identity.clone(),
-        invocation_uuid: &context.invocation_uuid,
-        provider_session_id: &report.provider_session_id,
-        effective_cwd: context.effective_cwd.as_deref(),
-    })
+    crate::session_provider::validate_endpoint_identity(&context.endpoint, &context.identity)
+        .map_err(|error| error.to_string())?;
+    let capture = capture_live_report_with_client(
+        context.endpoint.client(),
+        SessionProviderLiveCaptureRequest {
+            registry: context.registry.as_ref(),
+            identity: context.identity.clone(),
+            invocation_uuid: &context.invocation_uuid,
+            provider_session_id: &report.provider_session_id,
+            effective_cwd: context.effective_cwd.as_deref(),
+        },
+    )
     .map_err(|err| format!("Provider rejected live session report: {err}"))?;
     let captured = capture
         .provider_session_id
@@ -278,10 +288,34 @@ fn handle_live_session_report(
         ));
     }
     let state = StateDb::open(&context.state_db_path)?;
-    persist_live_binding(context, &state, &captured)?;
+    let resolved_workspace = live_session_resolved_workspace(context.effective_cwd.as_deref())?;
+    commit_session_authority(SessionAuthorityCommitRequest {
+        state: &state,
+        invocation_row_id: context.invocation_row_id,
+        invocation_uuid: &context.invocation_uuid,
+        expectation: SessionAuthorityExpectation {
+            account_name: &context.identity.provider_name,
+            provider_session_id: context.expected_provider_session_id.as_deref(),
+        },
+        observation: Some(AuthoritativeSessionObservation {
+            account_name: context.endpoint.account_name(),
+            provider_session_id: &captured,
+        }),
+        capture_method: PENDING_CAPTURE_METHOD,
+        provider_instance_id: context
+            .identity
+            .provider_instance_id
+            .as_deref()
+            .ok_or_else(|| "Live-session provider instance identity missing".to_string())?,
+        settings_id: &context.identity.settings_id,
+        resume_input_id: context.expected_provider_session_id.clone(),
+        provider_session_resolved_account: resolved_workspace,
+    })
+    .map_err(|error| error.to_string())?;
     backfill_captured_session_id(Some(spawn_context), Some(generation), &captured)?;
     set_shared_session(session_state, &captured)?;
     state.transition_invocation_provider_session_capture_method(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         context.invocation_row_id,
         &captured,
         PENDING_CAPTURE_METHOD,
@@ -315,6 +349,7 @@ fn restore_pending_capture_after_marker_failure(
     marker_error: String,
 ) -> String {
     match state.transition_invocation_provider_session_capture_method(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
         invocation_row_id,
         provider_session_id,
         CAPTURE_METHOD,
@@ -359,36 +394,6 @@ fn validate_report(
         return Err("Live-session report session ID is empty".to_string());
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn persist_live_binding(
-    context: &InteractiveLiveSessionBinding,
-    state: &StateDb,
-    provider_session_id: &str,
-) -> Result<(), String> {
-    let record = state
-        .get_invocation_by_uuid(&context.invocation_uuid)?
-        .ok_or_else(|| "Live-session invocation does not exist".to_string())?;
-    if record.id != context.invocation_row_id {
-        return Err("Live-session invocation row changed".to_string());
-    }
-    if record.provider_name.as_deref() != Some(context.identity.provider_name.as_str()) {
-        return Err("Live-session provider does not match the invocation".to_string());
-    }
-    if record.status != InvocationStatus::Running {
-        return Err("Live-session invocation is no longer running".to_string());
-    }
-    let resolved_workspace = live_session_resolved_workspace(context.effective_cwd.as_deref())?;
-    state.bind_invocation_provider_session_start(
-        context.invocation_row_id,
-        &ProviderSessionBinding {
-            provider_session_id: provider_session_id.to_string(),
-            capture_method: PENDING_CAPTURE_METHOD,
-            resume_input_id: None,
-            provider_session_resolved_account: resolved_workspace,
-        },
-    )
 }
 
 #[cfg(unix)]
@@ -552,15 +557,15 @@ mod tests {
         register_runtime_generation_starting,
     };
     use crate::provider_registry::ProviderRegistryOptions;
-    use oulipoly_config::provider_implementation_ref::ProviderImplementationRef;
     use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
+    use oulipoly_config::{ProviderEndpointConfig, ProviderEntry, ProvidersConfig};
     use oulipoly_state::mailbox::MailboxDb;
     use oulipoly_state::pid_identity::PidIdentityDb;
     use oulipoly_state::{CompositeInvocationId, InvocationStart};
     use std::os::unix::fs::PermissionsExt;
 
     const INVOCATION_UUID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const SESSION_ID: &str = "session-live-fixture";
+    const SESSION_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
     const PROVIDER_NAME: &str = "fixture-account";
     const MODEL_NAME: &str = "fixture-model";
 
@@ -617,6 +622,157 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.invocation_uuid, INVOCATION_UUID);
         assert_eq!(runtime.session_id.as_deref(), Some(SESSION_ID));
+    }
+
+    #[test]
+    fn age345_live_authority_survives_all_exit_outcomes_without_ingestion() {
+        for (success, code, category, reason) in [
+            (true, 0, None, None),
+            (false, 1, Some("provider_error"), None),
+            (false, 130, None, Some("interrupted")),
+            (false, -1, Some("spawn_error"), None),
+        ] {
+            let fixture = LiveBindingFixture::new();
+            assert!(
+                report_live_session_binding(
+                    &fixture.server.socket_path,
+                    &fixture.server.token,
+                    INVOCATION_UUID,
+                    SESSION_ID,
+                )
+                .unwrap()
+            );
+            let state = StateDb::open(&fixture.state_path).unwrap();
+            let row_id = fixture.server.context.invocation_row_id;
+            let chain = state
+                .chain_id_for_segment(PROVIDER_NAME, SESSION_ID)
+                .unwrap()
+                .unwrap();
+            let authority = state
+                .active_provider_session_authority(&chain)
+                .unwrap()
+                .unwrap();
+            assert_eq!(authority.provider_instance_id, "fixture-instance");
+            assert_eq!(authority.settings_id, "live-binding-settings-record");
+            state
+                .finalize_invocation(
+                    oulipoly_state::InvocationMutationAuthority::Standalone,
+                    row_id,
+                    success,
+                    code,
+                    category,
+                    reason,
+                )
+                .unwrap();
+            assert_eq!(
+                state.active_provider_session_authority(&chain).unwrap(),
+                Some(authority.clone())
+            );
+            assert_eq!(
+                state
+                    .latest_provider_session_resolved_account_for_authority(
+                        PROVIDER_NAME,
+                        SESSION_ID,
+                        &authority,
+                    )
+                    .unwrap(),
+                Some(fixture._temp.path().display().to_string())
+            );
+            let models =
+                std::collections::HashMap::from([(MODEL_NAME.to_string(), fixture_model())]);
+            let resolved = state.resolve_resume(&models, SESSION_ID, None).unwrap();
+            assert_eq!(resolved.chain_id, chain);
+            assert_eq!(resolved.active_provider, PROVIDER_NAME);
+            assert_eq!(resolved.active_session_id, SESSION_ID);
+            let providers = fixture.providers.clone();
+            let before_count: i64 = rusqlite::Connection::open(&fixture.state_path)
+                .unwrap()
+                .query_row("SELECT count(*) FROM invocations", [], |row| row.get(0))
+                .unwrap();
+            let metadata = crate::session_metadata::locate_session_metadata_with_provider_dispatch(
+                &state,
+                &models,
+                &providers,
+                &oulipoly_config::SessionsConfig::default(),
+                Some(fixture.server.context.registry.as_ref()),
+                SESSION_ID,
+            )
+            .unwrap();
+            assert_eq!(metadata.session_id, SESSION_ID);
+            assert_eq!(metadata.chain_id, chain);
+            assert_eq!(metadata.workspace_root, fixture._temp.path());
+            assert_eq!(
+                metadata.jsonl_path,
+                fixture._temp.path().join("transcript.jsonl")
+            );
+            assert_eq!(
+                rusqlite::Connection::open(&fixture.state_path)
+                    .unwrap()
+                    .query_row("SELECT count(*) FROM invocations", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                before_count
+            );
+
+            assert_eq!(
+                crate::session_metadata::resolve_resume_workspace_root(
+                    &state, &providers, &resolved,
+                )
+                .unwrap(),
+                fixture._temp.path()
+            );
+            let mut missing_account = providers;
+            missing_account.entries.clear();
+            assert!(
+                crate::session_metadata::resolve_resume_workspace_root(
+                    &state,
+                    &missing_account,
+                    &resolved,
+                )
+                .is_err()
+            );
+            let invocation = state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap();
+            assert_eq!(invocation.provider_session_id.as_deref(), Some(SESSION_ID));
+            assert_eq!(
+                invocation.provider_session_capture_method.as_deref(),
+                Some(CAPTURE_METHOD)
+            );
+        }
+    }
+
+    #[test]
+    fn age345_endpoint_and_settings_mismatch_publish_nothing() {
+        for mismatch in ["instance", "settings", "account", "missing-instance"] {
+            let fixture = LiveBindingFixture::new_with_identity_mismatch(mismatch);
+            assert!(
+                report_live_session_binding(
+                    &fixture.server.socket_path,
+                    &fixture.server.token,
+                    INVOCATION_UUID,
+                    SESSION_ID,
+                )
+                .is_err(),
+                "{mismatch}"
+            );
+            let state = StateDb::open(&fixture.state_path).unwrap();
+            assert_eq!(
+                state
+                    .get_invocation_by_uuid(INVOCATION_UUID)
+                    .unwrap()
+                    .unwrap()
+                    .provider_session_id,
+                None
+            );
+            assert_eq!(
+                state
+                    .chain_id_for_segment(PROVIDER_NAME, SESSION_ID)
+                    .unwrap(),
+                None
+            );
+        }
     }
 
     #[test]
@@ -710,6 +866,34 @@ mod tests {
     }
 
     #[test]
+    fn expected_live_session_mismatch_does_not_publish_a_binding() {
+        let fixture = LiveBindingFixture::new_with_expected_session_id(
+            SESSION_ID,
+            Some("different-expected-session"),
+        );
+
+        let error = report_live_session_binding(
+            &fixture.server.socket_path,
+            &fixture.server.token,
+            INVOCATION_UUID,
+            SESSION_ID,
+        )
+        .expect_err("expected and observed live sessions must match exactly");
+
+        assert!(
+            error.contains("authoritative provider session mismatch"),
+            "{error}"
+        );
+        let invocation = StateDb::open(&fixture.state_path)
+            .unwrap()
+            .get_invocation_by_uuid(INVOCATION_UUID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(invocation.provider_session_id, None);
+        assert_eq!(invocation.provider_session_capture_method, None);
+    }
+
+    #[test]
     fn multi_kilobyte_session_id_round_trips_without_truncation() {
         let session_id = format!("ses_{}", "x".repeat(4 * 1024));
         let fixture = LiveBindingFixture::new_with_session_id(&session_id);
@@ -763,6 +947,7 @@ mod tests {
         _temp: tempfile::TempDir,
         state_path: PathBuf,
         server: LiveSessionBindingServer,
+        providers: ProvidersConfig,
         process_identity: oulipoly_state::pid_identity::ProcessIdentity,
         child: std::process::Child,
     }
@@ -773,6 +958,25 @@ mod tests {
         }
 
         fn new_with_session_id(session_id: &str) -> Self {
+            Self::new_with_expected_session_id(session_id, None)
+        }
+
+        fn new_with_expected_session_id(
+            session_id: &str,
+            expected_provider_session_id: Option<&str>,
+        ) -> Self {
+            Self::new_configured(session_id, expected_provider_session_id, None)
+        }
+
+        fn new_with_identity_mismatch(mismatch: &str) -> Self {
+            Self::new_configured(SESSION_ID, None, Some(mismatch))
+        }
+
+        fn new_configured(
+            session_id: &str,
+            expected_provider_session_id: Option<&str>,
+            mismatch: Option<&str>,
+        ) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let state_path = temp.path().join("state.db");
             let state = StateDb::open(&state_path).unwrap();
@@ -786,26 +990,53 @@ mod tests {
                 })
                 .unwrap();
             let provider = fake_provider(temp.path(), session_id);
+            let providers = ProvidersConfig {
+                entries: std::collections::HashMap::from([(
+                    PROVIDER_NAME.to_string(),
+                    ProviderEntry {
+                        command: Some("must-not-launch-fixture".to_string()),
+                        implementation: Some(ProviderEndpointConfig {
+                            family: "fixture".to_string(),
+                            executable: provider.display().to_string(),
+                        }),
+                        settings_id: Some("live-binding-settings-record".to_string()),
+                        ..Default::default()
+                    },
+                )]),
+            };
             let registry = Arc::new(
-                ProviderRegistry::from_model_configs(
-                    &[fixture_model(&provider)],
+                ProviderRegistry::from_configs(
+                    &[fixture_model()],
+                    &providers,
                     ProviderRegistryOptions::default(),
                 )
                 .unwrap(),
             );
-            let context = InteractiveLiveSessionBinding {
+            let endpoint = registry.preflight_account(PROVIDER_NAME).unwrap();
+            let mut context = InteractiveLiveSessionBinding {
                 registry,
+                endpoint,
                 identity: SessionProviderIdentity {
                     model_name: MODEL_NAME.to_string(),
                     provider_name: PROVIDER_NAME.to_string(),
-                    provider_instance_id: None,
-                    settings_id: PROVIDER_NAME.to_string(),
+                    provider_instance_id: Some("fixture-instance".to_string()),
+                    settings_id: "live-binding-settings-record".to_string(),
                 },
                 state_db_path: state_path.clone(),
                 invocation_row_id,
                 invocation_uuid: INVOCATION_UUID.to_string(),
+                expected_provider_session_id: expected_provider_session_id.map(str::to_string),
                 effective_cwd: Some(temp.path().to_path_buf()),
             };
+            match mismatch {
+                Some("instance") => {
+                    context.identity.provider_instance_id = Some("wrong-instance".into())
+                }
+                Some("missing-instance") => context.identity.provider_instance_id = None,
+                Some("settings") => context.identity.settings_id = "wrong-settings".into(),
+                Some("account") => context.identity.provider_name = "missing-account".into(),
+                _ => {}
+            }
             let mut server = LiveSessionBindingServer::bind(context).unwrap();
             let parent = serde_json::to_string(&CompositeInvocationId {
                 source: PROVIDER_NAME.to_string(),
@@ -833,6 +1064,7 @@ mod tests {
             Self {
                 _temp: temp,
                 state_path,
+                providers,
                 server,
                 process_identity,
                 child,
@@ -847,24 +1079,20 @@ mod tests {
         }
     }
 
-    fn fixture_model(provider: &Path) -> ModelConfig {
+    fn fixture_model() -> ModelConfig {
         ModelConfig {
             name: MODEL_NAME.to_string(),
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::model_provider(PROVIDER_NAME, Vec::new())],
             inputs: Vec::new(),
-            provider: Some(ProviderImplementationRef {
-                path: Some(provider.display().to_string()),
-                crate_name: None,
-                version: None,
-                binary: None,
-                script: None,
-            }),
+            provider: None,
         }
     }
 
     fn fake_provider(dir: &Path, session_id: &str) -> PathBuf {
         let path = dir.join("fake-provider");
+        std::fs::write(dir.join("transcript.jsonl"), "{}\n").unwrap();
+        let transcript_path = dir.join("transcript.jsonl").display().to_string();
         let script = format!(
             r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -878,6 +1106,10 @@ case "${{1-}}" in
     printf '%s' "$request" | grep -F '"live_report"' >/dev/null
     printf '%s' "$request" | grep -F '"provider_session_id":"{session_id}"' >/dev/null
     printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","ok":true,"result":{{"provider_session_id":"{session_id}","state":null,"artifacts":[]}}}}\n' "$request_id"
+    ;;
+  session.locate_transcript)
+    printf '%s' "$request" | grep -F '"session_id":"{session_id}"' >/dev/null
+    printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","ok":true,"result":{{"located":true,"path":"{transcript_path}","require_existing_observed":true}}}}\n' "$request_id"
     ;;
   *) exit 64 ;;
 esac

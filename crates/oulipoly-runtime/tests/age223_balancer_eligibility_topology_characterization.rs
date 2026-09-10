@@ -303,12 +303,11 @@ fn single_provider_model() -> ModelConfig {
 
 fn routing_context<'a>(
     providers_cfg: &'a ProvidersConfig,
-    sessions_cfg: &'a SessionsConfig,
+    _sessions_cfg: &'a SessionsConfig,
     in_flight: &'a InFlight,
 ) -> BalanceContext<'a> {
     BalanceContext {
         providers_cfg,
-        sessions_cfg,
         in_flight,
     }
 }

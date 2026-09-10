@@ -49,10 +49,18 @@ fn seed_session(state: &StateDb, model: &ModelConfig) -> ResolvedResume {
         })
         .unwrap();
     state
-        .update_session_capture(invocation_row_id, Some(SESSION_ID), "fixture")
+        .update_session_capture(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            Some(SESSION_ID),
+            "fixture",
+        )
         .unwrap();
     state
-        .mint_chain_for_invocation_session(invocation_row_id)
+        .mint_chain_for_invocation_session(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+        )
         .unwrap();
     let chain_id = state
         .chain_id_for_segment(SESSION_OWNER, SESSION_ID)

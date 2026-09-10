@@ -4,6 +4,7 @@
 
 use oulipoly_state::mailbox::{
     DeliveredPayloadCompactionReport, DeliveredPayloadCompactionStats, MailboxDb, MailboxRow,
+    TerminalHistoryPruneReport, TerminalHistoryRetentionStats,
 };
 use serde::Serialize;
 use std::fs::File;
@@ -57,6 +58,16 @@ struct MailboxCompactionResponse {
     before: DeliveredPayloadCompactionStats,
     report: Option<DeliveredPayloadCompactionReport>,
     after: DeliveredPayloadCompactionStats,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalHistoryPruneResponse {
+    applied: bool,
+    vacuumed: bool,
+    limit: usize,
+    before: TerminalHistoryRetentionStats,
+    report: Option<TerminalHistoryPruneReport>,
+    after: TerminalHistoryRetentionStats,
 }
 
 pub(crate) fn run_list(session_id: &str, all: bool, json: bool) -> Result<i32, String> {
@@ -307,6 +318,113 @@ pub(crate) fn run_compact_delivered(limit: usize, apply: bool, json: bool) -> Re
         json,
     )?;
     Ok(0)
+}
+
+pub(crate) fn run_prune_terminal(
+    limit: usize,
+    apply: bool,
+    vacuum: bool,
+    json: bool,
+) -> Result<i32, String> {
+    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
+        return render_terminal_prune(
+            TerminalHistoryPruneResponse {
+                applied: apply,
+                vacuumed: false,
+                limit,
+                before: TerminalHistoryRetentionStats::default(),
+                report: apply.then(TerminalHistoryPruneReport::default),
+                after: TerminalHistoryRetentionStats::default(),
+            },
+            json,
+        )
+        .map(|()| 0);
+    };
+    let before = db.terminal_history_retention_stats()?;
+    let report = apply
+        .then(|| prune_terminal_history_bounded(&mut db, limit))
+        .transpose()?;
+    if vacuum {
+        db.vacuum_terminal_history()?;
+    }
+    let after = db.terminal_history_retention_stats()?;
+    render_terminal_prune(
+        TerminalHistoryPruneResponse {
+            applied: apply,
+            vacuumed: vacuum,
+            limit,
+            before,
+            report,
+            after,
+        },
+        json,
+    )?;
+    Ok(0)
+}
+
+fn prune_terminal_history_bounded(
+    db: &mut MailboxDb,
+    limit: usize,
+) -> Result<TerminalHistoryPruneReport, String> {
+    const BATCH_SIZE: usize = 4_096;
+    let mut report = TerminalHistoryPruneReport::default();
+    loop {
+        let pruned = report
+            .mailbox_rows_deleted
+            .max(report.delivery_attempts_deleted)
+            .max(report.payload_files_deleted);
+        let batch_limit = limit.saturating_sub(pruned).min(BATCH_SIZE);
+        if batch_limit == 0 {
+            break;
+        }
+        let batch = db.prune_terminal_history(batch_limit)?;
+        let made_progress = batch.mailbox_rows_deleted > 0
+            || batch.delivery_attempts_deleted > 0
+            || batch.payload_files_deleted > 0;
+        merge_terminal_prune_report(&mut report, batch);
+        if !made_progress {
+            break;
+        }
+    }
+    Ok(report)
+}
+
+fn merge_terminal_prune_report(
+    report: &mut TerminalHistoryPruneReport,
+    batch: TerminalHistoryPruneReport,
+) {
+    report.mailbox_rows_deleted += batch.mailbox_rows_deleted;
+    report.listeners_detached += batch.listeners_detached;
+    report.delivery_attempts_deleted += batch.delivery_attempts_deleted;
+    report.delivery_attempt_items_deleted += batch.delivery_attempt_items_deleted;
+    report.payload_files_deleted += batch.payload_files_deleted;
+    report.payload_bytes_reclaimed += batch.payload_bytes_reclaimed;
+}
+
+fn render_terminal_prune(response: TerminalHistoryPruneResponse, json: bool) -> Result<(), String> {
+    if json {
+        return print_json(&response);
+    }
+    let report = response.report.unwrap_or_default();
+    println!(
+        "applied={} vacuumed={} limit={} eligible_mailbox_rows={} eligible_attempts={} reclaimable_payloads={} mailbox_rows_deleted={} attempts_deleted={} attempt_items_deleted={} listeners_detached={} payload_files_deleted={} payload_bytes_reclaimed={} remaining_mailbox_rows={} remaining_attempts={} remaining_payloads={}",
+        response.applied,
+        response.vacuumed,
+        response.limit,
+        response.before.prunable_mailbox_rows,
+        response.before.prunable_delivery_attempts,
+        response.before.reclaimable_payload_files,
+        report.mailbox_rows_deleted,
+        report.delivery_attempts_deleted,
+        report.delivery_attempt_items_deleted,
+        report.listeners_detached,
+        report.payload_files_deleted,
+        report.payload_bytes_reclaimed,
+        response.after.prunable_mailbox_rows,
+        response.after.prunable_delivery_attempts,
+        response.after.reclaimable_payload_files,
+    );
+    Ok(())
 }
 
 fn render_compaction(response: MailboxCompactionResponse, json: bool) -> Result<(), String> {

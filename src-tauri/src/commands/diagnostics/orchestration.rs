@@ -22,5 +22,6 @@ pub(crate) fn run_diagnostics(
             working_dir,
         ),
         exit_code,
+        provider_output,
     )
 }

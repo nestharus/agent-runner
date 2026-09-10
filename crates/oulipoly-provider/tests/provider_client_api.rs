@@ -4,9 +4,7 @@ use oulipoly_provider::client::{
 use oulipoly_provider::error::{
     HostErrorKind, ProviderCapabilityError, ProviderClientError, ProviderDiagnostics,
 };
-use oulipoly_provider::resolver::{
-    ProviderArtifactRef, ProviderResolveOptions, ProviderResolver, ResolvedProviderCommand,
-};
+use oulipoly_provider::resolver::{ProviderArtifactRef, ProviderResolveOptions, ProviderResolver};
 use oulipoly_provider::stream::{DecodedLaunchEvent, LaunchExit, LaunchJsonlReader};
 use std::ffi::OsString;
 use std::time::Duration;
@@ -61,14 +59,19 @@ fn public_launch_stream_types_preserve_decoded_bytes_and_exit() {
 
 #[test]
 fn resolved_command_public_shape_is_exact_artifact_plus_subcommand() {
-    let resolved = ResolvedProviderCommand::new("/tmp/fake-provider");
+    let path = support_path();
+    let resolved = ProviderResolver::new(ProviderResolveOptions::default())
+        .resolve(&ProviderArtifactRef::Path { path: path.clone() }, None)
+        .expect("fixture provider resolves");
     assert_eq!(
         resolved.argv_for_subcommand("describe"),
-        vec![
-            OsString::from("/tmp/fake-provider"),
-            OsString::from("describe")
-        ]
+        vec![path.into_os_string(), OsString::from("describe")]
     );
+}
+
+fn support_path() -> std::path::PathBuf {
+    let path = std::env::current_exe().expect("test executable path");
+    path.canonicalize().expect("canonical test executable path")
 }
 
 #[test]

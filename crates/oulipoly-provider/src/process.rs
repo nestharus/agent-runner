@@ -2,9 +2,9 @@
 //!
 //! Roles: orchestration, mapper, predicate, accessor, filter, validator.
 //!
-//! - orchestration: `ProcessRunner` starts provider subprocesses, drains
-//!   stdio on worker threads, supervises total-runtime or stdout-line-gap
-//!   liveness, and terminates/reaps process trees on timeout or cancellation.
+//! - orchestration: `ProcessRunner` starts provider subprocesses and
+//!   `ProcessSupervisor` consumes bounded worker/cancellation events, polls
+//!   child lifecycle state, and terminates/reaps process trees.
 //! - mapper: `map_completed_process_outcome`, `termination_diagnostics_from_parts`,
 //!   `provider_process_command`, `host_process_error`, `process_status`, `exit_code`, and
 //!   `process_nonzero` translate OS process observations into provider DTOs
@@ -19,8 +19,8 @@
 //!   `ByteAccumulator`, `ByteTailAccumulator`, and `alive_descendants` retain
 //!   bounded byte/process subsets from larger streams or process sets.
 //! - validator: embedded process-runner and byte-accumulator tests validate
-//!   pipe pressure, process-tree cleanup, cancellation, and truncation
-//!   contracts.
+//!   bounded event delivery, poll cadence, worker failure, pipe pressure,
+//!   process-tree cleanup, cancellation, and truncation contracts.
 //!
 //! ## Adapter declarations
 //!
@@ -48,15 +48,23 @@
 
 use crate::error::{HostErrorKind, ProviderClientError, ProviderDiagnostics};
 use crate::generated::ProcessStatus;
+use crate::process_custody::OwnedChild as Child;
+use oulipoly_core::CancellationRegistration;
 pub use oulipoly_core::CancellationToken;
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+// Terminal observation has a fixed bound even when the OS cannot confirm death
+// or a pipe/worker remains live. It is not additional provider execution time.
+const SETTLEMENT_OBSERVATION_BOUND: Duration = Duration::from_secs(1);
+
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteLimit {
@@ -196,6 +204,10 @@ impl ByteTailAccumulator {
 
 pub(crate) trait StdoutDrainOutput: Default + Send + 'static {
     fn captured_bytes(&self) -> CapturedBytes;
+
+    fn processor_error(&self) -> Option<&ProviderClientError> {
+        None
+    }
 }
 
 impl StdoutDrainOutput for CapturedBytes {
@@ -207,8 +219,8 @@ impl StdoutDrainOutput for CapturedBytes {
 pub(crate) trait StdoutProcessor: Send + 'static {
     type Output: StdoutDrainOutput;
 
-    fn push(&mut self, chunk: &[u8]);
-    fn finish(self) -> Self::Output;
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderClientError>;
+    fn finish(self, error: Option<ProviderClientError>) -> Self::Output;
 }
 
 struct ByteCaptureProcessor {
@@ -226,11 +238,12 @@ impl ByteCaptureProcessor {
 impl StdoutProcessor for ByteCaptureProcessor {
     type Output = CapturedBytes;
 
-    fn push(&mut self, chunk: &[u8]) {
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderClientError> {
         self.accumulator.push(chunk);
+        Ok(())
     }
 
-    fn finish(self) -> Self::Output {
+    fn finish(self, _error: Option<ProviderClientError>) -> Self::Output {
         self.accumulator.finish()
     }
 }
@@ -271,6 +284,7 @@ fn capture_window(limit: ByteLimit, current_len: usize, incoming_len: usize) -> 
 
 #[derive(Debug, Clone)]
 pub struct ProcessLimits {
+    pub custody: Option<crate::custody::OperationCustody>,
     pub timeout: Duration,
     pub kill_after_grace: Duration,
     pub stdout_limit: ByteLimit,
@@ -306,6 +320,7 @@ impl std::fmt::Debug for ProcessSpawnObserver {
 impl Default for ProcessLimits {
     fn default() -> Self {
         Self {
+            custody: None,
             timeout: Duration::from_secs(30),
             kill_after_grace: Duration::from_millis(100),
             stdout_limit: ByteLimit::new(1024 * 1024),
@@ -320,6 +335,9 @@ impl Default for ProcessLimits {
 pub struct ProcessCommand {
     program: PathBuf,
     args: Vec<OsString>,
+    pinned_executable: Option<Arc<File>>,
+    is_script: bool,
+    environment_removals: Vec<OsString>,
 }
 
 impl ProcessCommand {
@@ -327,6 +345,9 @@ impl ProcessCommand {
         Self {
             program: program.into(),
             args: Vec::new(),
+            pinned_executable: None,
+            is_script: false,
+            environment_removals: Vec::new(),
         }
     }
 
@@ -339,6 +360,21 @@ impl ProcessCommand {
         let mut argv = vec![self.program.as_os_str().to_os_string()];
         argv.extend(self.args.iter().cloned());
         argv
+    }
+
+    pub(crate) fn with_pinned_executable(mut self, executable: Option<Arc<File>>) -> Self {
+        self.pinned_executable = executable;
+        self
+    }
+
+    pub(crate) fn with_script(mut self, is_script: bool) -> Self {
+        self.is_script = is_script;
+        self
+    }
+
+    pub(crate) fn with_environment_removals(mut self, names: Vec<OsString>) -> Self {
+        self.environment_removals = names;
+        self
     }
 }
 
@@ -393,6 +429,38 @@ struct ProcessThreads<T: StdoutDrainOutput> {
     stdin: thread::JoinHandle<bool>,
 }
 
+#[derive(Default)]
+struct PendingProcessEvents {
+    latest_stdout_line: Option<Instant>,
+    cancellation_requested: bool,
+    stdout_processor_failed: bool,
+    worker_failed: bool,
+}
+
+struct ProcessEvents {
+    latest_stdout_line: Option<Instant>,
+    cancellation_requested: bool,
+    stdout_processor_failed: bool,
+    worker_failed: bool,
+}
+
+#[derive(Clone)]
+struct ProcessEventPublisher {
+    bus: Arc<(Mutex<PendingProcessEvents>, Condvar)>,
+}
+
+struct ProcessEventSubscriber {
+    bus: Arc<(Mutex<PendingProcessEvents>, Condvar)>,
+}
+
+struct JoinedProcessThreads<T: StdoutDrainOutput> {
+    stdout: Option<T>,
+    stderr: Option<CapturedBytes>,
+    stdin_closed_early: Option<bool>,
+    failed_workers: Vec<&'static str>,
+    cleanup_pending: bool,
+}
+
 struct TerminatedProcess {
     status: Option<ExitStatus>,
     force_killed: bool,
@@ -402,6 +470,21 @@ struct TerminatedProcess {
 enum TimeoutMode {
     TotalRuntime,
     StdoutLineGap,
+}
+
+struct ProcessSupervisor<'a, T: StdoutDrainOutput> {
+    child: Child,
+    command: ProcessCommand,
+    threads: ProcessThreads<T>,
+    events: ProcessEventSubscriber,
+    timeout_mode: TimeoutMode,
+    started: Instant,
+    next_status_poll: Instant,
+    last_stdout_line: Instant,
+    cancellation_started: Option<Instant>,
+    _cancellation_registration: Option<CancellationRegistration>,
+    limits: &'a ProcessLimits,
+    argv: Vec<OsString>,
 }
 
 impl ProcessRunner {
@@ -495,7 +578,7 @@ impl ProcessRunner {
         P: StdoutProcessor,
     {
         let argv = command.argv();
-        let mut child = spawn_provider_process(&command, envs)?;
+        let mut child = spawn_provider_process(&command, envs, self.limits.custody.clone())?;
         if let Err(error) = notify_spawn_observer(&self.limits.spawn_observer, child.id()) {
             return Err(terminate_after_spawn_observer_failure(
                 child,
@@ -504,94 +587,231 @@ impl ProcessRunner {
                 error,
             ));
         }
-        let (stdout_line_activity, stdout_line_rx) = stdout_line_activity_channel(timeout_mode);
+        let (event_publisher, events) = process_event_bus();
         let threads = start_process_threads(
             &mut child,
             stdin_bytes,
             self.limits.stderr_limit,
-            stdout_line_activity,
+            event_publisher.clone(),
+            stdout_line_activity_publisher(timeout_mode, &event_publisher),
             stdout_processor,
         );
 
-        let started = std::time::Instant::now();
-        let mut last_stdout_line = started;
-        let mut cancellation_started = None;
+        let started = Instant::now();
+        let cancellation_registration = self.limits.cancellation.as_ref().map(|cancellation| {
+            cancellation.register(move || event_publisher.publish_cancellation())
+        });
+        ProcessSupervisor {
+            child,
+            command,
+            threads,
+            events,
+            timeout_mode,
+            started,
+            next_status_poll: started,
+            last_stdout_line: started,
+            cancellation_started: None,
+            _cancellation_registration: cancellation_registration,
+            limits: &self.limits,
+            argv,
+        }
+        .run()
+    }
+}
+
+impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
+    fn run(mut self) -> Result<ProcessOutcome<T>, ProviderClientError> {
         loop {
-            record_stdout_line_activity(&stdout_line_rx, &mut last_stdout_line);
-
-            if self.limits.spawn_observer.is_some()
-                && child_custody_test_fault("external_status_poll").is_err()
-            {
-                return Err(self.terminate_and_collect(
-                    child,
-                    command,
-                    threads,
+            let events = self.record_pending_events();
+            if events.worker_failed {
+                let error = ProviderClientError::host_transport(
                     HostErrorKind::WaitFailed,
-                    false,
-                ));
+                    subcommand_for_error(&self.command),
+                    None,
+                    ProviderDiagnostics::with_description("worker_failure_observed".into()),
+                );
+                return Err(self.terminate_after_wait_failure(error));
             }
-            let status = match poll_child_status(&mut child, &command) {
-                Ok(status) => status,
-                Err(_) => {
-                    return Err(self.terminate_and_collect(
-                        child,
-                        command,
-                        threads,
-                        HostErrorKind::WaitFailed,
-                        false,
-                    ));
-                }
-            };
-            if let Some(status) = status {
-                return Ok(map_completed_process_outcome(
-                    status,
-                    threads,
-                    cancellation_started.is_some(),
-                    &self.limits,
-                    argv,
-                ));
+            if events.stdout_processor_failed {
+                return Err(self.terminate_after_stdout_processor_failure());
             }
-
-            if timeout_expired(timeout_mode, started, last_stdout_line, self.limits.timeout) {
-                return Err(self.terminate_and_collect(
-                    child,
-                    command,
-                    threads,
-                    HostErrorKind::Timeout,
-                    false,
-                ));
-            }
-
-            if cancellation_requested(&self.limits) {
-                let cancelled_at = cancellation_started.get_or_insert_with(Instant::now);
-                if cancellation_grace_expired(cancelled_at, self.limits.kill_after_grace) {
-                    return Err(self.terminate_and_collect(
-                        child,
-                        command,
-                        threads,
-                        HostErrorKind::Cancelled,
-                        true,
-                    ));
+            if Instant::now() >= self.next_status_poll {
+                self.next_status_poll = Instant::now() + STATUS_POLL_INTERVAL;
+                match poll_child_status(&mut self.child, &self.command) {
+                    Ok(Some(status)) => return self.collect_completed(status),
+                    Ok(None) => {}
+                    Err(error) => return Err(self.terminate_after_wait_failure(error)),
                 }
             }
 
-            thread::sleep(Duration::from_millis(5));
+            if timeout_expired(
+                self.timeout_mode,
+                self.started,
+                self.last_stdout_line,
+                self.limits.timeout,
+            ) {
+                return Err(self.terminate_and_collect(HostErrorKind::Timeout, false));
+            }
+
+            if self.cancellation_started.as_ref().is_some_and(|started| {
+                cancellation_grace_expired(started, self.limits.kill_after_grace)
+            }) {
+                return Err(self.force_kill_and_collect());
+            }
+
+            self.events.wait_for_event_or_poll(self.next_wait());
         }
     }
 
-    fn terminate_and_collect<T: StdoutDrainOutput>(
-        &self,
-        mut child: Child,
-        command: ProcessCommand,
-        threads: ProcessThreads<T>,
+    fn record_pending_events(&mut self) -> ProcessEvents {
+        let events = self.events.take_pending();
+        if let Some(observed_at) = events.latest_stdout_line {
+            self.last_stdout_line = observed_at;
+        }
+        if events.cancellation_requested {
+            self.begin_cancellation();
+        }
+        events
+    }
+
+    fn next_wait(&self) -> Duration {
+        let timeout_remaining = match self.timeout_mode {
+            TimeoutMode::TotalRuntime => self.limits.timeout.saturating_sub(self.started.elapsed()),
+            TimeoutMode::StdoutLineGap => self
+                .limits
+                .timeout
+                .saturating_sub(self.last_stdout_line.elapsed()),
+        };
+        let cancellation_remaining = self
+            .cancellation_started
+            .as_ref()
+            .map(|started| {
+                cancellation_grace(self.limits.kill_after_grace).saturating_sub(started.elapsed())
+            })
+            .unwrap_or(STATUS_POLL_INTERVAL);
+        self.next_status_poll
+            .saturating_duration_since(Instant::now())
+            .min(timeout_remaining)
+            .min(cancellation_remaining)
+    }
+
+    fn begin_cancellation(&mut self) {
+        if self.cancellation_started.is_none() {
+            self.child.cancellation();
+            terminate_tree(&mut self.child);
+            self.cancellation_started = Some(Instant::now());
+            self.next_status_poll = Instant::now();
+        }
+    }
+
+    fn collect_completed(
+        self,
+        status: ExitStatus,
+    ) -> Result<ProcessOutcome<T>, ProviderClientError> {
+        let host_cancellation_requested =
+            self.cancellation_started.is_some() || cancellation_requested(self.limits);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
+        if host_cancellation_requested && self.timeout_mode == TimeoutMode::TotalRuntime {
+            let diagnostics = termination_diagnostics_from_joined(
+                joined,
+                TerminatedProcess {
+                    status: Some(status),
+                    force_killed: false,
+                },
+                true,
+            );
+            return Err(termination_transport_error(
+                HostErrorKind::Cancelled,
+                &self.command,
+                diagnostics,
+                Some(process_status(status)),
+            ));
+        }
+        map_completed_process_outcome(
+            status,
+            joined,
+            &self.command,
+            self.argv,
+            host_cancellation_requested,
+        )
+    }
+
+    fn terminate_and_collect(
+        mut self,
         kind: HostErrorKind,
         host_cancellation_requested: bool,
     ) -> ProviderClientError {
-        terminate_tree(&mut child);
-        let terminated = wait_for_terminated_process(&mut child, self.limits.kill_after_grace);
+        terminate_tree(&mut self.child);
+        let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
+        let status = terminated.status.map(process_status);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
         let diagnostics =
-            map_termination_diagnostics(threads, terminated, host_cancellation_requested);
-        termination_transport_error(kind, &command, diagnostics)
+            termination_diagnostics_from_joined(joined, terminated, host_cancellation_requested);
+        termination_transport_error(kind, &self.command, diagnostics, status)
+    }
+
+    fn terminate_after_wait_failure(mut self, error: ProviderClientError) -> ProviderClientError {
+        // Preserve the first observed failure; cleanup is not its replacement or proof.
+        self.child.uncertain();
+        terminate_tree(&mut self.child);
+        let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
+        let status = terminated.status.map(process_status);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
+        let diagnostics = termination_diagnostics_from_joined(joined, terminated, false);
+        wait_failure_with_process_context(error, diagnostics, status)
+    }
+
+    fn force_kill_and_collect(mut self) -> ProviderClientError {
+        let admitted = kill_tree(&mut self.child);
+        if admitted {
+            self.child.forced();
+        }
+        let terminated = TerminatedProcess {
+            status: reap_after_kill(&mut self.child, admitted),
+            force_killed: admitted,
+        };
+        let status = terminated.status.map(process_status);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
+        let diagnostics = termination_diagnostics_from_joined(joined, terminated, true);
+        termination_transport_error(HostErrorKind::Cancelled, &self.command, diagnostics, status)
+    }
+
+    fn terminate_after_stdout_processor_failure(mut self) -> ProviderClientError {
+        terminate_tree(&mut self.child);
+        let terminated = wait_for_terminated_process(&mut self.child, self.limits.kill_after_grace);
+        let status = terminated.status.map(process_status);
+        let joined = collect_or_retain_process_threads(self.threads, self.child);
+        let host_cancellation_requested =
+            self.cancellation_started.is_some() || cancellation_requested(self.limits);
+        if host_cancellation_requested {
+            let diagnostics = termination_diagnostics_from_joined(joined, terminated, true);
+            return termination_transport_error(
+                HostErrorKind::Cancelled,
+                &self.command,
+                diagnostics,
+                status,
+            );
+        }
+        let processor_error = joined
+            .stdout
+            .as_ref()
+            .and_then(StdoutDrainOutput::processor_error)
+            .cloned()
+            .unwrap_or_else(|| {
+                ProviderClientError::host_transport(
+                    HostErrorKind::Other("stdout_processor_failed".to_string()),
+                    subcommand_for_error(&self.command),
+                    None,
+                    ProviderDiagnostics::default(),
+                )
+            });
+        processor_failure_with_process_context(
+            processor_error,
+            joined,
+            terminated,
+            host_cancellation_requested,
+            status,
+        )
     }
 }
 
@@ -599,22 +819,43 @@ fn termination_transport_error(
     kind: HostErrorKind,
     command: &ProcessCommand,
     diagnostics: ProviderDiagnostics,
+    status: Option<ProcessStatus>,
 ) -> ProviderClientError {
-    ProviderClientError::host_transport(kind, subcommand_for_error(command), None, diagnostics)
+    let error = ProviderClientError::host_transport(
+        kind,
+        subcommand_for_error(command),
+        None,
+        diagnostics.clone(),
+    );
+    match status {
+        Some(status) => error.with_process_context(diagnostics, status),
+        None => error,
+    }
 }
 
 fn spawn_provider_process<I, K, V>(
     command: &ProcessCommand,
     envs: I,
+    custody: Option<crate::custody::OperationCustody>,
 ) -> Result<Child, ProviderClientError>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
+    if custody.is_some() && !crate::process_custody::containment_supported() {
+        return Err(ProviderClientError::host_transport(
+            HostErrorKind::Other("attempt_process_custody_unsupported".into()),
+            subcommand_for_error(command),
+            None,
+            ProviderDiagnostics::default(),
+        ));
+    }
     let mut process = build_provider_process(command, envs);
+    crate::process_custody::configure_containment(&mut process, custody.is_some());
     process
         .spawn()
+        .map(|child| Child::new(child, custody))
         .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error))
 }
 
@@ -625,7 +866,7 @@ where
     V: AsRef<OsStr>,
 {
     let mut process = provider_process_command(command, envs);
-    configure_provider_process(&mut process);
+    configure_provider_process(&mut process, command);
     process
 }
 
@@ -635,7 +876,7 @@ where
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
-    let mut process = Command::new(&command.program);
+    let mut process = Command::new(provider_execution_path(command));
     process
         .args(&command.args)
         .stdin(Stdio::piped())
@@ -644,18 +885,98 @@ where
     for (key, value) in envs {
         process.env(key, value);
     }
+    for name in &command.environment_removals {
+        process.env_remove(name);
+    }
     process
 }
 
-fn configure_provider_process(process: &mut Command) {
+fn configure_provider_process(process: &mut Command, command: &ProcessCommand) {
     configure_process_group(process);
+    configure_pinned_executable(process, command);
 }
+
+#[cfg(unix)]
+fn provider_execution_path(command: &ProcessCommand) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    // Apple cannot execute the pinned descriptor through /dev/fd, so use the
+    // visible path only while it still names the selected inode.
+    if (command.is_script || cfg!(target_vendor = "apple"))
+        && program_path_still_names_pinned_executable(command)
+    {
+        return command.program.clone();
+    }
+    command
+        .pinned_executable
+        .as_ref()
+        .map(|file| inherited_fd_path(file.as_raw_fd()))
+        .unwrap_or_else(|| command.program.clone())
+}
+
+#[cfg(not(unix))]
+fn provider_execution_path(command: &ProcessCommand) -> PathBuf {
+    command.program.clone()
+}
+
+#[cfg(unix)]
+fn program_path_still_names_pinned_executable(command: &ProcessCommand) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(executable) = command.pinned_executable.as_ref() else {
+        return false;
+    };
+    let Ok(pinned) = executable.metadata() else {
+        return false;
+    };
+    let Ok(current) = command.program.metadata() else {
+        return false;
+    };
+    pinned.dev() == current.dev() && pinned.ino() == current.ino()
+}
+
+#[cfg(target_os = "linux")]
+fn inherited_fd_path(fd: std::os::fd::RawFd) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{fd}"))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn inherited_fd_path(fd: std::os::fd::RawFd) -> PathBuf {
+    PathBuf::from(format!("/dev/fd/{fd}"))
+}
+
+#[cfg(unix)]
+fn configure_pinned_executable(process: &mut Command, command: &ProcessCommand) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let Some(executable) = command.pinned_executable.as_ref() else {
+        return;
+    };
+    let fd = executable.as_raw_fd();
+    unsafe {
+        process.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_pinned_executable(_process: &mut Command, _command: &ProcessCommand) {}
 
 fn start_process_threads<P: StdoutProcessor>(
     child: &mut Child,
     stdin_bytes: Vec<u8>,
     stderr_limit: ByteLimit,
-    stdout_line_activity: Option<Sender<Instant>>,
+    process_events: ProcessEventPublisher,
+    stdout_line_activity: Option<ProcessEventPublisher>,
     stdout_processor: P,
 ) -> ProcessThreads<P::Output> {
     let stdout = child
@@ -667,12 +988,36 @@ fn start_process_threads<P: StdoutProcessor>(
         .take()
         .expect("stderr pipe should be configured");
     let stdin = child.stdin.take().expect("stdin pipe should be configured");
+    let stdout_events = process_events.clone();
+    let stdout_processor_events = process_events.clone();
+    let stderr_events = process_events.clone();
     ProcessThreads {
         stdout: thread::spawn(move || {
-            drain_reader_with_processor(stdout, stdout_line_activity, stdout_processor)
+            run_process_worker(stdout_events, || {
+                let output =
+                    drain_reader_with_processor(stdout, stdout_line_activity, stdout_processor);
+                if output.processor_error().is_some() {
+                    stdout_processor_events.publish_stdout_processor_failure();
+                }
+                output
+            })
         }),
-        stderr: thread::spawn(move || drain_reader(stderr, stderr_limit, None)),
-        stdin: thread::spawn(move || write_stdin(stdin, stdin_bytes)),
+        stderr: thread::spawn(move || {
+            run_process_worker(stderr_events, || drain_reader(stderr, stderr_limit, None))
+        }),
+        stdin: thread::spawn(move || {
+            run_process_worker(process_events, || write_stdin(stdin, stdin_bytes))
+        }),
+    }
+}
+
+fn run_process_worker<T>(events: ProcessEventPublisher, worker: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker)) {
+        Ok(output) => output,
+        Err(panic) => {
+            events.publish_worker_failure();
+            std::panic::resume_unwind(panic)
+        }
     }
 }
 
@@ -691,9 +1036,9 @@ fn poll_child_status(
         )
     };
     if result != 0 {
-        return Err(host_process_error(
-            HostErrorKind::WaitFailed,
+        return Err(wait_operation_error(
             command,
+            "waitid_wnowait",
             std::io::Error::last_os_error(),
         ));
     }
@@ -702,11 +1047,17 @@ fn poll_child_status(
         return Ok(None);
     }
     // WNOWAIT keeps the exact leader unreaped while its owned descendants are cleaned.
-    kill_tree(child);
+    if !kill_tree(child) {
+        return Err(wait_operation_error(
+            command,
+            "cleanup_admission_or_signal",
+            std::io::Error::other("process cleanup admission unavailable"),
+        ));
+    }
     child
         .wait()
         .map(Some)
-        .map_err(|error| host_process_error(HostErrorKind::WaitFailed, command, error))
+        .map_err(|error| wait_operation_error(command, "owned_wait", error))
 }
 
 #[cfg(not(unix))]
@@ -716,52 +1067,140 @@ fn poll_child_status(
 ) -> Result<Option<ExitStatus>, ProviderClientError> {
     child
         .try_wait()
-        .map_err(|error| host_process_error(HostErrorKind::WaitFailed, command, error))
+        .map_err(|error| wait_operation_error(command, "owned_try_wait", error))
 }
 
 fn map_completed_process_outcome<T: StdoutDrainOutput>(
     status: ExitStatus,
-    threads: ProcessThreads<T>,
-    cancellation_started: bool,
-    limits: &ProcessLimits,
+    joined: JoinedProcessThreads<T>,
+    command: &ProcessCommand,
     argv: Vec<OsString>,
-) -> ProcessOutcome<T> {
-    ProcessOutcome {
-        status: process_status(status),
-        stdout: join_stdout(threads.stdout),
-        stderr: join_capture(threads.stderr),
-        stdin_closed_early: join_stdin(threads.stdin),
-        host_cancellation_requested: host_cancellation_was_requested(cancellation_started, limits),
+    host_cancellation_requested: bool,
+) -> Result<ProcessOutcome<T>, ProviderClientError> {
+    let process_status = process_status(status);
+    if joined.cleanup_pending || !joined.failed_workers.is_empty() {
+        return Err(process_worker_failure(
+            command,
+            joined,
+            Some(process_status),
+            host_cancellation_requested,
+        ));
+    }
+    if let Some(error) = joined
+        .stdout
+        .as_ref()
+        .and_then(StdoutDrainOutput::processor_error)
+        .cloned()
+    {
+        let diagnostics =
+            completed_process_diagnostics(&joined, &process_status, host_cancellation_requested);
+        return Err(error.with_process_context(diagnostics, process_status));
+    }
+    Ok(ProcessOutcome {
+        status: process_status,
+        stdout: joined.stdout.expect("validated stdout worker result"),
+        stderr: joined.stderr.expect("validated stderr worker result"),
+        stdin_closed_early: joined
+            .stdin_closed_early
+            .expect("validated stdin worker result"),
+        host_cancellation_requested,
         argv,
-    }
+    })
 }
 
-fn host_cancellation_was_requested(cancellation_started: bool, limits: &ProcessLimits) -> bool {
-    cancellation_started
-        || limits
-            .cancellation
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
+fn process_event_bus() -> (ProcessEventPublisher, ProcessEventSubscriber) {
+    let bus = Arc::new((Mutex::new(PendingProcessEvents::default()), Condvar::new()));
+    (
+        ProcessEventPublisher {
+            bus: Arc::clone(&bus),
+        },
+        ProcessEventSubscriber { bus },
+    )
 }
 
-fn stdout_line_activity_channel(
+fn stdout_line_activity_publisher(
     timeout_mode: TimeoutMode,
-) -> (Option<Sender<Instant>>, Option<Receiver<Instant>>) {
+    event_publisher: &ProcessEventPublisher,
+) -> Option<ProcessEventPublisher> {
     match timeout_mode {
-        TimeoutMode::StdoutLineGap => {
-            let (tx, rx) = mpsc::channel();
-            (Some(tx), Some(rx))
-        }
-        TimeoutMode::TotalRuntime => (None, None),
+        TimeoutMode::StdoutLineGap => Some(event_publisher.clone()),
+        TimeoutMode::TotalRuntime => None,
     }
 }
 
-fn record_stdout_line_activity(rx: &Option<Receiver<Instant>>, last_stdout_line: &mut Instant) {
-    let Some(rx) = rx else {
-        return;
-    };
-    while let Ok(observed_at) = rx.try_recv() {
-        *last_stdout_line = observed_at;
+impl ProcessEventPublisher {
+    fn publish_stdout_line(&self, observed_at: Instant) {
+        let (state, wake) = &*self.bus;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let should_wake = state.latest_stdout_line.is_none();
+        state.latest_stdout_line = Some(observed_at);
+        if should_wake {
+            wake.notify_one();
+        }
+    }
+
+    fn publish_cancellation(&self) {
+        let (state, wake) = &*self.bus;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.cancellation_requested {
+            state.cancellation_requested = true;
+            wake.notify_one();
+        }
+    }
+
+    fn publish_worker_failure(&self) {
+        let (state, wake) = &*self.bus;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.worker_failed {
+            state.worker_failed = true;
+            wake.notify_one();
+        }
+    }
+
+    fn publish_stdout_processor_failure(&self) {
+        let (state, wake) = &*self.bus;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.stdout_processor_failed {
+            state.stdout_processor_failed = true;
+            wake.notify_one();
+        }
+    }
+}
+
+impl ProcessEventSubscriber {
+    fn take_pending(&self) -> ProcessEvents {
+        let (state, _) = &*self.bus;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ProcessEvents {
+            latest_stdout_line: state.latest_stdout_line.take(),
+            cancellation_requested: std::mem::take(&mut state.cancellation_requested),
+            stdout_processor_failed: std::mem::take(&mut state.stdout_processor_failed),
+            worker_failed: std::mem::take(&mut state.worker_failed),
+        }
+    }
+
+    fn wait_for_event_or_poll(&self, timeout: Duration) {
+        let (state, wake) = &*self.bus;
+        let state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.latest_stdout_line.is_none()
+            && !state.cancellation_requested
+            && !state.stdout_processor_failed
+            && !state.worker_failed
+        {
+            let _ = wake.wait_timeout(state, timeout);
+        }
     }
 }
 
@@ -796,16 +1235,22 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
         match child_exited_without_reaping(child) {
             Ok(true) => {
                 // Keep the leader waitable until its exact process group is clean.
-                kill_tree(child);
-                break child.wait().ok();
+                let admitted = kill_tree(child);
+                break reap_after_kill(child, admitted);
             }
             Ok(false) if should_force_kill(&grace_started, kill_after_grace) => {
-                force_killed = true;
-                kill_tree(child);
-                break child.wait().ok();
+                let admitted = kill_tree(child);
+                force_killed = admitted;
+                if admitted {
+                    child.forced();
+                }
+                break reap_after_kill(child, admitted);
             }
             Ok(false) => thread::sleep(Duration::from_millis(5)),
-            Err(_) => break None,
+            Err(_) => {
+                child.uncertain();
+                break None;
+            }
         }
     };
     TerminatedProcess {
@@ -839,12 +1284,18 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) if should_force_kill(&grace_started, kill_after_grace) => {
-                force_killed = true;
-                kill_tree(child);
-                break child.wait().ok();
+                let admitted = kill_tree(child);
+                force_killed = admitted;
+                if admitted {
+                    child.forced();
+                }
+                break reap_after_kill(child, admitted);
             }
             Ok(None) => thread::sleep(Duration::from_millis(5)),
-            Err(_) => break None,
+            Err(_) => {
+                child.uncertain();
+                break None;
+            }
         }
     };
     TerminatedProcess {
@@ -857,34 +1308,218 @@ fn should_force_kill(grace_started: &Instant, kill_after_grace: Duration) -> boo
     grace_started.elapsed() >= kill_after_grace
 }
 
-fn map_termination_diagnostics<T: StdoutDrainOutput>(
-    threads: ProcessThreads<T>,
+fn termination_diagnostics_from_joined<T: StdoutDrainOutput>(
+    joined: JoinedProcessThreads<T>,
     terminated: TerminatedProcess,
     host_cancellation_requested: bool,
 ) -> ProviderDiagnostics {
-    let joined = join_process_threads(threads);
-    termination_diagnostics_from_parts(
+    let description = joined_failure_description(&joined);
+    let mut diagnostics = termination_diagnostics_from_parts(
         terminated,
         host_cancellation_requested,
-        joined.stdout.captured_bytes(),
-        joined.stderr,
+        joined
+            .stdout
+            .as_ref()
+            .map(StdoutDrainOutput::captured_bytes)
+            .unwrap_or_default(),
+        joined.stderr.unwrap_or_default(),
+    );
+    diagnostics.stdin_closed_early = joined.stdin_closed_early.unwrap_or_default();
+    if joined.cleanup_pending || !joined.failed_workers.is_empty() {
+        diagnostics.description = Some(description);
+    }
+    diagnostics
+}
+
+fn processor_failure_with_process_context<T: StdoutDrainOutput>(
+    error: ProviderClientError,
+    joined: JoinedProcessThreads<T>,
+    terminated: TerminatedProcess,
+    host_cancellation_requested: bool,
+    status: Option<ProcessStatus>,
+) -> ProviderClientError {
+    let description = error.diagnostics().description.clone();
+    let mut diagnostics =
+        termination_diagnostics_from_joined(joined, terminated, host_cancellation_requested);
+    diagnostics.description = match (description, diagnostics.description) {
+        (Some(original), Some(workers)) => Some(format!("{original}; {workers}")),
+        (original, workers) => original.or(workers),
+    };
+    match status {
+        Some(status) => error.with_process_context(diagnostics, status),
+        None => replace_error_diagnostics(error, diagnostics),
+    }
+}
+
+fn wait_failure_with_process_context(
+    error: ProviderClientError,
+    mut diagnostics: ProviderDiagnostics,
+    status: Option<ProcessStatus>,
+) -> ProviderClientError {
+    diagnostics.description = match (
+        error.diagnostics().description.as_deref(),
+        diagnostics.description.as_deref(),
+    ) {
+        (Some(first), Some(secondary)) => {
+            Some(format!("first_failure: {first}; collection: {secondary}"))
+        }
+        (Some(first), None) => Some(format!("first_failure: {first}")),
+        (None, Some(secondary)) => Some(format!("collection: {secondary}")),
+        (None, None) => None,
+    };
+    match status {
+        Some(status) => error.with_process_context(diagnostics, status),
+        None => replace_error_diagnostics(error, diagnostics),
+    }
+}
+
+// Callers supply only fixed operation labels and host wait/cleanup errors, never
+// provider output or argv. errno is recorded only when the io::Error carries it.
+fn wait_operation_error(
+    command: &ProcessCommand,
+    operation: &'static str,
+    error: std::io::Error,
+) -> ProviderClientError {
+    let detail: String = error.to_string().chars().take(256).collect();
+    let errno = match error.raw_os_error() {
+        Some(errno) => errno.to_string(),
+        None => "unavailable".into(),
+    };
+    ProviderClientError::host_transport(
+        HostErrorKind::WaitFailed,
+        subcommand_for_error(command),
+        None,
+        ProviderDiagnostics::with_description(format!("{operation}: {detail}; errno={errno}")),
     )
 }
 
-struct JoinedProcessThreads<T: StdoutDrainOutput> {
-    stdout: T,
-    stderr: CapturedBytes,
-    _stdin_closed_early: bool,
+fn replace_error_diagnostics(
+    error: ProviderClientError,
+    diagnostics: ProviderDiagnostics,
+) -> ProviderClientError {
+    match error {
+        ProviderClientError::Transport {
+            kind,
+            subcommand,
+            request_id,
+            description,
+            process_status,
+            ..
+        } => ProviderClientError::Transport {
+            kind,
+            subcommand,
+            request_id,
+            description,
+            diagnostics: Box::new(diagnostics),
+            process_status,
+        },
+        ProviderClientError::Protocol {
+            kind,
+            subcommand,
+            request_id,
+            description,
+            process_status,
+            launch_failure_evidence,
+            ..
+        } => ProviderClientError::Protocol {
+            kind,
+            subcommand,
+            request_id,
+            description,
+            diagnostics: Box::new(diagnostics),
+            process_status,
+            launch_failure_evidence,
+        },
+        ProviderClientError::ProviderCapability(error) => {
+            ProviderClientError::ProviderCapability(error)
+        }
+    }
+}
+
+fn completed_process_diagnostics<T: StdoutDrainOutput>(
+    joined: &JoinedProcessThreads<T>,
+    status: &ProcessStatus,
+    host_cancellation_requested: bool,
+) -> ProviderDiagnostics {
+    ProviderDiagnostics {
+        stdout: joined
+            .stdout
+            .as_ref()
+            .map(StdoutDrainOutput::captured_bytes)
+            .unwrap_or_default(),
+        stderr: joined.stderr.clone().unwrap_or_default(),
+        stdin_closed_early: joined.stdin_closed_early.unwrap_or_default(),
+        process_was_reaped: true,
+        provider_process_nonzero: process_nonzero(status),
+        provider_exit_code: exit_code(status),
+        host_cancellation_requested,
+        ..ProviderDiagnostics::default()
+    }
 }
 
 fn join_process_threads<T: StdoutDrainOutput>(
     threads: ProcessThreads<T>,
+    child: &Child,
 ) -> JoinedProcessThreads<T> {
-    JoinedProcessThreads {
-        stdout: join_stdout(threads.stdout),
-        stderr: join_capture(threads.stderr),
-        _stdin_closed_early: join_stdin(threads.stdin),
+    let stdout = threads.stdout.join().ok();
+    let stderr = threads.stderr.join().ok();
+    let stdin_closed_early = threads.stdin.join().ok();
+    let mut failed_workers = Vec::new();
+    if stdout.is_none() {
+        failed_workers.push("stdout");
     }
+    if stderr.is_none() {
+        failed_workers.push("stderr");
+    }
+    if stdin_closed_early.is_none() {
+        failed_workers.push("stdin");
+    }
+    // Joining is the final observation boundary, after the supervisor stops
+    // reading events. Successful tree cleanup cannot erase lost worker evidence.
+    if !failed_workers.is_empty() {
+        child.uncertain();
+    }
+    JoinedProcessThreads {
+        stdout,
+        stderr,
+        stdin_closed_early,
+        failed_workers,
+        cleanup_pending: false,
+    }
+}
+
+fn process_worker_failure<T: StdoutDrainOutput>(
+    command: &ProcessCommand,
+    joined: JoinedProcessThreads<T>,
+    status: Option<ProcessStatus>,
+    host_cancellation_requested: bool,
+) -> ProviderClientError {
+    let description = joined_failure_description(&joined);
+    let mut diagnostics = ProviderDiagnostics {
+        stdout: joined
+            .stdout
+            .as_ref()
+            .map(StdoutDrainOutput::captured_bytes)
+            .unwrap_or_default(),
+        stderr: joined.stderr.unwrap_or_default(),
+        stdin_closed_early: joined.stdin_closed_early.unwrap_or_default(),
+        process_was_reaped: status.is_some(),
+        host_cancellation_requested,
+        description: Some(description),
+        ..ProviderDiagnostics::default()
+    };
+    if let Some(status) = &status {
+        diagnostics.provider_exit_code = exit_code(status);
+        diagnostics.provider_process_nonzero = process_nonzero(status);
+    }
+    termination_transport_error(HostErrorKind::WaitFailed, command, diagnostics, status)
+}
+
+fn worker_failure_description(failed_workers: &[&str]) -> String {
+    format!(
+        "process worker thread panicked: {}",
+        failed_workers.join(", ")
+    )
 }
 
 fn termination_diagnostics_from_parts(
@@ -919,36 +1554,6 @@ fn notify_spawn_observer(
     Ok(())
 }
 
-fn child_custody_test_fault(site: &str) -> Result<(), String> {
-    if std::env::var("OULIPOLY_CHILD_CUSTODY_TEST_FAULT")
-        .ok()
-        .as_deref()
-        == Some(site)
-    {
-        wait_for_child_custody_test_ready()?;
-        return Err(format!("injected child custody failure at {site}"));
-    }
-    Ok(())
-}
-
-fn wait_for_child_custody_test_ready() -> Result<(), String> {
-    let Some(path) = std::env::var_os("OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE") else {
-        return Ok(());
-    };
-    let path = PathBuf::from(path);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if path.is_file() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    Err(format!(
-        "timed out waiting for child custody test readiness at {}",
-        path.display()
-    ))
-}
-
 fn terminate_after_spawn_observer_failure(
     mut child: Child,
     command: &ProcessCommand,
@@ -965,6 +1570,14 @@ fn terminate_after_spawn_observer_failure(
         diagnostics.provider_exit_code = exit_code(&status);
         diagnostics.provider_process_nonzero = process_nonzero(&status);
     }
+    if !child.is_reaped() {
+        child.uncertain();
+        diagnostics.description = Some(format!(
+            "{};process_cleanup_pending",
+            diagnostics.description.unwrap_or_default()
+        ));
+        cleanup::retain(child, || true);
+    }
     ProviderClientError::host_transport(
         HostErrorKind::Other("spawn_observer_failed".to_string()),
         subcommand_for_error(command),
@@ -976,7 +1589,7 @@ fn terminate_after_spawn_observer_failure(
 fn drain_reader(
     mut reader: impl Read,
     limit: ByteLimit,
-    stdout_line_activity: Option<Sender<Instant>>,
+    stdout_line_activity: Option<ProcessEventPublisher>,
 ) -> CapturedBytes {
     drain_reader_with_processor(
         &mut reader,
@@ -987,39 +1600,35 @@ fn drain_reader(
 
 fn drain_reader_with_processor<P: StdoutProcessor>(
     mut reader: impl Read,
-    stdout_line_activity: Option<Sender<Instant>>,
+    stdout_line_activity: Option<ProcessEventPublisher>,
     mut processor: P,
 ) -> P::Output {
     let mut buffer = [0_u8; 8192];
+    let mut processor_error = None;
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => {
                 let chunk = &buffer[..read];
                 notify_stdout_line_activity(&stdout_line_activity, chunk);
-                processor.push(chunk);
+                if let Err(error) = processor.push(chunk) {
+                    processor_error = Some(error);
+                    break;
+                }
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
-    processor.finish()
+    processor.finish(processor_error)
 }
 
-fn notify_stdout_line_activity(activity: &Option<Sender<Instant>>, chunk: &[u8]) {
+fn notify_stdout_line_activity(activity: &Option<ProcessEventPublisher>, chunk: &[u8]) {
     let Some(activity) = activity else {
         return;
     };
-    send_stdout_line_activity(activity, stdout_line_count(chunk));
-}
-
-fn stdout_line_count(chunk: &[u8]) -> usize {
-    chunk.iter().filter(|byte| **byte == b'\n').count()
-}
-
-fn send_stdout_line_activity(activity: &Sender<Instant>, count: usize) {
-    for _ in 0..count {
-        let _ = activity.send(Instant::now());
+    if chunk.contains(&b'\n') {
+        activity.publish_stdout_line(Instant::now());
     }
 }
 
@@ -1031,13 +1640,13 @@ fn write_stdin(mut stdin: impl Write, bytes: Vec<u8>) -> bool {
 }
 
 fn write_stdin_bytes(stdin: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
-    for (index, byte) in bytes.iter().enumerate() {
-        stdin.write_all(std::slice::from_ref(byte))?;
-        if index == 0 {
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-    Ok(())
+    let Some((first, remaining)) = bytes.split_first() else {
+        return Ok(());
+    };
+    // Give a provider that rejects stdin a bounded chance to close before the bulk write.
+    stdin.write_all(std::slice::from_ref(first))?;
+    thread::sleep(Duration::from_millis(10));
+    stdin.write_all(remaining)
 }
 
 fn stdin_flush_closed_early(stdin: &mut impl Write) -> bool {
@@ -1053,18 +1662,6 @@ fn flush_stdin(stdin: &mut impl Write) -> std::io::Result<()> {
 
 fn stdin_error_closed_early(error: &std::io::Error) -> bool {
     error.kind() == ErrorKind::BrokenPipe || error.kind() == ErrorKind::WouldBlock
-}
-
-fn join_capture(handle: thread::JoinHandle<CapturedBytes>) -> CapturedBytes {
-    handle.join().unwrap_or_default()
-}
-
-fn join_stdout<T: StdoutDrainOutput>(handle: thread::JoinHandle<T>) -> T {
-    handle.join().unwrap_or_default()
-}
-
-fn join_stdin(handle: thread::JoinHandle<bool>) -> bool {
-    handle.join().unwrap_or(true)
 }
 
 fn host_process_error(
@@ -1144,6 +1741,10 @@ fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn terminate_tree(child: &mut Child) {
+    if !child.can_signal_group() {
+        child.uncertain();
+        return;
+    }
     let group = -(child.id() as i32);
     unsafe {
         libc::kill(group, libc::SIGTERM);
@@ -1161,21 +1762,27 @@ fn terminate_tree(child: &mut Child) {
 }
 
 #[cfg(unix)]
-fn kill_tree(child: &mut Child) {
-    let group = -(child.id() as i32);
-    unsafe {
-        libc::kill(group, libc::SIGKILL);
+fn kill_tree(child: &mut Child) -> bool {
+    if !child.can_signal_group() {
+        child.uncertain();
+        return false;
     }
+    let group = -(child.id() as i32);
+    let signal_ok = unsafe { libc::kill(group, libc::SIGKILL) } == 0;
+    child.confirm_group_dead(signal_ok);
+    if !signal_ok {
+        child.uncertain();
+    }
+    signal_ok
 }
 
-#[cfg(windows)]
-fn kill_tree(child: &mut Child) {
-    let _ = child.kill();
-}
-
-#[cfg(not(any(unix, windows)))]
-fn kill_tree(child: &mut Child) {
-    let _ = child.kill();
+#[cfg(not(unix))]
+fn kill_tree(child: &mut Child) -> bool {
+    let admitted = child.kill().is_ok();
+    if !admitted {
+        child.uncertain();
+    }
+    admitted
 }
 
 pub(crate) fn is_executable(path: &Path) -> bool {
@@ -1201,15 +1808,46 @@ pub(crate) fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_vendor = "apple")]
+    use super::provider_execution_path;
     use super::{
         ByteAccumulator, ByteLimit, CancellationToken, ProcessCommand, ProcessLimits,
-        ProcessRunner, ProcessSpawnObserver,
+        ProcessRunner, ProcessSpawnObserver, STATUS_POLL_INTERVAL, StdoutProcessor,
+        process_event_bus, write_stdin_bytes,
     };
+    use crate::error::{CapturedBytes, ProviderClientError};
     use crate::testkit::{FakeProvider, FakeProviderMode, LeakProbe};
     use serde_json::json;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apple_native_provider_uses_verified_program_path_and_rejects_replacement() {
+        use std::fs::{self, File};
+
+        let directory = std::env::temp_dir().join(format!(
+            "oulipoly-provider-apple-pinned-path-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let program = directory.join("provider");
+        let replacement = directory.join("replacement");
+        fs::write(&program, b"selected").expect("write selected provider");
+        fs::write(&replacement, b"replacement").expect("write replacement provider");
+        let pinned = Arc::new(File::open(&program).expect("open selected provider"));
+        let command = ProcessCommand::new(&program).with_pinned_executable(Some(pinned));
+
+        assert_eq!(provider_execution_path(&command), program);
+
+        fs::rename(&replacement, &program).expect("replace configured provider");
+        let replacement_path = provider_execution_path(&command);
+        assert_ne!(replacement_path, program);
+        assert!(replacement_path.starts_with("/dev/fd"));
+        fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
 
     #[test]
     fn process_writes_one_json_object_closes_stdin_and_drains_stderr() {
@@ -1466,6 +2104,101 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_sends_termination_before_kill_grace_elapses() {
+        let fake = FakeProvider::compile(fake_provider_source());
+        let token = CancellationToken::new();
+        let limits = ProcessLimits {
+            timeout: Duration::from_secs(30),
+            kill_after_grace: Duration::from_secs(1),
+            cancellation: Some(token.clone()),
+            ..ProcessLimits::default()
+        };
+
+        token.cancel_after(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let error = ProcessRunner::new(limits)
+            .run(
+                ProcessCommand::new(fake.path()).arg("describe"),
+                serde_json::to_vec(&describe_request()).expect("request should serialize"),
+                FakeProviderMode::Sleep.env(),
+            )
+            .expect_err("sleeping provider should be cancelled");
+
+        assert_eq!(error.transport_kind(), "host_cancelled");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "SIGTERM was delayed until the force-kill grace elapsed"
+        );
+        assert!(!error.diagnostics().process_was_force_killed);
+    }
+
+    #[test]
+    fn steady_state_status_polling_is_bounded() {
+        let polls_per_second =
+            Duration::from_secs(1).as_millis() / STATUS_POLL_INTERVAL.as_millis();
+
+        assert_eq!(polls_per_second, 20);
+        assert_eq!(polls_per_second * 100, 2_000);
+    }
+
+    #[test]
+    fn stdout_line_activity_is_coalesced_to_one_pending_event() {
+        let (publisher, subscriber) = process_event_bus();
+        for _ in 0..100_000 {
+            publisher.publish_stdout_line(std::time::Instant::now());
+        }
+
+        assert!(subscriber.take_pending().latest_stdout_line.is_some());
+        assert!(subscriber.take_pending().latest_stdout_line.is_none());
+    }
+
+    #[test]
+    fn stdin_payload_is_written_in_bulk() {
+        let mut writer = CountingWriter::default();
+        let payload = vec![b'x'; 1024 * 1024];
+
+        write_stdin_bytes(&mut writer, &payload).expect("bulk stdin write should succeed");
+
+        assert_eq!(writer.write_calls, 2);
+        assert_eq!(writer.written, payload.len());
+    }
+
+    #[test]
+    fn stdout_worker_panic_is_reported_as_wait_failure() {
+        let fake = FakeProvider::compile(fake_provider_source());
+        let started = std::time::Instant::now();
+        let custody = crate::custody::AttemptActorCustody::new(uuid::Uuid::new_v4());
+        let guard = custody.begin("launch");
+        let error = ProcessRunner::new(ProcessLimits {
+            custody: cfg!(target_os = "linux").then(|| guard.0.clone()),
+            ..ProcessLimits::default()
+        })
+        .run_with_stdout_line_gap_timeout_and_stdout_processor(
+            ProcessCommand::new(fake.path()).arg("launch"),
+            serde_json::to_vec(&describe_request()).expect("request should serialize"),
+            FakeProviderMode::LaunchPartialHang.env(),
+            PanickingStdoutProcessor,
+        )
+        .expect_err("stdout worker panic should fail the process outcome");
+
+        drop(guard);
+        if cfg!(target_os = "linux") {
+            assert!(!custody.receipts()[0].effect_incapable());
+        }
+        assert_eq!(error.transport_kind(), "wait_failed");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "worker panic remained hidden until the process timeout"
+        );
+        assert_eq!(
+            error.diagnostics().description.as_deref(),
+            Some(
+                "first_failure: worker_failure_observed; collection: process worker thread panicked: stdout"
+            )
+        );
+    }
+
+    #[test]
     fn byte_accumulator_is_byte_oriented_and_records_truncation_metadata() {
         let mut accumulator = ByteAccumulator::new(ByteLimit::new(5));
         accumulator.push(b"a");
@@ -1498,6 +2231,38 @@ mod tests {
         assert!(outcome.stdout_text().contains("\"ok\":true"));
     }
 
+    #[derive(Default)]
+    struct CountingWriter {
+        write_calls: usize,
+        written: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.write_calls += 1;
+            self.written += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PanickingStdoutProcessor;
+
+    impl StdoutProcessor for PanickingStdoutProcessor {
+        type Output = CapturedBytes;
+
+        fn push(&mut self, _chunk: &[u8]) -> Result<(), ProviderClientError> {
+            panic!("injected stdout worker panic");
+        }
+
+        fn finish(self, _error: Option<ProviderClientError>) -> Self::Output {
+            CapturedBytes::default()
+        }
+    }
+
     fn fake_provider_source() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/provider_client/fake_provider.rs")
@@ -1520,4 +2285,118 @@ mod tests {
             "params": {}
         })
     }
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "process_shutdown_tests.rs"]
+mod shutdown_tests;
+
+// Pending cleanup owns the exact Child and original worker handles, never a
+// reconstructed PID. A failed thread start retains its task in the queue.
+#[path = "process_cleanup.rs"]
+mod cleanup;
+
+fn reap_after_kill(child: &mut Child, admitted: bool) -> Option<ExitStatus> {
+    if !admitted {
+        child.uncertain();
+        return None;
+    }
+    let started = Instant::now();
+    loop {
+        #[cfg(unix)]
+        let result = child_exited_without_reaping(child).and_then(|exited| {
+            if exited {
+                child.wait().map(Some)
+            } else {
+                Ok(None)
+            }
+        });
+        #[cfg(not(unix))]
+        let result = child.try_wait();
+        match result {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if started.elapsed() < SETTLEMENT_OBSERVATION_BOUND => {
+                thread::sleep(Duration::from_millis(2))
+            }
+            _ => {
+                child.uncertain();
+                return None;
+            }
+        }
+    }
+}
+
+fn joined_failure_description<T: StdoutDrainOutput>(joined: &JoinedProcessThreads<T>) -> String {
+    let workers = if joined.failed_workers.is_empty() {
+        String::new()
+    } else {
+        worker_failure_description(&joined.failed_workers)
+    };
+    if joined.cleanup_pending {
+        format!("process_cleanup_pending; worker output may be incomplete; {workers}")
+    } else {
+        workers
+    }
+}
+
+fn collect_or_retain_process_threads<T: StdoutDrainOutput>(
+    threads: ProcessThreads<T>,
+    child: Child,
+) -> JoinedProcessThreads<T> {
+    let started = Instant::now();
+    while !(threads.stdout.is_finished()
+        && threads.stderr.is_finished()
+        && threads.stdin.is_finished())
+        && child.is_reaped()
+        && started.elapsed() < SETTLEMENT_OBSERVATION_BOUND
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    if threads.stdout.is_finished()
+        && threads.stderr.is_finished()
+        && threads.stdin.is_finished()
+        && child.is_reaped()
+    {
+        return join_process_threads(threads, &child);
+    }
+    child.uncertain();
+    let mut stdout = Some(threads.stdout);
+    let mut stderr = Some(threads.stderr);
+    let mut stdin = Some(threads.stdin);
+    let mut failed_workers = Vec::new();
+    fn finished<T>(
+        handle: &mut Option<thread::JoinHandle<T>>,
+        name: &'static str,
+        failed: &mut Vec<&'static str>,
+    ) -> Option<T> {
+        if !handle.as_ref()?.is_finished() {
+            return None;
+        }
+        match handle.take().unwrap().join() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                failed.push(name);
+                None
+            }
+        }
+    }
+    let joined = JoinedProcessThreads {
+        stdout: finished(&mut stdout, "stdout", &mut failed_workers),
+        stderr: finished(&mut stderr, "stderr", &mut failed_workers),
+        stdin_closed_early: finished(&mut stdin, "stdin", &mut failed_workers),
+        failed_workers,
+        cleanup_pending: true,
+    };
+    cleanup::retain(child, move || {
+        let mut ignored_failures = Vec::new();
+        finished(&mut stdout, "stdout", &mut ignored_failures);
+        finished(&mut stderr, "stderr", &mut ignored_failures);
+        finished(&mut stdin, "stdin", &mut ignored_failures);
+        stdout.is_none() && stderr.is_none() && stdin.is_none()
+    });
+    joined
 }

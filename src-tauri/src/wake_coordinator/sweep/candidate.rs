@@ -8,59 +8,65 @@ use oulipoly_state::mailbox::{
 };
 use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
 
-use super::{WakeSweepDisposition, consumed};
-use crate::wake_coordinator::auto_wake_env::{
-    auto_wake_cap_reached, auto_wake_max_for_runtime, emit_auto_wake_cap_reached,
-};
+use super::consumed;
+use super::plan::{WakeSweepAction, WakeSweepRetentionReason};
 
-pub(super) fn wake_sweep_candidate_disposition(
+pub(super) fn wake_sweep_candidate_action(
     db: &mut MailboxDb,
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
-) -> Result<WakeSweepDisposition, String> {
-    // Recoverable means either an idle headless runtime with durable resume
-    // evidence, or a live owner PID identity that must not be reaped. Missing
-    // runtime/history with no live owner is retained abandoned debris, not
-    // resumable work.
+) -> Result<WakeSweepAction, String> {
     if db.notifications_paused(&candidate.session_id)? {
-        return Ok(WakeSweepDisposition::Skip);
+        return Ok(WakeSweepAction::Retain(
+            WakeSweepRetentionReason::NotStartable,
+        ));
     }
     if consumed::pending_mailbox_consumed_marker_present(db, state, &candidate.session_id)? {
-        return Ok(WakeSweepDisposition::Skip);
+        return Ok(WakeSweepAction::Retain(
+            WakeSweepRetentionReason::NotStartable,
+        ));
     }
     if wake_sweep_candidate_is_unclaimed_abandoned_transient(db, &candidate.session_id)? {
-        return abandoned_transient_disposition(db, state, candidate);
+        return abandoned_transient_action(db, state, candidate);
     }
-    if let Some(runtime) = wake_sweep_candidate_resumable_runtime(db, state, candidate)? {
-        return Ok(resumable_disposition_with_cap_emit(candidate, &runtime));
+    if wake_sweep_candidate_has_resumable_runtime(db, state, candidate)? {
+        return Ok(resumable_wake_sweep_action(candidate));
     }
     if wake_sweep_candidate_has_live_owner(db, &candidate.session_id)? {
-        return Ok(WakeSweepDisposition::Skip);
+        return Ok(WakeSweepAction::Retain(
+            WakeSweepRetentionReason::NotStartable,
+        ));
     }
-    Ok(WakeSweepDisposition::Abandoned)
+    Ok(WakeSweepAction::Retain(
+        WakeSweepRetentionReason::DebrisWithoutReapAuthority,
+    ))
 }
 
-/// Disposition for an unclaimed session whose pending rows all have a dead owner
-/// PID lineage. Such a session is never auto-woken (anti-resurrection, #44/#55).
-/// When it also has no durable resume evidence, its pending rows are
-/// undeliverable debris and are retained pending under the fail-closed policy;
-/// a resumable session is also left pending so a later deliberate resume can
-/// still consume it.
-fn abandoned_transient_disposition(
+/// Selects the retention reason for an unclaimed session with at least one
+/// recorded owner identity and no currently live recorded owner. Such a session
+/// is never auto-woken (anti-resurrection, #44/#55). When it also has no durable
+/// resume evidence, its pending rows are undeliverable debris retained under the
+/// fail-closed policy; a resumable session is also retained so a later deliberate
+/// resume can consume it.
+fn abandoned_transient_action(
     db: &MailboxDb,
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
-) -> Result<WakeSweepDisposition, String> {
-    // Preserve only sessions with durable WORK — at least one produced assistant
-    // turn. A bare resume target (a registered chain segment with zero turns) is
-    // an empty registration, not work. Both cases remain pending because this
-    // scope assigns no terminal abandonment authority.
+) -> Result<WakeSweepAction, String> {
+    // Classify as not startable only sessions with durable WORK: at least one
+    // produced assistant turn. A bare resume target (a registered chain segment
+    // with zero turns) is an empty registration, not work. Both classifications
+    // remain pending because this scope assigns no terminal abandonment authority.
     if wake_sweep_candidate_has_produced_turns(db, state, candidate)? {
-        trace_abandoned_transient_wake_skip(&candidate.session_id);
-        return Ok(WakeSweepDisposition::Skip);
+        trace_abandoned_transient_work_retained(&candidate.session_id);
+        return Ok(WakeSweepAction::Retain(
+            WakeSweepRetentionReason::NotStartable,
+        ));
     }
     trace_abandoned_transient_wake_retained(&candidate.session_id);
-    Ok(WakeSweepDisposition::Abandoned)
+    Ok(WakeSweepAction::Retain(
+        WakeSweepRetentionReason::DebrisWithoutReapAuthority,
+    ))
 }
 
 fn wake_sweep_candidate_has_produced_turns(
@@ -68,72 +74,39 @@ fn wake_sweep_candidate_has_produced_turns(
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
 ) -> Result<bool, String> {
-    let Some(runtime) = wake_sweep_candidate_runtime(db, candidate)? else {
+    let Some(runtime) = db
+        .wake_session_reader()
+        .session_metadata(&candidate.session_id)?
+    else {
         return Ok(false);
     };
-    let evidence = wake_sweep_runtime_resume_evidence_values(state, &runtime)?;
-    Ok(runtime_has_produced_turns(evidence))
+    Ok(resume_evidence(state, &runtime)?.is_some_and(|evidence| evidence.turn_count > 0))
 }
 
-fn runtime_has_produced_turns(evidence: Option<(bool, u64)>) -> bool {
-    evidence
-        .map(|(_, turn_count)| turn_count > 0)
-        .unwrap_or(false)
-}
-
-fn resumable_disposition_with_cap_emit(
-    candidate: &WakeSweepCandidate,
-    runtime: &SessionMetadataRow,
-) -> WakeSweepDisposition {
-    let auto_wake_max = auto_wake_max_for_runtime(Some(runtime));
-    emit_cap_reached_if_capped(candidate, auto_wake_max);
-    resumable_wake_sweep_disposition(candidate, auto_wake_max)
-}
-
-fn emit_cap_reached_if_capped(candidate: &WakeSweepCandidate, auto_wake_max: i64) {
-    if wake_sweep_candidate_reached_cap(candidate, auto_wake_max) {
-        emit_wake_sweep_candidate_cap_reached(&candidate.session_id, candidate, auto_wake_max);
-    }
-}
-
-fn resumable_wake_sweep_disposition(
-    candidate: &WakeSweepCandidate,
-    auto_wake_max: i64,
-) -> WakeSweepDisposition {
-    if wake_sweep_candidate_reached_cap(candidate, auto_wake_max) {
-        return WakeSweepDisposition::Skip;
-    }
+fn resumable_wake_sweep_action(candidate: &WakeSweepCandidate) -> WakeSweepAction {
     if !wake_sweep_candidate_has_deliverable_pending(&candidate.session_id) {
-        return WakeSweepDisposition::Skip;
+        return WakeSweepAction::Retain(WakeSweepRetentionReason::NotStartable);
     }
-    WakeSweepDisposition::Recoverable
+    WakeSweepAction::Start
 }
 
 fn wake_sweep_candidate_has_deliverable_pending(session_id: &str) -> bool {
     crate::mailbox_delivery::deliverable_pending_count(session_id)
-        .map(count_is_positive)
+        .map(|count| count > 0)
         .unwrap_or(false)
 }
 
-fn count_is_positive(count: usize) -> bool {
-    count > 0
-}
-
-fn option_is_present<T>(value: Option<T>) -> bool {
-    value.is_some()
-}
-
-fn wake_sweep_candidate_resumable_runtime(
+fn wake_sweep_candidate_has_resumable_runtime(
     db: &mut MailboxDb,
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
-) -> Result<Option<SessionMetadataRow>, String> {
+) -> Result<bool, String> {
     if db
         .runtime_lifecycle()
         .reconcile_session_liveness(&candidate.session_id)?
         == oulipoly_state::mailbox::SessionLiveness::Busy
     {
-        return Ok(None);
+        return Ok(false);
     }
     if !matches!(
         db.runtime_lifecycle_reader()
@@ -141,164 +114,87 @@ fn wake_sweep_candidate_resumable_runtime(
             .map_err(|err| err.to_string())?,
         SessionGenerationProjection::None
     ) {
-        return Ok(None);
-    }
-    let Some(runtime) = wake_sweep_candidate_runtime(db, candidate)? else {
-        return Ok(None);
-    };
-    if wake_sweep_runtime_is_resumable(state, &runtime)? {
-        Ok(Some(runtime))
-    } else {
-        Ok(None)
-    }
-}
-
-fn wake_sweep_candidate_runtime(
-    db: &MailboxDb,
-    candidate: &WakeSweepCandidate,
-) -> Result<Option<SessionMetadataRow>, String> {
-    db.wake_session_reader()
-        .session_metadata(&candidate.session_id)
-}
-
-fn wake_sweep_runtime_is_resumable(
-    state: Option<&StateDb>,
-    runtime: &SessionMetadataRow,
-) -> Result<bool, String> {
-    if !wake_sweep_runtime_can_resume(runtime) {
         return Ok(false);
     }
-    wake_sweep_runtime_has_resume_evidence(state, runtime)
-}
-
-fn wake_sweep_runtime_can_resume(runtime: &SessionMetadataRow) -> bool {
-    runtime.mode == "headless"
-        && runtime
+    let Some(runtime) = db
+        .wake_session_reader()
+        .session_metadata(&candidate.session_id)?
+    else {
+        return Ok(false);
+    };
+    if runtime.mode != "headless"
+        || runtime
             .provider_name
             .as_deref()
-            .is_some_and(|provider| !provider.is_empty())
+            .is_none_or(|provider| provider.is_empty())
+    {
+        return Ok(false);
+    }
+    Ok(resume_evidence(state, &runtime)?
+        .is_some_and(|evidence| evidence.has_chain || evidence.turn_count > 0))
 }
 
-fn wake_sweep_runtime_has_resume_evidence(
-    state: Option<&StateDb>,
-    runtime: &SessionMetadataRow,
-) -> Result<bool, String> {
-    let evidence = wake_sweep_runtime_resume_evidence_values(state, runtime)?;
-    Ok(resume_evidence_values_present(evidence))
+#[derive(Clone, Copy)]
+struct ResumeEvidence {
+    has_chain: bool,
+    turn_count: u64,
 }
 
-fn wake_sweep_runtime_resume_evidence_values(
+fn resume_evidence(
     state: Option<&StateDb>,
     runtime: &SessionMetadataRow,
-) -> Result<Option<(bool, u64)>, String> {
+) -> Result<Option<ResumeEvidence>, String> {
     let Some(state) = state else {
         return Ok(None);
     };
     let Some(provider_name) = runtime.provider_name.as_deref() else {
         return Ok(None);
     };
-    let has_chain = segment_has_chain(state, provider_name, &runtime.session_id)?;
-    let turn_count = session_total_turn_count(state, provider_name, &runtime.session_id)?;
-    Ok(Some((has_chain, turn_count)))
-}
-
-fn segment_has_chain(
-    state: &StateDb,
-    provider_name: &str,
-    session_id: &str,
-) -> Result<bool, String> {
-    state
-        .chain_id_for_segment(provider_name, session_id)
-        .map(option_is_present)
-        .map_err(|err| err.to_string())
-}
-
-fn session_total_turn_count(
-    state: &StateDb,
-    provider_name: &str,
-    session_id: &str,
-) -> Result<u64, String> {
-    Ok(state.count_session_turns(provider_name, session_id)?.total)
-}
-
-fn resume_evidence_values_present(evidence: Option<(bool, u64)>) -> bool {
-    evidence
-        .map(|(has_chain, turn_count)| has_chain || turn_count > 0)
-        .unwrap_or(false)
+    let has_chain = state
+        .chain_id_for_segment(provider_name, &runtime.session_id)
+        .map_err(|err| err.to_string())?
+        .is_some();
+    let turn_count = state
+        .count_session_turns(provider_name, &runtime.session_id)?
+        .total;
+    Ok(Some(ResumeEvidence {
+        has_chain,
+        turn_count,
+    }))
 }
 
 fn wake_sweep_candidate_has_live_owner(db: &MailboxDb, session_id: &str) -> Result<bool, String> {
-    let rows = pending_mailbox_rows(db, session_id)?;
-    pending_rows_have_live_owner(&rows)
-}
-
-fn pending_mailbox_rows(db: &MailboxDb, session_id: &str) -> Result<Vec<MailboxRow>, String> {
-    db.list_pending(session_id)
+    pending_rows_have_live_owner(&db.list_pending(session_id)?)
 }
 
 fn pending_rows_have_live_owner(rows: &[MailboxRow]) -> Result<bool, String> {
-    Ok(pending_rows_liveness(rows)?.contains(&true))
-}
-
-fn pending_rows_liveness(rows: &[MailboxRow]) -> Result<Vec<bool>, String> {
-    rows.iter()
-        .map(mailbox_row_has_live_owner_identity)
-        .collect()
-}
-
-fn wake_sweep_candidate_is_abandoned_transient(
-    db: &MailboxDb,
-    session_id: &str,
-) -> Result<bool, String> {
-    let rows = pending_mailbox_rows(db, session_id)?;
-    pending_rows_are_abandoned_transient(&rows)
+    let mut has_live_owner = false;
+    for row in rows {
+        let Some(recorded) = mailbox_row_owner_identity(row) else {
+            continue;
+        };
+        if read_live_process_identity(recorded.os_pid)?.as_ref() == Some(&recorded) {
+            has_live_owner = true;
+        }
+    }
+    Ok(has_live_owner)
 }
 
 fn wake_sweep_candidate_is_unclaimed_abandoned_transient(
     db: &MailboxDb,
     session_id: &str,
 ) -> Result<bool, String> {
-    if wake_sweep_candidate_has_wake_claim(db, session_id)? {
+    if db.wake_session_reader().wake_claim(session_id)?.is_some() {
         return Ok(false);
     }
-    wake_sweep_candidate_is_abandoned_transient(db, session_id)
-}
-
-fn wake_sweep_candidate_has_wake_claim(db: &MailboxDb, session_id: &str) -> Result<bool, String> {
-    db.wake_session_reader()
-        .wake_claim(session_id)
-        .map(option_is_present)
-}
-
-fn pending_rows_are_abandoned_transient(rows: &[MailboxRow]) -> Result<bool, String> {
-    if !pending_rows_have_owner_identity(rows) {
+    let rows = db.list_pending(session_id)?;
+    if !rows
+        .iter()
+        .any(|row| mailbox_row_owner_identity(row).is_some())
+    {
         return Ok(false);
     }
-    Ok(!pending_rows_have_live_owner(rows)?)
-}
-
-fn pending_rows_have_owner_identity(rows: &[MailboxRow]) -> bool {
-    rows.iter().any(mailbox_row_owner_identity_present)
-}
-
-fn mailbox_row_owner_identity_present(row: &MailboxRow) -> bool {
-    mailbox_row_owner_identity(row).is_some()
-}
-
-fn mailbox_row_has_live_owner_identity(row: &MailboxRow) -> Result<bool, String> {
-    let Some(recorded) = mailbox_row_owner_identity(row) else {
-        return Ok(false);
-    };
-    recorded_identity_is_live(&recorded)
-}
-
-fn recorded_identity_is_live(recorded: &ProcessIdentity) -> Result<bool, String> {
-    read_live_process_identity(recorded.os_pid)
-        .map(|live| live_identity_matches(live.as_ref(), recorded))
-}
-
-fn live_identity_matches(live: Option<&ProcessIdentity>, recorded: &ProcessIdentity) -> bool {
-    live == Some(recorded)
+    Ok(!pending_rows_have_live_owner(&rows)?)
 }
 
 fn mailbox_row_owner_identity(row: &MailboxRow) -> Option<ProcessIdentity> {
@@ -309,26 +205,10 @@ fn mailbox_row_owner_identity(row: &MailboxRow) -> Option<ProcessIdentity> {
     })
 }
 
-fn wake_sweep_candidate_reached_cap(candidate: &WakeSweepCandidate, auto_wake_max: i64) -> bool {
-    auto_wake_cap_reached(candidate.auto_wake_count.saturating_sub(1), auto_wake_max)
-}
-
-fn emit_wake_sweep_candidate_cap_reached(
-    session_id: &str,
-    candidate: &WakeSweepCandidate,
-    auto_wake_max: i64,
-) {
-    emit_auto_wake_cap_reached(
-        session_id,
-        candidate.auto_wake_count.saturating_sub(1),
-        auto_wake_max,
-    );
-}
-
-fn trace_abandoned_transient_wake_skip(session_id: &str) {
+fn trace_abandoned_transient_work_retained(session_id: &str) {
     tracing::warn!(
         session_id,
-        "Skipping auto wake for abandoned transient session with dead owner lineage"
+        "Retaining abandoned transient work with dead owner lineage because it is not startable"
     );
 }
 

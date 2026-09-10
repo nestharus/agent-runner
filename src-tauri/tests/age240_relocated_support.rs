@@ -44,6 +44,40 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 #[cfg(unix)]
+struct TestDataDirGuard {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl TestDataDirGuard {
+    fn set(path: &Path) -> Self {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("OULIPOLY_DATA_DIR");
+        // SAFETY: this test support serializes every mutation through ENV_LOCK.
+        unsafe { std::env::set_var("OULIPOLY_DATA_DIR", path) };
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TestDataDirGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard still owns ENV_LOCK while restoring the prior value.
+        unsafe {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var("OULIPOLY_DATA_DIR", value),
+                None => std::env::remove_var("OULIPOLY_DATA_DIR"),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 pub fn write_executable(path: &std::path::Path, body: &str) {
     std::fs::write(path, body).unwrap();
     let mut perms = std::fs::metadata(path).unwrap().permissions();
@@ -425,6 +459,7 @@ impl StubExecutorService {
             output: Mutex::new(Some(ExecutionResult {
                 stdout: stdout.to_vec(),
                 stderr: stderr.to_string(),
+                output_spool: None,
                 exit_code,
                 provider_index: 0,
                 session_capture: SessionCaptureResult {
@@ -435,7 +470,7 @@ impl StubExecutorService {
                 terminal_reason: None,
                 terminal_signal,
                 produced_assistant_response: false,
-                submitted_user_turn: None,
+                prompt_acceptance_attestation: None,
                 captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
                 returned_artifacts: Vec::new(),
             })),
@@ -532,6 +567,7 @@ impl ExecutorServicePort for PolicyRecordingExecutorService {
             result: ExecutionResult {
                 stdout: b"ok".to_vec(),
                 stderr: String::new(),
+                output_spool: None,
                 exit_code: 0,
                 provider_index: 0,
                 session_capture: SessionCaptureResult {
@@ -542,7 +578,7 @@ impl ExecutorServicePort for PolicyRecordingExecutorService {
                 terminal_reason: None,
                 terminal_signal: None,
                 produced_assistant_response: true,
-                submitted_user_turn: None,
+                prompt_acceptance_attestation: None,
                 captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
                 returned_artifacts: Vec::new(),
             },
@@ -766,7 +802,10 @@ pub fn age38_test_model_success_routes_effective_request_through_stub_ports() {
 
     assert!(result.success);
     assert_eq!(result.exit_code, 0);
-    assert_eq!(result.stdout, String::from_utf8_lossy(stdout).into_owned());
+    assert_eq!(
+        result.stdout_preview,
+        String::from_utf8_lossy(stdout).into_owned()
+    );
     assert_eq!(opener.calls(), vec![db_path]);
     assert_eq!(providers.calls(), vec![dir.path().join("providers.toml")]);
     assert_eq!(routing.calls(), vec!["select:age38-model:true"]);
@@ -1248,7 +1287,7 @@ pub fn test_model_marks_provider_exhausted_on_quota_stderr() {
 
     assert!(!result.success);
     assert_eq!(result.exit_code, 7);
-    assert!(result.stderr.contains("typed quota signal"));
+    assert!(result.stderr_preview.contains("typed quota signal"));
     let db = StateDb::open(&db_path).unwrap();
     let quota = db.get_quota("quota-provider").unwrap().unwrap();
     assert!(quota.exhausted_at.is_some());
@@ -1257,6 +1296,7 @@ pub fn test_model_marks_provider_exhausted_on_quota_stderr() {
 #[cfg(unix)]
 pub fn test_model_migrated_provider_uses_providers_toml_effective_provider() {
     let dir = tempfile::tempdir().unwrap();
+    let _data_dir = TestDataDirGuard::set(dir.path());
     let models_dir = dir.path().join("models");
     std::fs::create_dir_all(&models_dir).unwrap();
     let argv_dump = dir.path().join("test-model-argv.txt");
@@ -1304,8 +1344,8 @@ prompt_mode = "arg"
     let result = test_model_for_test(models, models_dir.clone(), "test-model").unwrap();
 
     assert!(result.success);
-    assert_eq!(result.stdout, "test-model stdout\n");
-    assert_eq!(result.stderr, "test-model stderr\n");
+    assert_eq!(result.stdout_preview, "test-model stdout\n");
+    assert_eq!(result.stderr_preview, "test-model stderr\n");
     assert_eq!(result.exit_code, 0);
     assert_eq!(std::fs::read_to_string(&stdin_dump).unwrap(), "");
     let argv = std::fs::read_to_string(&argv_dump).unwrap();
@@ -1353,15 +1393,15 @@ prompt_mode = "arg"
     assert_eq!(quota_result.exit_code, 7);
     assert!(
         quota_result
-            .stderr
+            .stderr_preview
             .contains("quota exhausted from effective provider"),
         "{}",
-        quota_result.stderr
+        quota_result.stderr_preview
     );
     assert!(
-        !quota_result.stderr.contains("Empty command"),
+        !quota_result.stderr_preview.contains("Empty command"),
         "{}",
-        quota_result.stderr
+        quota_result.stderr_preview
     );
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
     // AGE-166: substring quota detection was removed in PR #126; this
@@ -1378,6 +1418,7 @@ prompt_mode = "arg"
 #[cfg(unix)]
 pub fn test_model_raw_sigterm_returns_unified_signal_exit_code() {
     let dir = tempfile::tempdir().unwrap();
+    let _data_dir = TestDataDirGuard::set(dir.path());
     let models_dir = dir.path().join("models");
     std::fs::create_dir_all(&models_dir).unwrap();
     let model = ModelConfig {
@@ -1403,22 +1444,22 @@ pub fn test_model_raw_sigterm_returns_unified_signal_exit_code() {
 pub fn provider_settings_command_args_deserialize_camel_case_ipc_payloads() {
     let schema_args: provider_settings::GetProviderSettingsSchemaArgs =
         serde_json::from_value(serde_json::json!({
-            "modelName": "example-model",
+            "accountName": "provider-a",
             "schemaId": "example.settings/v1",
         }))
         .expect("camelCase schema payload should deserialize for Tauri IPC");
-    assert_eq!(schema_args.model_name, "example-model");
+    assert_eq!(schema_args.account_name, "provider-a");
     assert_eq!(schema_args.schema_id, "example.settings/v1");
 
     let update_args: provider_settings::UpdateProviderSettingsArgs =
         serde_json::from_value(serde_json::json!({
-            "modelName": "example-model",
+            "accountName": "provider-a",
             "id": "record",
             "version": "opaque-version",
             "values": {"endpoint": "https://example.test", "enabled": true},
         }))
         .expect("camelCase update payload should deserialize for Tauri IPC");
-    assert_eq!(update_args.model_name, "example-model");
+    assert_eq!(update_args.account_name, "provider-a");
     assert_eq!(update_args.id, "record");
     assert_eq!(update_args.version, "opaque-version");
     assert_eq!(
@@ -1428,12 +1469,12 @@ pub fn provider_settings_command_args_deserialize_camel_case_ipc_payloads() {
 
     let migrate_args: provider_settings::MigrateProviderSettingsArgs =
         serde_json::from_value(serde_json::json!({
-            "modelName": "example-model",
+            "accountName": "provider-a",
             "dryRun": true,
             "legacy": {"providers": {"provider-a": {"command": "example"}}},
         }))
         .expect("camelCase migrate payload should deserialize for Tauri IPC");
-    assert_eq!(migrate_args.model_name, "example-model");
+    assert_eq!(migrate_args.account_name, "provider-a");
     assert!(migrate_args.dry_run);
     assert_eq!(
         migrate_args.legacy["providers"]["provider-a"]["command"],
@@ -1466,7 +1507,7 @@ pub fn provider_settings_command_preserves_structured_conflict_and_transport_err
     let conflict = provider_settings::update_provider_settings_inner(
         harness.state(),
         provider_settings::UpdateProviderSettingsArgs {
-            model_name: "example-model".to_string(),
+            account_name: "provider-a".to_string(),
             id: "record".to_string(),
             version: "stale-version".to_string(),
             values: serde_json::json!({"endpoint": "https://example.test"}),
@@ -1488,7 +1529,7 @@ pub fn provider_settings_command_preserves_structured_conflict_and_transport_err
     let transport = provider_settings::validate_provider_settings_inner(
         harness.state(),
         provider_settings::ValidateProviderSettingsArgs {
-            model_name: "example-model".to_string(),
+            account_name: "provider-a".to_string(),
             values: serde_json::json!({"endpoint": "https://example.test"}),
         },
     )
@@ -1509,13 +1550,22 @@ pub fn provider_settings_command_preserves_migration_diagnostics_from_real_host(
     );
     let models_dir = dir.path().join("models");
     std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(
+        dir.path().join("providers.toml"),
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            "[provider-a]\ncommand = \"example\"\nargs = []\nprompt_mode = \"arg\"\n",
+            "provider-settings",
+            &provider_path,
+        ),
+    )
+    .unwrap();
     let model = model_with_provider_artifact("example-model", "provider-a", &provider_path);
     let state = test_state(models_dir, HashMap::from([(model.name.clone(), model)]));
 
     let migrated = provider_settings::migrate_provider_settings_inner(
         &state,
         provider_settings::MigrateProviderSettingsArgs {
-            model_name: "example-model".to_string(),
+            account_name: "provider-a".to_string(),
             dry_run: true,
             legacy: serde_json::json!({"providers": {"provider-a": {"command": "example"}}}),
         },
@@ -1552,6 +1602,15 @@ pub fn provider_settings_targets_skip_central_config_only_models() {
     );
     let models_dir = dir.path().join("models");
     std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(
+        dir.path().join("providers.toml"),
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            "[provider-a]\ncommand = \"example\"\nargs = []\nprompt_mode = \"arg\"\n",
+            "provider-settings",
+            &provider_path,
+        ),
+    )
+    .unwrap();
     let artifact_model =
         model_with_provider_artifact("artifact-model", "provider-a", &provider_path);
     let central_model = make_model("central-only-model", &["provider-a"]);
@@ -1567,7 +1626,7 @@ pub fn provider_settings_targets_skip_central_config_only_models() {
         .expect("mixed central and artifact models should list configured targets");
 
     assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].model_name, "artifact-model");
+    assert_eq!(targets[0].account_name, "provider-a");
     assert_eq!(targets[0].provider_id, "provider-a");
 }
 
@@ -1673,14 +1732,22 @@ args = ["--endpoint", "https://example.test"]
 prompt_mode = "arg"
 "#;
     std::fs::write(&model_path, model_toml).unwrap();
-    std::fs::write(&providers_path, providers_toml).unwrap();
+    std::fs::write(
+        &providers_path,
+        provider_authority_fixture::with_explicit_provider_authority_at(
+            providers_toml,
+            "provider-settings",
+            &provider_path,
+        ),
+    )
+    .unwrap();
     let providers = load_providers_for_models_dir(&models_dir);
     let models = config::load_models(&models_dir, Some(&providers)).unwrap();
     let state = test_state(models_dir.clone(), models);
     let before_model = std::fs::read_to_string(&model_path).unwrap();
     let before_providers = std::fs::read_to_string(&providers_path).unwrap();
 
-    let legacy = provider_settings::package_migration_legacy_payload(&state, "example-model")
+    let legacy = provider_settings::package_migration_legacy_payload(&state)
         .expect("migration legacy packaging should read central config");
 
     assert_eq!(
@@ -1709,7 +1776,7 @@ prompt_mode = "arg"
     let migrated = provider_settings::migrate_provider_settings_inner(
         &state,
         provider_settings::MigrateProviderSettingsArgs {
-            model_name: "example-model".to_string(),
+            account_name: "provider-a".to_string(),
             dry_run: false,
             legacy: serde_json::Value::Null,
         },
@@ -1831,3 +1898,5 @@ fn first_provider_settings_migration_record_line(text: &str) -> &str {
 fn parse_provider_settings_migration_record_line(line: &str) -> serde_json::Value {
     serde_json::from_str(line).expect("recorded request should parse")
 }
+#[path = "provider_authority_fixture.rs"]
+mod provider_authority_fixture;

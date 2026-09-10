@@ -3,6 +3,8 @@
 //! ## Declared roles
 //! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use std::collections::BTreeSet;
 use std::fs;
@@ -50,7 +52,10 @@ impl CliFixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env("HOME", &self.data_home);
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
@@ -102,7 +107,9 @@ impl CliFixture {
         let entries = self.provider_entries(providers, include_quota_scripts);
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            provider_entries_toml(&entries),
+            provider_authority_fixture::with_explicit_provider_authority(&provider_entries_toml(
+                &entries,
+            )),
         )
         .unwrap();
     }
@@ -157,7 +164,9 @@ impl CliFixture {
         let entries = self.command_body_provider_entries(providers);
         fs::write(
             self.app_config_dir.join("providers.toml"),
-            provider_entries_toml(&entries),
+            provider_authority_fixture::with_explicit_provider_authority(&provider_entries_toml(
+                &entries,
+            )),
         )
         .unwrap();
     }
@@ -415,7 +424,21 @@ fn assert_result_envelope_contract(
 ) {
     assert_eq!(output.status.code(), Some(expected_exit_code), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let envelope = result_envelope(&stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("OULIPOLY_PARENT_INVOCATION="))
+            .count(),
+        0,
+        "no parent marker should be emitted when no parent env is supplied: {stderr}"
+    );
+    let envelope = if expected_success {
+        result_envelope(&stderr)
+    } else {
+        result_envelope(&stdout)
+    };
     let keys: BTreeSet<&str> = envelope
         .as_object()
         .unwrap()
@@ -431,8 +454,8 @@ fn assert_result_envelope_contract(
         "success",
         "terminal_reason",
     ]);
-    if expected_success {
-        assert_eq!(keys, base_keys);
+    let expected = if expected_success {
+        base_keys
     } else {
         let mut expected = base_keys;
         expected.extend([
@@ -441,7 +464,10 @@ fn assert_result_envelope_contract(
             "provider_session_id",
             "agent_runner_chain_id",
         ]);
-        assert_eq!(keys, expected);
+        expected
+    };
+    assert_eq!(keys, expected);
+    if !expected_success {
         assert_eq!(envelope["agent_runner_invocation_id"], envelope["id"]);
     }
     assert_eq!(envelope["status"], expected_status);
@@ -449,17 +475,7 @@ fn assert_result_envelope_contract(
     assert_eq!(envelope["exit_code"], expected_exit_code);
     assert!(envelope["finished_at"].as_str().is_some());
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let invocation = parse_invocation(&stderr);
     assert_eq!(envelope["id"], invocation.id);
-    assert_eq!(
-        stderr
-            .lines()
-            .filter(|line| line.starts_with("OULIPOLY_PARENT_INVOCATION="))
-            .count(),
-        0,
-        "no parent marker should be emitted when no parent env is supplied: {stderr}"
-    );
 }
 
 fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
@@ -492,7 +508,7 @@ fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
 }
 
 #[test]
-fn idx_main_02_one_shot_emits_single_result_envelope_and_invocation_marker() {
+fn idx_main_02_one_shot_emits_provider_stdout_and_invocation_marker() {
     let fixture = CliFixture::new();
     fixture.write_model("idx-main-02-ok", &["idx-main-02-ok-provider"]);
     fixture.write_model("idx-main-02-fail", &["idx-main-02-fail-provider"]);
@@ -520,8 +536,7 @@ fn idx_main_02_one_shot_emits_single_result_envelope_and_invocation_marker() {
 }
 
 #[test]
-fn age_35_one_shot_run_with_balancing_uses_balance_context_to_refresh_and_scan_all_model_providers()
-{
+fn age_35_one_shot_routing_refreshes_quota_without_scanning_session_history() {
     let fixture = CliFixture::new();
     fixture.write_model("age35", &["age35-a", "age35-b"]);
     fixture.write_providers(&["age35-a", "age35-b"], true);
@@ -539,8 +554,8 @@ fn age_35_one_shot_run_with_balancing_uses_balance_context_to_refresh_and_scan_a
         );
         assert_eq!(
             db.count_assistant_turns_since(provider, None).unwrap(),
-            1,
-            "one-shot routing should scan sessions before selecting {provider}"
+            0,
+            "one-shot routing must not scan session history for {provider}"
         );
     }
 }
@@ -567,9 +582,10 @@ fn age_81_one_shot_retries_first_quota_exhausted_provider_then_succeeds() {
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("age81-b executed\n"), "{stdout}");
-    assert!(stdout.contains("OULIPOLY_RESULT="), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.starts_with("age81-b executed\n"), "{stdout}");
+    assert!(result_envelope_lines(&stdout).is_empty(), "{stdout}");
+    assert_eq!(result_envelope_lines(&stderr).len(), 1, "{stderr}");
     assert!(
         stderr.contains("age81-a") && stderr.contains("rotating to another provider"),
         "{stderr}"
@@ -619,9 +635,10 @@ fn age_81_one_shot_retries_n_minus_one_quota_exhausted_providers_then_succeeds()
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("age81-c executed\n"), "{stdout}");
-    assert!(stdout.contains("OULIPOLY_RESULT="), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.starts_with("age81-c executed\n"), "{stdout}");
+    assert!(result_envelope_lines(&stdout).is_empty(), "{stdout}");
+    assert_eq!(result_envelope_lines(&stderr).len(), 1, "{stderr}");
     assert_eq!(
         stderr.matches("rotating to another provider").count(),
         2,
@@ -718,7 +735,7 @@ fn age_81_one_shot_non_quota_failure_does_not_retry() {
 }
 
 #[test]
-fn age_35_non_resume_repl_uses_balance_context_to_refresh_and_scan_all_model_providers() {
+fn age_35_non_resume_repl_refreshes_quota_without_scanning_session_history() {
     let fixture = CliFixture::new();
     fixture.write_model("age35", &["age35-a", "age35-b"]);
     fixture.write_providers(&["age35-a", "age35-b"], true);
@@ -736,8 +753,8 @@ fn age_35_non_resume_repl_uses_balance_context_to_refresh_and_scan_all_model_pro
         );
         assert_eq!(
             db.count_assistant_turns_since(provider, None).unwrap(),
-            1,
-            "non-resume REPL routing should scan sessions before selecting {provider}"
+            0,
+            "non-resume REPL routing must not scan session history for {provider}"
         );
     }
 }

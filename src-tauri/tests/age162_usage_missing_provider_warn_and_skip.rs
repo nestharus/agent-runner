@@ -25,6 +25,8 @@
 
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -66,7 +68,10 @@ impl Fixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env("OULIPOLY_CONFIG_HOME", &self.config_home);
         cmd.env("OULIPOLY_DATA_HOME", &self.data_home);
         cmd
@@ -88,7 +93,11 @@ impl Fixture {
     }
 
     fn write_providers_toml(&self, body: &str) {
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(body),
+        )
+        .unwrap();
     }
 
     fn write_quota_script(&self, name: &str, body: &str) -> PathBuf {

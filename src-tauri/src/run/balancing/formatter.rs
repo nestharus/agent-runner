@@ -106,25 +106,36 @@ pub(super) fn emit_routing_retry(provider_name: &str) {
 }
 
 pub(super) fn emit_stderr(stderr: &str) {
-    eprintln!("{stderr}");
+    let _ = writeln!(std::io::stderr().lock(), "{stderr}");
 }
 
 pub(super) fn emit_success_output(
     invocation_id: &str,
-    exit_code: i32,
     error_category: Option<&str>,
-    terminal_reason: Option<&str>,
-    stdout: &[u8],
-) {
-    let _ = std::io::stdout().write_all(stdout);
+    result: &executor::ExecutionResult,
+) -> std::io::Result<()> {
+    if let Some(spool) = &result.output_spool {
+        return crate::run::spooled_success_delivery::deliver(
+            spool,
+            invocation_id,
+            result.exit_code,
+            error_category,
+            result.terminal_reason.as_deref(),
+        );
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    result.write_stdout_to(&mut stdout)?;
+    stdout.flush()?;
+    drop(stdout);
     emit_result_envelope(
         invocation_id,
         true,
-        exit_code,
+        result.exit_code,
         error_category,
-        terminal_reason,
+        result.terminal_reason.as_deref(),
         None,
-    );
+    )
 }
 
 pub(super) fn emit_failure_output(input: FailureResultEnvelopeInput<'_>, stderr: &str) {
@@ -152,14 +163,16 @@ pub(super) fn emit_failure_result_envelope(input: FailureResultEnvelopeInput<'_>
         input.provider_session_id,
         agent_runner_chain_id,
     );
-    emit_result_envelope(
+    if let Err(error) = emit_result_envelope(
         input.invocation_id,
         false,
         input.exit_code,
         input.error_category,
         input.terminal_reason,
         Some(&failure_identity),
-    );
+    ) {
+        emit_stderr(&format!("failed to deliver result envelope: {error}"));
+    }
 }
 
 pub(super) fn emit_spawn_error_failure_result_envelope(

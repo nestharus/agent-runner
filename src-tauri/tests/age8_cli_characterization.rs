@@ -2,6 +2,8 @@
 
 // Characterization test for AGE-8 — pins current behavior of runner CLI seams touched by the agents binary refactor.
 
+mod provider_authority_fixture;
+
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use std::fs;
 use std::io::Write;
@@ -57,14 +59,14 @@ name = "fixture-provider"
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format!(
+            provider_authority_fixture::with_explicit_provider_authority(&format!(
                 r#"[fixture-provider]
 command = "{}"
 args = []
 prompt_mode = "arg"
 "#,
                 provider_script.display()
-            ),
+            )),
         )
         .unwrap();
 
@@ -93,7 +95,10 @@ prompt_mode = "arg"
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd
     }
 }
@@ -133,7 +138,7 @@ fn one_shot_fails_closed_when_default_state_db_cannot_open() {
 
     let mut cmd = fixture.command();
     cmd.env("XDG_DATA_HOME", &blocked_data_home);
-    cmd.env_remove("OULIPOLY_DATA_DIR");
+    cmd.env("OULIPOLY_DATA_DIR", &blocked_data_home);
     cmd.arg("--models-dir")
         .arg(&fixture.models_dir)
         .arg("--model")
@@ -146,12 +151,11 @@ fn one_shot_fails_closed_when_default_state_db_cannot_open() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Failed to create state directory"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("Not a directory"),
-        "state DB open failure should preserve actionable OS cause: {stderr}"
+        stderr.contains(&format!(
+            "Failed to create state directory {}",
+            blocked_data_home.display()
+        )),
+        "state DB open failure should name the configured directory: {stderr}"
     );
     assert_eq!(parse_invocations(&stderr).len(), 0, "{stderr}");
     assert!(
@@ -207,7 +211,7 @@ name = "diagnostic-provider"
     .unwrap();
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"[failure-provider]
 command = "{}"
 args = []
@@ -220,7 +224,7 @@ prompt_mode = "stdin"
 "#,
             failure_script.display(),
             diag_script.display()
-        ),
+        )),
     )
     .unwrap();
     fs::write(
@@ -271,14 +275,14 @@ fn model_execution_reads_prompt_from_piped_stdin_when_no_file_or_positional_prom
     let fixture = Fixture::new();
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
-        format!(
+        provider_authority_fixture::with_explicit_provider_authority(&format!(
             r#"[fixture-provider]
 command = "{}"
 args = []
 prompt_mode = "stdin"
 "#,
             fixture._dir.path().join("fixture-provider.sh").display()
-        ),
+        )),
     )
     .unwrap();
 

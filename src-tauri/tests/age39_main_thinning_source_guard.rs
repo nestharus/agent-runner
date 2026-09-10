@@ -353,7 +353,15 @@ fn age_39_invocation_start_uses_lifecycle_service_in_repl_resume_and_one_shot() 
     for (name, body) in [
         ("run_repl", compact(repl_slice())),
         ("run_resume", compact(resume_slice())),
-        ("run_with_balancing", compact(one_shot_slice())),
+        (
+            "run_with_balancing",
+            compact(
+                one_shot_slice()
+                    .split("#[cfg(test)]")
+                    .next()
+                    .expect("one-shot production source"),
+            ),
+        ),
     ] {
         assert_contains(&body, "AgentRuntimeServices", name);
         assert_not_contains(&body, "state.start_invocation(", name);
@@ -370,7 +378,7 @@ fn age_39_repl_completion_finalization_uses_lifecycle_service_port() {
     assert_contains(&repl, "AgentRuntimeServices", "run_repl signature");
     assert_not_contains(
         &repl,
-        "state.finalize_invocation(",
+        "state.finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,",
         "REPL finalization cut-over",
     );
     assert_contains(
@@ -378,7 +386,11 @@ fn age_39_repl_completion_finalization_uses_lifecycle_service_port() {
         "invocation_lifecycle_service",
         "REPL finalization cut-over",
     );
-    assert_contains(&repl, ".finalize_invocation(", "REPL finalization cut-over");
+    assert_contains(
+        &repl,
+        ".finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,",
+        "REPL finalization cut-over",
+    );
     assert_contains(
         &repl,
         "InvocationLifecycleFinalizeRequest",
@@ -386,7 +398,7 @@ fn age_39_repl_completion_finalization_uses_lifecycle_service_port() {
     );
     assert_order(
         &repl,
-        ".finalize_invocation(",
+        ".finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,",
         "guard.mark_finalized()",
         "explicit REPL finalization must precede guard suppression",
     );
@@ -399,7 +411,7 @@ fn age_39_headless_resume_finalization_uses_lifecycle_service_port() {
     assert_contains(&resume, "AgentRuntimeServices", "run_resume signature");
     assert_not_contains(
         &resume,
-        "state.finalize_invocation(",
+        "state.finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,",
         "headless resume finalization cut-over",
     );
     assert_contains(
@@ -409,7 +421,7 @@ fn age_39_headless_resume_finalization_uses_lifecycle_service_port() {
     );
     assert_contains(
         &resume,
-        ".finalize_invocation(",
+        ".finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,",
         "headless resume finalization cut-over",
     );
     assert_contains(
@@ -430,7 +442,7 @@ fn age_39_one_shot_finalization_uses_lifecycle_service_port() {
     );
     assert_not_contains(
         &one_shot,
-        "state.finalize_invocation(",
+        "state.finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,",
         "one-shot finalization cut-over",
     );
     assert_contains(
@@ -440,7 +452,7 @@ fn age_39_one_shot_finalization_uses_lifecycle_service_port() {
     );
     assert_contains(
         &one_shot,
-        ".finalize_invocation(",
+        ".finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,",
         "one-shot finalization cut-over",
     );
     assert_contains(
@@ -594,7 +606,11 @@ fn age_39_returned_artifacts_are_persisted_before_lifecycle_finalization() {
     ] {
         assert_contains(&body, "record_returned_artifacts(", name);
         assert_contains(&body, "invocation_lifecycle_service", name);
-        assert_contains(&body, ".finalize_invocation(", name);
+        assert_contains(
+            &body,
+            ".finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,",
+            name,
+        );
         assert_artifacts_before_finalization(name, artifact_finalization_positions(&body));
     }
 }
@@ -602,7 +618,7 @@ fn age_39_returned_artifacts_are_persisted_before_lifecycle_finalization() {
 fn artifact_finalization_positions(body: &str) -> (Option<usize>, Option<usize>) {
     (
         body.find("record_returned_artifacts("),
-        body.rfind(".finalize_invocation("),
+        body.rfind(".finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,"),
     )
 }
 
@@ -701,7 +717,7 @@ fn age_39_no_port_residuals_remain_direct_and_explicit() {
 
     assert_contains(
         &compact(finalizer_drop),
-        "self.db.finalize_invocation(",
+        "self.db.finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,",
         "FinalizerGuard::drop remains direct residual",
     );
     assert_contains(

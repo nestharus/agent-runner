@@ -28,10 +28,22 @@ fn age160_lifecycle_log_facade_start_finalize_session_capture_preserves_records(
     let row_id = db
         .start_invocation(&age160_invocation_start(invocation_uuid))
         .unwrap();
-    db.update_session_capture(row_id, Some("session-age160"), "resumed")
-        .unwrap();
-    db.finalize_invocation(row_id, true, 0, None, Some("done"))
-        .unwrap();
+    db.update_session_capture(
+        crate::InvocationMutationAuthority::Standalone,
+        row_id,
+        Some("session-age160"),
+        "resumed",
+    )
+    .unwrap();
+    db.finalize_invocation(
+        crate::InvocationMutationAuthority::Standalone,
+        row_id,
+        true,
+        0,
+        None,
+        Some("done"),
+    )
+    .unwrap();
 
     let records = age160_lifecycle_records(&sink);
     assert_eq!(records.len(), 3);

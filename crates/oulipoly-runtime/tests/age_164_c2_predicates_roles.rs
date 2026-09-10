@@ -98,10 +98,6 @@ const CLI_SOURCES: &[CliSource] = &[
         path: "src/executor/cli/ipc/return_channel_path.rs",
     },
     CliSource {
-        label: "ipc/return_channel_jsonl.rs",
-        path: "src/executor/cli/ipc/return_channel_jsonl.rs",
-    },
-    CliSource {
         label: "ipc/return_channel_parent.rs",
         path: "src/executor/cli/ipc/return_channel_parent.rs",
     },
@@ -411,10 +407,6 @@ const E4_SPLIT_SOURCES: &[CliSource] = &[
     CliSource {
         label: "ipc/return_channel_path.rs",
         path: "src/executor/cli/ipc/return_channel_path.rs",
-    },
-    CliSource {
-        label: "ipc/return_channel_jsonl.rs",
-        path: "src/executor/cli/ipc/return_channel_jsonl.rs",
     },
     CliSource {
         label: "ipc/return_channel_parent.rs",

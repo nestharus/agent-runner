@@ -82,7 +82,27 @@ operation = sys.argv[1]
 with calls.open("a", encoding="utf-8") as handle:
     handle.write(operation + "\n")
 
-if operation == "setup.detect":
+if operation == "describe":
+    result = {{
+        "provider_id": "fixture-setup-provider",
+        "display_name": "Fixture Setup Provider",
+        "contract_versions": [request["contract"]],
+        "preferred_contract": request["contract"],
+        "capabilities": {{
+            "launch": False,
+            "policy": False,
+            "quota": False,
+            "session": False,
+            "terminal": False,
+            "rotation": False,
+            "discovery": True,
+            "settings": False,
+            "setup_brain": False,
+            "setup": True,
+            "migration": False
+        }}
+    }}
+elif operation == "setup.detect":
     result = {{"installed": True, "binary": {{"path": "/fixture/bin/tool"}}, "auth": "ready", "profiles": [{{"id": "profile-alpha"}}], "warnings": []}}
 elif operation == "setup.install_plan":
     result = {{"steps": [{{"id": "prepare", "label": "Prepare neutral setup"}}]}}
@@ -130,7 +150,7 @@ print(json.dumps({{"contract": request["contract"], "request_id": request["reque
     );
     assert_eq!(
         fs::read_to_string(calls_path).expect("read provider calls"),
-        "setup.detect\nsetup.install_plan\nsetup.sync_plan\ndiscovery.accounts\n"
+        "describe\nsetup.detect\nsetup.install_plan\nsetup.sync_plan\ndiscovery.accounts\n"
     );
     assert_eq!(
         context.context.pointer("/setup/detect/installed"),

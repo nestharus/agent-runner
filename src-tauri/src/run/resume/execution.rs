@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use oulipoly_runtime::executor;
 use oulipoly_runtime::provider_registry::ProviderRegistryOptions;
-use oulipoly_runtime::services::{ExecutorServiceRequest, ResumeServiceOutput};
+use oulipoly_runtime::services::{
+    ExecutorServiceRequest, MailboxDeliveryCorrelation, ResumeServiceOutput,
+};
 
 use super::orchestration::ResumeAttemptInput;
 use super::{formatter, mapper, migration, validator, wake};
@@ -46,6 +48,13 @@ pub(in crate::run) struct PreparedHeadlessResumeExecution {
     pub(super) effective_spawn_cwd: PathBuf,
     pub(super) parent_invocation_id: Option<i64>,
     pub(super) max_attempts: usize,
+    pub(super) provider_prompt_accepted: bool,
+}
+
+impl PreparedHeadlessResumeExecution {
+    pub(in crate::run) fn provider_prompt_accepted(&self) -> bool {
+        self.provider_prompt_accepted
+    }
 }
 
 pub(super) fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
@@ -71,7 +80,8 @@ pub(in crate::run) fn prepare_headless_resume_execution(
     models_dir_override: Option<&Path>,
 ) -> Result<Result<PreparedHeadlessResumeExecution, i32>, String> {
     let answer = resolve_resume_answer(prompt, file)?;
-    let answer = persist_tokenized_resume_input(answer, submission_token, target_kind, session_id)?;
+    let (answer, submitted_seq) =
+        persist_tokenized_resume_input(answer, submission_token, target_kind, session_id)?;
     let env = load_resume_execution_environment(models_dir_override)?;
     refresh_resume_provider_registry(agent_runtime_services, &env)?;
     let resolved = match resolve_resume_for_headless_execution(
@@ -100,8 +110,28 @@ pub(in crate::run) fn prepare_headless_resume_execution(
     )?;
     let parent_invocation_id = crate::dispatch::resolve_parent_invocation_id(&env.state);
     let max_attempts = headless_resume_retry_budget(&resolved);
-    let mailbox_delivery =
-        wake::prepare_headless_resume_delivery(&resolved, answer, Some(&env.models_dir))?;
+    if let Err(error) = wake::reconcile_pending_headless_delivery_observations(
+        agent_runtime_services,
+        &resolved,
+        &effective_spawn_cwd,
+    ) {
+        formatter::emit_stderr(&format!(
+            "Warning: Pending mailbox delivery observation recovery failed: {error}"
+        ));
+    }
+    let mailbox_delivery = wake::prepare_headless_resume_delivery(
+        &resolved,
+        answer,
+        Some(&env.models_dir),
+        submitted_seq,
+    )?;
+    if crate::wake_coordinator::is_auto_wake_invocation()
+        && mailbox_delivery.seqs.is_empty()
+        && mailbox_delivery.answer.is_none()
+    {
+        wake::release_current_auto_wake_claim(session_id);
+        return Ok(Err(0));
+    }
     Ok(Ok(mapper::prepared_headless_resume_execution(
         mailbox_delivery,
         env,
@@ -117,14 +147,33 @@ fn persist_tokenized_resume_input(
     submission_token: Option<&str>,
     target_kind: oulipoly_state::InboxTargetKind,
     target_id: &str,
-) -> Result<Option<String>, String> {
+) -> Result<(Option<String>, Option<i64>), String> {
     let Some(submission_token) = submission_token else {
-        return Ok(answer);
+        return Ok((answer, None));
     };
     let Some(answer) = answer else {
-        return Ok(None);
+        return Err("tokenized resume requires an explicit input payload; no launch".to_string());
     };
     let mut mailbox = oulipoly_state::mailbox::MailboxDb::open_default()?;
+    persist_tokenized_resume_input_on(
+        &mut mailbox,
+        answer,
+        submission_token,
+        target_kind,
+        target_id,
+    )
+}
+
+fn persist_tokenized_resume_input_on(
+    mailbox: &mut oulipoly_state::mailbox::MailboxDb,
+    answer: String,
+    submission_token: &str,
+    target_kind: oulipoly_state::InboxTargetKind,
+    target_id: &str,
+) -> Result<(Option<String>, Option<i64>), String> {
+    if answer.trim().is_empty() {
+        return Err("tokenized resume requires a nonempty input payload; no launch".into());
+    }
     match mailbox.enqueue_submitted_input(&oulipoly_state::SubmittedInputEnqueue {
         submission_token,
         target: oulipoly_state::InboxTarget {
@@ -133,8 +182,8 @@ fn persist_tokenized_resume_input(
         },
         input: answer.as_bytes(),
     })? {
-        oulipoly_state::mailbox::EnqueueResult::Inserted(_)
-        | oulipoly_state::mailbox::EnqueueResult::AlreadyEnqueued(_) => Ok(None),
+        oulipoly_state::mailbox::EnqueueResult::Inserted(row)
+        | oulipoly_state::mailbox::EnqueueResult::AlreadyEnqueued(row) => Ok((None, Some(row.seq))),
         oulipoly_state::mailbox::EnqueueResult::Conflict { existing } => {
             Err(format_submission_token_conflict(existing.seq))
         }
@@ -150,23 +199,24 @@ fn refresh_resume_provider_registry(
     env: &ResumeExecutionEnvironment,
 ) -> Result<(), String> {
     let models = mapper::resume_provider_models(&env.models);
-    let registry = mapper::resume_provider_registry(&models, resume_provider_registry_options(env))
-        .map_err(formatter::resume_provider_registry_failure)?;
+    let registry = mapper::resume_provider_registry(
+        &models,
+        &env.providers_cfg,
+        resume_provider_registry_options(env)?,
+    )
+    .map_err(formatter::resume_provider_registry_failure)?;
     agent_runtime_services
         .provider_registry_handle
         .replace(Arc::new(registry));
     Ok(())
 }
 
-fn resume_provider_registry_options(env: &ResumeExecutionEnvironment) -> ProviderRegistryOptions {
-    ProviderRegistryOptions::default()
-        .with_path_entries_from_process_path()
+fn resume_provider_registry_options(
+    env: &ResumeExecutionEnvironment,
+) -> Result<ProviderRegistryOptions, String> {
+    Ok(ProviderRegistryOptions::default()
         .with_config_root(env.config_root.clone())
-        .with_data_root(resume_provider_registry_data_root(env))
-}
-
-fn resume_provider_registry_data_root(env: &ResumeExecutionEnvironment) -> PathBuf {
-    oulipoly_state::paths::data_dir().unwrap_or_else(|_| env.config_root.clone())
+        .with_data_root(oulipoly_state::paths::data_dir()?))
 }
 
 fn headless_resume_retry_budget(resolved: &oulipoly_state::ResolvedResume) -> usize {
@@ -203,11 +253,11 @@ pub(super) fn prepare_resume_attempt_target(
     Ok(Ok(target))
 }
 
-pub(super) fn resume_attempt_strategy_for_target<'a>(
-    resolved: &oulipoly_state::ResolvedResume,
-    provider: &'a oulipoly_config::ProviderConfig,
-) -> Result<Option<&'a oulipoly_config::ResumeStrategy>, i32> {
-    if resolved_uses_provider_ref(resolved) {
+pub(super) fn resume_attempt_strategy_for_target(
+    provider: &oulipoly_config::ProviderConfig,
+    account_endpoint_configured: bool,
+) -> Result<Option<&oulipoly_config::ResumeStrategy>, i32> {
+    if account_endpoint_configured {
         return Ok(None);
     }
     provider.resume.as_ref().map(Some).ok_or_else(|| {
@@ -224,7 +274,19 @@ pub(super) fn execute_resume_attempt_command(
     invocation_env: &str,
     strategy: Option<&oulipoly_config::ResumeStrategy>,
 ) -> Result<executor::ExecutionResult, String> {
-    if let Some(model) = eligible_provider_ref_resume_model(input.resolved) {
+    if input
+        .agent_runtime_services
+        .provider_registry_handle
+        .current()
+        .has_account_endpoint(&provider.name)
+    {
+        let fallback_model;
+        let (model, provider_index) = if let Some(model) = input.resolved.model.as_ref() {
+            (model, provider_index)
+        } else {
+            fallback_model = provider_only_resume_model(input, provider, prompt_mode);
+            (&fallback_model, 0)
+        };
         let request = provider_ref_resume_executor_request(
             input,
             model,
@@ -257,13 +319,25 @@ pub(super) fn execute_resume_attempt_command(
     )
 }
 
-fn eligible_provider_ref_resume_model(
-    resolved: &oulipoly_state::ResolvedResume,
-) -> Option<&oulipoly_config::ModelConfig> {
-    resolved
-        .model
-        .as_ref()
-        .filter(|model| model.provider.is_some())
+fn provider_only_resume_model(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    prompt_mode: oulipoly_config::PromptMode,
+) -> oulipoly_config::ModelConfig {
+    oulipoly_config::ModelConfig {
+        name: input
+            .resolved
+            .model_name
+            .clone()
+            .unwrap_or_else(|| "<unknown>".to_string()),
+        prompt_mode,
+        providers: vec![oulipoly_config::ProviderConfig::model_provider(
+            &provider.name,
+            Vec::new(),
+        )],
+        inputs: Vec::new(),
+        provider: None,
+    }
 }
 
 fn provider_ref_resume_executor_request(
@@ -285,6 +359,11 @@ fn provider_ref_resume_executor_request(
         extra_inputs: HashMap::new(),
         parent_invocation_env: Some(invocation_env.to_string()),
         start_known_provider_session_id: input.resolved.active_session_id.clone(),
+        mailbox_delivery_correlation: input.mailbox_delivery_nonce.map(|delivery_nonce| {
+            MailboxDeliveryCorrelation {
+                delivery_nonce: delivery_nonce.to_string(),
+            }
+        }),
     }
 }
 
@@ -389,14 +468,30 @@ fn prepare_initial_headless_resume_target(
     if crate::dispatch::should_emit_resume_short_line(stderr_is_terminal) {
         formatter::emit_resume_short_line(&resolved.active_provider);
     }
-    validate_headless_resume_target(resolved, &target, &resolved.active_provider)
+    let selected_provider = &resolved.active_provider;
+    let account_endpoint_configured = providers_cfg
+        .entries
+        .get(selected_provider)
+        .and_then(|provider| provider.implementation.as_ref())
+        .is_some();
+    validate_headless_resume_target(
+        resolved,
+        &target,
+        selected_provider,
+        account_endpoint_configured,
+    )
 }
 
 fn validate_headless_resume_target(
     resolved: &oulipoly_state::ResolvedResume,
     target: &ResumeExecutionTarget,
     selected_provider: &str,
+    account_endpoint_configured: bool,
 ) -> Result<(), i32> {
+    if account_endpoint_configured {
+        return validate_selected_provider_resume_target(resolved, target, selected_provider)
+            .map_err(|message| provider_ref_resume_block_exit_code(&message));
+    }
     if resolved_uses_provider_ref(resolved) {
         return validate_provider_ref_headless_resume_target(resolved, target, selected_provider)
             .map_err(|message| provider_ref_resume_block_exit_code(&message));
@@ -422,20 +517,30 @@ pub(super) fn validate_provider_ref_headless_resume_target(
             "provider-ref resume target {selected_provider} has no provider implementation"
         ));
     }
-    let target_member_name = model
-        .providers
-        .get(target.provider_index)
-        .map(|provider| provider.name.as_str())
-        .ok_or_else(|| {
-            format!(
-                "provider-ref resume target {selected_provider} has invalid provider index {}",
-                target.provider_index
-            )
-        })?;
-    if target_member_name != selected_provider {
-        return Err(format!(
-            "provider-ref resume target {selected_provider} resolved provider {target_member_name}"
-        ));
+    validate_selected_provider_resume_target(resolved, target, selected_provider)
+}
+
+fn validate_selected_provider_resume_target(
+    resolved: &oulipoly_state::ResolvedResume,
+    target: &ResumeExecutionTarget,
+    selected_provider: &str,
+) -> Result<(), String> {
+    if let Some(model) = resolved.model.as_ref() {
+        let target_member_name = model
+            .providers
+            .get(target.provider_index)
+            .map(|provider| provider.name.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "provider-ref resume target {selected_provider} has invalid provider index {}",
+                    target.provider_index
+                )
+            })?;
+        if target_member_name != selected_provider {
+            return Err(format!(
+                "provider-ref resume target {selected_provider} resolved provider {target_member_name}"
+            ));
+        }
     }
     if target.provider.name != selected_provider {
         return Err(format!(
@@ -457,3 +562,7 @@ pub(super) fn resolved_uses_provider_ref(resolved: &oulipoly_state::ResolvedResu
         .as_ref()
         .is_some_and(|model| model.provider.is_some())
 }
+
+#[cfg(test)]
+#[path = "submitted_input_tests.rs"]
+mod submitted_input_tests;

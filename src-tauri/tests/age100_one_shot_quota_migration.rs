@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::StateDb;
 use serde_json::Value;
 use std::fs;
@@ -85,15 +87,19 @@ args = []
             );
             body.push_str(&format!(
                 r#"[{provider}]
-command = {}
+command = {command}
 args = []
 prompt_mode = "arg"
 
 "#,
-                toml_string(&command.display().to_string())
+                command = toml_string(&command.display().to_string()),
             ));
         }
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(&body),
+        )
+        .unwrap();
     }
 
     fn run_one_shot(&self, model_name: &str) -> Output {
@@ -104,8 +110,12 @@ prompt_mode = "arg"
             .arg(model_name)
             .arg("prompt");
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("OULIPOLY_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env("HOME", &self.data_home);
         cmd.env(FORCE_KIND, "QuotaExhaustedInband");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
@@ -135,7 +145,7 @@ fn assert_contains_keys(value: &Value, keys: &[&str], context: &str) {
     }
 }
 
-fn assert_pool_exhausted_failure_stdout(stdout: &str) {
+fn assert_pool_exhausted_failure_stdout(stdout: &str, stderr: &str) {
     assert!(
         !stdout
             .lines()
@@ -150,7 +160,7 @@ fn assert_pool_exhausted_failure_stdout(stdout: &str) {
     assert_eq!(
         failure_lines.len(),
         1,
-        "expected exactly one OULIPOLY_FAILURE line in stdout:\n{stdout}"
+        "expected exactly one OULIPOLY_FAILURE line in stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     let payload = serde_json::from_str::<Value>(failure_lines[0])
@@ -237,8 +247,8 @@ fn one_shot_all_pool_members_quota_exhausted_returns_blocked_all_providers_exhau
 
     assert_ne!(output.status.code(), Some(0), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_pool_exhausted_failure_stdout(&stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_pool_exhausted_failure_stdout(&stdout, &stderr);
     assert!(
         stderr.contains("BLOCKED:all-providers-exhausted")
             || stderr.contains("all providers in pool age100-one-shot are quota-exhausted"),

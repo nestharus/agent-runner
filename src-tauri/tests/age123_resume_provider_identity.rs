@@ -23,6 +23,8 @@
 
 #![cfg(unix)]
 
+mod provider_authority_fixture;
+
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, WakeClaimAcquireResult, WakeClaimRequest,
 };
@@ -191,7 +193,11 @@ prompt_mode = "stdin"
 "#,
             toml_string(&diagnostic_command.display().to_string())
         ));
-        fs::write(self.app_config_dir.join("providers.toml"), providers_toml).unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml),
+        )
+        .unwrap();
     }
 
     fn provider_projects_dir(&self, provider: &str) -> PathBuf {
@@ -232,6 +238,18 @@ prompt_mode = "stdin"
             params![CHAIN_ID, target_provider, SESSION_B],
         )
         .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            source_provider,
+            SESSION_A,
+            self.dir.path(),
+        );
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            target_provider,
+            SESSION_B,
+            self.dir.path(),
+        );
     }
 
     fn seed_active_chain(&self, provider: &str, session_id: &str) {
@@ -249,6 +267,12 @@ prompt_mode = "stdin"
             params![CHAIN_ID, provider, session_id],
         )
         .unwrap();
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &conn,
+            provider,
+            session_id,
+            self.dir.path(),
+        );
     }
 
     fn run_resume(&self, resume_input: &str) -> Output {
@@ -358,8 +382,12 @@ prompt_mode = "stdin"
     fn run(&self, mut cmd: Command) -> Output {
         cmd.current_dir(self.dir.path());
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("OULIPOLY_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.output().unwrap()
     }
@@ -426,7 +454,7 @@ fn identity_for(fixture: &Fixture, provider: &str) -> String {
 }
 
 #[test]
-fn resume_session_mismatch_records_expected_segment_and_resolved_provider_identity() {
+fn endpoint_resume_failure_ignores_legacy_mismatch_text_and_records_resolved_identity() {
     let fixture = Fixture::new();
     fixture.write_resume_pool(
         "age123-resume",
@@ -452,23 +480,15 @@ fn resume_session_mismatch_records_expected_segment_and_resolved_provider_identi
     assert_eq!(row.resume_input_id.as_deref(), Some(CHAIN_ID));
     assert_eq!(
         row.provider_session_capture_method.as_deref(),
-        Some("resumed")
+        Some("external_provider_launch")
     );
     assert_eq!(
         row.provider_session_resolved_account,
         Some(identity_for(&fixture, "claude-b"))
     );
-    assert_eq!(row.resume_acceptance_status.as_deref(), Some("rejected"));
-    assert!(
-        row.resume_acceptance_evidence
-            .as_deref()
-            .is_some_and(|evidence| evidence.contains("resume_session_mismatch")),
-        "{row:?}"
-    );
-    assert_eq!(
-        row.error_category.as_deref(),
-        Some("resume_session_mismatch")
-    );
+    assert_eq!(row.resume_acceptance_status, None);
+    assert_eq!(row.resume_acceptance_evidence, None);
+    assert_eq!(row.error_category.as_deref(), Some("quota_exhausted"));
 }
 
 #[test]
@@ -502,7 +522,8 @@ fn successful_resume_records_resolved_provider_identity() {
     assert_eq!(row.status, InvocationStatus::Succeeded.as_str());
     assert_eq!(row.success, Some(true));
     assert_eq!(row.exit_code, Some(0));
-    assert_eq!(row.resume_acceptance_status.as_deref(), Some("unconfirmed"));
+    assert_eq!(row.resume_acceptance_status, None);
+    assert_eq!(row.resume_acceptance_evidence, None);
 }
 
 #[test]

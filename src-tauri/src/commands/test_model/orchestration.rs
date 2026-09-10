@@ -73,7 +73,7 @@ pub fn test_model_with_db_path(
     );
     let result = dispatch::execute_effective_request(services.executor_service, request)?;
     apply_exhaustion_disposition(&services, &context.db, &provider.name, &result)?;
-    Ok(mapper::map_test_model_result(&result))
+    mapper::map_test_model_result(&context.db, &result)
 }
 
 fn apply_exhaustion_disposition(

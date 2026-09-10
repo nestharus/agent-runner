@@ -25,6 +25,7 @@ use crate::provider_registry::ProviderRegistry;
 use crate::session_provider::SessionProviderIdentity;
 use chrono::{SecondsFormat, Utc};
 use oulipoly_config::ProviderConfig;
+use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_state::mailbox::{MailboxDb, MailboxRow};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -39,10 +40,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod cancel;
+#[cfg(all(test, target_os = "linux"))]
+mod executable_replacement_tests;
 mod outbound_observer;
 mod snapshot_worker;
+mod terminal_protocol;
 mod transcript_view;
 mod tui;
+mod tui_profile;
 
 const CONTROL_MAGIC: &[u8; 4] = b"OPTY";
 const CONTROL_VERSION: u8 = 1;
@@ -440,7 +445,7 @@ fn outbound_observer_source(
     context: Result<ProviderSessionObservationContext, &'static str>,
 ) -> outbound_observer::OutboundObserverSource {
     match context {
-        Ok(context) => outbound_observer::OutboundObserverSource::Provider(
+        Ok(context) => outbound_observer::OutboundObserverSource::Provider(Box::new(
             outbound_observer::ProviderSessionTurnSource::new(
                 context.registry,
                 context.identity,
@@ -448,7 +453,7 @@ fn outbound_observer_source(
                 context.invocation_uuid,
                 context.effective_cwd,
             ),
-        ),
+        )),
         Err(detail) => outbound_observer::OutboundObserverSource::Unavailable(detail.to_string()),
     }
 }
@@ -458,19 +463,16 @@ fn provider_inspect_identity(
     model_name: &str,
     provider_name: &str,
 ) -> Option<SessionProviderIdentity> {
-    let model_name =
-        registry.resolve_model_name_for_provider_instance(model_name, provider_name)?;
-    let describe = registry
-        .describe_model_provider_instance(&model_name, provider_name)
-        .ok()?;
+    let endpoint = registry.preflight_account(provider_name).ok()?;
+    let describe = endpoint.capabilities();
     if !describe.capabilities.session {
         return None;
     }
     Some(SessionProviderIdentity {
-        model_name,
+        model_name: model_name.to_string(),
         provider_name: provider_name.to_string(),
         provider_instance_id: Some(format_provider_instance_id(&describe.provider_id)),
-        settings_id: provider_name.to_string(),
+        settings_id: endpoint.settings_id().ok()?.to_string(),
     })
 }
 
@@ -485,7 +487,7 @@ pub(super) fn observed_tui_enabled() -> bool {
     if !controlling_terminal_available() {
         return false;
     }
-    if std::env::var_os("OULIPOLY_AUTO_WAKE").is_some() {
+    if std::env::var_os(AutoWakeEnvironmentVariable::MARKER.name()).is_some() {
         return false;
     }
     if tui_disabled_by_env() {
@@ -706,14 +708,17 @@ fn open_pty_fds(
 ) -> Result<(RawFd, RawFd), io::Error> {
     let mut master_fd = -1;
     let mut slave_fd = -1;
-    let size = *winsize;
+    let mut size = *winsize;
+    let mut terminal = *termios;
+    let size_ptr = std::ptr::addr_of_mut!(size);
+    let terminal_ptr = std::ptr::addr_of_mut!(terminal);
     let rc = unsafe {
         libc::openpty(
             &mut master_fd,
             &mut slave_fd,
             std::ptr::null_mut(),
-            termios,
-            &size,
+            terminal_ptr,
+            size_ptr,
         )
     };
     if rc == -1 {
@@ -895,7 +900,7 @@ fn create_child_session() -> io::Result<()> {
 }
 
 fn make_slave_controlling_terminal(slave_fd: RawFd) -> io::Result<()> {
-    if unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) } == -1 {
+    if unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) } == -1 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -987,10 +992,6 @@ impl ControlSocket {
 
     fn mark_child_spawned(&mut self) {
         self.child_started_at = Instant::now();
-    }
-
-    fn age(&self) -> Duration {
-        self.child_started_at.elapsed()
     }
 }
 
@@ -1578,6 +1579,13 @@ impl PendingChildInput {
     }
 
     fn enqueue(&mut self, bytes: &[u8]) {
+        // Sustained partial writes need not empty the queue. Reclaim a consumed
+        // prefix before refilling, amortizing the copy over at least as many
+        // consumed bytes as remain, so storage tracks live input rather than age.
+        if self.drained >= RELAY_BUFFER_BYTES && self.drained >= self.pending_len() {
+            self.bytes.drain(..self.drained);
+            self.drained = 0;
+        }
         self.bytes.extend_from_slice(bytes);
     }
 
@@ -2584,12 +2592,16 @@ pub fn append_notify_trace_record(fields: &str) {
     let Some(path) = notify_trace_path() else {
         return;
     };
+    append_notify_trace_record_at(&path, fields);
+}
+
+fn append_notify_trace_record_at(path: &Path, fields: &str) {
     let line = format!(
         "{} {}\n",
         Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         fields.trim()
     );
-    let _ = append_notify_trace_line(&path, &line);
+    let _ = append_notify_trace_line(path, &line);
 }
 
 fn notify_trace_path() -> Option<PathBuf> {
@@ -2705,19 +2717,41 @@ fn trace_notify_gate_decision(
 ) {
     let foreground = foreground_owner_state(master_fd, child_pid);
     let line = line_state.trace_snapshot_for_decision(decision);
+    let record = notify_gate_trace_record(
+        control.session_id().as_deref(),
+        control.invocation_uuid(),
+        foreground,
+        &line,
+        child_output_state,
+        decision,
+        status,
+    );
+    append_notify_trace_record(&record);
+    if trace_notify_enabled() {
+        eprintln!("oulipoly_notify_trace {record}");
+    }
+}
+
+fn notify_gate_trace_record(
+    session_id: Option<&str>,
+    invocation_uuid: &str,
+    foreground: ForegroundOwnerState,
+    line: &InputLineTraceSnapshot,
+    child_output_state: &ChildOutputState,
+    decision: &str,
+    status: &str,
+) -> String {
     let inject_status = notify_trace_inject_status(decision, status);
-    let reason = notify_trace_gate_reason(foreground, &line, child_output_state);
-    let record = format!(
+    let reason = notify_trace_gate_reason(foreground, line, child_output_state);
+    format!(
         "trigger=pty-control \
          session_id={} invocation_uuid={} input_empty={} at_boundary={} mid_escape={} \
          last_user_input_ms={} user_input_idle_ms={} user_input_idle={} \
          user_input_idle_threshold_ms={} boundary_probe={} mouse_skipped={} quiescent={} \
          last_child_output_ms={} foreground={} decision={} inject_status={} \
          reason={} consumed=unknown",
-        control
-            .session_id()
-            .unwrap_or_else(|| "<pending>".to_string()),
-        control.invocation_uuid(),
+        session_id.unwrap_or("<pending>"),
+        invocation_uuid,
         line.input_empty,
         line.at_boundary,
         line.mid_escape,
@@ -2733,11 +2767,7 @@ fn trace_notify_gate_decision(
         notify_trace_decision(decision, &inject_status),
         inject_status,
         reason,
-    );
-    append_notify_trace_record(&record);
-    if trace_notify_enabled() {
-        eprintln!("oulipoly_notify_trace {record}");
-    }
+    )
 }
 
 fn notify_trace_gate_reason(
@@ -2861,9 +2891,10 @@ mod tests {
     use super::*;
     use crate::provider_registry::ProviderRegistryOptions;
     use oulipoly_config::{
-        ModelConfig, PromptMode, ProviderConfig, ProvidersConfig,
-        provider_implementation_ref::ProviderImplementationRef,
+        ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
+        ProvidersConfig, provider_implementation_ref::ProviderImplementationRef,
     };
+    use std::collections::HashMap;
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::thread;
@@ -3082,66 +3113,90 @@ mod tests {
     }
 
     #[test]
-    fn provider_default_identity_uses_unique_account_artifact() {
+    fn provider_default_identity_preserves_explicit_model_and_uses_account_endpoint() {
         let temp = tempfile::tempdir().unwrap();
         let script = write_session_describe_provider(temp.path(), "provider.py");
-        let registry = provider_registry(&[
-            provider_model("z-model", "provider-account", &script),
-            provider_model("a-model", "provider-account", &script),
-        ]);
+        let registry = provider_registry(
+            &[
+                provider_model("z-model", "provider-account"),
+                provider_model("a-model", "provider-account"),
+            ],
+            "provider-account",
+            &script,
+        );
 
         let identity =
             provider_inspect_identity(&registry, "<provider-default>", "provider-account")
-                .expect("a unique account artifact should resolve provider-default identity");
+                .expect("the explicit account endpoint should resolve provider-default identity");
 
-        assert_eq!(identity.model_name, "a-model");
+        assert_eq!(identity.model_name, "<provider-default>");
         assert_eq!(identity.provider_name, "provider-account");
         assert_eq!(
             identity.provider_instance_id.as_deref(),
             Some("fixture-instance")
         );
-        assert_eq!(identity.settings_id, "provider-account");
+        assert_eq!(identity.settings_id, "provider-account-settings");
     }
 
     #[test]
-    fn provider_default_identity_rejects_conflicting_account_artifacts() {
+    fn provider_default_identity_ignores_conflicting_model_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let first = write_session_describe_provider(temp.path(), "provider-a.py");
         let second = write_session_describe_provider(temp.path(), "provider-b.py");
-        let registry = provider_registry(&[
-            provider_model("a-model", "provider-account", &first),
-            provider_model("b-model", "provider-account", &second),
-        ]);
+        let account = write_session_describe_provider(temp.path(), "provider-account.py");
+        let mut first_model = provider_model("a-model", "provider-account");
+        first_model.provider = Some(provider_ref(&first));
+        let mut second_model = provider_model("b-model", "provider-account");
+        second_model.provider = Some(provider_ref(&second));
+        let registry =
+            provider_registry(&[first_model, second_model], "provider-account", &account);
 
         assert!(
             provider_inspect_identity(&registry, "<provider-default>", "provider-account",)
-                .is_none(),
-            "provider-default identity must remain unavailable when the account maps to multiple artifacts"
+                .is_some(),
+            "model artifacts must not override the explicit account endpoint"
         );
     }
 
-    fn provider_registry(models: &[ModelConfig]) -> ProviderRegistry {
-        ProviderRegistry::from_model_configs_with_provider_config(
-            models,
-            &ProvidersConfig::default(),
-            ProviderRegistryOptions::default(),
-        )
-        .unwrap()
+    fn provider_registry(
+        models: &[ModelConfig],
+        provider_name: &str,
+        script: &Path,
+    ) -> ProviderRegistry {
+        let providers = ProvidersConfig {
+            entries: HashMap::from([(
+                provider_name.to_string(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "provider-family".to_string(),
+                        executable: script.display().to_string(),
+                    }),
+                    settings_id: Some("provider-account-settings".to_string()),
+                    ..ProviderEntry::default()
+                },
+            )]),
+        };
+        ProviderRegistry::from_configs(models, &providers, ProviderRegistryOptions::default())
+            .unwrap()
     }
 
-    fn provider_model(name: &str, provider_name: &str, script: &Path) -> ModelConfig {
+    fn provider_model(name: &str, provider_name: &str) -> ModelConfig {
         ModelConfig {
             name: name.to_string(),
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::model_provider(provider_name, Vec::new())],
             inputs: Vec::new(),
-            provider: Some(ProviderImplementationRef {
-                path: Some(script.display().to_string()),
-                crate_name: None,
-                version: None,
-                binary: None,
-                script: None,
-            }),
+            provider: None,
+        }
+    }
+
+    fn provider_ref(script: &Path) -> ProviderImplementationRef {
+        ProviderImplementationRef {
+            path: Some(script.display().to_string()),
+            crate_name: None,
+            version: None,
+            binary: None,
+            script: None,
         }
     }
 

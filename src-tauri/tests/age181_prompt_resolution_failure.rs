@@ -22,6 +22,8 @@
 //!       - subordinate fixture setup for isolated config/data homes
 //! ```
 
+mod provider_authority_fixture;
+
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
@@ -64,7 +66,10 @@ impl Age181Fixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
-        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env(
+            "OULIPOLY_DATA_DIR",
+            self.data_home.join("oulipoly-agent-runner"),
+        );
         cmd.env("HOME", &self.data_home);
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
@@ -115,7 +120,13 @@ impl Age181Fixture {
             &provider_script_body(&self.provider_marker),
         );
         fs::write(files.model_file, model_toml()).unwrap();
-        fs::write(files.providers_file, providers_toml(&files.provider_script)).unwrap();
+        fs::write(
+            files.providers_file,
+            provider_authority_fixture::with_explicit_provider_authority(&providers_toml(
+                &files.provider_script,
+            )),
+        )
+        .unwrap();
     }
 
     fn prepare(&self) {

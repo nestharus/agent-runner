@@ -14,6 +14,41 @@ use oulipoly_state::StateDb;
 use uuid::Uuid;
 
 #[test]
+fn provider_unavailable_fails_without_quota_or_cooldown_side_effects() {
+    let db = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+    db.upsert_quota_refresh("provider-a", &[]).unwrap();
+    let before = db.get_quota("provider-a").unwrap().unwrap();
+    let invocation_id = Uuid::nil();
+    let mut stderr = Vec::new();
+    let mut ctx = TerminalSignalContext {
+        invocation_id: &invocation_id,
+        session_id: None,
+        provider: "provider-a",
+        state_db: &db,
+        stderr: &mut stderr,
+    };
+    let unavailable = signal(TerminalSignalKind::ProviderUnavailable);
+    let disposition = apply_terminal_signal_outcome(&Some(unavailable), &mut ctx);
+    assert!(matches!(
+        disposition,
+        TerminalSignalDisposition::InteractiveFail
+    ));
+    let category = classify_error_category_with_fallback(
+        &result_with_signal(Some(TerminalSignalKind::ProviderUnavailable)),
+        || panic!("typed provider unavailability must bypass quota heuristics"),
+    );
+    assert_eq!(
+        category.as_deref(),
+        Some(ErrorCategory::ProviderUnavailable.as_str())
+    );
+    let after = db.get_quota("provider-a").unwrap().unwrap();
+    assert_eq!(after.exhausted_at, before.exhausted_at);
+    assert_eq!(after.next_available_at, before.next_available_at);
+    assert_eq!(after.last_refresh_at, before.last_refresh_at);
+    assert_eq!(after.failure_class, before.failure_class);
+}
+
+#[test]
 fn age153_apply_terminal_signal_outcome_unit_contract_declares_five_dispositions() {
     assert_production_contains(&["fn ", "apply_terminal_signal_outcome", "("]);
     assert_production_contains(&["enum ", "TerminalSignalDisposition"]);

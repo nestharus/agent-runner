@@ -126,7 +126,10 @@ fn run_migrate_db(fixture: &MigrateDbFixture) -> Output {
     cmd.env("XDG_CONFIG_HOME", &fixture.config_home);
     cmd.env("XDG_DATA_HOME", &fixture.data_home);
     cmd.env("HOME", &fixture.data_home);
-    cmd.env_remove("OULIPOLY_DATA_DIR");
+    cmd.env(
+        "OULIPOLY_DATA_DIR",
+        fixture.data_home.join("oulipoly-agent-runner"),
+    );
     cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
     cmd.output().unwrap()
 }

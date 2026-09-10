@@ -525,6 +525,24 @@ pub(crate) enum MailboxSubcommands {
         #[arg(long)]
         json: bool,
     },
+    /// Prune terminal mailbox history and reclaim unreferenced payload storage.
+    PruneTerminal {
+        /// Maximum rows or delivery attempts to prune in this invocation.
+        #[arg(long, default_value_t = 250_000)]
+        limit: usize,
+
+        /// Apply pruning. Without this flag the command only reports eligible history.
+        #[arg(long)]
+        apply: bool,
+
+        /// Rebuild the sidecar after pruning so free SQLite pages return to the filesystem.
+        #[arg(long, requires = "apply")]
+        vacuum: bool,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Debug, Subcommand)]
