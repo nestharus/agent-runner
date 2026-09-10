@@ -8381,7 +8381,7 @@ mod tests {
 
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(
-            r#"[ -t 0 ] || exit 7; printf '\033[3;7H\033[6n'; IFS= read -r -s -N 6 -t 2 reply || exit 9; [ "$reply" = $'\033[3;7R' ] || exit 10; IFS= read -r -t 5 line || exit 6; [ "$line" = "ping" ] && exit 42 || exit 8"#,
+            r#"[ -t 0 ] || exit 7; printf '\033[3;7H\033[6n'; IFS= read -r -s -N 6 -t 2 reply || exit 9; [ "$reply" = $'\033[3;7R' ] || exit 10; printf READY_FOR_INPUT; IFS= read -r -t 5 line || exit 6; [ "$line" = "ping" ] && exit 42 || exit 8"#,
         );
         configure_child_pty(&mut cmd, &pty).expect("configure child pty");
         let child = cmd.spawn().expect("spawn child");
@@ -8414,7 +8414,8 @@ mod tests {
         });
 
         // Read rendered frames continuously (so the PTY buffer never blocks the
-        // relay) and inject the line once the child has had time to reach `read`.
+        // relay) and inject only after the child verifies its cursor reply. A
+        // wall-clock delay can race a slow startup and corrupt the six-byte reply.
         set_nonblocking(outer.master.as_raw_fd());
         let mut rendered = Vec::new();
         let mut buf = [0_u8; 8192];
@@ -8426,7 +8427,11 @@ mod tests {
             {
                 rendered.extend_from_slice(&buf[..n]);
             }
-            if !injected && start.elapsed() >= Duration::from_millis(200) {
+            if !injected
+                && rendered
+                    .windows(b"READY_FOR_INPUT".len())
+                    .any(|w| w == b"READY_FOR_INPUT")
+            {
                 (&outer.master).write_all(b"ping\n").expect("write input");
                 injected = true;
             }
