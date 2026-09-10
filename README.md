@@ -1245,7 +1245,11 @@ resolution history remain in the sidecar. A stale stop ID cannot clear a new
 failure. After rearm, use the supported `resume --session-id <session>` with the
 session's appropriate saved model/configuration, or let ordinary eligible wake
 demand proceed. If notifications were separately paused, separately authorized
-`mailbox resume` is still required. Possibly submitted attempts are observed from
+`mailbox resume` is still required. It clears pause and then requests eligible
+delivery through the wake coordinator; busy sessions retain their turn boundary,
+and observation stops are not rearmed. The response includes the wake outcome;
+a failed wake request returns nonzero without ACKing or discarding pending work.
+No pending work means no new launch. Possibly submitted attempts are observed from
 the retained anchor/checkpoint, never blindly resubmitted. Unsubmitted work may
 prepare once under the normal submission fence. Actual receipt evidence is still
 required for settlement; a still-refusing provider stops again. Do not ACK pending

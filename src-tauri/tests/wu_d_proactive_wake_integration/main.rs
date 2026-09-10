@@ -163,3 +163,13 @@ fn immediate_consumer_ack_preserves_success_without_fabricated_observation() {
 fn immediate_consumer_ack_does_not_hide_genuine_provider_failure() {
     cases_early_ack::immediate_ack(false);
 }
+
+#[test]
+fn mailbox_unpause_alone_wakes_sleeping_recipient_and_settled_repeat_does_not_launch() {
+    cases_early_ack::unpause_ack("sleeping");
+}
+
+#[test]
+fn mailbox_unpause_busy_recipient_waits_for_turn_boundary() {
+    cases_early_ack::unpause_ack("busy");
+}

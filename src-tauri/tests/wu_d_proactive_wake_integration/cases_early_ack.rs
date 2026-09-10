@@ -4,6 +4,14 @@ use rusqlite::Connection;
 use std::process::Command;
 
 pub(crate) fn immediate_ack(completed: bool) {
+    run_ack_case(completed, "none");
+}
+
+pub(crate) fn unpause_ack(mode: &str) {
+    run_ack_case(true, mode);
+}
+
+fn run_ack_case(completed: bool, unpause_mode: &str) {
     let _guard = crate::test_guard::integration_test_guard();
     let fixture = Fixture::new();
     let helper = std::env::var_os("AGENT_BASH_BIN")
@@ -16,7 +24,11 @@ pub(crate) fn immediate_ack(completed: bool) {
         .parent()
         .unwrap()
         .join("runner/oulipoly-agent-runner");
-    let hook = fixture.write_executable("early_ack_hook.py", include_str!("early_ack_hook.py"));
+    let hook_source = format!(
+        "UNPAUSE_MODE = {unpause_mode:?}\n{}",
+        include_str!("early_ack_hook.py")
+    );
+    let hook = fixture.write_executable("early_ack_hook.py", &hook_source);
     let mut provider = fake_provider::provider_script(
         &format!("python3 '{}' initial", hook.display()),
         &format!("python3 '{}' resume", hook.display()),
@@ -51,6 +63,21 @@ pub(crate) fn immediate_ack(completed: bool) {
         .arg("Real immediate ACK regression");
     let output = fixture.run(cmd);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
+    if unpause_mode == "sleeping" {
+        let mailbox = fixture.mailbox();
+        assert!(mailbox.notifications_paused(SESSION).unwrap());
+        let pending = mailbox.list_pending(SESSION).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_attempts, 0);
+        assert!(!fixture.prompt_file("early-ack-verified.json").exists());
+        let mut command = Command::new(&runner);
+        command.args(["mailbox", "resume", "--session-id", SESSION, "--json"]);
+        let unpause = fixture.run(command);
+        assert_eq!(unpause.status.code(), Some(0), "{unpause:?}");
+        let response: serde_json::Value = serde_json::from_slice(&unpause.stdout).unwrap();
+        assert_eq!(response["paused"], false);
+        assert_eq!(response["wake"]["status"], "spawned");
+    }
     wait_until("immediate ACK and both terminal invocations", || {
         if !fixture.prompt_file("early-ack-verified.json").exists() {
             return false;
@@ -144,4 +171,18 @@ pub(crate) fn immediate_ack(completed: bool) {
         confirmations, 0,
         "assistant success cannot manufacture delivery confirmation after consumer ACK"
     );
+    if unpause_mode != "none" {
+        let mut command = Command::new(&runner);
+        command.args(["mailbox", "resume", "--session-id", SESSION, "--json"]);
+        let settled = fixture.run(command);
+        assert_eq!(settled.status.code(), Some(0), "{settled:?}");
+        let response: serde_json::Value = serde_json::from_slice(&settled.stdout).unwrap();
+        assert_eq!(response["wake"]["status"], "no_pending");
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM invocations", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
 }

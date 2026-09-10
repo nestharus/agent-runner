@@ -34,6 +34,10 @@ if sys.argv[1] == 'initial':
     owner = json.loads(os.environ['OULIPOLY_PARENT_INVOCATION'])['id']
     await_rows('SELECT os_pid FROM pid_identity WHERE os_pid=? AND invocation_uuid=? AND session_id=?',
                (int(os.environ['FIXTURE_PROVIDER_PID']), owner, os.environ['session']))
+    if UNPAUSE_MODE != 'none':
+        pause = subprocess.run([runner, 'mailbox', 'pause', '--session-id', os.environ['session'], '--json'],
+                               capture_output=True, text=True, timeout=15)
+        assert pause.returncode == 0 and json.loads(pause.stdout)['paused'], (pause.stdout, pause.stderr)
     dispatch = subprocess.run([os.environ['AGENT_BASH_BIN'], 'run', '--completion-scope', 'tree',
                                '--delivery', 'async', '--', 'printf', 'early-ack-payload\n'],
                               capture_output=True, text=True, timeout=30)
@@ -43,6 +47,15 @@ if sys.argv[1] == 'initial':
     (work / 'early-ack-dispatch.json').write_text(dispatch.stdout)
     found = await_rows('SELECT session_id,owner_invocation_uuid FROM mailbox WHERE handle=?', (result['handle'],))
     assert found == [(os.environ['session'], owner)], found
+    if UNPAUSE_MODE == 'busy':
+        unpause = subprocess.run([runner, 'mailbox', 'resume', '--session-id', os.environ['session'], '--json'],
+                                 capture_output=True, text=True, timeout=15)
+        assert unpause.returncode == 0, (unpause.stdout, unpause.stderr)
+        response = json.loads(unpause.stdout)
+        assert not response['paused'] and response['wake']['status'] == 'busy', response
+        assert rows('SELECT delivered_at,delivery_attempts FROM mailbox WHERE handle=?', (result['handle'],)) == [(None, 0)]
+        assert not (work / 'early-ack-verified.json').exists()
+        (work / 'busy-unpause.json').write_text(unpause.stdout)
 else:
     handle = json.loads((work / 'early-ack-dispatch.json').read_text())['handle']
     prompt = os.environ['last']

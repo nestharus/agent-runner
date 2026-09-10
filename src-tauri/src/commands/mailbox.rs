@@ -36,6 +36,8 @@ struct MailboxArtifacts {
 struct MailboxStatusResponse {
     session_id: String,
     paused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wake: Option<crate::wake_coordinator::WakeDiagnostic>,
     observation_stop: Option<oulipoly_state::mailbox::MailboxObservationStop>,
     pending_count: usize,
     deliverable_count: usize,
@@ -129,10 +131,32 @@ pub(crate) fn run_status(session_id: &str, json: bool) -> Result<i32, String> {
 
 pub(crate) fn run_pause(session_id: &str, paused: bool, json: bool) -> Result<i32, String> {
     let mut db = MailboxDb::open_default()?;
-    db.set_notifications_paused(session_id, paused)?;
+    let wake = set_pause_and_request_wake(&mut db, session_id, paused, || {
+        crate::wake_coordinator::trigger_notify_wake(session_id)
+    })?;
     drop(db);
-    render_status(&mailbox_status(session_id)?, json)?;
-    Ok(0)
+    let failed = wake
+        .as_ref()
+        .is_some_and(|wake| matches!(wake.status.as_str(), "storage_error" | "spawn_error"));
+    let mut status = mailbox_status(session_id)?;
+    status.wake = wake;
+    render_status(&status, json)?;
+    // Unpause has committed even if requesting delivery failed. Do not undo it,
+    // acknowledge pending work, or disguise the failed request as success.
+    Ok(if failed { 1 } else { 0 })
+}
+
+fn set_pause_and_request_wake(
+    db: &mut MailboxDb,
+    session_id: &str,
+    paused: bool,
+    request_wake: impl FnOnce() -> crate::wake_coordinator::WakeDiagnostic,
+) -> Result<Option<crate::wake_coordinator::WakeDiagnostic>, String> {
+    db.set_notifications_paused(session_id, paused)?;
+    // Startup recovery runs before this transition. Request again afterwards,
+    // including on repeated unpause: the coordinator owns eligibility, busy
+    // turn boundaries, observation stops, and atomic duplicate-wake admission.
+    Ok((!paused).then(request_wake))
 }
 
 pub(crate) fn run_ack(
@@ -172,6 +196,7 @@ fn mailbox_status(session_id: &str) -> Result<MailboxStatusResponse, String> {
         return Ok(MailboxStatusResponse {
             session_id: session_id.to_string(),
             paused: false,
+            wake: None,
             observation_stop: None,
             pending_count: 0,
             deliverable_count: 0,
@@ -187,6 +212,7 @@ fn mailbox_status(session_id: &str) -> Result<MailboxStatusResponse, String> {
     Ok(MailboxStatusResponse {
         session_id: session_id.to_string(),
         paused,
+        wake: None,
         observation_stop: db.mailbox_observation_stop(session_id)?,
         pending_count: pending.len(),
         deliverable_count,
@@ -199,6 +225,13 @@ fn render_status(response: &MailboxStatusResponse, json: bool) -> Result<(), Str
     if json {
         print_json(response)
     } else {
+        if let Some(wake) = &response.wake {
+            println!(
+                "wake={} message={}",
+                wake.status,
+                wake.message.as_deref().unwrap_or("")
+            );
+        }
         println!(
             "session={} paused={} pending={} deliverable={} min_seq={} max_seq={}",
             response.session_id,
@@ -504,4 +537,82 @@ pub(crate) fn run_rearm_observation(
         println!("session={session_id} rearmed_stop_id={stop_id}; no ACK or launch performed");
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod unpause_tests {
+    use super::*;
+
+    fn diagnostic(status: &str) -> crate::wake_coordinator::WakeDiagnostic {
+        crate::wake_coordinator::WakeDiagnostic {
+            attempted: false,
+            status: status.to_string(),
+            claim_token: None,
+            wake_pid: None,
+            auto_wake_count: None,
+            message: Some("test request result".to_string()),
+        }
+    }
+
+    #[test]
+    fn unpause_requests_after_committed_transition_including_repeated_requests() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        db.set_notifications_paused("recipient", true).unwrap();
+        for _ in 0..2 {
+            let wake = set_pause_and_request_wake(&mut db, "recipient", false, || {
+                let observer = MailboxDb::open(&path).unwrap();
+                assert!(!observer.notifications_paused("recipient").unwrap());
+                diagnostic("no_pending")
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(wake.status, "no_pending");
+        }
+    }
+
+    #[test]
+    fn pause_does_not_request_wake() {
+        let root = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&root.path().join("pid-identity.db")).unwrap();
+        assert!(
+            set_pause_and_request_wake(&mut db, "recipient", true, || {
+                panic!("pause must not request delivery")
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert!(db.notifications_paused("recipient").unwrap());
+    }
+
+    #[test]
+    fn unpause_preserves_failed_request_diagnostic_and_pending_work() {
+        use oulipoly_state::mailbox::{InboxTarget, SubmittedInputEnqueue};
+        let root = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&root.path().join("pid-identity.db")).unwrap();
+        db.enqueue_submitted_input(&SubmittedInputEnqueue {
+            submission_token: "unpause-input",
+            target: InboxTarget {
+                kind: oulipoly_state::InboxTargetKind::Session,
+                id: "recipient",
+            },
+            input: b"pending input",
+        })
+        .unwrap();
+        db.set_notifications_paused("recipient", true).unwrap();
+        for status in ["spawn_error", "storage_error"] {
+            let wake =
+                set_pause_and_request_wake(&mut db, "recipient", false, || diagnostic(status))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(wake.status, status);
+            assert_eq!(wake.message.as_deref(), Some("test request result"));
+            assert!(!db.notifications_paused("recipient").unwrap());
+            let pending = db.list_pending("recipient").unwrap();
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].delivered_at.is_none());
+            assert_eq!(pending[0].delivery_attempts, 0);
+        }
+    }
 }

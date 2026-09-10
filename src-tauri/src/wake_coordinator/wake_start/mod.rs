@@ -219,6 +219,99 @@ mod tests {
     use oulipoly_state::mailbox::{SessionMetadataUpsert, WakeClaimRequest};
 
     #[test]
+    fn unpause_concurrent_sleeping_requests_admit_only_one_owner_without_replay() {
+        let fixture = ConsumedCompletionFixture::new();
+        let session = ConsumedCompletionFixture::SESSION_ID;
+        fixture
+            .mailbox()
+            .set_notifications_paused(session, true)
+            .unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let statuses = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|index| {
+                    let fixture = &fixture;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let mut db = fixture.mailbox();
+                        db.set_notifications_paused(session, false).unwrap();
+                        barrier.wait();
+                        match prepare_wake_start_context_with_db(
+                            StartWakeInput {
+                                session_id: session,
+                                reason: "notify_idle",
+                                auto_wake_count: 1,
+                                renew_token: None,
+                            },
+                            &format!("unpause-owner-{index}"),
+                            db,
+                        ) {
+                            Ok(_) => "acquired".to_string(),
+                            Err(diagnostic) => diagnostic.status,
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| *status == "acquired")
+                .count(),
+            1,
+            "{statuses:?}"
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| *status == "already_in_flight")
+                .count(),
+            1,
+            "{statuses:?}"
+        );
+        let mut db = fixture.mailbox();
+        let claim = db
+            .wake_session_reader()
+            .wake_claim(session)
+            .unwrap()
+            .unwrap();
+        let pending = db.list_pending(session).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_attempts, 0);
+        db.acknowledge_range(session, pending[0].seq, pending[0].seq, "test-consumer")
+            .unwrap();
+        db.wake_sessions()
+            .release_wake_claim(session, &claim.claim_token)
+            .unwrap();
+        let diagnostic = match prepare_wake_start_context_with_db(
+            StartWakeInput {
+                session_id: session,
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                renew_token: None,
+            },
+            "after-settlement",
+            db,
+        ) {
+            Ok(_) => panic!("settled work must not launch"),
+            Err(diagnostic) => diagnostic,
+        };
+        assert_eq!(diagnostic.status, "no_pending");
+        assert!(
+            fixture
+                .mailbox()
+                .wake_session_reader()
+                .wake_claim(session)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn stopped_observation_rejects_notify_retry_and_restart_sweep_without_claim_takeover() {
         let fixture = ConsumedCompletionFixture::new();
         let session = ConsumedCompletionFixture::SESSION_ID;
@@ -257,6 +350,15 @@ mod tests {
         )
         .unwrap();
         let stop = db.mailbox_observation_stop(session).unwrap().unwrap();
+        db.set_notifications_paused(session, true).unwrap();
+        db.set_notifications_paused(session, false).unwrap();
+        assert_eq!(
+            db.mailbox_observation_stop(session)
+                .unwrap()
+                .unwrap()
+                .stop_id,
+            stop.stop_id
+        );
         drop(db);
         for reason in [
             "notify_idle",
