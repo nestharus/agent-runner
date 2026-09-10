@@ -8,16 +8,16 @@
 //!   payload threaded through executor launches.
 
 use oulipoly_state::CompositeInvocationId;
+#[cfg(test)]
+use oulipoly_state::mailbox::ExactProcessEvidence;
 use oulipoly_state::mailbox::{
     AdvanceRuntimeGenerationDrain, AttachRuntimeGenerationSession, BindRuntimeGenerationRunning,
     CreateRuntimeGeneration, DrainAdvanceResult, DrainFinishResult, DrainHandoff, DrainRequestId,
-    DrainRequestResult, ExactProcessEvidence, ExitRuntimeGenerationNonOrderly,
-    FinishRuntimeGenerationDrain, GenerationMutation, MailboxDb, RequestRuntimeGenerationDrain,
-    RuntimeGenerationFence, RuntimeGenerationId, RuntimeLifecycleState, RuntimeTerminalReason,
+    DrainRequestResult, ExitRuntimeGenerationNonOrderly, FinishRuntimeGenerationDrain,
+    GenerationMutation, MailboxDb, RequestRuntimeGenerationDrain, RuntimeGenerationFence,
+    RuntimeGenerationId, RuntimeLifecycleState, RuntimeTerminalReason,
 };
-use oulipoly_state::pid_identity::{
-    self, ProcessIdentity, ProcessIdentityObservation, observe_live_process_identity,
-};
+use oulipoly_state::pid_identity::{self, ProcessIdentity};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
@@ -486,49 +486,10 @@ fn recover_stale_session_generations(
     let Some(session_id) = context.session_id() else {
         return Ok(());
     };
-    let generations = db
-        .runtime_lifecycle_reader()
-        .runtime_generation_history(session_id)
-        .map_err(|err| err.to_string())?;
-    for generation in generations {
-        if generation.lifecycle_state == RuntimeLifecycleState::Exited {
-            continue;
-        }
-        let liveness_evidence = if generation.lifecycle_state == RuntimeLifecycleState::Starting {
-            &generation.creator_process_evidence
-        } else {
-            &generation.exact_process_evidence
-        };
-        let ExactProcessEvidence::Recorded(identity) = liveness_evidence else {
-            continue;
-        };
-        let stale = match observe_live_process_identity(identity.os_pid) {
-            ProcessIdentityObservation::ExactLive(live) => live != *identity,
-            ProcessIdentityObservation::Dead => true,
-            ProcessIdentityObservation::Unsupported | ProcessIdentityObservation::ReadError(_) => {
-                false
-            }
-        };
-        if !stale {
-            continue;
-        }
-        let mutation = db
-            .runtime_lifecycle()
-            .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
-                fence: RuntimeGenerationFence {
-                    generation_id: &generation.generation_id,
-                    spawn_invocation_uuid: &generation.spawn_invocation_uuid,
-                },
-                reason: RuntimeTerminalReason::RecoveredDead,
-                exit_code: None,
-            })
-            .map_err(|err| err.to_string())?;
-        if let GenerationMutation::Rejected(rejection) = mutation {
-            return Err(format!(
-                "Stale runtime generation recovery rejected: {rejection:?}"
-            ));
-        }
-    }
+    // Share the state-side owner/child rule and transactional revalidation.
+    // A competing recovery or a still-live finalizer is busy, not spawn failure.
+    db.runtime_lifecycle()
+        .reconcile_session_liveness(session_id)?;
     Ok(())
 }
 
@@ -829,6 +790,42 @@ mod tests {
             },
         };
         (context, generation)
+    }
+
+    #[test]
+    fn stale_child_recovery_leaves_live_finalizer_without_false_spawn_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (context, generation) = attachment_fixture(&dir.path().join("pid-identity.db"));
+        attach_captured_session_id(Some(&context), Some(&generation), "session-a").unwrap();
+        let mut context = context;
+        context.session_id = Some("session-a".into());
+        let mut db = context.open_mailbox().unwrap();
+        let mut replaced = pid_identity::read_live_process_identity(i64::from(std::process::id()))
+            .unwrap()
+            .unwrap();
+        replaced.os_pid_starttime_ticks += 1;
+        assert!(matches!(
+            db.runtime_lifecycle()
+                .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                    fence: generation_fence(&context),
+                    spawned_os_pid: replaced.os_pid,
+                    exact_process_identity: &replaced,
+                    os_pgid: None,
+                },)
+                .unwrap(),
+            GenerationMutation::Applied(_)
+        ));
+        recover_stale_session_generations(&mut db, &context).unwrap();
+        assert_eq!(
+            db.runtime_lifecycle_reader()
+                .runtime_generation(&context.generation_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            RuntimeLifecycleState::Running
+        );
+        drop(db);
+        mark_runtime_generation_orderly_completed(Some(&context), Some(0), Some(0)).unwrap();
     }
 
     #[test]

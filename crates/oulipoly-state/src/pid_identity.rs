@@ -1064,7 +1064,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
-    fn dead_child_identity_reconciles_runtime_generation() {
+    fn dead_child_identity_preserves_live_creator_finalization() {
         let mut child = spawn_sleeping_child();
         let os_pid = i64::from(child.id());
         let identity = read_live_process_identity(os_pid).unwrap().unwrap();
@@ -1118,7 +1118,7 @@ mod tests {
                 .runtime_lifecycle()
                 .reconcile_session_liveness("session-crash-recovery")
                 .unwrap(),
-            SessionLiveness::Idle
+            SessionLiveness::Busy
         );
         assert_eq!(
             mailbox
@@ -1127,7 +1127,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .lifecycle_state,
-            RuntimeLifecycleState::Exited
+            RuntimeLifecycleState::Running
         );
     }
 

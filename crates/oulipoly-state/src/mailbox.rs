@@ -7755,20 +7755,23 @@ fn validate_recovered_dead_process(
     if request.reason != RuntimeTerminalReason::RecoveredDead {
         return Ok(());
     }
-    let ExactProcessEvidence::Recorded(recorded) = generation_liveness_process(before) else {
-        return Err(GenerationRejection::InvariantViolation);
-    };
-    match pid_identity::observe_live_process_identity(recorded.os_pid) {
-        pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
-            Err(GenerationRejection::ProcessIdentityConflict)
-        }
-        pid_identity::ProcessIdentityObservation::ExactLive(_)
-        | pid_identity::ProcessIdentityObservation::Dead => Ok(()),
-        pid_identity::ProcessIdentityObservation::Unsupported
-        | pid_identity::ProcessIdentityObservation::ReadError(_) => {
-            Err(GenerationRejection::InvariantViolation)
+    for evidence in generation_liveness_processes(before) {
+        let ExactProcessEvidence::Recorded(recorded) = evidence else {
+            return Err(GenerationRejection::InvariantViolation);
+        };
+        match pid_identity::observe_finalizer_process_identity(recorded.os_pid) {
+            pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
+                return Err(GenerationRejection::ProcessIdentityConflict);
+            }
+            pid_identity::ProcessIdentityObservation::ExactLive(_)
+            | pid_identity::ProcessIdentityObservation::Dead => {}
+            pid_identity::ProcessIdentityObservation::Unsupported
+            | pid_identity::ProcessIdentityObservation::ReadError(_) => {
+                return Err(GenerationRejection::InvariantViolation);
+            }
         }
     }
+    Ok(())
 }
 
 fn validate_non_orderly_predecessor(
@@ -8694,28 +8697,22 @@ enum GenerationLivenessObservation {
 fn generation_liveness_observation(
     generation: &RuntimeGenerationRow,
 ) -> GenerationLivenessObservation {
-    let ExactProcessEvidence::Recorded(recorded) = generation_liveness_process(generation) else {
-        return GenerationLivenessObservation::Busy;
-    };
-    match pid_identity::observe_live_process_identity(recorded.os_pid) {
-        pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
-            GenerationLivenessObservation::Busy
-        }
-        pid_identity::ProcessIdentityObservation::ExactLive(_)
-        | pid_identity::ProcessIdentityObservation::Dead => GenerationLivenessObservation::Stale,
-        pid_identity::ProcessIdentityObservation::Unsupported
-        | pid_identity::ProcessIdentityObservation::ReadError(_) => {
-            GenerationLivenessObservation::Busy
-        }
+    match classify_generation_liveness_read_only(std::slice::from_ref(generation)) {
+        RuntimeGenerationReadOnlyLiveness::Busy => GenerationLivenessObservation::Busy,
+        _ => GenerationLivenessObservation::Stale,
     }
 }
 
-fn generation_liveness_process(generation: &RuntimeGenerationRow) -> &ExactProcessEvidence {
-    if generation.lifecycle_state == RuntimeLifecycleState::Starting {
-        &generation.creator_process_evidence
-    } else {
-        &generation.exact_process_evidence
-    }
+/// A child exiting does not discharge its creator's orderly-finalization work.
+/// Recovery must prove both identities gone; a surviving child also retains its
+/// claims/stop authority after creator death. Unknown evidence is not death.
+fn generation_liveness_processes(
+    generation: &RuntimeGenerationRow,
+) -> impl Iterator<Item = &ExactProcessEvidence> {
+    std::iter::once(&generation.creator_process_evidence).chain(
+        (generation.lifecycle_state != RuntimeLifecycleState::Starting)
+            .then_some(&generation.exact_process_evidence),
+    )
 }
 
 fn classify_generation_liveness_read_only(
@@ -8726,23 +8723,24 @@ fn classify_generation_liveness_read_only(
     }
     let mut stale = RuntimeGenerationReadOnlyLiveness::StaleMissingIdentity;
     for generation in generations {
-        let ExactProcessEvidence::Recorded(recorded) = generation_liveness_process(generation)
-        else {
-            continue;
-        };
-        match pid_identity::observe_live_process_identity(recorded.os_pid) {
-            pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
+        for evidence in generation_liveness_processes(generation) {
+            let ExactProcessEvidence::Recorded(recorded) = evidence else {
                 return RuntimeGenerationReadOnlyLiveness::Busy;
-            }
-            pid_identity::ProcessIdentityObservation::ExactLive(_) => {
-                stale = RuntimeGenerationReadOnlyLiveness::StalePidReused;
-            }
-            pid_identity::ProcessIdentityObservation::Dead => {
-                stale = RuntimeGenerationReadOnlyLiveness::StaleDead;
-            }
-            pid_identity::ProcessIdentityObservation::Unsupported
-            | pid_identity::ProcessIdentityObservation::ReadError(_) => {
-                return RuntimeGenerationReadOnlyLiveness::Busy;
+            };
+            match pid_identity::observe_finalizer_process_identity(recorded.os_pid) {
+                pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
+                    return RuntimeGenerationReadOnlyLiveness::Busy;
+                }
+                pid_identity::ProcessIdentityObservation::ExactLive(_) => {
+                    stale = RuntimeGenerationReadOnlyLiveness::StalePidReused;
+                }
+                pid_identity::ProcessIdentityObservation::Dead => {
+                    stale = RuntimeGenerationReadOnlyLiveness::StaleDead;
+                }
+                pid_identity::ProcessIdentityObservation::Unsupported
+                | pid_identity::ProcessIdentityObservation::ReadError(_) => {
+                    return RuntimeGenerationReadOnlyLiveness::Busy;
+                }
             }
         }
     }
@@ -17089,6 +17087,16 @@ mod tests {
             })
             .unwrap();
 
+        // Model creator replacement as well as child replacement. A live
+        // exact creator still owes orderly finalization after child exit.
+        db.conn
+            .execute(
+                "UPDATE runtime_generation SET creator_identity_os_pid_starttime_ticks =
+             creator_identity_os_pid_starttime_ticks + 1 WHERE generation_uuid = ?1",
+                params![generation_id.to_string()],
+            )
+            .unwrap();
+
         assert_eq!(
             db.runtime_lifecycle()
                 .reconcile_session_liveness("session-a")
@@ -17153,6 +17161,16 @@ mod tests {
                 fence,
                 drain_request_id: &drain_request_id,
             })
+            .unwrap();
+
+        // Model creator replacement as well as child replacement. A live
+        // exact creator still owes orderly finalization after child exit.
+        db.conn
+            .execute(
+                "UPDATE runtime_generation SET creator_identity_os_pid_starttime_ticks =
+             creator_identity_os_pid_starttime_ticks + 1 WHERE generation_uuid = ?1",
+                params![generation_id.to_string()],
+            )
             .unwrap();
 
         assert_eq!(

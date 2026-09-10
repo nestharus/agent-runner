@@ -613,7 +613,9 @@ fn terminalize_stale_runtime_generation(
                 GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_)
             )
         });
-    let _ = unlink_control_socket_if_owned(control_path);
+    if terminalized {
+        let _ = unlink_control_socket_if_owned(control_path);
+    }
     terminalized
 }
 
@@ -1628,6 +1630,86 @@ fn sanitize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_live_finalizer_recovery_retains_pty_control_path() {
+        const FIXTURE: &str = "AGE353_PTY_FINALIZER_FIXTURE";
+        let Some(root) = std::env::var_os(FIXTURE) else {
+            let dir = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "mailbox_delivery::tests::rejected_live_finalizer_recovery_retains_pty_control_path"])
+                .env(FIXTURE, dir.path())
+                .env("XDG_RUNTIME_DIR", dir.path())
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let path = root.join("pid-identity.db");
+        let socket_dir = root.join("oulipoly-agent-runner/pty");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let control = socket_dir.join("owner.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&control).unwrap();
+        let mut db = MailboxDb::open(&path).unwrap();
+        let id = RuntimeGenerationId::new();
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &id,
+                spawn_invocation_uuid: "owner",
+                session_id: Some("session"),
+                runtime_mode: "pty_interactive",
+                provider_name: "fixture",
+                model_name: None,
+                pty_control_path: control.to_str(),
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        let mut replaced =
+            oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+                .unwrap()
+                .unwrap();
+        replaced.os_pid_starttime_ticks += 1;
+        db.runtime_lifecycle()
+            .bind_runtime_generation_running(
+                oulipoly_state::mailbox::BindRuntimeGenerationRunning {
+                    fence: RuntimeGenerationFence {
+                        generation_id: &id,
+                        spawn_invocation_uuid: "owner",
+                    },
+                    spawned_os_pid: replaced.os_pid,
+                    exact_process_identity: &replaced,
+                    os_pgid: None,
+                },
+            )
+            .unwrap();
+        assert!(!terminalize_stale_runtime_generation(
+            &mut db,
+            "session",
+            control.to_str().unwrap()
+        ));
+        assert!(
+            control.exists(),
+            "rejected recovery cannot unlink the owner's control path"
+        );
+        // The same path is reclaimable after exact creator replacement too.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE runtime_generation SET creator_identity_os_pid_starttime_ticks =
+             creator_identity_os_pid_starttime_ticks + 1",
+                [],
+            )
+            .unwrap();
+        assert!(terminalize_stale_runtime_generation(
+            &mut db,
+            "session",
+            control.to_str().unwrap()
+        ));
+        assert!(!control.exists());
+        drop(listener);
+    }
 
     struct DataDirOverride(Option<std::ffi::OsString>);
 
