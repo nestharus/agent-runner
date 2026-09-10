@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+#[path = "fixtures/live_completion_diagnostic.rs"]
+mod live_completion_diagnostic;
 mod provider_authority_fixture;
 
 use oulipoly_runtime::executor::cli::pty_broker::{
@@ -22,7 +24,7 @@ use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -108,7 +110,11 @@ impl Fixture {
         Connection::open(self.state_path()).unwrap()
     }
 
-    fn run(&self, mut cmd: Command) -> Output {
+    fn run(&self, cmd: Command) -> Output {
+        self.run_diagnostic(cmd, None)
+    }
+
+    fn run_diagnostic(&self, mut cmd: Command, stage: Option<&str>) -> Output {
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
@@ -118,11 +124,35 @@ impl Fixture {
             "OULIPOLY_DATA_DIR",
             self.data_home.join("oulipoly-agent-runner"),
         );
+        cmd.env_remove("OULIPOLY_CONFIG_HOME");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
-        cmd.output().unwrap()
+        if let Some(stage) = stage {
+            readiness_diagnostic(
+                stage,
+                json!({"event": "launch", "arg_count": cmd.get_args().count(),
+                "env_count": cmd.get_envs().count()}),
+            );
+        }
+        let output = if stage.is_some() {
+            bounded_diagnostic_output(cmd, Duration::from_secs(5))
+        } else {
+            cmd.output().unwrap()
+        };
+        if let Some(stage) = stage {
+            readiness_diagnostic(
+                stage,
+                json!({"event": "exit", "success": output.status.success(),
+                "stdout_len": output.stdout.len(), "stderr_len": output.stderr.len() }),
+            );
+        }
+        output
     }
 
     fn run_notify(&self, handle: &str, metadata: Value) -> Output {
+        self.run_notify_diagnostic(handle, metadata, false)
+    }
+
+    fn run_notify_diagnostic(&self, handle: &str, metadata: Value, diagnostic: bool) -> Output {
         let owner_invocation_uuid = metadata
             .get("owner_invocation_uuid")
             .and_then(Value::as_str)
@@ -135,9 +165,15 @@ impl Fixture {
             COMPLETION_REGISTRATION_AUTHORITY_ENV,
             authority.process_environment_value(),
         );
-        let registration = self.run(registration);
-        assert!(registration.status.success(), "{registration:?}");
-        self.run(self.notify_command(handle, &artifacts))
+        let registration = self.run_diagnostic(registration, diagnostic.then_some("registration"));
+        assert!(
+            registration.status.success(),
+            "completion registration failed (output redacted)"
+        );
+        self.run_diagnostic(
+            self.notify_command(handle, &artifacts),
+            diagnostic.then_some("notify"),
+        )
     }
 
     fn run_mailbox_status(&self, session_id: &str) -> Output {
@@ -214,6 +250,7 @@ impl Fixture {
             "OULIPOLY_DATA_DIR",
             self.data_home.join("oulipoly-agent-runner"),
         );
+        cmd.env_remove("OULIPOLY_CONFIG_HOME");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
     }
 
@@ -856,11 +893,20 @@ fn fixture_interactive_session_agent_bash_completion_arrives_live() {
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
     fixture.associate_observed_completion_authority(&invocation_uuid);
-    let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+    let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
 
     let output = fixture.run_notify("h-e2e-live", owner_metadata(SESSION_A, &invocation_uuid));
     assert_success(&output);
     let value = stdout_json(&output);
+    if value["pty_delivery"]["status"] == "submission_uncertain" {
+        live_completion_diagnostic::retain(
+            &fixture,
+            &received_log,
+            &value,
+            &mut repl,
+            &child_identity,
+        );
+    }
     assert_eq!(value["pty_delivery"]["status"], "acked");
     assert_eq!(value["pty_delivery"]["submitted"], true);
     assert!(value["wake"].is_null());
@@ -1080,111 +1126,140 @@ fn production_plain_and_tui_confirmation_faults_remain_uncertain_after_provider_
 #[test]
 fn production_plain_and_tui_state_open_faults_reconcile_exact_evidence_once() {
     for observed_tui in [false, true] {
-        let fixture = Fixture::new();
-        let mode = if observed_tui { "tui" } else { "plain" };
-        let received_log = fixture
-            .dir
-            .path()
-            .join(format!("{mode}-state-open-fault-received.log"));
-        let barrier = fixture.dir.path().join(format!("{mode}-after-confirm"));
-        let held_state_path = fixture.dir.path().join(format!("{mode}-held-state.db"));
-        let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
-        fixture.write_interactive_model("fixture-state-open-fault", "fixture-provider", &script);
-        fixture.seed_active_chain(
-            "afafafaf-afaf-4faf-8faf-afafafafafaf",
-            "fixture-provider",
-            SESSION_A,
-            "fixture-state-open-fault",
-        );
-        let pty = OuterPty::open(30, 100);
-        let mut repl = spawn_repl_under_pty_mode_with_test_hooks(
-            &fixture,
-            &pty,
-            "fixture-state-open-fault",
-            SESSION_A,
-            observed_tui,
-            None,
-            Some(&barrier),
-        );
-        let startup = read_until(
-            pty.master.as_raw_fd(),
-            "READY_FOR_NOTIFY",
-            Duration::from_secs(5),
-        );
-        assert!(
-            startup.contains("READY_FOR_NOTIFY"),
-            "startup was {startup:?}"
-        );
-        let invocation_uuid = wait_for_running_invocation(&fixture);
-        fixture.associate_observed_completion_authority(&invocation_uuid);
-        let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
-
-        let state_path = fixture.state_path();
-        let (output, attempt_id) = thread::scope(|scope| {
-            let notify = scope.spawn(|| {
-                fixture.run_notify(
-                    "h-production-state-open-fault",
-                    owner_metadata(SESSION_A, &invocation_uuid),
-                )
-            });
-            wait_for_file_contains(&barrier.join("ready"), "ready", Duration::from_secs(5));
-            fs::rename(&state_path, &held_state_path).unwrap();
-            fs::create_dir(&state_path).unwrap();
-            fs::write(barrier.join("release"), "release").unwrap();
-            let output = notify.join().unwrap();
-            let received = wait_for_file_contains(
-                &received_log,
-                "[OULIPOLY-DELIVERY ",
-                Duration::from_secs(5),
-            );
-            let attempt_id = delivery_attempt_id(&received);
-            assert_delivered_with_pending_evidence(
-                &fixture,
-                "h-production-state-open-fault",
-                &attempt_id,
-            );
-            fs::remove_dir(&state_path).unwrap();
-            fs::rename(&held_state_path, &state_path).unwrap();
-            (output, attempt_id)
-        });
-
-        assert_success(&output);
-        let diagnostic = stdout_json(&output);
-        assert_eq!(diagnostic["pty_delivery"]["status"], "evidence_pending");
-        assert_eq!(diagnostic["pty_delivery"]["submitted"], true);
-        assert_eq!(diagnostic["pty_delivery"]["delivered_seqs"], json!([1]));
-        let provider_output =
-            read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
-        assert!(
-            provider_output.contains("GOT_NOTIFY"),
-            "output was {provider_output:?}"
-        );
-        assert!(repl.wait().unwrap().success());
-        let received = fs::read_to_string(&received_log).unwrap();
-        assert!(
-            fixture
-                .mailbox()
-                .pending_delivery_evidence_obligations(SESSION_A)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            state_delivery_evidence_counts(&fixture, &attempt_id),
-            (1, 1)
-        );
-        let replay = fixture.run_mailbox_status(SESSION_A);
-        assert_success(&replay);
-        assert_eq!(
-            state_delivery_evidence_counts(&fixture, &attempt_id),
-            (1, 1)
-        );
-        assert_eq!(
-            received
-                .matches(&format!("[OULIPOLY-DELIVERY {attempt_id}]"))
-                .count(),
-            1
-        );
+        state_open_fault_case(observed_tui, false, &mut None);
     }
+}
+
+fn state_open_fault_case(
+    observed_tui: bool,
+    readiness_failure: bool,
+    observed_processes: &mut Option<(u32, ProcessIdentity)>,
+) {
+    let fixture = Fixture::new();
+    let mode = if observed_tui { "tui" } else { "plain" };
+    let received_log = fixture
+        .dir
+        .path()
+        .join(format!("{mode}-state-open-fault-received.log"));
+    let barrier = fixture.dir.path().join(format!("{mode}-after-confirm"));
+    let held_state_path = fixture.dir.path().join(format!("{mode}-held-state.db"));
+    let lifetime = ProviderLifetime::new(fixture.dir.path());
+    let script = if readiness_failure {
+        // A directory cannot be written as the genuine ready file. No marker
+        // is fabricated; production hook failure must reach caller deadline.
+        fs::create_dir_all(barrier.join("ready")).unwrap();
+        fixture_provider_with_lifetime(fixture.dir.path(), &received_log, &lifetime)
+    } else {
+        fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log)
+    };
+    fixture.write_interactive_model("fixture-state-open-fault", "fixture-provider", &script);
+    fixture.seed_active_chain(
+        "afafafaf-afaf-4faf-8faf-afafafafafaf",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-state-open-fault",
+    );
+    let pty = OuterPty::open(30, 100);
+    let mut repl = SettlementChild::new(spawn_repl_under_pty_mode_with_test_hooks(
+        &fixture,
+        &pty,
+        "fixture-state-open-fault",
+        SESSION_A,
+        observed_tui,
+        None,
+        Some(&barrier),
+    ));
+    readiness_diagnostic(
+        mode,
+        json!({"event": "runner_spawned", "pid": repl.child.id()}),
+    );
+    let startup = read_until_diagnostic(
+        pty.master.as_raw_fd(),
+        "READY_FOR_NOTIFY",
+        Duration::from_secs(5),
+    );
+    assert!(
+        startup.contains("READY_FOR_NOTIFY"),
+        "startup marker absent (PTY output redacted)"
+    );
+    let invocation_uuid = wait_for_running_invocation(&fixture);
+    fixture.associate_observed_completion_authority(&invocation_uuid);
+    repl.provider = Some(wait_for_child_identity(&fixture, &invocation_uuid));
+    *observed_processes = Some((repl.child.id(), repl.provider.clone().unwrap()));
+    readiness_diagnostic(
+        mode,
+        json!({"event": "startup_observed", "invocation_uuid": invocation_uuid}),
+    );
+
+    let state_path = fixture.state_path();
+    let (output, attempt_id) = thread::scope(|scope| {
+        let notify = scope.spawn(|| {
+            fixture.run_notify_diagnostic(
+                "h-production-state-open-fault",
+                owner_metadata(SESSION_A, &invocation_uuid),
+                true,
+            )
+        });
+        if readiness_failure {
+            (&pty.slave)
+                .write_all(b"sensitive-deadline-output-sentinel\n")
+                .unwrap();
+        }
+        wait_for_ready_diagnostic(&barrier.join("ready"), pty.master.as_raw_fd(), &mut repl);
+        fs::rename(&state_path, &held_state_path).unwrap();
+        fs::create_dir(&state_path).unwrap();
+        fs::write(barrier.join("release"), "release").unwrap();
+        let output = notify.join().unwrap();
+        let received =
+            wait_for_file_contains(&received_log, "[OULIPOLY-DELIVERY ", Duration::from_secs(5));
+        let attempt_id = delivery_attempt_id(&received);
+        assert_delivered_with_pending_evidence(
+            &fixture,
+            "h-production-state-open-fault",
+            &attempt_id,
+        );
+        fs::remove_dir(&state_path).unwrap();
+        fs::rename(&held_state_path, &state_path).unwrap();
+        (output, attempt_id)
+    });
+
+    assert!(output.status.success(), "notify failed (output redacted)");
+    let diagnostic: Value =
+        serde_json::from_slice(&output.stdout).expect("notify JSON invalid (output redacted)");
+    assert_eq!(diagnostic["pty_delivery"]["status"], "evidence_pending");
+    assert_eq!(diagnostic["pty_delivery"]["submitted"], true);
+    assert_eq!(diagnostic["pty_delivery"]["delivered_seqs"], json!([1]));
+    let provider_output =
+        read_until_diagnostic(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
+    assert!(
+        provider_output.contains("GOT_NOTIFY"),
+        "provider notification marker absent (output redacted)"
+    );
+    assert!(repl.child.wait().unwrap().success());
+    let received = fs::read_to_string(&received_log).unwrap();
+    assert!(
+        fixture
+            .mailbox()
+            .pending_delivery_evidence_obligations(SESSION_A)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &attempt_id),
+        (1, 1)
+    );
+    let replay = fixture.run_mailbox_status(SESSION_A);
+    assert_success(&replay);
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &attempt_id),
+        (1, 1)
+    );
+    assert_eq!(
+        received
+            .matches(&format!("[OULIPOLY-DELIVERY {attempt_id}]"))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -1736,7 +1811,12 @@ fn live_broker_confirmation_contracts_overlapping_attempts() {
         "fixture-overlap",
     );
     let pty = OuterPty::open(30, 100);
-    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-overlap", SESSION_A);
+    let mut repl = SettlementChild::new(spawn_repl_under_pty(
+        &fixture,
+        &pty,
+        "fixture-overlap",
+        SESSION_A,
+    ));
     let startup = read_until(
         pty.master.as_raw_fd(),
         "READY_FOR_NOTIFY",
@@ -1814,7 +1894,7 @@ fn live_broker_confirmation_contracts_overlapping_attempts() {
         "user",
         "[OULIPOLY-DELIVERY overlap-attempt-2]",
     );
-    assert!(repl.wait().unwrap().success());
+    assert!(repl.child.wait().unwrap().success());
 
     let received = fs::read_to_string(&received_log).unwrap();
     for index in 1..=3 {
@@ -1925,7 +2005,9 @@ fn live_broker_rejects_attempt_resolved_before_socket_acceptance() {
 fn live_broker_contracts_registered_overlap_after_each_injection() {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("concurrent-overlap-received.log");
-    let script = fixture_provider_waiting_for_two_notifications(fixture.dir.path(), &received_log);
+    File::create(fixture.dir.path().join("stream-stages")).unwrap();
+    let mut lifetime = ProviderLifetime::new(fixture.dir.path());
+    let script = fixture_provider_with_lifetime(fixture.dir.path(), &received_log, &lifetime);
     fixture.write_interactive_model("fixture-concurrent-overlap", "fixture-provider", &script);
     fixture.seed_active_chain(
         "ffffffff-ffff-4fff-8fff-ffffffffffff",
@@ -1934,7 +2016,12 @@ fn live_broker_contracts_registered_overlap_after_each_injection() {
         "fixture-concurrent-overlap",
     );
     let pty = OuterPty::open(30, 100);
-    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-concurrent-overlap", SESSION_A);
+    let mut repl = SettlementChild::new(spawn_repl_under_pty(
+        &fixture,
+        &pty,
+        "fixture-concurrent-overlap",
+        SESSION_A,
+    ));
     let startup = read_until(
         pty.master.as_raw_fd(),
         "READY_FOR_NOTIFY",
@@ -1945,6 +2032,7 @@ fn live_broker_contracts_registered_overlap_after_each_injection() {
         "startup was {startup:?}"
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
+    repl.provider = Some(wait_for_child_identity(&fixture, &invocation_uuid));
     let control_path = running_control_path(&fixture);
     let rows = (1..=6)
         .map(|index| fixture.seed_mailbox(&format!("h-concurrent-overlap-{index}")))
@@ -2001,7 +2089,25 @@ fn live_broker_contracts_registered_overlap_after_each_injection() {
         .unwrap();
     assert!(second_window.acknowledged_at.is_some());
     assert!(second_window.resolved_at.is_some());
-    assert!(repl.wait().unwrap().success());
+    // Receipt is not settlement: keep observing input and own provider lifetime
+    // until both socket responses and the durable overlap assertions complete.
+    lifetime.probe(pty.master.as_raw_fd());
+    let fence = inject_control_envelope(&control_path, "PROVIDER_INPUT_FENCE\n").unwrap();
+    assert!(fence.ack, "{fence:?}");
+    read_pty_until_file_occurrences(
+        pty.master.as_raw_fd(),
+        &received_log,
+        "PROVIDER_INPUT_FENCE",
+        1,
+        Duration::from_secs(5),
+    );
+    repl.exit_observation = Some(ExitObservation::new(&fixture, &invocation_uuid));
+    lifetime.release();
+    assert!(
+        repl.wait_bounded(pty.master.as_raw_fd(), Duration::from_secs(5))
+            .unwrap()
+            .success()
+    );
 
     let received = fs::read_to_string(&received_log).unwrap();
     for index in 1..=6 {
@@ -2018,9 +2124,36 @@ fn live_broker_contracts_registered_overlap_after_each_injection() {
 
 #[test]
 fn live_broker_transport_ack_completes_delivery_when_response_is_unread() {
+    unread_response_settlement(false, false, false);
+}
+
+#[test]
+fn unread_response_confirmation_failure_is_uncertain_without_retransmission() {
+    unread_response_settlement(true, false, false);
+}
+
+#[test]
+fn accepted_settlement_retains_provider_through_held_retry() {
+    unread_response_settlement(false, true, false);
+}
+
+#[test]
+fn uncertain_settlement_retains_provider_through_held_retry() {
+    unread_response_settlement(true, true, false);
+}
+
+#[test]
+fn provider_input_observer_detects_extra_emission_after_unread_retry() {
+    for inject_failure in [false, true] {
+        unread_response_settlement(inject_failure, true, true);
+    }
+}
+
+fn unread_response_settlement(inject_failure: bool, held_retry: bool, extra_input: bool) {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("lost-ack-received.log");
-    let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
+    let mut lifetime = ProviderLifetime::new(fixture.dir.path());
+    let script = fixture_provider_with_lifetime(fixture.dir.path(), &received_log, &lifetime);
     fixture.write_interactive_model("fixture-lost-ack", "fixture-provider", &script);
     fixture.seed_active_chain(
         "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
@@ -2029,7 +2162,12 @@ fn live_broker_transport_ack_completes_delivery_when_response_is_unread() {
         "fixture-lost-ack",
     );
     let pty = OuterPty::open(30, 100);
-    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-lost-ack", SESSION_A);
+    let mut repl = SettlementChild::new(spawn_repl_under_pty(
+        &fixture,
+        &pty,
+        "fixture-lost-ack",
+        SESSION_A,
+    ));
     let startup = read_until(
         pty.master.as_raw_fd(),
         "READY_FOR_NOTIFY",
@@ -2040,7 +2178,18 @@ fn live_broker_transport_ack_completes_delivery_when_response_is_unread() {
         "startup was {startup:?}"
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
+    repl.provider = Some(wait_for_child_identity(&fixture, &invocation_uuid));
     let control_path = running_control_path(&fixture);
+    if inject_failure {
+        Connection::open(fixture.sidecar_path())
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_unread_confirmation
+             BEFORE UPDATE OF acknowledged_at ON mailbox_delivery_attempts
+             BEGIN SELECT RAISE(FAIL, 'injected unread confirmation failure'); END;",
+            )
+            .unwrap();
+    }
     let row = fixture.seed_mailbox("h-lost-ack");
     let mut mailbox = fixture.mailbox();
     mailbox
@@ -2062,40 +2211,830 @@ fn live_broker_transport_ack_completes_delivery_when_response_is_unread() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
     assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
-    // The TUI relays provider output independently of its control worker. The
-    // provider can echo the input before the worker commits confirmation. Wait
-    // for that exact broker ACK event without reading the disconnected peer or
-    // extending the original five-second observation budget. The trace is only
-    // synchronization: the unchanged DB assertions below prove delivery.
+    // Child receipt is not a commit barrier. The worker records this exact nonce's
+    // result after process_peer settles, before trying to write the dropped response.
+    let settlement = wait_for_settlement_trace(
+        &fixture.notify_trace_path(),
+        pty.master.as_raw_fd(),
+        &invocation_uuid,
+        "lost-ack-attempt",
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "{error}; attempt={:?}",
+            fixture
+                .mailbox()
+                .delivery_attempt_window("lost-ack-attempt")
+        )
+    });
+    eprintln!("unread response settlement: {settlement}");
+    if inject_failure {
+        assert_eq!(settlement, "delivery_submission_uncertain:lost-ack-attempt");
+        let mailbox = fixture.mailbox();
+        let rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivered_at.is_none());
+        assert!(rows[0].delivered_by_invocation_uuid.is_none());
+        assert_eq!(rows[0].delivery_attempts, 0);
+        let attempt = mailbox
+            .delivery_attempt_window("lost-ack-attempt")
+            .unwrap()
+            .unwrap();
+        assert!(attempt.submission_started_at.is_some());
+        assert!(attempt.acknowledged_at.is_none());
+        assert!(attempt.resolved_at.is_none());
+    } else {
+        assert_eq!(settlement, "delivery_ack:lost-ack-attempt");
+        let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivered_at.is_some());
+        assert_eq!(
+            rows[0].delivered_by_invocation_uuid.as_deref(),
+            Some(invocation_uuid.as_str())
+        );
+        assert_eq!(rows[0].delivery_attempts, 1);
+        let attempt = fixture
+            .mailbox()
+            .delivery_attempt_window("lost-ack-attempt")
+            .unwrap()
+            .unwrap();
+        assert!(attempt.acknowledged_at.is_some());
+        assert!(attempt.resolved_at.is_some());
+    }
+    // Exact replay retains the terminal outcome, without resubmission or a second count.
+    let retry = thread::scope(|scope| {
+        let (release, held) = std::sync::mpsc::channel();
+        let control_path = &control_path;
+        let envelope = &envelope;
+        let retry = scope.spawn(move || {
+            held.recv_timeout(Duration::from_secs(5)).unwrap();
+            inject_control_envelope(control_path, envelope).unwrap()
+        });
+        if held_retry {
+            // Settlement and durable assertions precede this independent gate.
+            // The provider must service a lifetime probe while retry is withheld.
+            lifetime.probe(pty.master.as_raw_fd());
+            assert!(!retry.is_finished(), "retry escaped its test-side gate");
+            assert!(repl.child.try_wait().unwrap().is_none());
+            eprintln!("settlement observed; retry held; provider lifetime probe completed");
+        }
+        release.send(()).unwrap();
+        retry.join().unwrap()
+    });
+    assert!(retry.ack, "{retry:?}");
+    assert_eq!(retry.message, settlement);
+    assert_eq!(
+        fixture.mailbox().list_mailbox(SESSION_A, true).unwrap()[0].delivery_attempts,
+        if inject_failure { 0 } else { 1 }
+    );
+    if extra_input {
+        // Same real broker/provider stream, deliberately without a delivery nonce:
+        // exercise the observation oracle, not production replay settlement.
+        let extra = inject_control_envelope(&control_path, "handle: h-lost-ack\n").unwrap();
+        assert!(extra.ack, "{extra:?}");
+    }
+    // Ordered through the same broker after the exact retry. Seeing this marker
+    // proves the provider read past retry bytes before FIFO-owned release.
+    let fence = inject_control_envelope(&control_path, "PROVIDER_INPUT_FENCE\n").unwrap();
+    assert!(fence.ack, "{fence:?}");
     read_pty_until_file_occurrences(
         pty.master.as_raw_fd(),
-        &fixture.notify_trace_path(),
-        "inject_status=delivery_ack:lost-ack-attempt",
+        &received_log,
+        "PROVIDER_INPUT_FENCE",
         1,
-        deadline.saturating_duration_since(Instant::now()),
+        Duration::from_secs(5),
     );
-    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].delivered_at.is_some());
-    assert_eq!(
-        rows[0].delivered_by_invocation_uuid.as_deref(),
-        Some(invocation_uuid.as_str())
+    lifetime.release();
+    assert!(
+        repl.wait_bounded(pty.master.as_raw_fd(), Duration::from_secs(5))
+            .unwrap()
+            .success()
     );
-    assert_eq!(rows[0].delivery_attempts, 1);
-    let attempt = fixture
-        .mailbox()
-        .delivery_attempt_window("lost-ack-attempt")
-        .unwrap()
-        .unwrap();
-    assert!(attempt.acknowledged_at.is_some());
-    assert!(attempt.resolved_at.is_some());
-    assert!(repl.wait().unwrap().success());
     assert!(
         fs::read_to_string(&received_log)
             .unwrap()
             .contains("handle: h-lost-ack")
     );
+    let count = fs::read_to_string(&received_log)
+        .unwrap()
+        .matches("handle: h-lost-ack")
+        .count();
+    assert_eq!(count, if extra_input { 2 } else { 1 });
+    if extra_input {
+        assert_ne!(
+            count, 1,
+            "once-only oracle missed the deliberate extra emission"
+        );
+    }
     fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn settlement_trace_requires_exact_complete_result_and_distinguishes_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trace");
+    let pty = OuterPty::open(30, 100);
+    let record = |session: &str, owner: &str, status: &str| {
+        format!(
+            "trigger=pty-control session_id={session} invocation_uuid={owner} inject_status={status}\n"
+        )
+    };
+    for ignored in [
+        record(SESSION_A, "stale-owner", "delivery_ack:exact"),
+        record("wrong-session", INVOCATION_A, "delivery_ack:exact"),
+        record(SESSION_A, INVOCATION_A, "delivery_ack:stale"),
+        record(SESSION_A, INVOCATION_A, "delivery_ack:exact")
+            .trim_end()
+            .to_string(),
+    ] {
+        fs::write(&path, &ignored).unwrap();
+        let error = wait_for_settlement_trace(
+            &path,
+            pty.master.as_raw_fd(),
+            INVOCATION_A,
+            "exact",
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("settlement timeout"), "{error}");
+    }
+    for status in ["delivery_ack:exact", "delivery_submission_uncertain:exact"] {
+        fs::write(&path, record(SESSION_A, INVOCATION_A, status)).unwrap();
+        assert_eq!(
+            wait_for_settlement_trace(
+                &path,
+                pty.master.as_raw_fd(),
+                INVOCATION_A,
+                "exact",
+                Duration::ZERO,
+            )
+            .unwrap(),
+            status
+        );
+    }
+}
+
+// This child intentionally fails its libtest node after observing the genuine
+// caller unwind. Parent retains the failing transcript, never calls it ready.
+#[cfg(target_os = "linux")]
+#[test]
+fn readiness_deadline_unwinds_actual_scoped_caller_and_owned_processes() {
+    const OBSERVER: &str = "PTY_READINESS_OBSERVER";
+    if let Some(mode) = std::env::var_os(OBSERVER) {
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let mut processes = None;
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state_open_fault_case(mode == "tui", true, &mut processes);
+        }))
+        .expect_err("missing readiness unexpectedly succeeded");
+        let message = failure
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| failure.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(
+            message,
+            Some("post_confirm readiness deadline (details redacted)")
+        );
+        let (runner, provider) = processes.expect("caller did not observe owned processes");
+        let _fallback = CleanupProviderFallback(Some(provider.clone()));
+        assert_eq!(
+            unsafe { libc::waitpid(runner as i32, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(
+            read_live_process_identity(i64::from(runner))
+                .unwrap()
+                .is_none()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut status = 0;
+            let waited =
+                unsafe { libc::waitpid(provider.os_pid as i32, &mut status, libc::WNOHANG) };
+            if waited == provider.os_pid as i32 {
+                assert!(libc::WIFSIGNALED(status));
+                assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+                break;
+            }
+            if waited == -1 {
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+                break;
+            }
+            assert_eq!(waited, 0);
+            assert!(Instant::now() < deadline, "provider survived caller unwind");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            read_live_process_identity(provider.os_pid)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(unsafe { libc::kill(-(provider.os_pid as i32), 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        eprintln!("readiness caller cleanup: runner_reaped=ECHILD provider_group_absent=ESRCH");
+        std::panic::resume_unwind(failure);
+    }
+    for mode in ["plain", "tui"] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "readiness_deadline_unwinds_actual_scoped_caller_and_owned_processes",
+                "--nocapture",
+            ])
+            .env(OBSERVER, mode)
+            .env("TERM", "xterm-256color");
+        // Observer budget covers startup + unchanged 5s readiness failure +
+        // cleanup; it does not change the readiness deadline or success oracle.
+        let output = bounded_diagnostic_output(command, Duration::from_secs(20));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "readiness observer {mode}: status={} stdout follows",
+            output.status
+        );
+        io::stderr().write_all(&output.stdout).unwrap();
+        eprintln!("readiness observer {mode}: stderr follows");
+        io::stderr().write_all(&output.stderr).unwrap();
+        assert!(
+            !output.status.success(),
+            "genuine deadline failure was lost"
+        );
+        assert!(stderr.contains("post_confirm readiness deadline (details redacted)"));
+        assert!(stderr.contains("\"event\":\"deadline\""));
+        assert!(stderr.contains("\"readiness_diagnostic\":\"deadline_pty\""));
+        assert!(!stderr.contains("\"event\":\"ready_observed\""));
+        assert!(!stderr.contains("sensitive-deadline-output-sentinel"));
+        let diagnostics: Vec<Value> = stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|record| record.get("readiness_diagnostic").is_some())
+            .collect();
+        let drained: u64 = diagnostics
+            .iter()
+            .filter(|record| record["readiness_diagnostic"] == "deadline_pty")
+            .filter_map(|record| record["byte_count"].as_u64())
+            .sum();
+        assert!(drained > 0 && drained <= DIAGNOSTIC_CAPTURE_LIMIT as u64);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|record| record.to_string().len() < DIAGNOSTIC_RECORD_LIMIT)
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .map(|record| record.to_string().len() + 1)
+                .sum::<usize>()
+                <= DIAGNOSTIC_TOTAL_LIMIT
+        );
+        assert!(stderr.contains("runner_reaped=ECHILD provider_group_absent=ESRCH"));
+        assert!(!stderr.contains("fallback invoked"));
+    }
+}
+
+// Linux subreaping is confined to a fresh test subprocess, never the parallel
+// test harness. It lets the observer reap the orphaned provider and distinguish
+// provider death from runner reaping (and from a still-existing zombie group).
+#[cfg(target_os = "linux")]
+#[test]
+fn settlement_child_cleanup_reaps_on_panic_and_timeout() {
+    const OBSERVER: &str = "AGE348_CLEANUP_OBSERVER";
+    if std::env::var_os(OBSERVER).is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "settlement_child_cleanup_reaps_on_panic_and_timeout",
+                "--nocapture",
+            ])
+            .env(OBSERVER, "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated cleanup observer failed: {status}"
+        );
+        return;
+    }
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+    for recorded in [false, true] {
+        for panic_after_spawn in [false, true] {
+            observe_settlement_tree_cleanup(recorded, panic_after_spawn, false);
+            observe_settlement_tree_cleanup(recorded, panic_after_spawn, true);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_settlement_tree_cleanup(recorded: bool, panic_after_spawn: bool, held_lifetime: bool) {
+    let fixture = Fixture::new();
+    let script = fixture.dir.path().join("cleanup-provider.sh");
+    let identity_path = fixture.dir.path().join("cleanup-provider.pid");
+    let mut lifetime = ProviderLifetime::new(fixture.dir.path());
+    let barrier = if held_lifetime {
+        lifetime.provider_loop()
+    } else {
+        "IFS= read -r -t 30 line\nexit 91".to_owned()
+    };
+    // Only Bash builtins: no independent timer or unrelated process to kill.
+    // read is a fixture barrier, not a successful lifetime-based assertion. Its
+    // 30s backstop bounds escape even if startup/observer assertions fail.
+    fs::write(
+        &script,
+        format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+test -t 0 && test -t 1 && test -t 2
+printf '%s\n' "$$" > {identity}
+printf 'CLEANUP_PROVIDER_BLOCKED\n'
+{barrier}
+"#,
+            identity = shell_single_quote(&path_string(&identity_path)),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.write_interactive_model("fixture-cleanup", "fixture-provider", &script);
+    fixture.seed_active_chain(
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-cleanup",
+    );
+    let pty = OuterPty::open(30, 100);
+    // Declared first so setup unwinding drops/reaps the runner before fallback.
+    let mut fallback = CleanupProviderFallback(None);
+    let mut guard = SettlementChild::new(spawn_repl_under_pty(
+        &fixture,
+        &pty,
+        "fixture-cleanup",
+        SESSION_A,
+    ));
+    let runner_pid = guard.child.id() as i32;
+    let runner_identity = read_live_process_identity(i64::from(runner_pid))
+        .unwrap()
+        .unwrap();
+    let startup = read_until(
+        pty.master.as_raw_fd(),
+        "CLEANUP_PROVIDER_BLOCKED",
+        Duration::from_secs(5),
+    );
+    assert!(startup.contains("CLEANUP_PROVIDER_BLOCKED"), "{startup:?}");
+    if held_lifetime {
+        lifetime.probe(pty.master.as_raw_fd());
+    }
+    let provider_pid: i64 = fs::read_to_string(identity_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let identity = read_live_process_identity(provider_pid).unwrap().unwrap();
+    // An observer-owned fallback is not invoked until AFTER all death assertions;
+    // it cannot manufacture success for a leaking guard.
+    fallback.0 = Some(identity.clone());
+    assert_ne!(provider_pid, i64::from(runner_pid));
+    assert_eq!(
+        unsafe { libc::getpgid(provider_pid as i32) },
+        provider_pid as i32
+    );
+    assert_eq!(unsafe { libc::kill(-(provider_pid as i32), 0) }, 0);
+    assert!(guard.child.try_wait().unwrap().is_none());
+    if recorded {
+        let invocation = wait_for_running_invocation(&fixture);
+        let stored = wait_for_child_identity(&fixture, &invocation);
+        assert_eq!(stored, identity);
+        guard.provider = Some(stored);
+    } else {
+        // Provider is demonstrably live, but the guard has not learned its PID.
+        // Only PTY closure can terminate it in this case.
+        assert!(guard.provider.is_none());
+    }
+    eprintln!(
+        "cleanup before: lifetime_outstanding={held_lifetime} recorded={recorded} panic={panic_after_spawn} runner={runner_identity:?} provider={identity:?} group_live=true"
+    );
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut guard = guard;
+        if panic_after_spawn {
+            panic!("injected actual-runner settlement assertion panic");
+        }
+        assert_eq!(
+            guard
+                .wait_bounded(pty.master.as_raw_fd(), Duration::from_millis(50))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut,
+        );
+    }));
+    assert_eq!(result.is_err(), panic_after_spawn);
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(runner_pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    assert!(
+        read_live_process_identity(i64::from(runner_pid))
+            .unwrap()
+            .is_none()
+    );
+    // Subreaper custody is observation only: no signal before this wait. A live
+    // provider yields zero until the deadline and fails, even if runner was reaped.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let provider_status = loop {
+        let waited = unsafe { libc::waitpid(provider_pid as i32, &mut status, libc::WNOHANG) };
+        if waited == provider_pid as i32 {
+            break Some(status);
+        }
+        if waited == -1 {
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            // The runner may win the reap race before its own SIGKILL. Absence
+            // checks below still independently prove provider/group termination.
+            break None;
+        }
+        assert_eq!(waited, 0);
+        assert!(
+            Instant::now() < deadline,
+            "runner reaped but provider survived: {identity:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    if let Some(status) = provider_status {
+        assert!(
+            libc::WIFSIGNALED(status),
+            "provider exited without cleanup signal: {status}"
+        );
+        assert_eq!(
+            libc::WTERMSIG(status),
+            if recorded {
+                libc::SIGKILL
+            } else {
+                libc::SIGHUP
+            }
+        );
+    }
+    assert!(read_live_process_identity(provider_pid).unwrap().is_none());
+    assert_eq!(unsafe { libc::kill(-(provider_pid as i32), 0) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    eprintln!(
+        "cleanup after: lifetime_outstanding={held_lifetime} recorded={recorded} panic={panic_after_spawn} runner_reaped=ECHILD provider={provider_pid} observer_wait_status={provider_status:?} group_absent=ESRCH"
+    );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[cfg(target_os = "linux")]
+struct CleanupProviderFallback(Option<ProcessIdentity>);
+
+#[cfg(target_os = "linux")]
+impl Drop for CleanupProviderFallback {
+    fn drop(&mut self) {
+        let Some(identity) = &self.0 else { return };
+        if read_live_process_identity(identity.os_pid)
+            .ok()
+            .flatten()
+            .as_ref()
+            != Some(identity)
+        {
+            return;
+        }
+        eprintln!("cleanup observer fallback invoked after failed assertions: {identity:?}");
+        unsafe {
+            libc::kill(-(identity.os_pid as i32), libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let mut status = 0;
+            let waited =
+                unsafe { libc::waitpid(identity.os_pid as i32, &mut status, libc::WNOHANG) };
+            if waited != 0 || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+// This guard is installed immediately after spawn, before any fallible assertion.
+// Killing the runner closes the provider PTY (SIGHUP); once recorded, also fence
+// explicit provider cleanup by its OS identity. Reap our child even on unwind.
+struct SettlementChild {
+    child: Child,
+    provider: Option<ProcessIdentity>,
+    exit_observation: Option<ExitObservation>,
+}
+
+impl SettlementChild {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            provider: None,
+            exit_observation: None,
+        }
+    }
+
+    fn wait_bounded(
+        &mut self,
+        fd: RawFd,
+        timeout: Duration,
+    ) -> io::Result<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        let result = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Err(error) => break Err(error),
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                break Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fixture runner exit timed out",
+                ));
+            }
+            if let Some(observation) = &mut self.exit_observation {
+                observation.sample_provider(self.provider.as_ref());
+            }
+            if let Err(error) = drain_exit_output(fd, deadline, self.exit_observation.as_mut()) {
+                break Err(error);
+            }
+        };
+        // This is before guard teardown. Later cleanup cannot establish earlier state.
+        if let Some(observation) = &mut self.exit_observation {
+            observation.finish(&result, self.provider.as_ref());
+        }
+        result
+    }
+}
+
+impl Drop for SettlementChild {
+    fn drop(&mut self) {
+        if let Some(identity) = &self.provider
+            && read_live_process_identity(identity.os_pid)
+                .ok()
+                .flatten()
+                .as_ref()
+                == Some(identity)
+        {
+            unsafe {
+                libc::kill(-(identity.os_pid as i32), libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn drain_settlement_output(fd: RawFd, deadline: Instant) -> io::Result<()> {
+    drain_exit_output(fd, deadline, None)
+}
+
+fn drain_exit_output(
+    fd: RawFd,
+    deadline: Instant,
+    observation: Option<&mut ExitObservation>,
+) -> io::Result<()> {
+    // Same cadence, read size and deadline; observation is never a success condition.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if poll_readable(fd, remaining.min(Duration::from_millis(20)))? {
+        let mut buffer = [0; 4096];
+        match read_fd(fd, &mut buffer) {
+            Ok(n) => {
+                if let Some(observation) = observation {
+                    observation.output.observe(&buffer[..n]);
+                }
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+// Only counts and fixed-marker match progress survive a read. No PTY payload,
+// path, invocation, environment or arbitrary string is serialized by this observer.
+#[derive(Default)]
+struct ExitOutput {
+    bytes: usize,
+    reads: usize,
+    matched: usize,
+    released: bool,
+}
+
+impl ExitOutput {
+    fn observe(&mut self, bytes: &[u8]) {
+        const MARKER: &[u8] = b"PROVIDER_INPUT_RELEASED";
+        self.bytes = self
+            .bytes
+            .saturating_add(bytes.len())
+            .min(DIAGNOSTIC_CAPTURE_LIMIT);
+        self.reads = self.reads.saturating_add(1).min(DIAGNOSTIC_CAPTURE_LIMIT);
+        for &byte in bytes {
+            if byte == MARKER[self.matched] {
+                self.matched += 1;
+            } else {
+                self.matched = usize::from(byte == MARKER[0]);
+            }
+            if self.matched == MARKER.len() {
+                self.released = true;
+                self.matched = 0;
+            }
+        }
+    }
+}
+
+struct ExitObservation {
+    started: Instant,
+    stages: PathBuf,
+    state: PathBuf,
+    sidecar: PathBuf,
+    invocation: String,
+    provider_absent_ms: Option<u64>,
+    output: ExitOutput,
+}
+
+impl ExitObservation {
+    fn new(fixture: &Fixture, invocation: &str) -> Self {
+        Self {
+            started: Instant::now(),
+            stages: fixture.dir.path().join("stream-stages"),
+            state: fixture.state_path(),
+            sidecar: fixture.sidecar_path(),
+            invocation: invocation.to_owned(),
+            provider_absent_ms: None,
+            output: ExitOutput::default(),
+        }
+    }
+
+    fn sample_provider(&mut self, provider: Option<&ProcessIdentity>) {
+        if self.provider_absent_ms.is_none()
+            && let Some(identity) = provider
+            && let Ok(current) = read_live_process_identity(identity.os_pid)
+            && current.as_ref() != Some(identity)
+        {
+            self.provider_absent_ms = Some(self.started.elapsed().as_millis() as u64);
+        }
+    }
+
+    fn finish(
+        &mut self,
+        result: &io::Result<std::process::ExitStatus>,
+        provider: Option<&ProcessIdentity>,
+    ) {
+        self.sample_provider(provider);
+        readiness_diagnostic(
+            "exit_wait",
+            json!({
+                "event": if result.is_ok() { "exit" } else if result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::TimedOut) { "deadline" } else { "read_error" },
+                "success": result.as_ref().is_ok_and(|status| status.success()),
+                "byte_count": self.output.bytes, "read_count": self.output.reads,
+                "elapsed_ms": self.started.elapsed().as_millis() as u64,
+                "provider_absent_ms": self.provider_absent_ms,
+                "released_marker": self.output.released,
+                "timed_out": result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::TimedOut),
+            }),
+        );
+        self.emit_provider_stages();
+        self.emit_durable_stages();
+    }
+
+    fn emit_provider_stages(&self) {
+        let mut bytes = Vec::new();
+        let available = File::open(&self.stages)
+            .and_then(|file| file.take(1025).read_to_end(&mut bytes))
+            .is_ok();
+        readiness_diagnostic(
+            "provider_exit",
+            json!({"success": available && bytes.len() <= 1024}),
+        );
+        if !available || bytes.len() > 1024 {
+            return;
+        }
+        for line in bytes.split_inclusive(|byte| *byte == b'\n').take(4) {
+            if !line.ends_with(b"\n") {
+                continue;
+            }
+            let Ok(line) = std::str::from_utf8(line) else {
+                continue;
+            };
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() != 3 {
+                continue;
+            }
+            if let (Ok(stage @ 1..=4), Ok(elapsed), Ok(count)) = (
+                fields[0].parse::<u64>(),
+                fields[1].parse::<u64>(),
+                fields[2].parse::<u64>(),
+            ) {
+                readiness_diagnostic(
+                    "provider_exit",
+                    json!({
+                        "stage_code": stage, "elapsed_ms": elapsed, "byte_count": count,
+                    }),
+                );
+            }
+        }
+    }
+
+    fn emit_durable_stages(&self) {
+        // Existing durable hooks, not a new production stage or a writable DB open.
+        // One zero-busy-timeout query per database; no retry or manufactured state.
+        for (path, sql, stage) in [
+            (
+                &self.sidecar,
+                "SELECT CASE lifecycle_state WHEN 'starting' THEN 1 WHEN 'running' THEN 2 WHEN 'draining' THEN 3 WHEN 'exited' THEN CASE WHEN terminal_reason = 'orderly_completion' THEN 4 ELSE 5 END ELSE 0 END FROM runtime_generation WHERE spawn_invocation_uuid = ?1",
+                "generation_exit",
+            ),
+            (
+                &self.state,
+                "SELECT CASE WHEN finished_at IS NULL THEN 1 WHEN success = 1 THEN 2 ELSE 3 END FROM invocations WHERE invocation_uuid = ?1",
+                "invocation_exit",
+            ),
+        ] {
+            let value =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .and_then(|connection| {
+                        connection.busy_timeout(Duration::ZERO)?;
+                        connection.query_row(sql, [&self.invocation], |row| row.get::<_, u32>(0))
+                    });
+            readiness_diagnostic(
+                stage,
+                json!({"success": value.is_ok(), "stage_code": value.ok()}),
+            );
+        }
+    }
+}
+
+#[test]
+fn exit_observation_redacts_stream_and_bounds_counts() {
+    let mut output = ExitOutput::default();
+    output.observe(b"private-token PROVIDER_INPUT_");
+    output.observe(b"RELEASED secret-argv");
+    assert!(output.released);
+    for _ in 0..100 {
+        output.observe(&[b'x'; 4096]);
+    }
+    assert_eq!(output.bytes, DIAGNOSTIC_CAPTURE_LIMIT);
+    let value = safe_readiness_record(
+        "exit_wait",
+        &json!({
+            "byte_count": u64::MAX, "elapsed_ms": u64::MAX,
+            "released_marker": true, "payload": "private-token", "event": "secret-argv",
+        }),
+    );
+    assert_eq!(value["byte_count"], DIAGNOSTIC_CAPTURE_LIMIT);
+    assert_eq!(value["elapsed_ms"], DIAGNOSTIC_CAPTURE_LIMIT);
+    assert_eq!(value["released_marker"], true);
+    let encoded = value.to_string();
+    assert!(!encoded.contains("private-token") && !encoded.contains("secret-argv"));
+    assert!(encoded.len() < DIAGNOSTIC_RECORD_LIMIT);
+}
+
+fn wait_for_settlement_trace(
+    path: &Path,
+    fd: RawFd,
+    invocation: &str,
+    attempt: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let trace = fs::read_to_string(path).unwrap_or_default();
+        // Ignore an incomplete append and unrelated sessions/nonces. The fixture
+        // supplies one request; accepted and uncertain are distinct terminal results.
+        for line in trace
+            .split_inclusive('\n')
+            .filter(|line| line.ends_with('\n'))
+        {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if !fields.contains(&"trigger=pty-control")
+                || !fields.contains(&format!("invocation_uuid={invocation}").as_str())
+                || !fields.contains(&format!("session_id={SESSION_A}").as_str())
+            {
+                continue;
+            }
+            for prefix in ["delivery_ack:", "delivery_submission_uncertain:"] {
+                let status = format!("{prefix}{attempt}");
+                if fields.contains(&format!("inject_status={status}").as_str()) {
+                    return Ok(status);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("settlement timeout for {attempt}; trace={trace:?}"));
+        }
+        drain_settlement_output(fd, deadline).map_err(|error| error.to_string())?;
+    }
 }
 
 fn spawn_control_server(
@@ -2279,6 +3218,89 @@ fn spawn_repl_under_pty_mode_with_test_hooks(
 }
 
 fn fixture_provider_waiting_for_notification(dir: &Path, received_log: &Path) -> PathBuf {
+    fixture_notification_provider(dir, received_log, "sleep 1\n    exit 0")
+}
+
+// The test owns the write end before spawn. No elapsed interval releases it.
+// SettlementChild owns process teardown on unwind, including blocked FIFO reads.
+struct ProviderLifetime {
+    path: PathBuf,
+    control: File,
+}
+
+impl ProviderLifetime {
+    fn new(dir: &Path) -> Self {
+        let path = dir.join("provider-lifetime");
+        let name = std::ffi::CString::new(path_string(&path)).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let control = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        Self { path, control }
+    }
+
+    fn provider_loop(&self) -> String {
+        format!(
+            r#"while IFS= read -r command; do
+  case "$command" in
+    probe:*) printf '%s' "${{command#probe:}}" > {} ; printf 'PROVIDER_LIFETIME_HELD\n' ;;
+    release) exit 0 ;;
+    *) exit 92 ;;
+  esac
+done < {}
+exit 93"#,
+            shell_single_quote(&path_string(&self.path.with_extension("probe"))),
+            shell_single_quote(&path_string(&self.path))
+        )
+    }
+
+    fn probe(&mut self, fd: RawFd) {
+        // Differential TUI paint can reuse unchanged cells inside the marker.
+        // Only the provider consuming this fresh FIFO challenge may acknowledge it.
+        let nonce = uuid::Uuid::new_v4().to_string();
+        writeln!(self.control, "probe:{nonce}").unwrap();
+        let response = read_pty_until_file_occurrences(
+            fd,
+            &self.path.with_extension("probe"),
+            &nonce,
+            1,
+            Duration::from_secs(5),
+        );
+        assert_eq!(response, nonce);
+    }
+
+    fn release(&mut self) {
+        self.control.write_all(b"release\n").unwrap();
+    }
+}
+
+fn fixture_provider_with_lifetime(
+    dir: &Path,
+    received_log: &Path,
+    lifetime: &ProviderLifetime,
+) -> PathBuf {
+    let observer = dir.join("notification_stream.py");
+    fs::write(&observer, include_str!("fixtures/notification_stream.py")).unwrap();
+    let script = dir.join("fixture-stream-provider.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nexec /usr/bin/python3 {} {} {} {}\n",
+            shell_single_quote(&path_string(&observer)),
+            shell_single_quote(&path_string(received_log)),
+            shell_single_quote(&path_string(&observed_completion_authority_path(dir))),
+            shell_single_quote(&path_string(&lifetime.path)),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+fn fixture_notification_provider(dir: &Path, received_log: &Path, completion: &str) -> PathBuf {
     let path = dir.join("fixture-live-provider.sh");
     let authority = observed_completion_authority_path(dir);
     fs::write(
@@ -2298,8 +3320,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> {received}
   if [ "$line" = "[END OULIPOLY NOTIFICATIONS]" ]; then
     printf 'GOT_NOTIFY\n'
-    sleep 1
-    exit 0
+    {completion}
   fi
 done
 "#,
@@ -2410,6 +3431,10 @@ fn wait_for_file_contains(path: &Path, expected: &str, timeout: Duration) -> Str
 }
 
 fn read_until(fd: RawFd, needle: &str, timeout: Duration) -> String {
+    read_until_observed(fd, needle, timeout, false)
+}
+
+fn read_until_observed(fd: RawFd, needle: &str, timeout: Duration, diagnostic: bool) -> String {
     let start = Instant::now();
     let mut output = Vec::new();
     let mut buffer = [0_u8; 4096];
@@ -2419,6 +3444,13 @@ fn read_until(fd: RawFd, needle: &str, timeout: Duration) -> String {
             if n == 0 {
                 break;
             }
+            if diagnostic {
+                readiness_diagnostic("pty_read", json!({"byte_count": n}));
+            }
+            assert!(
+                !diagnostic || output.len() + n <= DIAGNOSTIC_CAPTURE_LIMIT,
+                "diagnostic PTY capture limit exceeded (output redacted)"
+            );
             output.extend_from_slice(&buffer[..n]);
             let rendered = String::from_utf8_lossy(&output);
             if rendered.contains(needle) {
@@ -2671,4 +3703,372 @@ fn toml_string(value: &str) -> String {
 
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+// Closed projection: arbitrary strings, arrays, argv, environment, paths and
+// provider output never cross this sink. No hashing/encoding of authority values.
+const DIAGNOSTIC_CAPTURE_LIMIT: usize = 65_536;
+const DIAGNOSTIC_RECORD_LIMIT: usize = 512;
+const DIAGNOSTIC_TOTAL_LIMIT: usize = 262_144;
+static DIAGNOSTIC_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn safe_readiness_record(stage: &str, value: &Value) -> Value {
+    let stage = match stage {
+        "registration" | "notify" | "plain" | "tui" | "pty_read" | "post_confirm"
+        | "deadline_pty" | "exit_wait" | "provider_exit" | "generation_exit"
+        | "invocation_exit" | "live_notify" | "live_receipt" | "live_runner" | "live_provider"
+        | "live_attempt" => stage,
+        _ => "other",
+    };
+    let event = value["event"]
+        .as_str()
+        .filter(|event| {
+            matches!(
+                *event,
+                "launch"
+                    | "exit"
+                    | "runner_spawned"
+                    | "startup_observed"
+                    | "ready_observed"
+                    | "deadline"
+                    | "read_error"
+            )
+        })
+        .unwrap_or("observation");
+    let mut safe = json!({"readiness_diagnostic": stage, "event": event,
+        "details": "redacted", "retention": "best_effort_process_budget"});
+    for key in [
+        "arg_count",
+        "env_count",
+        "stdout_len",
+        "stderr_len",
+        "byte_count",
+        "read_count",
+        "elapsed_ms",
+        "provider_absent_ms",
+        "stage_code",
+        "os_error",
+        "exit_code",
+        "signal",
+    ] {
+        if let Some(count) = value[key].as_u64() {
+            safe[key] = json!(count.min(DIAGNOSTIC_CAPTURE_LIMIT as u64));
+        }
+    }
+    for key in [
+        "success",
+        "released_marker",
+        "timed_out",
+        "submitted",
+        "wake_absent",
+        "submission_started",
+        "acknowledged",
+        "resolved",
+        "complete_capture",
+        "notification_marker",
+        "handle_marker",
+        "exact_attempt_marker",
+    ] {
+        if let Some(flag) = value[key].as_bool() {
+            safe[key] = json!(flag);
+        }
+    }
+    safe
+}
+
+fn readiness_diagnostic(stage: &str, value: Value) {
+    let record = safe_readiness_record(stage, &value);
+    let _ = write_readiness_record(Path::new("/dev/stderr"), &record);
+}
+
+// Per-process aggregate budget includes failed writes. At most one 512-byte
+// serialized record per write attempt. Independent O_NONBLOCK descriptor; no retries on
+// full/closed sinks. Regular-file I/O is still subject to host filesystem stalls.
+fn write_readiness_record(path: &Path, record: &Value) -> io::Result<()> {
+    write_readiness_record_with_budget(path, record, &DIAGNOSTIC_BYTES)
+}
+
+fn write_readiness_record_with_budget(
+    path: &Path,
+    record: &Value,
+    budget: &std::sync::atomic::AtomicUsize,
+) -> io::Result<()> {
+    let safe = safe_readiness_record(
+        record["readiness_diagnostic"].as_str().unwrap_or("other"),
+        record,
+    );
+    let bytes = format!("{safe}\n");
+    assert!(bytes.len() <= DIAGNOSTIC_RECORD_LIMIT);
+    if budget
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |used| {
+                used.checked_add(bytes.len())
+                    .filter(|total| *total <= DIAGNOSTIC_TOTAL_LIMIT)
+            },
+        )
+        .is_err()
+    {
+        return Err(io::Error::other("diagnostic retention budget exhausted"));
+    }
+    let mut sink = fs::OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    sink.write_all(bytes.as_bytes())
+}
+
+fn capture_diagnostic_chunk(reader: &mut impl Read, bytes: &mut Vec<u8>) -> bool {
+    let mut buffer = [0; 4096];
+    match reader.read(&mut buffer) {
+        Ok(0) => true,
+        Ok(n) => {
+            assert!(
+                bytes.len() + n <= DIAGNOSTIC_CAPTURE_LIMIT,
+                "diagnostic command capture limit exceeded (output redacted)"
+            );
+            bytes.extend_from_slice(&buffer[..n]);
+            false
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
+        Err(_) => panic!("diagnostic command read failed (detail redacted)"),
+    }
+}
+
+fn bounded_diagnostic_output(mut cmd: Command, timeout: Duration) -> Output {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut guard = SettlementChild::new(cmd.spawn().expect("diagnostic command spawn failed"));
+    let mut stdout = guard.child.stdout.take().unwrap();
+    let mut stderr = guard.child.stderr.take().unwrap();
+    for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+    }
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out_done = capture_diagnostic_chunk(&mut stdout, &mut output);
+        let err_done = capture_diagnostic_chunk(&mut stderr, &mut errors);
+        if out_done
+            && err_done
+            && let Some(status) = guard.child.try_wait().unwrap()
+        {
+            return Output {
+                status,
+                stdout: output,
+                stderr: errors,
+            };
+        }
+        assert!(
+            Instant::now() < deadline,
+            "diagnostic command deadline (output redacted)"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn bounded_ready_marker(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut bytes = [0; 64];
+    let Ok(length) = file.take(64).read(&mut bytes) else {
+        return false;
+    };
+    bytes[..length].windows(5).any(|window| window == b"ready")
+}
+
+fn wait_for_ready_diagnostic(path: &Path, fd: RawFd, repl: &mut SettlementChild) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if bounded_ready_marker(path) {
+            readiness_diagnostic("post_confirm", json!({"event": "ready_observed"}));
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    // Drain ONLY after the unchanged deadline has failed, so successful-path
+    // assertions keep all their bytes. Zero-wait poll plus byte/iteration cap.
+    let _ = repl.child.try_wait();
+    readiness_diagnostic("post_confirm", json!({"event": "deadline"}));
+    for _ in 0..16 {
+        if !poll_readable(fd, Duration::ZERO).unwrap_or(false) {
+            break;
+        }
+        let mut bytes = [0_u8; 4096];
+        match read_fd(fd, &mut bytes) {
+            Ok(0) => break,
+            Ok(n) => readiness_diagnostic("deadline_pty", json!({"byte_count": n})),
+            Err(_) => {
+                readiness_diagnostic("deadline_pty", json!({"event": "read_error"}));
+                break;
+            }
+        }
+    }
+    panic!("post_confirm readiness deadline (details redacted)");
+}
+
+fn read_until_diagnostic(fd: RawFd, needle: &str, timeout: Duration) -> String {
+    read_until_observed(fd, needle, timeout, true)
+}
+
+#[test]
+fn readiness_diagnostic_launch_env_and_output_never_emit_raw_values() {
+    const OBSERVER: &str = "PTY_DIAGNOSTIC_OBSERVER";
+    const SENTINEL: &str = "diagnostic-sensitive-value-sentinel";
+    if std::env::var_os(OBSERVER).is_some() {
+        let fixture = Fixture::new();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf '%s' \"$1\"; printf '%s' \"$PRIVATE_VALUE\" >&2",
+                "fixture",
+                SENTINEL,
+            ])
+            .env("PRIVATE_VALUE", SENTINEL)
+            .env(COMPLETION_REGISTRATION_AUTHORITY_ENV, SENTINEL);
+        let output = fixture.run_diagnostic(command, Some("registration"));
+        assert!(output.status.success());
+        assert!(output.stdout == SENTINEL.as_bytes());
+        assert!(output.stderr == SENTINEL.as_bytes());
+        return;
+    }
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "readiness_diagnostic_launch_env_and_output_never_emit_raw_values",
+            "--nocapture",
+        ])
+        .env(OBSERVER, "1")
+        .env("TERM", "xterm-256color");
+    let output = bounded_diagnostic_output(command, Duration::from_secs(20));
+    io::stderr().write_all(&output.stdout).unwrap();
+    io::stderr().write_all(&output.stderr).unwrap();
+    assert!(output.status.success());
+    for bytes in [&output.stdout, &output.stderr] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains(SENTINEL));
+        assert!(!text.contains(COMPLETION_REGISTRATION_AUTHORITY_ENV));
+        assert!(!text.contains(&serde_json::to_string(SENTINEL.as_bytes()).unwrap()));
+    }
+    let records: Vec<Value> = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["event"] == "launch" && record["arg_count"] == 4)
+    );
+    assert!(records.iter().any(|record| record["event"] == "exit"
+        && record["success"] == true
+        && record["stdout_len"] == SENTINEL.len()
+        && record["stderr_len"] == SENTINEL.len()));
+}
+
+#[test]
+fn readiness_diagnostic_redacts_values_and_bounds_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("diagnostic.jsonl");
+    File::create(&path).unwrap();
+    let secret = "sensitive-sentinel-credential";
+    let record = json!({"readiness_diagnostic": "registration", "event": "launch",
+        "arg_count": 4, "env_count": 8, "program": secret, "args": [secret],
+        "environment_overrides": [[COMPLETION_REGISTRATION_AUTHORITY_ENV, secret]],
+        "stdout": secret.as_bytes(), "stderr": [secret], "path": secret});
+    write_readiness_record(&path, &record).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    assert!(bytes.len() <= DIAGNOSTIC_RECORD_LIMIT);
+    let retained: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(retained["event"], "launch");
+    assert_eq!(retained["arg_count"], 4);
+    assert_eq!(retained["env_count"], 8);
+    assert_eq!(retained.as_object().unwrap().len(), 6);
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(!text.contains(secret));
+    assert!(!text.contains(COMPLETION_REGISTRATION_AUTHORITY_ENV));
+    assert!(!text.contains(&serde_json::to_string(secret.as_bytes()).unwrap()));
+    assert_eq!(
+        safe_readiness_record(secret, &json!({"event": secret}))["event"],
+        "observation"
+    );
+    assert!(DIAGNOSTIC_BYTES.load(std::sync::atomic::Ordering::Relaxed) <= DIAGNOSTIC_TOTAL_LIMIT);
+}
+
+#[test]
+fn readiness_diagnostic_aggregate_budget_is_a_hard_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("diagnostic.jsonl");
+    File::create(&path).unwrap();
+    let budget = std::sync::atomic::AtomicUsize::new(0);
+    let record = json!({"readiness_diagnostic": "post_confirm", "event": "deadline"});
+    let mut retained = 0;
+    loop {
+        match write_readiness_record_with_budget(&path, &record, &budget) {
+            Ok(()) => retained += 1,
+            Err(error) => {
+                assert_eq!(error.to_string(), "diagnostic retention budget exhausted");
+                break;
+            }
+        }
+        assert!(retained <= DIAGNOSTIC_TOTAL_LIMIT);
+    }
+    assert!(retained > 0);
+    assert!(fs::metadata(&path).unwrap().len() <= DIAGNOSTIC_TOTAL_LIMIT as u64);
+    assert_eq!(
+        fs::metadata(&path).unwrap().len() as usize,
+        budget.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let before = fs::metadata(&path).unwrap().len();
+    assert!(write_readiness_record_with_budget(&path, &record, &budget).is_err());
+    assert_eq!(fs::metadata(&path).unwrap().len(), before);
+}
+
+#[test]
+fn readiness_diagnostic_capture_overflow_fails_without_retaining_excess() {
+    let mut retained = vec![0; DIAGNOSTIC_CAPTURE_LIMIT];
+    let mut input = io::Cursor::new(b"sensitive-sentinel".to_vec());
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        capture_diagnostic_chunk(&mut input, &mut retained);
+    }));
+    assert!(outcome.is_err());
+    assert_eq!(retained.len(), DIAGNOSTIC_CAPTURE_LIMIT);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn readiness_diagnostic_full_sink_does_not_wait_or_change_shared_flags() {
+    let mut fds = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) },
+        0
+    );
+    let _reader = unsafe { File::from_raw_fd(fds[0]) };
+    let mut writer = unsafe { File::from_raw_fd(fds[1]) };
+    let bytes = [0_u8; 4096];
+    while writer.write(&bytes).is_ok() {}
+    // Make the original blocking: the diagnostic must use its own open description.
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, 0) },
+        0
+    );
+    let path = PathBuf::from(format!("/proc/self/fd/{}", writer.as_raw_fd()));
+    assert_eq!(
+        write_readiness_record(&path, &json!({"event": "full"}))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0
+    );
 }
