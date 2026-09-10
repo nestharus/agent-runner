@@ -1,5 +1,6 @@
 //! Opt-in offline pairing: AGE347_PROVIDER_BINARY must name a source-built
-//! candidate, never an installed provider. The proxy admits only describe and
+//! candidate, never an installed provider. Read-only describe/account discovery
+//! bootstraps fixture identity; the page proxy admits only describe and
 //! session.read_turns, with an empty environment and fixture HOME/data roots.
 //! Every accepted page goes through the production Runner JSON/schema mapper.
 use super::*;
@@ -11,6 +12,20 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+
+// This fixture targets native storage with dot-account HOME directories and
+// provider-id-scoped state. Identity comes from the real provider's read-only
+// discovery contract, not a second Runner-maintained account/family catalog.
+#[derive(serde::Deserialize)]
+struct PairedProfile {
+    family: String,
+    settings_id: String,
+    native_sessions: PathBuf,
+}
+
+fn profile(root: &Path) -> PairedProfile {
+    serde_json::from_slice(&fs::read(root.join("paired-profile.json")).unwrap()).unwrap()
+}
 
 struct Paired {
     f: Fixture,
@@ -28,19 +43,27 @@ impl Paired {
         assert!(Path::new(&binary).is_absolute());
         assert!(Path::new(&binary).is_file());
         let mut f = Fixture::new();
-        f.anchor.provider_instance_id = "codex-instance".into();
-        f.anchor.settings_id = "codex".into();
-        let native = f.root.path().join("home/.codex/sessions/2026/09/07");
+        let proxy = write_proxy(f.root.path(), &binary);
+        let discovered = profile(f.root.path());
+        f.anchor.provider_instance_id = format!("{}-instance", discovered.family);
+        f.anchor.settings_id = discovered.settings_id;
+        let native = f
+            .root
+            .path()
+            .join("home")
+            .join(discovered.native_sessions)
+            .join("2026/09/07");
         fs::create_dir_all(&native).unwrap();
         let transcript = native.join(format!("rollout-offline-{SESSION}.jsonl"));
         fs::write(&transcript, format!("{}\n", json!({"timestamp":"2026-09-07T12:00:00Z","type":"session_meta","payload":{"id":SESSION,"cwd":"/offline"}}))).unwrap();
         let mode = f.root.path().join("mode");
         fs::write(&mode, "normal").unwrap();
-        let proxy = write_proxy(f.root.path(), &binary);
         let staging = f
             .root
             .path()
-            .join("data/provider-state/codex/session-pages-v1");
+            .join("data/provider-state")
+            .join(&discovered.family)
+            .join("session-pages-v1");
         fs::create_dir_all(&staging).unwrap();
         fs::File::create(staging.join("unrelated-retained-sparse"))
             .unwrap()
@@ -83,7 +106,14 @@ impl Paired {
         index: u64,
         sequence: u64,
     ) -> Result<SessionProviderReadPageResult, String> {
-        read_paired(&self.registry, &self.f.attempt, cursor, index, sequence)
+        read_paired(
+            self.f.root.path(),
+            &self.registry,
+            &self.f.attempt,
+            cursor,
+            index,
+            sequence,
+        )
     }
 
     fn set_mode(&self, mode: &str) {
@@ -102,31 +132,35 @@ impl Paired {
             .f
             .root
             .path()
-            .join("data/provider-state/codex/observation-auth-v1");
+            .join("data/provider-state")
+            .join(profile(self.f.root.path()).family)
+            .join("observation-auth-v1");
         assert_eq!(fs::read_dir(&key_dir).unwrap().count(), 1);
         assert_eq!(fs::metadata(key_dir.join("key")).unwrap().len(), 32);
     }
 }
 
-fn identity() -> SessionProviderIdentity {
+fn identity(root: &Path) -> SessionProviderIdentity {
+    let discovered = profile(root);
     SessionProviderIdentity {
         model_name: "offline-paired".into(),
         provider_name: "account".into(),
-        provider_instance_id: Some("codex-instance".into()),
-        settings_id: "codex".into(),
+        provider_instance_id: Some(format!("{}-instance", discovered.family)),
+        settings_id: discovered.settings_id,
     }
 }
 
 fn registry(root: &Path, proxy: &Path) -> ProviderRegistry {
+    let discovered = profile(root);
     let providers = ProvidersConfig {
         entries: HashMap::from([(
             "account".into(),
             ProviderEntry {
                 implementation: Some(ProviderEndpointConfig {
-                    family: "codex".into(),
+                    family: discovered.family,
                     executable: proxy.display().to_string(),
                 }),
-                settings_id: Some("codex".into()),
+                settings_id: Some(discovered.settings_id),
                 ..ProviderEntry::default()
             },
         )]),
@@ -142,6 +176,7 @@ fn registry(root: &Path, proxy: &Path) -> ProviderRegistry {
 }
 
 fn read_paired(
+    root: &Path,
     registry: &ProviderRegistry,
     nonce: &str,
     cursor: SessionProviderPageCursor,
@@ -151,7 +186,7 @@ fn read_paired(
     let cancellation = CancellationToken::new();
     read_turn_page(SessionProviderReadPageRequest {
         registry,
-        identity: identity(),
+        identity: identity(root),
         session_id: SESSION,
         effective_cwd: None,
         projection: SessionProviderTurnProjection::UserObservation,
@@ -179,6 +214,17 @@ fn write_proxy(root: &Path, binary: &str) -> PathBuf {
         );
     fs::write(&proxy, script).unwrap();
     fs::set_permissions(&proxy, fs::Permissions::from_mode(0o700)).unwrap();
+    let bootstrap = std::process::Command::new(&proxy)
+        .arg("--prepare-fixture")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(
+        bootstrap.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bootstrap.stderr)
+    );
     proxy
 }
 
@@ -376,7 +422,7 @@ fn age347_paired_production_quantum_wrong_nonce_and_duplicate_prose_never_ack() 
         let cancel = CancellationToken::new();
         let page = read_turn_page(SessionProviderReadPageRequest {
             registry: &p.registry,
-            identity: identity(),
+            identity: identity(p.f.root.path()),
             session_id: SESSION,
             effective_cwd: None,
             projection: SessionProviderTurnProjection::UserObservation,
@@ -408,7 +454,7 @@ fn age347_paired_production_quantum_wrong_nonce_and_duplicate_prose_never_ack() 
             &p.f.db,
             &p.f.attempt,
             &p.registry,
-            identity(),
+            identity(p.f.root.path()),
             p.f.root.path(),
             &p.f.anchor,
         )
@@ -438,10 +484,10 @@ fn age347_offline_recovery_subprocess() {
     assert!(
         !observe_delivery_with(&db, &pending.attempt_id, &pending.anchor, |c, i, s, _| {
             calls += 1;
-            let result = read_paired(&registry, &pending.attempt_id, c.clone(), i, s)?;
+            let result = read_paired(&root, &registry, &pending.attempt_id, c.clone(), i, s)?;
             if calls == 1 {
                 assert_eq!(i, 16);
-                let replay = read_paired(&registry, &pending.attempt_id, c, i, s)?;
+                let replay = read_paired(&root, &registry, &pending.attempt_id, c, i, s)?;
                 assert_eq!(result.page_digest, replay.page_digest);
             }
             Ok(result)

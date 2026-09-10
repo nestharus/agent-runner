@@ -32,7 +32,7 @@ fn read(
     let cancellation = CancellationToken::new();
     read_turn_page(SessionProviderReadPageRequest {
         registry: &p.registry,
-        identity: identity(),
+        identity: identity(p.f.root.path()),
         session_id: SESSION,
         effective_cwd: None,
         projection: budgets.projection,
@@ -426,7 +426,7 @@ fn age347_paired_request_context_not_warning_identifies_observation() {
     for nonce in [None, Some("invalid")] {
         let err = read_turn_page(SessionProviderReadPageRequest {
             registry: &p.registry,
-            identity: identity(),
+            identity: identity(p.f.root.path()),
             session_id: SESSION,
             effective_cwd: None,
             projection: SessionProviderTurnProjection::UserObservation,

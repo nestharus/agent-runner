@@ -8,6 +8,41 @@ import sys
 
 root = pathlib.Path(__FIXTURE_ROOT__)
 binary = __PROVIDER_BINARY__
+# Bootstrap calls are read-only provider metadata operations, separate from
+# the deliberately narrower page proxy. All provider executions remain offline
+# under this fixture's empty environment and owned HOME/data/config roots.
+def invoke(operation, request):
+    return subprocess.run(
+        [binary, operation], input=json.dumps(request).encode(), capture_output=True,
+        env={"HOME": str(root / "home"), "XDG_CONFIG_HOME": str(root / "config"),
+             "XDG_DATA_HOME": str(root / "data"), "PATH": "/usr/bin:/bin", "TMPDIR": str(root)},
+        timeout=5, check=False,
+    )
+
+if sys.argv[1:] == ["--prepare-fixture"]:
+    request = {"contract": "oulipoly.provider/v1", "request_id": "offline-profile",
+               "host": {"app": "offline-fixture", "data_root": str(root / "data"),
+                        "config_root": str(root / "config"), "env": {"HOME": str(root / "home")}},
+               "params": {}}
+    def metadata(operation):
+        result = invoke(operation, request)
+        assert result.returncode == 0, result.stderr
+        response = json.loads(result.stdout)
+        assert response["ok"], response
+        return response["result"]
+    family = metadata("describe")["provider_id"]
+    account = metadata("discovery.accounts")["accounts"][0]["id"]
+    # Fixture layout contract: native dot-account sessions and family-scoped
+    # retained state. Reject path traversal before any fixture filesystem write.
+    for name in (family, account):
+        assert name and name not in (".", "..") and "/" not in name and "\\" not in name
+    (root / "paired-profile.json").write_text(json.dumps({
+        "family": family, "settings_id": account,
+        "native_sessions": str(pathlib.Path("." + account) / "sessions"),
+    }))
+    sys.exit(0)
+
+profile = json.loads((root / "paired-profile.json").read_text())
 assert len(sys.argv) == 2 and sys.argv[1] in ("describe", "session.read_turns")
 request = json.load(sys.stdin)
 request["host"]["env"]["HOME"] = str(root / "home")
@@ -24,19 +59,14 @@ if sys.argv[1] == "session.read_turns":
     if mode == "wrong_nonce":
         request["params"]["expected_delivery_nonce"] = "b" * 64
     if mode == "wrong_account":
-        other = root / "other-home/.codex/sessions"
+        other = root / "other-home" / profile["native_sessions"]
         other.mkdir(parents=True, exist_ok=True)
-        native = next((root / "home/.codex/sessions").rglob("*.jsonl"))
+        native = next((root / "home" / profile["native_sessions"]).rglob("*.jsonl"))
         shutil.copyfile(native, other / native.name)
         request["host"]["env"]["HOME"] = str(root / "other-home")
     if mode == "wrong_snapshot":
         request["params"]["snapshot_id"] = "wrong-opaque-snapshot"
-output = subprocess.run(
-    [binary, sys.argv[1]], input=json.dumps(request).encode(), capture_output=True,
-    env={"HOME": str(root / "home"), "XDG_CONFIG_HOME": str(root / "config"),
-         "XDG_DATA_HOME": str(root / "data"), "PATH": "/usr/bin:/bin", "TMPDIR": str(root)},
-    timeout=5, check=False,
-)
+output = invoke(sys.argv[1], request)
 response = json.loads(output.stdout)
 if sys.argv[1] == "session.read_turns" and response.get("ok"):
     result = response["result"]
