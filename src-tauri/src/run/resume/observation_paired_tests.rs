@@ -625,3 +625,145 @@ fn age353_paired_typed_anchor_stop_explicit_rearm_and_transient_control() {
     assert_eq!(p.f.submissions, 1);
     p.assert_staging_untouched();
 }
+
+#[test]
+#[ignore = "requires explicit frozen source-built provider; no model workloads"]
+fn age355_paired_periodic_active_partial_restart_receipt_and_failure() {
+    let mut p = Paired::new();
+    p.f.state
+        .start_invocation(&oulipoly_state::InvocationStart {
+            invocation_uuid: "native-invocation".into(),
+            model_name: "offline".into(),
+            provider_name: "account".into(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    p.f.db
+        .wake_sessions()
+        .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+            session_id: SESSION,
+            mode: "headless",
+            invocation_uuid: Some("native-invocation"),
+            provider_name: Some("account"),
+            model_name: Some("offline"),
+            models_dir: None,
+            effective_cwd: Some("/offline"),
+        })
+        .unwrap();
+    p.anchor_and_submit();
+    // Native writer appends exact canonical input but no final record delimiter.
+    // Neither assistant output nor successful provider exit participates.
+    let record = json!({"timestamp":"2026-09-07T12:00:01Z","type":"response_item",
+        "payload":{"type":"message","role":"user", "internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]},
+            "content":[{"type":"input_text","text":p.f.envelope}]}})
+    .to_string();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&p.transcript)
+        .unwrap()
+        .write_all(record.as_bytes())
+        .unwrap();
+    crate::native_receipt::poll_headless_receipt_tick_with(&mut p.f.db, |_| {
+        Ok(registry(p.f.root.path(), &p.proxy))
+    })
+    .unwrap();
+    assert!(
+        p.f.db
+            .delivery_observation_confirmation(&p.f.attempt)
+            .unwrap()
+            .is_none()
+    );
+    p.restart();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&p.transcript)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
+    let root = p.f.root.path().to_path_buf();
+    let attempt = p.f.attempt.clone();
+    let (send, received) = std::sync::mpsc::channel();
+    // Exercise the production periodic worker and scanner, using only private
+    // physical fixture roots and the same provider-neutral page-only registry.
+    let guard = crate::native_receipt::start_receipt_polling_with(
+        move || {
+            let mut db = MailboxDb::open(&root.join("pid-identity.db"))?;
+            crate::native_receipt::poll_headless_receipt_tick_with(&mut db, |_| {
+                Ok(registry(&root, &root.join("offline-page-only.py")))
+            })?;
+            if db.delivery_observation_confirmation(&attempt)?.is_some() {
+                let _ = send.send(());
+            }
+            Ok(())
+        },
+        Duration::from_millis(20),
+    )
+    .unwrap();
+    received
+        .recv_timeout(Duration::from_secs(10))
+        .expect("periodic observer did not confirm active input");
+    drop(guard); // joins observer before deleting any fixture root
+    assert_eq!(
+        p.f.state
+            .get_invocation_by_uuid("native-invocation")
+            .unwrap()
+            .unwrap()
+            .status,
+        oulipoly_state::InvocationStatus::Running
+    );
+    assert!(p.f.db.list_pending(SESSION).unwrap().is_empty());
+    assert!(
+        p.f.db
+            .mark_delivery_attempt_failed(&p.f.attempt, SESSION, None, &[p.f.seq], "native_exit_1")
+            .unwrap()
+    );
+    p.restart();
+    assert!(
+        p.f.db
+            .delivery_observation_confirmation(&p.f.attempt)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        p.f.db.list_mailbox(SESSION, true).unwrap()[0].delivery_attempts,
+        1
+    );
+    assert_eq!(p.f.submissions, 1);
+}
+
+#[test]
+#[ignore = "requires explicit frozen source-built provider; no model workloads"]
+fn age355_paired_contextual_input_and_duplicate_are_not_receipt() {
+    for duplicate in [false, true] {
+        let mut p = Paired::new();
+        p.anchor_and_submit();
+        let kind = if duplicate {
+            "user.text"
+        } else {
+            "compaction.summary"
+        };
+        let record = json!({"timestamp":"2026-09-07T12:00:01Z","type":"response_item",
+            "payload":{"type":"message","role":"user", "internal_chat_message_metadata_passthrough":{"content_item_kinds":[kind]},
+                "content":[{"type":"input_text","text":p.f.envelope}]}})
+        .to_string();
+        let mut native = fs::OpenOptions::new()
+            .append(true)
+            .open(&p.transcript)
+            .unwrap();
+        writeln!(native, "{record}").unwrap();
+        if duplicate {
+            writeln!(native, "{record}").unwrap();
+        }
+        assert!(
+            !observe_delivery_with(
+                &p.f.db,
+                &p.f.attempt,
+                &p.f.anchor,
+                |cursor, index, seq, _| p.read(cursor, index, seq)
+            )
+            .unwrap()
+        );
+        p.f.assert_pending_without_replay();
+    }
+}

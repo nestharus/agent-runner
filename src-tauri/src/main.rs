@@ -29,6 +29,7 @@ mod invocation;
 mod json_error;
 mod mailbox_delivery;
 mod migration_providers;
+mod native_receipt;
 #[allow(dead_code)]
 #[path = "main/owned_turn_event_ingest.rs"]
 mod owned_turn_event_ingest;

@@ -427,3 +427,22 @@ print(json.dumps({{
         path
     }
 }
+
+/// Private short-lived registry for non-semantic receipt inspection. In particular
+/// its describe timeout must not inherit the 90s launch-handshake allowance.
+pub(crate) fn receipt_registry(
+    models_dir: Option<&std::path::Path>,
+) -> Result<ProviderRegistry, String> {
+    let mut paths = default_cli_runtime_paths()?;
+    if let Some(models_dir) = models_dir {
+        paths.models_dir = models_dir.to_path_buf();
+    }
+    let options = ProviderRegistryOptions::default()
+        .with_client_options(
+            oulipoly_provider::client::ProviderClientOptions::default()
+                .with_timeout(std::time::Duration::from_secs(2)),
+        )
+        .with_config_root(paths.config_root.clone())
+        .with_data_root(paths.data_root.clone());
+    production_provider_registry(&paths, options)
+}
