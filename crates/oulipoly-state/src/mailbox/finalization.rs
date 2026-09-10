@@ -46,6 +46,18 @@ impl MailboxDb {
 }
 
 pub(super) fn reap_abandoned_finalizers(conn: &mut Connection, limit: i64) -> Result<(), String> {
+    reap_abandoned_finalizers_with(
+        conn,
+        limit,
+        pid_identity::observe_finalizer_process_identity,
+    )
+}
+
+pub(super) fn reap_abandoned_finalizers_with(
+    conn: &mut Connection,
+    limit: i64,
+    observe: impl Fn(i64) -> pid_identity::ProcessIdentityObservation,
+) -> Result<(), String> {
     // Rotate live/uncertain owners to the tail so they cannot starve crashed
     // owners. Work is bounded per maintenance call, not a lease expiry that could
     // erase evidence underneath a slow but live finalizer.
@@ -73,7 +85,7 @@ pub(super) fn reap_abandoned_finalizers(conn: &mut Connection, limit: i64) -> Re
     let observations = owners
         .into_iter()
         .map(|(token, owner)| {
-            let dead = match pid_identity::observe_live_process_identity(owner.os_pid) {
+            let dead = match observe(owner.os_pid) {
                 pid_identity::ProcessIdentityObservation::Dead => true,
                 pid_identity::ProcessIdentityObservation::ExactLive(live) => live != owner,
                 _ => false, // uncertain is not authority to discard evidence

@@ -16165,6 +16165,175 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalization_uncertain_identity_retains_reference_and_exact_ack_membership() {
+        use std::io::{Error, ErrorKind};
+        // Inject read/probe outcomes, not permissions or a substituted production
+        // /proc mount. hidepid NotFound and kill(0) EPERM both mean uncertainty.
+        for fault in [
+            "stat-denied",
+            "stat-unparseable",
+            "stat-zero",
+            "stat-hidden",
+            "stat-hidden-eperm",
+            "boot-denied",
+            "boot-missing",
+            "boot-empty",
+            "boot-unparseable",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+            let old = inserted_row(db.enqueue_agent_bash_complete(&input("old", "session-a")));
+            let retained = db.retain_delivery_finalization("exact").unwrap();
+            db.register_headless_delivery_attempt(
+                "exact",
+                "session-a",
+                None,
+                "invocation",
+                &[old.seq],
+                0,
+            )
+            .unwrap();
+            let observe = |pid| {
+                pid_identity::observe_finalizer_process_identity_with(
+                    pid,
+                    |path| {
+                        let boot = path.ends_with("boot_id");
+                        match (fault, boot) {
+                            ("stat-denied", false) | ("boot-denied", true) => {
+                                Err(ErrorKind::PermissionDenied.into())
+                            }
+                            ("stat-hidden" | "stat-hidden-eperm", false)
+                            | ("boot-missing", true) => Err(ErrorKind::NotFound.into()),
+                            ("stat-unparseable", false) | ("boot-unparseable", true) => {
+                                Ok("not an identity".into())
+                            }
+                            ("boot-empty", true) => Ok("  \n".into()),
+                            ("stat-zero", false) => {
+                                Ok(format!("{pid} (redacted) S {} 0", vec!["0"; 18].join(" ")))
+                            }
+                            _ => std::fs::read_to_string(path),
+                        }
+                    },
+                    |_| {
+                        if fault == "stat-hidden-eperm" {
+                            Err(Error::from_raw_os_error(libc::EPERM))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+            };
+            assert!(
+                matches!(
+                    observe(i64::from(std::process::id())),
+                    pid_identity::ProcessIdentityObservation::ReadError(_)
+                ),
+                "{fault}"
+            );
+            finalization::reap_abandoned_finalizers_with(&mut db.conn, 1, observe).unwrap();
+            assert!(
+                !db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                    .unwrap(),
+                "uncertainty is not ACK: {fault}"
+            );
+            assert!(
+                db.delivery_observation_confirmation("exact")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                db.acknowledge_range("session-a", old.seq, old.seq, "consumer")
+                    .unwrap(),
+                1
+            );
+            finalization::reap_abandoned_finalizers_with(&mut db.conn, 1, observe).unwrap();
+            assert_eq!(
+                count_rows(
+                    &db.conn,
+                    "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                    [],
+                    "refs"
+                )
+                .unwrap(),
+                1,
+                "{fault}"
+            );
+            db.prune_terminal_history_with_keep(2048, 0).unwrap();
+            assert!(
+                db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                    .unwrap(),
+                "{fault}"
+            );
+            assert_eq!(
+                db.list_mailbox("session-a", true).unwrap().len(),
+                1,
+                "{fault}"
+            );
+            assert!(
+                db.delivery_attempt_fully_settled("missing", "session-a", None, &[old.seq])
+                    .is_err()
+            );
+            assert!(
+                db.delivery_observation_confirmation("exact")
+                    .unwrap()
+                    .is_none()
+            );
+            drop(retained);
+            db.prune_terminal_history_with_keep(2048, 0).unwrap();
+            assert!(
+                db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalization_proven_absence_reclaims_ack_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let old = inserted_row(db.enqueue_agent_bash_complete(&input("old", "session-a")));
+        let retained = db.retain_delivery_finalization("exact").unwrap();
+        db.register_headless_delivery_attempt(
+            "exact",
+            "session-a",
+            None,
+            "invocation",
+            &[old.seq],
+            0,
+        )
+        .unwrap();
+        db.acknowledge_range("session-a", old.seq, old.seq, "consumer")
+            .unwrap();
+        finalization::reap_abandoned_finalizers_with(&mut db.conn, 1, |pid| {
+            pid_identity::observe_finalizer_process_identity_with(
+                pid,
+                |_| Err(std::io::ErrorKind::NotFound.into()),
+                |_| Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            0
+        );
+        db.prune_terminal_history_with_keep(2048, 0).unwrap();
+        assert!(db.list_mailbox("session-a", true).unwrap().is_empty());
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                .is_err()
+        );
+        drop(retained);
+    }
+
     #[test]
     fn finalization_abrupt_exit_child() {
         let Some(path) = std::env::var_os("AGE353_FINALIZATION_CHILD_DB") else {

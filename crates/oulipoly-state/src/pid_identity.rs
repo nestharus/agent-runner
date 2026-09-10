@@ -325,6 +325,70 @@ pub fn observe_live_process_identity(os_pid: i64) -> ProcessIdentityObservation 
     observe_live_process_identity_impl(os_pid)
 }
 
+/// Conservative evidence for finalizer reclamation only. Keep the established
+/// optional-read semantics of the public observer and its authority callers.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn observe_finalizer_process_identity(os_pid: i64) -> ProcessIdentityObservation {
+    observe_live_process_identity(os_pid)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn observe_finalizer_process_identity(os_pid: i64) -> ProcessIdentityObservation {
+    observe_finalizer_process_identity_with(
+        os_pid,
+        |path| std::fs::read_to_string(path),
+        |pid| {
+            // hidepid can make a live process's proc entry appear absent. Signal 0
+            // does not signal the process; only ESRCH proves absence in our namespace.
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn observe_finalizer_process_identity_with(
+    os_pid: i64,
+    read: impl Fn(&Path) -> std::io::Result<String>,
+    probe: impl Fn(libc::pid_t) -> std::io::Result<()>,
+) -> ProcessIdentityObservation {
+    use ProcessIdentityObservation::{Dead, ExactLive, ReadError};
+    let Ok(pid) = libc::pid_t::try_from(os_pid) else {
+        return ReadError("Invalid finalizer PID".into());
+    };
+    if pid <= 0 {
+        return ReadError("Invalid finalizer PID".into());
+    }
+    let path = proc_stat_path(os_pid);
+    let stat = match read(&path) {
+        Ok(stat) => stat,
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::NotFound
+                && probe(pid).is_err_and(|error| error.raw_os_error() == Some(libc::ESRCH))
+            {
+                return Dead;
+            }
+            return ReadError(file_read_error(&path, "finalizer proc stat", &err));
+        }
+    };
+    let Some(start) = parse_proc_stat_starttime_ticks(&stat).filter(|ticks| *ticks > 0) else {
+        // Malformed or unavailable fields are not a different process identity.
+        return ReadError("Missing or invalid finalizer process start time".into());
+    };
+    let boot_path = Path::new("/proc/sys/kernel/random/boot_id");
+    let boot = match read(boot_path) {
+        Ok(boot) => boot.trim().to_string(),
+        Err(err) => return ReadError(file_read_error(boot_path, "finalizer boot id", &err)),
+    };
+    if uuid::Uuid::parse_str(&boot).is_err() {
+        return ReadError("Missing or invalid finalizer boot identity".into());
+    }
+    ExactLive(process_identity(os_pid, boot, start))
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn observe_live_process_identity_impl(os_pid: i64) -> ProcessIdentityObservation {
     match read_live_process_identity_impl(os_pid) {
