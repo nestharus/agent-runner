@@ -598,7 +598,9 @@ fn bind_verified_live_owner_session(
             provider_session_id: owner.session_id.clone(),
             capture_method: "completion_registration_live_pid",
             resume_input_id: None,
-            provider_session_resolved_account: record.provider_name.clone(),
+            // Live PID ancestry attests the session, not its workspace. Keep any
+            // retained workspace; launch authority supplies it when still unknown.
+            provider_session_resolved_account: record.provider_session_resolved_account.clone(),
         },
     )
 }
@@ -777,6 +779,115 @@ mod tests {
     use oulipoly_state::mailbox::{CompletionEventTriggerInput, MailboxDb};
     use serde_json::json;
     use std::path::Path;
+
+    #[test]
+    fn live_owner_registration_does_not_invent_workspace_authority() {
+        assert_live_owner_workspace_binding(None);
+    }
+
+    #[test]
+    fn live_owner_registration_preserves_retained_workspace_authority() {
+        assert_live_owner_workspace_binding(Some("/fixture/workspace"));
+    }
+
+    fn assert_live_owner_workspace_binding(retained_workspace: Option<&str>) {
+        use oulipoly_state::{
+            InvocationMutationAuthority, InvocationStart, ProviderSessionAuthorityCommit,
+            ProviderSessionBinding, StateDb,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let owner = super::OwnerBinding {
+            session_id: "fixture-session".to_string(),
+            invocation_uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+        };
+        let row_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: owner.invocation_uuid.clone(),
+                model_name: "fixture-model".to_string(),
+                provider_name: "fixture-account".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        // Seed only the retained-workspace case; the other starts unbound.
+        if let Some(workspace) = retained_workspace {
+            state
+                .bind_invocation_provider_session_start(
+                    InvocationMutationAuthority::Standalone,
+                    row_id,
+                    &ProviderSessionBinding {
+                        provider_session_id: owner.session_id.clone(),
+                        capture_method: "provider_live_report_pending",
+                        resume_input_id: None,
+                        provider_session_resolved_account: Some(workspace.to_string()),
+                    },
+                )
+                .unwrap();
+        }
+        let before = state
+            .get_invocation_by_uuid(&owner.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        super::bind_verified_live_owner_session(&state, &before, &owner).unwrap();
+        let registered = state
+            .get_invocation_by_uuid(&owner.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registered.provider_session_id.as_deref(),
+            Some(owner.session_id.as_str())
+        );
+        assert_eq!(
+            registered.provider_session_resolved_account.as_deref(),
+            retained_workspace
+        );
+
+        let binding = ProviderSessionBinding {
+            provider_session_id: owner.session_id.clone(),
+            capture_method: "external_provider_launch",
+            resume_input_id: None,
+            provider_session_resolved_account: Some("/fixture/workspace".to_string()),
+        };
+        let commit = ProviderSessionAuthorityCommit {
+            invocation_uuid: &owner.invocation_uuid,
+            provider_name: "fixture-account",
+            binding: &binding,
+            provider_instance_id: "fixture-instance",
+            settings_id: "fixture-settings",
+        };
+        state
+            .commit_invocation_provider_session_authority(
+                InvocationMutationAuthority::Standalone,
+                row_id,
+                &commit,
+            )
+            .unwrap();
+        let conflicting_binding = ProviderSessionBinding {
+            provider_session_resolved_account: Some("/different/workspace".to_string()),
+            ..binding.clone()
+        };
+        let error = state
+            .commit_invocation_provider_session_authority(
+                InvocationMutationAuthority::Standalone,
+                row_id,
+                &ProviderSessionAuthorityCommit {
+                    binding: &conflicting_binding,
+                    ..commit
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("workspace mismatch"), "{error}");
+        let after = state
+            .get_invocation_by_uuid(&owner.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.provider_session_resolved_account,
+            binding.provider_session_resolved_account
+        );
+    }
 
     #[test]
     fn completion_obligation_admission_id_disambiguates_delimiters_in_components() {

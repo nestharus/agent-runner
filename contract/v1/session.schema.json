@@ -313,7 +313,10 @@
           "items": { "$ref": "#/$defs/SessionTurnPageTurn" }
         },
         "page_turn_count": { "type": "integer", "minimum": 0, "maximum": 256 },
-        "source_bytes_examined": { "type": "integer", "minimum": 0, "maximum": 8388608 },
+        "source_bytes_examined": {
+          "type": "integer", "minimum": 0, "maximum": 16777215,
+          "description": "All native reads. Canonical and undeclared observation totals retain the 8388608 ceiling. Declared observation also requires checked request-relative accounting in the consumer."
+        },
         "scan_progress": { "type": "boolean" },
         "snapshot_complete": { "type": "boolean" },
         "next_page_token": { "$ref": "#/$defs/SessionTurnPageToken" },
@@ -343,6 +346,41 @@
         "resume_token",
         "source_final",
         "warnings"
+      ],
+      "allOf": [
+        {
+          "if": { "properties": { "turn_projection": { "const": "user_observation" } } },
+          "then": {
+            "if": {
+              "properties": {
+                "warnings": { "contains": { "pattern": "^codex_observation_io_v1" } }
+              }
+            },
+            "then": {
+              "properties": {
+                "warnings": {
+                  "contains": { "pattern": "^codex_observation_io_v1" },
+                  "minContains": 1,
+                  "maxContains": 1,
+                  "items": {
+                    "if": { "pattern": "^codex_observation_io_v1" },
+                    "then": {
+                      "pattern": "^codex_observation_io_v1:forward=[0-9]{1,20};reconstruction=[0-9]{1,20};metadata=[0-9]{1,20}$",
+                      "not": { "pattern": "[\\r\\n]" }
+                    }
+                  }
+                }
+              }
+            },
+            "else": { "properties": { "source_bytes_examined": { "maximum": 8388608 } } }
+          },
+          "else": {
+            "properties": {
+              "source_bytes_examined": { "maximum": 8388608 },
+              "warnings": { "items": { "not": { "pattern": "^codex_observation_io_v1" } } }
+            }
+          }
+        }
       ],
       "oneOf": [
         {

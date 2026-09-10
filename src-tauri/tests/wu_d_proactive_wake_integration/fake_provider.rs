@@ -25,19 +25,33 @@ pub(crate) fn provider_script(on_initial: &str, on_resume: &str, prompt_file: &s
         )
 }
 
+// A tail-read failure rejects the actual Runner anchor-admission path before
+// begin_headless_delivery_submission. It is not a provider launch attestation.
+pub(crate) fn anchor_admission_provider_script(
+    on_anchor: &str,
+    on_resume: &str,
+    prompt_file: &str,
+) -> String {
+    provider_script("", on_resume, prompt_file).replace(
+        "ON_ANCHOR = \"\"",
+        &format!("ON_ANCHOR = {}", serde_json::to_string(on_anchor).unwrap()),
+    )
+}
+
 pub(crate) fn delayed_agent_bash_provider_script(agent_bash_bin: &Path) -> String {
     let agent_bash_bin = shell_single_quote(&agent_bash_bin.to_string_lossy());
     provider_script(
         &format!(
-            r#"runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
+            r#"set -e
+runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
 owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
-writer_ready="$work/pid-sidecar-writer-ready"
-python3 - "$OULIPOLY_DATA_DIR/pid-identity.db" "$owner_invocation" "$writer_ready" <<'PY' &
+coproc SIDECAR_WRITER {{
+python3 -u - "$OULIPOLY_DATA_DIR/pid-identity.db" "$owner_invocation" <<'PY' 2> "$work/pid-sidecar-writer.err"
 import sqlite3
 import sys
 import time
 
-path, owner_invocation, ready = sys.argv[1:]
+path, owner_invocation = sys.argv[1:]
 connection = sqlite3.connect(path, timeout=0.1)
 admission_deadline = time.monotonic() + 5
 revision = 0
@@ -60,7 +74,7 @@ while True:
         raise RuntimeError("owner identity did not appear before write burst")
     time.sleep(0.01)
 
-open(ready, "w", encoding="utf-8").close()
+print("owner-lookup-admitted", flush=True)
 deadline = time.monotonic() + 1
 while time.monotonic() < deadline:
     try:
@@ -79,12 +93,14 @@ while time.monotonic() < deadline:
         raise RuntimeError("owner identity disappeared during write burst")
     revision += 1
 PY
-writer_pid=$!
-for _ in $(seq 1 200); do
-  [ -e "$writer_ready" ] && break
-  sleep 0.01
-done
-[ -e "$writer_ready" ]
+}}
+writer_pid=$SIDECAR_WRITER_PID
+if ! IFS= read -r writer_ready <&"${{SIDECAR_WRITER[0]}}"; then
+  cat "$work/pid-sidecar-writer.err" >&2
+  wait "$writer_pid" || true
+  exit 1
+fi
+[ "$writer_ready" = owner-lookup-admitted ]
 if AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
    {agent_bash_bin} run --completion-scope tree --delivery async -- \
      bash -lc '( sleep 1; printf nested-tree-complete ) &' \
@@ -97,6 +113,7 @@ else
   wait "$writer_pid" || true
   exit "$rc"
 fi
+python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"' "$work/agent-bash-dispatch.json"
 wait "$writer_pid"
 "#,
         ),
@@ -109,15 +126,15 @@ pub(crate) fn late_consumed_agent_bash_provider_script(agent_bash_bin: &Path) ->
     let agent_bash_bin = shell_single_quote(&agent_bash_bin.to_string_lossy());
     provider_script(
         &format!(
-            r#"runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
+            r#"set -e
+runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
 owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
 dispatch="$work/late-consumed-dispatch.json"
 AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
 AGENT_BASH_CONSUMER_GRACE_MS=0 \
 {agent_bash_bin} run --completion-scope root --delivery async -- \
   bash -lc 'printf nested-root-complete' > "$dispatch"
-handle="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["handle"])' "$dispatch")"
-state_dir="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["state_dir"])' "$dispatch")"
+handle="$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$dispatch")"
 found=""
 for _ in $(seq 1 200); do
   mailbox="$($runner mailbox list --session-id "$session" --json)"
@@ -129,7 +146,8 @@ for _ in $(seq 1 200); do
 done
 [ -n "$found" ]
 {agent_bash_bin} status "$handle" > "$work/late-consumed-poll.txt"
-: > "$state_dir/consumed""#,
+grep -q '^DONE rc=0' "$work/late-consumed-poll.txt"
+{agent_bash_bin} consume "$handle" > "$work/late-consumed-consume.json""#,
         ),
         "",
         "late-consumed-resumed-input.txt",
@@ -140,7 +158,8 @@ pub(crate) fn mixed_consumed_agent_bash_provider_script(agent_bash_bin: &Path) -
     let agent_bash_bin = shell_single_quote(&agent_bash_bin.to_string_lossy());
     provider_script(
         &format!(
-            r#"runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
+            r#"set -e
+runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
 owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
 run_job() {{
   local dispatch="$1"
@@ -152,10 +171,9 @@ run_job() {{
 consumed_dispatch="$work/mixed-consumed-dispatch.json"
 unpolled_dispatch="$work/mixed-unpolled-dispatch.json"
 run_job "$consumed_dispatch"
+consumed_handle="$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$consumed_dispatch")"
 run_job "$unpolled_dispatch"
-consumed_handle="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["handle"])' "$consumed_dispatch")"
-unpolled_handle="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["handle"])' "$unpolled_dispatch")"
-consumed_state_dir="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["state_dir"])' "$consumed_dispatch")"
+unpolled_handle="$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$unpolled_dispatch")"
 found=""
 for _ in $(seq 1 200); do
   mailbox="$($runner mailbox list --session-id "$session" --json)"
@@ -168,7 +186,8 @@ for _ in $(seq 1 200); do
 done
 [ -n "$found" ]
 {agent_bash_bin} status "$consumed_handle" > "$work/mixed-consumed-poll.txt"
-: > "$consumed_state_dir/consumed""#,
+grep -q '^DONE rc=0' "$work/mixed-consumed-poll.txt"
+{agent_bash_bin} consume "$consumed_handle" > "$work/mixed-consumed-consume.json""#,
         ),
         "",
         "mixed-resumed-input.txt",
@@ -195,6 +214,7 @@ SESSION = __WU_D_SESSION__
 ON_INITIAL = __WU_D_ON_INITIAL__
 ON_RESUME = __WU_D_ON_RESUME__
 PROMPT_FILE = __WU_D_PROMPT_FILE__
+ON_ANCHOR = ""
 
 def envelope(request, result):
     return {"contract": CONTRACT, "request_id": request["request_id"], "ok": True, "result": result}
@@ -204,8 +224,9 @@ def event(request, seq, kind, **fields):
     value.update(fields)
     print(json.dumps(value, separators=(",", ":")), flush=True)
 
-def next_resume_index(work):
-    lock = work / "provider-resume-sequence.lock"
+def next_resume_index(work, prefix="provider-resume-sequence"):
+
+    lock = work / (prefix + ".lock")
     while True:
         try:
             lock.mkdir()
@@ -213,7 +234,7 @@ def next_resume_index(work):
         except FileExistsError:
             time.sleep(0.01)
     try:
-        sequence_file = work / "provider-resume-sequence.txt"
+        sequence_file = work / (prefix + ".txt")
         index = int(sequence_file.read_text() or "0") if sequence_file.exists() else 0
         index += 1
         sequence_file.write_text(str(index))
@@ -309,6 +330,14 @@ def session_turn_page(request):
     records = load_turns(work, session)
     projection = params.get("turn_projection")
     if params.get("start_mode") == "tail":
+        if ON_ANCHOR:
+            index = next_resume_index(work, "anchor-admission-sequence")
+            env = dict(os.environ, WU_D_ANCHOR_INDEX=str(index), work=str(work))
+            checked = subprocess.run(["bash", "-c", ON_ANCHOR], cwd=work, env=env, capture_output=True)
+            if checked.returncode:
+                return {"contract": CONTRACT, "request_id": request["request_id"], "ok": False,
+                        "error": {"category": "unavailable", "code": "offline_anchor_unavailable",
+                                  "message": "synthetic pre-submission tail read unavailable", "retryable": True}}
         base = len(records)
         snapshot_count = base
         start = base

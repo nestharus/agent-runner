@@ -65,7 +65,6 @@ pub(crate) struct LaunchOutputArtifacts {
 pub(crate) fn map_launch_result_with_terminal_classification(
     result: LaunchResult,
     provider_index: usize,
-    provider_name: &str,
     classification: Option<TerminalClassification>,
     retain_prompt_acceptance_attestation_v1: bool,
     output: LaunchOutputArtifacts,
@@ -80,7 +79,7 @@ pub(crate) fn map_launch_result_with_terminal_classification(
     let terminal = map_terminal_cancel_outcome(
         &result.exit.status,
         &result.exit.terminal_signal,
-        provider_name,
+        &authority.account_name,
     );
     let terminal = classification.unwrap_or(TerminalClassification {
         exit_code: terminal.exit_code,

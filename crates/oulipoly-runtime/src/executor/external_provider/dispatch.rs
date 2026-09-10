@@ -390,7 +390,6 @@ pub(super) fn attempt_account_dispatch(
             let result = map_launch_result_with_terminal_classification(
                 launch_result,
                 context.provider_index,
-                &context.provider.name,
                 None,
                 launch_prompt_acceptance_v1_enabled,
                 LaunchOutputArtifacts {
@@ -415,7 +414,6 @@ pub(super) fn attempt_account_dispatch(
     Ok(map_launch_result_with_terminal_classification(
         launch_result,
         context.provider_index,
-        &context.provider.name,
         classification,
         launch_prompt_acceptance_v1_enabled,
         LaunchOutputArtifacts {

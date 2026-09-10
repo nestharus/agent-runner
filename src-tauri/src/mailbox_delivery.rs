@@ -1494,6 +1494,21 @@ fn notification_prefix_len(rows: &[MailboxRow], remaining_count: usize) -> usize
         .unwrap_or_else(|_| MAILBOX_PREFIX_MAX_BYTES.saturating_add(1))
 }
 
+/// Only the exact persisted notification window can reconstruct a legacy
+/// envelope. Appended manual text or changed formatting will not match its hash.
+pub(crate) fn legacy_notification_envelope(
+    window: &oulipoly_state::mailbox::MailboxDeliveryWindow,
+) -> Result<Option<String>, String> {
+    if window
+        .rows
+        .iter()
+        .any(|row| row.kind != oulipoly_state::mailbox::AGENT_BASH_COMPLETE_KIND)
+    {
+        return Ok(None);
+    }
+    render_mailbox_prefix(&window.rows, window.remaining_count, &window.attempt_id).map(Some)
+}
+
 fn render_mailbox_prefix(
     rows: &[MailboxRow],
     remaining_count: usize,
@@ -1695,7 +1710,7 @@ mod tests {
                     provider_instance_id: "provider-instance".to_string(),
                     settings_id: "settings".to_string(),
                     provider_session_id: "observation-session".to_string(),
-                    resume_token: "opaque-anchor".to_string(),
+                    resume_token: Some("opaque-anchor".to_string()),
                     expected_sha256: "a".repeat(64),
                 },
             )
@@ -1933,6 +1948,8 @@ mod tests {
         let sidecar_path = directory.path().join("pid-identity.db");
         let connection = rusqlite::Connection::open(&sidecar_path).unwrap();
         for column in [
+            "headless_submission_state",
+            "observation_progress",
             "evidence_reconciled_at",
             "evidence_observed_at",
             "evidence_turn_generation_id",
@@ -2086,6 +2103,8 @@ mod tests {
             )
             .unwrap();
         for column in [
+            "headless_submission_state",
+            "observation_progress",
             "evidence_reconciled_at",
             "evidence_observed_at",
             "evidence_turn_generation_id",

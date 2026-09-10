@@ -177,8 +177,9 @@ fn configure_agent_bash_env(
     );
     command.env(
         "AGENT_BASH_AGENT_RUNNER_BIN",
-        env!("CARGO_BIN_EXE_oulipoly-agent-runner"),
+        fixture._dir.path().join("runner/oulipoly-agent-runner"),
     );
+    command.env("AGENT_BASH_BIN", fixture._dir.path().join("agent-bash"));
     command.env(
         "OULIPOLY_DATA_DIR",
         fixture.data_home.join("oulipoly-agent-runner"),
@@ -188,25 +189,17 @@ fn configure_agent_bash_env(
 fn agent_bash_bin_from_env() -> PathBuf {
     let value = std::env::var_os(AGENT_BASH_BIN_ENV)
         .map(PathBuf::from)
-        .or_else(find_agent_bash_in_path)
         .unwrap_or_else(|| {
-            panic!("{AGENT_BASH_BIN_ENV} must point to an agent-bash binary or agent-bash must be on PATH")
+            panic!("{AGENT_BASH_BIN_ENV} must name the absolute source-qualified agent-bash binary (see .github/actions/install-agent-bash)")
         });
     assert_agent_bash_bin(&value);
     value
 }
 
-fn find_agent_bash_in_path() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("agent-bash"))
-        .find(|path| path.is_file())
-}
-
 fn assert_agent_bash_bin(path: &Path) {
     assert!(
-        path.is_file(),
-        "{AGENT_BASH_BIN_ENV} must point to an agent-bash binary"
+        path.is_absolute() && path.is_file(),
+        "{AGENT_BASH_BIN_ENV} must point to an absolute agent-bash binary"
     );
 }
 
@@ -216,6 +209,31 @@ fn isolated_agent_bash_bin(fixture: &Fixture, source: &Path) -> PathBuf {
     let mut permissions = fs::metadata(&target).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&target, permissions).unwrap();
+    let runner_dir = fixture._dir.path().join("runner");
+    fs::create_dir_all(&runner_dir).unwrap();
+    let runner = runner_dir.join("oulipoly-agent-runner");
+    let source_runner = env!("CARGO_BIN_EXE_oulipoly-agent-runner");
+    if fs::hard_link(source_runner, &runner).is_err() {
+        fs::copy(source_runner, &runner).unwrap();
+    }
+    fs::write(
+        fixture._dir.path().join("agent-bash.toml"),
+        format!(
+            "state_root = {:?}\nagent_runner_bin = {:?}\n",
+            fixture.state_home().join("agent-bash"),
+            runner,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        runner_dir.join("config.toml"),
+        format!(
+            "data_dir = {:?}\nconfig_home = {:?}\n",
+            fixture.data_home.join("oulipoly-agent-runner"),
+            fixture.config_home,
+        ),
+    )
+    .unwrap();
     target
 }
 

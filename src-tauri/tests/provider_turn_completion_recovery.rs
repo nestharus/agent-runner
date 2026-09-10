@@ -169,12 +169,30 @@ fn automatic_legacy_turn_script_cannot_recover_a_nonzero_exit() {
 }
 
 #[test]
+fn resumed_mismatched_seed_authority_still_fails_closed() {
+    let fixture = ExternalRecoveryFixture::new("confirmed");
+    // Deliberately retain the generic fixture's different advertised instance.
+    fixture
+        .base
+        .seed_active_chain(EXTERNAL_PROVIDER, EXTERNAL_MODEL);
+    let output = fixture.run_resume();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("provider_session_authority_mismatch"),
+        "{output:?}"
+    );
+    assert_eq!(fixture.latest_persisted_invocation().success, 0);
+    assert!(!fixture.poison_canary.exists());
+}
+
+#[test]
 fn resumed_clean_exit_without_terminal_completion_is_unconfirmed_failure() {
     let fixture = ExternalRecoveryFixture::new("unconfirmed");
-    fixture.base.seed_active_chain_with_instance(
+    fixture.base.seed_active_chain_with_authority(
         EXTERNAL_PROVIDER,
         EXTERNAL_MODEL,
         "age270-local-external-provider-instance",
+        EXTERNAL_PROVIDER,
     );
 
     let output = fixture.run_resume();
@@ -221,10 +239,11 @@ fn resumed_clean_exit_without_terminal_completion_is_unconfirmed_failure() {
 #[test]
 fn resumed_clean_exit_with_terminal_assistant_response_succeeds() {
     let fixture = ExternalRecoveryFixture::new("confirmed");
-    fixture.base.seed_active_chain_with_instance(
+    fixture.base.seed_active_chain_with_authority(
         EXTERNAL_PROVIDER,
         EXTERNAL_MODEL,
         "age270-local-external-provider-instance",
+        EXTERNAL_PROVIDER,
     );
 
     let output = fixture.run_resume();

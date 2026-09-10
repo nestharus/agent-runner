@@ -101,7 +101,12 @@ fn dispatch_handle(fixture: &Fixture, file_name: &str) -> String {
 
 fn parse_dispatch_handle(dispatch: &str) -> String {
     let dispatch: serde_json::Value = serde_json::from_str(dispatch).unwrap();
-    dispatch["handle"].as_str().unwrap().to_string()
+    let handle = dispatch["handle"].as_str().unwrap();
+    assert!(
+        !handle.trim().is_empty(),
+        "dispatch handle must be nonempty"
+    );
+    handle.to_string()
 }
 
 fn assert_delayed_completion_outcome(fixture: &Fixture, session_id: &str, handle: &str) {
@@ -281,17 +286,8 @@ fn format_automatic_delivery_timeout(
 fn agent_bash_bin() -> PathBuf {
     std::env::var_os("AGENT_BASH_BIN")
         .map(PathBuf::from)
-        .or_else(find_agent_bash_in_path)
-        .filter(|path| path.is_file())
-        .expect("AGENT_BASH_BIN must name an agent-bash binary or agent-bash must be on PATH")
-}
-
-fn find_agent_bash_in_path() -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join("agent-bash"))
-            .find(|path| path.is_file())
-    })
+        .filter(|path| path.is_absolute() && path.is_file())
+        .expect("AGENT_BASH_BIN must name the absolute source-qualified agent-bash binary (see .github/actions/install-agent-bash)")
 }
 
 fn invocation_count(fixture: &Fixture) -> i64 {

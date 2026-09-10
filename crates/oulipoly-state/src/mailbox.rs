@@ -57,11 +57,6 @@ const PENDING_MAILBOX_TARGET_PREDICATE: &str = "(
     OR (?2 IS NOT NULL AND target_kind = 'chain' AND target_id = ?2)
 )";
 
-struct DeliveryAttemptTarget<'a> {
-    session_id: &'a str,
-    chain_id: Option<&'a str>,
-}
-
 fn bounded_pending_mailbox_query() -> String {
     format!(
         "SELECT {MAILBOX_ROW_COLUMNS}
@@ -821,13 +816,27 @@ pub struct MailboxDeliveryWindow {
     pub remaining_count: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeliveryAttemptMode {
+    Legacy,
+    Headless,
+    ExplicitInput,
+}
+
+struct DeliveryAttemptTarget<'a> {
+    session_id: &'a str,
+    chain_id: Option<&'a str>,
+    mode: DeliveryAttemptMode,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxDeliveryObservationAnchor {
     pub provider_name: String,
     pub provider_instance_id: String,
     pub settings_id: String,
     pub provider_session_id: String,
-    pub resume_token: String,
+    /// None only for explicitly recovered legacy identity: scan Beginning, not a fabricated tail.
+    pub resume_token: Option<String>,
     pub expected_sha256: String,
 }
 
@@ -854,7 +863,11 @@ fn validate_delivery_observation_anchor(
     if anchor.provider_session_id != session_id {
         return Err("mailbox delivery observation session identity mismatch".to_string());
     }
-    if anchor.resume_token.is_empty() || anchor.resume_token.len() > 4096 {
+    if anchor
+        .resume_token
+        .as_deref()
+        .is_some_and(|token| token.is_empty() || token.len() > 4096)
+    {
         return Err("invalid mailbox delivery observation anchor token".to_string());
     }
     if anchor.expected_sha256.len() != 64
@@ -3468,11 +3481,11 @@ impl MailboxDb {
             DeliveryAttemptTarget {
                 session_id,
                 chain_id: None,
+                mode: DeliveryAttemptMode::Legacy,
             },
             delivery_invocation_uuid,
             seqs,
             remaining_count,
-            false,
         )
     }
 
@@ -3490,11 +3503,11 @@ impl MailboxDb {
             DeliveryAttemptTarget {
                 session_id,
                 chain_id,
+                mode: DeliveryAttemptMode::Headless,
             },
             delivery_invocation_uuid,
             seqs,
             remaining_count,
-            false,
         )
     }
 
@@ -3511,11 +3524,11 @@ impl MailboxDb {
             DeliveryAttemptTarget {
                 session_id,
                 chain_id,
+                mode: DeliveryAttemptMode::ExplicitInput,
             },
             attempt_id,
             &[seq],
             0,
-            true,
         )
     }
 
@@ -3526,17 +3539,19 @@ impl MailboxDb {
         delivery_invocation_uuid: &str,
         seqs: &[i64],
         remaining_count: usize,
-        explicit_input: bool,
     ) -> Result<(), String> {
         let DeliveryAttemptTarget {
             session_id,
             chain_id,
+            mode,
         } = target;
         if seqs.is_empty() {
             return Err("Cannot register an empty mailbox delivery attempt".to_string());
         }
+        let explicit_input = mode == DeliveryAttemptMode::ExplicitInput;
+        let headless = mode != DeliveryAttemptMode::Legacy;
         let now = now_rfc3339();
-        let behavior = if explicit_input {
+        let behavior = if headless {
             TransactionBehavior::Immediate
         } else {
             TransactionBehavior::Deferred
@@ -3550,6 +3565,28 @@ impl MailboxDb {
         if explicit_input {
             validate_explicit_input_delivery_on(&tx, session_id, chain_id, seqs[0])?;
         }
+        if headless {
+            for seq in seqs {
+                let occupied: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM mailbox_delivery_attempts a
+                     JOIN mailbox_delivery_attempt_items i ON i.attempt_id = a.attempt_id
+                     WHERE i.mailbox_seq = ?1 AND a.resolved_at IS NULL
+                       AND (a.submission_started_at IS NOT NULL
+                         OR a.acknowledged_at IS NOT NULL
+                         OR a.headless_submission_state IS NULL
+                         OR a.session_id != ?2))",
+                        params![seq, session_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|err| format!("Failed to inspect uncertain delivery: {err}"))?;
+                if occupied {
+                    return Err(format!(
+                        "mailbox delivery {seq} has unresolved possible submission; no launch"
+                    ));
+                }
+            }
+        }
         tx.execute(
             "UPDATE mailbox_delivery_attempts
              SET resolved_at = ?3
@@ -3558,6 +3595,11 @@ impl MailboxDb {
                 AND acknowledged_at IS NULL
                 AND submission_started_at IS NULL
                 AND resolved_at IS NULL
+                AND (?6 = 0 OR (headless_submission_state = 'prepared' AND EXISTS (
+                    SELECT 1 FROM mailbox_delivery_attempt_items AS selected
+                    WHERE selected.attempt_id = mailbox_delivery_attempts.attempt_id
+                      AND selected.mailbox_seq IN (SELECT value FROM json_each(?7))
+                )))
                 AND (?4 = 0 OR EXISTS (
                     SELECT 1 FROM mailbox_delivery_attempt_items AS items
                     WHERE items.attempt_id = mailbox_delivery_attempts.attempt_id
@@ -3568,7 +3610,9 @@ impl MailboxDb {
                 delivery_invocation_uuid,
                 &now,
                 explicit_input,
-                seqs[0]
+                seqs[0],
+                headless,
+                serde_json::to_string(seqs).map_err(|err| err.to_string())?,
             ],
         )
         .map_err(|err| {
@@ -3577,14 +3621,15 @@ impl MailboxDb {
         tx.execute(
             "INSERT INTO mailbox_delivery_attempts (
                 attempt_id, session_id, delivery_invocation_uuid, created_at,
-                prepared_remaining_count
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                prepared_remaining_count, headless_submission_state
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 attempt_id,
                 session_id,
                 delivery_invocation_uuid,
                 &now,
-                remaining_count as i64
+                remaining_count as i64,
+                if headless { Some("prepared") } else { None }
             ],
         )
         .map_err(|err| format!("Failed to insert mailbox delivery attempt: {err}"))?;
@@ -3628,6 +3673,7 @@ impl MailboxDb {
                  SET delivery_invocation_uuid = ?3
                  WHERE attempt_id = ?1
                    AND session_id = ?2
+                   AND submission_started_at IS NULL
                    AND resolved_at IS NULL",
                 params![attempt_id, session_id, delivery_invocation_uuid],
             )
@@ -3640,6 +3686,186 @@ impl MailboxDb {
         Ok(())
     }
 
+    /// The last durable fence before headless execution. A second caller or a
+    /// replaced preparation cannot cross this boundary, even after restart.
+    pub fn begin_headless_delivery_submission(
+        &self,
+        attempt_id: &str,
+        session_id: &str,
+        invocation_uuid: &str,
+        require_anchor: bool,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts
+             SET submission_started_at = ?4, headless_submission_state = 'possible'
+             WHERE attempt_id = ?1 AND session_id = ?2 AND delivery_invocation_uuid = ?3
+               AND resolved_at IS NULL AND submission_started_at IS NULL
+               AND headless_submission_state = 'prepared'
+               AND (?5 = 0 OR observation_anchor_token IS NOT NULL)",
+                params![
+                    attempt_id,
+                    session_id,
+                    invocation_uuid,
+                    now_rfc3339(),
+                    require_anchor
+                ],
+            )
+            .map_err(|err| format!("Failed to fence headless submission: {err}"))?;
+        if changed != 1 {
+            return Err(
+                "headless delivery missing anchor, replaced, or possibly submitted; no launch"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn record_delivery_observation_error(
+        &self,
+        attempt_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts SET observation_error = ?2
+             WHERE attempt_id = ?1 AND resolved_at IS NULL AND observation_confirmed_at IS NULL",
+                params![attempt_id, truncate_utf8(error, 1024)],
+            )
+            .map(|_| ())
+            .map_err(|err| format!("Failed to retain observation uncertainty: {err}"))
+    }
+
+    pub fn delivery_observation_progress(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT observation_progress FROM mailbox_delivery_attempts
+             WHERE attempt_id = ?1 AND resolved_at IS NULL",
+                params![attempt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(|err| format!("Failed to read observation progress: {err}"))
+    }
+
+    /// Store only bounded opaque provider cursors and scan counters. The CAS
+    /// prevents concurrent recovery readers from regressing the checkpoint.
+    pub fn advance_delivery_observation_progress(
+        &self,
+        attempt_id: &str,
+        previous: Option<&str>,
+        next: &str,
+    ) -> Result<(), String> {
+        if next.len() > 128 * 1024 {
+            return Err("mailbox observation progress exceeds bound".into());
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts SET observation_progress = ?3, observation_error = NULL
+             WHERE attempt_id = ?1 AND observation_progress IS ?2
+               AND resolved_at IS NULL AND observation_confirmed_at IS NULL
+               AND observation_expected_sha256 IS NOT NULL",
+                params![attempt_id, previous, next],
+            )
+            .map_err(|err| format!("Failed to persist observation progress: {err}"))?;
+        if changed != 1 {
+            return Err("mailbox observation progress changed or resolved".into());
+        }
+        Ok(())
+    }
+
+    /// Legacy null submission markers are not negative submission evidence.
+    /// Return only unresolved exact windows; already resolved history is never rewritten.
+    pub fn legacy_delivery_observation_candidates(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MailboxDeliveryWindow>, String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT attempt_id, prepared_remaining_count,
+                    (SELECT COUNT(*) FROM mailbox_delivery_attempt_items i WHERE i.attempt_id = a.attempt_id)
+             FROM mailbox_delivery_attempts a
+             WHERE session_id = ?1 AND resolved_at IS NULL
+               AND headless_submission_state IS NULL AND observation_expected_sha256 IS NULL
+             ORDER BY created_at, attempt_id LIMIT ?2"
+        ).map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![session_id, bounded_mailbox_sql_limit(limit)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(|err| err.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?;
+        let mut windows = Vec::new();
+        for (attempt_id, remaining_count, original_count) in rows {
+            let remaining_count =
+                usize::try_from(remaining_count).map_err(|err| err.to_string())?;
+            let original_count = usize::try_from(original_count).map_err(|err| err.to_string())?;
+            if original_count > 64 {
+                continue;
+            }
+            if let Some(mut window) = self.read_delivery_attempt_window(&attempt_id, true)? {
+                // Partial settlement cannot reconstruct the original envelope.
+                if window.rows.is_empty() || window.rows.len() != original_count {
+                    continue;
+                }
+                window.remaining_count = remaining_count;
+                windows.push(window);
+            }
+        }
+        Ok(windows)
+    }
+
+    /// Recovery identity is supplied only after joining the exact historical
+    /// invocation's persisted account/session authority. No tail is invented.
+    pub fn record_legacy_delivery_observation_identity(
+        &self,
+        attempt_id: &str,
+        session_id: &str,
+        context: &MailboxDeliveryObservationAnchor,
+    ) -> Result<(), String> {
+        validate_delivery_observation_anchor(session_id, context)?;
+        if context.resume_token.is_some() {
+            return Err("legacy recovery cannot fabricate an anchor".into());
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts SET observation_provider_name = ?3,
+                observation_provider_instance_id = ?4, observation_settings_id = ?5,
+                observation_session_id = ?2, observation_expected_sha256 = ?6
+             WHERE attempt_id = ?1 AND session_id = ?2 AND resolved_at IS NULL
+               AND headless_submission_state IS NULL AND observation_expected_sha256 IS NULL
+               AND observation_anchor_token IS NULL",
+                params![
+                    attempt_id,
+                    session_id,
+                    context.provider_name,
+                    context.provider_instance_id,
+                    context.settings_id,
+                    context.expected_sha256
+                ],
+            )
+            .map_err(|err| format!("Failed to preserve legacy recovery identity: {err}"))?;
+        if changed != 1 {
+            return Err("legacy observation identity unavailable or already established".into());
+        }
+        Ok(())
+    }
+
     pub fn record_delivery_observation_anchor(
         &self,
         attempt_id: &str,
@@ -3647,6 +3873,9 @@ impl MailboxDb {
         anchor: &MailboxDeliveryObservationAnchor,
     ) -> Result<(), String> {
         validate_delivery_observation_anchor(session_id, anchor)?;
+        if anchor.resume_token.is_none() {
+            return Err("new submission requires a tail anchor".into());
+        }
         let changed = self
             .conn
             .execute(
@@ -3738,7 +3967,7 @@ impl MailboxDb {
                         observation_anchor_token, observation_expected_sha256
                  FROM mailbox_delivery_attempts
                  WHERE attempt_id = ?1 AND resolved_at IS NULL
-                   AND observation_anchor_token IS NOT NULL",
+                   AND observation_expected_sha256 IS NOT NULL",
                 params![attempt_id],
                 |row| {
                     Ok(MailboxDeliveryObservationAnchor {
@@ -3774,7 +4003,7 @@ impl MailboxDb {
                  FROM mailbox_delivery_attempts AS attempts
                  WHERE attempts.session_id = ?1
                    AND attempts.resolved_at IS NULL
-                   AND attempts.observation_anchor_token IS NOT NULL
+                   AND attempts.observation_expected_sha256 IS NOT NULL
                    AND attempts.observation_confirmed_at IS NULL
                    AND EXISTS (
                        SELECT 1
@@ -3825,7 +4054,7 @@ impl MailboxDb {
                 "UPDATE mailbox_delivery_attempts
                  SET observation_confirmed_turn_id = ?2, observation_confirmed_at = ?3
                  WHERE attempt_id = ?1 AND resolved_at IS NULL
-                   AND observation_anchor_token IS NOT NULL",
+                   AND observation_expected_sha256 IS NOT NULL",
                 params![attempt_id, turn_id, now_rfc3339()],
             )
             .map_err(|err| {
@@ -3914,7 +4143,9 @@ impl MailboxDb {
                 "SELECT attempt_id
                  FROM mailbox_delivery_attempts
                  WHERE session_id = ?1
-                   AND submission_started_at IS NOT NULL
+                   AND (submission_started_at IS NOT NULL
+                     OR observation_error IS NOT NULL
+                     OR observation_expected_sha256 IS NOT NULL)
                    AND resolved_at IS NULL
                  ORDER BY submission_started_at, created_at, attempt_id
                  LIMIT 1",
@@ -4021,17 +4252,26 @@ impl MailboxDb {
         &self,
         attempt_id: &str,
     ) -> Result<Option<MailboxDeliveryWindow>, String> {
+        self.read_delivery_attempt_window(attempt_id, false)
+    }
+
+    fn read_delivery_attempt_window(
+        &self,
+        attempt_id: &str,
+        original_count: bool,
+    ) -> Result<Option<MailboxDeliveryWindow>, String> {
         let Some((
             session_id,
             delivery_invocation_uuid,
             acknowledged_at,
             submission_started_at,
             resolved_at,
+            prepared_remaining_count,
         )) = self
             .conn
             .query_row(
                 "SELECT session_id, delivery_invocation_uuid, acknowledged_at,
-                        submission_started_at, resolved_at
+                        submission_started_at, resolved_at, prepared_remaining_count
                  FROM mailbox_delivery_attempts WHERE attempt_id = ?1",
                 params![attempt_id],
                 |row| {
@@ -4041,6 +4281,7 @@ impl MailboxDb {
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
                     ))
                 },
             )
@@ -4077,11 +4318,15 @@ impl MailboxDb {
             .into_iter()
             .filter(mailbox_row_is_deliverable_pending)
             .collect::<Vec<_>>();
-        let pending_count = self
-            .list_pending(&session_id)?
-            .into_iter()
-            .filter(mailbox_row_is_deliverable_pending)
-            .count();
+        let remaining_count = if original_count {
+            usize::try_from(prepared_remaining_count).map_err(|err| err.to_string())?
+        } else {
+            self.list_pending(&session_id)?
+                .into_iter()
+                .filter(mailbox_row_is_deliverable_pending)
+                .count()
+                .saturating_sub(rows.len())
+        };
         Ok(Some(MailboxDeliveryWindow {
             attempt_id: attempt_id.to_string(),
             session_id,
@@ -4089,7 +4334,7 @@ impl MailboxDb {
             acknowledged_at,
             submission_started_at,
             resolved_at,
-            remaining_count: pending_count.saturating_sub(rows.len()),
+            remaining_count,
             rows,
         }))
     }
@@ -11490,6 +11735,12 @@ mod tests {
                 [],
             )
             .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+            ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
+            )
+            .unwrap();
         connection.pragma_update(None, "user_version", 1).unwrap();
         drop(connection);
 
@@ -11544,6 +11795,8 @@ mod tests {
             .execute_batch(
                 "DROP INDEX idx_session_admission_state_runtime;
                  DROP INDEX idx_runtime_generation_lifecycle_created;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 8;",
             )
             .unwrap();
@@ -11587,6 +11840,8 @@ mod tests {
                  DROP INDEX idx_mailbox_payload_reference;
                  DROP INDEX idx_completion_event_payload_reference;
                  ALTER TABLE completion_event DROP COLUMN payload_reclaimed_at;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 9;",
             )
             .unwrap();
@@ -11638,6 +11893,8 @@ mod tests {
             .execute_batch(
                 "DROP INDEX idx_mailbox_payload_reference;
                  DROP INDEX idx_completion_event_payload_reference;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 10;",
             )
             .unwrap();
@@ -11684,6 +11941,8 @@ mod tests {
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_error;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_confirmed_turn_id;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_confirmed_at;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 11;",
             )
             .unwrap();
@@ -11785,6 +12044,8 @@ mod tests {
                  );
                  CREATE INDEX idx_session_wake_claim_claimed_at
                     ON session_wake_claim(claimed_at);
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 2;",
             )
             .unwrap();
@@ -11822,6 +12083,8 @@ mod tests {
         connection
             .execute_batch(
                 "DROP TABLE session_admission_queue;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 5;",
             )
             .unwrap();
@@ -11875,6 +12138,8 @@ mod tests {
                     admission_id, registration_identity, state,
                     created_at_unix_ms, updated_at_unix_ms
                  ) VALUES ('legacy-admission', 'legacy-registration', 'queued', 1, 1);
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 6;",
             )
             .unwrap();
@@ -12004,6 +12269,8 @@ mod tests {
                     generation_uuid, lifecycle_state, identity_os_pid,
                     identity_os_boot_id, identity_os_pid_starttime_ticks
                  ) VALUES ('legacy-verified-running', 'running', 42, 'legacy-boot', 7);
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 3;",
             )
             .unwrap();
@@ -12182,6 +12449,8 @@ mod tests {
 
         let connection = Connection::open(&sidecar_path).unwrap();
         for column in [
+            "headless_submission_state",
+            "observation_progress",
             "evidence_reconciled_at",
             "evidence_observed_at",
             "evidence_turn_generation_id",
@@ -12310,6 +12579,13 @@ mod tests {
             .unwrap();
         mailbox
             .connection()
+            .execute_batch(
+                "ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+            ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
+            )
+            .unwrap();
+        mailbox
+            .connection()
             .pragma_update(None, "user_version", 1)
             .unwrap();
         drop(mailbox);
@@ -12410,6 +12686,13 @@ mod tests {
                     &identity.os_boot_id,
                     identity.os_pid_starttime_ticks,
                 ],
+            )
+            .unwrap();
+        mailbox
+            .connection()
+            .execute_batch(
+                "ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+            ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
             )
             .unwrap();
         mailbox
@@ -13968,6 +14251,219 @@ mod tests {
     }
 
     #[test]
+    fn age347_possible_submission_fence_survives_restart_and_settles_listener_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let event_id = "ab_age347";
+        db.register_completion_event(completion_registration(
+            event_id,
+            "async",
+            "session-a",
+            "11111111-1111-4111-8111-111111111111",
+        ))
+        .unwrap();
+        db.trigger_completion_event(completion_trigger(event_id, "{}", false))
+            .unwrap();
+        let row = db.list_pending("session-a").unwrap().remove(0);
+        db.register_headless_delivery_attempt(
+            "exact-attempt",
+            "session-a",
+            None,
+            "exact-attempt",
+            &[row.seq],
+            0,
+        )
+        .unwrap();
+        db.bind_delivery_attempt_invocation("exact-attempt", "session-a", "native")
+            .unwrap();
+        assert!(
+            db.begin_headless_delivery_submission("exact-attempt", "session-a", "native", true)
+                .is_err()
+        );
+        let anchor = MailboxDeliveryObservationAnchor {
+            provider_name: "account".into(),
+            provider_instance_id: "instance".into(),
+            settings_id: "settings".into(),
+            provider_session_id: "session-a".into(),
+            resume_token: Some("opaque-tail".into()),
+            expected_sha256: "a".repeat(64),
+        };
+        db.record_delivery_observation_anchor("exact-attempt", "session-a", &anchor)
+            .unwrap();
+        assert!(
+            db.begin_headless_delivery_submission("exact-attempt", "session-b", "native", true)
+                .is_err()
+        );
+        assert!(
+            db.begin_headless_delivery_submission(
+                "exact-attempt",
+                "session-a",
+                "other-generation",
+                true
+            )
+            .is_err()
+        );
+        db.begin_headless_delivery_submission("exact-attempt", "session-a", "native", true)
+            .unwrap();
+        for _ in 0..3 {
+            drop(db);
+            db = MailboxDb::open(&path).unwrap();
+            db.record_delivery_observation_error(
+                "exact-attempt",
+                "session_turn_staging_capacity_exceeded",
+            )
+            .unwrap();
+            assert!(
+                db.begin_headless_delivery_submission("exact-attempt", "session-a", "native", true)
+                    .is_err()
+            );
+            assert!(
+                db.register_headless_delivery_attempt(
+                    "retry",
+                    "session-a",
+                    None,
+                    "retry",
+                    &[row.seq],
+                    0
+                )
+                .is_err()
+            );
+            assert!(
+                !db.resolve_unacknowledged_delivery_attempt("exact-attempt")
+                    .unwrap()
+            );
+            assert!(
+                db.completion_event_listeners(event_id).unwrap()[0]
+                    .acknowledged_at
+                    .is_none()
+            );
+        }
+        db.record_delivery_observation_confirmation("exact-attempt", "native-user")
+            .unwrap();
+        db.mark_delivered("session-a", None, &[row.seq], "native")
+            .unwrap();
+        let acknowledged = db.completion_event_listeners(event_id).unwrap()[0]
+            .acknowledged_at
+            .clone();
+        assert!(acknowledged.is_some());
+        for _ in 0..3 {
+            db.mark_delivered("session-a", None, &[row.seq], "native")
+                .unwrap();
+        }
+        assert_eq!(
+            db.completion_event_listeners(event_id).unwrap()[0].acknowledged_at,
+            acknowledged
+        );
+        assert_eq!(
+            db.list_mailbox("session-a", true).unwrap()[0].delivery_attempts,
+            1
+        );
+    }
+
+    #[test]
+    fn age347_legacy_null_marker_is_uncertain_and_original_batch_count_is_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("old", "session-a")));
+        db.register_delivery_attempt("legacy", "session-a", "native", &[row.seq], 7)
+            .unwrap();
+        db.record_delivery_observation_anchor_failure("legacy", "session-a", "capacity")
+            .unwrap();
+        assert!(
+            db.register_headless_delivery_attempt(
+                "retry",
+                "session-a",
+                None,
+                "retry",
+                &[row.seq],
+                0
+            )
+            .is_err()
+        );
+        assert!(!db.delivery_attempt_submission_started("legacy").unwrap());
+        let windows = db
+            .legacy_delivery_observation_candidates("session-a", 1)
+            .unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].remaining_count, 7);
+        assert!(
+            db.legacy_delivery_observation_candidates("session-b", 1)
+                .unwrap()
+                .is_empty()
+        );
+        let context = MailboxDeliveryObservationAnchor {
+            provider_name: "account".into(),
+            provider_instance_id: "instance".into(),
+            settings_id: "settings".into(),
+            provider_session_id: "session-a".into(),
+            resume_token: None,
+            expected_sha256: "a".repeat(64),
+        };
+        db.record_legacy_delivery_observation_identity("legacy", "session-a", &context)
+            .unwrap();
+        assert_eq!(
+            db.pending_delivery_observations("session-a", 1).unwrap()[0].anchor,
+            context
+        );
+        assert!(
+            db.register_headless_delivery_attempt(
+                "retry",
+                "session-a",
+                None,
+                "retry",
+                &[row.seq],
+                0
+            )
+            .is_err()
+        );
+        assert!(
+            db.delivery_observation_confirmation("legacy")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!db.delivery_attempt_submission_started("legacy").unwrap());
+    }
+
+    #[test]
+    fn age347_v12_upgrade_preserves_legacy_uncertainty_without_inventing_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("legacy", "session-a")));
+        db.register_delivery_attempt("legacy", "session-a", "native", &[row.seq], 0)
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+            ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
+            PRAGMA user_version = 12;",
+            )
+            .unwrap();
+        drop(db);
+        let mut db = MailboxDb::open(&path).unwrap();
+        assert!(!db.delivery_attempt_submission_started("legacy").unwrap());
+        assert!(
+            db.register_headless_delivery_attempt(
+                "retry",
+                "session-a",
+                None,
+                "retry",
+                &[row.seq],
+                0
+            )
+            .is_err()
+        );
+        assert!(
+            db.delivery_attempt_window("legacy")
+                .unwrap()
+                .unwrap()
+                .resolved_at
+                .is_none()
+        );
+    }
+
+    #[test]
     fn delivery_observation_anchor_and_confirmation_are_attempt_scoped() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
@@ -13985,7 +14481,7 @@ mod tests {
             provider_instance_id: "provider-instance-a".to_string(),
             settings_id: "settings-a".to_string(),
             provider_session_id: "session-a".to_string(),
-            resume_token: "opaque-tail-anchor".to_string(),
+            resume_token: Some("opaque-tail-anchor".to_string()),
             expected_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
         };
@@ -13998,7 +14494,7 @@ mod tests {
             Some(anchor.clone())
         );
         let retry_anchor = MailboxDeliveryObservationAnchor {
-            resume_token: "later-retry-anchor".to_string(),
+            resume_token: Some("later-retry-anchor".to_string()),
             ..anchor.clone()
         };
         db.record_delivery_observation_anchor("attempt-observation", "session-a", &retry_anchor)

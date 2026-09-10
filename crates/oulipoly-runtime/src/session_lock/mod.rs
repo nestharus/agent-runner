@@ -50,6 +50,17 @@ pub struct ProcessAuthority {
     session_id: String,
 }
 
+impl Drop for ProcessAuthority {
+    fn drop(&mut self) {
+        // Closing our descriptor alone leaves flock held by a concurrent fork's
+        // inherited duplicate until exec. Authority ends with this guard, not
+        // with unrelated child setup; explicitly revoke the shared lock first.
+        if let Err(error) = fs4::FileExt::unlock(&self._file) {
+            tracing::warn!("Failed to release session process authority: {error}");
+        }
+    }
+}
+
 impl ProcessAuthority {
     pub fn require_session(&self, session_id: &str) -> Result<(), LockError> {
         if self.session_id == session_id {
@@ -508,6 +519,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock = SessionLock::new(dir.path()).unwrap();
         (dir, lock)
+    }
+
+    // dup shares the open file description exactly as a concurrent fork does
+    // until exec closes CLOEXEC descriptors. It must not extend guard authority.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_process_authority_releases_even_with_a_fork_style_duplicate() {
+        let (_dir, lock) = lock_fixture();
+        let authority = lock.acquire_process_authority("release-owner").unwrap();
+        let inherited = authority._file.try_clone().unwrap();
+        assert!(matches!(
+            lock.acquire_process_authority("release-owner"),
+            Err(LockError::Busy { .. })
+        ));
+        drop(authority);
+        let successor = lock.acquire_process_authority("release-owner").unwrap();
+        drop(inherited);
+        assert!(matches!(
+            lock.acquire_process_authority("release-owner"),
+            Err(LockError::Busy { .. })
+        ));
+        drop(successor);
+        lock.acquire_process_authority("release-owner").unwrap();
     }
 
     #[test]
