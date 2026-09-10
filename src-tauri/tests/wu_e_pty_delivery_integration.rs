@@ -3260,7 +3260,7 @@ exit 93"#,
     fn probe(&mut self, fd: RawFd) {
         // Differential TUI paint can reuse unchanged cells inside the marker.
         // Only the provider consuming this fresh FIFO challenge may acknowledge it.
-        let nonce = Uuid::new_v4().to_string();
+        let nonce = uuid::Uuid::new_v4().to_string();
         writeln!(self.control, "probe:{nonce}").unwrap();
         let response = read_pty_until_file_occurrences(
             fd,
