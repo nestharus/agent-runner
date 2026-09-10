@@ -270,10 +270,10 @@ pub(crate) fn wake_sweep_does_not_disturb_live_identity_matched_claim() {
     assert_xdg_isolated(&fixture);
 }
 
-pub(crate) fn wake_sweep_does_not_rewake_consumed_pending_mailbox() {
+pub(crate) fn wake_sweep_does_not_treat_pre_anchor_prose_as_consumption() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.write_provider(&provider_script("", "", "consumed-not-rewoken.txt"));
+    fixture.write_provider(&provider_script("", "", "pre-anchor-prose-retried.txt"));
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-consumed");
@@ -282,10 +282,22 @@ pub(crate) fn wake_sweep_does_not_rewake_consumed_pending_mailbox() {
 
     let output = fixture.run_mailbox_list(SESSION);
     assert_success(&output);
-    settle_wake_sweep();
-
-    assert_prompt_file_missing(&fixture, "consumed-not-rewoken.txt");
-    assert_pending_mailbox_count(&fixture, SESSION, 1);
+    // The stored prose predates the delivery anchor and has no exact nonce.
+    // It cannot suppress this row; only the new provider-observed submission
+    // may settle it (sweep/consumed.rs and the AGE347 observation contract).
+    let prompt = wait_for_file(&fixture.prompt_file("pre-anchor-prose-retried.txt"));
+    assert_prompt_contains_handle(&prompt, "h-consumed");
+    wait_until("fresh post-anchor evidence settles the pending row", || {
+        delivered_single_row_without_error_or_claim(&fixture, SESSION)
+    });
+    let row = fixture
+        .mailbox()
+        .list_mailbox(SESSION, true)
+        .unwrap()
+        .remove(0);
+    assert_eq!(row.delivery_attempts, 1);
+    assert!(row.delivered_by_invocation_uuid.is_some());
+    assert_pending_mailbox_count(&fixture, SESSION, 0);
     assert_xdg_isolated(&fixture);
 }
 

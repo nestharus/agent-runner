@@ -109,8 +109,8 @@ fn wake_sweep_does_not_disturb_live_identity_matched_claim() {
 }
 
 #[test]
-fn wake_sweep_does_not_rewake_consumed_pending_mailbox() {
-    cases_batch_sweep::wake_sweep_does_not_rewake_consumed_pending_mailbox();
+fn wake_sweep_does_not_treat_pre_anchor_prose_as_consumption() {
+    cases_batch_sweep::wake_sweep_does_not_treat_pre_anchor_prose_as_consumption();
 }
 
 #[test]
