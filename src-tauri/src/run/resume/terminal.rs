@@ -288,27 +288,16 @@ fn handle_ordinary_resume_attempt_terminal_signal(
     terminal_completion_confirmed: bool,
     mailbox_delivery_outcome: Option<wake::MailboxDeliveryOutcome>,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    let confirmed_delivery_evidence = ordinary_confirmed_delivery_evidence(
-        input,
-        result,
-        completion_evidence,
-        terminal_completion_confirmed,
-        mailbox_delivery_outcome.as_ref(),
-    )?;
     let turn_generation_id = attempt.invocation.id.clone();
-    let confirmed_delivery = match confirmed_delivery_evidence.as_ref() {
-        Some(evidence) => Some(ConfirmedDeliverySettlement {
-            delivery_id: input.mailbox_delivery_nonce.ok_or_else(|| {
-                "confirmed mailbox delivery is missing its delivery nonce".to_string()
-            })?,
-            session_id: input.mailbox_session_id,
-            turn_generation_id: &turn_generation_id,
-            submitted_evidence: &evidence.submitted,
-            confirmed_evidence: &evidence.confirmed,
-            observed_at: current_unix_millis(),
-        }),
-        None => None,
-    };
+    let confirmed_delivery_evidence =
+        ordinary_confirmed_delivery_evidence(input, completion_evidence)?;
+    let confirmed_delivery = delivery_settlement(
+        input,
+        &turn_generation_id,
+        confirmed_delivery_evidence.as_ref(),
+    )?;
+    #[cfg(test)]
+    races_tests::checkpoint("after_terminal_evidence");
     let outcome = resume_terminal_disposition_outcome(
         input,
         attempt,
@@ -350,6 +339,12 @@ fn handle_ordinary_resume_attempt_terminal_signal(
     )? {
         return Ok(control);
     }
+    // Observation may have run (or a final partial consumer ACK may have won).
+    // Reconcile at the finalization boundary; never carry speculative completion
+    // across this window as though it were host confirmation.
+    let final_evidence = ordinary_confirmed_delivery_evidence(input, completion_evidence)?;
+    let confirmed_delivery =
+        delivery_settlement(input, &turn_generation_id, final_evidence.as_ref())?;
     finalize_completed_attempt_for_resume(
         input,
         attempt,
@@ -368,52 +363,83 @@ struct ConfirmedDeliveryEvidence {
 
 fn ordinary_confirmed_delivery_evidence(
     input: &ResumeAttemptInput<'_>,
-    result: &executor::ExecutionResult,
     completion_evidence: wake::ResumeCompletionEvidence<'_>,
-    terminal_completion_confirmed: bool,
-    mailbox_delivery_outcome: Option<&wake::MailboxDeliveryOutcome>,
 ) -> Result<Option<ConfirmedDeliveryEvidence>, String> {
-    // Durable consumer ACK is not automatic transcript/transport confirmation.
-    // Do not manufacture ConfirmedDeliverySettlement merely from assistant success.
-    if wake::mailbox_delivery_already_settled(input)? {
+    if input.mailbox_delivery_seqs.is_empty() {
         return Ok(None);
     }
-    let completed_success = completion_evidence.recovered_generic_nonzero
-        || super::predicate::completed_attempt_success(result, terminal_completion_confirmed);
-    let delivery_confirmed = matches!(
-        mailbox_delivery_outcome,
-        Some(
-            wake::MailboxDeliveryOutcome::Confirmed
-                | wake::MailboxDeliveryOutcome::ConfirmedPromptAcceptance(_)
-        )
-    );
-    if input.mailbox_delivery_seqs.is_empty() || (!completed_success && !delivery_confirmed) {
-        return Ok(None);
-    }
+    let attempt_id = input
+        .mailbox_delivery_nonce
+        .ok_or_else(|| "mailbox confirmation missing exact attempt nonce".to_string())?;
+    let db = oulipoly_state::mailbox::MailboxDb::open_default_if_exists()?
+        .ok_or_else(|| "mailbox confirmation missing sidecar".to_string())?;
+    independent_delivery_evidence(
+        &db,
+        attempt_id,
+        input.mailbox_session_id,
+        Some(&input.resolved.chain_id),
+        input.mailbox_delivery_seqs,
+        input.answer,
+        completion_evidence.prompt_acceptance_confirmation,
+    )
+}
 
-    let submitted = completion_evidence
-        .prompt_acceptance_confirmation
-        .map(|acceptance| acceptance.prompt_sha256().to_string())
-        .or_else(|| {
-            input
-                .answer
-                .map(|answer| wake::sha256_hex(answer.as_bytes()))
-        })
+fn independent_delivery_evidence(
+    db: &oulipoly_state::mailbox::MailboxDb,
+    attempt_id: &str,
+    session_id: &str,
+    chain_id: Option<&str>,
+    seqs: &[i64],
+    answer: Option<&str>,
+    acceptance: Option<&ValidatedPromptAcceptance>,
+) -> Result<Option<ConfirmedDeliveryEvidence>, String> {
+    // Validate the complete authority even when independent evidence exists.
+    // Consumer settlement neither creates nor invalidates host evidence.
+    db.delivery_attempt_fully_settled(attempt_id, session_id, chain_id, seqs)?;
+    let observed_turn = db.delivery_observation_confirmation(attempt_id)?;
+    if acceptance.is_none() && observed_turn.is_none() {
+        return Ok(None);
+    }
+    let submitted = acceptance
+        .map(|value| value.prompt_sha256().to_string())
+        .or_else(|| answer.map(|value| wake::sha256_hex(value.as_bytes())))
         .ok_or_else(|| "confirmed mailbox delivery is missing its composed prompt".to_string())?;
-    let confirmed = completion_evidence
-        .prompt_acceptance_confirmation
-        .map(|acceptance| {
-            format!(
-                "{};prompt_sha256={}",
-                acceptance.protocol(),
-                acceptance.prompt_sha256()
-            )
-        })
-        .unwrap_or_else(|| format!("ordinary_resume_delivery_confirmed;prompt_sha256={submitted}"));
+    let confirmed = match acceptance {
+        Some(value) => format!(
+            "{};prompt_sha256={}",
+            value.protocol(),
+            value.prompt_sha256()
+        ),
+        None => format!(
+            "observed_mailbox_delivery;turn_id={};prompt_sha256={submitted}",
+            observed_turn.unwrap()
+        ),
+    };
     Ok(Some(ConfirmedDeliveryEvidence {
         submitted,
         confirmed,
     }))
+}
+
+fn delivery_settlement<'a>(
+    input: &'a ResumeAttemptInput<'_>,
+    turn_generation_id: &'a str,
+    evidence: Option<&'a ConfirmedDeliveryEvidence>,
+) -> Result<Option<ConfirmedDeliverySettlement<'a>>, String> {
+    evidence
+        .map(|evidence| {
+            Ok(ConfirmedDeliverySettlement {
+                delivery_id: input.mailbox_delivery_nonce.ok_or_else(|| {
+                    "confirmed mailbox delivery is missing its delivery nonce".to_string()
+                })?,
+                session_id: input.mailbox_session_id,
+                turn_generation_id,
+                submitted_evidence: &evidence.submitted,
+                confirmed_evidence: &evidence.confirmed,
+                observed_at: current_unix_millis(),
+            })
+        })
+        .transpose()
 }
 
 fn resume_terminal_disposition_outcome(
@@ -742,7 +768,7 @@ mod tests {
         ExecutionResult, ResumeAcceptanceStatus, SessionCaptureMethod, SessionCaptureResult,
     };
 
-    fn clean_result() -> ExecutionResult {
+    pub(super) fn clean_result() -> ExecutionResult {
         ExecutionResult {
             stdout: b"tool output".to_vec(),
             stderr: String::new(),
@@ -875,3 +901,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "terminal_races_tests.rs"]
+pub(super) mod races_tests;

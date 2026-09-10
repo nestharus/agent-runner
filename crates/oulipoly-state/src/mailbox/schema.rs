@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 14;
+pub(super) const CURRENT_VERSION: i64 = 15;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -117,6 +117,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 14,
         owner: SidecarEntity::MailboxDelivery,
         apply: ensure_observation_stop_schema,
+    },
+    MigrationStep {
+        target_version: 15,
+        owner: SidecarEntity::MailboxDelivery,
+        apply: ensure_delivery_finalization_schema,
     },
 ];
 
@@ -544,4 +549,9 @@ fn migrate_headless_observation_fence(conn: &Connection) -> Result<(), String> {
 fn ensure_observation_stop_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("0014_observation_stop.sql"))
         .map_err(|err| format!("Failed to create observation stop history: {err}"))
+}
+
+fn ensure_delivery_finalization_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("0015_delivery_finalization.sql"))
+        .map_err(|err| format!("Failed to create delivery finalization references: {err}"))
 }

@@ -423,6 +423,8 @@ pub(super) fn handle_unconfirmed_mailbox_delivery_if_needed(
     {
         return Ok(None);
     }
+    #[cfg(test)]
+    super::terminal::races_tests::checkpoint("before_failure_reconcile");
     if reconcile_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")? {
         return Ok(None);
     }

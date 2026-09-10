@@ -1255,6 +1255,22 @@ prepare once under the normal submission fence. Actual receipt evidence is still
 required for settlement; a still-refusing provider stops again. Do not ACK pending
 notifications as a workaround for a capacity or observation failure.
 
+A genuine consumer ACK is distinct from validated provider prompt acceptance or
+observed delivery. Affirmative assistant completion alone does not become host
+confirmation. Prepared headless finalizers retain the exact attempt and batch
+through finalization, even when a late ACK falls outside the global 1,024-row
+terminal-history window. Normal scope exit releases that reference; bounded
+maintenance reclaims references whose exact owner process has died or been
+replaced. Uncertain process liveness retains evidence rather than expiring a live
+finalizer by time. This retention grants no submission, ACK, rearm or claim power.
+
+This requires PID-sidecar schema **15** (14→15 adds the finalizer-reference table
+and indexes; state.db is unchanged). Quiesce old runner/helper writers before
+cutover: already-open old connections do not honor these references, and older
+runners reject the upgraded sidecar on reopen. The migration does not reconstruct
+previously pruned evidence or rewrite existing confirmation history. No transparent
+mixed-version or downgrade guarantee is provided.
+
 Outbound observation keeps its pre-send tail position through body and submit
 input drainage. The anchor is released after the message becomes sent, not
 replaced by a new tail. Each observer read reserves one delivery slot until the

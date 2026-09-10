@@ -35,6 +35,7 @@ pub(super) fn prepared_headless_resume_execution(
     max_attempts: usize,
 ) -> super::execution::PreparedHeadlessResumeExecution {
     super::execution::PreparedHeadlessResumeExecution {
+        _mailbox_finalization_guard: mailbox_delivery.finalization_guard,
         answer: mailbox_delivery.answer,
         mailbox_session_id: mailbox_delivery.session_id,
         mailbox_delivery_seqs: mailbox_delivery.seqs,

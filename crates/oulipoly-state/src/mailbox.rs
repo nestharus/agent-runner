@@ -23,8 +23,10 @@ use uuid::Uuid;
 
 use crate::pid_identity::{self, ProcessIdentity};
 
+mod finalization;
 #[path = "mailbox/schema.rs"]
 mod schema;
+pub use finalization::DeliveryFinalizationGuard;
 
 pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
 pub const MAILBOX_DELIVERY_UNCONFIRMED_ERROR: &str = "mailbox_delivery_unconfirmed";
@@ -2901,6 +2903,7 @@ impl MailboxDb {
             .map_err(|_| "Terminal history prune limit does not fit SQLite INTEGER".to_string())?;
         let keep = i64::try_from(keep)
             .map_err(|_| "Terminal history keep count does not fit SQLite INTEGER".to_string())?;
+        finalization::reap_abandoned_finalizers(&mut self.conn, limit)?;
         // Candidate discovery can scan retained history. Keep it outside the write
         // transaction so maintenance cannot block unrelated mailbox writers.
         let attempt_ids = prunable_delivery_attempt_ids(&self.conn, keep, limit)?;
@@ -2917,6 +2920,8 @@ impl MailboxDb {
                     "SELECT EXISTS (
                          SELECT 1 FROM mailbox_delivery_attempts
                          WHERE attempt_id = ?1
+                           AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                                           WHERE finalizer.attempt_id = ?1)
                            AND resolved_at IS NOT NULL
                            AND (
                                evidence_disposition IS NULL
@@ -2967,7 +2972,10 @@ impl MailboxDb {
                                JOIN mailbox_delivery_attempts AS attempt
                                  ON attempt.attempt_id = item.attempt_id
                                WHERE item.mailbox_seq = candidate.seq
-                                 AND attempt.resolved_at IS NULL
+                                 AND (attempt.resolved_at IS NULL OR EXISTS (
+                                     SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                                     WHERE finalizer.attempt_id = attempt.attempt_id
+                                 ))
                            )
                      )",
                     params![row.seq, AGENT_BASH_COMPLETE_KIND],
@@ -6846,7 +6854,10 @@ fn terminal_history_retention_stats_on(
                JOIN mailbox_delivery_attempts AS attempt
                  ON attempt.attempt_id = item.attempt_id
                WHERE item.mailbox_seq = candidate.seq
-                 AND attempt.resolved_at IS NULL
+                 AND (attempt.resolved_at IS NULL OR EXISTS (
+                       SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                       WHERE finalizer.attempt_id = attempt.attempt_id
+                   ))
            )",
         params![keep, AGENT_BASH_COMPLETE_KIND],
         "prunable terminal mailbox rows",
@@ -6862,6 +6873,8 @@ fn terminal_history_retention_stats_on(
         "SELECT COUNT(*)
          FROM mailbox_delivery_attempts AS candidate
          WHERE candidate.resolved_at IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                           WHERE finalizer.attempt_id = candidate.attempt_id)
            AND (
                candidate.evidence_disposition IS NULL
                OR candidate.evidence_disposition NOT IN ('pending', 'legacy_pending')
@@ -6937,6 +6950,8 @@ fn prunable_delivery_attempt_ids(
             "SELECT attempt_id
              FROM mailbox_delivery_attempts AS candidate
              WHERE candidate.resolved_at IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                           WHERE finalizer.attempt_id = candidate.attempt_id)
                AND (
                    candidate.evidence_disposition IS NULL
                    OR candidate.evidence_disposition NOT IN ('pending', 'legacy_pending')
@@ -6992,7 +7007,10 @@ fn prunable_terminal_mailbox_rows(
                    JOIN mailbox_delivery_attempts AS attempt
                      ON attempt.attempt_id = item.attempt_id
                    WHERE item.mailbox_seq = candidate.seq
-                     AND attempt.resolved_at IS NULL
+                     AND (attempt.resolved_at IS NULL OR EXISTS (
+                       SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                       WHERE finalizer.attempt_id = attempt.attempt_id
+                   ))
                )
              ORDER BY candidate.seq ASC
              LIMIT ?3",
@@ -16063,6 +16081,198 @@ mod tests {
         assert!(db.notifications_paused("session-a").unwrap());
         db.set_notifications_paused("session-a", false).unwrap();
         assert!(!db.notifications_paused("session-a").unwrap());
+    }
+
+    #[test]
+    fn early_ack_old_backlog_survives_prune_until_finalizer_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let old = inserted_row(db.enqueue_agent_bash_complete(&input("old", "session-a")));
+        let mut newer = Vec::new();
+        for n in 0..TERMINAL_HISTORY_KEEP_ROWS {
+            newer.push(
+                inserted_row(
+                    db.enqueue_agent_bash_complete(&input(&format!("new-{n}"), "session-b")),
+                )
+                .seq,
+            );
+        }
+        db.mark_delivered("session-b", None, &newer, "other-consumer")
+            .unwrap();
+        let retained = db.retain_delivery_finalization("exact").unwrap();
+        db.register_headless_delivery_attempt(
+            "exact",
+            "session-a",
+            None,
+            "invocation",
+            &[old.seq],
+            0,
+        )
+        .unwrap();
+        assert!(
+            !db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                .unwrap()
+        );
+        // Same public-API probe signal, now retaining the live finalization obligation.
+        let mut consumer = MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            consumer
+                .acknowledge_range("session-a", old.seq, old.seq, "consumer")
+                .unwrap(),
+            1
+        );
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                .unwrap()
+        );
+        assert_eq!(db.list_mailbox("session-a", true).unwrap().len(), 1);
+        // Both mailbox and attempt pruning (including keep=0) preserve exact authority.
+        db.prune_terminal_history_with_keep(2048, 0).unwrap();
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                .unwrap()
+        );
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-b", None, &[old.seq])
+                .is_err()
+        );
+        assert!(
+            db.delivery_attempt_fully_settled("missing", "session-a", None, &[old.seq])
+                .is_err()
+        );
+        assert!(
+            db.delivery_observation_confirmation("exact")
+                .unwrap()
+                .is_none()
+        );
+        drop(retained);
+        db.prune_terminal_history_with_keep(2048, 0).unwrap();
+        assert!(db.list_mailbox("session-a", true).unwrap().is_empty());
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                .is_err()
+        );
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn finalization_abrupt_exit_child() {
+        let Some(path) = std::env::var_os("AGE353_FINALIZATION_CHILD_DB") else {
+            return;
+        };
+        let db = MailboxDb::open(Path::new(&path)).unwrap();
+        let _retained = db.retain_delivery_finalization("crashed").unwrap();
+        // Abrupt process exit, deliberately no Rust destructors. Parent waits/reaps.
+        std::process::exit(23);
+    }
+
+    #[test]
+    fn finalization_reaps_crashed_owner_without_starvation_or_live_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let live = db.retain_delivery_finalization("live").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mailbox::tests::finalization_abrupt_exit_child",
+                "--nocapture",
+            ])
+            .env("AGE353_FINALIZATION_CHILD_DB", &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(23));
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            2
+        );
+        finalization::reap_abandoned_finalizers(&mut db.conn, 1).unwrap();
+        // First bounded slice rotates the live owner, second reaches the crash.
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            2
+        );
+        finalization::reap_abandoned_finalizers(&mut db.conn, 1).unwrap();
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            1
+        );
+        drop(live);
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            0
+        );
+        // Reused PID identity is not the old finalizer, even though its PID is live.
+        let reused = db.retain_delivery_finalization("reused").unwrap();
+        db.conn.execute("UPDATE mailbox_delivery_finalizers SET os_pid_starttime_ticks = os_pid_starttime_ticks + 1", []).unwrap();
+        finalization::reap_abandoned_finalizers(&mut db.conn, 1).unwrap();
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            0
+        );
+        drop(reused);
+    }
+
+    #[test]
+    fn finalization_reference_migrates_v14_without_losing_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("pending", "session-a")));
+        db.conn
+            .execute_batch("DROP TABLE mailbox_delivery_finalizers; PRAGMA user_version = 14;")
+            .unwrap();
+        drop(db);
+        let db = MailboxDb::open(&path).unwrap();
+        assert_eq!(db.list_pending("session-a").unwrap()[0].seq, row.seq);
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            15
+        );
+        let retained = db.retain_delivery_finalization("new").unwrap();
+        drop(retained);
     }
 
     #[test]

@@ -36,6 +36,7 @@ const DELIVERY_NONCE_LENGTH_PLACEHOLDER: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
 pub(crate) struct PreparedMailboxDelivery {
+    pub finalization_guard: Option<oulipoly_state::mailbox::DeliveryFinalizationGuard>,
     pub answer: Option<String>,
     pub session_id: String,
     pub seqs: Vec<i64>,
@@ -1238,6 +1239,7 @@ fn open_mailbox_sidecar() -> Result<Option<MailboxDb>, String> {
 
 fn empty_delivery(answer: Option<String>, session_id: String) -> PreparedMailboxDelivery {
     PreparedMailboxDelivery {
+        finalization_guard: None,
         answer,
         session_id,
         seqs: Vec::new(),
@@ -1268,6 +1270,7 @@ fn delivery_for_batch(
         .iter()
         .any(|row| row.kind != SUBMITTED_INPUT_KIND);
     let delivery_nonce = new_delivery_nonce();
+    let finalization_guard = db.retain_delivery_finalization(&delivery_nonce)?;
     if explicit_input {
         db.register_explicit_input_delivery_attempt(
             &delivery_nonce,
@@ -1286,14 +1289,16 @@ fn delivery_for_batch(
         )?;
     }
     let prefix = render_mailbox_prefix(&batch.rows, batch.remaining_count, &delivery_nonce)?;
-    Ok(prepared_delivery(
+    let mut prepared = prepared_delivery(
         session_id,
         seqs,
         prefix,
         answer,
         delivery_nonce,
         requires_turn_confirmation,
-    ))
+    );
+    prepared.finalization_guard = Some(finalization_guard);
+    Ok(prepared)
 }
 
 pub(crate) fn bind_headless_resume_delivery_attempt(
@@ -1373,6 +1378,7 @@ fn prepared_delivery(
     requires_turn_confirmation: bool,
 ) -> PreparedMailboxDelivery {
     PreparedMailboxDelivery {
+        finalization_guard: None,
         answer: Some(compose_answer(prefix, answer)),
         session_id,
         seqs,
@@ -1649,6 +1655,7 @@ mod tests {
         let original = Some("byte-identical".to_string());
         let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27".to_string();
         let prepared = PreparedMailboxDelivery {
+            finalization_guard: None,
             answer: original.clone(),
             session_id,
             seqs: Vec::new(),
