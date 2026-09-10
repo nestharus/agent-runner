@@ -7760,13 +7760,16 @@ fn validate_recovered_dead_process(
             return Err(GenerationRejection::InvariantViolation);
         };
         match pid_identity::observe_finalizer_process_identity(recorded.os_pid) {
-            pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
+            pid_identity::FinalizerProcessIdentityObservation::ExactLive(live)
+                if live == *recorded =>
+            {
                 return Err(GenerationRejection::ProcessIdentityConflict);
             }
-            pid_identity::ProcessIdentityObservation::ExactLive(_)
-            | pid_identity::ProcessIdentityObservation::Dead => {}
-            pid_identity::ProcessIdentityObservation::Unsupported
-            | pid_identity::ProcessIdentityObservation::ReadError(_) => {
+            pid_identity::FinalizerProcessIdentityObservation::ExactLive(_)
+            | pid_identity::FinalizerProcessIdentityObservation::ExactExited(_)
+            | pid_identity::FinalizerProcessIdentityObservation::Dead => {}
+            pid_identity::FinalizerProcessIdentityObservation::Unsupported
+            | pid_identity::FinalizerProcessIdentityObservation::ReadError(_) => {
                 return Err(GenerationRejection::InvariantViolation);
             }
         }
@@ -8728,17 +8731,25 @@ fn classify_generation_liveness_read_only(
                 return RuntimeGenerationReadOnlyLiveness::Busy;
             };
             match pid_identity::observe_finalizer_process_identity(recorded.os_pid) {
-                pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
+                pid_identity::FinalizerProcessIdentityObservation::ExactLive(live)
+                    if live == *recorded =>
+                {
                     return RuntimeGenerationReadOnlyLiveness::Busy;
                 }
-                pid_identity::ProcessIdentityObservation::ExactLive(_) => {
+                pid_identity::FinalizerProcessIdentityObservation::ExactLive(_) => {
                     stale = RuntimeGenerationReadOnlyLiveness::StalePidReused;
                 }
-                pid_identity::ProcessIdentityObservation::Dead => {
+                pid_identity::FinalizerProcessIdentityObservation::ExactExited(exited)
+                    if exited != *recorded =>
+                {
+                    stale = RuntimeGenerationReadOnlyLiveness::StalePidReused;
+                }
+                pid_identity::FinalizerProcessIdentityObservation::ExactExited(_)
+                | pid_identity::FinalizerProcessIdentityObservation::Dead => {
                     stale = RuntimeGenerationReadOnlyLiveness::StaleDead;
                 }
-                pid_identity::ProcessIdentityObservation::Unsupported
-                | pid_identity::ProcessIdentityObservation::ReadError(_) => {
+                pid_identity::FinalizerProcessIdentityObservation::Unsupported
+                | pid_identity::FinalizerProcessIdentityObservation::ReadError(_) => {
                     return RuntimeGenerationReadOnlyLiveness::Busy;
                 }
             }
@@ -16226,7 +16237,7 @@ mod tests {
             assert!(
                 matches!(
                     observe(i64::from(std::process::id())),
-                    pid_identity::ProcessIdentityObservation::ReadError(_)
+                    pid_identity::FinalizerProcessIdentityObservation::ReadError(_)
                 ),
                 "{fault}"
             );

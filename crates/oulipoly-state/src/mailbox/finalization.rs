@@ -56,7 +56,7 @@ pub(super) fn reap_abandoned_finalizers(conn: &mut Connection, limit: i64) -> Re
 pub(super) fn reap_abandoned_finalizers_with(
     conn: &mut Connection,
     limit: i64,
-    observe: impl Fn(i64) -> pid_identity::ProcessIdentityObservation,
+    observe: impl Fn(i64) -> pid_identity::FinalizerProcessIdentityObservation,
 ) -> Result<(), String> {
     // Rotate live/uncertain owners to the tail so they cannot starve crashed
     // owners. Work is bounded per maintenance call, not a lease expiry that could
@@ -86,8 +86,9 @@ pub(super) fn reap_abandoned_finalizers_with(
         .into_iter()
         .map(|(token, owner)| {
             let dead = match observe(owner.os_pid) {
-                pid_identity::ProcessIdentityObservation::Dead => true,
-                pid_identity::ProcessIdentityObservation::ExactLive(live) => live != owner,
+                pid_identity::FinalizerProcessIdentityObservation::Dead
+                | pid_identity::FinalizerProcessIdentityObservation::ExactExited(_) => true,
+                pid_identity::FinalizerProcessIdentityObservation::ExactLive(live) => live != owner,
                 _ => false, // uncertain is not authority to discard evidence
             };
             (token, dead)

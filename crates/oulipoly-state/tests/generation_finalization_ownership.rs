@@ -250,11 +250,30 @@ fn creator_fixture() {
     );
     let mut db = MailboxDb::open(Path::new(&path)).unwrap();
     create(&mut db, &id, &child);
+    // Deliberately leak the reference: process death, not guard Drop, must reclaim it.
+    std::mem::forget(
+        db.retain_delivery_finalization("creator-reference")
+            .unwrap(),
+    );
     std::fs::write(format!("{path}.ready"), "ready").unwrap();
     let _ = std::io::stdin().read(&mut [0]);
 }
 #[test]
 fn true_creator_death_preserves_live_child_then_competing_recovery_is_idempotent() {
+    creator_death_recovery(false, false);
+}
+
+#[test]
+fn unreaped_creator_preserves_live_child_then_recovers_running() {
+    creator_death_recovery(true, false);
+}
+
+#[test]
+fn unreaped_creator_preserves_live_child_then_recovers_draining() {
+    creator_death_recovery(true, true);
+}
+
+fn creator_death_recovery(unreaped: bool, draining: bool) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pid-identity.db");
     let id = RuntimeGenerationId::new();
@@ -275,9 +294,71 @@ fn true_creator_death_preserves_live_child_then_competing_recovery_is_idempotent
         assert!(creator.0.try_wait().unwrap().is_none());
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    creator.0.kill().unwrap();
-    assert!(!creator.0.wait().unwrap().success());
+    let creator_identity = identity(creator.0.id());
     let mut db = MailboxDb::open(&path).unwrap();
+    if draining {
+        let drain = DrainRequestId::new();
+        assert!(matches!(
+            db.runtime_lifecycle()
+                .request_runtime_generation_drain(RequestRuntimeGenerationDrain {
+                    fence: fence(&id),
+                    drain_request_id: &drain,
+                    requested_by_invocation_uuid: INV,
+                })
+                .unwrap(),
+            DrainRequestResult::Installed(..)
+        ));
+        assert!(matches!(
+            db.runtime_lifecycle()
+                .advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
+                    fence: fence(&id),
+                    drain_request_id: &drain,
+                })
+                .unwrap(),
+            DrainAdvanceResult::Advanced(_)
+        ));
+    }
+    // Live reference retention is not an age-based lease.
+    db.prune_terminal_history(2048).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let references = || {
+        conn.query_row(
+            "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(references(), 1);
+    creator.0.kill().unwrap();
+    if unreaped {
+        // Do not call try_wait/wait: both would consume the zombie evidence.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", creator.0.id())).unwrap();
+            if stat[stat.rfind(") ").unwrap() + 2..]
+                .split_whitespace()
+                .next()
+                == Some("Z")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "creator did not become zombie"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(identity(creator.0.id()), creator_identity);
+    } else {
+        assert!(!creator.0.wait().unwrap().success());
+    }
+    db.prune_terminal_history(2048).unwrap();
+    assert_eq!(
+        references(),
+        0,
+        "exited creator cannot retain finalization history"
+    );
     busy(&mut db);
     assert_eq!(
         recover(&mut db, &id),
@@ -328,6 +409,11 @@ fn true_creator_death_preserves_live_child_then_competing_recovery_is_idempotent
         Some(RuntimeTerminalReason::RecoveredDead)
     );
     assert_eq!(row.exit_code, None);
+    if unreaped {
+        // The PID/start identity still exists throughout recovery. Reap only now.
+        assert_eq!(identity(creator.0.id()), creator_identity);
+        assert!(!creator.0.wait().unwrap().success());
+    }
 }
 
 #[test]

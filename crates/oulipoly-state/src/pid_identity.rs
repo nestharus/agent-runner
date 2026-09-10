@@ -29,6 +29,17 @@ pub enum ProcessIdentityObservation {
     ReadError(String),
 }
 
+/// Reclamation evidence is deliberately separate from generic monitoring liveness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FinalizerProcessIdentityObservation {
+    ExactLive(ProcessIdentity),
+    ExactExited(ProcessIdentity),
+    Dead,
+    #[allow(dead_code)] // Constructed on unsupported non-Linux platforms.
+    Unsupported,
+    ReadError(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PidIdentityRow {
     pub os_pid: i64,
@@ -328,12 +339,25 @@ pub fn observe_live_process_identity(os_pid: i64) -> ProcessIdentityObservation 
 /// Conservative evidence for finalizer reclamation only. Keep the established
 /// optional-read semantics of the public observer and its authority callers.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn observe_finalizer_process_identity(os_pid: i64) -> ProcessIdentityObservation {
-    observe_live_process_identity(os_pid)
+pub(crate) fn observe_finalizer_process_identity(
+    os_pid: i64,
+) -> FinalizerProcessIdentityObservation {
+    match observe_live_process_identity(os_pid) {
+        ProcessIdentityObservation::ExactLive(identity) => {
+            FinalizerProcessIdentityObservation::ExactLive(identity)
+        }
+        ProcessIdentityObservation::Dead => FinalizerProcessIdentityObservation::Dead,
+        ProcessIdentityObservation::Unsupported => FinalizerProcessIdentityObservation::Unsupported,
+        ProcessIdentityObservation::ReadError(error) => {
+            FinalizerProcessIdentityObservation::ReadError(error)
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn observe_finalizer_process_identity(os_pid: i64) -> ProcessIdentityObservation {
+pub(crate) fn observe_finalizer_process_identity(
+    os_pid: i64,
+) -> FinalizerProcessIdentityObservation {
     observe_finalizer_process_identity_with(
         os_pid,
         |path| std::fs::read_to_string(path),
@@ -354,8 +378,8 @@ pub(crate) fn observe_finalizer_process_identity_with(
     os_pid: i64,
     read: impl Fn(&Path) -> std::io::Result<String>,
     probe: impl Fn(libc::pid_t) -> std::io::Result<()>,
-) -> ProcessIdentityObservation {
-    use ProcessIdentityObservation::{Dead, ExactLive, ReadError};
+) -> FinalizerProcessIdentityObservation {
+    use FinalizerProcessIdentityObservation::{Dead, ExactExited, ExactLive, ReadError};
     let Ok(pid) = libc::pid_t::try_from(os_pid) else {
         return ReadError("Invalid finalizer PID".into());
     };
@@ -386,7 +410,18 @@ pub(crate) fn observe_finalizer_process_identity_with(
     if uuid::Uuid::parse_str(&boot).is_err() {
         return ReadError("Missing or invalid finalizer boot identity".into());
     }
-    ExactLive(process_identity(os_pid, boot, start))
+    let identity = process_identity(os_pid, boot, start);
+    // State and start identity come from the same stat snapshot. A zombie has
+    // exited even while its parent retains the PID by delaying wait(). Never
+    // interpret stopped, unknown, or malformed state as terminal evidence.
+    match stat
+        .rfind(") ")
+        .and_then(|close| stat[close + 2..].split_whitespace().next())
+    {
+        Some("Z" | "X" | "x") => ExactExited(identity),
+        Some("R" | "S" | "D" | "T" | "t" | "K" | "W" | "P" | "I") => ExactLive(identity),
+        _ => ReadError("Missing or unknown finalizer process state".into()),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -1179,5 +1214,51 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod finalizer_state_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_state_requires_valid_identity_and_known_state() {
+        use FinalizerProcessIdentityObservation::*;
+        let boot = "12345678-1234-1234-1234-123456789abc";
+        let observe = |state: &str, start: &str, boot: &str| {
+            observe_finalizer_process_identity_with(
+                42,
+                |path| {
+                    if path.ends_with("boot_id") {
+                        Ok(boot.into())
+                    } else {
+                        Ok(format!(
+                            "42 (name ) with spaces) {state} {} {start}",
+                            vec!["0"; 18].join(" ")
+                        ))
+                    }
+                },
+                |_| panic!("readable stat must not use absence probe"),
+            )
+        };
+        for state in ["Z", "X", "x"] {
+            assert_eq!(
+                observe(state, "123", boot),
+                ExactExited(process_identity(42, boot.into(), 123))
+            );
+            for start in ["0", "-1", "bad"] {
+                assert!(matches!(observe(state, start, boot), ReadError(_)));
+            }
+            assert!(matches!(observe(state, "123", "unknown"), ReadError(_)));
+        }
+        for state in ["R", "S", "D", "T", "t", "K", "W", "P", "I"] {
+            assert_eq!(
+                observe(state, "123", boot),
+                ExactLive(process_identity(42, boot.into(), 123))
+            );
+        }
+        for state in ["?", "ZZ", "", "0"] {
+            assert!(matches!(observe(state, "123", boot), ReadError(_)));
+        }
     }
 }
