@@ -1569,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn dead_running_generation_is_reconciled_before_same_session_admission() {
+    fn replaced_child_and_creator_are_reconciled_before_same_session_admission() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
@@ -1597,11 +1597,20 @@ mod tests {
                 effective_cwd: None,
             })
             .unwrap();
-        let dead_process = oulipoly_state::pid_identity::ProcessIdentity {
-            os_pid: i64::MAX,
-            os_boot_id: "dead-boot".to_string(),
-            os_pid_starttime_ticks: 1,
-        };
+        // Exact replacement evidence, not an invalid PID interpreted as death.
+        let mut dead_process =
+            oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+                .unwrap()
+                .unwrap();
+        dead_process.os_pid_starttime_ticks += 1;
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE runtime_generation SET creator_identity_os_pid_starttime_ticks =
+             creator_identity_os_pid_starttime_ticks + 1 WHERE generation_uuid = ?1",
+                [generation_id.to_string()],
+            )
+            .unwrap();
         db.runtime_lifecycle()
             .bind_runtime_generation_running(BindRuntimeGenerationRunning {
                 fence: RuntimeGenerationFence {

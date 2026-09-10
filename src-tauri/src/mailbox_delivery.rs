@@ -36,6 +36,7 @@ const DELIVERY_NONCE_LENGTH_PLACEHOLDER: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
 pub(crate) struct PreparedMailboxDelivery {
+    pub finalization_guard: Option<oulipoly_state::mailbox::DeliveryFinalizationGuard>,
     pub answer: Option<String>,
     pub session_id: String,
     pub seqs: Vec<i64>,
@@ -612,7 +613,9 @@ fn terminalize_stale_runtime_generation(
                 GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_)
             )
         });
-    let _ = unlink_control_socket_if_owned(control_path);
+    if terminalized {
+        let _ = unlink_control_socket_if_owned(control_path);
+    }
     terminalized
 }
 
@@ -1102,6 +1105,12 @@ pub(crate) fn prepare_headless_resume_delivery_on(
     answer: Option<String>,
     submitted_seq: Option<i64>,
 ) -> Result<PreparedMailboxDelivery, String> {
+    if let Some(stop) = db.mailbox_observation_stop(session_id)? {
+        return Err(format!(
+            "mailbox_observation_stopped stop_id={}: {}",
+            stop.stop_id, stop.error
+        ));
+    }
     // A submission receipt is authority for this exact input, never for the
     // paused notification backlog. Use the normal nonce/ACK delivery path.
     if let Some(seq) = submitted_seq {
@@ -1154,7 +1163,9 @@ pub(crate) fn deliverable_pending_count_on(
     session_id: &str,
 ) -> Result<usize, String> {
     reconcile_confirmed_headless_deliveries_on(db, state, session_id)?;
-    if notifications_paused_on(db, session_id)? {
+    if notifications_paused_on(db, session_id)?
+        || db.mailbox_observation_stop(session_id)?.is_some()
+    {
         return Ok(0);
     }
     pending_mailbox_row_count(db, session_id)
@@ -1230,6 +1241,7 @@ fn open_mailbox_sidecar() -> Result<Option<MailboxDb>, String> {
 
 fn empty_delivery(answer: Option<String>, session_id: String) -> PreparedMailboxDelivery {
     PreparedMailboxDelivery {
+        finalization_guard: None,
         answer,
         session_id,
         seqs: Vec::new(),
@@ -1260,6 +1272,7 @@ fn delivery_for_batch(
         .iter()
         .any(|row| row.kind != SUBMITTED_INPUT_KIND);
     let delivery_nonce = new_delivery_nonce();
+    let finalization_guard = db.retain_delivery_finalization(&delivery_nonce)?;
     if explicit_input {
         db.register_explicit_input_delivery_attempt(
             &delivery_nonce,
@@ -1278,14 +1291,16 @@ fn delivery_for_batch(
         )?;
     }
     let prefix = render_mailbox_prefix(&batch.rows, batch.remaining_count, &delivery_nonce)?;
-    Ok(prepared_delivery(
+    let mut prepared = prepared_delivery(
         session_id,
         seqs,
         prefix,
         answer,
         delivery_nonce,
         requires_turn_confirmation,
-    ))
+    );
+    prepared.finalization_guard = Some(finalization_guard);
+    Ok(prepared)
 }
 
 pub(crate) fn bind_headless_resume_delivery_attempt(
@@ -1365,6 +1380,7 @@ fn prepared_delivery(
     requires_turn_confirmation: bool,
 ) -> PreparedMailboxDelivery {
     PreparedMailboxDelivery {
+        finalization_guard: None,
         answer: Some(compose_answer(prefix, answer)),
         session_id,
         seqs,
@@ -1386,21 +1402,6 @@ pub(crate) fn mark_headless_resume_delivered(
         return Err("mailbox sidecar missing while marking delivered rows".to_string());
     };
     db.mark_delivered(session_id, chain_id, seqs, delivered_by_invocation_uuid)
-}
-
-pub(crate) fn mark_headless_resume_delivery_failed(
-    session_id: &str,
-    chain_id: Option<&str>,
-    seqs: &[i64],
-    delivery_error: &str,
-) -> Result<(), String> {
-    if seqs.is_empty() {
-        return Ok(());
-    }
-    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
-        return Err("mailbox sidecar missing while marking failed delivery rows".to_string());
-    };
-    db.mark_delivery_failed(session_id, chain_id, seqs, delivery_error)
 }
 
 struct MailboxBatch {
@@ -1630,6 +1631,86 @@ fn sanitize(value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn rejected_live_finalizer_recovery_retains_pty_control_path() {
+        const FIXTURE: &str = "AGE353_PTY_FINALIZER_FIXTURE";
+        let Some(root) = std::env::var_os(FIXTURE) else {
+            let dir = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "mailbox_delivery::tests::rejected_live_finalizer_recovery_retains_pty_control_path"])
+                .env(FIXTURE, dir.path())
+                .env("XDG_RUNTIME_DIR", dir.path())
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let path = root.join("pid-identity.db");
+        let socket_dir = root.join("oulipoly-agent-runner/pty");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let control = socket_dir.join("owner.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&control).unwrap();
+        let mut db = MailboxDb::open(&path).unwrap();
+        let id = RuntimeGenerationId::new();
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &id,
+                spawn_invocation_uuid: "owner",
+                session_id: Some("session"),
+                runtime_mode: "pty_interactive",
+                provider_name: "fixture",
+                model_name: None,
+                pty_control_path: control.to_str(),
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        let mut replaced =
+            oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+                .unwrap()
+                .unwrap();
+        replaced.os_pid_starttime_ticks += 1;
+        db.runtime_lifecycle()
+            .bind_runtime_generation_running(
+                oulipoly_state::mailbox::BindRuntimeGenerationRunning {
+                    fence: RuntimeGenerationFence {
+                        generation_id: &id,
+                        spawn_invocation_uuid: "owner",
+                    },
+                    spawned_os_pid: replaced.os_pid,
+                    exact_process_identity: &replaced,
+                    os_pgid: None,
+                },
+            )
+            .unwrap();
+        assert!(!terminalize_stale_runtime_generation(
+            &mut db,
+            "session",
+            control.to_str().unwrap()
+        ));
+        assert!(
+            control.exists(),
+            "rejected recovery cannot unlink the owner's control path"
+        );
+        // The same path is reclaimable after exact creator replacement too.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE runtime_generation SET creator_identity_os_pid_starttime_ticks =
+             creator_identity_os_pid_starttime_ticks + 1",
+                [],
+            )
+            .unwrap();
+        assert!(terminalize_stale_runtime_generation(
+            &mut db,
+            "session",
+            control.to_str().unwrap()
+        ));
+        assert!(!control.exists());
+        drop(listener);
+    }
+
     struct DataDirOverride(Option<std::ffi::OsString>);
 
     impl DataDirOverride {
@@ -1656,6 +1737,7 @@ mod tests {
         let original = Some("byte-identical".to_string());
         let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27".to_string();
         let prepared = PreparedMailboxDelivery {
+            finalization_guard: None,
             answer: original.clone(),
             session_id,
             seqs: Vec::new(),

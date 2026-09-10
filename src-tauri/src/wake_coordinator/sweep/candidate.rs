@@ -16,7 +16,11 @@ pub(super) fn wake_sweep_candidate_action(
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
 ) -> Result<WakeSweepAction, String> {
-    if db.notifications_paused(&candidate.session_id)? {
+    if db.notifications_paused(&candidate.session_id)?
+        || db
+            .mailbox_observation_stop(&candidate.session_id)?
+            .is_some()
+    {
         return Ok(WakeSweepAction::Retain(
             WakeSweepRetentionReason::NotStartable,
         ));

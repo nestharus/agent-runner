@@ -30,6 +30,7 @@
 
 mod cases_basic;
 mod cases_batch_sweep;
+mod cases_early_ack;
 mod cases_wake_backlog;
 mod fake_provider;
 mod fixtures;
@@ -151,4 +152,24 @@ fn wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_debris() {
 #[test]
 fn wake_sweep_eventually_reaches_startable_session_between_paused_edges() {
     cases_wake_backlog::wake_sweep_eventually_reaches_startable_session_between_paused_edges();
+}
+
+#[test]
+fn immediate_consumer_ack_preserves_success_without_fabricated_observation() {
+    cases_early_ack::immediate_ack(true);
+}
+
+#[test]
+fn immediate_consumer_ack_does_not_hide_genuine_provider_failure() {
+    cases_early_ack::immediate_ack(false);
+}
+
+#[test]
+fn mailbox_unpause_alone_wakes_sleeping_recipient_and_settled_repeat_does_not_launch() {
+    cases_early_ack::unpause_ack("sleeping");
+}
+
+#[test]
+fn mailbox_unpause_busy_recipient_waits_for_turn_boundary() {
+    cases_early_ack::unpause_ack("busy");
 }

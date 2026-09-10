@@ -47,6 +47,7 @@ pub(super) struct ResumeCompletionEvidence<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MailboxDeliveryOutcome {
     Absent,
+    AlreadySettled,
     Confirmed,
     ConfirmedPromptAcceptance(ValidatedPromptAcceptance),
     Unconfirmed,
@@ -105,6 +106,7 @@ pub(super) fn reconcile_pending_headless_delivery_observations(
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
+    ensure_observation_not_stopped(&db, &resolved.active_session_id)?;
     prepare_legacy_observation_recovery(&db, resolved)?;
     let registry = agent_runtime_services.provider_registry_handle.current();
     for pending in db.pending_delivery_observations(
@@ -244,6 +246,7 @@ fn persist_pre_delivery_observation_anchor(
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Err("mailbox sidecar missing while anchoring headless delivery".to_string());
     };
+    ensure_observation_not_stopped(&db, input.mailbox_session_id)?;
     if db.delivery_observation_anchor(attempt_id)?.is_some() {
         return Ok(());
     }
@@ -300,7 +303,18 @@ fn capture_pre_delivery_observation_anchor(
         cancellation: &cancellation,
         timeout: OBSERVATION_TIMEOUT,
     })
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| {
+        let db = MailboxDb::open_default_if_exists();
+        match db {
+            Ok(Some(db)) => {
+                retain_observation_failure(&db, input.mailbox_session_id, attempt_id, error)
+            }
+            Ok(None) => {
+                format!("{error}; mailbox sidecar missing while retaining observation failure")
+            }
+            Err(storage) => format!("{error}; {storage}"),
+        }
+    })?;
     let resume_token = page
         .resume_token
         .ok_or_else(|| "mailbox_delivery_observation_anchor_missing".to_string())?;
@@ -371,9 +385,12 @@ pub(super) fn resolve_mailbox_delivery_outcome(
     provider: &oulipoly_config::ProviderConfig,
     result: &executor::ExecutionResult,
     completion_evidence: ResumeCompletionEvidence<'_>,
-) -> MailboxDeliveryOutcome {
+) -> Result<MailboxDeliveryOutcome, String> {
     if input.mailbox_delivery_seqs.is_empty() {
-        return MailboxDeliveryOutcome::Absent;
+        return Ok(MailboxDeliveryOutcome::Absent);
+    }
+    if mailbox_delivery_already_settled(input)? {
+        return Ok(MailboxDeliveryOutcome::AlreadySettled);
     }
     let errors = ingest_mailbox_delivery_confirmation_turn_silently_if_needed(
         input,
@@ -382,13 +399,15 @@ pub(super) fn resolve_mailbox_delivery_outcome(
         completion_evidence,
     );
     emit_session_ingest_warnings(&provider.name, &errors);
-    if mailbox_delivery_unconfirmed(input, provider, result, completion_evidence) {
-        MailboxDeliveryOutcome::Unconfirmed
-    } else if let Some(acceptance) = completion_evidence.prompt_acceptance_confirmation {
-        MailboxDeliveryOutcome::ConfirmedPromptAcceptance(acceptance.clone())
-    } else {
-        MailboxDeliveryOutcome::Confirmed
-    }
+    Ok(
+        if mailbox_delivery_unconfirmed(input, provider, result, completion_evidence) {
+            MailboxDeliveryOutcome::Unconfirmed
+        } else if let Some(acceptance) = completion_evidence.prompt_acceptance_confirmation {
+            MailboxDeliveryOutcome::ConfirmedPromptAcceptance(acceptance.clone())
+        } else {
+            MailboxDeliveryOutcome::Confirmed
+        },
+    )
 }
 
 pub(super) fn handle_unconfirmed_mailbox_delivery_if_needed(
@@ -399,10 +418,16 @@ pub(super) fn handle_unconfirmed_mailbox_delivery_if_needed(
     result: &executor::ExecutionResult,
     completion_evidence: ResumeCompletionEvidence<'_>,
 ) -> Result<Option<ResumeAttemptLoopControl>, String> {
-    if !mailbox_delivery_unconfirmed(input, provider, result, completion_evidence) {
+    if mailbox_delivery_already_settled(input)?
+        || !mailbox_delivery_unconfirmed(input, provider, result, completion_evidence)
+    {
         return Ok(None);
     }
-    record_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")?;
+    #[cfg(test)]
+    super::terminal::races_tests::checkpoint("before_failure_reconcile");
+    if reconcile_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")? {
+        return Ok(None);
+    }
     finalize_unconfirmed_mailbox_delivery(input, attempt, result)?;
     mark_resume_attempt_idle(provider_session_id, &attempt.invocation.id, Some(1))?;
     Ok(Some(ResumeAttemptLoopControl::Return(1)))
@@ -540,6 +565,7 @@ fn confirm_delivery_observation(
     effective_cwd: &std::path::Path,
     anchor: &MailboxDeliveryObservationAnchor,
 ) -> Result<bool, String> {
+    ensure_observation_not_stopped(db, &anchor.provider_session_id)?;
     let cancellation = CancellationToken::new();
     observe_delivery_with(
         db,
@@ -563,7 +589,9 @@ fn confirm_delivery_observation(
                 cancellation: &cancellation,
                 timeout: remaining.min(OBSERVATION_TIMEOUT),
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                retain_observation_failure(db, &anchor.provider_session_id, attempt_id, error)
+            })
         },
     )
 }
@@ -585,6 +613,7 @@ fn observe_delivery_with(
         String,
     >,
 ) -> Result<bool, String> {
+    ensure_observation_not_stopped(db, &anchor.provider_session_id)?;
     if db.delivery_observation_confirmation(attempt_id)?.is_some() {
         return Ok(true);
     }
@@ -754,16 +783,51 @@ fn finalize_unconfirmed_mailbox_delivery(
     Ok(())
 }
 
-pub(super) fn record_failed_mailbox_delivery_attempt(
+pub(super) fn mailbox_delivery_already_settled(
+    input: &ResumeAttemptInput<'_>,
+) -> Result<bool, String> {
+    if input.mailbox_delivery_seqs.is_empty() {
+        return Ok(false);
+    }
+    let attempt_id = input
+        .mailbox_delivery_nonce
+        .ok_or_else(|| "mailbox reconciliation missing exact attempt nonce".to_string())?;
+    let db = MailboxDb::open_default_if_exists()?
+        .ok_or_else(|| "mailbox reconciliation missing sidecar".to_string())?;
+    db.delivery_attempt_fully_settled(
+        attempt_id,
+        input.mailbox_session_id,
+        Some(&input.resolved.chain_id),
+        input.mailbox_delivery_seqs,
+    )
+}
+
+fn reconcile_failed_mailbox_delivery_attempt(
     input: &ResumeAttemptInput<'_>,
     delivery_error: &str,
-) -> Result<(), String> {
-    crate::mailbox_delivery::mark_headless_resume_delivery_failed(
+) -> Result<bool, String> {
+    if input.mailbox_delivery_seqs.is_empty() {
+        return Ok(false);
+    }
+    let attempt_id = input
+        .mailbox_delivery_nonce
+        .ok_or_else(|| "mailbox failure reconciliation missing exact attempt nonce".to_string())?;
+    let mut db = MailboxDb::open_default_if_exists()?
+        .ok_or_else(|| "mailbox failure reconciliation missing sidecar".to_string())?;
+    db.mark_delivery_attempt_failed(
+        attempt_id,
         input.mailbox_session_id,
         Some(&input.resolved.chain_id),
         input.mailbox_delivery_seqs,
         delivery_error,
     )
+}
+
+pub(super) fn record_failed_mailbox_delivery_attempt(
+    input: &ResumeAttemptInput<'_>,
+    delivery_error: &str,
+) -> Result<(), String> {
+    reconcile_failed_mailbox_delivery_attempt(input, delivery_error).map(|_| ())
 }
 
 pub(super) fn failed_delivery_error(result: &executor::ExecutionResult, fallback: &str) -> String {
@@ -817,7 +881,7 @@ pub(super) fn settle_clean_exit_mailbox_delivery_outcome(
     outcome: MailboxDeliveryOutcome,
 ) -> Result<(), String> {
     match outcome {
-        MailboxDeliveryOutcome::Absent => {
+        MailboxDeliveryOutcome::Absent | MailboxDeliveryOutcome::AlreadySettled => {
             mark_resume_attempt_idle(provider_session_id, invocation_uuid, Some(shell_exit_code))
         }
         MailboxDeliveryOutcome::Confirmed => settle_accepted_mailbox_delivery_and_recheck(
@@ -844,3 +908,29 @@ pub(super) fn settle_clean_exit_mailbox_delivery_outcome(
 #[cfg(test)]
 #[path = "observation_tests.rs"]
 mod observation_tests;
+
+fn ensure_observation_not_stopped(db: &MailboxDb, session_id: &str) -> Result<(), String> {
+    if let Some(stop) = db.mailbox_observation_stop(session_id)? {
+        return Err(format!(
+            "mailbox_observation_stopped stop_id={}: {}",
+            stop.stop_id, stop.error
+        ));
+    }
+    Ok(())
+}
+
+fn retain_observation_failure(
+    db: &MailboxDb,
+    session_id: &str,
+    attempt_id: &str,
+    error: oulipoly_runtime::session_provider::SessionProviderError,
+) -> String {
+    let message = error.to_string();
+    if let Some(reason) = error.fixed_observation_stop_reason() {
+        if let Err(storage) = db.stop_mailbox_observation(session_id, attempt_id, reason, &message)
+        {
+            return format!("{message}; {storage}");
+        }
+    }
+    message
+}

@@ -23,8 +23,10 @@ use uuid::Uuid;
 
 use crate::pid_identity::{self, ProcessIdentity};
 
+mod finalization;
 #[path = "mailbox/schema.rs"]
 mod schema;
+pub use finalization::DeliveryFinalizationGuard;
 
 pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
 pub const MAILBOX_DELIVERY_UNCONFIRMED_ERROR: &str = "mailbox_delivery_unconfirmed";
@@ -1268,6 +1270,15 @@ enum BoundedMailboxRowsError {
     Prepare(rusqlite::Error),
     Query(rusqlite::Error),
     Row(rusqlite::Error),
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MailboxObservationStop {
+    pub stop_id: String,
+    pub attempt_id: String,
+    pub reason: String,
+    pub error: String,
+    pub stopped_at: String,
 }
 
 impl MailboxDb {
@@ -2892,6 +2903,7 @@ impl MailboxDb {
             .map_err(|_| "Terminal history prune limit does not fit SQLite INTEGER".to_string())?;
         let keep = i64::try_from(keep)
             .map_err(|_| "Terminal history keep count does not fit SQLite INTEGER".to_string())?;
+        finalization::reap_abandoned_finalizers(&mut self.conn, limit)?;
         // Candidate discovery can scan retained history. Keep it outside the write
         // transaction so maintenance cannot block unrelated mailbox writers.
         let attempt_ids = prunable_delivery_attempt_ids(&self.conn, keep, limit)?;
@@ -2908,6 +2920,8 @@ impl MailboxDb {
                     "SELECT EXISTS (
                          SELECT 1 FROM mailbox_delivery_attempts
                          WHERE attempt_id = ?1
+                           AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                                           WHERE finalizer.attempt_id = ?1)
                            AND resolved_at IS NOT NULL
                            AND (
                                evidence_disposition IS NULL
@@ -2958,7 +2972,10 @@ impl MailboxDb {
                                JOIN mailbox_delivery_attempts AS attempt
                                  ON attempt.attempt_id = item.attempt_id
                                WHERE item.mailbox_seq = candidate.seq
-                                 AND attempt.resolved_at IS NULL
+                                 AND (attempt.resolved_at IS NULL OR EXISTS (
+                                     SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                                     WHERE finalizer.attempt_id = attempt.attempt_id
+                                 ))
                            )
                      )",
                     params![row.seq, AGENT_BASH_COMPLETE_KIND],
@@ -3234,6 +3251,93 @@ impl MailboxDb {
         } else {
             self.list_pending(session_id)
         }
+    }
+
+    /// Retain a fixed observation failure separately from pause and delivery/ACK state.
+    /// The attempt/session join prevents a stale or foreign attempt stopping another owner.
+    pub fn stop_mailbox_observation(
+        &self,
+        session_id: &str,
+        attempt_id: &str,
+        reason: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "INSERT INTO mailbox_observation_stops
+             (stop_id, session_id, attempt_id, reason, error, stopped_at)
+             SELECT ?1, session_id, attempt_id, ?4, ?5, ?6 FROM mailbox_delivery_attempts
+             WHERE session_id = ?2 AND attempt_id = ?3 AND resolved_at IS NULL
+               AND observation_confirmed_at IS NULL AND acknowledged_at IS NULL
+             ON CONFLICT(session_id) WHERE rearmed_at IS NULL DO NOTHING",
+                params![
+                    Uuid::new_v4().to_string(),
+                    session_id,
+                    attempt_id,
+                    reason,
+                    truncate_utf8(error, 1024),
+                    now_rfc3339()
+                ],
+            )
+            .map_err(|err| format!("Failed to stop mailbox observation: {err}"))?;
+        if changed == 0 && self.mailbox_observation_stop(session_id)?.is_none() {
+            return Err("observation stop requires an unresolved owned delivery attempt".into());
+        }
+        Ok(())
+    }
+
+    pub fn mailbox_observation_stop(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<MailboxObservationStop>, String> {
+        self.conn
+            .query_row(
+                "SELECT stop_id, attempt_id, reason, error, stopped_at
+             FROM mailbox_observation_stops WHERE session_id = ?1 AND rearmed_at IS NULL",
+                params![session_id],
+                |row| {
+                    Ok(MailboxObservationStop {
+                        stop_id: row.get(0)?,
+                        attempt_id: row.get(1)?,
+                        reason: row.get(2)?,
+                        error: row.get(3)?,
+                        stopped_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| format!("Failed to read observation stop: {err}"))
+    }
+
+    /// Explicit operator attestation, not an ACK or a claim takeover. A stale
+    /// stop ID cannot clear a subsequent failure, even for the same cause.
+    pub fn rearm_mailbox_observation(
+        &self,
+        session_id: &str,
+        stop_id: &str,
+        resolution: &str,
+    ) -> Result<(), String> {
+        if resolution.trim().is_empty() {
+            return Err("cause resolution is required".into());
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE mailbox_observation_stops SET rearmed_at = ?3, resolution = ?4
+             WHERE session_id = ?1 AND stop_id = ?2 AND rearmed_at IS NULL",
+                params![
+                    session_id,
+                    stop_id,
+                    now_rfc3339(),
+                    truncate_utf8(resolution, 1024)
+                ],
+            )
+            .map_err(|err| format!("Failed to rearm mailbox observation: {err}"))?;
+        if changed != 1 {
+            return Err("active observation stop ID did not match; no rearm".into());
+        }
+        Ok(())
     }
 
     pub fn notifications_paused(&self, session_id: &str) -> Result<bool, String> {
@@ -3562,6 +3666,11 @@ impl MailboxDb {
             .map_err(|err| {
                 format!("Failed to start mailbox delivery attempt transaction: {err}")
             })?;
+        if headless && mailbox_observation_stopped_on(&tx, session_id)? {
+            return Err(
+                "mailbox observation stopped; explicit cause-resolved rearm required".into(),
+            );
+        }
         if explicit_input {
             validate_explicit_input_delivery_on(&tx, session_id, chain_id, seqs[0])?;
         }
@@ -3703,6 +3812,8 @@ impl MailboxDb {
              WHERE attempt_id = ?1 AND session_id = ?2 AND delivery_invocation_uuid = ?3
                AND resolved_at IS NULL AND submission_started_at IS NULL
                AND headless_submission_state = 'prepared'
+               AND NOT EXISTS (SELECT 1 FROM mailbox_observation_stops
+                   WHERE session_id = ?2 AND rearmed_at IS NULL)
                AND (?5 = 0 OR observation_anchor_token IS NOT NULL)",
                 params![
                     attempt_id,
@@ -4749,6 +4860,55 @@ impl MailboxDb {
         Ok(true)
     }
 
+    /// Reconcile consumer settlement against the complete, exact attempt batch.
+    /// This does not assert transport acceptance or transcript observation.
+    pub fn delivery_attempt_fully_settled(
+        &self,
+        attempt_id: &str,
+        session_id: &str,
+        chain_id: Option<&str>,
+        seqs: &[i64],
+    ) -> Result<bool, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|err| err.to_string())?;
+        let pending =
+            exact_delivery_attempt_pending_on(&tx, attempt_id, session_id, chain_id, seqs)?;
+        tx.commit().map_err(|err| err.to_string())?;
+        Ok(pending.is_empty())
+    }
+
+    /// Record a failure only for the remaining owned items. Unlike the generic
+    /// pending-only API, the exact attempt identity permits partial consumer ACK.
+    /// Returns true when consumer settlement won the race with finalization.
+    pub fn mark_delivery_attempt_failed(
+        &mut self,
+        attempt_id: &str,
+        session_id: &str,
+        chain_id: Option<&str>,
+        seqs: &[i64],
+        delivery_error: &str,
+    ) -> Result<bool, String> {
+        reject_unauthorized_terminal_wake_abandonment(delivery_error)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| err.to_string())?;
+        let pending =
+            exact_delivery_attempt_pending_on(&tx, attempt_id, session_id, chain_id, seqs)?;
+        for seq in &pending {
+            tx.execute(
+                "UPDATE mailbox SET delivery_attempts = delivery_attempts + 1, delivery_error = ?2
+                 WHERE seq = ?1 AND delivered_at IS NULL",
+                params![seq, delivery_error],
+            )
+            .map_err(|err| format!("Failed to record exact delivery attempt failure: {err}"))?;
+        }
+        tx.commit().map_err(|err| err.to_string())?;
+        Ok(pending.is_empty())
+    }
+
     pub fn mark_delivery_failed(
         &mut self,
         session_id: &str,
@@ -5194,7 +5354,9 @@ impl WakeSessionRepository<'_> {
             commit_empty_wake_claim_transaction(tx)?;
             return Ok(WakeClaimAcquireResult::Busy);
         }
-        if wake_claim_notifications_paused_tx(&tx, input.session_id)? {
+        if wake_claim_notifications_paused_tx(&tx, input.session_id)?
+            || mailbox_observation_stopped_on(&tx, input.session_id)?
+        {
             commit_empty_wake_claim_transaction(tx)?;
             return Ok(WakeClaimAcquireResult::NoPending);
         }
@@ -5498,7 +5660,10 @@ impl WakeSessionRepository<'_> {
                 .map_err(|err| format!("Failed to commit replayed wake-child admission: {err}"))?;
             return Ok(replay_matches);
         }
-        if observed_busy || wake_claim_runtime_is_busy_tx(&tx, session_id)? {
+        if observed_busy
+            || wake_claim_runtime_is_busy_tx(&tx, session_id)?
+            || mailbox_observation_stopped_on(&tx, session_id)?
+        {
             tx.execute(
                 "DELETE FROM session_wake_claim
                  WHERE session_id = ?1
@@ -6689,7 +6854,10 @@ fn terminal_history_retention_stats_on(
                JOIN mailbox_delivery_attempts AS attempt
                  ON attempt.attempt_id = item.attempt_id
                WHERE item.mailbox_seq = candidate.seq
-                 AND attempt.resolved_at IS NULL
+                 AND (attempt.resolved_at IS NULL OR EXISTS (
+                       SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                       WHERE finalizer.attempt_id = attempt.attempt_id
+                   ))
            )",
         params![keep, AGENT_BASH_COMPLETE_KIND],
         "prunable terminal mailbox rows",
@@ -6705,6 +6873,8 @@ fn terminal_history_retention_stats_on(
         "SELECT COUNT(*)
          FROM mailbox_delivery_attempts AS candidate
          WHERE candidate.resolved_at IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                           WHERE finalizer.attempt_id = candidate.attempt_id)
            AND (
                candidate.evidence_disposition IS NULL
                OR candidate.evidence_disposition NOT IN ('pending', 'legacy_pending')
@@ -6780,6 +6950,8 @@ fn prunable_delivery_attempt_ids(
             "SELECT attempt_id
              FROM mailbox_delivery_attempts AS candidate
              WHERE candidate.resolved_at IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                           WHERE finalizer.attempt_id = candidate.attempt_id)
                AND (
                    candidate.evidence_disposition IS NULL
                    OR candidate.evidence_disposition NOT IN ('pending', 'legacy_pending')
@@ -6835,7 +7007,10 @@ fn prunable_terminal_mailbox_rows(
                    JOIN mailbox_delivery_attempts AS attempt
                      ON attempt.attempt_id = item.attempt_id
                    WHERE item.mailbox_seq = candidate.seq
-                     AND attempt.resolved_at IS NULL
+                     AND (attempt.resolved_at IS NULL OR EXISTS (
+                       SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                       WHERE finalizer.attempt_id = attempt.attempt_id
+                   ))
                )
              ORDER BY candidate.seq ASC
              LIMIT ?3",
@@ -7580,20 +7755,26 @@ fn validate_recovered_dead_process(
     if request.reason != RuntimeTerminalReason::RecoveredDead {
         return Ok(());
     }
-    let ExactProcessEvidence::Recorded(recorded) = generation_liveness_process(before) else {
-        return Err(GenerationRejection::InvariantViolation);
-    };
-    match pid_identity::observe_live_process_identity(recorded.os_pid) {
-        pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
-            Err(GenerationRejection::ProcessIdentityConflict)
-        }
-        pid_identity::ProcessIdentityObservation::ExactLive(_)
-        | pid_identity::ProcessIdentityObservation::Dead => Ok(()),
-        pid_identity::ProcessIdentityObservation::Unsupported
-        | pid_identity::ProcessIdentityObservation::ReadError(_) => {
-            Err(GenerationRejection::InvariantViolation)
+    for evidence in generation_liveness_processes(before) {
+        let ExactProcessEvidence::Recorded(recorded) = evidence else {
+            return Err(GenerationRejection::InvariantViolation);
+        };
+        match pid_identity::observe_finalizer_process_identity(recorded.os_pid) {
+            pid_identity::FinalizerProcessIdentityObservation::ExactLive(live)
+                if live == *recorded =>
+            {
+                return Err(GenerationRejection::ProcessIdentityConflict);
+            }
+            pid_identity::FinalizerProcessIdentityObservation::ExactLive(_)
+            | pid_identity::FinalizerProcessIdentityObservation::ExactExited(_)
+            | pid_identity::FinalizerProcessIdentityObservation::Dead => {}
+            pid_identity::FinalizerProcessIdentityObservation::Unsupported
+            | pid_identity::FinalizerProcessIdentityObservation::ReadError(_) => {
+                return Err(GenerationRejection::InvariantViolation);
+            }
         }
     }
+    Ok(())
 }
 
 fn validate_non_orderly_predecessor(
@@ -8151,6 +8332,47 @@ fn mailbox_delivery_target_states_on(
     Ok(states)
 }
 
+fn exact_delivery_attempt_pending_on(
+    conn: &Connection,
+    attempt_id: &str,
+    session_id: &str,
+    chain_id: Option<&str>,
+    seqs: &[i64],
+) -> Result<Vec<i64>, String> {
+    if seqs.is_empty() || seqs.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("exact delivery reconciliation requires a nonempty ordered batch".into());
+    }
+    let owned: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM mailbox_delivery_attempts
+         WHERE attempt_id = ?1 AND session_id = ?2)",
+            params![attempt_id, session_id],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
+    let mut stmt = conn.prepare(
+        "SELECT mailbox_seq FROM mailbox_delivery_attempt_items WHERE attempt_id = ?1 ORDER BY mailbox_seq"
+    ).map_err(|err| err.to_string())?;
+    let items = stmt
+        .query_map(params![attempt_id], |row| row.get::<_, i64>(0))
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    if !owned || items != seqs {
+        return Err("delivery reconciliation batch does not match the exact owned attempt".into());
+    }
+    let states = mailbox_delivery_target_states_on(conn, session_id, chain_id, seqs)
+        .map_err(|err| err.to_string())?;
+    if !all_mailbox_seqs_owned(&states) {
+        return Err("delivery reconciliation contains a missing or foreign-target row".into());
+    }
+    Ok(seqs
+        .iter()
+        .zip(states)
+        .filter_map(|(seq, state)| matches!(state, Some(None)).then_some(*seq))
+        .collect())
+}
+
 fn all_mailbox_seqs_owned(states: &[Option<Option<String>>]) -> bool {
     states.iter().all(Option::is_some)
 }
@@ -8478,28 +8700,22 @@ enum GenerationLivenessObservation {
 fn generation_liveness_observation(
     generation: &RuntimeGenerationRow,
 ) -> GenerationLivenessObservation {
-    let ExactProcessEvidence::Recorded(recorded) = generation_liveness_process(generation) else {
-        return GenerationLivenessObservation::Busy;
-    };
-    match pid_identity::observe_live_process_identity(recorded.os_pid) {
-        pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
-            GenerationLivenessObservation::Busy
-        }
-        pid_identity::ProcessIdentityObservation::ExactLive(_)
-        | pid_identity::ProcessIdentityObservation::Dead => GenerationLivenessObservation::Stale,
-        pid_identity::ProcessIdentityObservation::Unsupported
-        | pid_identity::ProcessIdentityObservation::ReadError(_) => {
-            GenerationLivenessObservation::Busy
-        }
+    match classify_generation_liveness_read_only(std::slice::from_ref(generation)) {
+        RuntimeGenerationReadOnlyLiveness::Busy => GenerationLivenessObservation::Busy,
+        _ => GenerationLivenessObservation::Stale,
     }
 }
 
-fn generation_liveness_process(generation: &RuntimeGenerationRow) -> &ExactProcessEvidence {
-    if generation.lifecycle_state == RuntimeLifecycleState::Starting {
-        &generation.creator_process_evidence
-    } else {
-        &generation.exact_process_evidence
-    }
+/// A child exiting does not discharge its creator's orderly-finalization work.
+/// Recovery must prove both identities gone; a surviving child also retains its
+/// claims/stop authority after creator death. Unknown evidence is not death.
+fn generation_liveness_processes(
+    generation: &RuntimeGenerationRow,
+) -> impl Iterator<Item = &ExactProcessEvidence> {
+    std::iter::once(&generation.creator_process_evidence).chain(
+        (generation.lifecycle_state != RuntimeLifecycleState::Starting)
+            .then_some(&generation.exact_process_evidence),
+    )
 }
 
 fn classify_generation_liveness_read_only(
@@ -8510,23 +8726,32 @@ fn classify_generation_liveness_read_only(
     }
     let mut stale = RuntimeGenerationReadOnlyLiveness::StaleMissingIdentity;
     for generation in generations {
-        let ExactProcessEvidence::Recorded(recorded) = generation_liveness_process(generation)
-        else {
-            continue;
-        };
-        match pid_identity::observe_live_process_identity(recorded.os_pid) {
-            pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
+        for evidence in generation_liveness_processes(generation) {
+            let ExactProcessEvidence::Recorded(recorded) = evidence else {
                 return RuntimeGenerationReadOnlyLiveness::Busy;
-            }
-            pid_identity::ProcessIdentityObservation::ExactLive(_) => {
-                stale = RuntimeGenerationReadOnlyLiveness::StalePidReused;
-            }
-            pid_identity::ProcessIdentityObservation::Dead => {
-                stale = RuntimeGenerationReadOnlyLiveness::StaleDead;
-            }
-            pid_identity::ProcessIdentityObservation::Unsupported
-            | pid_identity::ProcessIdentityObservation::ReadError(_) => {
-                return RuntimeGenerationReadOnlyLiveness::Busy;
+            };
+            match pid_identity::observe_finalizer_process_identity(recorded.os_pid) {
+                pid_identity::FinalizerProcessIdentityObservation::ExactLive(live)
+                    if live == *recorded =>
+                {
+                    return RuntimeGenerationReadOnlyLiveness::Busy;
+                }
+                pid_identity::FinalizerProcessIdentityObservation::ExactLive(_) => {
+                    stale = RuntimeGenerationReadOnlyLiveness::StalePidReused;
+                }
+                pid_identity::FinalizerProcessIdentityObservation::ExactExited(exited)
+                    if exited != *recorded =>
+                {
+                    stale = RuntimeGenerationReadOnlyLiveness::StalePidReused;
+                }
+                pid_identity::FinalizerProcessIdentityObservation::ExactExited(_)
+                | pid_identity::FinalizerProcessIdentityObservation::Dead => {
+                    stale = RuntimeGenerationReadOnlyLiveness::StaleDead;
+                }
+                pid_identity::FinalizerProcessIdentityObservation::Unsupported
+                | pid_identity::FinalizerProcessIdentityObservation::ReadError(_) => {
+                    return RuntimeGenerationReadOnlyLiveness::Busy;
+                }
             }
         }
     }
@@ -15868,6 +16093,485 @@ mod tests {
     }
 
     #[test]
+    fn early_ack_old_backlog_survives_prune_until_finalizer_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let old = inserted_row(db.enqueue_agent_bash_complete(&input("old", "session-a")));
+        let mut newer = Vec::new();
+        for n in 0..TERMINAL_HISTORY_KEEP_ROWS {
+            newer.push(
+                inserted_row(
+                    db.enqueue_agent_bash_complete(&input(&format!("new-{n}"), "session-b")),
+                )
+                .seq,
+            );
+        }
+        db.mark_delivered("session-b", None, &newer, "other-consumer")
+            .unwrap();
+        let retained = db.retain_delivery_finalization("exact").unwrap();
+        db.register_headless_delivery_attempt(
+            "exact",
+            "session-a",
+            None,
+            "invocation",
+            &[old.seq],
+            0,
+        )
+        .unwrap();
+        assert!(
+            !db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                .unwrap()
+        );
+        // Same public-API probe signal, now retaining the live finalization obligation.
+        let mut consumer = MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            consumer
+                .acknowledge_range("session-a", old.seq, old.seq, "consumer")
+                .unwrap(),
+            1
+        );
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                .unwrap()
+        );
+        assert_eq!(db.list_mailbox("session-a", true).unwrap().len(), 1);
+        // Both mailbox and attempt pruning (including keep=0) preserve exact authority.
+        db.prune_terminal_history_with_keep(2048, 0).unwrap();
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                .unwrap()
+        );
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-b", None, &[old.seq])
+                .is_err()
+        );
+        assert!(
+            db.delivery_attempt_fully_settled("missing", "session-a", None, &[old.seq])
+                .is_err()
+        );
+        assert!(
+            db.delivery_observation_confirmation("exact")
+                .unwrap()
+                .is_none()
+        );
+        drop(retained);
+        db.prune_terminal_history_with_keep(2048, 0).unwrap();
+        assert!(db.list_mailbox("session-a", true).unwrap().is_empty());
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                .is_err()
+        );
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalization_uncertain_identity_retains_reference_and_exact_ack_membership() {
+        use std::io::{Error, ErrorKind};
+        // Inject read/probe outcomes, not permissions or a substituted production
+        // /proc mount. hidepid NotFound and kill(0) EPERM both mean uncertainty.
+        for fault in [
+            "stat-denied",
+            "stat-unparseable",
+            "stat-zero",
+            "stat-hidden",
+            "stat-hidden-eperm",
+            "boot-denied",
+            "boot-missing",
+            "boot-empty",
+            "boot-unparseable",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+            let old = inserted_row(db.enqueue_agent_bash_complete(&input("old", "session-a")));
+            let retained = db.retain_delivery_finalization("exact").unwrap();
+            db.register_headless_delivery_attempt(
+                "exact",
+                "session-a",
+                None,
+                "invocation",
+                &[old.seq],
+                0,
+            )
+            .unwrap();
+            let observe = |pid| {
+                pid_identity::observe_finalizer_process_identity_with(
+                    pid,
+                    |path| {
+                        let boot = path.ends_with("boot_id");
+                        match (fault, boot) {
+                            ("stat-denied", false) | ("boot-denied", true) => {
+                                Err(ErrorKind::PermissionDenied.into())
+                            }
+                            ("stat-hidden" | "stat-hidden-eperm", false)
+                            | ("boot-missing", true) => Err(ErrorKind::NotFound.into()),
+                            ("stat-unparseable", false) | ("boot-unparseable", true) => {
+                                Ok("not an identity".into())
+                            }
+                            ("boot-empty", true) => Ok("  \n".into()),
+                            ("stat-zero", false) => {
+                                Ok(format!("{pid} (redacted) S {} 0", vec!["0"; 18].join(" ")))
+                            }
+                            _ => std::fs::read_to_string(path),
+                        }
+                    },
+                    |_| {
+                        if fault == "stat-hidden-eperm" {
+                            Err(Error::from_raw_os_error(libc::EPERM))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+            };
+            assert!(
+                matches!(
+                    observe(i64::from(std::process::id())),
+                    pid_identity::FinalizerProcessIdentityObservation::ReadError(_)
+                ),
+                "{fault}"
+            );
+            finalization::reap_abandoned_finalizers_with(&mut db.conn, 1, observe).unwrap();
+            assert!(
+                !db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                    .unwrap(),
+                "uncertainty is not ACK: {fault}"
+            );
+            assert!(
+                db.delivery_observation_confirmation("exact")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                db.acknowledge_range("session-a", old.seq, old.seq, "consumer")
+                    .unwrap(),
+                1
+            );
+            finalization::reap_abandoned_finalizers_with(&mut db.conn, 1, observe).unwrap();
+            assert_eq!(
+                count_rows(
+                    &db.conn,
+                    "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                    [],
+                    "refs"
+                )
+                .unwrap(),
+                1,
+                "{fault}"
+            );
+            db.prune_terminal_history_with_keep(2048, 0).unwrap();
+            assert!(
+                db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                    .unwrap(),
+                "{fault}"
+            );
+            assert_eq!(
+                db.list_mailbox("session-a", true).unwrap().len(),
+                1,
+                "{fault}"
+            );
+            assert!(
+                db.delivery_attempt_fully_settled("missing", "session-a", None, &[old.seq])
+                    .is_err()
+            );
+            assert!(
+                db.delivery_observation_confirmation("exact")
+                    .unwrap()
+                    .is_none()
+            );
+            drop(retained);
+            db.prune_terminal_history_with_keep(2048, 0).unwrap();
+            assert!(
+                db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalization_proven_absence_reclaims_ack_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let old = inserted_row(db.enqueue_agent_bash_complete(&input("old", "session-a")));
+        let retained = db.retain_delivery_finalization("exact").unwrap();
+        db.register_headless_delivery_attempt(
+            "exact",
+            "session-a",
+            None,
+            "invocation",
+            &[old.seq],
+            0,
+        )
+        .unwrap();
+        db.acknowledge_range("session-a", old.seq, old.seq, "consumer")
+            .unwrap();
+        finalization::reap_abandoned_finalizers_with(&mut db.conn, 1, |pid| {
+            pid_identity::observe_finalizer_process_identity_with(
+                pid,
+                |_| Err(std::io::ErrorKind::NotFound.into()),
+                |_| Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            0
+        );
+        db.prune_terminal_history_with_keep(2048, 0).unwrap();
+        assert!(db.list_mailbox("session-a", true).unwrap().is_empty());
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
+                .is_err()
+        );
+        drop(retained);
+    }
+
+    #[test]
+    fn finalization_abrupt_exit_child() {
+        let Some(path) = std::env::var_os("AGE353_FINALIZATION_CHILD_DB") else {
+            return;
+        };
+        let db = MailboxDb::open(Path::new(&path)).unwrap();
+        let _retained = db.retain_delivery_finalization("crashed").unwrap();
+        // Abrupt process exit, deliberately no Rust destructors. Parent waits/reaps.
+        std::process::exit(23);
+    }
+
+    #[test]
+    fn finalization_reaps_crashed_owner_without_starvation_or_live_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let live = db.retain_delivery_finalization("live").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mailbox::tests::finalization_abrupt_exit_child",
+                "--nocapture",
+            ])
+            .env("AGE353_FINALIZATION_CHILD_DB", &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(23));
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            2
+        );
+        finalization::reap_abandoned_finalizers(&mut db.conn, 1).unwrap();
+        // First bounded slice rotates the live owner, second reaches the crash.
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            2
+        );
+        finalization::reap_abandoned_finalizers(&mut db.conn, 1).unwrap();
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            1
+        );
+        drop(live);
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            0
+        );
+        // Reused PID identity is not the old finalizer, even though its PID is live.
+        let reused = db.retain_delivery_finalization("reused").unwrap();
+        db.conn.execute("UPDATE mailbox_delivery_finalizers SET os_pid_starttime_ticks = os_pid_starttime_ticks + 1", []).unwrap();
+        finalization::reap_abandoned_finalizers(&mut db.conn, 1).unwrap();
+        assert_eq!(
+            count_rows(
+                &db.conn,
+                "SELECT COUNT(*) FROM mailbox_delivery_finalizers",
+                [],
+                "refs"
+            )
+            .unwrap(),
+            0
+        );
+        drop(reused);
+    }
+
+    #[test]
+    fn finalization_reference_migrates_v14_without_losing_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("pending", "session-a")));
+        db.conn
+            .execute_batch("DROP TABLE mailbox_delivery_finalizers; PRAGMA user_version = 14;")
+            .unwrap();
+        drop(db);
+        let db = MailboxDb::open(&path).unwrap();
+        assert_eq!(db.list_pending("session-a").unwrap()[0].seq, row.seq);
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            15
+        );
+        let retained = db.retain_delivery_finalization("new").unwrap();
+        drop(retained);
+    }
+
+    #[test]
+    fn early_ack_exact_attempt_reconciliation_preserves_partial_and_full_settlement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let a = inserted_row(db.enqueue_agent_bash_complete(&input("a", "session-a")));
+        let b = inserted_row(db.enqueue_agent_bash_complete(&input("b", "session-a")));
+        let seqs = [a.seq, b.seq];
+        db.register_delivery_attempt("exact", "session-a", "invocation", &seqs, 0)
+            .unwrap();
+        assert!(
+            !db.delivery_attempt_fully_settled("exact", "session-a", None, &seqs)
+                .unwrap()
+        );
+        db.acknowledge_range("session-a", a.seq, a.seq, "consumer")
+            .unwrap();
+        assert!(
+            !db.delivery_attempt_fully_settled("exact", "session-a", None, &seqs)
+                .unwrap()
+        );
+        assert!(
+            !db.mark_delivery_attempt_failed("exact", "session-a", None, &seqs, "unconfirmed")
+                .unwrap()
+        );
+        let rows = db.list_mailbox("session-a", true).unwrap();
+        assert_eq!(
+            rows[0].delivered_by_invocation_uuid.as_deref(),
+            Some("consumer")
+        );
+        assert_eq!(rows[0].delivery_attempts, 1);
+        assert!(rows[0].delivery_error.is_none());
+        assert!(rows[1].delivered_at.is_none());
+        assert_eq!(rows[1].delivery_error.as_deref(), Some("unconfirmed"));
+        assert!(
+            db.delivery_attempt_window("exact")
+                .unwrap()
+                .unwrap()
+                .resolved_at
+                .is_none()
+        );
+        db.acknowledge_range("session-a", b.seq, b.seq, "consumer")
+            .unwrap();
+        let before = db.list_mailbox("session-a", true).unwrap();
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &seqs)
+                .unwrap()
+        );
+        assert!(
+            db.mark_delivery_attempt_failed("exact", "session-a", None, &seqs, "late-error")
+                .unwrap()
+        );
+        assert_eq!(db.list_mailbox("session-a", true).unwrap(), before);
+        assert!(
+            db.delivery_attempt_window("exact")
+                .unwrap()
+                .unwrap()
+                .resolved_at
+                .is_some()
+        );
+        assert!(
+            db.delivery_observation_confirmation("exact")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.unresolved_delivery_attempt_windows("session-a")
+                .unwrap()
+                .is_empty()
+        );
+        // Neither a subset, another attempt, nor foreign session can borrow this ACK.
+        for (attempt, session, batch) in [
+            ("exact", "session-a", vec![a.seq]),
+            ("missing", "session-a", seqs.to_vec()),
+            ("exact", "session-b", seqs.to_vec()),
+            ("exact", "session-a", vec![a.seq, b.seq + 100]),
+        ] {
+            assert!(
+                db.delivery_attempt_fully_settled(attempt, session, None, &batch)
+                    .is_err()
+            );
+            assert!(
+                db.mark_delivery_attempt_failed(attempt, session, None, &batch, "error")
+                    .is_err()
+            );
+        }
+        assert_eq!(db.list_mailbox("session-a", true).unwrap(), before);
+        // Generic pending-only API still rejects settled batches.
+        assert!(
+            db.mark_delivery_failed("session-a", None, &seqs, "error")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn early_ack_reconciliation_rejects_corrupt_missing_or_foreign_attempt_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let a = inserted_row(db.enqueue_agent_bash_complete(&input("a", "session-a")));
+        db.register_delivery_attempt("exact", "session-a", "invocation", &[a.seq], 0)
+            .unwrap();
+        db.conn.execute("UPDATE mailbox SET target_kind = 'session', target_id = 'session-b', session_id = 'session-b' WHERE seq = ?1", params![a.seq]).unwrap();
+        assert!(
+            db.mark_delivery_attempt_failed("exact", "session-a", None, &[a.seq], "error")
+                .is_err()
+        );
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &[a.seq])
+                .is_err()
+        );
+        db.conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        db.conn
+            .execute("DELETE FROM mailbox WHERE seq = ?1", params![a.seq])
+            .unwrap();
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &[a.seq])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn mark_delivery_failed_records_attempt_without_delivery() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
@@ -16394,6 +17098,16 @@ mod tests {
             })
             .unwrap();
 
+        // Model creator replacement as well as child replacement. A live
+        // exact creator still owes orderly finalization after child exit.
+        db.conn
+            .execute(
+                "UPDATE runtime_generation SET creator_identity_os_pid_starttime_ticks =
+             creator_identity_os_pid_starttime_ticks + 1 WHERE generation_uuid = ?1",
+                params![generation_id.to_string()],
+            )
+            .unwrap();
+
         assert_eq!(
             db.runtime_lifecycle()
                 .reconcile_session_liveness("session-a")
@@ -16458,6 +17172,16 @@ mod tests {
                 fence,
                 drain_request_id: &drain_request_id,
             })
+            .unwrap();
+
+        // Model creator replacement as well as child replacement. A live
+        // exact creator still owes orderly finalization after child exit.
+        db.conn
+            .execute(
+                "UPDATE runtime_generation SET creator_identity_os_pid_starttime_ticks =
+             creator_identity_os_pid_starttime_ticks + 1 WHERE generation_uuid = ?1",
+                params![generation_id.to_string()],
+            )
             .unwrap();
 
         assert_eq!(
@@ -18016,5 +18740,86 @@ mod tests {
         stmt.query_map([], |row| row.get::<_, String>(1))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
+    }
+}
+
+fn mailbox_observation_stopped_on(conn: &Connection, session_id: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mailbox_observation_stops
+        WHERE session_id = ?1 AND rearmed_at IS NULL)",
+        params![session_id],
+        |row| row.get(0),
+    )
+    .map_err(|err| format!("Failed to read mailbox observation stop: {err}"))
+}
+
+#[cfg(test)]
+mod observation_stop_history_tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_v13_upgrade_and_rearm_keep_failure_history_and_fence_stale_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pid-identity.db");
+        {
+            let db = MailboxDb::open(&path).unwrap();
+            // Exact prior schema: v14 adds only the independent stop-history table.
+            db.conn
+                .execute_batch("DROP TABLE mailbox_observation_stops; PRAGMA user_version = 13;")
+                .unwrap();
+        }
+        let mut db = MailboxDb::open(&path).unwrap();
+        let EnqueueResult::Inserted(row) = db
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "session",
+                handle: "work",
+                payload_json: "{}",
+                owner_invocation_uuid: Some("owner"),
+                matched_os_pid: None,
+                matched_os_boot_id: None,
+                matched_os_pid_starttime_ticks: None,
+                matched_chain_index: None,
+                state_dir: "/offline",
+                meta_path: "/offline/meta",
+                log_path: "/offline/log",
+                rc_path: "/offline/rc",
+                rc: 0,
+            })
+            .unwrap()
+        else {
+            panic!("missing fixture row")
+        };
+        db.register_headless_delivery_attempt("attempt", "session", None, "native", &[row.seq], 0)
+            .unwrap();
+        assert!(
+            db.stop_mailbox_observation("foreign", "attempt", "capacity", "error")
+                .is_err()
+        );
+        db.stop_mailbox_observation("session", "attempt", "capacity", "causal error")
+            .unwrap();
+        let old = db.mailbox_observation_stop("session").unwrap().unwrap();
+        db.rearm_mailbox_observation("session", &old.stop_id, "restored capacity evidence")
+            .unwrap();
+        db.stop_mailbox_observation("session", "attempt", "capacity", "new exhaustion")
+            .unwrap();
+        let current = db.mailbox_observation_stop("session").unwrap().unwrap();
+        assert_ne!(old.stop_id, current.stop_id);
+        assert!(
+            db.rearm_mailbox_observation("session", &old.stop_id, "stale resolution")
+                .is_err()
+        );
+        let retained: (String, String, String) = db.conn.query_row(
+            "SELECT error, rearmed_at, resolution FROM mailbox_observation_stops WHERE stop_id = ?1",
+            params![old.stop_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(retained.0, "causal error");
+        assert!(!retained.1.is_empty());
+        assert_eq!(retained.2, "restored capacity evidence");
+        assert_eq!(db.list_pending("session").unwrap().len(), 1);
+        assert!(
+            db.delivery_observation_confirmation("attempt")
+                .unwrap()
+                .is_none()
+        );
     }
 }

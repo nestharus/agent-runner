@@ -38,6 +38,8 @@ use crate::spawn_cwd::effective_resume_spawn_cwd;
 use crate::wiring;
 
 pub(in crate::run) struct PreparedHeadlessResumeExecution {
+    pub(super) _mailbox_finalization_guard:
+        Option<oulipoly_state::mailbox::DeliveryFinalizationGuard>,
     pub(super) answer: Option<String>,
     pub(super) mailbox_session_id: String,
     pub(super) mailbox_delivery_seqs: Vec<i64>,

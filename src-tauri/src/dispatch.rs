@@ -100,7 +100,9 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     if let Some(Subcommands::Mailbox { command }) = &cli.command
         && matches!(
             command,
-            MailboxSubcommands::CompactDelivered { .. } | MailboxSubcommands::PruneTerminal { .. }
+            MailboxSubcommands::CompactDelivered { .. }
+                | MailboxSubcommands::PruneTerminal { .. }
+                | MailboxSubcommands::RearmObservation { .. }
         )
     {
         return dispatch_mailbox_subcommand(command.clone());
@@ -507,6 +509,17 @@ fn dispatch_mailbox_subcommand(command: MailboxSubcommands) -> Result<i32, Strin
         MailboxSubcommands::Status { session_id, json } => {
             crate::commands::mailbox::run_status(&session_id, json)
         }
+        MailboxSubcommands::RearmObservation {
+            session_id,
+            stop_id,
+            cause_resolved,
+            json,
+        } => crate::commands::mailbox::run_rearm_observation(
+            &session_id,
+            &stop_id,
+            &cause_resolved,
+            json,
+        ),
         MailboxSubcommands::Pause { session_id, json } => {
             crate::commands::mailbox::run_pause(&session_id, true, json)
         }

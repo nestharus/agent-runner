@@ -2,6 +2,7 @@
 use super::*;
 use crate::mailbox_delivery::{deliverable_pending_count_on, prepare_headless_resume_delivery_on};
 use oulipoly_runtime::session_provider::{SessionProviderPageTurn, SessionProviderReadPageResult};
+use oulipoly_state::SessionLifecycleRepository;
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult};
 
 const SESSION: &str = "11111111-1111-4111-8111-111111111111";
@@ -396,3 +397,200 @@ fn age347_legacy_null_marker_recovery_uses_beginning_without_invented_anchor() {
 #[cfg(unix)]
 #[path = "observation_paired_tests.rs"]
 mod paired_tests;
+
+#[test]
+fn fixed_anchor_stop_survives_restart_demand_and_rearms_without_ack_or_replay() {
+    for reason in [
+        "session_turn_staging_capacity_exceeded",
+        "session_turn_paging_paused",
+    ] {
+        let mut f = Fixture::new();
+        f.db.record_delivery_observation_anchor_failure(&f.attempt, SESSION, reason)
+            .unwrap();
+        f.db.stop_mailbox_observation(SESSION, &f.attempt, reason, reason)
+            .unwrap();
+        let stop = f.db.mailbox_observation_stop(SESSION).unwrap().unwrap();
+        assert_eq!(stop.attempt_id, f.attempt);
+        assert_eq!(stop.reason, reason);
+        assert_eq!(stop.error, reason);
+        let EnqueueResult::Inserted(new_row) =
+            f.db.enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: SESSION,
+                handle: "new-demand-while-stopped",
+                payload_json: "{}",
+                owner_invocation_uuid: Some("owner"),
+                matched_os_pid: Some(1),
+                matched_os_boot_id: Some("boot"),
+                matched_os_pid_starttime_ticks: Some(1),
+                matched_chain_index: Some(0),
+                state_dir: "/offline/new",
+                meta_path: "/offline/new/meta",
+                log_path: "/offline/new/log",
+                rc_path: "/offline/new/rc",
+                rc: 0,
+            })
+            .unwrap()
+        else {
+            panic!("new notification missing")
+        };
+        assert!(new_row.seq > f.seq);
+        for _ in 0..3 {
+            f.restart();
+            // Routine pause/resume is not intervention-resolution authority.
+            f.db.set_notifications_paused(SESSION, true).unwrap();
+            f.db.set_notifications_paused(SESSION, false).unwrap();
+            assert_eq!(
+                deliverable_pending_count_on(&mut f.db, &f.state, SESSION).unwrap(),
+                0
+            );
+            assert!(
+                prepare_headless_resume_delivery_on(&mut f.db, SESSION, "chain", None, None)
+                    .is_err()
+            );
+            assert!(f.submit().is_err());
+            assert_eq!(f.submissions, 0);
+            let rows = f.db.list_pending(SESSION).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].delivery_attempts, 0);
+            assert_eq!(rows[0].delivered_at, None);
+            assert_eq!(
+                f.db.mailbox_observation_stop(SESSION)
+                    .unwrap()
+                    .unwrap()
+                    .stop_id,
+                stop.stop_id
+            );
+            assert!(
+                f.db.rearm_mailbox_observation(SESSION, "stale-stop", "resolved")
+                    .is_err()
+            );
+            assert!(
+                f.db.rearm_mailbox_observation(SESSION, &stop.stop_id, "  ")
+                    .is_err()
+            );
+        }
+        // Direct state admission is also fenced; preparation cannot replace the evidence.
+        assert!(
+            f.db.register_headless_delivery_attempt(
+                "replacement",
+                SESSION,
+                None,
+                "other",
+                &[f.seq],
+                0
+            )
+            .is_err()
+        );
+        f.db.rearm_mailbox_observation(
+            SESSION,
+            &stop.stop_id,
+            "fixture capacity restored / containment disabled",
+        )
+        .unwrap();
+        assert_eq!(f.db.list_pending(SESSION).unwrap().len(), 2);
+        assert_eq!(f.submissions, 0);
+        let prepared =
+            prepare_headless_resume_delivery_on(&mut f.db, SESSION, "chain", None, None).unwrap();
+        f.attempt = prepared.delivery_nonce.unwrap();
+        f.anchor.expected_sha256 = normalized_text_sha256(prepared.answer.as_deref().unwrap());
+        f.db.bind_delivery_attempt_invocation(&f.attempt, SESSION, "native-invocation")
+            .unwrap();
+        f.anchored_submit();
+        assert!(f.submit().is_err());
+        assert!(
+            observe_delivery_with(&f.db, &f.attempt, &f.anchor, |_, index, seq, _| {
+                Ok(page(&f.anchor, index, seq, true, 1))
+            })
+            .unwrap()
+        );
+        for _ in 0..3 {
+            f.restart();
+            assert_eq!(
+                deliverable_pending_count_on(&mut f.db, &f.state, SESSION).unwrap(),
+                0
+            );
+            let rows = f.db.list_mailbox(SESSION, true).unwrap();
+            assert_eq!(rows[0].delivery_attempts, 1);
+            assert!(rows[0].delivered_at.is_some());
+            assert_eq!(f.submissions, 1);
+        }
+    }
+}
+
+#[test]
+fn fixed_post_submission_stop_retains_checkpoint_and_never_resubmits() {
+    let mut f = Fixture::new();
+    f.anchored_submit();
+    assert!(
+        !observe_delivery_with(&f.db, &f.attempt, &f.anchor, |_, index, seq, _| {
+            Ok(page(&f.anchor, index, seq, false, usize::from(index == 0)))
+        })
+        .unwrap()
+    );
+    let checkpoint = f.db.delivery_observation_progress(&f.attempt).unwrap();
+    f.db.stop_mailbox_observation(SESSION, &f.attempt, "session_turn_paging_paused", "paused")
+        .unwrap();
+    f.restart();
+    assert!(
+        observe_delivery_with(&f.db, &f.attempt, &f.anchor, |_, _, _, _| {
+            panic!("stopped observer must not read provider")
+        })
+        .is_err()
+    );
+    assert_eq!(
+        f.db.delivery_observation_progress(&f.attempt).unwrap(),
+        checkpoint
+    );
+    let stop = f.db.mailbox_observation_stop(SESSION).unwrap().unwrap();
+    f.db.rearm_mailbox_observation(SESSION, &stop.stop_id, "containment disabled")
+        .unwrap();
+    assert!(prepare_headless_resume_delivery_on(&mut f.db, SESSION, "chain", None, None).is_err());
+    assert!(
+        observe_delivery_with(&f.db, &f.attempt, &f.anchor, |_, index, seq, _| {
+            assert_eq!((index, seq), (OBSERVATION_MAX_PAGES as u64, 1));
+            Ok(page(&f.anchor, index, seq, true, 0))
+        })
+        .unwrap()
+    );
+    assert_eq!(
+        deliverable_pending_count_on(&mut f.db, &f.state, SESSION).unwrap(),
+        0
+    );
+    assert_eq!(f.submissions, 1);
+}
+
+#[test]
+fn early_ack_settled_anchor_is_historical_not_a_stop_or_replay_candidate() {
+    let mut f = Fixture::new();
+    f.anchored_submit();
+    f.db.acknowledge_range(SESSION, f.seq, f.seq, "consumer")
+        .unwrap();
+    f.restart();
+    assert!(
+        f.db.delivery_attempt_fully_settled(&f.attempt, SESSION, Some("chain"), &[f.seq])
+            .unwrap()
+    );
+    assert!(
+        f.db.delivery_observation_anchor(&f.attempt)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.db.delivery_observation_confirmation(&f.attempt)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.db.pending_delivery_observations(SESSION, 4)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(f.db.mailbox_observation_stop(SESSION).unwrap().is_none());
+    assert!(f.submit().is_err());
+    assert_eq!(f.submissions, 1);
+    assert_eq!(
+        deliverable_pending_count_on(&mut f.db, &f.state, SESSION).unwrap(),
+        0
+    );
+    assert!(f.state.acknowledgement(&f.attempt).unwrap().is_none());
+}
