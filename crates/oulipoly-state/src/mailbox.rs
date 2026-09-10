@@ -4852,6 +4852,55 @@ impl MailboxDb {
         Ok(true)
     }
 
+    /// Reconcile consumer settlement against the complete, exact attempt batch.
+    /// This does not assert transport acceptance or transcript observation.
+    pub fn delivery_attempt_fully_settled(
+        &self,
+        attempt_id: &str,
+        session_id: &str,
+        chain_id: Option<&str>,
+        seqs: &[i64],
+    ) -> Result<bool, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|err| err.to_string())?;
+        let pending =
+            exact_delivery_attempt_pending_on(&tx, attempt_id, session_id, chain_id, seqs)?;
+        tx.commit().map_err(|err| err.to_string())?;
+        Ok(pending.is_empty())
+    }
+
+    /// Record a failure only for the remaining owned items. Unlike the generic
+    /// pending-only API, the exact attempt identity permits partial consumer ACK.
+    /// Returns true when consumer settlement won the race with finalization.
+    pub fn mark_delivery_attempt_failed(
+        &mut self,
+        attempt_id: &str,
+        session_id: &str,
+        chain_id: Option<&str>,
+        seqs: &[i64],
+        delivery_error: &str,
+    ) -> Result<bool, String> {
+        reject_unauthorized_terminal_wake_abandonment(delivery_error)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| err.to_string())?;
+        let pending =
+            exact_delivery_attempt_pending_on(&tx, attempt_id, session_id, chain_id, seqs)?;
+        for seq in &pending {
+            tx.execute(
+                "UPDATE mailbox SET delivery_attempts = delivery_attempts + 1, delivery_error = ?2
+                 WHERE seq = ?1 AND delivered_at IS NULL",
+                params![seq, delivery_error],
+            )
+            .map_err(|err| format!("Failed to record exact delivery attempt failure: {err}"))?;
+        }
+        tx.commit().map_err(|err| err.to_string())?;
+        Ok(pending.is_empty())
+    }
+
     pub fn mark_delivery_failed(
         &mut self,
         session_id: &str,
@@ -8257,6 +8306,47 @@ fn mailbox_delivery_target_states_on(
         states.push(state);
     }
     Ok(states)
+}
+
+fn exact_delivery_attempt_pending_on(
+    conn: &Connection,
+    attempt_id: &str,
+    session_id: &str,
+    chain_id: Option<&str>,
+    seqs: &[i64],
+) -> Result<Vec<i64>, String> {
+    if seqs.is_empty() || seqs.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("exact delivery reconciliation requires a nonempty ordered batch".into());
+    }
+    let owned: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM mailbox_delivery_attempts
+         WHERE attempt_id = ?1 AND session_id = ?2)",
+            params![attempt_id, session_id],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
+    let mut stmt = conn.prepare(
+        "SELECT mailbox_seq FROM mailbox_delivery_attempt_items WHERE attempt_id = ?1 ORDER BY mailbox_seq"
+    ).map_err(|err| err.to_string())?;
+    let items = stmt
+        .query_map(params![attempt_id], |row| row.get::<_, i64>(0))
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    if !owned || items != seqs {
+        return Err("delivery reconciliation batch does not match the exact owned attempt".into());
+    }
+    let states = mailbox_delivery_target_states_on(conn, session_id, chain_id, seqs)
+        .map_err(|err| err.to_string())?;
+    if !all_mailbox_seqs_owned(&states) {
+        return Err("delivery reconciliation contains a missing or foreign-target row".into());
+    }
+    Ok(seqs
+        .iter()
+        .zip(states)
+        .filter_map(|(seq, state)| matches!(state, Some(None)).then_some(*seq))
+        .collect())
 }
 
 fn all_mailbox_seqs_owned(states: &[Option<Option<String>>]) -> bool {
@@ -15973,6 +16063,124 @@ mod tests {
         assert!(db.notifications_paused("session-a").unwrap());
         db.set_notifications_paused("session-a", false).unwrap();
         assert!(!db.notifications_paused("session-a").unwrap());
+    }
+
+    #[test]
+    fn early_ack_exact_attempt_reconciliation_preserves_partial_and_full_settlement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let a = inserted_row(db.enqueue_agent_bash_complete(&input("a", "session-a")));
+        let b = inserted_row(db.enqueue_agent_bash_complete(&input("b", "session-a")));
+        let seqs = [a.seq, b.seq];
+        db.register_delivery_attempt("exact", "session-a", "invocation", &seqs, 0)
+            .unwrap();
+        assert!(
+            !db.delivery_attempt_fully_settled("exact", "session-a", None, &seqs)
+                .unwrap()
+        );
+        db.acknowledge_range("session-a", a.seq, a.seq, "consumer")
+            .unwrap();
+        assert!(
+            !db.delivery_attempt_fully_settled("exact", "session-a", None, &seqs)
+                .unwrap()
+        );
+        assert!(
+            !db.mark_delivery_attempt_failed("exact", "session-a", None, &seqs, "unconfirmed")
+                .unwrap()
+        );
+        let rows = db.list_mailbox("session-a", true).unwrap();
+        assert_eq!(
+            rows[0].delivered_by_invocation_uuid.as_deref(),
+            Some("consumer")
+        );
+        assert_eq!(rows[0].delivery_attempts, 1);
+        assert!(rows[0].delivery_error.is_none());
+        assert!(rows[1].delivered_at.is_none());
+        assert_eq!(rows[1].delivery_error.as_deref(), Some("unconfirmed"));
+        assert!(
+            db.delivery_attempt_window("exact")
+                .unwrap()
+                .unwrap()
+                .resolved_at
+                .is_none()
+        );
+        db.acknowledge_range("session-a", b.seq, b.seq, "consumer")
+            .unwrap();
+        let before = db.list_mailbox("session-a", true).unwrap();
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &seqs)
+                .unwrap()
+        );
+        assert!(
+            db.mark_delivery_attempt_failed("exact", "session-a", None, &seqs, "late-error")
+                .unwrap()
+        );
+        assert_eq!(db.list_mailbox("session-a", true).unwrap(), before);
+        assert!(
+            db.delivery_attempt_window("exact")
+                .unwrap()
+                .unwrap()
+                .resolved_at
+                .is_some()
+        );
+        assert!(
+            db.delivery_observation_confirmation("exact")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.unresolved_delivery_attempt_windows("session-a")
+                .unwrap()
+                .is_empty()
+        );
+        // Neither a subset, another attempt, nor foreign session can borrow this ACK.
+        for (attempt, session, batch) in [
+            ("exact", "session-a", vec![a.seq]),
+            ("missing", "session-a", seqs.to_vec()),
+            ("exact", "session-b", seqs.to_vec()),
+            ("exact", "session-a", vec![a.seq, b.seq + 100]),
+        ] {
+            assert!(
+                db.delivery_attempt_fully_settled(attempt, session, None, &batch)
+                    .is_err()
+            );
+            assert!(
+                db.mark_delivery_attempt_failed(attempt, session, None, &batch, "error")
+                    .is_err()
+            );
+        }
+        assert_eq!(db.list_mailbox("session-a", true).unwrap(), before);
+        // Generic pending-only API still rejects settled batches.
+        assert!(
+            db.mark_delivery_failed("session-a", None, &seqs, "error")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn early_ack_reconciliation_rejects_corrupt_missing_or_foreign_attempt_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let a = inserted_row(db.enqueue_agent_bash_complete(&input("a", "session-a")));
+        db.register_delivery_attempt("exact", "session-a", "invocation", &[a.seq], 0)
+            .unwrap();
+        db.conn.execute("UPDATE mailbox SET target_kind = 'session', target_id = 'session-b', session_id = 'session-b' WHERE seq = ?1", params![a.seq]).unwrap();
+        assert!(
+            db.mark_delivery_attempt_failed("exact", "session-a", None, &[a.seq], "error")
+                .is_err()
+        );
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &[a.seq])
+                .is_err()
+        );
+        db.conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        db.conn
+            .execute("DELETE FROM mailbox WHERE seq = ?1", params![a.seq])
+            .unwrap();
+        assert!(
+            db.delivery_attempt_fully_settled("exact", "session-a", None, &[a.seq])
+                .is_err()
+        );
     }
 
     #[test]

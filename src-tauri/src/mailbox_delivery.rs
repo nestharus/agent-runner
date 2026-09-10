@@ -1396,21 +1396,6 @@ pub(crate) fn mark_headless_resume_delivered(
     db.mark_delivered(session_id, chain_id, seqs, delivered_by_invocation_uuid)
 }
 
-pub(crate) fn mark_headless_resume_delivery_failed(
-    session_id: &str,
-    chain_id: Option<&str>,
-    seqs: &[i64],
-    delivery_error: &str,
-) -> Result<(), String> {
-    if seqs.is_empty() {
-        return Ok(());
-    }
-    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
-        return Err("mailbox sidecar missing while marking failed delivery rows".to_string());
-    };
-    db.mark_delivery_failed(session_id, chain_id, seqs, delivery_error)
-}
-
 struct MailboxBatch {
     rows: Vec<MailboxRow>,
     remaining_count: usize,

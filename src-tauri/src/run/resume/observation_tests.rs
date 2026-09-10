@@ -2,6 +2,7 @@
 use super::*;
 use crate::mailbox_delivery::{deliverable_pending_count_on, prepare_headless_resume_delivery_on};
 use oulipoly_runtime::session_provider::{SessionProviderPageTurn, SessionProviderReadPageResult};
+use oulipoly_state::SessionLifecycleRepository;
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult};
 
 const SESSION: &str = "11111111-1111-4111-8111-111111111111";
@@ -556,4 +557,40 @@ fn fixed_post_submission_stop_retains_checkpoint_and_never_resubmits() {
         0
     );
     assert_eq!(f.submissions, 1);
+}
+
+#[test]
+fn early_ack_settled_anchor_is_historical_not_a_stop_or_replay_candidate() {
+    let mut f = Fixture::new();
+    f.anchored_submit();
+    f.db.acknowledge_range(SESSION, f.seq, f.seq, "consumer")
+        .unwrap();
+    f.restart();
+    assert!(
+        f.db.delivery_attempt_fully_settled(&f.attempt, SESSION, Some("chain"), &[f.seq])
+            .unwrap()
+    );
+    assert!(
+        f.db.delivery_observation_anchor(&f.attempt)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.db.delivery_observation_confirmation(&f.attempt)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.db.pending_delivery_observations(SESSION, 4)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(f.db.mailbox_observation_stop(SESSION).unwrap().is_none());
+    assert!(f.submit().is_err());
+    assert_eq!(f.submissions, 1);
+    assert_eq!(
+        deliverable_pending_count_on(&mut f.db, &f.state, SESSION).unwrap(),
+        0
+    );
+    assert!(f.state.acknowledgement(&f.attempt).unwrap().is_none());
 }

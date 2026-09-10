@@ -139,7 +139,7 @@ pub(super) fn handle_resume_attempt_result(
     ) {
         CleanExitMailboxResolutionEligibility::Ineligible => None,
         CleanExitMailboxResolutionEligibility::PreCompletionFailureCleanExit => Some(
-            wake::resolve_mailbox_delivery_outcome(input, provider, result, completion_evidence),
+            wake::resolve_mailbox_delivery_outcome(input, provider, result, completion_evidence)?,
         ),
     };
     handle_ordinary_resume_attempt_terminal_signal(
@@ -373,6 +373,11 @@ fn ordinary_confirmed_delivery_evidence(
     terminal_completion_confirmed: bool,
     mailbox_delivery_outcome: Option<&wake::MailboxDeliveryOutcome>,
 ) -> Result<Option<ConfirmedDeliveryEvidence>, String> {
+    // Durable consumer ACK is not automatic transcript/transport confirmation.
+    // Do not manufacture ConfirmedDeliverySettlement merely from assistant success.
+    if wake::mailbox_delivery_already_settled(input)? {
+        return Ok(None);
+    }
     let completed_success = completion_evidence.recovered_generic_nonzero
         || super::predicate::completed_attempt_success(result, terminal_completion_confirmed);
     let delivery_confirmed = matches!(
