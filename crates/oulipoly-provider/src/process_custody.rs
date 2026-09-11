@@ -810,4 +810,3 @@ mod native_group_diagnostic_tests {
         }
     }
 }
-

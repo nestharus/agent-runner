@@ -824,6 +824,10 @@ fn assert_cargo_inventory_matches(workflow_name: &str, workflow: &Value) {
             ),
             (
                 "rust-native-wake",
+                r"^cargo\s+test\s+-p\s+oulipoly-provider\s+--lib\s+native_group_diagnostic_tests\s+--\s+--nocapture\s*$",
+            ),
+            (
+                "rust-native-wake",
                 r"^cargo\s+test\s+-p\s+oulipoly-agent-runner\s+--test\s+age330_native_delivery_domain\s+--\s+--nocapture\s*$",
             ),
         ]);
