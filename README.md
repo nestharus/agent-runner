@@ -1285,3 +1285,54 @@ observer pinned to a paging-paused containment provider can stop again even afte
 an installed pathname is replaced. Neither explicit rearming nor these local
 queue semantics establishes an in-process provider-replacement handoff or deployed
 restoration; deployment authority and evidence remain separate.
+
+### Active headless native notification receipt
+
+Headless mailbox resumes now keep bounded receipt inspection active while the
+provider runs, including auto-wake children. The wake startup/maintenance scanner
+also visits submitted unresolved attempts after observer restart. Inspection
+calls only the existing provider `session.read_turns` / `user_observation` reader;
+it never launches or semantically resumes a model to inspect history.
+
+Receipt means exactly one **new canonical native user-role envelope**, bound to
+its pre-submission anchor, session/account, delivery nonce and full normalized
+text digest, within a completed finite snapshot. Provider-owned projection
+exclusions apply under the trusted-native-writer assumption. This is not evidence
+of human origin, mental processing, an assistant response, successful execution,
+or task completion. Exact unclassified user-role replay by the trusted writer is
+not distinguishable. PTY transport ACK is unchanged; PTY native receipt remains
+future work.
+
+Each active owner visits one durable, globally round-robin attempt slot per
+2-second interval; desktop/REPL maintenance also visits one slot per existing
+60-second sweep, and startup visits once. Selection advances before external IO,
+including unavailable/excluded slots, using an indexed keyset cursor in mailbox
+sidecar schema 16. Each visit reads at most one provider page (64 turns, 128 KiB
+response, 512 KiB forward source budget; existing provider accounting also bounds
+metadata/reconstruction work). Describe has a 2-second timeout; the page receives
+only the remaining 2-second inspection budget. Pinned-adapter fingerprinting uses
+the existing client identity reader's 512 MiB executable ceiling. These are work
+and process-timeout bounds, not a hard latency guarantee for blocked filesystem
+operations. No mailbox transaction or wake coordination lock is held over IO or
+between ticks. Active worker shutdown joins its bounded in-flight inspection.
+
+Opaque page checkpoints retain finite-snapshot match counts with CAS. Final
+receipt publication rechecks the checkpoint, original attempt/owner/anchor,
+fixed stop and pause in the same transaction as exact-attempt mailbox settlement.
+Partial explicit ACK retains its own attribution; full ACK wins without creating
+native evidence. Receipt publication never idles or completes a running
+invocation, and later provider failure does not undo the receipt. Fixed stops
+remain fixed across restart until explicit cause-resolved rearm.
+
+**Upgrade limits:** deploy with a provider implementing the selected exclusion
+semantics (paired here with Codex adapter candidate `9960339`), not merely one
+advertising the same wire protocol. Older checkpoints lacking this reader policy
+or carrying another pinned executable identity are reobserved from the original
+persisted submission anchor; cached matches and later cursors are not promoted.
+No resend or anchor reset occurs. Invalid old tokens, absent original anchors,
+missing routes/cwd, stopped or unsupported providers remain unknown. Already
+settled historical confirmations are not retrospectively requalified. Executable
+identity detects adapter replacement, not changes behind an unchanged wrapper,
+remote service, native writer or dependency; those require operator-controlled
+upgrade handling. The protocol version alone does not attest these semantics.
+No SDK or provider contract change was required.

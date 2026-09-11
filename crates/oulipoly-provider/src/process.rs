@@ -64,6 +64,27 @@ use std::time::{Duration, Instant};
 // or a pipe/worker remains live. It is not additional provider execution time.
 const SETTLEMENT_OBSERVATION_BOUND: Duration = Duration::from_secs(1);
 
+// Set only inside the dedicated Runner receipt helper, before any threads or
+// provider operations. Nested providers belong to that disposable inspection
+// group. Their timeout tears down the helper as well; no model uses this mode.
+#[cfg(unix)]
+static RECEIPT_GROUP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+#[cfg(unix)]
+pub fn enter_receipt_inspection_group() -> Result<(), String> {
+    if unsafe { libc::getpgrp() } != std::process::id() as i32 {
+        return Err("receipt helper requires its own process group".into());
+    }
+    RECEIPT_GROUP.store(
+        unsafe { libc::getpgrp() },
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    Ok(())
+}
+#[cfg(unix)]
+fn receipt_group() -> i32 {
+    RECEIPT_GROUP.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -892,6 +913,14 @@ where
 }
 
 fn configure_provider_process(process: &mut Command, command: &ProcessCommand) {
+    #[cfg(unix)]
+    if receipt_group() != 0 {
+        // On Linux deny group/session/namespace escape to all descendants.
+        crate::process_custody::configure_containment(process, true);
+    } else {
+        configure_process_group(process);
+    }
+    #[cfg(not(unix))]
     configure_process_group(process);
     configure_pinned_executable(process, command);
 }
@@ -1047,7 +1076,11 @@ fn poll_child_status(
         return Ok(None);
     }
     // WNOWAIT keeps the exact leader unreaped while its owned descendants are cleaned.
-    if !kill_tree(child) {
+    // A receipt helper is a single bounded inspection scope: its parent owns
+    // the whole group, including descendants after a direct operation exits.
+    // Killing that group here would kill the cache/DB owner after every describe.
+    // Normal invocation custody retains its existing per-operation teardown.
+    if receipt_group() == 0 && !kill_tree(child) {
         return Err(wait_operation_error(
             command,
             "cleanup_admission_or_signal",
@@ -1745,9 +1778,22 @@ fn terminate_tree(child: &mut Child) {
         child.uncertain();
         return;
     }
-    let group = -(child.id() as i32);
+    let group = -if receipt_group() != 0 {
+        receipt_group()
+    } else {
+        child.id() as i32
+    };
     unsafe {
-        libc::kill(group, libc::SIGTERM);
+        // This group includes the helper's lifetime/teardown owner. TERM
+        // could kill it before escalation while resistant descendants survive.
+        libc::kill(
+            group,
+            if receipt_group() != 0 {
+                libc::SIGKILL
+            } else {
+                libc::SIGTERM
+            },
+        );
     }
 }
 
@@ -1767,7 +1813,11 @@ fn kill_tree(child: &mut Child) -> bool {
         child.uncertain();
         return false;
     }
-    let group = -(child.id() as i32);
+    let group = -if receipt_group() != 0 {
+        receipt_group()
+    } else {
+        child.id() as i32
+    };
     let signal_ok = unsafe { libc::kill(group, libc::SIGKILL) } == 0;
     child.confirm_group_dead(signal_ok);
     if !signal_ok {

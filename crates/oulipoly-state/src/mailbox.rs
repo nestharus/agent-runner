@@ -4095,6 +4095,163 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to read mailbox delivery observation anchor: {err}"))
     }
 
+    /// Claim one keyset position, including across process restart. No provider IO
+    /// occurs in this short transaction; failed/unavailable candidates still rotate.
+    pub fn next_headless_receipt_attempt(&mut self) -> Result<Option<String>, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let after: String = tx
+            .query_row(
+                "SELECT after_attempt_id FROM mailbox_receipt_scan WHERE singleton = 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        let query = "SELECT a.attempt_id FROM mailbox_delivery_attempts a
+            WHERE a.attempt_id > ?1
+              AND a.resolved_at IS NULL AND a.observation_confirmed_at IS NULL
+              AND a.headless_submission_state = 'possible'
+              AND a.submission_started_at IS NOT NULL
+              AND a.observation_anchor_token IS NOT NULL
+              AND a.observation_expected_sha256 IS NOT NULL
+            ORDER BY a.attempt_id LIMIT 1";
+        let mut selected = tx
+            .query_row(query, params![after], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if selected.is_none() {
+            selected = tx
+                .query_row(query, params![""], |r| r.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?;
+        }
+        tx.execute(
+            "INSERT INTO mailbox_receipt_scan VALUES (1, ?1)
+            ON CONFLICT(singleton) DO UPDATE SET after_attempt_id = excluded.after_attempt_id",
+            params![selected.as_deref().unwrap_or("")],
+        )
+        .map_err(|e| e.to_string())?;
+        // Qualify one visited slot, not an unbounded scan across paused/PTY
+        // sessions. Even excluded slots advance the durable fair cursor.
+        let eligible: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+            SELECT 1 FROM mailbox_delivery_attempts a
+            JOIN session_runtime r ON r.session_id = a.session_id
+            WHERE a.attempt_id = ?1 AND r.mode = 'headless'
+              AND NOT EXISTS (SELECT 1 FROM mailbox_observation_stops s
+                  WHERE s.session_id = a.session_id AND s.rearmed_at IS NULL)
+              AND NOT EXISTS (SELECT 1 FROM mailbox_notification_control n
+                  WHERE n.session_id = a.session_id AND n.paused = 1))",
+                params![selected],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(selected.filter(|_| eligible))
+    }
+
+    /// Constant-sized observation custody read: unlike a delivery window this
+    /// never materializes message payloads or the rest of the session backlog.
+    pub fn delivery_observation_owner(
+        &self,
+        attempt_id: &str,
+        session_id: &str,
+    ) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT delivery_invocation_uuid FROM mailbox_delivery_attempts
+            WHERE attempt_id = ?1 AND session_id = ?2 AND resolved_at IS NULL
+              AND (headless_submission_state IS NULL OR
+                  (headless_submission_state = 'possible' AND submission_started_at IS NOT NULL))",
+                params![attempt_id, session_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Publish native receipt and settle only this attempt's remaining items.
+    /// This is deliberately independent of runtime generation/idle/terminal state.
+    /// Full consumer ACK wins without inventing native evidence; partial ACK is
+    /// retained and only the remainder is marked. CAS and identity are rechecked
+    /// in the same transaction as publication, after all provider IO has finished.
+    pub fn confirm_native_delivery_receipt(
+        &self,
+        attempt_id: &str,
+        invocation_uuid: &str,
+        anchor: &MailboxDeliveryObservationAnchor,
+        checkpoint: &str,
+        turn_id: &str,
+    ) -> Result<bool, String> {
+        if turn_id.is_empty() || turn_id.len() > 1024 {
+            return Err("invalid native receipt turn id".into());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let now = now_rfc3339();
+        let changed = tx
+            .execute(
+                "UPDATE mailbox_delivery_attempts SET observation_confirmed_at = ?10,
+                observation_confirmed_turn_id = ?11
+             WHERE attempt_id = ?1 AND delivery_invocation_uuid = ?2
+               AND session_id = ?3 AND observation_session_id = ?3
+               AND observation_provider_name = ?4 AND observation_provider_instance_id = ?5
+               AND observation_settings_id = ?6 AND observation_anchor_token IS ?7
+               AND observation_expected_sha256 = ?8 AND observation_progress IS ?9
+               AND resolved_at IS NULL AND observation_confirmed_at IS NULL
+               AND (headless_submission_state IS NULL OR headless_submission_state = 'possible')
+               AND NOT EXISTS (SELECT 1 FROM mailbox_observation_stops
+                   WHERE session_id = ?3 AND rearmed_at IS NULL)
+               AND NOT EXISTS (SELECT 1 FROM mailbox_notification_control
+                   WHERE session_id = ?3 AND paused = 1)
+               AND EXISTS (SELECT 1 FROM mailbox_delivery_attempt_items i
+                   JOIN mailbox m ON m.seq = i.mailbox_seq
+                   WHERE i.attempt_id = ?1 AND m.delivered_at IS NULL)
+               AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_attempt_items i
+                   LEFT JOIN mailbox m ON m.seq = i.mailbox_seq
+                   WHERE i.attempt_id = ?1 AND (m.seq IS NULL OR m.session_id != ?3))",
+                params![
+                    attempt_id,
+                    invocation_uuid,
+                    anchor.provider_session_id,
+                    anchor.provider_name,
+                    anchor.provider_instance_id,
+                    anchor.settings_id,
+                    anchor.resume_token,
+                    anchor.expected_sha256,
+                    checkpoint,
+                    now,
+                    turn_id
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE mailbox SET delivered_at = ?2, delivered_by_invocation_uuid = ?3,
+                delivery_attempts = delivery_attempts + 1, delivery_error = NULL
+            WHERE delivered_at IS NULL AND seq IN (SELECT mailbox_seq
+                FROM mailbox_delivery_attempt_items WHERE attempt_id = ?1)",
+            params![attempt_id, now, invocation_uuid],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute("UPDATE completion_event_listener SET acknowledged_at = COALESCE(acknowledged_at, ?2),
+            acknowledgement_reason = COALESCE(acknowledgement_reason, 'native_receipt')
+            WHERE mailbox_seq IN (SELECT mailbox_seq FROM mailbox_delivery_attempt_items WHERE attempt_id = ?1)",
+            params![attempt_id, now]).map_err(|e| e.to_string())?;
+        resolve_completed_delivery_attempts(&tx, &anchor.provider_session_id, &now, None)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
     pub fn pending_delivery_observations(
         &self,
         session_id: &str,
@@ -11962,7 +12119,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+                "DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
+            ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
             ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
             )
             .unwrap();
@@ -12004,7 +12162,10 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            current_open_steps < 576,
+            // Schema 16 adds the fair cursor and its partial candidate index.
+            // The measured fixed schema-open overhead is 582 VM steps; retain a
+            // tight constant ceiling and the independent no-backfill assertion.
+            current_open_steps < 608,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
         );
     }
@@ -12020,6 +12181,7 @@ mod tests {
             .execute_batch(
                 "DROP INDEX idx_session_admission_state_runtime;
                  DROP INDEX idx_runtime_generation_lifecycle_created;
+                 DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 8;",
@@ -12065,6 +12227,7 @@ mod tests {
                  DROP INDEX idx_mailbox_payload_reference;
                  DROP INDEX idx_completion_event_payload_reference;
                  ALTER TABLE completion_event DROP COLUMN payload_reclaimed_at;
+                 DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 9;",
@@ -12118,6 +12281,7 @@ mod tests {
             .execute_batch(
                 "DROP INDEX idx_mailbox_payload_reference;
                  DROP INDEX idx_completion_event_payload_reference;
+                 DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 10;",
@@ -12157,7 +12321,8 @@ mod tests {
         let connection = Connection::open(&sidecar_path).unwrap();
         connection
             .execute_batch(
-                "ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_provider_name;
+                "DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
+                 ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_provider_name;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_provider_instance_id;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_settings_id;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_session_id;
@@ -12166,6 +12331,7 @@ mod tests {
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_error;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_confirmed_turn_id;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_confirmed_at;
+                 DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 11;",
@@ -12269,6 +12435,7 @@ mod tests {
                  );
                  CREATE INDEX idx_session_wake_claim_claimed_at
                     ON session_wake_claim(claimed_at);
+                 DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 2;",
@@ -12308,6 +12475,7 @@ mod tests {
         connection
             .execute_batch(
                 "DROP TABLE session_admission_queue;
+                 DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 5;",
@@ -12363,6 +12531,7 @@ mod tests {
                     admission_id, registration_identity, state,
                     created_at_unix_ms, updated_at_unix_ms
                  ) VALUES ('legacy-admission', 'legacy-registration', 'queued', 1, 1);
+                 DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 6;",
@@ -12494,6 +12663,7 @@ mod tests {
                     generation_uuid, lifecycle_state, identity_os_pid,
                     identity_os_boot_id, identity_os_pid_starttime_ticks
                  ) VALUES ('legacy-verified-running', 'running', 42, 'legacy-boot', 7);
+                 DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
                  ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
                  PRAGMA user_version = 3;",
@@ -12673,6 +12843,9 @@ mod tests {
         drop(mailbox);
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute_batch("DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;")
+            .unwrap();
         for column in [
             "headless_submission_state",
             "observation_progress",
@@ -12805,7 +12978,8 @@ mod tests {
         mailbox
             .connection()
             .execute_batch(
-                "ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+                "DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
+            ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
             ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
             )
             .unwrap();
@@ -12916,7 +13090,8 @@ mod tests {
         mailbox
             .connection()
             .execute_batch(
-                "ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+                "DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
+            ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
             ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
             )
             .unwrap();
@@ -14660,7 +14835,8 @@ mod tests {
             .unwrap();
         db.conn
             .execute_batch(
-                "ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
+                "DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
+            ALTER TABLE mailbox_delivery_attempts DROP COLUMN headless_submission_state;
             ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;
             PRAGMA user_version = 12;",
             )
@@ -16447,7 +16623,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            15
+            schema::CURRENT_VERSION
         );
         let retained = db.retain_delivery_finalization("new").unwrap();
         drop(retained);
@@ -18821,5 +18997,44 @@ mod observation_stop_history_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod native_receipt_schema_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_cursor_migrates_v15_and_uses_bounded_candidate_index() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pid-identity.db");
+        let db = MailboxDb::open(&path).unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TABLE mailbox_receipt_scan;
+            DROP INDEX idx_mailbox_receipt_scan_candidates; PRAGMA user_version = 15;",
+            )
+            .unwrap();
+        drop(db);
+        let mut db = MailboxDb::open(&path).unwrap();
+        assert_eq!(db.next_headless_receipt_attempt().unwrap(), None);
+        let plan: String = db
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT attempt_id
+            FROM mailbox_delivery_attempts WHERE attempt_id > 'cursor'
+                AND resolved_at IS NULL AND observation_confirmed_at IS NULL
+                AND headless_submission_state = 'possible' AND submission_started_at IS NOT NULL
+                AND observation_anchor_token IS NOT NULL AND observation_expected_sha256 IS NOT NULL
+            ORDER BY attempt_id LIMIT 1",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_mailbox_receipt_scan_candidates"),
+            "{plan}"
+        );
+        assert!(plan.contains("SEARCH"), "{plan}");
     }
 }

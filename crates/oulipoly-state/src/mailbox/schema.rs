@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 15;
+pub(super) const CURRENT_VERSION: i64 = 16;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -122,6 +122,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 15,
         owner: SidecarEntity::MailboxDelivery,
         apply: ensure_delivery_finalization_schema,
+    },
+    MigrationStep {
+        target_version: 16,
+        owner: SidecarEntity::MailboxDelivery,
+        apply: migrate_receipt_scan,
     },
 ];
 
@@ -554,4 +559,9 @@ fn ensure_observation_stop_schema(conn: &Connection) -> Result<(), String> {
 fn ensure_delivery_finalization_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("0015_delivery_finalization.sql"))
         .map_err(|err| format!("Failed to create delivery finalization references: {err}"))
+}
+
+fn migrate_receipt_scan(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("0016_receipt_scan.sql"))
+        .map_err(|err| format!("Failed to migrate receipt scan: {err}"))
 }

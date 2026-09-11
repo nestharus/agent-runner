@@ -427,3 +427,59 @@ print(json.dumps({{
         path
     }
 }
+
+/// One account registry retained by the sole inspection helper. Session page
+/// dispatch calls preflight_account and checks persisted account/instance/settings
+/// (session_provider/provider_client.rs), never model mappings. Launch-only model
+/// files are therefore not an inspection dependency or an invalidation trigger.
+/// Reload account configuration each tick; never persist capabilities across
+/// helper lifetimes or assume a pathname is immutable.
+#[derive(Default)]
+pub(crate) struct ReceiptRegistryCache {
+    entry: Option<(String, std::sync::Arc<ProviderRegistry>)>,
+}
+impl ReceiptRegistryCache {
+    pub(crate) fn registry(
+        &mut self,
+        _models_dir: Option<&std::path::Path>,
+    ) -> Result<std::sync::Arc<ProviderRegistry>, String> {
+        self.registry_at(None)
+    }
+
+    pub(crate) fn registry_at(
+        &mut self,
+        config_root: Option<&Path>,
+    ) -> Result<std::sync::Arc<ProviderRegistry>, String> {
+        let mut paths = default_cli_runtime_paths()?;
+        if let Some(config_root) = config_root {
+            paths.config_root = config_root.to_path_buf();
+        }
+        let providers = load_registry_providers(&paths)?;
+        let accounts: std::collections::BTreeMap<_, _> = providers.entries.iter().collect();
+        // Account fields use ordered collections. This private in-memory key
+        // covers all parsed settings and is never logged (may contain secrets).
+        let key = format!(
+            "{:?}|{:?}|{:?}",
+            paths.config_root, paths.data_root, accounts
+        );
+        if let Some((prior, registry)) = &self.entry {
+            if *prior == key && registry.receipt_endpoints_unchanged() {
+                return Ok(registry.clone());
+            }
+        }
+        // Never use an invalidated endpoint as fallback on reconstruction error.
+        self.entry = None;
+        let options = ProviderRegistryOptions::default()
+            .with_client_options(
+                oulipoly_provider::client::ProviderClientOptions::default()
+                    .with_timeout(std::time::Duration::from_secs(2)),
+            )
+            .with_config_root(paths.config_root)
+            .with_data_root(paths.data_root);
+        let registry = std::sync::Arc::new(
+            ProviderRegistry::from_configs(&[], &providers, options).map_err(|e| e.to_string())?,
+        );
+        self.entry = Some((key, registry.clone()));
+        Ok(registry)
+    }
+}

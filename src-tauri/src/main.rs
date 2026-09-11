@@ -29,6 +29,7 @@ mod invocation;
 mod json_error;
 mod mailbox_delivery;
 mod migration_providers;
+mod native_receipt;
 #[allow(dead_code)]
 #[path = "main/owned_turn_event_ingest.rs"]
 mod owned_turn_event_ingest;
@@ -57,6 +58,31 @@ fn main() -> ExitCode {
 }
 
 fn process_entrypoint() -> ExitCode {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(native_receipt::helper::ARG))
+    {
+        let target = match std::env::args()
+            .nth(3)
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+        {
+            Ok(target) => target,
+            Err(error) => {
+                eprintln!("invalid receipt target: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return match native_receipt::helper::entry_target(
+            std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("once")),
+            target,
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     initialize_tracing();
 
     if wake_coordinator::is_wake_reclaim_handoff_invocation() {

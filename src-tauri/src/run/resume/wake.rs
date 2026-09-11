@@ -22,20 +22,16 @@ use oulipoly_runtime::session_provider::{
 };
 use oulipoly_state::mailbox::{MailboxDb, MailboxDeliveryObservationAnchor};
 use sha2::{Digest, Sha256};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
 
 use super::lifecycle::ResumeInvocationAttempt;
 use super::orchestration::{ResumeAttemptInput, ResumeAttemptLoopControl};
 use super::{formatter, mapper};
 use crate::zero_turn_orchestration::ZeroTurnAction;
 
-const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
-const OBSERVATION_DEADLINE: Duration = Duration::from_secs(30);
-const OBSERVATION_MAX_PAGES: usize = 16;
+use crate::native_receipt::*;
 const OBSERVATION_MAX_PENDING_ATTEMPTS: usize = 4;
-const OBSERVATION_MAX_TURNS: u64 = 64;
-const OBSERVATION_MAX_RESPONSE_BYTES: u64 = 128 * 1024;
-const OBSERVATION_MAX_SOURCE_BYTES: u64 = 512 * 1024;
 
 #[derive(Clone, Copy)]
 pub(super) struct ResumeCompletionEvidence<'a> {
@@ -99,54 +95,36 @@ pub(super) fn prepare_headless_resume_delivery(
 }
 
 pub(super) fn reconcile_pending_headless_delivery_observations(
-    agent_runtime_services: &crate::wiring::AgentRuntimeServices,
     resolved: &oulipoly_state::ResolvedResume,
     effective_cwd: &std::path::Path,
+    config_root: &std::path::Path,
 ) -> Result<(), String> {
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
     ensure_observation_not_stopped(&db, &resolved.active_session_id)?;
     prepare_legacy_observation_recovery(&db, resolved)?;
-    let registry = agent_runtime_services.provider_registry_handle.current();
-    for pending in db.pending_delivery_observations(
+    let pending = db.pending_delivery_observations(
         &resolved.active_session_id,
         OBSERVATION_MAX_PENDING_ATTEMPTS,
-    )? {
-        let anchor = pending.anchor;
-        let Some(provider_identity) = crate::session_ingest_cli::session_external_provider_identity(
-            agent_runtime_services,
-            resolved.model.as_ref(),
-            &anchor.provider_name,
-        ) else {
-            continue;
-        };
-        let identity = SessionProviderIdentity {
-            model_name: provider_identity.model_name,
-            provider_name: provider_identity.provider_name,
-            provider_instance_id: provider_identity.provider_instance_id,
-            settings_id: provider_identity.settings_id,
-        };
-        let Some(provider_instance_id) = identity.provider_instance_id.as_deref() else {
-            continue;
-        };
-        if provider_instance_id != anchor.provider_instance_id
-            || identity.settings_id != anchor.settings_id
-            || anchor.provider_session_id != resolved.active_session_id
-        {
+    )?;
+    drop(db);
+    for pending in pending {
+        if pending.anchor.provider_session_id != resolved.active_session_id {
             continue;
         }
-        if let Err(error) = confirm_delivery_observation(
-            &db,
-            &pending.attempt_id,
-            registry.as_ref(),
-            identity,
-            effective_cwd,
-            &anchor,
-        ) {
+        if let Err(error) =
+            crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
+                attempt_id: pending.attempt_id,
+                anchor_identity: crate::native_receipt::helper::anchor_identity(&pending.anchor),
+                model_name: resolved.model_name.clone().unwrap_or_default(),
+                cwd: effective_cwd.to_path_buf(),
+                config_root: config_root.to_path_buf(),
+            })
+        {
             formatter::emit_stderr(&format!(
                 "Warning: Bounded recovery observation failed for {}: {error}",
-                anchor.provider_name
+                pending.anchor.provider_name
             ));
         }
     }
@@ -209,6 +187,21 @@ pub(super) fn bind_headless_resume_delivery_attempt(
         input.mailbox_delivery_seqs,
         invocation_uuid,
     )?;
+    if !input.mailbox_delivery_seqs.is_empty() {
+        let mut db = MailboxDb::open_default_if_exists()?
+            .ok_or("mailbox missing while retaining receipt route")?;
+        db.wake_sessions().upsert_session_metadata(
+            oulipoly_state::mailbox::SessionMetadataUpsert {
+                session_id: input.mailbox_session_id,
+                mode: "headless",
+                invocation_uuid: Some(invocation_uuid),
+                provider_name: Some(&provider.name),
+                model_name: input.resolved.model_name.as_deref(),
+                models_dir: input.env.models_dir.to_str(),
+                effective_cwd: input.effective_spawn_cwd.to_str(),
+            },
+        )?;
+    }
     persist_pre_delivery_observation_anchor(input, provider)
 }
 
@@ -500,233 +493,19 @@ fn confirm_mailbox_delivery_from_anchor(
     {
         return Ok(false);
     }
-    let identity = observation_identity(input, provider)?;
-    let provider_instance_id = identity
-        .provider_instance_id
-        .clone()
-        .ok_or_else(|| "session_provider_instance_identity_missing".to_string())?;
-    if provider_instance_id != anchor.provider_instance_id
-        || identity.settings_id != anchor.settings_id
-    {
+    drop(db);
+    crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
+        attempt_id: attempt_id.to_string(),
+        anchor_identity: crate::native_receipt::helper::anchor_identity(&anchor),
+        model_name: input.resolved.model_name.clone().unwrap_or_default(),
+        cwd: input.effective_spawn_cwd.to_path_buf(),
+        config_root: input.env.config_root.clone(),
+    })?;
+    // Only committed exact native evidence counts, never helper exit status.
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(false);
-    }
-    let registry = input
-        .agent_runtime_services
-        .provider_registry_handle
-        .current();
-    confirm_delivery_observation(
-        &db,
-        attempt_id,
-        registry.as_ref(),
-        identity,
-        input.effective_spawn_cwd,
-        &anchor,
-    )
-}
-
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct ObservationProgress {
-    snapshot_id: Option<String>,
-    page_token: Option<String>,
-    after_token: Option<String>,
-    page_index: u64,
-    turn_sequence: u64,
-    matching_turn_id: Option<String>,
-    matching_turns: u64,
-    complete: bool,
-}
-
-impl ObservationProgress {
-    fn cursor(
-        &self,
-        anchor: &MailboxDeliveryObservationAnchor,
-    ) -> Result<SessionProviderPageCursor, String> {
-        match (&self.snapshot_id, &self.page_token) {
-            (Some(snapshot_id), Some(page_token)) => Ok(SessionProviderPageCursor::Continuation {
-                snapshot_id: snapshot_id.clone(),
-                page_token: page_token.clone(),
-            }),
-            (None, None) => Ok(SessionProviderPageCursor::Beginning {
-                after_token: self
-                    .after_token
-                    .clone()
-                    .or_else(|| anchor.resume_token.clone()),
-            }),
-            _ => Err("mailbox observation checkpoint incomplete".into()),
-        }
-    }
-}
-
-fn confirm_delivery_observation(
-    db: &MailboxDb,
-    attempt_id: &str,
-    registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
-    identity: SessionProviderIdentity,
-    effective_cwd: &std::path::Path,
-    anchor: &MailboxDeliveryObservationAnchor,
-) -> Result<bool, String> {
-    ensure_observation_not_stopped(db, &anchor.provider_session_id)?;
-    let cancellation = CancellationToken::new();
-    observe_delivery_with(
-        db,
-        attempt_id,
-        anchor,
-        |cursor, page_index, turn_sequence, remaining| {
-            read_turn_page(SessionProviderReadPageRequest {
-                registry,
-                identity: identity.clone(),
-                session_id: &anchor.provider_session_id,
-                effective_cwd: Some(effective_cwd),
-                projection: SessionProviderTurnProjection::UserObservation,
-                expected_delivery_nonce: Some(attempt_id),
-                cursor,
-                expected_page_index: page_index,
-                expected_turn_sequence: turn_sequence,
-                max_turns: OBSERVATION_MAX_TURNS,
-                max_response_bytes: OBSERVATION_MAX_RESPONSE_BYTES,
-                max_source_bytes: OBSERVATION_MAX_SOURCE_BYTES,
-                max_inline_body_bytes: 0,
-                cancellation: &cancellation,
-                timeout: remaining.min(OBSERVATION_TIMEOUT),
-            })
-            .map_err(|error| {
-                retain_observation_failure(db, &anchor.provider_session_id, attempt_id, error)
-            })
-        },
-    )
-}
-
-// The production reader validates account/session/nonce-bound opaque pages.
-// Keeping the scan driver separate permits deterministic offline fault/restart
-// tests without launching a provider or admitting a second semantic prompt.
-fn observe_delivery_with(
-    db: &MailboxDb,
-    attempt_id: &str,
-    anchor: &MailboxDeliveryObservationAnchor,
-    mut read: impl FnMut(
-        SessionProviderPageCursor,
-        u64,
-        u64,
-        Duration,
-    ) -> Result<
-        oulipoly_runtime::session_provider::SessionProviderReadPageResult,
-        String,
-    >,
-) -> Result<bool, String> {
-    ensure_observation_not_stopped(db, &anchor.provider_session_id)?;
-    if db.delivery_observation_confirmation(attempt_id)?.is_some() {
-        return Ok(true);
-    }
-    let deadline = Instant::now() + OBSERVATION_DEADLINE;
-    let mut stored = db.delivery_observation_progress(attempt_id)?;
-    let mut progress: ObservationProgress = stored
-        .as_deref()
-        .map(serde_json::from_str)
-        .transpose()
-        .map_err(|err| format!("invalid observation checkpoint: {err}"))?
-        .unwrap_or_default();
-    for _ in 0..OBSERVATION_MAX_PAGES {
-        if progress.matching_turns > 1 {
-            return Ok(false);
-        }
-        if progress.complete {
-            if progress.matching_turns == 1 {
-                db.record_delivery_observation_confirmation(
-                    attempt_id,
-                    progress
-                        .matching_turn_id
-                        .as_deref()
-                        .ok_or("observation match id missing")?,
-                )?;
-                return Ok(true);
-            }
-            // A completed empty snapshot is not proof of non-submission. Scan
-            // future append-only evidence from its opaque resume token, never
-            // create another attempt or rescan the old snapshot.
-            progress.complete = false;
-            progress.snapshot_id = None;
-            progress.page_token = None;
-            progress.page_index = 0;
-            progress.turn_sequence = 0;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(false);
-        }
-        let page = match read(
-            progress.cursor(anchor)?,
-            progress.page_index,
-            progress.turn_sequence,
-            remaining,
-        ) {
-            Ok(page) => page,
-            Err(error) => {
-                db.record_delivery_observation_error(attempt_id, &error)?;
-                return Err(error);
-            }
-        };
-        if page.provider_instance_id != anchor.provider_instance_id
-            || page.settings_id != anchor.settings_id
-            || page.session_id != anchor.provider_session_id
-            || page.projection != SessionProviderTurnProjection::UserObservation
-            || page.page_index != progress.page_index
-            || page.page_start_sequence != progress.turn_sequence
-            || progress
-                .snapshot_id
-                .as_ref()
-                .is_some_and(|snapshot| snapshot != &page.snapshot_id)
-        {
-            return Err("mailbox observation identity/position mismatch".into());
-        }
-        for turn in page.turns.iter().filter(|turn| turn.role == "user") {
-            if turn.canonical_text_sha256.as_deref() == Some(anchor.expected_sha256.as_str()) {
-                progress.matching_turns = progress.matching_turns.saturating_add(1);
-                progress
-                    .matching_turn_id
-                    .get_or_insert_with(|| turn.turn_id.clone());
-            }
-        }
-        progress.complete = page.snapshot_complete;
-        if page.snapshot_complete {
-            progress.after_token = Some(
-                page.resume_token
-                    .ok_or("mailbox observation resume token missing")?,
-            );
-            progress.snapshot_id = None;
-            progress.page_token = None;
-        } else {
-            progress.page_index = page
-                .page_index
-                .checked_add(1)
-                .ok_or("observation page overflow")?;
-            progress.turn_sequence = page
-                .page_start_sequence
-                .checked_add(page.page_turn_count)
-                .ok_or("observation sequence overflow")?;
-            progress.snapshot_id = Some(page.snapshot_id);
-            progress.page_token = Some(
-                page.next_page_token
-                    .ok_or("mailbox observation page token missing")?,
-            );
-        }
-        let next = serde_json::to_string(&progress).map_err(|err| err.to_string())?;
-        db.advance_delivery_observation_progress(attempt_id, stored.as_deref(), &next)?;
-        stored = Some(next);
-        if progress.complete {
-            if progress.matching_turns == 1 {
-                db.record_delivery_observation_confirmation(
-                    attempt_id,
-                    progress
-                        .matching_turn_id
-                        .as_deref()
-                        .ok_or("observation match id missing")?,
-                )?;
-                return Ok(true);
-            }
-            return Ok(false);
-        }
-    }
-    Ok(false)
+    };
+    Ok(db.delivery_observation_confirmation(attempt_id)?.is_some())
 }
 
 pub(super) fn validated_prompt_acceptance_for_resume(
@@ -756,6 +535,9 @@ fn normalized_text_sha256(text: &str) -> String {
     sha256_hex(normalized.trim().as_bytes())
 }
 
+// Exit 1 records this invocation's inability to establish confirmation, not
+// provider failure, non-submission, or resend permission. The pending attempt
+// and anchor remain eligible for later observation; history need not be rewritten.
 fn finalize_unconfirmed_mailbox_delivery(
     input: &ResumeAttemptInput<'_>,
     attempt: &mut ResumeInvocationAttempt<'_>,
@@ -908,29 +690,3 @@ pub(super) fn settle_clean_exit_mailbox_delivery_outcome(
 #[cfg(test)]
 #[path = "observation_tests.rs"]
 mod observation_tests;
-
-fn ensure_observation_not_stopped(db: &MailboxDb, session_id: &str) -> Result<(), String> {
-    if let Some(stop) = db.mailbox_observation_stop(session_id)? {
-        return Err(format!(
-            "mailbox_observation_stopped stop_id={}: {}",
-            stop.stop_id, stop.error
-        ));
-    }
-    Ok(())
-}
-
-fn retain_observation_failure(
-    db: &MailboxDb,
-    session_id: &str,
-    attempt_id: &str,
-    error: oulipoly_runtime::session_provider::SessionProviderError,
-) -> String {
-    let message = error.to_string();
-    if let Some(reason) = error.fixed_observation_stop_reason() {
-        if let Err(storage) = db.stop_mailbox_observation(session_id, attempt_id, reason, &message)
-        {
-            return format!("{message}; {storage}");
-        }
-    }
-    message
-}

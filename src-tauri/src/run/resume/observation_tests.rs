@@ -352,46 +352,22 @@ fn age347_checkpoint_cas_prevents_concurrent_reader_regression() {
 }
 
 #[test]
-fn age347_legacy_null_marker_recovery_uses_beginning_without_invented_anchor() {
+fn age355_unanchored_legacy_recovery_remains_unknown_without_invented_newness() {
     let mut f = Fixture::with_legacy(true);
-    f.submissions = 1; // retained incident signal: native accepted although marker is null
+    f.submissions = 1;
     f.anchor.resume_token = None;
-    f.assert_pending_without_replay();
-    assert!(
-        !f.db
-            .delivery_attempt_submission_started(&f.attempt)
-            .unwrap()
-    );
     f.db.record_legacy_delivery_observation_identity(&f.attempt, SESSION, &f.anchor)
         .unwrap();
-    assert!(
-        observe_delivery_with(&f.db, &f.attempt, &f.anchor, |_, _, _, _| Err(
-            "capacity".into()
-        ))
-        .is_err()
-    );
-    f.restart();
-    f.assert_pending_without_replay();
-    assert!(
-        observe_delivery_with(&f.db, &f.attempt, &f.anchor, |cursor, index, seq, _| {
-            assert_eq!(
-                cursor,
-                SessionProviderPageCursor::Beginning { after_token: None }
-            );
-            Ok(page(&f.anchor, index, seq, true, 1))
-        })
-        .unwrap()
-    );
-    assert!(
-        !f.db
-            .delivery_attempt_submission_started(&f.attempt)
+    for _ in 0..2 {
+        assert!(
+            !observe_delivery_with(&f.db, &f.attempt, &f.anchor, |_, _, _, _| {
+                panic!("unanchored legacy history cannot prove new receipt")
+            })
             .unwrap()
-    );
-    assert_eq!(
-        deliverable_pending_count_on(&mut f.db, &f.state, SESSION).unwrap(),
-        0
-    );
-    assert_eq!(f.submissions, 1);
+        );
+        f.restart();
+        f.assert_pending_without_replay();
+    }
 }
 
 #[cfg(unix)]
@@ -593,4 +569,508 @@ fn early_ack_settled_anchor_is_historical_not_a_stop_or_replay_candidate() {
         0
     );
     assert!(f.state.acknowledgement(&f.attempt).unwrap().is_none());
+}
+
+#[test]
+fn age355_active_no_output_receipt_never_terminalizes_running_invocation() {
+    let mut f = Fixture::new();
+    f.state
+        .start_invocation(&oulipoly_state::InvocationStart {
+            invocation_uuid: "native-invocation".into(),
+            model_name: "offline".into(),
+            provider_name: "account".into(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    f.db.wake_sessions()
+        .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+            session_id: SESSION,
+            mode: "headless",
+            invocation_uuid: Some("native-invocation"),
+            provider_name: Some("account"),
+            model_name: Some("offline"),
+            models_dir: None,
+            effective_cwd: Some("/offline"),
+        })
+        .unwrap();
+    f.anchored_submit();
+    assert_eq!(
+        f.db.next_headless_receipt_attempt().unwrap(),
+        Some(f.attempt.clone())
+    );
+    let before =
+        f.db.wake_session_reader()
+            .session_metadata(SESSION)
+            .unwrap()
+            .unwrap();
+    let mut reads = 0;
+    assert!(
+        observe_delivery_bounded_with(
+            &f.db,
+            &f.attempt,
+            &f.anchor,
+            1,
+            Duration::from_secs(2),
+            |_, index, seq, remaining| {
+                reads += 1;
+                assert!(remaining <= Duration::from_secs(2));
+                let p = page(&f.anchor, index, seq, true, 1);
+                assert!(!p.source_final); // native history has accepted input, no assistant event
+                Ok(p)
+            }
+        )
+        .unwrap()
+    );
+    assert_eq!(reads, 1);
+    assert!(f.db.list_pending(SESSION).unwrap().is_empty());
+    assert_eq!(
+        f.state
+            .get_invocation_by_uuid("native-invocation")
+            .unwrap()
+            .unwrap()
+            .status,
+        oulipoly_state::InvocationStatus::Running
+    );
+    assert_eq!(
+        f.db.wake_session_reader()
+            .session_metadata(SESSION)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    // A subsequent native failure is independent, cannot undo or resend receipt.
+    assert!(
+        f.db.mark_delivery_attempt_failed(&f.attempt, SESSION, None, &[f.seq], "native_exit_1")
+            .unwrap()
+    );
+    f.restart();
+    assert!(
+        f.db.delivery_observation_confirmation(&f.attempt)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(f.db.next_headless_receipt_attempt().unwrap(), None);
+    assert_eq!(
+        f.db.list_mailbox(SESSION, true).unwrap()[0].delivery_attempts,
+        1
+    );
+    assert_eq!(f.submissions, 1);
+}
+
+#[test]
+fn age355_old_cached_match_is_reobserved_from_original_anchor_not_promoted() {
+    let mut f = Fixture::new();
+    f.anchored_submit();
+    let old = serde_json::json!({"snapshot_id":null,"page_token":null,"after_token":"old-end",
+        "page_index":0,"turn_sequence":1,"matching_turn_id":"weaker-match",
+        "matching_turns":1,"complete":true})
+    .to_string();
+    f.db.advance_delivery_observation_progress(&f.attempt, None, &old)
+        .unwrap();
+    f.restart();
+    assert!(
+        !observe_delivery_bounded_with(
+            &f.db,
+            &f.attempt,
+            &f.anchor,
+            1,
+            Duration::from_secs(2),
+            |cursor, index, seq, _| {
+                assert_eq!(
+                    cursor,
+                    SessionProviderPageCursor::Beginning {
+                        after_token: f.anchor.resume_token.clone()
+                    }
+                );
+                Ok(page(&f.anchor, index, seq, true, 0))
+            }
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        f.db.delivery_observation_anchor(&f.attempt)
+            .unwrap()
+            .unwrap(),
+        f.anchor
+    );
+    f.assert_pending_without_replay();
+}
+
+#[test]
+fn age355_one_page_ticks_resume_finite_uniqueness_after_restart() {
+    for duplicates in [false, true] {
+        let mut f = Fixture::new();
+        f.anchored_submit();
+        assert!(
+            !observe_delivery_bounded_with(
+                &f.db,
+                &f.attempt,
+                &f.anchor,
+                1,
+                Duration::from_secs(2),
+                |_, index, seq, _| Ok(page(&f.anchor, index, seq, false, 1))
+            )
+            .unwrap()
+        );
+        f.restart();
+        let confirmed = observe_delivery_bounded_with(
+            &f.db,
+            &f.attempt,
+            &f.anchor,
+            1,
+            Duration::from_secs(2),
+            |cursor, index, seq, _| {
+                assert!(matches!(
+                    cursor,
+                    SessionProviderPageCursor::Continuation { .. }
+                ));
+                assert_eq!((index, seq), (1, 1));
+                Ok(page(&f.anchor, index, seq, true, usize::from(duplicates)))
+            },
+        )
+        .unwrap();
+        assert_eq!(confirmed, !duplicates);
+        if duplicates {
+            f.assert_pending_without_replay();
+        }
+    }
+}
+
+#[test]
+fn age355_final_confirmation_rechecks_stop_owner_checkpoint_and_full_ack() {
+    for race in ["stop", "owner", "checkpoint", "full_ack", "pause"] {
+        let mut f = Fixture::new();
+        f.anchored_submit();
+        let checkpoint = "unique finite snapshot";
+        f.db.advance_delivery_observation_progress(&f.attempt, None, checkpoint)
+            .unwrap();
+        // Separate physical handle represents a writer between scan and commit.
+        let conn = rusqlite::Connection::open(f.root.path().join("pid-identity.db")).unwrap();
+        match race {
+            "stop" => {
+                f.db.stop_mailbox_observation(
+                    SESSION,
+                    &f.attempt,
+                    "session_turn_paging_paused",
+                    "fixed",
+                )
+                .unwrap()
+            }
+            "pause" => f.db.set_notifications_paused(SESSION, true).unwrap(),
+            "owner" => {
+                conn.execute("UPDATE mailbox_delivery_attempts SET delivery_invocation_uuid = 'successor' WHERE attempt_id = ?1", [&f.attempt]).unwrap();
+            }
+            "checkpoint" => {
+                f.db.advance_delivery_observation_progress(&f.attempt, Some(checkpoint), "newer")
+                    .unwrap()
+            }
+            "full_ack" => {
+                f.db.acknowledge_range(SESSION, f.seq, f.seq, "consumer")
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !f.db
+                .confirm_native_delivery_receipt(
+                    &f.attempt,
+                    "native-invocation",
+                    &f.anchor,
+                    checkpoint,
+                    "exact-native-user"
+                )
+                .unwrap(),
+            "{race}"
+        );
+        assert!(
+            f.db.delivery_observation_confirmation(&f.attempt)
+                .unwrap()
+                .is_none()
+        );
+        let row = &f.db.list_mailbox(SESSION, true).unwrap()[0];
+        assert_eq!(row.delivered_at.is_some(), race == "full_ack");
+    }
+}
+
+#[test]
+fn age355_stop_during_page_io_cannot_publish_receipt() {
+    let mut f = Fixture::new();
+    f.anchored_submit();
+    assert!(
+        !observe_delivery_bounded_with(
+            &f.db,
+            &f.attempt,
+            &f.anchor,
+            1,
+            Duration::from_secs(2),
+            |_, index, seq, _| {
+                f.db.stop_mailbox_observation(
+                    SESSION,
+                    &f.attempt,
+                    "session_turn_paging_paused",
+                    "stopped during IO",
+                )
+                .unwrap();
+                Ok(page(&f.anchor, index, seq, true, 1))
+            }
+        )
+        .unwrap()
+    );
+    assert!(
+        f.db.delivery_observation_confirmation(&f.attempt)
+            .unwrap()
+            .is_none()
+    );
+    f.restart();
+    assert!(
+        observe_delivery_with(&f.db, &f.attempt, &f.anchor, |_, _, _, _| panic!("stopped"))
+            .is_err()
+    );
+    assert_eq!(f.submissions, 1);
+}
+
+fn enqueue_additional(f: &mut Fixture, handle: &str) -> i64 {
+    let EnqueueResult::Inserted(row) =
+        f.db.enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            session_id: SESSION,
+            handle,
+            payload_json: "{}",
+            owner_invocation_uuid: Some("owner"),
+            matched_os_pid: Some(1),
+            matched_os_boot_id: Some("boot"),
+            matched_os_pid_starttime_ticks: Some(1),
+            matched_chain_index: Some(0),
+            state_dir: "/offline/state",
+            meta_path: "/offline/meta",
+            log_path: "/offline/log",
+            rc_path: "/offline/rc",
+            rc: 0,
+        })
+        .unwrap()
+    else {
+        panic!("expected new fixture item");
+    };
+    row.seq
+}
+
+#[test]
+fn age355_partial_ack_race_keeps_consumer_authority_and_settles_only_remainder() {
+    let mut f = Fixture::new();
+    let second = enqueue_additional(&mut f, "second");
+    let prepared =
+        prepare_headless_resume_delivery_on(&mut f.db, SESSION, "chain", None, None).unwrap();
+    f.attempt = prepared.delivery_nonce.unwrap();
+    f.envelope = prepared.answer.unwrap();
+    f.anchor.expected_sha256 = normalized_text_sha256(&f.envelope);
+    f.db.bind_delivery_attempt_invocation(&f.attempt, SESSION, "native-invocation")
+        .unwrap();
+    f.anchored_submit();
+    let mut competing = MailboxDb::open(&f.root.path().join("pid-identity.db")).unwrap();
+    assert!(
+        observe_delivery_bounded_with(
+            &f.db,
+            &f.attempt,
+            &f.anchor,
+            1,
+            Duration::from_secs(2),
+            |_, index, seq, _| {
+                competing
+                    .acknowledge_range(SESSION, f.seq, f.seq, "consumer")
+                    .unwrap();
+                Ok(page(&f.anchor, index, seq, true, 1))
+            }
+        )
+        .unwrap()
+    );
+    let rows = f.db.list_mailbox(SESSION, true).unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.seq == f.seq)
+            .unwrap()
+            .delivered_by_invocation_uuid
+            .as_deref(),
+        Some("consumer")
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.seq == second)
+            .unwrap()
+            .delivered_by_invocation_uuid
+            .as_deref(),
+        Some("native-invocation")
+    );
+    assert!(f.db.list_pending(SESSION).unwrap().is_empty());
+    assert!(
+        f.db.delivery_observation_confirmation(&f.attempt)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn age355_fair_cursor_survives_restart_and_excludes_prepared_stopped_and_pty() {
+    let mut f = Fixture::new();
+    f.db.wake_sessions()
+        .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+            session_id: SESSION,
+            mode: "headless",
+            invocation_uuid: Some("native-invocation"),
+            provider_name: Some("account"),
+            model_name: None,
+            models_dir: None,
+            effective_cwd: Some("/offline"),
+        })
+        .unwrap();
+    // Prepared-but-not-submitted attempts never consume a receipt slot.
+    f.db.record_delivery_observation_anchor(&f.attempt, SESSION, &f.anchor)
+        .unwrap();
+    assert_eq!(f.db.next_headless_receipt_attempt().unwrap(), None);
+    f.submit().unwrap();
+    let mut expected = vec![f.attempt.clone()];
+    for id in ["a-fair", "z-fair"] {
+        let seq = enqueue_additional(&mut f, id);
+        f.db.register_headless_delivery_attempt(id, SESSION, None, id, &[seq], 0)
+            .unwrap();
+        f.db.record_delivery_observation_anchor(id, SESSION, &f.anchor)
+            .unwrap();
+        f.db.begin_headless_delivery_submission(id, SESSION, id, true)
+            .unwrap();
+        expected.push(id.to_string());
+    }
+    expected.sort();
+    for id in expected.iter().cycle().take(6) {
+        assert_eq!(
+            f.db.next_headless_receipt_attempt().unwrap().as_ref(),
+            Some(id)
+        );
+        // No match or unavailable provider does not starve later candidates.
+        f.restart();
+    }
+    f.db.stop_mailbox_observation(SESSION, &f.attempt, "session_turn_paging_paused", "fixed")
+        .unwrap();
+    assert_eq!(f.db.next_headless_receipt_attempt().unwrap(), None);
+    let stop = f.db.mailbox_observation_stop(SESSION).unwrap().unwrap();
+    f.db.rearm_mailbox_observation(SESSION, &stop.stop_id, "fixed cause resolved")
+        .unwrap();
+    f.db.wake_sessions()
+        .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+            session_id: SESSION,
+            mode: "pty_interactive",
+            invocation_uuid: Some("native-invocation"),
+            provider_name: Some("account"),
+            model_name: None,
+            models_dir: None,
+            effective_cwd: Some("/offline"),
+        })
+        .unwrap();
+    assert_eq!(f.db.next_headless_receipt_attempt().unwrap(), None);
+}
+
+#[test]
+fn age355_changed_reader_reobserves_original_anchor_instead_of_carrying_matches() {
+    let mut f = Fixture::new();
+    f.anchored_submit();
+    assert!(
+        !observe_delivery_for_revision_with(
+            &f.db,
+            &f.attempt,
+            &f.anchor,
+            1,
+            Duration::from_secs(2),
+            "older-adapter",
+            |_, i, s, _| Ok(page(&f.anchor, i, s, false, 1))
+        )
+        .unwrap()
+    );
+    f.restart();
+    assert!(
+        !observe_delivery_for_revision_with(
+            &f.db,
+            &f.attempt,
+            &f.anchor,
+            1,
+            Duration::from_secs(2),
+            "new-adapter",
+            |cursor, i, s, _| {
+                assert_eq!(
+                    cursor,
+                    SessionProviderPageCursor::Beginning {
+                        after_token: f.anchor.resume_token.clone()
+                    }
+                );
+                assert_eq!((i, s), (0, 0));
+                Ok(page(&f.anchor, i, s, true, 0))
+            }
+        )
+        .unwrap()
+    );
+    f.assert_pending_without_replay();
+}
+
+#[test]
+fn age355_expired_tick_budget_never_starts_io() {
+    let mut f = Fixture::new();
+    f.anchored_submit();
+    assert!(
+        !observe_delivery_bounded_with(
+            &f.db,
+            &f.attempt,
+            &f.anchor,
+            1,
+            Duration::ZERO,
+            |_, _, _, _| panic!("no IO after exhausted budget")
+        )
+        .unwrap()
+    );
+    f.assert_pending_without_replay();
+}
+
+#[test]
+fn age355_correction_global_selection_does_not_overlap() {
+    let mut f = Fixture::new();
+    f.anchored_submit();
+    f.db.wake_sessions()
+        .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+            session_id: SESSION,
+            mode: "headless",
+            invocation_uuid: Some("native-invocation"),
+            provider_name: Some("account"),
+            model_name: Some("offline"),
+            models_dir: None,
+            effective_cwd: Some("/offline"),
+        })
+        .unwrap();
+    let root = f.root.path().to_path_buf();
+    let (entered, observed) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let first_entered = entered.clone();
+    let first = std::thread::spawn(move || {
+        let mut db = MailboxDb::open(&root.join("pid-identity.db")).unwrap();
+        crate::native_receipt::poll_headless_receipt_tick_with(&mut db, |_| {
+            first_entered.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            Err::<oulipoly_runtime::provider_registry::ProviderRegistry, _>(
+                "private unavailable registry".into(),
+            )
+        })
+    });
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The first selection is still in flight. A second physical DB connection
+    // must not perform duplicate global inspection of this sole candidate.
+    let result = crate::native_receipt::poll_headless_receipt_tick_with(&mut f.db, |_| {
+        entered.send(()).unwrap();
+        Err::<oulipoly_runtime::provider_registry::ProviderRegistry, _>(
+            "private unavailable registry".into(),
+        )
+    });
+    let duplicated = observed.try_recv().is_ok();
+    release.send(()).unwrap();
+    assert!(first.join().unwrap().is_err());
+    assert!(result.is_ok() || result.as_ref().unwrap_err() == "private unavailable registry");
+    f.assert_pending_without_replay();
+    assert!(
+        !duplicated,
+        "both observers entered registry preparation for the sole attempt"
+    );
 }

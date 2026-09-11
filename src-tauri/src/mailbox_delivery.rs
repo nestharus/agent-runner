@@ -2029,6 +2029,9 @@ mod tests {
 
         let sidecar_path = directory.path().join("pid-identity.db");
         let connection = rusqlite::Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute_batch("DROP INDEX idx_mailbox_receipt_scan_candidates;")
+            .unwrap();
         for column in [
             "headless_submission_state",
             "observation_progress",
@@ -2183,6 +2186,9 @@ mod tests {
                  WHERE generation_uuid = ?1",
                 rusqlite::params![unique_generation.to_string()],
             )
+            .unwrap();
+        connection
+            .execute_batch("DROP INDEX idx_mailbox_receipt_scan_candidates;")
             .unwrap();
         for column in [
             "headless_submission_state",

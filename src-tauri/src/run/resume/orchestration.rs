@@ -263,6 +263,11 @@ fn run_resume_attempt(
 
     wake::begin_headless_delivery_submission(&input, &bound_attempt.attempt.invocation.id)?;
 
+    let _receipt_observer = if input.mailbox_delivery_seqs.is_empty() {
+        None
+    } else {
+        Some(crate::native_receipt::start_headless_receipt_polling()?)
+    };
     let mut result = match execution::execute_resume_attempt_command(
         &input,
         &provider,

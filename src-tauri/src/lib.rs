@@ -22,6 +22,8 @@ pub mod commands;
 #[allow(dead_code)]
 mod mailbox_delivery;
 #[allow(dead_code)]
+mod native_receipt;
+#[allow(dead_code)]
 mod provider_artifact;
 #[path = "commands/provider_settings.rs"]
 pub mod provider_settings;
