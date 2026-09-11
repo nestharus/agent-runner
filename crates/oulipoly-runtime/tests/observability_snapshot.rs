@@ -1515,11 +1515,12 @@ fn default_snapshot_hides_terminal_nodes_and_explicit_full_snapshot_keeps_them()
 }
 
 #[test]
-fn agent_bash_scan_is_bounded_filters_unrelated_and_degrades_corrupt_meta() {
+fn agent_bash_scan_bounds_history_preserves_live_filters_unrelated_and_degrades_corrupt_meta() {
     let fixture = Fixture::new();
     seed_root_session(&fixture);
     let pid = fixture.open_pid();
     let owner = current_identity();
+    let nonrunning_workload = mismatched_current_identity();
     let unrelated = ProcessIdentity {
         os_pid: 888_888_888,
         os_boot_id: "boot-other".to_string(),
@@ -1534,13 +1535,7 @@ fn agent_bash_scan_is_bounded_filters_unrelated_and_degrades_corrupt_meta() {
     let running_dir = write_agent_bash_meta(
         &root,
         "yy-running",
-        &agent_bash_meta(
-            "yy-running",
-            "RUNNING",
-            &owner,
-            Some(dead_identity().os_pid),
-            None,
-        ),
+        &agent_bash_meta_with_workload_identity("yy-running", &owner, &nonrunning_workload),
         "running tail",
     );
     set_dir_mtime(&running_dir, 50);
@@ -1561,17 +1556,26 @@ fn agent_bash_scan_is_bounded_filters_unrelated_and_degrades_corrupt_meta() {
     let old_dir = write_agent_bash_meta(
         &root,
         "vv-old",
-        &agent_bash_meta("vv-old", "RUNNING", &owner, Some(780), None),
+        &agent_bash_meta_with_workload_identity("vv-old", &owner, &nonrunning_workload),
         "old tail",
     );
     set_dir_mtime(&old_dir, 10);
     let other_dir = write_agent_bash_meta(
         &root,
         "uu-other",
-        &agent_bash_meta("uu-other", "RUNNING", &unrelated, Some(781), None),
+        &agent_bash_meta_with_workload_identity("uu-other", &unrelated, &owner),
         "other tail",
     );
     set_dir_mtime(&other_dir, 20);
+    // Both live controls are outside the four-directory history window. Only
+    // the root-owned one may survive: recency cannot mask an ownership defect.
+    let live_dir = write_agent_bash_meta(
+        &root,
+        "tt-live",
+        &agent_bash_meta_with_workload_identity("tt-live", &owner, &owner),
+        "live tail",
+    );
+    set_dir_mtime(&live_dir, 5);
 
     let snapshot = fixture.service().snapshot(
         &fixture.root(),
@@ -1614,7 +1618,19 @@ fn agent_bash_scan_is_bounded_filters_unrelated_and_degrades_corrupt_meta() {
             .as_deref(),
         Some("running tail")
     );
-    assert_eq!(snapshot.summary.running_agent_bash_count, 0);
+    assert_eq!(
+        node(&snapshot, "agent-bash:yy-running").liveness,
+        LivenessStatus::PidReused
+    );
+    assert_eq!(
+        node(&snapshot, "agent-bash:tt-live").status,
+        MonitorStatus::Running
+    );
+    assert_eq!(
+        node(&snapshot, "agent-bash:tt-live").liveness,
+        LivenessStatus::VerifiedLive
+    );
+    assert_eq!(snapshot.summary.running_agent_bash_count, 1);
 }
 
 #[test]
@@ -1927,6 +1943,7 @@ fn agent_bash_scan_orders_canonical_handles_without_directory_mtime() {
     seed_root_session(&fixture);
     let pid = fixture.open_pid();
     let owner = current_identity();
+    let nonrunning_workload = mismatched_current_identity();
     record_identity(&pid, ROOT_UUID, Some(SESSION_ID), &owner);
     drop(pid);
     let root = fixture.agent_bash_root();
@@ -1935,13 +1952,13 @@ fn agent_bash_scan_orders_canonical_handles_without_directory_mtime() {
     let older_dir = write_agent_bash_meta(
         &root,
         older_handle,
-        &agent_bash_meta(older_handle, "RUNNING", &owner, Some(700), None),
+        &agent_bash_meta_with_workload_identity(older_handle, &owner, &nonrunning_workload),
         "older",
     );
     let newer_dir = write_agent_bash_meta(
         &root,
         newer_handle,
-        &agent_bash_meta(newer_handle, "RUNNING", &owner, Some(701), None),
+        &agent_bash_meta_with_workload_identity(newer_handle, &owner, &nonrunning_workload),
         "newer",
     );
     set_dir_mtime(&older_dir, 60);
@@ -1956,12 +1973,9 @@ fn agent_bash_scan_orders_canonical_handles_without_directory_mtime() {
         },
     );
 
-    assert!(
-        snapshot
-            .nodes
-            .iter()
-            .any(|node| node.id == format!("agent-bash:{newer_handle}"))
-    );
+    let newer_node = node(&snapshot, &format!("agent-bash:{newer_handle}"));
+    assert_eq!(newer_node.status, MonitorStatus::Stale);
+    assert_eq!(newer_node.liveness, LivenessStatus::PidReused);
     assert!(
         snapshot
             .nodes
@@ -2663,6 +2677,15 @@ fn seed_invocation(db: &StateDb, uuid: &str, parent: Option<i64>) -> i64 {
 
 fn current_identity() -> ProcessIdentity {
     expect_live_identity(read_current_identity().unwrap())
+}
+
+// Keep the PID under this test process's ownership throughout the snapshot,
+// but name a different incarnation. Exact identity comparison must report
+// PidReused, regardless of which other PIDs happen to exist on the host.
+fn mismatched_current_identity() -> ProcessIdentity {
+    let mut identity = current_identity();
+    identity.os_pid_starttime_ticks = identity.os_pid_starttime_ticks.checked_add(1).unwrap();
+    identity
 }
 
 fn read_current_identity() -> Result<Option<ProcessIdentity>, String> {
