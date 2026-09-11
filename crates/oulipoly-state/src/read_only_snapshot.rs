@@ -1567,6 +1567,12 @@ mod tests {
             std::thread::sleep(HELPER_POLL_INTERVAL);
         }
         let leaked_path = PathBuf::from(std::fs::read_to_string(&snapshot_path).unwrap());
+        assert_eq!(leaked_path.parent(), Some(snapshot_temp.as_path()));
+        assert!(
+            leaked_path.is_dir(),
+            "retry boundary must name actual storage"
+        );
+        eprintln!("retry boundary reached with existing private snapshot storage");
         child.kill().unwrap();
         child.wait().unwrap();
 
@@ -1603,14 +1609,48 @@ mod tests {
     }
 
     #[test]
+    fn changed_snapshot_owner_fixture_reports_unexpected_snapshot_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("snapshot-path");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "read_only_snapshot::tests::changed_snapshot_owner_fixture",
+                "--nocapture",
+            ])
+            .env(
+                "OULIPOLY_TEST_CHANGED_SNAPSHOT_SOURCE",
+                directory.path().join("missing-source"),
+            )
+            .env("OULIPOLY_TEST_CHANGED_SNAPSHOT_PATH", &marker)
+            .env("OULIPOLY_TEST_CHANGED_SNAPSHOT_TEMP", directory.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            !marker.exists(),
+            "failed fixture must not publish a retry boundary"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("changed snapshot owner returned before parent termination"),
+            "{output:?}"
+        );
+    }
+
+    #[test]
     fn changed_snapshot_owner_fixture() {
         let Some(source) = std::env::var_os("OULIPOLY_TEST_CHANGED_SNAPSHOT_SOURCE") else {
             return;
         };
         let snapshot_path = std::env::var_os("OULIPOLY_TEST_CHANGED_SNAPSHOT_PATH").unwrap();
         let snapshot_temp = std::env::var_os("OULIPOLY_TEST_CHANGED_SNAPSHOT_TEMP").unwrap();
+        // This fixture runs alone in its exact child test process. Override
+        // tempfile itself: Windows need not use Unix TMPDIR (or TMP/TEMP).
+        tempfile::env::override_temp_dir(Path::new(&snapshot_temp)).unwrap();
+        assert_eq!(tempfile::env::temp_dir(), PathBuf::from(&snapshot_temp));
         let source = Path::new(&source);
-        let _ = ReadOnlySnapshot::create_with_retry_policy(
+        let result = ReadOnlySnapshot::create_with_retry_policy(
             source,
             Duration::from_secs(30),
             Duration::from_secs(30),
@@ -1618,19 +1658,25 @@ mod tests {
             || {
                 std::fs::write(source, vec![8_u8; COPY_BUFFER_BYTES * 4])?;
                 let snapshot_directory = std::fs::read_dir(&snapshot_temp)?
-                    .filter_map(Result::ok)
+                    .collect::<io::Result<Vec<_>>>()?
+                    .into_iter()
                     .map(|entry| entry.path())
                     .find(|path| {
                         path.file_name()
                             .is_some_and(|name| name.to_string_lossy().starts_with(".tmp"))
                     })
                     .ok_or_else(|| io::Error::other("snapshot directory was not created"))?;
-                std::fs::write(
-                    &snapshot_path,
-                    snapshot_directory.to_string_lossy().as_bytes(),
-                )
+                let staging = PathBuf::from(&snapshot_path).with_extension("staging");
+                std::fs::write(&staging, snapshot_directory.to_string_lossy().as_bytes())?;
+                std::fs::rename(staging, &snapshot_path)
             },
         );
+        match result {
+            Err(error) => {
+                panic!("changed snapshot owner returned before parent termination: {error}")
+            }
+            Ok(_) => panic!("changed snapshot owner unexpectedly published a stable snapshot"),
+        }
     }
 
     #[cfg(target_os = "linux")]

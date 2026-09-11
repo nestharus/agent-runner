@@ -1101,11 +1101,24 @@ fn poll_child_status(
     // the whole group, including descendants after a direct operation exits.
     // Killing that group here would kill the cache/DB owner after every describe.
     // Normal invocation custody retains its existing per-operation teardown.
-    if receipt_group() == 0 && !kill_tree(child) {
-        return Err(wait_operation_error(
-            command,
-            "cleanup_admission_or_signal",
-            std::io::Error::other("process cleanup admission unavailable"),
+    if receipt_group() == 0
+        && let Err((operation, error)) = kill_tree_checked(child)
+    {
+        let errno = error
+            .raw_os_error()
+            .map_or_else(|| "unavailable".into(), |n| n.to_string());
+        let custody = if child.has_actor_custody() {
+            "present"
+        } else {
+            "absent"
+        };
+        return Err(ProviderClientError::host_transport(
+            HostErrorKind::WaitFailed,
+            subcommand_for_error(command),
+            None,
+            ProviderDiagnostics::with_description(format!(
+                "{operation}: actor_custody={custody}; errno={errno}"
+            )),
         ));
     }
     child
@@ -1836,27 +1849,37 @@ fn terminate_tree(child: &mut Child) {
 
 #[cfg(unix)]
 fn kill_tree(child: &mut Child) -> bool {
-    if !child.can_signal_group() {
+    kill_tree_checked(child).is_ok()
+}
+
+#[cfg(unix)]
+fn kill_tree_checked(child: &mut Child) -> Result<(), (&'static str, std::io::Error)> {
+    if let Err(error) = child.check_signal_group() {
         child.uncertain();
-        return false;
+        return Err(error);
     }
     if let Some(result) = child.signal_remote(libc::SIGKILL) {
         if result.is_err() {
             child.uncertain();
         }
-        return result.is_ok();
+        return result
+            .map(|_| ())
+            .map_err(|error| ("cleanup_remote_signal", error));
     }
     let group = -if receipt_group() != 0 {
         receipt_group()
     } else {
         child.id() as i32
     };
-    let signal_ok = unsafe { libc::kill(group, libc::SIGKILL) } == 0;
-    child.confirm_group_dead(signal_ok);
-    if !signal_ok {
+    let result = unsafe { libc::kill(group, libc::SIGKILL) };
+    // Retain the actual group-signal error, not an error from confirmation.
+    let error = (result != 0).then(std::io::Error::last_os_error);
+    child.confirm_group_dead(result == 0);
+    if let Some(error) = error {
         child.uncertain();
+        return Err(("cleanup_group_kill", error));
     }
-    signal_ok
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -2487,3 +2510,7 @@ fn collect_or_retain_process_threads<T: StdoutDrainOutput>(
     });
     joined
 }
+
+#[cfg(all(test, unix))]
+#[path = "process/cleanup_diagnostic_tests.rs"]
+mod cleanup_diagnostic_tests;

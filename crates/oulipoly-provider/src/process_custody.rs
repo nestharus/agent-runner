@@ -102,33 +102,52 @@ impl OwnedChild {
         }
     }
     pub fn can_signal_group(&self) -> bool {
+        self.check_signal_group().is_ok()
+    }
+    #[cfg(unix)]
+    pub fn has_actor_custody(&self) -> bool {
+        self.custody.is_some()
+    }
+    pub fn check_signal_group(&self) -> Result<(), (&'static str, std::io::Error)> {
         #[cfg(unix)]
         {
             let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-            let retained = unsafe {
+            let result = unsafe {
                 libc::waitid(
                     libc::P_PID,
                     self.child.id() as libc::id_t,
                     info.as_mut_ptr(),
                     libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
                 )
-            } == 0;
-            if !retained {
+            };
+            if result != 0 {
+                // Capture errno before locks or other cleanup can overwrite it.
+                let error = std::io::Error::last_os_error();
                 self.uncertain();
-                return false;
+                return Err(("cleanup_waitid_wnowait", error));
             }
             if let Some(c) = &self.custody {
                 let r = c.0.lock().unwrap_or_else(|e| e.into_inner());
-                return !r.leader_reaped
-                    && r.exact_process_identity
+                if r.leader_reaped
+                    || !r
+                        .exact_process_identity
                         .as_ref()
-                        .is_some_and(|p| self.current_identity().ok().as_ref() == Some(p));
+                        .is_some_and(|p| self.current_identity().ok().as_ref() == Some(p))
+                {
+                    return Err((
+                        "cleanup_identity",
+                        std::io::Error::other("identity unavailable"),
+                    ));
+                }
             }
-            true
+            Ok(())
         }
         #[cfg(not(unix))]
         {
-            false
+            Err((
+                "cleanup_unsupported",
+                std::io::Error::other("unsupported group signaling"),
+            ))
         }
     }
     pub fn cancellation(&self) {
