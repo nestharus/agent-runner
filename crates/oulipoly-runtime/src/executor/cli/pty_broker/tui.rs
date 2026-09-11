@@ -5417,9 +5417,12 @@ fn apply_routed_pseudo_input(pane: &mut MonitorPane, actions: &[PseudoInputActio
 }
 
 fn apply_routed_commands(pane: &mut MonitorPane, commands: &[MonitorCommand]) -> bool {
-    commands
-        .iter()
-        .fold(false, |force, command| pane.apply(*command) || force)
+    let mut force_refresh = false;
+    for command in commands {
+        // Every command has effects; never short-circuit the application.
+        force_refresh |= pane.apply(*command);
+    }
+    force_refresh
 }
 
 fn pane_refresh_required(force_refresh: bool, cancelled: bool) -> bool {
@@ -6715,6 +6718,20 @@ mod tests {
             validate_control_input_ready(false, false, CONTROL_PRIMARY_SCREEN_READY_FALLBACK,),
             Ok(())
         );
+    }
+
+    #[test]
+    fn routed_commands_apply_all_effects_after_refresh_in_order_once() {
+        let mut pane = MonitorPane::new();
+        assert!(!apply_routed_commands(&mut pane, &[]));
+        assert!(apply_routed_commands(&mut pane, &[
+            MonitorCommand::Refresh,
+            MonitorCommand::Collapse,
+            MonitorCommand::ToggleList,
+        ]));
+        assert!(!pane.collapsed, "collapse then exactly one toggle must expand");
+        assert!(!apply_routed_commands(&mut pane, &[MonitorCommand::ToggleList]));
+        assert!(pane.collapsed);
     }
 
     #[test]

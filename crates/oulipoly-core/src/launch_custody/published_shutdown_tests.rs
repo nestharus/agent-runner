@@ -13,6 +13,7 @@ struct Fixture {
     custody: Arc<LaunchCustody>,
     child: Option<Child>,
     master: Option<OwnedFd>,
+    terminal_probe: Option<File>,
 }
 impl Fixture {
     fn new(name: &str) -> Self {
@@ -24,6 +25,7 @@ impl Fixture {
             custody,
             child: None,
             master: None,
+            terminal_probe: None,
         }
     }
     fn command(&mut self, script: &str, pty: bool) -> Command {
@@ -33,22 +35,25 @@ impl Fixture {
             .current_dir(&self.root)
             .env_clear();
         if pty {
-            let mut master = -1;
-            let mut slave = -1;
-            assert_eq!(
-                unsafe {
-                    libc::openpty(
-                        &mut master,
-                        &mut slave,
-                        std::ptr::null_mut(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                    )
-                },
-                0
-            );
+            // Atomic CLOEXEC on BOTH endpoints: openpty + fcntl leaves a
+            // fork/exec window in the parallel test harness. Rust-owned FDs
+            // alone do not imply CLOEXEC. This fixture is Linux-only.
+            let master =
+                unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+            assert!(master >= 0, "{}", io::Error::last_os_error());
             self.master = Some(unsafe { OwnedFd::from_raw_fd(master) });
+            assert_eq!(unsafe { libc::grantpt(master) }, 0);
+            assert_eq!(unsafe { libc::unlockpt(master) }, 0);
+            let slave = unsafe {
+                libc::ioctl(
+                    master,
+                    libc::TIOCGPTPEER,
+                    libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(slave >= 0, "{}", io::Error::last_os_error());
             let slave = unsafe { File::from_raw_fd(slave) };
+            self.terminal_probe = Some(slave.try_clone().unwrap());
             command
                 .stdin(slave.try_clone().unwrap())
                 .stdout(slave.try_clone().unwrap())
@@ -73,6 +78,24 @@ impl Fixture {
                 .process_group(0);
         }
         command
+    }
+    fn terminal_lost(&self) -> bool {
+        let mut fd = libc::pollfd {
+            fd: self.terminal_probe.as_ref().unwrap().as_raw_fd(),
+            events: libc::POLLHUP,
+            revents: 0,
+        };
+        assert!(unsafe { libc::poll(&mut fd, 1, 0) } >= 0);
+        fd.revents & libc::POLLHUP != 0
+    }
+    fn close_last_master(&mut self) {
+        assert!(
+            !self.terminal_lost(),
+            "control: terminal live before closure"
+        );
+        self.master.take();
+        until(|| self.terminal_lost().then_some(()));
+        eprintln!("private slave POLLHUP: induced last-master terminal loss");
     }
     fn spawn(&mut self, script: &str, pty: bool) {
         let mut command = self.command(script, pty);
@@ -138,6 +161,36 @@ fn children(pid: i32) -> Vec<i32> {
 }
 
 #[test]
+fn private_pty_master_does_not_survive_unrelated_exec() {
+    let mut fixture = Fixture::new("cloexec-control");
+    let command = fixture.command("pass", true);
+    drop(command);
+    let mut unrelated = Command::new("/usr/bin/python3")
+        .args([
+            "-c",
+            "import sys; print('ready',flush=True); sys.stdin.read()",
+        ])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = [0; 6];
+    unrelated
+        .stdout
+        .take()
+        .unwrap()
+        .read_exact(&mut ready)
+        .unwrap();
+    assert_eq!(&ready, b"ready\n");
+    // The unrelated exec remains alive throughout actual master closure.
+    fixture.close_last_master();
+    assert!(unrelated.try_wait().unwrap().is_none());
+    drop(unrelated.stdin.take());
+    assert!(unrelated.wait().unwrap().success());
+}
+
+#[test]
 fn terminal_loss_before_workload_exists_is_not_consumed() {
     let mut fixture = Fixture::new("early-hangup");
     let mut command = fixture.command(
@@ -162,7 +215,7 @@ fn terminal_loss_before_workload_exists_is_not_consumed() {
     let custodian = children(published)[0];
     assert_ne!(unsafe { libc::getpgid(custodian) }, published);
     assert!(children(custodian).is_empty());
-    fixture.master.take();
+    fixture.close_last_master();
     // Give the old handler an opportunity to consume HUP in an empty P group.
     std::thread::sleep(Duration::from_millis(100));
     assert!(children(custodian).is_empty());
@@ -396,7 +449,7 @@ os._exit(92)
         fixture.spawn(&script, true);
         let workload = pid_file(&fixture.root, "ready");
         let start = Instant::now();
-        fixture.master.take();
+        fixture.close_last_master();
         let status = fixture.settle();
         if trapped {
             assert_eq!(status.code(), Some(37));
@@ -514,7 +567,7 @@ fn ready_transition_hangup_after_false_probe_still_relays() {
     let workload = children(custodian)[0];
     assert_eq!(unsafe { libc::getpgid(workload) }, published);
     // The first probe has observed a live terminal, W is masked awaiting ACK.
-    fixture.master.take();
+    fixture.close_last_master();
     observer.write_all(b"A").unwrap();
     fixture.child = Some(spawn.join().unwrap().unwrap());
     fixture.custody.seal();

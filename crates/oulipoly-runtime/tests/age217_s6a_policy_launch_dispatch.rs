@@ -692,6 +692,11 @@ if PID_FILE and READY_FILE and SUBCOMMAND == "launch":
     parent_stat = pathlib.Path("/proc/" + str(os.getppid()) + "/stat").read_text()
     proxy_pid = parent_stat.rsplit(") ", 1)[1].split()[1]
     pathlib.Path(PID_FILE + ".proxy").write_text(proxy_pid)
+    pathlib.Path(PID_FILE + ".custodian").write_text(str(os.getppid()))
+    identities = {{}}
+    for role, pid in [("W", os.getpid()), ("C", os.getppid()), ("P", int(proxy_pid))]:
+        identities[role] = pathlib.Path("/proc/" + str(pid) + "/stat").read_text()
+    pathlib.Path(PID_FILE + ".identities").write_text(json.dumps(identities))
     pathlib.Path(READY_FILE).touch()
 
 def clear_custody_readiness():
@@ -1614,9 +1619,12 @@ fn run_external_child_custody_fault(
         .trim()
         .parse::<libc::pid_t>()
         .expect("numeric provider pid");
-    assert_external_child_reaped(pid);
     let proxy: libc::pid_t = fs::read_to_string(format!("{}.proxy", pid_path.display()))
         .expect("live proxy ancestry recorded before host cleanup").trim().parse().unwrap();
+    let custodian: libc::pid_t = fs::read_to_string(format!("{}.custodian", pid_path.display()))
+        .unwrap().trim().parse().unwrap();
+    diagnose_external_custody_return(&data_dir, &pid_path, invocation_uuid, fault, pid, proxy, custodian);
+    assert_external_child_reaped(pid);
     assert_ne!(pid, proxy);
     assert_external_child_reaped(proxy);
     assert_external_terminal_generation(
@@ -1627,8 +1635,70 @@ fn run_external_child_custody_fault(
     );
 }
 
+// Diagnostic-only observation: retain the immediate oracle even if a finite
+// cleanup finishes during sampling. Never signal a PID inferred from /proc.
+fn diagnose_external_custody_return(
+    data: &Path,
+    pid_path: &Path,
+    invocation: &str,
+    fault: &str,
+    workload: libc::pid_t,
+    proxy: libc::pid_t,
+    custodian: libc::pid_t,
+) {
+    let start = std::time::Instant::now();
+    let immediate = [workload, proxy].map(|pid| {
+        let rc = unsafe { libc::kill(pid, 0) };
+        (rc, io::Error::last_os_error().raw_os_error())
+    });
+    let identities = fs::read_to_string(format!("{}.identities", pid_path.display())).unwrap();
+    eprintln!("custody fault={fault} invocation={invocation} captured identities={identities}");
+    loop {
+        let connection = Connection::open_with_flags(
+            data.join("pid-identity.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let row: (String, String, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>) = connection.query_row(
+            "SELECT generation_uuid,lifecycle_state,spawned_os_pid,running_at,draining_at,exited_at,terminal_reason FROM runtime_generation WHERE spawn_invocation_uuid=?1",
+            [invocation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).unwrap();
+        let q = oulipoly_core::launch_custody::is_quiescent(
+            &oulipoly_core::launch_custody::proof_path(&data.join("pid-identity.db"), &row.0),
+        );
+        let states = [("W", workload), ("P", proxy), ("C", custodian)]
+            .map(|(role, pid)| (role, pid, fs::read_to_string(format!("/proc/{pid}/stat"))));
+        eprintln!(
+            "custody fault={fault} elapsed={:?} immediate={immediate:?} row={row:?} Q={q} states={states:?}",
+            start.elapsed()
+        );
+        if (q
+            && row.1 == "exited"
+            && states.iter().all(|(_, _, state)| {
+                state
+                    .as_ref()
+                    .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+            }))
+            || start.elapsed() >= std::time::Duration::from_secs(3)
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        immediate
+            .iter()
+            .all(|(rc, errno)| *rc == -1 && *errno == Some(libc::ESRCH)),
+        "immediate W/P cessation failed: fault={fault} W={workload} P={proxy} C={custodian}; see chronology (later cleanup is not synchronous drain)"
+    );
+}
+
 fn assert_external_child_reaped(pid: libc::pid_t) {
-    assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "provider remained live");
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "provider remained live: pid={pid}, stat={:?}",
+        fs::read_to_string(format!("/proc/{pid}/stat"))
+    );
     assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     let mut status = 0;
     assert_eq!(
@@ -2916,17 +2986,21 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
         count, 0,
         "partial output must not become complete delivery evidence"
     );
-    let pid = fs::read_to_string(pid_path)
+    let pid = fs::read_to_string(&pid_path)
         .unwrap()
         .trim()
         .parse::<libc::pid_t>()
         .unwrap();
     assert_external_child_reaped(pid);
+    let proxy: libc::pid_t = fs::read_to_string(format!("{}.proxy", pid_path.display()))
+        .expect("published generation proxy").trim().parse().unwrap();
+    assert_ne!(pid, proxy);
+    assert_external_child_reaped(proxy);
     assert_external_terminal_generation(
         &data_dir,
         uuid,
         "abnormal_termination",
-        Some(i64::from(pid)),
+        Some(i64::from(proxy)),
     );
     let conn = Connection::open(data_dir.join("pid-identity.db")).unwrap();
     let session: Option<String> = conn
