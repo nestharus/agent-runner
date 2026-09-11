@@ -25,9 +25,9 @@ use super::status::{
 };
 use std::process::{Child, ExitStatus};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-const TERMINATE_GRACE_PERIOD: Duration = Duration::from_millis(250);
+use oulipoly_core::launch_custody::TERMINATION_GRACE_PERIOD as TERMINATE_GRACE_PERIOD;
 
 pub(super) fn terminate_child(child: &mut Child) -> Result<Option<ExitStatus>, String> {
     if let Some(status) = try_wait_before_terminate(child)? {

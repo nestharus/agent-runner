@@ -8,6 +8,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::{cell::RefCell, io};
 
+/// Shared published-launch and executor supervision grace. Provider remote
+/// cancellation retains its own configured grace policy.
+pub const TERMINATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub fn proof_path(database: &Path, generation: &str) -> PathBuf {
     database
         .with_extension("starting-custody-v1")
@@ -285,6 +289,19 @@ mod linux {
     }
 
     pub(super) fn configure(custody: &LaunchCustody, command: &mut Command) -> io::Result<()> {
+        configure_impl(
+            custody,
+            command,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    pub(super) fn configure_impl(
+        custody: &LaunchCustody,
+        command: &mut Command,
+        #[cfg(test)] startup_gate: Option<RawFd>,
+    ) -> io::Result<()> {
         let endpoint = custody.endpoint.lock().unwrap_or_else(|e| e.into_inner());
         let endpoint = endpoint
             .as_ref()
@@ -332,17 +349,33 @@ mod linux {
                 {
                     return Err(io::Error::last_os_error());
                 }
-                let custodian = fork_process();
-                if custodian < 0 {
+                let mut ready_pair = [-1; 2];
+                if libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    ready_pair.as_mut_ptr(),
+                ) != 0
+                {
                     libc::close(status_pair[0]);
                     libc::close(status_pair[1]);
                     return Err(io::Error::last_os_error());
                 }
+                let custodian = fork_process();
+                if custodian < 0 {
+                    libc::close(status_pair[0]);
+                    libc::close(status_pair[1]);
+                    libc::close(ready_pair[0]);
+                    libc::close(ready_pair[1]);
+                    return Err(io::Error::last_os_error());
+                }
                 if custodian > 0 {
                     libc::close(status_pair[1]);
-                    proxy_status(status_pair[0], custodian, fd);
+                    libc::close(ready_pair[1]);
+                    proxy_status(status_pair[0], ready_pair[0], custodian, fd);
                 }
                 libc::close(status_pair[0]);
+                libc::close(ready_pair[0]);
                 // Keep the actual tree custodian OUTSIDE the workload's kill
                 // group. Existing killpg cleanup may kill the std Child proxy
                 // and its workload, but not the owner of quiescence evidence.
@@ -354,6 +387,28 @@ mod linux {
                 if !send(fd, b'B') {
                     libc::_exit(125);
                 }
+                #[cfg(test)]
+                if let Some(gate) = startup_gate {
+                    // Test-only barrier after C leaves P's group, before W
+                    // exists. No environment-based production fault injection.
+                    if !send(gate, b'R') {
+                        libc::_exit(125);
+                    }
+                    if libc::send(
+                        gate,
+                        (&proxy as *const libc::pid_t).cast(),
+                        4,
+                        libc::MSG_NOSIGNAL,
+                    ) != 4
+                    {
+                        libc::_exit(125);
+                    }
+                    let mut release = 0u8;
+                    if libc::recv(gate, (&mut release as *mut u8).cast(), 1, 0) != 1 {
+                        libc::_exit(125);
+                    }
+                    libc::close(gate);
+                }
                 let workload = fork_process();
                 if workload < 0 {
                     send(fd, b'D');
@@ -362,17 +417,28 @@ mod linux {
                 if workload == 0 {
                     libc::close(fd);
                     libc::close(status_pair[1]);
-                    if libc::setpgid(0, proxy) != 0
-                        || libc::sigprocmask(
-                            libc::SIG_SETMASK,
-                            &workload_mask,
-                            std::ptr::null_mut(),
-                        ) != 0
+                    // Recipient readiness precedes signal release: P may relay
+                    // a startup notification while W still has it blocked.
+                    // Standard-signal coalescing then covers simultaneous group
+                    // delivery, without leaving a future recipient unnotified.
+                    if libc::setpgid(0, proxy) != 0 || !send(ready_pair[1], b'R') {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let mut ack = 0u8;
+                    if libc::recv(ready_pair[1], (&mut ack as *mut u8).cast(), 1, 0) != 1
+                        || ack != b'A'
+                    {
+                        libc::_exit(125);
+                    }
+                    libc::close(ready_pair[1]);
+                    if libc::sigprocmask(libc::SIG_SETMASK, &workload_mask, std::ptr::null_mut())
+                        != 0
                     {
                         return Err(io::Error::last_os_error());
                     }
                     return Ok(());
                 }
+                libc::close(ready_pair[1]);
                 // C is outside the published group. Only P retains the block;
                 // exact custodian failure and unknown-custody fences are intact.
                 if libc::sigprocmask(libc::SIG_SETMASK, &workload_mask, std::ptr::null_mut()) != 0 {
@@ -481,56 +547,160 @@ mod linux {
         }
     }
 
-    // PTY hangup is delivered by the kernel to its session leader P, not
-    // necessarily to W. Relay that directed notification to the owned group.
-    // User/runner killpg already reaches W: relaying it again would duplicate
-    // signals (and recursively relay our own killpg). P pins this group ID.
-    unsafe extern "C" fn proxy_terminal_hangup(
-        _signal: libc::c_int,
-        info: *mut libc::siginfo_t,
-        _context: *mut libc::c_void,
-    ) {
+    // Existing runtime supervision grace is 250ms. Published TERM/HUP now
+    // use the same grace, owned by C (survives R/P loss). INT remains an
+    // interactive interrupt, not a request to end the session.
+    const SHUTDOWN_GRACE_MS: i64 = super::TERMINATION_GRACE_PERIOD.as_millis() as i64;
+
+    unsafe fn monotonic_ms() -> i64 {
         unsafe {
-            let saved_errno = *libc::__errno_location();
-            if !info.is_null() && (*info).si_code == libc::SI_KERNEL {
-                libc::kill(-libc::getpid(), libc::SIGHUP);
+            let mut now: libc::timespec = std::mem::zeroed();
+            if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) != 0 {
+                libc::_exit(125);
             }
-            // recv/wait_exact own their errno even when interrupted by hangup.
-            *libc::__errno_location() = saved_errno;
+            now.tv_sec * 1000 + now.tv_nsec / 1_000_000
         }
     }
 
-    unsafe fn proxy_status(fd: RawFd, custodian: libc::pid_t, launch_fd: RawFd) -> ! {
+    unsafe fn terminal_hung_up(fd: RawFd) -> bool {
         unsafe {
-            // Only P installs this handler, after C has forked with the original
-            // dispositions. HUP was blocked before the fork, so an early PTY
-            // notification remains pending until the relay is ready.
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = proxy_terminal_hangup as *const () as usize;
-            action.sa_flags = libc::SA_SIGINFO;
-            libc::sigemptyset(&mut action.sa_mask);
-            let mut hup: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut hup);
-            libc::sigaddset(&mut hup, libc::SIGHUP);
-            if libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut()) != 0
-                || libc::sigprocmask(libc::SIG_UNBLOCK, &hup, std::ptr::null_mut()) != 0
-            {
+            let mut poll = libc::pollfd {
+                fd,
+                events: 0,
+                revents: 0,
+            };
+            libc::poll(&mut poll, 1, 0) > 0 && poll.revents & libc::POLLHUP != 0
+        }
+    }
+
+    unsafe fn proxy_status(fd: RawFd, ready: RawFd, custodian: libc::pid_t, launch_fd: RawFd) -> ! {
+        unsafe {
+            // Retain only this session's terminal, not any arbitrary input pipe.
+            // POLLHUP on the slave is independent evidence of terminal loss;
+            // SI_KERNEL alone also describes orphaned stopped GROUP delivery.
+            let mut sid: libc::pid_t = 0;
+            let tty = if libc::ioctl(0, libc::TIOCGSID, &mut sid) == 0 && sid == libc::getpid() {
+                let retained = libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3);
+                if retained < 0 {
+                    libc::_exit(125);
+                }
+                retained
+            } else {
+                -1
+            };
+            close_preserving(&[fd, ready, launch_fd, tty]);
+            let mut signals: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut signals);
+            for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+                libc::sigaddset(&mut signals, signal);
+            }
+            let events = libc::signalfd(-1, &signals, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC);
+            if events < 0 {
                 libc::_exit(125);
             }
-            // A stopped proxy also retains the launch endpoint until actual exit.
-            close_except(fd, launch_fd);
-            let mut status: i32 = 125 << 8;
+            let mut started = false;
+            let mut early = [false; 4];
+            let mut hangup_relayed = false;
+            let mut shutdown_sent = false;
+            let mut status = 125 << 8;
             loop {
-                let rc = libc::recv(fd, (&mut status as *mut i32).cast(), 4, 0);
+                // A missing C is protocol failure, never W's exit status. In
+                // particular don't relay orphan-group HUP after C disappears.
+                let rc = libc::recv(fd, (&mut status as *mut i32).cast(), 4, libc::MSG_DONTWAIT);
                 if rc == 4 {
                     break;
                 }
-                if rc < 0 && *libc::__errno_location() == libc::EINTR {
-                    continue;
+                if rc >= 0
+                    || (rc < 0 && ![libc::EAGAIN, libc::EINTR].contains(&*libc::__errno_location()))
+                {
+                    let mut ignored = 0;
+                    wait_exact(custodian, &mut ignored);
+                    libc::_exit(125);
                 }
-                let mut custody_status = 0;
-                wait_exact(custodian, &mut custody_status);
-                libc::_exit(125);
+                loop {
+                    let mut event: libc::signalfd_siginfo = std::mem::zeroed();
+                    if libc::read(
+                        events,
+                        (&mut event as *mut libc::signalfd_siginfo).cast(),
+                        std::mem::size_of_val(&event),
+                    ) != std::mem::size_of_val(&event) as isize
+                    {
+                        break;
+                    }
+                    let signal = event.ssi_signo as i32;
+                    if !started {
+                        if let Some(index) =
+                            [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT]
+                                .iter()
+                                .position(|candidate| *candidate == signal)
+                        {
+                            early[index] = true;
+                        }
+                    }
+                    if [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT].contains(&signal)
+                        && !shutdown_sent
+                    {
+                        shutdown_sent = send(fd, b'T');
+                    }
+                }
+                if !started {
+                    let mut byte = 0u8;
+                    let rc =
+                        libc::recv(ready, (&mut byte as *mut u8).cast(), 1, libc::MSG_DONTWAIT);
+                    if rc == 1 && byte == b'R' {
+                        for (index, signal) in
+                            [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT]
+                                .iter()
+                                .enumerate()
+                        {
+                            if early[index] {
+                                libc::kill(-libc::getpid(), *signal);
+                            }
+                        }
+                        // W is still masked until ACK. Closing the terminal
+                        // before W existed therefore cannot consume its HUP.
+                        if terminal_hung_up(tty) && !early[2] {
+                            libc::kill(-libc::getpid(), libc::SIGHUP);
+                        }
+                        hangup_relayed = terminal_hung_up(tty);
+                        if !send(ready, b'A') {
+                            libc::_exit(125);
+                        }
+                        libc::close(ready);
+                        started = true;
+                    } else if rc >= 0 {
+                        libc::_exit(125);
+                    }
+                } else if !hangup_relayed && terminal_hung_up(tty) {
+                    libc::kill(-libc::getpid(), libc::SIGHUP);
+                    hangup_relayed = true;
+                }
+                if hangup_relayed && !shutdown_sent {
+                    shutdown_sent = send(fd, b'T');
+                }
+                let mut polls = [
+                    libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: if started { -1 } else { ready },
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: events,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: if hangup_relayed || !started { -1 } else { tty },
+                        events: 0,
+                        revents: 0,
+                    },
+                ];
+                libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, -1);
             }
             let mut custody_status = 0;
             wait_exact(custodian, &mut custody_status);
@@ -548,17 +718,136 @@ mod linux {
         }
     }
 
+    unsafe fn close_preserving(fds: &[RawFd]) {
+        unsafe {
+            // Fixed small stack array only: this is a post-fork pre-exec path.
+            let mut sorted = [-1; 4];
+            sorted[..fds.len()].copy_from_slice(fds);
+            sorted.sort_unstable();
+            let mut start = 0u32;
+            for fd in sorted {
+                if fd < 0 {
+                    continue;
+                }
+                let fd = fd as u32;
+                if start < fd && libc::syscall(libc::SYS_close_range, start, fd - 1, 0u32) != 0 {
+                    libc::_exit(125);
+                }
+                start = fd + 1;
+            }
+            if libc::syscall(libc::SYS_close_range, start, u32::MAX, 0u32) != 0 {
+                libc::_exit(125);
+            }
+        }
+    }
+
+    // Kill only our direct, unreaped children. Their numeric identities remain
+    // pinned by our exclusive wait ownership. Killing parents adopts further
+    // descendants, including escaped groups; repeat until consuming ECHILD.
+    // No global PID scan, allocation, status-carrier kill or stale group lookup.
+    unsafe fn kill_owned_children() -> bool {
+        unsafe {
+            let fd = libc::open(
+                c"/proc/thread-self/children".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            );
+            if fd < 0 {
+                return false;
+            }
+            let mut bytes = [0u8; 4096];
+            let count = libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len());
+            libc::close(fd);
+            if count < 0 {
+                return false;
+            }
+            let mut pid: i32 = 0;
+            for byte in &bytes[..count as usize] {
+                if byte.is_ascii_digit() {
+                    let Some(next) = pid
+                        .checked_mul(10)
+                        .and_then(|n| n.checked_add(i32::from(*byte - b'0')))
+                    else {
+                        return false;
+                    };
+                    pid = next;
+                } else if *byte == b' ' && pid > 0 {
+                    if libc::kill(pid, libc::SIGKILL) != 0
+                        && *libc::__errno_location() != libc::ESRCH
+                    {
+                        return false;
+                    }
+                    pid = 0;
+                } else {
+                    return false;
+                }
+            }
+            // The kernel list ends each PID with a space. A truncated last
+            // token is skipped; earlier children are killed and reaped first.
+            true
+        }
+    }
+
     unsafe fn reap_tree(fd: RawFd, workload: libc::pid_t, status_fd: RawFd) -> ! {
         unsafe {
             close_except(fd, status_fd);
+            let mut children: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut children);
+            libc::sigaddset(&mut children, libc::SIGCHLD);
+            if libc::sigprocmask(libc::SIG_BLOCK, &children, std::ptr::null_mut()) != 0 {
+                libc::_exit(125);
+            }
+            let events = libc::signalfd(-1, &children, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC);
+            if events < 0 {
+                libc::_exit(125);
+            }
             let mut root_status = None;
+            let mut deadline = None;
             loop {
+                let mut request = 0u8;
+                let rc = libc::recv(
+                    status_fd,
+                    (&mut request as *mut u8).cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                );
+                // Loss of P also starts bounded shutdown; it is not cessation.
+                if deadline.is_none() && (rc == 0 || (rc == 1 && request == b'T')) {
+                    deadline = Some(monotonic_ms() + SHUTDOWN_GRACE_MS);
+                }
+                if deadline.is_some_and(|end| monotonic_ms() >= end) && !kill_owned_children() {
+                    libc::_exit(125); // No D: failed custody remains unknown.
+                }
                 let mut status = 0;
-                let pid = libc::waitpid(-1, &mut status, 0);
+                let pid = libc::waitpid(-1, &mut status, libc::WNOHANG);
                 if pid == workload {
                     root_status = Some(status);
                 }
                 if pid > 0 {
+                    continue;
+                }
+                if pid == 0 {
+                    let mut polls = [
+                        libc::pollfd {
+                            fd: if deadline.is_some() { -1 } else { status_fd },
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: events,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    let timeout = deadline.map_or(-1, |end| {
+                        (end - monotonic_ms()).clamp(1, SHUTDOWN_GRACE_MS) as i32
+                    });
+                    libc::poll(polls.as_mut_ptr(), 2, timeout);
+                    let mut event: libc::signalfd_siginfo = std::mem::zeroed();
+                    libc::read(
+                        events,
+                        (&mut event as *mut libc::signalfd_siginfo).cast(),
+                        std::mem::size_of_val(&event),
+                    );
                     continue;
                 }
                 if *libc::__errno_location() == libc::EINTR {
@@ -1098,3 +1387,7 @@ os._exit(93)
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "launch_custody/published_shutdown_tests.rs"]
+mod published_shutdown_tests;
