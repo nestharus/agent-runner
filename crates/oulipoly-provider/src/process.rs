@@ -794,7 +794,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         }
         let terminated = TerminatedProcess {
             status: reap_after_kill(&mut self.child, admitted),
-            force_killed: admitted,
+            force_killed: self.child.force_was_delivered(admitted),
         };
         let status = terminated.status.map(process_status);
         let joined = collect_or_retain_process_threads(self.threads, self.child);
@@ -1294,7 +1294,7 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
             }
             Ok(false) if should_force_kill(&grace_started, kill_after_grace) => {
                 let admitted = kill_tree(child);
-                force_killed = admitted;
+                force_killed = child.force_was_delivered(admitted);
                 if admitted {
                     child.forced();
                 }
@@ -1339,7 +1339,7 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
             Ok(Some(status)) => break Some(status),
             Ok(None) if should_force_kill(&grace_started, kill_after_grace) => {
                 let admitted = kill_tree(child);
-                force_killed = admitted;
+                force_killed = child.force_was_delivered(admitted);
                 if admitted {
                     child.forced();
                 }

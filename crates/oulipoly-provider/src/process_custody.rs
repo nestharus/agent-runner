@@ -8,6 +8,7 @@ pub(crate) struct OwnedChild {
     child: Child,
     #[cfg(target_os = "linux")]
     remote: Option<oulipoly_core::launch_custody::RemoteStatus>,
+    remote_force_delivered: bool,
     reaped: bool,
     custody: Option<OperationCustody>,
     confined: bool,
@@ -42,6 +43,7 @@ impl OwnedChild {
             child,
             #[cfg(target_os = "linux")]
             remote: None,
+            remote_force_delivered: false,
             reaped: false,
             confined: custody.is_some() && containment_supported(),
             custody,
@@ -56,13 +58,25 @@ impl OwnedChild {
         self
     }
     #[cfg(unix)]
-    pub fn signal_remote(&self, signal: i32) -> Option<std::io::Result<()>> {
+    pub fn signal_remote(&mut self, signal: i32) -> Option<std::io::Result<bool>> {
         #[cfg(target_os = "linux")]
         if let Some(remote) = &self.remote {
-            return Some(remote.signal(signal));
+            let result = remote.signal(signal);
+            if signal == libc::SIGKILL {
+                self.remote_force_delivered = matches!(result, Ok(true));
+            }
+            return Some(result);
         }
         let _ = signal;
         None
+    }
+    pub fn force_was_delivered(&self, admitted: bool) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.remote.is_some() {
+            return admitted && self.remote_force_delivered;
+        }
+        let _ = self.remote_force_delivered;
+        admitted
     }
     fn current_identity(&self) -> std::io::Result<ProcessIdentity> {
         #[cfg(all(test, target_os = "linux"))]
@@ -125,6 +139,9 @@ impl OwnedChild {
         }
     }
     pub fn forced(&self) {
+        if !self.force_was_delivered(true) {
+            return;
+        }
         if let Some(c) = &self.custody {
             c.0.lock().unwrap_or_else(|e| e.into_inner()).force_killed = true;
         }

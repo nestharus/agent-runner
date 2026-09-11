@@ -29,10 +29,11 @@ impl RemoteStatus {
 
     /// Requests are serialized with the owner's consuming root wait. A final
     /// tree status is also a successful no-op signal result, not ESRCH inference.
-    pub fn signal(&self, signal: i32) -> io::Result<()> {
+    /// Returns true only when the group signal syscall actually succeeded.
+    pub fn signal(&self, signal: i32) -> io::Result<bool> {
         let mut channel = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if channel.status.is_some() {
-            return Ok(());
+            return Ok(false);
         }
         if channel.signal_failed {
             return Err(io::Error::other("command signalling previously failed"));
@@ -48,7 +49,7 @@ impl RemoteStatus {
                 let message = receive(channel.fd.as_raw_fd())?;
                 if message[0] == b'X' as i32 {
                     channel.status = Some(message[1]);
-                    return Ok(());
+                    return Ok(false);
                 }
                 return Err(io::Error::other("unexpected command status message"));
             }
@@ -58,9 +59,10 @@ impl RemoteStatus {
             match message {
                 [kind, status] if kind == b'X' as i32 => {
                     channel.status = Some(status);
-                    Ok(())
+                    Ok(false)
                 }
-                [kind, 0] if sent && kind == b'A' as i32 => Ok(()),
+                [kind, 0] if sent && kind == b'A' as i32 => Ok(true),
+                [kind, libc::ESRCH] if sent && kind == b'A' as i32 => Ok(false),
                 [kind, errno] if sent && kind == b'A' as i32 => {
                     Err(io::Error::from_raw_os_error(errno))
                 }
@@ -339,7 +341,7 @@ unsafe fn own_tree(launch: RawFd, control: RawFd, root: i32) -> ! {
             // Root remains our unreaped child even when already exited; its PID
             // cannot name an unrelated group. C is outside this kill group.
             let rc = libc::kill(-root, message[1]);
-            let errno = if rc == 0 || *libc::__errno_location() == libc::ESRCH {
+            let errno = if rc == 0 {
                 0
             } else {
                 *libc::__errno_location()

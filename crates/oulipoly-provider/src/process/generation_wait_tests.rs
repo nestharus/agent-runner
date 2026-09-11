@@ -426,6 +426,10 @@ fn remote_timeout_retains_escaped_tree_and_consuming_cleanup_owner() {
             .contains("cleanup_pending")
     );
     assert!(!error.diagnostics().process_was_reaped);
+    assert!(
+        !error.diagnostics().process_was_force_killed,
+        "empty group acknowledgement is not an executed kill"
+    );
     assert_eq!(process_row(owner).1, std::process::id() as i32);
     drop(scope);
     generation.seal();
