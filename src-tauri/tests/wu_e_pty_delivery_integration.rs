@@ -2553,15 +2553,15 @@ fn observe_settlement_tree_cleanup(recorded: bool, panic_after_spawn: bool, held
     let fixture = Fixture::new();
     let script = fixture.dir.path().join("cleanup-provider.sh");
     let identity_path = fixture.dir.path().join("cleanup-provider.pid");
-    let eof_path = fixture.dir.path().join("cleanup-provider.eof");
+    let read_status_path = fixture.dir.path().join("cleanup-provider.read-status");
     let mut lifetime = ProviderLifetime::new(fixture.dir.path());
     let barrier = if held_lifetime {
         lifetime.provider_loop()
     } else {
         format!(
             "if IFS= read -r -t 30 line; then exit 91; else rc=$?; fi\n\
-             if [ \"$rc\" -eq 1 ]; then printf pty_eof > {}; exit 94; fi\nexit 95",
-            shell_single_quote(&path_string(&eof_path)),
+             if [ \"$rc\" -eq 1 ]; then printf read_status_1 > {}; exit 94; fi\nexit 95",
+            shell_single_quote(&path_string(&read_status_path)),
         )
     };
     // Only Bash builtins: no independent timer or unrelated process to kill.
@@ -2751,11 +2751,14 @@ printf 'CLEANUP_PROVIDER_BLOCKED\n'
     for (pid, status) in &observed_statuses {
         if *pid == provider_pid || *pid == i64::from(published_pid) {
             if !recorded && !held_lifetime && libc::WIFEXITED(*status) {
-                // Closing the terminal can wake read(2) with EOF before HUP is
-                // handled. This dedicated EOF exit is not the timeout (95),
-                // input (91), arbitrary failure (1), or a mere trap marker.
+                // Bash status 1 does not distinguish EOF from read errors.
+                // This dedicated branch excludes timeout/input only. Actual
+                // disappearance and independent Q remain required above.
                 assert_eq!(libc::WEXITSTATUS(*status), 94);
-                assert_eq!(fs::read_to_string(&eof_path).unwrap(), "pty_eof");
+                assert_eq!(
+                    fs::read_to_string(&read_status_path).unwrap(),
+                    "read_status_1"
+                );
             } else {
                 assert!(
                     libc::WIFSIGNALED(*status),
