@@ -231,7 +231,13 @@ fn startup_wake_reclaim_sweep_enabled(cli: &Cli) -> bool {
     }
     !matches!(
         &cli.command,
-        Some(Subcommands::Notify { .. })
+        // Export owns a single structured result/error channel. Incidental
+        // startup inspection must not launch helpers before that result. Other
+        // startup/maintenance triggers retain their recovery opportunities.
+        Some(Subcommands::Session {
+            command: SessionSubcommands::Export { .. },
+        })
+            | Some(Subcommands::Notify { .. })
             | Some(Subcommands::Resume { .. })
             | Some(Subcommands::Repl {
                 resume: Some(_),
@@ -848,6 +854,15 @@ mod tests {
         ])
         .unwrap();
 
+        assert!(!startup_wake_reclaim_sweep_enabled(&cli));
+    }
+
+    #[test]
+    fn session_export_does_not_schedule_incidental_startup_recovery() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner", "session", "export", "session-id",
+        ])
+        .unwrap();
         assert!(!startup_wake_reclaim_sweep_enabled(&cli));
     }
 
