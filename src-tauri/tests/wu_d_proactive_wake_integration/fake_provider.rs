@@ -120,6 +120,7 @@ wait "$writer_pid"
         "",
         "acr329-resumed-input.txt",
     )
+    .replace("SUCCESSFUL_ASSISTANT = False", "SUCCESSFUL_ASSISTANT = True")
 }
 
 pub(crate) fn late_consumed_agent_bash_provider_script(agent_bash_bin: &Path) -> String {
@@ -215,6 +216,7 @@ ON_INITIAL = __WU_D_ON_INITIAL__
 ON_RESUME = __WU_D_ON_RESUME__
 PROMPT_FILE = __WU_D_PROMPT_FILE__
 ON_ANCHOR = ""
+SUCCESSFUL_ASSISTANT = False
 
 def envelope(request, result):
     return {"contract": CONTRACT, "request_id": request["request_id"], "ok": True, "result": result}
@@ -242,14 +244,14 @@ def next_resume_index(work, prefix="provider-resume-sequence"):
     finally:
         lock.rmdir()
 
-def write_turn(work, session, prompt, index):
+def write_turn(work, session, prompt, index, role="user"):
     turns = work / "session-turns"
     turns.mkdir(parents=True, exist_ok=True)
     record = {
         "session_id": session,
-        "turn_id": "wu-d-delivery-" + session + "-" + str(index),
+        "turn_id": ("wu-d-delivery-" if role == "user" else "wu-d-assistant-") + session + "-" + str(index),
         "timestamp": "2026-07-29T12:00:00Z",
-        "role": "user",
+        "role": role,
         "body": [{"type": "text", "text": prompt}],
         "source_sequence": index,
     }
@@ -282,7 +284,16 @@ def launch(request):
     stdout = completed.stdout if completed else b""
     stderr = completed.stderr if completed else b""
     if resumed and code == 0:
-        write_turn(work, session, prompt, index)
+        # The successful fixture writes a genuine answer after the receipt;
+        # receipt-only fixtures deliberately remain completion-unconfirmed.
+        receipt_index = 2 * index - 1 if SUCCESSFUL_ASSISTANT else index
+        write_turn(work, session, prompt, receipt_index)
+        if SUCCESSFUL_ASSISTANT:
+            answer = "Completed the nested work notification."
+            write_turn(work, session, answer, 2 * index, role="assistant")
+            stdout += answer.encode("utf-8") + b"\n"
+            event(request, seq, "marker", name="oulipoly.produced_assistant_response", value=True)
+            seq += 1
 
     data_event_count = 0
     if stdout:

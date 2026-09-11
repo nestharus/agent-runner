@@ -1057,14 +1057,24 @@ mod tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
-            if let Some(pid) = self.stopped_proxy.take() {
-                unsafe {
-                    libc::kill(pid, libc::SIGCONT);
-                }
-            }
             if let Some(mut child) = self.creator.take() {
                 let _ = child.kill();
                 let _ = child.wait();
+            }
+            if let Some(pid) = self.stopped_proxy.take() {
+                // These two fixtures run in a private subreaper. Creator death
+                // transfers their recorded child to us before any cleanup signal.
+                if adopted_child(pid) {
+                    unsafe {
+                        libc::kill(pid, libc::SIGCONT);
+                    }
+                } else {
+                    eprintln!(
+                        "no cleanup ownership for recorded fixture child {pid}; retained {}",
+                        self.root.display()
+                    );
+                    return;
+                }
             }
             // Fixture descendants are finite (<= 1s), never arbitrary host PIDs.
             let _ = std::fs::remove_dir_all(&self.root);
@@ -1129,7 +1139,13 @@ mod tests {
             return;
         }
         let custody = LaunchCustody::start(root.join("proof")).unwrap();
-        if phase == "after_spawn" || phase == "stopped_preexec" || phase == "remote_after_spawn" {
+        if phase == "stopped_preexec" || phase == "stopped_proxy" {
+            std::fs::write(root.join("monitor"), custody.monitor_pid.to_string()).unwrap();
+        }
+        if matches!(
+            phase.as_str(),
+            "after_spawn" | "stopped_preexec" | "stopped_proxy" | "remote_after_spawn"
+        ) {
             use std::os::fd::AsRawFd;
             let mut command = Command::new("/bin/sh");
             command
@@ -1162,6 +1178,11 @@ mod tests {
             std::fs::write(root.join("reaper"), _owned.id().to_string()).unwrap();
             drop(command);
             eventually(|| root.join("descendant").exists());
+            if phase == "stopped_proxy" {
+                // Signal our retained, directly spawned Child, not a scan result.
+                assert_eq!(unsafe { libc::kill(_owned.id() as i32, libc::SIGSTOP) }, 0);
+                eventually(|| process_is_stopped(_owned.id() as i32));
+            }
         }
         std::fs::write(root.join("ready"), b"ready").unwrap();
         // Parent kills this creator and deliberately keeps it unreaped.
@@ -1305,40 +1326,137 @@ mod tests {
         assert!(!is_quiescent(&fixture.root.join("proof")));
     }
 
+    // Run only the stopped-authority fixtures under an isolated subreaper.
+    // After creator death, its P is adopted by a live ancestor in the SAME
+    // session but outside P's group. Otherwise setsid callers orphan that group,
+    // and Linux legitimately sends HUP/CONT, destroying the stopped premise.
+    // Do not set subreaper state in the shared parallel test harness.
+    fn stopped_fixture_process(name: &str) -> bool {
+        if std::env::var("CUSTODY_STOP_CASE").as_deref() == Ok(name) {
+            return true;
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .env("CUSTODY_STOP_CASE", name)
+            .env("TMPDIR", std::env::temp_dir())
+            .stdin(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "private stopped fixture: {status}");
+                return false;
+            }
+            if Instant::now() >= deadline {
+                // Only this retained direct child is authorized here. No sweep.
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("private stopped fixture timed out; descendants not swept");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn adopted_child(pid: i32) -> bool {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) == 0
+        }
+    }
+
+    fn process_is_stopped(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|stat| stat.rsplit_once(") ").unwrap().1.starts_with("T "))
+    }
+
+    fn assert_stopped_adoption(pid: i32) {
+        assert!(adopted_child(pid), "recorded fixture child was not adopted");
+        assert!(process_is_stopped(pid), "stopped-authority premise lost");
+        assert_eq!(unsafe { libc::getsid(pid) }, unsafe { libc::getsid(0) });
+        assert_ne!(unsafe { libc::getpgid(pid) }, unsafe { libc::getpgrp() });
+        eprintln!(
+            "recorded fixture child {pid}: adopted by {}, same session {}, distinct group {}, state T",
+            std::process::id(),
+            unsafe { libc::getsid(pid) },
+            unsafe { libc::getpgid(pid) }
+        );
+    }
+
+    fn resume_stopped_fixture(fixture: &mut Fixture, pid: i32) {
+        assert_stopped_adoption(pid);
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+        fixture.stopped_proxy = None;
+        eventually(|| is_quiescent(&fixture.root.join("proof")));
+        let monitor: i32 = std::fs::read_to_string(fixture.root.join("monitor"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        for child in [pid, monitor] {
+            let mut status = 0;
+            eventually(|| unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) == child });
+        }
+        eprintln!("Q after explicit CONT; recorded proxy and monitor reaped");
+    }
+
     #[test]
     fn stopped_unpublished_preexec_child_keeps_custody_after_creator_crash() {
-        let fixture = Fixture::new("stopped_preexec");
+        if !stopped_fixture_process(
+            "launch_custody::tests::stopped_unpublished_preexec_child_keeps_custody_after_creator_crash",
+        ) {
+            return;
+        }
+        let mut fixture = Fixture::new("stopped_preexec");
         eventually(|| std::fs::metadata(fixture.root.join("gated")).is_ok_and(|m| m.len() == 4));
         let bytes = std::fs::read(fixture.root.join("gated")).unwrap();
         let pid = i32::from_ne_bytes(bytes.try_into().unwrap());
+        fixture.stopped_proxy = Some(pid);
+        eventually(|| process_is_stopped(pid));
         fixture.crash_unreaped();
+        assert_stopped_adoption(pid);
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_stopped_adoption(pid);
         assert!(!is_quiescent(&fixture.root.join("proof")));
-        // A stopped child cannot shed its inherited custody endpoint. Resume
-        // the exact still-stopped fixture; no signal after its identity releases.
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
-        eventually(|| is_quiescent(&fixture.root.join("proof")));
+        resume_stopped_fixture(&mut fixture, pid);
     }
 
     #[test]
     fn stopped_status_proxy_retains_custody_after_actual_workload_exit() {
-        let mut fixture = Fixture::new("after_spawn");
+        if !stopped_fixture_process(
+            "launch_custody::tests::stopped_status_proxy_retains_custody_after_actual_workload_exit",
+        ) {
+            return;
+        }
+        let mut fixture = Fixture::new("stopped_proxy");
         fixture.wait_ready();
         let proxy: i32 = std::fs::read_to_string(fixture.root.join("reaper"))
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(proxy, libc::SIGSTOP) }, 0);
         fixture.stopped_proxy = Some(proxy);
         fixture.crash_unreaped();
+        assert_stopped_adoption(proxy);
         std::thread::sleep(Duration::from_millis(1200));
-        let withheld = !is_quiescent(&fixture.root.join("proof"));
-        assert_eq!(unsafe { libc::kill(proxy, libc::SIGCONT) }, 0);
-        fixture.stopped_proxy = None;
-        eventually(|| is_quiescent(&fixture.root.join("proof")));
+        assert_stopped_adoption(proxy);
         assert!(
-            withheld,
+            !is_quiescent(&fixture.root.join("proof")),
             "an unreleased status proxy lost its inherited endpoint"
         );
+        resume_stopped_fixture(&mut fixture, proxy);
     }
 
     #[test]
