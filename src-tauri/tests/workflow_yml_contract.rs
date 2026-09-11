@@ -925,15 +925,19 @@ fn assert_apt_packages(workflow_name: &str, workflow: &Value, job_name: &str) {
         1,
         "A13: {workflow_name} {job_name} must contain exactly one apt-get install step, found: {apt_steps:?}"
     );
+    let mut expected = BTreeSet::from([
+        "libwebkit2gtk-4.1-dev".to_string(),
+        "libgtk-3-dev".to_string(),
+        "libsoup-3.0-dev".to_string(),
+        "libjavascriptcoregtk-4.1-dev".to_string(),
+    ]);
+    if workflow_name == "ci.yml" {
+        expected.extend(["ripgrep", "util-linux", "ncurses-bin"].map(str::to_string));
+    }
     assert_eq!(
         apt_install_packages(apt_steps[0]),
-        BTreeSet::from([
-            "libwebkit2gtk-4.1-dev".to_string(),
-            "libgtk-3-dev".to_string(),
-            "libsoup-3.0-dev".to_string(),
-            "libjavascriptcoregtk-4.1-dev".to_string()
-        ]),
-        "A13: {workflow_name} {job_name} apt-get install step must list exactly the preserved Linux Tauri/WebKit packages"
+        expected,
+        "A13: {workflow_name} {job_name} must preserve Linux Tauri/WebKit and the workflow's explicit executable test dependencies"
     );
 }
 
