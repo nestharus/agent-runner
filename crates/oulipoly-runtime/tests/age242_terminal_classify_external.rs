@@ -347,9 +347,24 @@ fn external_terminal_classify_maps_quota_maybe_rate_and_cancelled_modes() {
 }
 
 #[test]
-fn terminal_classify_failure_after_launch_success_falls_back_to_s6a_mapping() {
+fn advertised_terminal_classify_failure_is_unknown_not_launch_fallback() {
     let script = classify_failure_provider();
-    assert_terminal(&execute_with_provider(&script), s6a_nonzero_expected());
+    let result = execute_with_provider(&script);
+    assert_terminal(
+        &result,
+        ExpectedTerminal {
+            kind: TerminalSignalKind::Unknown,
+            reason: Some("external_provider_terminal_classification_failed"),
+            exit_code: -1,
+        },
+    );
+    let evidence = &result.terminal_signal.as_ref().unwrap().evidence;
+    assert!(
+        evidence.contains("provider_client_failed;kind="),
+        "{evidence}"
+    );
+    assert_eq!(result.stdout, b"raw\0\xffZ");
+    assert_eq!(result.stderr, "err");
 }
 
 #[test]

@@ -45,7 +45,7 @@ use crate::executor::{
     ExecutionOutputSpool, ExecutionResult, ExternalProviderSessionAuthority, ReturnedArtifactRef,
     SessionCaptureMethod, SessionCaptureResult,
 };
-use crate::services::TerminalClassification;
+use crate::services::{ServiceError, TerminalClassification};
 use crate::session_authority::VerifiedSessionAuthority;
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
@@ -65,7 +65,7 @@ pub(crate) struct LaunchOutputArtifacts {
 pub(crate) fn map_launch_result_with_terminal_classification(
     result: LaunchResult,
     provider_index: usize,
-    classification: Option<TerminalClassification>,
+    classification: Result<Option<TerminalClassification>, ServiceError>,
     retain_prompt_acceptance_attestation_v1: bool,
     output: LaunchOutputArtifacts,
     authority: &ExternalProviderSessionAuthority,
@@ -81,11 +81,34 @@ pub(crate) fn map_launch_result_with_terminal_classification(
         &result.exit.terminal_signal,
         &authority.account_name,
     );
-    let terminal = classification.unwrap_or(TerminalClassification {
-        exit_code: terminal.exit_code,
-        terminal_reason: terminal.terminal_reason,
-        terminal_signal: terminal.terminal_signal,
-    });
+    let terminal = match classification {
+        Ok(Some(classification)) => classification,
+        Ok(None) => TerminalClassification {
+            exit_code: terminal.exit_code,
+            terminal_reason: terminal.terminal_reason,
+            terminal_signal: terminal.terminal_signal,
+        },
+        Err(error) => TerminalClassification {
+            // Cancellation is already known from launch, independently of
+            // classification. Keep that outcome while retaining failure evidence.
+            exit_code: if matches!(result.exit.status, ProcessStatus::Cancelled) {
+                130
+            } else {
+                -1
+            },
+            terminal_reason: Some(if matches!(result.exit.status, ProcessStatus::Cancelled) {
+                "cancelled".to_string()
+            } else {
+                "external_provider_terminal_classification_failed".to_string()
+            }),
+            terminal_signal: TerminalSignal {
+                kind: TerminalSignalKind::Unknown,
+                provider_name: authority.account_name.clone(),
+                evidence: error.to_string(),
+                observed_at: SystemTime::now(),
+            },
+        },
+    };
     let produced_assistant_response = launch_result_produced_assistant_response(&result);
     let captured_child_invocations = captured_child_invocations_from_stderr(&stderr);
     ExecutionResult {
