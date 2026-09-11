@@ -1027,7 +1027,6 @@ fn age355_expired_tick_budget_never_starts_io() {
 }
 
 #[test]
-#[ignore = "R1 unresolved: bounded duplicate global-selection probe, private DB only"]
 fn age355_correction_global_selection_does_not_overlap() {
     let mut f = Fixture::new();
     f.anchored_submit();
@@ -1051,7 +1050,9 @@ fn age355_correction_global_selection_does_not_overlap() {
         crate::native_receipt::poll_headless_receipt_tick_with(&mut db, |_| {
             first_entered.send(()).unwrap();
             released.recv_timeout(Duration::from_secs(5)).unwrap();
-            Err("private unavailable registry".into())
+            Err::<oulipoly_runtime::provider_registry::ProviderRegistry, _>(
+                "private unavailable registry".into(),
+            )
         })
     });
     observed.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1059,7 +1060,9 @@ fn age355_correction_global_selection_does_not_overlap() {
     // must not perform duplicate global inspection of this sole candidate.
     let result = crate::native_receipt::poll_headless_receipt_tick_with(&mut f.db, |_| {
         entered.send(()).unwrap();
-        Err("private unavailable registry".into())
+        Err::<oulipoly_runtime::provider_registry::ProviderRegistry, _>(
+            "private unavailable registry".into(),
+        )
     });
     let duplicated = observed.try_recv().is_ok();
     release.send(()).unwrap();

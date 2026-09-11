@@ -376,19 +376,22 @@ pub(crate) fn retain_observation_failure(
 /// One periodic slot, one provider page, independent of assistant output and
 /// semantic resume. The durable scan cursor advances before any external IO.
 pub(crate) fn poll_headless_receipt_tick() -> Result<(), String> {
-    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
-        return Ok(());
-    };
-    poll_headless_receipt_tick_with(&mut db, crate::wiring::receipt_registry)
+    helper::run_once()
 }
 
-pub(crate) fn poll_headless_receipt_tick_with(
+pub(crate) fn poll_headless_receipt_tick_with<
+    R: std::borrow::Borrow<oulipoly_runtime::provider_registry::ProviderRegistry>,
+>(
     db: &mut MailboxDb,
-    make_registry: impl FnOnce(
-        Option<&std::path::Path>,
-    )
-        -> Result<oulipoly_runtime::provider_registry::ProviderRegistry, String>,
+    make_registry: impl FnOnce(Option<&std::path::Path>) -> Result<R, String>,
 ) -> Result<(), String> {
+    // Independent physical connections/processes share this admission. It is
+    // retained across selection, preparation, pages and publication, but is not
+    // a SQLite writer lock and does not exclude consumer ACKs.
+    let Some(_admission) = helper::try_admit(db.path(), "receipt-scan")? else {
+        return Ok(());
+    };
+
     let Some(attempt_id) = db.next_headless_receipt_attempt()? else {
         return Ok(());
     };
@@ -416,7 +419,7 @@ pub(crate) fn poll_headless_receipt_tick_with(
     confirm_delivery_observation_bounded(
         db,
         &attempt_id,
-        &registry,
+        registry.borrow(),
         identity,
         std::path::Path::new(cwd),
         &anchor,
@@ -432,10 +435,14 @@ pub(crate) fn poll_headless_receipt_tick_with(
 pub(crate) struct ReceiptPollGuard {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+    cancellation: Option<CancellationToken>,
 }
 impl Drop for ReceiptPollGuard {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(token) = &self.cancellation {
+            token.cancel();
+        }
         if let Some(worker) = self.worker.take() {
             worker.thread().unpark();
             if let Err(error) = worker.join() {
@@ -445,9 +452,10 @@ impl Drop for ReceiptPollGuard {
     }
 }
 pub(crate) fn start_headless_receipt_polling() -> Result<ReceiptPollGuard, String> {
-    start_receipt_polling_with(poll_headless_receipt_tick, Duration::from_secs(2))
+    helper::start()
 }
 
+#[cfg(test)]
 pub(crate) fn start_receipt_polling_with(
     mut tick: impl FnMut() -> Result<(), String> + Send + 'static,
     interval: Duration,
@@ -473,9 +481,13 @@ pub(crate) fn start_receipt_polling_with(
     Ok(ReceiptPollGuard {
         stop,
         worker: Some(worker),
+        cancellation: None,
     })
 }
 
 #[cfg(test)]
 #[path = "native_receipt_correction_tests.rs"]
 mod correction_tests;
+
+#[path = "native_receipt_helper.rs"]
+pub(crate) mod helper;

@@ -354,6 +354,21 @@ impl ProviderRegistry {
         self.describe_uncached_model_artifact(model_name, &key)
     }
 
+    /// Used only by the receipt helper's retained registry cache. All populated
+    /// endpoints must retain both executable revision and configured resolution.
+    pub fn receipt_endpoints_unchanged(&self) -> bool {
+        self.endpoint_cache
+            .lock()
+            .expect("endpoint cache mutex")
+            .values()
+            .all(|endpoint| {
+                endpoint
+                    .client()
+                    .receipt_endpoint_unchanged()
+                    .unwrap_or(false)
+            })
+    }
+
     pub fn preflight_account(
         &self,
         account_name: &str,

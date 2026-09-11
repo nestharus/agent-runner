@@ -45,6 +45,8 @@ if sys.argv[1:] == ["--prepare-fixture"]:
 
 profile = json.loads((root / "paired-profile.json").read_text())
 assert len(sys.argv) == 2 and sys.argv[1] in ("describe", "session.read_turns")
+with (root / "inspection-operations").open("a") as operations:
+    operations.write(sys.argv[1] + "\n")
 request = json.load(sys.stdin)
 request["host"]["env"]["HOME"] = str(root / "home")
 request["host"]["data_root"] = str(root / "data")

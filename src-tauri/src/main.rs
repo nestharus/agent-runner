@@ -58,6 +58,19 @@ fn main() -> ExitCode {
 }
 
 fn process_entrypoint() -> ExitCode {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(native_receipt::helper::ARG))
+    {
+        return match native_receipt::helper::entry(
+            std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("once")),
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     initialize_tracing();
 
     if wake_coordinator::is_wake_reclaim_handoff_invocation() {

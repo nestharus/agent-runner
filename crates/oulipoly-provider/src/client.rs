@@ -63,7 +63,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 pub use crate::process::{CancellationToken, ProcessSpawnObserver};
@@ -248,6 +248,7 @@ pub struct ProviderClient {
     resolved: OnceLock<ResolvedProviderCommand>,
     last_diagnostics: Mutex<ProviderDiagnostics>,
     last_argv: Mutex<Vec<OsString>>,
+    identity_cache: Arc<crate::executable_identity::IdentityCache>,
 }
 
 impl ProviderClient {
@@ -258,6 +259,7 @@ impl ProviderClient {
             resolved: OnceLock::new(),
             last_diagnostics: Mutex::new(ProviderDiagnostics::default()),
             last_argv: Mutex::new(Vec::new()),
+            identity_cache: Arc::default(),
         }
     }
 
@@ -286,64 +288,30 @@ impl ProviderClient {
     }
 
     /// Digest the retained opened executable, never re-open the configured path.
+    /// Reuse the digest only after retained-handle change-stamp validation.
     pub fn pinned_executable_identity_sha256(&self) -> Result<String, String> {
-        use sha2::{Digest, Sha256};
         let resolved = self.resolved.get().ok_or("endpoint_not_pinned")?;
-        let file = resolved.pinned_executable();
-        // Native resolver handles may be O_PATH. Re-open the retained descriptor,
-        // never the configured pathname, and compare metadata around the read.
-        #[cfg(target_os = "linux")]
-        let file = {
-            use std::os::fd::AsRawFd;
-            std::fs::File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
-                .map_err(|e| e.to_string())?
-        };
-        let before = file.metadata().map_err(|e| e.to_string())?;
-        if !before.is_file() || before.len() > 512 * 1024 * 1024 {
-            return Err("endpoint_identity_unbounded".into());
+        self.identity_cache.digest(&resolved.pinned_executable())
+    }
+
+    /// Receipt-only cache validation. Re-resolve the configured artifact to
+    /// notice namespace/PATH replacement, then compare retained handle stamps.
+    /// False/error requires a fresh registry and describe, not cached capability
+    /// reuse with a new identity. No provider bytes are read on an unchanged hit.
+    pub fn receipt_endpoint_unchanged(&self) -> Result<bool, String> {
+        let pinned = self
+            .resolved
+            .get()
+            .ok_or("endpoint_not_pinned")?
+            .pinned_executable();
+        if !self.identity_cache.unchanged(&pinned)? {
+            return Ok(false);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{FileExt, MetadataExt};
-            let mut digest = Sha256::new();
-            let metadata = |m: &std::fs::Metadata| {
-                (
-                    m.dev(),
-                    m.ino(),
-                    m.len(),
-                    m.mtime(),
-                    m.mtime_nsec(),
-                    m.ctime(),
-                    m.ctime_nsec(),
-                )
-            };
-            digest.update(serde_json::to_vec(&metadata(&before)).map_err(|e| e.to_string())?);
-            let mut offset = 0;
-            let mut bytes = [0u8; 65536];
-            loop {
-                let read = file
-                    .read_at(&mut bytes, offset)
-                    .map_err(|e| e.to_string())?;
-                if read == 0 {
-                    break;
-                }
-                offset += read as u64;
-                if offset > before.len() {
-                    return Err("endpoint_identity_changed".into());
-                }
-                digest.update(&bytes[..read]);
-            }
-            if offset != before.len()
-                || metadata(&before) != metadata(&file.metadata().map_err(|e| e.to_string())?)
-            {
-                return Err("endpoint_identity_changed".into());
-            }
-            Ok(format!("{:x}", digest.finalize()))
-        }
-        #[cfg(not(unix))]
-        {
-            Err("endpoint_identity_unsupported".into())
-        }
+        let current = ProviderResolver::new(self.options.resolver.clone())
+            .resolve(&self.artifact, self.options.provider_config_dir.as_deref())
+            .map_err(|e| e.kind().to_string())?;
+        Ok(crate::executable_identity::stamp(&pinned)?
+            == crate::executable_identity::stamp(&current.pinned_executable())?)
     }
 
     /// Build another client for the exact executable already resolved and
@@ -354,7 +322,8 @@ impl ProviderClient {
         options: ProviderClientOptions,
     ) -> Result<Self, ProviderClientError> {
         let resolved = self.resolve("describe", None)?;
-        let fork = Self::new(self.artifact.clone(), options);
+        let mut fork = Self::new(self.artifact.clone(), options);
+        fork.identity_cache = self.identity_cache.clone();
         fork.resolved
             .set(resolved)
             .expect("new provider client cannot already contain a resolved command");
@@ -1213,3 +1182,6 @@ fn provider_nonzero(status: &ProcessStatus) -> bool {
     matches!(status, ProcessStatus::Exited { code } if *code != 0)
         || matches!(status, ProcessStatus::SignalTerminated { .. })
 }
+
+#[cfg(unix)]
+pub use crate::process::enter_receipt_inspection_group;

@@ -684,8 +684,8 @@ fn age355_paired_periodic_active_partial_restart_receipt_and_failure() {
     let root = p.f.root.path().to_path_buf();
     let attempt = p.f.attempt.clone();
     let (send, received) = std::sync::mpsc::channel();
-    // Exercise the production periodic worker and scanner, using only private
-    // physical fixture roots and the same provider-neutral page-only registry.
+    // Exercise the in-process fixture driver and production scanner with private
+    // roots. The dedicated process-helper experiment below covers actual polling.
     let guard = crate::native_receipt::start_receipt_polling_with(
         move || {
             let mut db = MailboxDb::open(&root.join("pid-identity.db"))?;
@@ -833,4 +833,125 @@ fn age355_paired_identity_distinguishes_replacement_and_in_place_change() {
         old_pinned,
         client.pinned_executable_identity_sha256().unwrap()
     );
+}
+
+#[test]
+#[ignore = "requires explicit source-built Runner and provider; private offline helper execution"]
+fn age355_paired_process_helper_cache_admission_invalidation_and_receipt() {
+    let binary = std::env::var("AGE355_RUNNER_BINARY").expect("explicit source-built Runner");
+    let mut p = Paired::new();
+    // A persisted launch-model directory is not a page-read dependency. A
+    // non-directory here would fail the former global model collection load.
+    let unusable_models = p.f.root.path().join("launch-models-not-a-directory");
+    fs::write(&unusable_models, "not a model directory").unwrap();
+    p.f.db
+        .wake_sessions()
+        .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+            session_id: SESSION,
+            mode: "headless",
+            invocation_uuid: Some("native-invocation"),
+            provider_name: Some("account"),
+            model_name: Some("offline-paired"),
+            models_dir: unusable_models.to_str(),
+            effective_cwd: Some("/offline"),
+        })
+        .unwrap();
+    p.anchor_and_submit();
+    let root = p.f.root.path();
+    let config_home = root.join("helper-config");
+    let config = config_home.join("oulipoly-agent-runner");
+    fs::create_dir_all(&config).unwrap();
+    let discovered = profile(root);
+    let provider_config = format!(
+        "[account]\nsettings_id = {:?}\nimplementation = {{ family = {:?}, executable = {:?} }}\n",
+        discovered.settings_id,
+        discovered.family,
+        p.proxy.display().to_string()
+    );
+    fs::write(config.join("providers.toml"), &provider_config).unwrap();
+    let operations = root.join("inspection-operations");
+    fs::write(&operations, "").unwrap();
+    let start_helper = || {
+        let mut command = std::process::Command::new(&binary);
+        command
+            .arg(crate::native_receipt::helper::ARG)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.join("home"))
+            .env("OULIPOLY_DATA_DIR", root)
+            .env("OULIPOLY_CONFIG_HOME", &config_home)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("TMPDIR", root);
+        crate::native_receipt::helper::start_command(command).unwrap()
+    };
+    let first = start_helper();
+    let second = start_helper();
+    let count = |name: &str| {
+        fs::read_to_string(&operations)
+            .unwrap()
+            .lines()
+            .filter(|line| *line == name)
+            .count()
+    };
+    let wait = |condition: &dyn Fn() -> bool| {
+        let start = std::time::Instant::now();
+        while !condition() && start.elapsed() < Duration::from_secs(15) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            condition(),
+            "helper did not make expected progress; operations={}",
+            fs::read_to_string(&operations).unwrap()
+        );
+    };
+    wait(&|| count("session.read_turns") >= 3);
+    assert_eq!(
+        count("describe"),
+        1,
+        "unchanged ticks/competing observers must reuse preparation"
+    );
+    assert!(
+        p.f.db
+            .delivery_observation_confirmation(&p.f.attempt)
+            .unwrap()
+            .is_none()
+    );
+    // Identical bytes, different inode: force new describe and original-anchor
+    // requalification, never continue using the pinned prior endpoint.
+    fs::copy(&p.proxy, root.join("replacement.py")).unwrap();
+    fs::rename(root.join("replacement.py"), &p.proxy).unwrap();
+    wait(&|| count("describe") >= 2);
+    assert_eq!(count("describe"), 2);
+    // All parsed configuration inputs invalidate, not only the pathname.
+    fs::write(
+        config.join("providers.toml"),
+        format!("{provider_config}args = [\"config-revision\"]\n"),
+    )
+    .unwrap();
+    wait(&|| count("describe") >= 3);
+    assert_eq!(count("describe"), 3);
+    // This fixture requires provider-owned user provenance, not arbitrary role.
+    let record = json!({"timestamp":"2026-09-07T12:00:02Z","type":"response_item",
+        "payload":{"type":"message","role":"user", "internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]},
+        "content":[{"type":"input_text","text":p.f.envelope}]}});
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&p.transcript)
+            .unwrap(),
+        "{record}"
+    )
+    .unwrap();
+    wait(&|| {
+        p.f.db
+            .delivery_observation_confirmation(&p.f.attempt)
+            .unwrap()
+            .is_some()
+    });
+    drop(first);
+    drop(second);
+    assert_eq!(count("describe"), 3);
+    assert!(p.f.db.list_pending(SESSION).unwrap().is_empty());
+    p.assert_staging_untouched();
 }
