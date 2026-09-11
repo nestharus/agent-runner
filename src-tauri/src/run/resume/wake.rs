@@ -663,6 +663,24 @@ pub(super) fn settle_accepted_mailbox_delivery_and_recheck(
     Ok(())
 }
 
+fn committed_native_receipt(input: &ResumeAttemptInput<'_>) -> Result<bool, String> {
+    let Some(attempt_id) = input.mailbox_delivery_nonce else {
+        return Ok(false);
+    };
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
+        return Ok(false);
+    };
+    // Validate the complete session/chain/item authority even if projection is
+    // already settled. A confirmation from another attempt cannot be borrowed.
+    db.delivery_attempt_fully_settled(
+        attempt_id,
+        input.mailbox_session_id,
+        Some(&input.resolved.chain_id),
+        input.mailbox_delivery_seqs,
+    )?;
+    Ok(db.delivery_observation_confirmation(attempt_id)?.is_some())
+}
+
 pub(super) fn settle_clean_exit_mailbox_delivery_outcome(
     input: &ResumeAttemptInput<'_>,
     provider_session_id: &str,
@@ -671,6 +689,18 @@ pub(super) fn settle_clean_exit_mailbox_delivery_outcome(
     shell_exit_code: i32,
     outcome: MailboxDeliveryOutcome,
 ) -> Result<(), String> {
+    // Periodic observation can settle the exact receipt before terminal
+    // classification (AlreadySettled), or between classification and this
+    // boundary (Unconfirmed). It has the same delivery/follow-up authority as
+    // synchronous confirmation, never authority to turn a shell failure into
+    // successful assistant completion. Keep the shell result unchanged.
+    if matches!(outcome, MailboxDeliveryOutcome::AlreadySettled | MailboxDeliveryOutcome::Unconfirmed)
+        && committed_native_receipt(input)?
+    {
+        return settle_accepted_mailbox_delivery_and_recheck(
+            input, provider_session_id, invocation_uuid, physical_exit_code,
+        );
+    }
     match outcome {
         MailboxDeliveryOutcome::Absent | MailboxDeliveryOutcome::AlreadySettled => {
             mark_resume_attempt_idle(provider_session_id, invocation_uuid, Some(shell_exit_code))
