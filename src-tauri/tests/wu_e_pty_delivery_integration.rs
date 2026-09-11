@@ -2553,11 +2553,16 @@ fn observe_settlement_tree_cleanup(recorded: bool, panic_after_spawn: bool, held
     let fixture = Fixture::new();
     let script = fixture.dir.path().join("cleanup-provider.sh");
     let identity_path = fixture.dir.path().join("cleanup-provider.pid");
+    let eof_path = fixture.dir.path().join("cleanup-provider.eof");
     let mut lifetime = ProviderLifetime::new(fixture.dir.path());
     let barrier = if held_lifetime {
         lifetime.provider_loop()
     } else {
-        "IFS= read -r -t 30 line\nexit 91".to_owned()
+        format!(
+            "if IFS= read -r -t 30 line; then exit 91; else rc=$?; fi\n\
+             if [ \"$rc\" -eq 1 ]; then printf pty_eof > {}; exit 94; fi\nexit 95",
+            shell_single_quote(&path_string(&eof_path)),
+        )
     };
     // Only Bash builtins: no independent timer or unrelated process to kill.
     // read is a fixture barrier, not a successful lifetime-based assertion. Its
@@ -2611,29 +2616,60 @@ printf 'CLEANUP_PROVIDER_BLOCKED\n'
         .trim()
         .parse()
         .unwrap();
-    let identity = read_live_process_identity(provider_pid).unwrap().unwrap();
-    // An observer-owned fallback is not invoked until AFTER all death assertions;
-    // it cannot manufacture success for a leaking guard.
-    fallback.0 = Some(identity.clone());
+    let workload = read_live_process_identity(provider_pid).unwrap().unwrap();
+    let published_pid = unsafe { libc::getpgid(provider_pid as i32) };
+    assert!(published_pid > 0);
+    let published = read_live_process_identity(i64::from(published_pid))
+        .unwrap()
+        .unwrap();
+    let custodian_pid = cleanup_parent_pid(provider_pid);
+    let custodian = read_live_process_identity(custodian_pid).unwrap().unwrap();
+    // Validate roles independently: W belongs to P's group but is reaped by C.
+    // P remains the published identity; C must be outside that signal group.
+    fallback.0 = Some(published.clone());
+    assert_ne!(workload, published);
+    assert_ne!(custodian, published);
     assert_ne!(provider_pid, i64::from(runner_pid));
+    assert_eq!(cleanup_parent_pid(custodian_pid), i64::from(published_pid));
     assert_eq!(
-        unsafe { libc::getpgid(provider_pid as i32) },
-        provider_pid as i32
+        cleanup_parent_pid(i64::from(published_pid)),
+        i64::from(runner_pid)
     );
-    assert_eq!(unsafe { libc::kill(-(provider_pid as i32), 0) }, 0);
+    assert_eq!(
+        unsafe { libc::getpgid(custodian_pid as i32) },
+        custodian_pid as i32
+    );
+    assert_eq!(unsafe { libc::kill(-published_pid, 0) }, 0);
+    let owned = cleanup_descendants(i64::from(runner_pid));
+    for identity in [&workload, &published, &custodian] {
+        assert!(owned.contains(identity), "missing owned role: {identity:?}");
+    }
     assert!(guard.child.try_wait().unwrap().is_none());
+    let invocation = wait_for_running_invocation(&fixture);
+    let stored = wait_for_child_identity(&fixture, &invocation);
+    assert_eq!(stored, published);
+    let generation: String = Connection::open_with_flags(
+        fixture.sidecar_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT generation_uuid FROM runtime_generation WHERE spawn_invocation_uuid = ?1",
+        [&invocation],
+        |row| row.get(0),
+    )
+    .unwrap();
+    let proof = oulipoly_core::launch_custody::proof_path(&fixture.sidecar_path(), &generation);
+    assert!(!oulipoly_core::launch_custody::is_quiescent(&proof));
     if recorded {
-        let invocation = wait_for_running_invocation(&fixture);
-        let stored = wait_for_child_identity(&fixture, &invocation);
-        assert_eq!(stored, identity);
         guard.provider = Some(stored);
     } else {
-        // Provider is demonstrably live, but the guard has not learned its PID.
-        // Only PTY closure can terminate it in this case.
+        // The observer knows P; the guard deliberately does not. Only PTY
+        // closure can terminate W here, not observer fallback signaling.
         assert!(guard.provider.is_none());
     }
     eprintln!(
-        "cleanup before: lifetime_outstanding={held_lifetime} recorded={recorded} panic={panic_after_spawn} runner={runner_identity:?} provider={identity:?} group_live=true"
+        "cleanup before: lifetime_outstanding={held_lifetime} recorded={recorded} panic={panic_after_spawn} runner={runner_identity:?} published={published:?} workload={workload:?} custodian={custodian:?} owned={owned:?} group_live=true"
     );
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let mut guard = guard;
@@ -2663,51 +2699,143 @@ printf 'CLEANUP_PROVIDER_BLOCKED\n'
             .unwrap()
             .is_none()
     );
-    // Subreaper custody is observation only: no signal before this wait. A live
-    // provider yields zero until the deadline and fails, even if runner was reaped.
+    // C can still own W after R has gone: ECHILD here is NOT cessation.
+    // Observe every snapshotted descendant (including M), consume only adopted
+    // exact children, and require their absence AND the independent monitor Q.
+    // No observer signal is sent to produce this evidence.
     let deadline = Instant::now() + Duration::from_secs(5);
-    let provider_status = loop {
-        let waited = unsafe { libc::waitpid(provider_pid as i32, &mut status, libc::WNOHANG) };
-        if waited == provider_pid as i32 {
-            break Some(status);
+    let mut observed_statuses = Vec::new();
+    loop {
+        let mut survivors = Vec::new();
+        for identity in &owned {
+            if read_live_process_identity(identity.os_pid)
+                .unwrap()
+                .as_ref()
+                != Some(identity)
+            {
+                continue;
+            }
+            let mut status = 0;
+            let waited =
+                unsafe { libc::waitpid(identity.os_pid as i32, &mut status, libc::WNOHANG) };
+            if waited == identity.os_pid as i32 {
+                observed_statuses.push((identity.os_pid, status));
+            } else if waited == -1 {
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+            } else {
+                assert_eq!(waited, 0);
+            }
+            if read_live_process_identity(identity.os_pid)
+                .unwrap()
+                .as_ref()
+                == Some(identity)
+            {
+                survivors.push(identity);
+            }
         }
-        if waited == -1 {
-            assert_eq!(
-                io::Error::last_os_error().raw_os_error(),
-                Some(libc::ECHILD)
-            );
-            // The runner may win the reap race before its own SIGKILL. Absence
-            // checks below still independently prove provider/group termination.
-            break None;
+        if survivors.is_empty() && oulipoly_core::launch_custody::is_quiescent(&proof) {
+            break;
         }
-        assert_eq!(waited, 0);
         assert!(
             Instant::now() < deadline,
-            "runner reaped but provider survived: {identity:?}"
+            "cleanup incomplete: survivors={survivors:?} Q={}",
+            oulipoly_core::launch_custody::is_quiescent(&proof)
         );
         thread::sleep(Duration::from_millis(10));
-    };
-    if let Some(status) = provider_status {
-        assert!(
-            libc::WIFSIGNALED(status),
-            "provider exited without cleanup signal: {status}"
-        );
-        assert_eq!(
-            libc::WTERMSIG(status),
-            if recorded {
-                libc::SIGKILL
+    }
+    // If adopted, P transports W's HUP status in the unrecorded arm; recorded
+    // group escalation kills P. C, when adopted, must have completed its reap.
+    for (pid, status) in &observed_statuses {
+        if *pid == provider_pid || *pid == i64::from(published_pid) {
+            if !recorded && !held_lifetime && libc::WIFEXITED(*status) {
+                // Closing the terminal can wake read(2) with EOF before HUP is
+                // handled. This dedicated EOF exit is not the timeout (95),
+                // input (91), arbitrary failure (1), or a mere trap marker.
+                assert_eq!(libc::WEXITSTATUS(*status), 94);
+                assert_eq!(fs::read_to_string(&eof_path).unwrap(), "pty_eof");
             } else {
-                libc::SIGHUP
+                assert!(
+                    libc::WIFSIGNALED(*status),
+                    "unexpected root status: {status}"
+                );
+                assert_eq!(
+                    libc::WTERMSIG(*status),
+                    if recorded {
+                        libc::SIGKILL
+                    } else {
+                        libc::SIGHUP
+                    }
+                );
             }
-        );
+        }
+        if *pid == custodian_pid {
+            assert!(libc::WIFEXITED(*status));
+            assert_eq!(libc::WEXITSTATUS(*status), 0);
+        }
     }
     assert!(read_live_process_identity(provider_pid).unwrap().is_none());
-    assert_eq!(unsafe { libc::kill(-(provider_pid as i32), 0) }, -1);
+    assert!(read_live_process_identity(custodian_pid).unwrap().is_none());
+    assert!(
+        read_live_process_identity(i64::from(published_pid))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(unsafe { libc::kill(-published_pid, 0) }, -1);
     assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     eprintln!(
-        "cleanup after: lifetime_outstanding={held_lifetime} recorded={recorded} panic={panic_after_spawn} runner_reaped=ECHILD provider={provider_pid} observer_wait_status={provider_status:?} group_absent=ESRCH"
+        "cleanup after: lifetime_outstanding={held_lifetime} recorded={recorded} panic={panic_after_spawn} runner_reaped=ECHILD published={published_pid} workload={provider_pid} custodian={custodian_pid} observer_wait_statuses={observed_statuses:?} owned_survivors=0 Q=true group_absent=ESRCH"
     );
     fixture.assert_default_user_paths_untouched();
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_parent_pid(pid: i64) -> i64 {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    stat.rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_descendants(runner: i64) -> Vec<ProcessIdentity> {
+    let processes = fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| {
+            let pid = entry.ok()?.file_name().to_str()?.parse::<i64>().ok()?;
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let parent = stat
+                .rsplit_once(") ")?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse::<i64>()
+                .ok()?;
+            let identity = read_live_process_identity(pid).ok()??;
+            Some((parent, identity))
+        })
+        .collect::<Vec<_>>();
+    let mut owned = Vec::<ProcessIdentity>::new();
+    loop {
+        let before = owned.len();
+        for (parent, identity) in &processes {
+            if (*parent == runner || owned.iter().any(|owner| owner.os_pid == *parent))
+                && !owned.contains(identity)
+            {
+                owned.push(identity.clone());
+            }
+        }
+        if owned.len() == before {
+            return owned;
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

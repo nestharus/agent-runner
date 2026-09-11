@@ -709,7 +709,23 @@ label=manual
 if [ "$index" -gt 1 ]; then
   label=$((index - 1))
 fi
-wake_pid="$(awk '{{print $4}}' "/proc/$PPID/stat")"
+# Join this provider invocation to the generation creator, not a fixed
+# ancestor depth (published proxy and custodian are not wake runners).
+wake_pid="$(python3 - <<'PYOWNER'
+import json, os, pathlib, sqlite3
+invocation = json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"]
+path = pathlib.Path(os.environ["OULIPOLY_DATA_DIR"]) / "pid-identity.db"
+with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+    rows = db.execute("SELECT creator_identity_os_pid, creator_identity_os_boot_id, creator_identity_os_pid_starttime_ticks FROM runtime_generation WHERE spawn_invocation_uuid = ?", (invocation,)).fetchall()
+assert len(rows) == 1, rows
+pid, boot, start = rows[0]
+assert pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip() == boot
+stat = pathlib.Path(f"/proc/{{pid}}/stat").read_text().rsplit(") ", 1)[1].split()
+assert int(stat[19]) == start
+assert os.path.samefile(f"/proc/{{pid}}/exe", os.environ["AGENT_BASH_AGENT_RUNNER_BIN"])
+print(pid)
+PYOWNER
+)" || exit 92
 printf '%s|%s\n' "$label" "$wake_pid" >> {ledger}
 if [ "$index" = 2 ]; then
   printf '%s' "$wake_pid" > {count1_pid}
@@ -771,6 +787,10 @@ fi"#,
     assert!(!claim.claim_token.is_empty());
     assert_eq!(claim.wake_pid, Some(renewed_pid));
     assert_eq!(claim.auto_wake_count, 2);
+    eprintln!(
+        "renewed claim: old_runner={old_pid} old_start={old_start} identity_gone=true renewed_runner={renewed_pid} claim_pid={:?} auto_wake_count=2",
+        claim.wake_pid
+    );
     assert_eq!(invocation_count(&fixture), 3);
     let ledger_lines = std::fs::read_to_string(&ledger)
         .unwrap()
@@ -837,6 +857,9 @@ fi"#,
         assert_age270_invocation(&fixture, id);
     }
     assert_eq!(invocation_count(&fixture), 3);
+    eprintln!(
+        "renewed settlement: rows=45 batches=20/20/5 delivery_attempts=1 errors=0 pending=0 claim=none invocations=3"
+    );
 }
 
 fn invocation_count(fixture: &Fixture) -> i64 {
