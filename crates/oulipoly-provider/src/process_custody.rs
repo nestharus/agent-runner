@@ -715,3 +715,99 @@ mod supervisor_identity_tests {
         unavailable_identity_terminal(false, true, true);
     }
 }
+
+// Native diagnostic fixtures, not a relaxation of check_signal_group or a
+// provider-tree completion contract. Each child here executes no descendants.
+#[cfg(all(test, target_os = "macos"))]
+mod native_group_diagnostic_tests {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            // Exact retained direct child only; never a discovered PID sweep.
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn group_signal(pid: u32, signal: i32) -> (i32, Option<i32>) {
+        let rc = unsafe { libc::kill(-(pid as i32), signal) };
+        let errno = (rc != 0)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten();
+        (rc, errno)
+    }
+
+    #[test]
+    fn retained_native_group_zombie_and_live_controls() {
+        for exited in [true, false] {
+            let mut command = if exited {
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", "exit 0"]);
+                command
+            } else {
+                let mut command = Command::new("/bin/sleep");
+                command.arg("2");
+                command
+            };
+            let mut child = OwnedChild(command.env_clear().process_group(0).spawn().unwrap());
+            let pid = child.0.id();
+            let started = Instant::now();
+            if exited {
+                loop {
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    let rc = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            pid,
+                            &mut info,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        )
+                    };
+                    assert_eq!(
+                        rc,
+                        0,
+                        "native retained wait: {:?}",
+                        std::io::Error::last_os_error()
+                    );
+                    if unsafe { info.si_pid() } == pid as i32 {
+                        break;
+                    }
+                    assert!(started.elapsed() < Duration::from_secs(2));
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            let state = Command::new("/bin/ps")
+                .args([
+                    "-p",
+                    &pid.to_string(),
+                    "-o",
+                    "pid,ppid,pgid,state,lstart,comm",
+                ])
+                .env_clear()
+                .output()
+                .unwrap();
+            let probe = group_signal(pid, 0);
+            let kill = group_signal(pid, libc::SIGKILL);
+            let status = child.0.wait().unwrap();
+            let after = group_signal(pid, 0);
+            eprintln!(
+                "native-group no-descendant-fixture exited={exited} retained_child={pid} ps={} probe={probe:?} kill={kill:?} collected={status:?} after_collection={after:?}",
+                String::from_utf8_lossy(&state.stdout)
+            );
+            if exited {
+                assert!(status.success());
+                // EPERM and success are observations, not a product permission
+                // exemption. An unexpected errno still remains a fixture failure.
+                assert!(kill == (0, None) || kill == (-1, Some(libc::EPERM)));
+            } else {
+                assert_eq!(kill, (0, None));
+                assert_eq!(status.signal(), Some(libc::SIGKILL));
+            }
+        }
+    }
+}
+

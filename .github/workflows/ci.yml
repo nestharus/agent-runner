@@ -152,7 +152,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - timeout-minutes: 30
+      - if: ${{ !cancelled() && runner.os == 'macOS' }}
+        name: Native retained group diagnostics (no settlement exemption)
+        timeout-minutes: 10
+        run: cargo test -p oulipoly-provider --lib native_group_diagnostic_tests -- --nocapture
+      - if: ${{ !cancelled() }}
+        timeout-minutes: 30
         run: cargo test -p oulipoly-agent-runner --test age330_native_delivery_domain -- --nocapture
       - if: ${{ !cancelled() }}
         timeout-minutes: 10
