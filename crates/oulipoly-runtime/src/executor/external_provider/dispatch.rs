@@ -49,7 +49,6 @@ use crate::session_authority::{
 };
 use oulipoly_provider::client::ProcessSpawnObserver;
 use oulipoly_provider::error::ProviderClientError;
-use oulipoly_provider::generated::ProcessStatus;
 use oulipoly_provider::stream::{DecodedLaunchEvent, LaunchEventObserver, LaunchResult};
 use std::sync::{Arc, Mutex};
 
@@ -384,6 +383,25 @@ fn attempt_account_dispatch_with_custody(
                 "runtime_generation_bind_failed",
             )));
         }
+    }
+    // Classification is provider work in this same still-open generation. Its
+    // process and descendants must be accounted for before seal/quiescence,
+    // including when classification fails. Never reopen custody for diagnostics.
+    let classification =
+        classify_after_launch_success(registry, &client, describe, context, &launch_result);
+    let result = map_launch_result_with_terminal_classification(
+        launch_result,
+        context.provider_index,
+        classification,
+        launch_prompt_acceptance_v1_enabled,
+        LaunchOutputArtifacts {
+            spool: output_spool,
+            returned_artifacts,
+        },
+        &session_authority,
+    );
+
+    if spawn_identity.is_some() {
         let attachment = backfill_external_launch_session_id(
             spawn_identity.as_ref(),
             &recorded_generation,
@@ -392,11 +410,13 @@ fn attempt_account_dispatch_with_custody(
         let failure = match attachment {
             Err(error) => Some(("runtime_generation_attach_failed", error)),
             Ok(_) => {
-                let exit_code = launch_exit_code(&launch_result.exit.status);
+                // Like headless CLI supervision, settle both generation and
+                // compatibility projection with the classified work outcome,
+                // not the launch exit status that classification superseded.
                 mark_runtime_generation_orderly_completed(
                     spawn_identity.as_ref(),
-                    exit_code,
-                    exit_code,
+                    Some(result.exit_code),
+                    Some(result.exit_code),
                 )
                 .err()
                 .map(|error| ("runtime_generation_exit_failed", error))
@@ -405,17 +425,6 @@ fn attempt_account_dispatch_with_custody(
         if let Some((stage, error)) = failure {
             let cleanup =
                 finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
-            let result = map_launch_result_with_terminal_classification(
-                launch_result,
-                context.provider_index,
-                None,
-                launch_prompt_acceptance_v1_enabled,
-                LaunchOutputArtifacts {
-                    spool: output_spool,
-                    returned_artifacts,
-                },
-                &session_authority,
-            );
             return Ok(failed_finalization_result(
                 result,
                 verified_session.as_ref(),
@@ -426,27 +435,7 @@ fn attempt_account_dispatch_with_custody(
         }
     }
 
-    let classification =
-        classify_after_launch_success(registry, &client, describe, context, &launch_result);
-
-    Ok(map_launch_result_with_terminal_classification(
-        launch_result,
-        context.provider_index,
-        classification,
-        launch_prompt_acceptance_v1_enabled,
-        LaunchOutputArtifacts {
-            spool: output_spool,
-            returned_artifacts,
-        },
-        &session_authority,
-    ))
-}
-
-fn launch_exit_code(status: &ProcessStatus) -> Option<i32> {
-    match status {
-        ProcessStatus::Exited { code } => Some(*code),
-        _ => None,
-    }
+    Ok(result)
 }
 
 fn external_launch_spawn_identity_context(
@@ -683,6 +672,7 @@ fn verify_optional_failure_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oulipoly_provider::generated::ProcessStatus;
 
     fn sealed_fixture_output() -> ExecutionOutputSpool {
         use oulipoly_provider::generated::{LAUNCH_OUTPUT_COMPLETE_MARKER_V1, LAUNCH_OUTPUT_V1};
