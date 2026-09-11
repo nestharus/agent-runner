@@ -476,6 +476,15 @@ fn make_external_fixture(
     policy_mode: PolicyMode,
     launch_mode: LaunchMode,
 ) -> ExternalFixture {
+    make_external_fixture_with_custody(capabilities, policy_mode, launch_mode, None)
+}
+
+fn make_external_fixture_with_custody(
+    capabilities: Capabilities,
+    policy_mode: PolicyMode,
+    launch_mode: LaunchMode,
+    custody: Option<(&Path, &Path)>,
+) -> ExternalFixture {
     ensure_test_data_dir();
     let dir = tempfile::tempdir().expect("tempdir");
     let order_path = dir.path().join("order.txt");
@@ -504,7 +513,8 @@ fn make_external_fixture(
             &process_env_record_path,
             &policy_record_path,
             &launch_record_path,
-        ),
+        )
+        .replace("CUSTODY = None", &fixture_custody_binding(custody)),
     );
 
     ExternalFixture {
@@ -586,6 +596,16 @@ fn disable_launch_output_capability(fixture: &ExternalFixture) {
         fs::read_to_string(&fixture.provider_path).expect("provider source")
     );
     write_executable(&fixture.provider_path, &body);
+}
+
+fn fixture_custody_binding(custody: Option<(&Path, &Path)>) -> String {
+    let value = custody.map_or_else(
+        || "None".to_string(),
+        |(pid, ready)| {
+            serde_json::json!({"pid": pid, "ready": ready, "host": std::process::id()}).to_string()
+        },
+    );
+    format!("CUSTODY = {value}")
 }
 
 fn shell_quote(path: &Path) -> String {
@@ -676,8 +696,10 @@ CAP_LAUNCH = {cap_launch}
 POLICY_MODE = {policy_mode}
 LAUNCH_MODE = {launch_mode}
 
-PID_FILE = os.environ.get("OULIPOLY_CHILD_PID_FILE")
-READY_FILE = os.environ.get("OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE")
+# Marker authority is embedded only in the selected fixture, never inherited.
+CUSTODY = None
+PID_FILE = CUSTODY["pid"] if CUSTODY else None
+READY_FILE = CUSTODY["ready"] if CUSTODY else None
 SUBCOMMAND = sys.argv[1] if len(sys.argv) > 1 else ""
 RUNNER_PRIVATE_ENV_NAMES = {runner_private_env_names}
 with PROCESS_ENV_RECORD.open("a") as stream:
@@ -686,16 +708,25 @@ with PROCESS_ENV_RECORD.open("a") as stream:
         "env": {{name: os.environ[name] for name in RUNNER_PRIVATE_ENV_NAMES if name in os.environ}},
     }}, sort_keys=True) + "\n")
 if PID_FILE and READY_FILE and SUBCOMMAND == "launch":
-    pathlib.Path(PID_FILE).write_text(str(os.getpid()))
-    # AGE354 publishes the owned status proxy, not this executable. Capture
-    # our live custodian's parent before readiness lets the host kill the group.
-    parent_stat = pathlib.Path("/proc/" + str(os.getppid()) + "/stat").read_text()
-    proxy_pid = parent_stat.rsplit(") ", 1)[1].split()[1]
-    pathlib.Path(PID_FILE + ".proxy").write_text(proxy_pid)
-    pathlib.Path(PID_FILE + ".custodian").write_text(str(os.getppid()))
+    # Linux custody explicitly places W in published P's group, with C outside
+    # that group (launch_custody::configure_with_transition). Validate the whole
+    # owned topology against this harness; arbitrary ancestors are not actors.
+    proxy_pid = os.getpgrp()
+    custodian_pid = os.getppid()
     identities = {{}}
-    for role, pid in [("W", os.getpid()), ("C", os.getppid()), ("P", int(proxy_pid))]:
+    for role, pid in [("W", os.getpid()), ("C", custodian_pid), ("P", proxy_pid)]:
         identities[role] = pathlib.Path("/proc/" + str(pid) + "/stat").read_text()
+    fields = {{role: stat.rsplit(") ", 1)[1].split() for role, stat in identities.items()}}
+    assert len({{os.getpid(), custodian_pid, proxy_pid, CUSTODY["host"]}}) == 4
+    assert int(fields["W"][1]) == custodian_pid
+    assert int(fields["W"][2]) == proxy_pid
+    assert int(fields["C"][1]) == proxy_pid
+    assert int(fields["C"][2]) != proxy_pid
+    assert int(fields["P"][1]) == CUSTODY["host"]
+    assert int(fields["P"][2]) == proxy_pid
+    pathlib.Path(PID_FILE).write_text(str(os.getpid()))
+    pathlib.Path(PID_FILE + ".proxy").write_text(str(proxy_pid))
+    pathlib.Path(PID_FILE + ".custodian").write_text(str(custodian_pid))
     pathlib.Path(PID_FILE + ".identities").write_text(json.dumps(identities))
     pathlib.Path(READY_FILE).touch()
 
@@ -1504,6 +1535,55 @@ fn assert_no_arg_mode_stdin(launch: &Value) {
 }
 
 #[test]
+fn unrelated_fixture_cannot_publish_or_clear_custody_markers_from_ambient_env() {
+    let _lock = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let pid = dir.path().join("selected.pid");
+    let ready = dir.path().join("selected.ready");
+    let pid_text = pid.to_string_lossy();
+    let ready_text = ready.to_string_lossy();
+    let _env = EnvScope::set_optional(&[
+        (CHILD_PID_FILE_ENV, Some(&pid_text)),
+        (CHILD_CUSTODY_READY_FILE_ENV, Some(&ready_text)),
+        (CHILD_CUSTODY_FAULT_ENV, None),
+    ]);
+    for existing in [false, true] {
+        if existing {
+            fs::write(&pid, "selected workload identity").unwrap();
+            fs::write(&ready, "selected readiness").unwrap();
+        }
+        let unrelated = make_external_fixture(
+            Capabilities {
+                policy: true,
+                launch: true,
+            },
+            PolicyMode::Accept,
+            LaunchMode::Success,
+        );
+        execute_external_fixture(&unrelated).expect("unrelated direct launch completes");
+        if existing {
+            assert_eq!(
+                fs::read_to_string(&pid).unwrap(),
+                "selected workload identity"
+            );
+            assert_eq!(fs::read_to_string(&ready).unwrap(), "selected readiness");
+        } else {
+            assert!(
+                !pid.exists(),
+                "unrelated launch must not publish selected W"
+            );
+            assert!(
+                !ready.exists(),
+                "unrelated launch must not release selected gate"
+            );
+        }
+        for suffix in ["proxy", "custodian", "identities"] {
+            assert!(!PathBuf::from(format!("{}.{}", pid.display(), suffix)).exists());
+        }
+    }
+}
+
+#[test]
 fn external_provider_post_spawn_failures_reap_before_fenced_generation_exit() {
     let _lock = env_lock();
     for (fault, invocation_uuid, terminal_reason, expect_bound_pid) in [
@@ -1533,21 +1613,20 @@ fn external_provider_success_reaps_and_completes_the_exact_generation_orderly() 
     let pid_path = dir.path().join("provider.pid");
     let ready_path = dir.path().join("provider.ready");
     let data_dir_text = data_dir.to_string_lossy().into_owned();
-    let pid_path_text = pid_path.to_string_lossy().into_owned();
     let ready_path_text = ready_path.to_string_lossy().into_owned();
     let _env = EnvScope::set_optional(&[
         ("OULIPOLY_DATA_DIR", Some(&data_dir_text)),
         (CHILD_CUSTODY_FAULT_ENV, None),
         (CHILD_CUSTODY_READY_FILE_ENV, Some(&ready_path_text)),
-        (CHILD_PID_FILE_ENV, Some(&pid_path_text)),
     ]);
-    let fixture = make_external_fixture(
+    let fixture = make_external_fixture_with_custody(
         Capabilities {
             policy: true,
             launch: true,
         },
         PolicyMode::Accept,
         LaunchMode::Success,
+        Some((&pid_path, &ready_path)),
     );
     let invocation_uuid = "74747474-7474-4474-8474-747474747474";
     let invocation = serde_json::to_string(&oulipoly_state::CompositeInvocationId {
@@ -1566,7 +1645,7 @@ fn external_provider_success_reaps_and_completes_the_exact_generation_orderly() 
         .expect("numeric provider pid");
     assert_external_child_reaped(pid);
     let proxy: libc::pid_t = fs::read_to_string(format!("{}.proxy", pid_path.display()))
-        .expect("live proxy ancestry recorded before host cleanup").trim().parse().unwrap();
+        .expect("validated custody group leader recorded before host cleanup").trim().parse().unwrap();
     assert_ne!(pid, proxy);
     assert_external_child_reaped(proxy);
     assert_external_terminal_generation(
@@ -1589,21 +1668,20 @@ fn run_external_child_custody_fault(
     let pid_path = dir.path().join("provider.pid");
     let ready_path = dir.path().join("provider.ready");
     let data_dir_text = data_dir.to_string_lossy().into_owned();
-    let pid_path_text = pid_path.to_string_lossy().into_owned();
     let ready_path_text = ready_path.to_string_lossy().into_owned();
     let _env = EnvScope::set(&[
         ("OULIPOLY_DATA_DIR", &data_dir_text),
         (CHILD_CUSTODY_FAULT_ENV, fault),
         (CHILD_CUSTODY_READY_FILE_ENV, &ready_path_text),
-        (CHILD_PID_FILE_ENV, &pid_path_text),
     ]);
-    let fixture = make_external_fixture(
+    let fixture = make_external_fixture_with_custody(
         Capabilities {
             policy: true,
             launch: true,
         },
         PolicyMode::Accept,
         LaunchMode::Success,
+        Some((&pid_path, &ready_path)),
     );
     let invocation = serde_json::to_string(&oulipoly_state::CompositeInvocationId {
         source: "external-custody-test".to_string(),
@@ -1620,7 +1698,7 @@ fn run_external_child_custody_fault(
         .parse::<libc::pid_t>()
         .expect("numeric provider pid");
     let proxy: libc::pid_t = fs::read_to_string(format!("{}.proxy", pid_path.display()))
-        .expect("live proxy ancestry recorded before host cleanup").trim().parse().unwrap();
+        .expect("validated custody group leader recorded before host cleanup").trim().parse().unwrap();
     let custodian: libc::pid_t = fs::read_to_string(format!("{}.custodian", pid_path.display()))
         .unwrap().trim().parse().unwrap();
     diagnose_external_custody_return(&data_dir, &pid_path, invocation_uuid, fault, pid, proxy, custodian);
@@ -1649,7 +1727,7 @@ fn diagnose_external_custody_return(
     let start = std::time::Instant::now();
     let immediate = [workload, proxy].map(|pid| {
         let rc = unsafe { libc::kill(pid, 0) };
-        (rc, io::Error::last_os_error().raw_os_error())
+        (rc, (rc == -1).then(|| io::Error::last_os_error().raw_os_error()).flatten())
     });
     let identities = fs::read_to_string(format!("{}.identities", pid_path.display())).unwrap();
     eprintln!("custody fault={fault} invocation={invocation} captured identities={identities}");
@@ -1735,6 +1813,20 @@ fn assert_external_terminal_generation(
     assert_eq!(exited, 1);
     assert_eq!(reason, terminal_reason);
     assert_eq!(spawned_pid, expected_pid);
+    let generation: String = connection
+        .query_row(
+            "SELECT generation_uuid FROM runtime_generation WHERE spawn_invocation_uuid=?1",
+            [invocation_uuid],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        oulipoly_core::launch_custody::is_quiescent(&oulipoly_core::launch_custody::proof_path(
+            &data_dir.join("pid-identity.db"),
+            &generation,
+        ),),
+        "terminal fixture generation must have its own Q: {generation}"
+    );
 }
 
 #[test]
@@ -2820,21 +2912,20 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
     let pid_path = dir.path().join("provider.pid");
     let ready_path = dir.path().join("provider.ready");
     let data_text = data_dir.to_string_lossy();
-    let pid_text = pid_path.to_string_lossy();
     let ready_text = ready_path.to_string_lossy();
     let _env = EnvScope::set_optional(&[
         ("OULIPOLY_DATA_DIR", Some(&data_text)),
         (CHILD_CUSTODY_FAULT_ENV, None),
         (CHILD_CUSTODY_READY_FILE_ENV, Some(&ready_text)),
-        (CHILD_PID_FILE_ENV, Some(&pid_text)),
     ]);
-    let fixture = make_external_fixture(
+    let fixture = make_external_fixture_with_custody(
         Capabilities {
             policy: true,
             launch: true,
         },
         PolicyMode::Accept,
         LaunchMode::LiveAttachmentStorageFailure,
+        Some((&pid_path, &ready_path)),
     );
     let uuid = "76767676-7676-4676-8676-767676767676";
     // Initialize only this temporary fixture store using the owner's unchanged schema
