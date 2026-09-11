@@ -276,6 +276,16 @@ impl Fixture {
                 },
             )
             .unwrap();
+        // The persisted user turn represents a crash after semantic submission,
+        // not a preparation that is still proven safe to replace.
+        mailbox
+            .begin_headless_delivery_submission(
+                &attempt_id,
+                SESSION,
+                "age309-crashed-invocation",
+                true,
+            )
+            .unwrap();
     }
 }
 
