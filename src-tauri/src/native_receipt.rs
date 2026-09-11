@@ -427,7 +427,7 @@ pub(crate) fn poll_headless_receipt_tick_with<
             let state = oulipoly_state::StateDb::open_read_only(
                 &oulipoly_state::StateDb::default_path()?,
             )
-            .map_err(|error| format!("receipt cwd recovery: {error}"))?;
+            .map_err(|error| format!("receipt cwd recovery: {error:?}"))?;
             let Some(cwd) = recover_observation_cwd(&state, &anchor)? else {
                 return Ok(());
             };
