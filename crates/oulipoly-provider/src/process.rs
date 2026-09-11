@@ -1860,6 +1860,10 @@ pub(crate) fn is_executable(path: &Path) -> bool {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "process/generation_wait_tests.rs"]
+mod generation_wait_tests;
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_vendor = "apple")]
