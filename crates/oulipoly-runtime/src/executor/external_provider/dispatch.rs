@@ -96,6 +96,29 @@ pub(super) fn attempt_account_dispatch(
     registry: &ProviderRegistry,
     context: &ExternalProviderDispatchContext,
 ) -> Result<ExecutionResult, AccountAttemptError> {
+    // Cover describe/policy as well as launch, including allocated attempts
+    // whose Starting registration precedes registry preflight.
+    let custody_identity = external_launch_spawn_identity_context(context);
+    if context.attempt.is_none() {
+        register_runtime_generation_starting(custody_identity.as_ref()).map_err(|_| {
+            terminal_attempt_error(protocol_service_error("runtime_generation_registration_failed"))
+        })?;
+    }
+    let _custody_scope = crate::executor::cli::spawn_identity::launch_custody_scope(custody_identity.as_ref());
+    let result = attempt_account_dispatch_with_custody(registry, context, custody_identity.clone());
+    if result.is_err() && context.attempt.is_none() {
+        // Preflight/policy now run under Starting too. A failed standalone
+        // attempt must revoke its authority before a candidate rotation.
+        let _ = crate::executor::cli::spawn_identity::mark_runtime_generation_spawn_failed(custody_identity.as_ref());
+    }
+    result
+}
+
+fn attempt_account_dispatch_with_custody(
+    registry: &ProviderRegistry,
+    context: &ExternalProviderDispatchContext,
+    custody_identity: Option<SpawnIdentityContext>,
+) -> Result<ExecutionResult, AccountAttemptError> {
     let endpoint = registry
         .preflight_account_with_custody(
             &context.provider.name,
@@ -143,7 +166,7 @@ pub(super) fn attempt_account_dispatch(
             .unwrap_or_else(|e| e.into_inner())
             .output = Some(output_spool.clone());
     }
-    let spawn_identity = external_launch_spawn_identity_context(context);
+    let spawn_identity = custody_identity;
     let recorded_generation = recorded_launch_generation();
     let spawn_observer =
         external_launch_spawn_observer(spawn_identity.as_ref(), Arc::clone(&recorded_generation));
@@ -236,13 +259,6 @@ pub(super) fn attempt_account_dispatch(
             .get("params")
             .and_then(|p| p.get("prompt_acceptance"))
             .and_then(|p| serde_json::from_value(p.clone()).ok());
-    }
-    if context.attempt.is_none() {
-        register_runtime_generation_starting(spawn_identity.as_ref()).map_err(|_| {
-            terminal_attempt_error(protocol_service_error(
-                "runtime_generation_registration_failed",
-            ))
-        })?;
     }
     let standalone_channel = if let Some(attempt) = &context.attempt {
         attempt

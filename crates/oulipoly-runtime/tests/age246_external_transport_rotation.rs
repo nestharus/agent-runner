@@ -104,6 +104,7 @@ fn fake_provider_body(
     format!(
         r#"#!/usr/bin/env python3
 import json
+import os
 import pathlib
 import sys
 import time
@@ -149,7 +150,21 @@ def settings_id(request):
     return (request.get("params") or {{}}).get("settings_id")
 
 
+def custody_gate(operation):
+    root = os.environ.get("AGE354_HELPER_ROOT")
+    if not root or os.environ.get("AGE354_HELPER_PHASE") != operation:
+        return
+    root = pathlib.Path(root)
+    (root / "helper-ready").write_text(str(os.getpid()))
+    deadline = time.monotonic() + 6
+    while not (root / "release-helper").exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("private helper crash barrier expired")
+        time.sleep(0.005)
+
+
 def describe(request):
+    custody_gate("describe")
     response(request, {{
         "provider_id": "fake-provider",
         "display_name": "Fake Provider",
@@ -173,6 +188,7 @@ def describe(request):
 
 
 def policy(request):
+    custody_gate("policy")
     sid = settings_id(request)
     append_order("policy:" + str(sid))
     if sid in SLOW:
@@ -1180,4 +1196,83 @@ fn allocated_verified_missing_final_retention_failure_is_explicit() {
 #[test]
 fn allocated_verified_complete_output_remains_complete() {
     verified_missing_final_output(true, true, false);
+}
+
+
+#[cfg(target_os = "linux")]
+#[test]
+fn age354_allocated_helper_creator_fixture() {
+    let Some(root) = std::env::var_os("AGE354_HELPER_ROOT").map(PathBuf::from) else { return; };
+    let fixture = make_fixture(&[], &[]);
+    let model = rotation_model(&fixture, &["fast-1"]);
+    let registry = registry_with_client_options(&model, &fixture,
+        ProviderClientOptions::default().with_timeout(Duration::from_secs(10)));
+    let allocation = allocated_input(&fixture, &model, true);
+    fs::write(root.join("allocation.json"), serde_json::to_vec(&serde_json::json!({
+        "mailbox": allocation.mailbox_db_path,
+        "generation": allocation.lease.runtime_generation_uuid.to_string(),
+    })).unwrap()).unwrap();
+    let _ = executor::execute_allocated_provider_attempt(&registry, allocated_request(model), allocation);
+    panic!("private helper creator was not crashed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn age354_allocated_describe_and_policy_crashes_retain_unpublished_helper_custody() {
+    use oulipoly_state::{mailbox::*, pid_identity};
+    use std::process::{Child, Command, Stdio};
+    use std::time::Instant;
+    struct Creator(Child);
+    impl Drop for Creator {
+        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+    }
+    fn eventually(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "private allocated-helper deadline");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    for phase in ["describe", "policy"] {
+        let root = tempfile::Builder::new().prefix("age354-helper-").tempdir_in("/tmp").unwrap();
+        for dir in ["home", "config", "data", "tmp"] { fs::create_dir(root.path().join(dir)).unwrap(); }
+        let mut creator = Creator(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "age354_allocated_helper_creator_fixture"])
+            .env_clear().env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path().join("home")).env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data")).env("TMPDIR", root.path().join("tmp"))
+            .env("AGE354_HELPER_ROOT", root.path()).env("AGE354_HELPER_PHASE", phase)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        eventually(|| root.path().join("helper-ready").exists());
+        let helper_pid: i64 = fs::read_to_string(root.path().join("helper-ready")).unwrap().parse().unwrap();
+        let allocation: serde_json::Value = serde_json::from_slice(&fs::read(root.path().join("allocation.json")).unwrap()).unwrap();
+        let sidecar = PathBuf::from(allocation["mailbox"].as_str().unwrap());
+        let id = RuntimeGenerationId::parse(allocation["generation"].as_str().unwrap()).unwrap();
+        let mut db = MailboxDb::open(&sidecar).unwrap();
+        let row = db.runtime_lifecycle_reader().runtime_generation(&id).unwrap().unwrap();
+        assert_eq!(row.lifecycle_state, RuntimeLifecycleState::Starting);
+        assert_eq!(row.exact_process_evidence, ExactProcessEvidence::NotRecorded,
+            "a policy/describe helper must not be published as Running");
+        creator.0.kill().unwrap();
+        eventually(|| fs::read_to_string(format!("/proc/{}/stat", creator.0.id()))
+            .is_ok_and(|stat| stat.rsplit_once(") ").unwrap().1.starts_with('Z')));
+        let stat = fs::read_to_string(format!("/proc/{helper_pid}/stat")).unwrap();
+        assert!(matches!(stat.rsplit_once(") ").unwrap().1.chars().next(), Some('R' | 'S' | 'D')));
+        let owner = pid_identity::read_live_process_identity(std::process::id().into()).unwrap().unwrap();
+        db.session_admissions().enqueue("helper-successor", "helper-successor", None, &owner, 1).unwrap();
+        assert!(matches!(db.session_admissions().try_admit_next("claim", 0, 2).unwrap(),
+            SessionAdmissionAttempt::LaunchMaterializing));
+        let proof = oulipoly_core::launch_custody::proof_path(&sidecar, &id.to_string());
+        assert!(!oulipoly_core::launch_custody::is_quiescent(&proof));
+        fs::write(root.path().join("release-helper"), b"release").unwrap();
+        eventually(|| oulipoly_core::launch_custody::is_quiescent(&proof));
+        assert!(matches!(db.session_admissions().try_admit_next("claim", 0, 3).unwrap(),
+            SessionAdmissionAttempt::Admitted(_)));
+        let row = db.runtime_lifecycle_reader().runtime_generation(&id).unwrap().unwrap();
+        assert_eq!(row.lifecycle_state, RuntimeLifecycleState::Exited);
+        assert_eq!(row.terminal_reason, Some(RuntimeTerminalReason::RecoveredDead));
+        assert_eq!(row.exact_process_evidence, ExactProcessEvidence::NotRecorded);
+        // Reap only after the real helper exited and exact successor was admitted.
+        creator.0.wait().unwrap();
+    }
 }

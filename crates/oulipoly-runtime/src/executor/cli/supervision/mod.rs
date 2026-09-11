@@ -128,6 +128,7 @@ fn execute_with_supervisor(
     process::configure_supervised_command(&mut cmd, &config);
     process::configure_supervised_process_group(&mut cmd);
     register_runtime_generation_starting(spawn_identity)?;
+    crate::executor::cli::spawn_identity::configure_launch_custody(&mut cmd, spawn_identity)?;
     let child = match process::spawn_supervised_child(cmd, provider_name) {
         Ok(child) => child,
         Err(err) => {

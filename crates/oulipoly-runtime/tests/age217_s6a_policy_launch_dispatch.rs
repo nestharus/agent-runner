@@ -687,6 +687,11 @@ with PROCESS_ENV_RECORD.open("a") as stream:
     }}, sort_keys=True) + "\n")
 if PID_FILE and READY_FILE and SUBCOMMAND == "launch":
     pathlib.Path(PID_FILE).write_text(str(os.getpid()))
+    # AGE354 publishes the owned status proxy, not this executable. Capture
+    # our live custodian's parent before readiness lets the host kill the group.
+    parent_stat = pathlib.Path("/proc/" + str(os.getppid()) + "/stat").read_text()
+    proxy_pid = parent_stat.rsplit(") ", 1)[1].split()[1]
+    pathlib.Path(PID_FILE + ".proxy").write_text(proxy_pid)
     pathlib.Path(READY_FILE).touch()
 
 def clear_custody_readiness():
@@ -1555,11 +1560,15 @@ fn external_provider_success_reaps_and_completes_the_exact_generation_orderly() 
         .parse::<libc::pid_t>()
         .expect("numeric provider pid");
     assert_external_child_reaped(pid);
+    let proxy: libc::pid_t = fs::read_to_string(format!("{}.proxy", pid_path.display()))
+        .expect("live proxy ancestry recorded before host cleanup").trim().parse().unwrap();
+    assert_ne!(pid, proxy);
+    assert_external_child_reaped(proxy);
     assert_external_terminal_generation(
         &data_dir,
         invocation_uuid,
         "orderly_completion",
-        Some(i64::from(pid)),
+        Some(i64::from(proxy)),
     );
 }
 
@@ -1606,11 +1615,15 @@ fn run_external_child_custody_fault(
         .parse::<libc::pid_t>()
         .expect("numeric provider pid");
     assert_external_child_reaped(pid);
+    let proxy: libc::pid_t = fs::read_to_string(format!("{}.proxy", pid_path.display()))
+        .expect("live proxy ancestry recorded before host cleanup").trim().parse().unwrap();
+    assert_ne!(pid, proxy);
+    assert_external_child_reaped(proxy);
     assert_external_terminal_generation(
         &data_dir,
         invocation_uuid,
         terminal_reason,
-        expect_bound_pid.then_some(i64::from(pid)),
+        expect_bound_pid.then_some(i64::from(proxy)),
     );
 }
 

@@ -249,7 +249,12 @@ pub(super) fn execute_interactive_child(
     });
     let generation_context = recorded_context.as_ref().or(context);
     register_runtime_generation_starting(generation_context)?;
-    let child = match cmd.spawn() {
+    crate::executor::cli::spawn_identity::configure_launch_custody(&mut cmd, generation_context)?;
+    let spawn_result = cmd.spawn();
+    // Drop the configured command's inherited launch endpoint now. Retaining
+    // the reusable Command through finalization would withhold quiescence.
+    drop(cmd);
+    let child = match spawn_result {
         Ok(child) => child,
         Err(err) => {
             let _ = mark_runtime_generation_spawn_failed(generation_context);
@@ -316,7 +321,12 @@ pub(super) fn execute_interactive_child_observed(
     });
     let generation_context = recorded_context.as_ref().or(context);
     register_runtime_generation_starting(generation_context)?;
-    let child = match cmd.spawn() {
+    crate::executor::cli::spawn_identity::configure_launch_custody(&mut cmd, generation_context)?;
+    let spawn_result = cmd.spawn();
+    // Drop the configured command's inherited launch endpoint now. Retaining
+    // the reusable Command through finalization would withhold quiescence.
+    drop(cmd);
+    let child = match spawn_result {
         Ok(child) => child,
         Err(err) => {
             let _ = mark_runtime_generation_spawn_failed(generation_context);

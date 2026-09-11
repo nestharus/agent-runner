@@ -873,6 +873,10 @@ where
         ));
     }
     let mut process = build_provider_process(command, envs);
+    oulipoly_core::launch_custody::configure_current(&mut process)
+        .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error))?;
+    // This filter is workload-only: the independent custodian must be able to
+    // leave the workload kill group before it authorizes the actual fork.
     crate::process_custody::configure_containment(&mut process, custody.is_some());
     process
         .spawn()
