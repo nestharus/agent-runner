@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 const FIXTURE_ROOT: &str = "OULIPOLY_TEST_LATER_RECOVERY_ROOT";
 const ENDED_ID: &str = "90111111-1111-4111-8111-111111111112";
+const UNKNOWN_ID: &str = "90111111-1111-4111-8111-111111111113";
 
 fn identity() -> ProcessIdentity {
     pid_identity::read_live_process_identity(std::process::id().into())
@@ -79,6 +80,12 @@ fn later_recovery_creator_fixture() {
         "ended",
         Some(&root.join("ended-proof")),
     );
+    create(
+        &mut db,
+        &RuntimeGenerationId::parse(UNKNOWN_ID).unwrap(),
+        "unknown",
+        None,
+    );
     std::fs::write(root.join("ready"), b"ready").unwrap();
     // Real pre-launch creator death closes the endpoint. No time limit is Q.
     std::thread::sleep(Duration::from_secs(15));
@@ -122,8 +129,7 @@ fn admission_recovers_later_ended_rows_behind_unknown_oldest() {
     );
     eventually(|| root.path().join("ready").exists());
     let mut db = MailboxDb::open(&root.path().join("pid-identity.db")).unwrap();
-    let unknown = RuntimeGenerationId::new();
-    create(&mut db, &unknown, "unknown", None);
+    let unknown = RuntimeGenerationId::parse(UNKNOWN_ID).unwrap();
     // Persisted ordering fixture: an older unresolved historical row. Only
     // timestamps/old epoch are synthesized, not same-boot custody evidence.
     db.conn.execute("UPDATE runtime_generation SET created_at = '2000-01-01T00:00:00Z' WHERE generation_uuid = ?1",
@@ -200,5 +206,17 @@ fn admission_recovers_later_ended_rows_behind_unknown_oldest() {
             .unwrap(),
         GenerationMutation::Rejected(_)
     ));
+    assert_eq!(
+        db.runtime_lifecycle()
+            .reconcile_session_liveness("unknown")
+            .unwrap(),
+        SessionLiveness::Busy
+    );
+    assert_eq!(
+        db.runtime_lifecycle()
+            .reconcile_session_liveness("ended")
+            .unwrap(),
+        SessionLiveness::Idle
+    );
     creator.0.wait().unwrap(); // retained real zombie through reconciliation
 }
