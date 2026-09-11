@@ -302,6 +302,55 @@ mod linux {
         command: &mut Command,
         #[cfg(test)] startup_gate: Option<RawFd>,
     ) -> io::Result<()> {
+        configure_with_transition(
+            custody,
+            command,
+            #[cfg(test)]
+            startup_gate,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    // Per-launch syscall-only test barriers; never configured by environment.
+    #[cfg(test)]
+    #[derive(Clone, Copy)]
+    pub(super) struct TransitionGate {
+        pub fd: RawFd,
+        pub point: u8,
+    }
+
+    #[cfg(test)]
+    unsafe fn transition_barrier(gate: Option<TransitionGate>, point: u8) {
+        unsafe {
+            if let Some(gate) = gate.filter(|gate| gate.point == point) {
+                let pid = libc::getpid().to_ne_bytes();
+                let packet = [point, pid[0], pid[1], pid[2], pid[3]];
+                if libc::send(gate.fd, packet.as_ptr().cast(), 5, libc::MSG_NOSIGNAL) != 5 {
+                    libc::_exit(125);
+                }
+                let mut poll = libc::pollfd {
+                    fd: gate.fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let mut ack = 0u8;
+                if libc::poll(&mut poll, 1, 2000) != 1
+                    || libc::recv(gate.fd, (&mut ack as *mut u8).cast(), 1, 0) != 1
+                    || ack != b'A'
+                {
+                    libc::_exit(125);
+                }
+            }
+        }
+    }
+
+    pub(super) fn configure_with_transition(
+        custody: &LaunchCustody,
+        command: &mut Command,
+        #[cfg(test)] startup_gate: Option<RawFd>,
+        #[cfg(test)] transition: Option<TransitionGate>,
+    ) -> io::Result<()> {
         let endpoint = custody.endpoint.lock().unwrap_or_else(|e| e.into_inner());
         let endpoint = endpoint
             .as_ref()
@@ -372,7 +421,14 @@ mod linux {
                 if custodian > 0 {
                     libc::close(status_pair[1]);
                     libc::close(ready_pair[1]);
-                    proxy_status(status_pair[0], ready_pair[0], custodian, fd);
+                    proxy_status(
+                        status_pair[0],
+                        ready_pair[0],
+                        custodian,
+                        fd,
+                        #[cfg(test)]
+                        transition,
+                    );
                 }
                 libc::close(status_pair[0]);
                 libc::close(ready_pair[0]);
@@ -424,6 +480,13 @@ mod linux {
                     if libc::setpgid(0, proxy) != 0 || !send(ready_pair[1], b'R') {
                         return Err(io::Error::last_os_error());
                     }
+                    #[cfg(test)]
+                    if let Some(gate) = transition {
+                        if gate.point == b'G' && !send(gate.fd, b'W') {
+                            libc::_exit(125);
+                        }
+                        libc::close(gate.fd);
+                    }
                     let mut ack = 0u8;
                     if libc::recv(ready_pair[1], (&mut ack as *mut u8).cast(), 1, 0) != 1
                         || ack != b'A'
@@ -439,6 +502,10 @@ mod linux {
                     return Ok(());
                 }
                 libc::close(ready_pair[1]);
+                #[cfg(test)]
+                if let Some(gate) = transition {
+                    libc::close(gate.fd);
+                }
                 // C is outside the published group. Only P retains the block;
                 // exact custodian failure and unknown-custody fences are intact.
                 if libc::sigprocmask(libc::SIG_SETMASK, &workload_mask, std::ptr::null_mut()) != 0 {
@@ -573,7 +640,13 @@ mod linux {
         }
     }
 
-    unsafe fn proxy_status(fd: RawFd, ready: RawFd, custodian: libc::pid_t, launch_fd: RawFd) -> ! {
+    unsafe fn proxy_status(
+        fd: RawFd,
+        ready: RawFd,
+        custodian: libc::pid_t,
+        launch_fd: RawFd,
+        #[cfg(test)] transition: Option<TransitionGate>,
+    ) -> ! {
         unsafe {
             // Retain only this session's terminal, not any arbitrary input pipe.
             // POLLHUP on the slave is independent evidence of terminal loss;
@@ -588,7 +661,16 @@ mod linux {
             } else {
                 -1
             };
-            close_preserving(&[fd, ready, launch_fd, tty]);
+            close_preserving(&[
+                fd,
+                ready,
+                launch_fd,
+                tty,
+                #[cfg(test)]
+                transition.map_or(-1, |gate| gate.fd),
+            ]);
+            #[cfg(test)]
+            let mut gap_held = false;
             let mut signals: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut signals);
             for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
@@ -617,15 +699,44 @@ mod linux {
                     wait_exact(custodian, &mut ignored);
                     libc::_exit(125);
                 }
+                // Observe membership BEFORE the final startup drain. R proves
+                // W is in the group with these signals blocked until our ACK.
+                // Thus every notification that could have missed W is either
+                // in early[] or still pending for this drain. Notifications
+                // after this drain already have W as a masked group recipient.
+                let ready_now = if !started {
+                    let mut byte = 0u8;
+                    let rc =
+                        libc::recv(ready, (&mut byte as *mut u8).cast(), 1, libc::MSG_DONTWAIT);
+                    if rc == 1 && byte == b'R' {
+                        true
+                    } else if rc < 0
+                        && [libc::EAGAIN, libc::EINTR].contains(&*libc::__errno_location())
+                    {
+                        false
+                    } else {
+                        libc::_exit(125);
+                    }
+                } else {
+                    false
+                };
                 loop {
                     let mut event: libc::signalfd_siginfo = std::mem::zeroed();
-                    if libc::read(
+                    let rc = libc::read(
                         events,
                         (&mut event as *mut libc::signalfd_siginfo).cast(),
                         std::mem::size_of_val(&event),
-                    ) != std::mem::size_of_val(&event) as isize
-                    {
-                        break;
+                    );
+                    if rc != std::mem::size_of_val(&event) as isize {
+                        if rc < 0 && *libc::__errno_location() == libc::EINTR {
+                            continue;
+                        }
+                        if rc < 0 && *libc::__errno_location() == libc::EAGAIN {
+                            break;
+                        }
+                        // Only an exhausted queue closes the startup handoff;
+                        // a failed read cannot prove no notification was missed.
+                        libc::_exit(125);
                     }
                     let signal = event.ssi_signo as i32;
                     if !started {
@@ -643,36 +754,44 @@ mod linux {
                         shutdown_sent = send(fd, b'T');
                     }
                 }
-                if !started {
-                    let mut byte = 0u8;
-                    let rc =
-                        libc::recv(ready, (&mut byte as *mut u8).cast(), 1, libc::MSG_DONTWAIT);
-                    if rc == 1 && byte == b'R' {
-                        for (index, signal) in
-                            [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT]
-                                .iter()
-                                .enumerate()
-                        {
-                            if early[index] {
-                                libc::kill(-libc::getpid(), *signal);
-                            }
-                        }
-                        // W is still masked until ACK. Closing the terminal
-                        // before W existed therefore cannot consume its HUP.
-                        if terminal_hung_up(tty) && !early[2] {
-                            libc::kill(-libc::getpid(), libc::SIGHUP);
-                        }
-                        hangup_relayed = terminal_hung_up(tty);
-                        if !send(ready, b'A') {
+                #[cfg(test)]
+                if !started && !gap_held {
+                    transition_barrier(transition, b'G');
+                    gap_held = true;
+                }
+                if ready_now {
+                    for (index, signal) in
+                        [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT]
+                            .iter()
+                            .enumerate()
+                    {
+                        if early[index] && libc::kill(-libc::getpid(), *signal) != 0 {
                             libc::_exit(125);
                         }
-                        libc::close(ready);
-                        started = true;
-                    } else if rc >= 0 {
+                    }
+                    // W is still masked until ACK. Closing the terminal
+                    // before W existed therefore cannot consume its HUP.
+                    let hung_up = terminal_hung_up(tty);
+                    #[cfg(test)]
+                    transition_barrier(transition, b'H');
+                    if hung_up {
+                        if !early[2] && libc::kill(-libc::getpid(), libc::SIGHUP) != 0 {
+                            libc::_exit(125);
+                        }
+                        // This one observation is covered by a successful
+                        // HUP relay above. A later probe cannot manufacture
+                        // completion for an action we never performed.
+                        hangup_relayed = true;
+                    }
+                    if !send(ready, b'A') {
                         libc::_exit(125);
                     }
-                } else if !hangup_relayed && terminal_hung_up(tty) {
-                    libc::kill(-libc::getpid(), libc::SIGHUP);
+                    libc::close(ready);
+                    started = true;
+                } else if started && !hangup_relayed && terminal_hung_up(tty) {
+                    if libc::kill(-libc::getpid(), libc::SIGHUP) != 0 {
+                        libc::_exit(125);
+                    }
                     hangup_relayed = true;
                 }
                 if hangup_relayed && !shutdown_sent {
@@ -721,7 +840,7 @@ mod linux {
     unsafe fn close_preserving(fds: &[RawFd]) {
         unsafe {
             // Fixed small stack array only: this is a post-fork pre-exec path.
-            let mut sorted = [-1; 4];
+            let mut sorted = [-1; 5];
             sorted[..fds.len()].copy_from_slice(fds);
             sorted.sort_unstable();
             let mut start = 0u32;

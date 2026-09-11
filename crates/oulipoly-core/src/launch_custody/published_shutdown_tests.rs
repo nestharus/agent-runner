@@ -415,3 +415,115 @@ os._exit(92)
         );
     }
 }
+
+fn gate_packet(observer: &mut UnixStream, point: u8) -> i32 {
+    let mut packet = [0u8; 5];
+    observer.read_exact(&mut packet).unwrap();
+    assert_eq!(packet[0], point);
+    i32::from_ne_bytes(packet[1..].try_into().unwrap())
+}
+
+#[test]
+fn ready_transition_retains_group_signals_after_empty_drain() {
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        let mut fixture = Fixture::new(&format!("drain-gap-{signal}"));
+        let mut command = fixture.command(
+            "import pathlib,time; pathlib.Path('executed').touch(); time.sleep(1)",
+            false,
+        );
+        let (mut startup_observer, startup) = UnixStream::pair().unwrap();
+        let (mut observer, gate) = UnixStream::pair().unwrap();
+        for stream in [&startup_observer, &observer] {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+        }
+        super::linux::configure_with_transition(
+            &fixture.custody,
+            &mut command,
+            Some(startup.as_raw_fd()),
+            Some(super::linux::TransitionGate {
+                fd: gate.as_raw_fd(),
+                point: b'G',
+            }),
+        )
+        .unwrap();
+        let spawn = std::thread::spawn(move || {
+            let result = command.spawn();
+            drop(command);
+            drop(startup);
+            drop(gate);
+            result
+        });
+        let published = gate_packet(&mut startup_observer, b'R');
+        assert_eq!(gate_packet(&mut observer, b'G'), published);
+        let custodian = children(published)[0];
+        assert_ne!(unsafe { libc::getpgid(custodian) }, published);
+        assert!(children(custodian).is_empty());
+        // P has drained an empty signalfd, W does not exist. The supported
+        // group signal is pending only in P before W joins and announces R.
+        assert_eq!(unsafe { libc::killpg(published, signal) }, 0);
+        startup_observer.write_all(b"A").unwrap();
+        let mut member = [0u8; 1];
+        observer.read_exact(&mut member).unwrap();
+        assert_eq!(member, [b'W']);
+        let workload = children(custodian)[0];
+        assert_eq!(unsafe { libc::getpgid(workload) }, published);
+        observer.write_all(b"A").unwrap();
+        fixture.child = Some(spawn.join().unwrap().unwrap());
+        fixture.custody.seal();
+        let status = fixture.settle();
+        eprintln!(
+            "drain gap signal={signal} W={workload} P={published} status={status:?} executed={} Q=true",
+            fixture.root.join("executed").exists()
+        );
+        assert_eq!(status.signal(), Some(signal));
+        assert!(!fixture.root.join("executed").exists());
+    }
+}
+
+#[test]
+fn ready_transition_hangup_after_false_probe_still_relays() {
+    let mut fixture = Fixture::new("probe-gap");
+    let mut command = fixture.command(
+        "import pathlib,time; pathlib.Path('executed').touch(); time.sleep(1)",
+        true,
+    );
+    let (mut observer, gate) = UnixStream::pair().unwrap();
+    observer
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    super::linux::configure_with_transition(
+        &fixture.custody,
+        &mut command,
+        None,
+        Some(super::linux::TransitionGate {
+            fd: gate.as_raw_fd(),
+            point: b'H',
+        }),
+    )
+    .unwrap();
+    let spawn = std::thread::spawn(move || {
+        let result = command.spawn();
+        drop(command);
+        drop(gate);
+        result
+    });
+    let published = gate_packet(&mut observer, b'H');
+    let custodian = children(published)[0];
+    let workload = children(custodian)[0];
+    assert_eq!(unsafe { libc::getpgid(workload) }, published);
+    // The first probe has observed a live terminal, W is masked awaiting ACK.
+    fixture.master.take();
+    observer.write_all(b"A").unwrap();
+    fixture.child = Some(spawn.join().unwrap().unwrap());
+    fixture.custody.seal();
+    let status = fixture.settle();
+    eprintln!(
+        "probe gap W={workload} P={published} status={status:?} executed={} Q=true",
+        fixture.root.join("executed").exists()
+    );
+    assert_eq!(status.signal(), Some(libc::SIGHUP));
+    // Unlike the early gap, W may exec before the post-start relay; the signal
+    // result rather than cleanup or absence of an executable marker is oracle.
+}
