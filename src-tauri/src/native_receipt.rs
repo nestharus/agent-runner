@@ -416,9 +416,27 @@ pub(crate) fn poll_headless_receipt_tick_with<
     else {
         return Ok(());
     };
-    let Some(cwd) = runtime.effective_cwd.as_deref() else {
-        return Ok(());
+    if runtime.session_id != anchor.provider_session_id
+        || runtime.provider_name.as_deref() != Some(anchor.provider_name.as_str())
+    {
+        return Err("receipt runtime identity mismatch".into());
+    }
+    let cwd = match runtime.effective_cwd {
+        Some(cwd) => std::path::PathBuf::from(cwd),
+        None => {
+            let state = oulipoly_state::StateDb::open_read_only(
+                &oulipoly_state::StateDb::default_path()?,
+            )
+            .map_err(|error| format!("receipt cwd recovery: {error}"))?;
+            let Some(cwd) = recover_observation_cwd(&state, &anchor)? else {
+                return Ok(());
+            };
+            cwd
+        }
     };
+    if !cwd.is_absolute() {
+        return Err("receipt cwd must be absolute".into());
+    }
     let registry = make_registry(runtime.models_dir.as_deref().map(std::path::Path::new))?;
     // The normal reader performs endpoint/schema/settings admission. No vendor
     // parsing or execution/resume capability is called by this inspection path.
@@ -433,12 +451,45 @@ pub(crate) fn poll_headless_receipt_tick_with<
         &attempt_id,
         registry.borrow(),
         identity,
-        std::path::Path::new(cwd),
+        &cwd,
         &anchor,
         1,
         Duration::from_secs(2),
     )?;
     Ok(())
+}
+
+// Reuse the same persisted, authority-bound cwd sources as session metadata.
+// No current-directory, arbitrary invocation, or filesystem discovery fallback.
+fn recover_observation_cwd(
+    state: &oulipoly_state::StateDb,
+    anchor: &MailboxDeliveryObservationAnchor,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let authority = oulipoly_state::StoredProviderSessionAuthority {
+        provider_instance_id: anchor.provider_instance_id.clone(),
+        settings_id: anchor.settings_id.clone(),
+    };
+    let imported = state.imported_session_cwd_for_authority(
+        &anchor.provider_name,
+        &anchor.provider_session_id,
+        &authority,
+    )?;
+    let cwd = match imported {
+        Some(cwd) => Some(cwd),
+        None => state.latest_provider_session_resolved_account_for_authority(
+            &anchor.provider_name,
+            &anchor.provider_session_id,
+            &authority,
+        )?,
+    };
+    cwd.map(|cwd| {
+        let path = std::path::PathBuf::from(cwd);
+        if !path.is_absolute() {
+            return Err("receipt recovered cwd must be absolute".into());
+        }
+        Ok(path)
+    })
+    .transpose()
 }
 
 /// A headless owner keeps the existing scanner active even when no desktop/REPL

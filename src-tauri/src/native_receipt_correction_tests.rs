@@ -290,3 +290,54 @@ fn age355_target_anchor_binding_is_framed_and_bounded_for_large_tokens() {
     anchor.provider_instance_id = "bc".into();
     assert_ne!(helper::anchor_identity(&anchor), framed);
 }
+
+#[test]
+fn receipt_cwd_recovery_requires_exact_persisted_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("state.db");
+    let state = oulipoly_state::StateDb::open(&path).unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch(
+        "INSERT INTO session_chains (chain_id, created_at, last_used_at)
+         VALUES ('chain', '2026-09-11', '2026-09-11');
+         INSERT INTO session_chain_segments
+             (chain_id, provider_name, session_id, started_at, transition_reason)
+         VALUES ('chain', 'account', 'session', '2026-09-11', 'initial');
+         INSERT INTO session_chain_segment_provider_authority
+             (segment_id, provider_instance_id, settings_id)
+         SELECT id, 'instance', 'settings' FROM session_chain_segments;"
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO imported_session_display_metadata
+             (provider_name, provider_session_id, cwd, first_seen_at, last_seen_at)
+         VALUES ('account', 'session', ?1, '2026-09-11', '2026-09-11')",
+        [root.path().to_str().unwrap()],
+    ).unwrap();
+    let mut anchor = MailboxDeliveryObservationAnchor {
+        provider_name: "account".into(),
+        provider_instance_id: "instance".into(),
+        settings_id: "settings".into(),
+        provider_session_id: "session".into(),
+        resume_token: Some("anchor".into()),
+        expected_sha256: "digest".into(),
+    };
+    assert_eq!(recover_observation_cwd(&state, &anchor).unwrap(), Some(root.path().into()));
+    for field in 0..4 {
+        let slot = match field {
+            0 => &mut anchor.provider_name,
+            1 => &mut anchor.provider_instance_id,
+            2 => &mut anchor.settings_id,
+            _ => &mut anchor.provider_session_id,
+        };
+        let original = std::mem::replace(slot, "mismatch".into());
+        assert_eq!(recover_observation_cwd(&state, &anchor).unwrap(), None);
+        match field {
+            0 => anchor.provider_name = original,
+            1 => anchor.provider_instance_id = original,
+            2 => anchor.settings_id = original,
+            _ => anchor.provider_session_id = original,
+        }
+    }
+    connection.execute("UPDATE imported_session_display_metadata SET cwd = 'relative'", []).unwrap();
+    assert!(recover_observation_cwd(&state, &anchor).unwrap_err().contains("absolute"));
+}
