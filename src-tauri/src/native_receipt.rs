@@ -76,7 +76,7 @@ pub(crate) fn confirm_delivery_observation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn confirm_delivery_observation_bounded(
+pub(crate) fn confirm_delivery_observation_bounded(
     db: &MailboxDb,
     attempt_id: &str,
     registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
@@ -87,7 +87,6 @@ fn confirm_delivery_observation_bounded(
     budget: Duration,
 ) -> Result<bool, String> {
     ensure_observation_not_stopped(db, &anchor.provider_session_id)?;
-    let deadline = Instant::now() + budget;
     let endpoint = registry
         .preflight_account(&identity.provider_name)
         .map_err(|e| e.to_string())?;
@@ -100,7 +99,10 @@ fn confirm_delivery_observation_bounded(
         attempt_id,
         anchor,
         max_pages,
-        deadline.saturating_duration_since(Instant::now()),
+        // Preparation has its own transport deadline; synchronous identity IO
+        // is not page work. A successful slow preparation must still leave a
+        // page opportunity. This is a page budget, not an end-to-end deadline.
+        budget,
         &reader_identity,
         |cursor, page_index, turn_sequence, remaining| {
             read_turn_page(SessionProviderReadPageRequest {
@@ -459,6 +461,11 @@ pub(crate) fn start_receipt_polling_with(
                 if let Err(error) = tick() {
                     tracing::warn!("Bounded active headless receipt tick: {error}");
                 }
+                // IO may consume the unpark token (for example a channel wait).
+                // Do not park for another full interval after stop was requested.
+                if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
                 std::thread::park_timeout(interval);
             }
         })
@@ -468,3 +475,7 @@ pub(crate) fn start_receipt_polling_with(
         worker: Some(worker),
     })
 }
+
+#[cfg(test)]
+#[path = "native_receipt_correction_tests.rs"]
+mod correction_tests;

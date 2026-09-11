@@ -1025,3 +1025,49 @@ fn age355_expired_tick_budget_never_starts_io() {
     );
     f.assert_pending_without_replay();
 }
+
+#[test]
+#[ignore = "R1 unresolved: bounded duplicate global-selection probe, private DB only"]
+fn age355_correction_global_selection_does_not_overlap() {
+    let mut f = Fixture::new();
+    f.anchored_submit();
+    f.db.wake_sessions()
+        .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+            session_id: SESSION,
+            mode: "headless",
+            invocation_uuid: Some("native-invocation"),
+            provider_name: Some("account"),
+            model_name: Some("offline"),
+            models_dir: None,
+            effective_cwd: Some("/offline"),
+        })
+        .unwrap();
+    let root = f.root.path().to_path_buf();
+    let (entered, observed) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let first_entered = entered.clone();
+    let first = std::thread::spawn(move || {
+        let mut db = MailboxDb::open(&root.join("pid-identity.db")).unwrap();
+        crate::native_receipt::poll_headless_receipt_tick_with(&mut db, |_| {
+            first_entered.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            Err("private unavailable registry".into())
+        })
+    });
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The first selection is still in flight. A second physical DB connection
+    // must not perform duplicate global inspection of this sole candidate.
+    let result = crate::native_receipt::poll_headless_receipt_tick_with(&mut f.db, |_| {
+        entered.send(()).unwrap();
+        Err("private unavailable registry".into())
+    });
+    let duplicated = observed.try_recv().is_ok();
+    release.send(()).unwrap();
+    assert!(first.join().unwrap().is_err());
+    assert!(result.is_ok() || result.as_ref().unwrap_err() == "private unavailable registry");
+    f.assert_pending_without_replay();
+    assert!(
+        !duplicated,
+        "both observers entered registry preparation for the sole attempt"
+    );
+}

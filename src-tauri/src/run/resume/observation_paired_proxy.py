@@ -5,6 +5,7 @@ import pathlib
 import subprocess
 import shutil
 import sys
+import time
 
 root = pathlib.Path(__FIXTURE_ROOT__)
 binary = __PROVIDER_BINARY__
@@ -49,6 +50,8 @@ request["host"]["env"]["HOME"] = str(root / "home")
 request["host"]["data_root"] = str(root / "data")
 request["host"]["config_root"] = str(root / "config")
 mode = (root / "mode").read_text()
+if sys.argv[1] == "describe" and mode == "slow_describe":
+    time.sleep(2.2)  # bounded preflight delay, never a model operation
 if sys.argv[1] == "session.read_turns":
     if mode == "canonical_request":
         request["params"]["turn_projection"] = "canonical_ingest"

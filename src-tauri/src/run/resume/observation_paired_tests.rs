@@ -767,3 +767,70 @@ fn age355_paired_contextual_input_and_duplicate_are_not_receipt() {
         p.f.assert_pending_without_replay();
     }
 }
+
+#[test]
+#[ignore = "requires explicit frozen source-built provider; no model workloads"]
+fn age355_paired_slow_preflight_retains_page_opportunity() {
+    let mut p = Paired::new();
+    p.anchor_and_submit();
+    p.append("user", &p.f.envelope);
+    p.set_mode("slow_describe");
+    // Fresh private registry forces successful slow preparation. Its describe
+    // timeout is independent of the page budget (as is synchronous identity IO).
+    // This is not a claim that production's 2s describe timeout permits 2.2s.
+    let registry = registry(p.f.root.path(), &p.proxy);
+    assert!(
+        crate::native_receipt::confirm_delivery_observation_bounded(
+            &p.f.db,
+            &p.f.attempt,
+            &registry,
+            identity(p.f.root.path()),
+            p.f.root.path(),
+            &p.f.anchor,
+            1,
+            Duration::from_secs(2),
+        )
+        .unwrap()
+    );
+    assert!(p.f.db.list_pending(SESSION).unwrap().is_empty());
+    assert_eq!(p.f.submissions, 1);
+}
+
+#[test]
+#[ignore = "requires explicit frozen source-built provider; Unix pinned-handle probe only"]
+fn age355_paired_identity_distinguishes_replacement_and_in_place_change() {
+    let p = Paired::new();
+    let endpoint = p.registry.preflight_account("account").unwrap();
+    let client = endpoint.client();
+    let initial = client.pinned_executable_identity_sha256().unwrap();
+    assert_eq!(initial, client.pinned_executable_identity_sha256().unwrap());
+    // Same bytes and pathname do not imply the same retained executable.
+    let replacement = p.f.root.path().join("replacement.py");
+    fs::copy(&p.proxy, &replacement).unwrap();
+    fs::rename(&replacement, &p.proxy).unwrap();
+    let new_registry = registry(p.f.root.path(), &p.proxy);
+    let new_endpoint = new_registry.preflight_account("account").unwrap();
+    let old_pinned = client.pinned_executable_identity_sha256().unwrap();
+    let replaced = new_endpoint
+        .client()
+        .pinned_executable_identity_sha256()
+        .unwrap();
+    assert_ne!(old_pinned, replaced);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&p.proxy)
+        .unwrap()
+        .write_all(b"\n# private in-place revision\n")
+        .unwrap();
+    assert_ne!(
+        replaced,
+        new_endpoint
+            .client()
+            .pinned_executable_identity_sha256()
+            .unwrap()
+    );
+    assert_eq!(
+        old_pinned,
+        client.pinned_executable_identity_sha256().unwrap()
+    );
+}
