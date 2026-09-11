@@ -63,11 +63,30 @@ use oulipoly_runtime::executor::cli::{
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
-fn argv_dump_script() -> (tempfile::TempDir, PathBuf, PathBuf) {
+// A concurrent custody fork can inherit another test's writable script FD even
+// with CLOEXEC: the custodian does not exec. Keep publication AND execution in
+// one fixture lifetime so no launch forks while another fixture is writing.
+static SCRIPT_LIFECYCLE: Mutex<()> = Mutex::new(());
+
+struct ScriptDirectory {
+    dir: tempfile::TempDir,
+    _lifecycle: MutexGuard<'static, ()>,
+}
+
+impl ScriptDirectory {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn script_directory() -> ScriptDirectory {
+    let lifecycle = SCRIPT_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     TEST_DATA_DIR.get_or_init(|| {
         let dir = tempfile::tempdir().expect("test data dir");
         unsafe {
@@ -75,7 +94,14 @@ fn argv_dump_script() -> (tempfile::TempDir, PathBuf, PathBuf) {
         }
         dir
     });
-    let dir = tempfile::tempdir().unwrap();
+    ScriptDirectory {
+        dir: tempfile::tempdir().unwrap(),
+        _lifecycle: lifecycle,
+    }
+}
+
+fn argv_dump_script() -> (ScriptDirectory, PathBuf, PathBuf) {
+    let dir = script_directory();
     let argv_dump = dir.path().join("argv.txt");
     let path = dir.path().join("argv-dump.sh");
     std::fs::write(&path, argv_dump_script_body(&argv_dump)).unwrap();
@@ -311,7 +337,7 @@ fn interactive_execution_preserves_invocation_mode_in_provider() {
 
 #[test]
 fn interactive_execution_propagates_parent_invocation_env() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = script_directory();
     let env_dump = dir.path().join("env.txt");
     let script_path = dir.path().join("env-dump.sh");
     std::fs::write(
@@ -354,7 +380,7 @@ fn interactive_execution_propagates_parent_invocation_env() {
 
 #[test]
 fn resume_execution_clears_session_capture_and_preserves_invocation_mode() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = script_directory();
     let script_path = dir.path().join("noop.sh");
     std::fs::write(&script_path, "#!/usr/bin/env bash\nexit 0\n").unwrap();
     let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
