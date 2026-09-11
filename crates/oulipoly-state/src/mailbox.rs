@@ -10837,14 +10837,56 @@ fn recover_stale_session_admissions_on(
     Ok(())
 }
 
+// This proves the recorded launcher incarnation cannot act, not that a child
+// tree has exited. Only reservations without a published Starting generation
+// are eligible; generation publication and this cancellation share an Immediate
+// transaction, and publication rejects a cancelled reservation.
+fn observe_session_admission_owner(
+    os_pid: i64,
+) -> pid_identity::FinalizerProcessIdentityObservation {
+    // Optional readers on non-Linux platforms also return None for invalid PIDs.
+    // Invalid persisted evidence cannot authorize cancellation on any platform.
+    if os_pid <= 0 || os_pid > i64::from(i32::MAX) {
+        return pid_identity::FinalizerProcessIdentityObservation::ReadError(
+            "Invalid session admission owner PID".into(),
+        );
+    }
+    pid_identity::observe_finalizer_process_identity(os_pid)
+}
+
+fn reservation_owner_has_exited(
+    recorded: &ProcessIdentity,
+    observation: pid_identity::FinalizerProcessIdentityObservation,
+) -> bool {
+    use pid_identity::FinalizerProcessIdentityObservation::*;
+    match observation {
+        ExactLive(live) => live != *recorded,
+        ExactExited(_) | Dead => true,
+        Unsupported | ReadError(_) => false,
+    }
+}
+
 fn cancel_dead_session_admission_head_on(
     conn: &Connection,
     now_unix_ms: i64,
 ) -> Result<bool, String> {
+    cancel_dead_session_admission_head_with(conn, now_unix_ms, observe_session_admission_owner)
+}
+
+fn cancel_dead_session_admission_head_with(
+    conn: &Connection,
+    now_unix_ms: i64,
+    observe: impl FnOnce(i64) -> pid_identity::FinalizerProcessIdentityObservation,
+) -> Result<bool, String> {
     let owner = conn
         .query_row(
             "SELECT registration_identity, launcher_os_pid, launcher_os_boot_id,
-                    launcher_os_pid_starttime_ticks
+                    launcher_os_pid_starttime_ticks, queue_sequence
+             FROM session_admission_queue
+             WHERE state = 'admitted' AND runtime_generation_uuid IS NULL
+             UNION ALL
+             SELECT registration_identity, launcher_os_pid, launcher_os_boot_id,
+                    launcher_os_pid_starttime_ticks, queue_sequence
              FROM session_admission_queue
              WHERE state = 'launching' AND runtime_generation_uuid IS NULL
              ORDER BY queue_sequence
@@ -10891,8 +10933,7 @@ fn cancel_dead_session_admission_head_on(
     let Some((registration_identity, recorded)) = owner else {
         return Ok(false);
     };
-    let live = pid_identity::read_live_process_identity(recorded.os_pid)?;
-    if live.as_ref() == Some(&recorded) {
+    if !reservation_owner_has_exited(&recorded, observe(recorded.os_pid)) {
         return Ok(false);
     }
     let changed = conn
@@ -10902,7 +10943,7 @@ fn cancel_dead_session_admission_head_on(
                  claimed_at_unix_ms = NULL, updated_at_unix_ms = ?2
              WHERE registration_identity = ?1
                AND (state = 'queued'
-                    OR (state = 'launching' AND runtime_generation_uuid IS NULL))
+                    OR (state IN ('admitted', 'launching') AND runtime_generation_uuid IS NULL))
                AND launcher_os_pid = ?3
                AND launcher_os_boot_id = ?4
                AND launcher_os_pid_starttime_ticks = ?5",
@@ -10950,8 +10991,18 @@ fn reconcile_dead_starting_generations_on(
     let Some((generation_uuid, creator)) = generation else {
         return Ok(());
     };
-    let live = pid_identity::read_live_process_identity(creator.os_pid)?;
-    if live.as_ref() == Some(&creator) {
+    // Tighten unknown evidence without extending recovery to unreaped creators.
+    // Starting may already have an unpublished OS child. Existing absent/replaced
+    // creator recovery is not proof of whole-tree cessation; broadening that
+    // custody policy (including zombie creators) needs a separate decision.
+    let recover = match observe_session_admission_owner(creator.os_pid) {
+        pid_identity::FinalizerProcessIdentityObservation::ExactLive(live) => live != creator,
+        pid_identity::FinalizerProcessIdentityObservation::Dead => true,
+        pid_identity::FinalizerProcessIdentityObservation::ExactExited(_)
+        | pid_identity::FinalizerProcessIdentityObservation::Unsupported
+        | pid_identity::FinalizerProcessIdentityObservation::ReadError(_) => false,
+    };
+    if !recover {
         return Ok(());
     }
     conn.execute(
@@ -12570,6 +12621,373 @@ mod tests {
     }
 
     #[test]
+    fn admission_reclamation_evidence_matrix_preserves_claims_and_fifo() {
+        use pid_identity::FinalizerProcessIdentityObservation as Evidence;
+        for state in ["queued", "admitted", "launching"] {
+            for kind in [
+                "live",
+                "exited",
+                "replaced",
+                "absent",
+                "unknown",
+                "unsupported",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+                let owner = current_identity();
+                db.session_admissions()
+                    .enqueue("head-id", "head", None, &owner, 1)
+                    .unwrap();
+                db.session_admissions()
+                    .enqueue("tail-id", "tail", None, &owner, 2)
+                    .unwrap();
+                db.conn.execute(
+                    "UPDATE session_admission_queue SET state = ?1, claim_token = CASE WHEN ?1 = 'queued' THEN NULL ELSE 'old-claim' END, claimed_at_unix_ms = CASE WHEN ?1 = 'queued' THEN NULL ELSE 1 END WHERE registration_identity = 'head'",
+                    params![state],
+                ).unwrap();
+                let evidence = match kind {
+                    "live" => Evidence::ExactLive(owner.clone()),
+                    "exited" => Evidence::ExactExited(owner.clone()),
+                    "replaced" => Evidence::ExactLive(ProcessIdentity {
+                        os_pid_starttime_ticks: owner.os_pid_starttime_ticks + 1,
+                        ..owner.clone()
+                    }),
+                    "absent" => Evidence::Dead,
+                    "unknown" => Evidence::ReadError("proc denied".into()),
+                    _ => Evidence::Unsupported,
+                };
+                let reclaim = matches!(kind, "exited" | "replaced" | "absent");
+                assert_eq!(
+                    cancel_dead_session_admission_head_with(&db.conn, 3, |_| evidence).unwrap(),
+                    reclaim,
+                    "{state}/{kind}"
+                );
+                let head = db.session_admissions().row("head").unwrap().unwrap();
+                assert_eq!(
+                    head.state,
+                    if reclaim { "cancelled" } else { state },
+                    "{state}/{kind}"
+                );
+                assert_eq!(
+                    head.claim_token.as_deref(),
+                    if reclaim || state == "queued" {
+                        None
+                    } else {
+                        Some("old-claim")
+                    }
+                );
+                assert_eq!(
+                    db.session_admissions().row("tail").unwrap().unwrap().state,
+                    "queued"
+                );
+                if reclaim {
+                    assert!(
+                        !db.session_admissions()
+                            .begin_launch("head", "old-claim", 4)
+                            .unwrap()
+                    );
+                    assert!(matches!(
+                        db.session_admissions()
+                            .try_admit_next("tail-claim", 0, 4)
+                            .unwrap(),
+                        SessionAdmissionAttempt::Admitted(_)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admission_reclaims_unreaped_zombie_and_exited_owner_but_retains_stopped_owner() {
+        use std::time::{Duration, Instant};
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for state in ["queued", "admitted", "launching"] {
+            // No shell or descendants: cleanup owns the entire fixture tree.
+            let mut child = Child(
+                std::process::Command::new("/bin/sleep")
+                    .arg("60")
+                    .spawn()
+                    .unwrap(),
+            );
+            let identity = pid_identity::read_live_process_identity(i64::from(child.0.id()))
+                .unwrap()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+            db.session_admissions()
+                .enqueue("head-id", "head", None, &identity, 1)
+                .unwrap();
+            db.conn.execute("UPDATE session_admission_queue SET state = ?1, claim_token = CASE WHEN ?1 = 'queued' THEN NULL ELSE 'old' END, claimed_at_unix_ms = CASE WHEN ?1 = 'queued' THEN NULL ELSE 1 END", params![state]).unwrap();
+            unsafe {
+                assert_eq!(libc::kill(child.0.id() as i32, libc::SIGSTOP), 0);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.0.id())).unwrap();
+                if stat.rsplit_once(") ").unwrap().1.starts_with('T') {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "fixture did not stop");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!cancel_dead_session_admission_head_on(&db.conn, 2).unwrap());
+            child.0.kill().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if matches!(
+                    pid_identity::observe_finalizer_process_identity(identity.os_pid),
+                    pid_identity::FinalizerProcessIdentityObservation::ExactExited(_)
+                ) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "fixture did not become zombie");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                db.session_admissions()
+                    .try_admit_next("new-claim", i64::MAX, 3)
+                    .unwrap(),
+                SessionAdmissionAttempt::Waiting,
+                "{state}"
+            );
+            assert_eq!(
+                db.session_admissions()
+                    .try_admit_next("retry-claim", i64::MAX, 4)
+                    .unwrap(),
+                SessionAdmissionAttempt::Empty,
+                "dead owner must not re-admit: {state}"
+            );
+            assert_eq!(
+                db.session_admissions().row("head").unwrap().unwrap().state,
+                "cancelled"
+            );
+            let generation_id =
+                RuntimeGenerationId::parse("97777777-7777-4777-8777-777777777770").unwrap();
+            db.runtime_lifecycle()
+                .create_runtime_generation(CreateRuntimeGeneration {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: "starting-zombie",
+                    session_id: None,
+                    runtime_mode: "headless",
+                    provider_name: "fixture",
+                    model_name: None,
+                    pty_control_path: None,
+                    models_dir: None,
+                    effective_cwd: None,
+                })
+                .unwrap();
+            db.conn.execute("UPDATE runtime_generation SET creator_identity_os_pid = ?1, creator_identity_os_boot_id = ?2, creator_identity_os_pid_starttime_ticks = ?3", params![identity.os_pid, identity.os_boot_id, identity.os_pid_starttime_ticks]).unwrap();
+            reconcile_dead_starting_generations_on(&db.conn, 4).unwrap();
+            // Reservation death is not new authority to recover a potentially
+            // unpublished child of a Starting creator. Root owns that decision.
+            assert_eq!(
+                db.runtime_lifecycle_reader()
+                    .runtime_generation(&generation_id)
+                    .unwrap()
+                    .unwrap()
+                    .lifecycle_state,
+                RuntimeLifecycleState::Starting
+            );
+            child.0.wait().unwrap();
+            db.session_admissions()
+                .enqueue("exited-id", "exited", None, &identity, 4)
+                .unwrap();
+            assert!(cancel_dead_session_admission_head_on(&db.conn, 5).unwrap());
+        }
+    }
+
+    #[test]
+    fn admission_reclamation_and_starting_publication_are_transactionally_exclusive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let identity = current_identity();
+        db.session_admissions()
+            .enqueue("head-id", "head", None, &identity, 1)
+            .unwrap();
+        db.session_admissions()
+            .try_admit_next("claim", 0, 2)
+            .unwrap();
+        assert!(
+            db.session_admissions()
+                .begin_launch("head", "claim", 3)
+                .unwrap()
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let cancel_barrier = barrier.clone();
+        let cancel_path = path.clone();
+        let cancellation = std::thread::spawn(move || {
+            let mut db = MailboxDb::open(&cancel_path).unwrap();
+            cancel_barrier.wait();
+            let tx = db
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            // Inject terminal evidence to exercise the transaction race independently
+            // of scheduling a real process exit. Production uses the OS observer.
+            let cancelled = cancel_dead_session_admission_head_with(&tx, 4, |_| {
+                pid_identity::FinalizerProcessIdentityObservation::Dead
+            })
+            .unwrap();
+            tx.commit().unwrap();
+            cancelled
+        });
+        barrier.wait();
+        let generation_id =
+            RuntimeGenerationId::parse("97777777-7777-4777-8777-777777777778").unwrap();
+        let publication =
+            db.runtime_lifecycle()
+                .create_runtime_generation(CreateRuntimeGeneration {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: "head",
+                    session_id: None,
+                    runtime_mode: "headless",
+                    provider_name: "fixture",
+                    model_name: None,
+                    pty_control_path: None,
+                    models_dir: None,
+                    effective_cwd: None,
+                });
+        let cancelled = cancellation.join().unwrap();
+        assert_ne!(cancelled, publication.is_ok());
+        if let Err(error) = publication {
+            assert!(
+                error.to_string().contains("session admission is stale"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            db.runtime_lifecycle_reader()
+                .runtime_generation(&generation_id)
+                .unwrap()
+                .is_some(),
+            !cancelled
+        );
+        let row = db.session_admissions().row("head").unwrap().unwrap();
+        assert_eq!(row.state, if cancelled { "cancelled" } else { "launching" });
+        assert_eq!(row.runtime_generation_uuid.is_some(), !cancelled);
+        // Once publication wins, no reservation-only cancellation can undo it.
+        assert!(
+            !cancel_dead_session_admission_head_with(&db.conn, 5, |_| {
+                pid_identity::FinalizerProcessIdentityObservation::Dead
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn admission_concurrent_reclamation_admits_only_the_first_live_successor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let live = current_identity();
+        let replaced = ProcessIdentity {
+            os_pid_starttime_ticks: live.os_pid_starttime_ticks + 1,
+            ..live.clone()
+        };
+        db.session_admissions()
+            .enqueue("dead-id", "dead", None, &replaced, 1)
+            .unwrap();
+        db.session_admissions()
+            .enqueue("first-id", "first", None, &live, 2)
+            .unwrap();
+        db.session_admissions()
+            .enqueue("second-id", "second", None, &live, 3)
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = ["claim-a", "claim-b"]
+            .into_iter()
+            .map(|claim| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut db = MailboxDb::open(&path).unwrap();
+                    barrier.wait();
+                    db.session_admissions().try_admit_next(claim, 0, 4).unwrap()
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, SessionAdmissionAttempt::Waiting))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, SessionAdmissionAttempt::Admitted(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            db.session_admissions().row("dead").unwrap().unwrap().state,
+            "cancelled"
+        );
+        assert_eq!(
+            db.session_admissions().row("first").unwrap().unwrap().state,
+            "admitted"
+        );
+        assert_eq!(
+            db.session_admissions()
+                .row("second")
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
+        );
+    }
+
+    #[test]
+    fn admission_starting_unknown_creator_is_not_recovered() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("97777777-7777-4777-8777-777777777779").unwrap();
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "starting",
+                session_id: None,
+                runtime_mode: "headless",
+                provider_name: "fixture",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        // Out-of-range PID is malformed evidence, not an absent process.
+        db.conn
+            .execute(
+                "UPDATE runtime_generation SET creator_identity_os_pid = ?1",
+                params![i64::MAX],
+            )
+            .unwrap();
+        reconcile_dead_starting_generations_on(&db.conn, 4).unwrap();
+        assert_eq!(
+            db.runtime_lifecycle_reader()
+                .runtime_generation(&generation_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            RuntimeLifecycleState::Starting
+        );
+    }
+
+    #[test]
     fn admission_drain_reconciles_dead_sessionless_starting_generation() {
         let directory = tempfile::tempdir().unwrap();
         let sidecar_path = directory.path().join("pid-identity.db");
@@ -12598,7 +13016,7 @@ mod tests {
                      creator_identity_os_boot_id = 'dead-boot',
                      creator_identity_os_pid_starttime_ticks = 1
                  WHERE generation_uuid = ?1",
-                params![generation_id.to_string(), i64::MAX],
+                params![generation_id.to_string(), i64::from(std::process::id())],
             )
             .unwrap();
         mailbox
