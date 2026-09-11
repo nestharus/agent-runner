@@ -303,6 +303,19 @@ mod linux {
                 {
                     return Err(io::Error::last_os_error());
                 }
+                // P is the published group leader AND status transport, not the
+                // workload. Block forwarded terminal signals before either fork
+                // so group delivery cannot kill P ahead of W's trapped outcome.
+                // Do not ignore them: ignored dispositions would survive exec.
+                let mut terminal_signals: libc::sigset_t = std::mem::zeroed();
+                let mut workload_mask: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut terminal_signals);
+                for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+                    libc::sigaddset(&mut terminal_signals, signal);
+                }
+                if libc::sigprocmask(libc::SIG_BLOCK, &terminal_signals, &mut workload_mask) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
                 reset_handlers();
                 libc::signal(libc::SIGCHLD, libc::SIG_DFL);
                 let proxy = libc::getpid();
@@ -349,10 +362,21 @@ mod linux {
                 if workload == 0 {
                     libc::close(fd);
                     libc::close(status_pair[1]);
-                    if libc::setpgid(0, proxy) != 0 {
+                    if libc::setpgid(0, proxy) != 0
+                        || libc::sigprocmask(
+                            libc::SIG_SETMASK,
+                            &workload_mask,
+                            std::ptr::null_mut(),
+                        ) != 0
+                    {
                         return Err(io::Error::last_os_error());
                     }
                     return Ok(());
+                }
+                // C is outside the published group. Only P retains the block;
+                // exact custodian failure and unknown-custody fences are intact.
+                if libc::sigprocmask(libc::SIG_SETMASK, &workload_mask, std::ptr::null_mut()) != 0 {
+                    libc::_exit(125);
                 }
                 reap_tree(fd, workload, status_pair[1]);
             });
@@ -457,8 +481,42 @@ mod linux {
         }
     }
 
+    // PTY hangup is delivered by the kernel to its session leader P, not
+    // necessarily to W. Relay that directed notification to the owned group.
+    // User/runner killpg already reaches W: relaying it again would duplicate
+    // signals (and recursively relay our own killpg). P pins this group ID.
+    unsafe extern "C" fn proxy_terminal_hangup(
+        _signal: libc::c_int,
+        info: *mut libc::siginfo_t,
+        _context: *mut libc::c_void,
+    ) {
+        unsafe {
+            let saved_errno = *libc::__errno_location();
+            if !info.is_null() && (*info).si_code == libc::SI_KERNEL {
+                libc::kill(-libc::getpid(), libc::SIGHUP);
+            }
+            // recv/wait_exact own their errno even when interrupted by hangup.
+            *libc::__errno_location() = saved_errno;
+        }
+    }
+
     unsafe fn proxy_status(fd: RawFd, custodian: libc::pid_t, launch_fd: RawFd) -> ! {
         unsafe {
+            // Only P installs this handler, after C has forked with the original
+            // dispositions. HUP was blocked before the fork, so an early PTY
+            // notification remains pending until the relay is ready.
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = proxy_terminal_hangup as *const () as usize;
+            action.sa_flags = libc::SA_SIGINFO;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut hup: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut hup);
+            libc::sigaddset(&mut hup, libc::SIGHUP);
+            if libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut()) != 0
+                || libc::sigprocmask(libc::SIG_UNBLOCK, &hup, std::ptr::null_mut()) != 0
+            {
+                libc::_exit(125);
+            }
             // A stopped proxy also retains the launch endpoint until actual exit.
             close_except(fd, launch_fd);
             let mut status: i32 = 125 << 8;
@@ -939,5 +997,104 @@ mod tests {
         assert_eq!(child.wait().unwrap().code(), Some(7));
         eventually(|| custody.quiescent());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn published_group_terminal_signals_preserve_workload_status() {
+        use std::os::unix::process::ExitStatusExt;
+        // Each fake W is finite, and this guard pins P until owned escalation
+        // and consuming wait, including assertion unwind.
+        struct PublishedChild(Child);
+        impl Drop for PublishedChild {
+            fn drop(&mut self) {
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    unsafe {
+                        libc::killpg(self.0.id() as i32, libc::SIGKILL);
+                    }
+                }
+                let _ = self.0.wait();
+            }
+        }
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            for exit_code in [-1, 0, 37] {
+                let root = std::env::temp_dir().join(format!(
+                    "published-signal-{}-{signal}-{exit_code}",
+                    std::process::id()
+                ));
+                std::fs::create_dir(&root).unwrap();
+                let custody = LaunchCustody::start(root.join("proof")).unwrap();
+                let mut command = Command::new("/usr/bin/python3");
+                command
+                    .args([
+                        "-c",
+                        r#"
+import os, pathlib, resource, signal, sys, time
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+sig, code = map(int, sys.argv[1:])
+root = pathlib.Path('.')
+received = 0
+def trapped(signum, frame):
+    global received
+    received += 1
+    (root / 'trapped').write_text(str(received))
+    deadline = time.monotonic() + 4
+    while not (root / 'release').exists():
+        if time.monotonic() >= deadline: os._exit(92)
+        time.sleep(.005)
+    os._exit(code)
+signal.signal(sig, trapped if code >= 0 else signal.SIG_DFL)
+(root / 'ready').write_text(str(os.getpid()))
+time.sleep(5)
+os._exit(93)
+"#,
+                    ])
+                    .arg(signal.to_string())
+                    .arg(exit_code.to_string())
+                    .current_dir(&root)
+                    .env_clear()
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(0);
+                custody.configure(&mut command).unwrap();
+                let mut child = PublishedChild(command.spawn().unwrap());
+                drop(command);
+                custody.seal();
+                eventually(|| root.join("ready").exists());
+                let workload: i32 = std::fs::read_to_string(root.join("ready"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let published = child.0.id() as i32;
+                assert_ne!(workload, published);
+                assert_eq!(unsafe { libc::getpgid(workload) }, published);
+                assert_eq!(unsafe { libc::killpg(published, signal) }, 0);
+                if exit_code >= 0 {
+                    eventually(|| root.join("trapped").exists());
+                    // A marker is not exit proof: W is still deliberately held.
+                    assert!(child.0.try_wait().unwrap().is_none());
+                    assert!(!custody.quiescent());
+                    std::fs::write(root.join("release"), b"release").unwrap();
+                }
+                let mut status = None;
+                eventually(|| {
+                    status = child.0.try_wait().unwrap();
+                    status.is_some()
+                });
+                let status = status.unwrap();
+                if exit_code < 0 {
+                    assert_eq!(status.signal(), Some(signal));
+                } else {
+                    assert_eq!(status.code(), Some(exit_code));
+                    assert_eq!(std::fs::read_to_string(root.join("trapped")).unwrap(), "1");
+                }
+                eventually(|| custody.quiescent());
+                assert!(!std::path::Path::new(&format!("/proc/{workload}")).exists());
+                eprintln!(
+                    "published signal={signal} expected_code={exit_code} status={status:?} Q=true"
+                );
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 }
