@@ -158,6 +158,11 @@ impl LiveSessionBindingServer {
         let session_id = Arc::clone(&self.session_id);
         let shutdown = Arc::clone(&self.shutdown);
         self.worker = Some(thread::spawn(move || {
+            // Thread-local provider custody must be explicitly transferred to
+            // this generation-affiliated worker before session.capture spawns.
+            let _scope = crate::executor::cli::spawn_identity::launch_custody_scope(
+                Some(&spawn_context),
+            );
             serve_live_session_reports(
                 listener,
                 context,
@@ -568,6 +573,53 @@ mod tests {
     const SESSION_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
     const PROVIDER_NAME: &str = "fixture-account";
     const MODEL_NAME: &str = "fixture-model";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_worker_retains_custody_after_creator_crash() {
+        const CHILD: &str = "AGE354_CAPTURE_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let mut fixture = LiveBindingFixture::new();
+            // No native workload is required: only the generation's binding
+            // helper is under experiment. Reap the fixture placeholder first.
+            fixture.child.kill().unwrap();
+            fixture.child.wait().unwrap();
+            std::fs::write(fixture._temp.path().join("capture.block"), b"").unwrap();
+            std::fs::write(Path::new(&root).join("fixture"), fixture._temp.path().as_os_str().as_encoded_bytes()).unwrap();
+            let _ = report_live_session_binding(&fixture.server.socket_path, &fixture.server.token,
+                INVOCATION_UUID, SESSION_ID);
+            panic!("capture creator was not crashed");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut creator = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "executor::cli::live_session_binding::tests::capture_worker_retains_custody_after_creator_crash", "--nocapture"])
+            .env(CHILD, root.path()).spawn().unwrap();
+        capture_eventually(|| root.path().join("fixture").exists());
+        let fixture = PathBuf::from(std::fs::read_to_string(root.path().join("fixture")).unwrap());
+        capture_eventually(|| fixture.join("capture.started").exists());
+        let sidecar = MailboxDb::path_for_state_db(&fixture.join("state.db"));
+        let proof_dir = sidecar.with_extension("starting-custody-v1");
+        let proof = std::fs::read_dir(proof_dir).unwrap().next().unwrap().unwrap().path();
+        creator.kill().unwrap(); // Retain the creator zombie while checking proof.
+        assert!(!oulipoly_core::launch_custody::is_quiescent(&proof));
+        // Both the helper's execution marker and an unreaped dead creator are
+        // real. The release, not creator exit, permits helper/tree cessation.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!oulipoly_core::launch_custody::is_quiescent(&proof));
+        std::fs::write(fixture.join("capture.release"), b"").unwrap();
+        capture_eventually(|| oulipoly_core::launch_custody::is_quiescent(&proof));
+        creator.wait().unwrap();
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_eventually(mut predicate: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !predicate() {
+            assert!(std::time::Instant::now() < deadline, "capture fixture deadline");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn exact_live_report_binds_state_chain_and_runtime_generation() {
@@ -1093,6 +1145,7 @@ mod tests {
         let path = dir.join("fake-provider");
         std::fs::write(dir.join("transcript.jsonl"), "{}\n").unwrap();
         let transcript_path = dir.join("transcript.jsonl").display().to_string();
+        let dir = dir.display();
         let script = format!(
             r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -1103,6 +1156,15 @@ case "${{1-}}" in
     printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","ok":true,"result":{{"provider_id":"fixture","display_name":"Fixture","contract_versions":["oulipoly.provider/v1"],"preferred_contract":"oulipoly.provider/v1","capabilities":{{"launch":false,"policy":false,"quota":false,"session":true,"session_enumerate":false,"terminal":false,"rotation":false,"discovery":false,"settings":false,"setup_brain":false,"setup":false,"migration":false}}}}}}\n' "$request_id"
     ;;
   session.capture)
+    if [ -f '{dir}/capture.block' ]; then
+      printf '%s' "$$" > '{dir}/capture.started'
+      attempts=0
+      while [ ! -f '{dir}/capture.release' ]; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 500 ] || exit 75
+        /bin/sleep 0.01
+      done
+    fi
     printf '%s' "$request" | grep -F '"live_report"' >/dev/null
     printf '%s' "$request" | grep -F '"provider_session_id":"{session_id}"' >/dev/null
     printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","ok":true,"result":{{"provider_session_id":"{session_id}","state":null,"artifacts":[]}}}}\n' "$request_id"
