@@ -130,6 +130,12 @@ fn enqueue_and_wait_at_with_memory_observer(
             .ok_or_else(|| {
                 format!("Session admission {registration_identity} disappeared while queued")
             })?;
+        if matches!(row.state.as_str(), "cancelled" | "settled") {
+            return Err(format!(
+                "Session admission {registration_identity} ended without launch: {} ({})",
+                row.state, row.queue_reason
+            ));
+        }
         if let Some(claim_token) = admitted_claim_token(&row)
             && db.session_admissions().begin_launch(
                 registration_identity,
@@ -598,7 +604,7 @@ mod tests {
         ExitRuntimeGenerationNonOrderly, RuntimeGenerationFence, RuntimeGenerationId,
         RuntimeLifecycleState, RuntimeTerminalReason,
     };
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::{Arc, Barrier};
 
     fn config() -> AdmissionCapacityConfig {
         AdmissionCapacityConfig {
@@ -1653,8 +1659,8 @@ mod tests {
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
         let dead = oulipoly_state::pid_identity::ProcessIdentity {
-            os_pid: i64::MAX,
-            os_boot_id: "dead-boot".to_string(),
+            os_pid: i64::from(std::process::id()),
+            os_boot_id: "replaced-boot".to_string(),
             os_pid_starttime_ticks: 1,
         };
         db.session_admissions()
@@ -1710,8 +1716,8 @@ mod tests {
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
         let dead = oulipoly_state::pid_identity::ProcessIdentity {
-            os_pid: i64::MAX,
-            os_boot_id: "dead-boot".to_string(),
+            os_pid: i64::from(std::process::id()),
+            os_boot_id: "replaced-boot".to_string(),
             os_pid_starttime_ticks: 1,
         };
         db.session_admissions()
@@ -1719,17 +1725,23 @@ mod tests {
             .unwrap();
         drop(db);
 
-        let (sender, receiver) = mpsc::channel();
-        let waiter_path = path.clone();
-        std::thread::spawn(move || {
-            sender
-                .send(enqueue_and_wait_at(&waiter_path, "live", None))
-                .unwrap();
-        });
-        let guard = receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("live successor did not reconcile the dead FIFO head")
-            .unwrap();
+        // Bound the waiter itself: on deadline telemetry becomes unavailable,
+        // cancelling this exact queued admission instead of leaking a thread.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let guard = enqueue_and_wait_at_with_memory_observer(
+            &path,
+            "live",
+            None,
+            || {
+                if std::time::Instant::now() < deadline {
+                    roomy_default_memory()
+                } else {
+                    Ok(None)
+                }
+            },
+            false,
+        )
+        .expect("live successor did not reconcile the dead FIFO head");
 
         let mut db = MailboxDb::open(&path).unwrap();
         assert_eq!(
@@ -1741,6 +1753,58 @@ mod tests {
             "launching"
         );
         drop(guard);
+    }
+
+    #[test]
+    fn cancellation_during_wait_finishes_without_launch_or_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let result = enqueue_and_wait_at_with_memory_observer(
+            &path,
+            "cancel-during-wait",
+            None,
+            || {
+                let mut db = MailboxDb::open(&path)?;
+                let row = db.session_admissions().row("cancel-during-wait")?.unwrap();
+                assert!(db.session_admissions().cancel_queued(
+                    "cancel-during-wait",
+                    &row.admission_id,
+                    "fixture_cancelled",
+                    unix_time_ms()?,
+                )?);
+                roomy_memory()
+            },
+            false,
+        );
+        let error = result
+            .err()
+            .expect("cancellation cannot report launch success");
+        assert!(error.contains("cancelled (fixture_cancelled)"), "{error}");
+    }
+
+    #[test]
+    fn terminal_admission_waiter_returns_non_success_without_observing_memory() {
+        for state in ["cancelled", "settled"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pid-identity.db");
+            let mut db = MailboxDb::open(&path).unwrap();
+            enqueue(&mut db, "terminal", None, 1);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute("UPDATE session_admission_queue SET state = ?1, claim_token = CASE WHEN ?1 = 'settled' THEN 'claim' ELSE NULL END, claimed_at_unix_ms = CASE WHEN ?1 = 'settled' THEN 1 ELSE NULL END", [state])
+                .unwrap();
+            let result = enqueue_and_wait_at_with_memory_observer(
+                &path,
+                "terminal",
+                None,
+                || panic!("terminal waiter must not drain or sleep"),
+                false,
+            );
+            let error = result
+                .err()
+                .expect("terminal admission cannot report launch success");
+            assert!(error.contains("ended without launch"), "{error}");
+            assert!(error.contains(state), "{error}");
+        }
     }
 
     #[test]

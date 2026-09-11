@@ -336,7 +336,7 @@ pub fn observe_live_process_identity(os_pid: i64) -> ProcessIdentityObservation 
     observe_live_process_identity_impl(os_pid)
 }
 
-/// Conservative evidence for finalizer reclamation only. Keep the established
+/// Conservative evidence shared by finalizer and admission reclamation. Keep the established
 /// optional-read semantics of the public observer and its authority callers.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn observe_finalizer_process_identity(
