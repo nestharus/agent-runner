@@ -298,8 +298,8 @@ fn receipt_cwd_recovery_requires_exact_persisted_authority() {
     let state = oulipoly_state::StateDb::open(&path).unwrap();
     let connection = rusqlite::Connection::open(&path).unwrap();
     connection.execute_batch(
-        "INSERT INTO session_chains (chain_id, created_at, last_used_at)
-         VALUES ('chain', '2026-09-11', '2026-09-11');
+        "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+         VALUES ('chain', '2026-09-11', '2026-09-11', 'fixture');
          INSERT INTO session_chain_segments
              (chain_id, provider_name, session_id, started_at, transition_reason)
          VALUES ('chain', 'account', 'session', '2026-09-11', 'initial');
