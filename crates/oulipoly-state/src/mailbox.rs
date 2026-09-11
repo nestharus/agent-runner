@@ -11948,7 +11948,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn starting_boot_recovery_uses_epoch_evidence_not_missing_proof_or_pid_absence() {
-        for (boot, previous_boot) in [(current_identity().os_boot_id, false), ("unverifiable".into(), false), (uuid::Uuid::new_v4().to_string(), true)] {
+        let current = current_identity().os_boot_id;
+        let previous = if current == "11111111-1111-4111-8111-111111111111" {
+            "22222222-2222-4222-8222-222222222222"
+        } else {
+            "11111111-1111-4111-8111-111111111111"
+        };
+        for (boot, previous_boot) in [(current, false), ("unverifiable".into(), false), (previous.into(), true)] {
             for route in ["session", "global"] {
                 let directory = tempfile::tempdir().unwrap();
                 let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
