@@ -11076,44 +11076,47 @@ fn reconcile_dead_starting_generations_on(
     conn: &Connection,
     now_unix_ms: i64,
 ) -> Result<(), String> {
-    let generation = conn
-        .query_row(
-            "SELECT generation_uuid, creator_identity_os_pid,
-                    creator_identity_os_boot_id,
-                    creator_identity_os_pid_starttime_ticks
-             FROM runtime_generation
-             WHERE lifecycle_state = 'starting'
-               AND identity_os_pid IS NULL
-               AND creator_identity_os_pid IS NOT NULL
-             ORDER BY created_at
-             LIMIT 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    ProcessIdentity {
-                        os_pid: row.get(1)?,
-                        os_boot_id: row.get(2)?,
-                        os_pid_starttime_ticks: row.get(3)?,
-                    },
-                ))
-            },
-        )
-        .optional()
-        .map_err(|err| format!("Failed to read starting-generation creator: {err}"))?;
-    let Some((generation_uuid, creator)) = generation else {
-        return Ok(());
-    };
-    let id = RuntimeGenerationId::parse(&generation_uuid).map_err(|e| e.to_string())?;
+    // Eligibility is per generation. An old unknown row still blocks admission,
+    // but must not hide affirmative cessation evidence belonging to later rows.
+    // Snapshot candidates before mutating the lifecycle index being scanned.
+    for generation_uuid in unpublished_starting_generation_ids_on(conn)? {
+        reconcile_dead_starting_generation_on(conn, &generation_uuid, now_unix_ms)?;
+    }
+    Ok(())
+}
+
+fn unpublished_starting_generation_ids_on(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut statement = conn.prepare(
+        "SELECT generation_uuid FROM runtime_generation
+         WHERE lifecycle_state = 'starting'
+           AND identity_os_pid IS NULL
+           AND creator_identity_os_pid IS NOT NULL
+         ORDER BY created_at, generation_uuid",
+    ).map_err(|err| format!("Failed to prepare starting-generation scan: {err}"))?;
+    statement.query_map([], |row| row.get(0))
+        .map_err(|err| format!("Failed to scan starting generations: {err}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|err| format!("Failed to read starting-generation identity: {err}"))
+}
+
+fn reconcile_dead_starting_generation_on(
+    conn: &Connection,
+    generation_uuid: &str,
+    now_unix_ms: i64,
+) -> Result<(), String> {
+    let id = RuntimeGenerationId::parse(generation_uuid).map_err(|e| e.to_string())?;
     let Some(row) = runtime_generation_by_id_on(conn, &id).map_err(|e| e.to_string())? else {
         return Ok(());
     };
+    let ExactProcessEvidence::Recorded(ref creator) = row.creator_process_evidence else {
+        return Ok(());
+    };
     let recover = generation_boot_has_ended(&row) || (custody_allows_recovery(conn, &row)
-        && reservation_owner_has_exited(&creator, observe_session_admission_owner(creator.os_pid)));
+        && reservation_owner_has_exited(creator, observe_session_admission_owner(creator.os_pid)));
     if !recover {
         return Ok(());
     }
-    conn.execute(
+    let changed = conn.execute(
         "UPDATE runtime_generation
          SET lifecycle_state = 'exited', exited_at = ?2,
              terminal_reason = 'recovered_dead'
@@ -11132,6 +11135,9 @@ fn reconcile_dead_starting_generations_on(
         ],
     )
     .map_err(|err| format!("Failed to reconcile dead starting generation: {err}"))?;
+    if changed != 1 {
+        return Ok(());
+    }
     conn.execute(
         "UPDATE session_admission_queue
           SET state = 'settled', queue_reason = 'settled', updated_at_unix_ms = ?2
@@ -11912,6 +11918,10 @@ fn now_unix_millis() -> Result<i64, String> {
         .try_into()
         .map_err(|_| "mailbox evidence timestamp exceeds i64".to_string())
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "mailbox/starting_recovery_tests.rs"]
+mod starting_recovery_tests;
 
 #[cfg(test)]
 mod tests {
