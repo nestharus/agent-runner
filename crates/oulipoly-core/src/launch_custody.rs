@@ -35,6 +35,8 @@ pub struct LaunchCustody {
     path: PathBuf,
     #[cfg(target_os = "linux")]
     endpoint: Mutex<Option<std::os::fd::OwnedFd>>,
+    #[cfg(all(test, target_os = "linux"))]
+    monitor_pid: i32,
 }
 impl PartialEq for LaunchCustody {
     fn eq(&self, other: &Self) -> bool {
@@ -144,6 +146,53 @@ mod linux {
         }
     }
 
+    // Parent-side ownership only. This guard is never constructed in a raw
+    // child. Readiness/thread-start failures kill and reap the still-owned M;
+    // successful setup transfers its consuming wait to one dedicated thread.
+    struct MonitorOwner(Option<libc::pid_t>);
+    impl MonitorOwner {
+        fn wait(mut self) {
+            if let Some(pid) = self.0.take() {
+                let mut status = 0;
+                unsafe {
+                    wait_exact(pid, &mut status);
+                }
+            }
+        }
+    }
+    impl Drop for MonitorOwner {
+        fn drop(&mut self) {
+            let Some(pid) = self.0.take() else {
+                return;
+            };
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            loop {
+                let rc = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        info.as_mut_ptr(),
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                if rc == 0 {
+                    // The retained owned child pins the numeric signal target.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                    let mut status = 0;
+                    unsafe {
+                        wait_exact(pid, &mut status);
+                    }
+                    break;
+                }
+                if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
+        }
+    }
+
     pub(super) fn start(path: PathBuf) -> io::Result<LaunchCustody> {
         let parent = path
             .parent()
@@ -177,27 +226,14 @@ mod linux {
             return Err(io::Error::last_os_error());
         }
         if pid == 0 {
-            // After fork: syscall-only paths, no allocator, Rust locks, logging,
-            // unwinding or destructors. A short intermediate owns the detach.
+            // Syscall-only after fork; setsid detaches cancellation scope, not
+            // parenthood. M has no parent-death signal and survives creator exit.
             unsafe {
-                let detached = fork_process();
-                if detached < 0 {
-                    libc::_exit(125);
-                }
-                if detached > 0 {
-                    libc::_exit(0);
-                }
                 monitor(server.as_raw_fd(), proof.as_raw_fd());
             }
         }
+        let owner = MonitorOwner(Some(pid));
         drop(server);
-        let mut status = 0;
-        unsafe {
-            wait_exact(pid, &mut status);
-        }
-        if status != 0 {
-            return Err(io::Error::other("launch custodian detach failed"));
-        }
         // Readiness is bounded even if the detached child cannot initialize.
         let mut pollfd = libc::pollfd {
             fd: client.as_raw_fd(),
@@ -213,9 +249,14 @@ mod linux {
         {
             return Err(io::Error::other("launch custodian not ready"));
         }
+        std::thread::Builder::new()
+            .name("launch-custody-wait".into())
+            .spawn(move || owner.wait())?;
         Ok(LaunchCustody {
             path,
             endpoint: Mutex::new(Some(client)),
+            #[cfg(test)]
+            monitor_pid: pid,
         })
     }
 
@@ -406,6 +447,8 @@ mod linux {
                 if rc < 0 && *libc::__errno_location() == libc::EINTR {
                     continue;
                 }
+                let mut custody_status = 0;
+                wait_exact(custodian, &mut custody_status);
                 libc::_exit(125);
             }
             let mut custody_status = 0;
@@ -736,6 +779,19 @@ mod tests {
         fixture.crash_unreaped();
         std::thread::sleep(Duration::from_millis(1200));
         assert!(!is_quiescent(&fixture.root.join("proof")));
+        eventually(|| !std::path::Path::new(&format!("/proc/{custodian}")).exists());
+    }
+
+    #[test]
+    fn completed_monitor_is_reaped_while_its_creator_remains_alive() {
+        let root = std::env::temp_dir().join(format!("custody-wait-owner-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let custody = LaunchCustody::start(root.join("proof")).unwrap();
+        let pid = custody.monitor_pid;
+        custody.seal();
+        eventually(|| custody.quiescent());
+        eventually(|| !std::path::Path::new(&format!("/proc/{pid}")).exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

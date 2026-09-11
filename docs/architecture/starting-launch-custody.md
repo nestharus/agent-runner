@@ -15,6 +15,12 @@ creator ── readiness-acknowledged detached monitor M
                      └── descendants, including changed groups / double forks
 ```
 
+M is session-detached but remains the creator's child while that creator lives.
+A dedicated parent-side thread owns M's consuming wait, so normal completion does
+not rely on reparenting to PID1. Creator crash destroys that waiter but not M;
+the environment's adopter then owns reaping M. Setup failure kills/reaps the
+still-owned monitor before returning no launch authority.
+
 M exists before Starting creation. It owns an exclusive-created proof inode and
 a sequenced-packet endpoint. Contexts and configured commands retain the other
 endpoint; fork inherits it before any child instructions can run. A stopped
