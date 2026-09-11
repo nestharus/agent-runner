@@ -98,6 +98,23 @@ fn direct_children() -> std::collections::BTreeSet<i32> {
 
 #[test]
 fn helper_tree_wait_completes_independently_of_live_command_in_same_generation() {
+    // Count only this fixture's children, even when the outer library suite
+    // runs unrelated process tests in parallel.
+    const ISOLATED: &str = "OULIPOLY_TEST_GENERATION_WAIT_ISOLATED";
+    if std::env::var_os(ISOLATED).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process::generation_wait_tests::helper_tree_wait_completes_independently_of_live_command_in_same_generation", "--nocapture"])
+            .env(ISOLATED, "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        return;
+    }
     let fixture = Fixture::new();
     let custody = Arc::new(LaunchCustody::start(fixture.0.join("proof")).unwrap());
     let main_custody = Arc::clone(&custody);
