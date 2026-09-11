@@ -23,7 +23,9 @@ still-owned monitor before returning no launch authority.
 
 M exists before Starting creation. It owns an exclusive-created proof inode and
 a sequenced-packet endpoint. Contexts and configured commands retain the other
-endpoint; fork inherits it before any child instructions can run. A stopped
+endpoint; configured Commands retain an Arc to the same parent descriptor rather
+than duplicating an FD per command. Fork duplicates the descriptor table before
+any child instructions can run. A stopped
 pre-exec child therefore retains custody even after its creator dies.
 
 C moves out of the workload kill group, establishes subreaping, records Begin to
@@ -55,7 +57,10 @@ stdio/group/session setup. External-provider dispatch establishes the same scope
 before registry preflight; all synchronous provider operations, including describe
 and policy, install custody. Allocated attempts share their already-established
 context. The scope is thread-affine (not Send/Sync); it does not implicitly
-propagate authority into new worker threads. Provider containment filters run *after* the custody pre-exec callback:
+propagate authority into new worker threads. The live-session binding worker
+explicitly enters its generation's scope before capture/locator provider calls.
+This does not preserve the binding listener after creator death or supply duplicate
+ACK behavior. Provider containment filters run *after* the custody pre-exec callback:
 they apply to W, not C's required group separation.
 
 After fork, the custodian/proxy branches use only raw syscalls and `_exit`, not
@@ -66,8 +71,13 @@ is introduced. Creator-thread PDEATHSIG is disabled before the independent fork;
 no temporary spawning thread owns the executable's survival.
 
 The implementation requires Linux fork, subreaper and `close_range` support.
-Unsupported setup fails closed before Starting authorization. Native macOS and
-Windows custody implementations are not supplied here.
+Linux custody setup failures do not fall back to unprotected Linux execution.
+Monitor readiness precedes Starting; per-command subreaper/group setup can fail
+later during spawn and must take the fenced failure-finalization path.
+Native macOS/Windows runtime launches retain their pre-custody launch/recovery
+boundary: registration does not request this Linux primitive or register a proof.
+No independent-tree custody guarantee is claimed for those platforms. The core
+primitive itself still returns Unsupported there if directly requested.
 
 ## Durable evidence and recovery
 
@@ -77,11 +87,23 @@ Quiescence must be read from that exact regular inode. Missing, replaced,
 unreadable or incomplete evidence is unknown. No proof files are reused, replaced
 or garbage-collected by this implementation.
 
-Both global Starting reconciliation and same-session recovery require custody
-proof and the existing conservative creator PID/boot/start observation. Recovery
+Within the same Linux boot, global Starting reconciliation and same-session
+recovery require custody proof and conservative creator PID/start observation. Recovery
 also revalidates within its mutation transaction. Protocol-bearing Running rows
 retain the proof requirement if their proxy has died. Late publication cannot
 resurrect a recovered generation.
+
+An independent cessation certificate is available after a host reboot: the
+host-local sidecar's recorded Linux kernel boot UUID and the current authoritative
+kernel boot UUID must both be valid v4 UUIDs and differ. Any recorded child boot
+must agree with its creator's epoch. The old kernel's entire process population
+has ceased; missing unpublished PIDs are immaterial to that certificate. Both
+recovery consumers and transactional RecoveredDead validation use it. This does
+not write Q or assert that historical custody ever completed successfully.
+Missing/malformed boot evidence, the same boot, and macOS/Windows absolute-start
+sentinels do not supply this certificate. Cross-host copied databases and
+independently virtualized procfs boot-ID views are outside this host-local identity
+contract; differing IDs in those environments alone do not prove remote death.
 
 Finalization revokes future context configuration and awaits affirmative proof;
 already-configured commands retain their endpoint until dropped. Thus even a
@@ -89,9 +111,10 @@ reusable configured command prevents premature quiescence. Failure to prove
 quiescence withholds settlement, not fabricates success. Receipt ACK remains a
 separate concern.
 
-Legacy Starting rows have no prospective proof and remain unknown, including on
-schema upgrade. No automatic backfill or creator-death clearance is supplied.
-All Starting rows block global materialization, including rows without an
+Legacy Linux Starting rows have no prospective proof and remain unknown within
+the same boot, including on schema upgrade. No automatic backfill or creator-death
+clearance is supplied. An authoritative ended-host-boot certificate is independent
+of that missing proof. All Linux Starting rows block global materialization, including rows without an
 associated launching admission. Running rows without this protocol retain their
 previous observation contract; this does not retroactively attest that contract.
 
@@ -105,3 +128,48 @@ barrier precedes sending its request on stdin: those entry tests prove custody o
 the unpublished protocol process, not that a native model began executing.
 Separate private process tests cover already-executing descendants. No installed
 provider/model or production-state experiment is implied.
+
+## Correction limits and unresolved topology
+
+The supervisor keeps its 50ms polling cadence after both output drains disconnect;
+EOF does not establish proxy/tree exit. Configuration no longer allocates a new
+FD after Starting. Configuration errors and errors from the post-registration
+private barrier attempt fenced StartupFailed finalization and retain any cleanup
+failure diagnostic. General resource/storage failure can still prevent durable
+finalization; no successful mutation is promised under unavailable storage or
+process-wide exhaustion.
+
+Resident costs are not solved by the descriptor reduction: one monitor M and its
+wait thread per generation, plus P and C per active command, remain. Ten thousand
+one hundred simultaneously active one-command generations imply 30,300 extra
+processes and 10,100 extra monitor-wait threads over direct W children, excluding
+creators/drains/provider infrastructure. This is a source-derived task count, not
+a memory/throughput measurement or an established concurrency requirement.
+
+Potential reductions require distinct choices, not deletion of custody owners:
+
+- A process-local pidfd/epoll wait reactor can replace per-M wait threads while
+  retaining exact consuming wait ownership. It saves threads only where multiple
+  generations share a creator, adds pidfd/reactor lifetime handling, and must not
+  steal another subsystem's children with waitpid(-1).
+- A cross-creator broker could share monitoring/reaping, but requires a real
+  pre-spawn authority-transfer protocol and an ancestor/adoption arrangement.
+  Existing sibling M cannot certify C's children using its own ECHILD.
+- Removing P requires replacing the std::process::Child/status/group contract;
+  removing C without replacing its cancellation-independent tree ownership loses
+  proof on ordinary killpg. A native-W handle plus separate custody completion is
+  a viable API redesign, not a transparent one-process optimization.
+- A delegated cgroup-v2 subtree can provide kernel membership/cessation evidence
+  without per-command P/C, but needs deployment authority, pre-exec membership,
+  escape prevention, exact subtree identity, and explicit wait/reap ownership.
+  Unsupported Linux environments must not silently fall back to weaker custody.
+
+The candidate keeps global Starting serialization. Known-session quarantine could
+preserve that session's non-overlap while admitting unrelated sessions; adopting
+it requires deciding whether global materialization represents a protected
+single-producer/global-resource invariant or only session overlap. Sessionless
+unpublished work needs an explicit affected-authority boundary or stays globally
+uncertain. No count cap, age expiry, assumed missing-proof clearance, or silent
+change of that admission invariant is implemented. Existing Running sessions are
+not automatically stopped by this predicate. Root must decide the topology and
+availability scope before treating this candidate as complete.
