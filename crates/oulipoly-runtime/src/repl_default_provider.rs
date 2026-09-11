@@ -1449,6 +1449,40 @@ executable = "{}"
     }
 
     #[test]
+    fn age356_success_without_required_identity_retains_incident_failure_signal() {
+        struct UnboundLauncher;
+        impl InteractiveLauncher for UnboundLauncher {
+            fn launch(
+                &self,
+                _: &ProviderConfig,
+                _: Option<&Path>,
+                _: Option<&str>,
+                _: Option<&Path>,
+                _: Option<InteractiveLiveSessionBinding>,
+            ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
+                let mut result = successful_interactive_result();
+                result.live_session_capture_required = true;
+                Ok(result)
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        StateDb::open(&state_path).unwrap();
+        write_config(temp.path(), r#"default_provider = "generic""#);
+        write_providers(temp.path(), &provider_fixture("generic"));
+        let error = run_repl_with_default_provider_with_launcher(
+            runtime_services_with_state(temp.path().to_path_buf(), state_path.clone()),
+            &UnboundLauncher,
+        )
+        .unwrap_err();
+        assert!(error.contains(LIVE_SESSION_IDENTITY_UNAVAILABLE), "{error}");
+        let (_, _, status, session, capture) = invocation_row(&state_path);
+        assert_eq!(status, "failed");
+        assert_eq!(session, None);
+        assert_eq!(capture, None);
+    }
+
+    #[test]
     fn creates_unknown_model_invocation_row() {
         let temp = tempfile::tempdir().unwrap();
         let state_path = temp.path().join("state.db");
