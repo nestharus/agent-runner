@@ -114,7 +114,7 @@ pub(super) fn reconcile_pending_headless_delivery_observations(
             continue;
         }
         if let Err(error) =
-            let observation = crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
+            crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
                 attempt_id: pending.attempt_id,
                 anchor_identity: crate::native_receipt::helper::anchor_identity(&pending.anchor),
                 model_name: resolved.model_name.clone().unwrap_or_default(),
@@ -494,7 +494,7 @@ fn confirm_mailbox_delivery_from_anchor(
         return Ok(false);
     }
     drop(db);
-    crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
+    let observation = crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
         attempt_id: attempt_id.to_string(),
         anchor_identity: crate::native_receipt::helper::anchor_identity(&anchor),
         model_name: input.resolved.model_name.clone().unwrap_or_default(),
