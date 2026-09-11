@@ -4242,7 +4242,12 @@ impl MailboxDb {
         if let Err(error) = self.project_native_delivery_receipt(
             attempt_id, invocation_uuid, &anchor.provider_session_id, &now,
         ) {
-            self.record_delivery_observation_error(attempt_id, &error)?;
+            self.conn.execute(
+                "UPDATE mailbox_delivery_attempts SET observation_error = ?3
+                 WHERE attempt_id = ?1 AND delivery_invocation_uuid = ?2
+                   AND resolved_at IS NULL AND observation_confirmed_at IS NOT NULL",
+                params![attempt_id, invocation_uuid, truncate_utf8(&error, 1024)],
+            ).map_err(|storage| format!("{error}; receipt projection diagnostic: {storage}"))?;
             return Err(error);
         }
         Ok(true)
