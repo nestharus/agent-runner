@@ -8904,7 +8904,8 @@ fn register_custody_proof_on(
 
 fn custody_allows_recovery(conn: &Connection, generation: &RuntimeGenerationRow) -> bool {
     custody_proof_observation(conn, generation)
-        .unwrap_or(generation.lifecycle_state != RuntimeLifecycleState::Starting)
+        .unwrap_or(!cfg!(target_os = "linux")
+            || generation.lifecycle_state != RuntimeLifecycleState::Starting)
 }
 
 fn custody_allows_terminal(conn: &Connection, generation: &RuntimeGenerationRow) -> bool {
@@ -10840,8 +10841,13 @@ fn unmaterialized_session_admission_exists_on(conn: &Connection) -> Result<bool,
                  SELECT 1
                  FROM runtime_generation generation
                  WHERE generation.lifecycle_state = 'starting'
+                   AND (?1 OR EXISTS (
+                       SELECT 1 FROM session_admission_queue admission
+                       WHERE admission.runtime_generation_uuid = generation.generation_uuid
+                         AND admission.state = 'launching'
+                   ))
              )",
-        [],
+        params![cfg!(target_os = "linux")],
         |row| row.get(0),
     )
     .map_err(|err| format!("Failed to inspect materializing session admissions: {err}"))

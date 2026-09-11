@@ -467,6 +467,7 @@ fn register_generation_starting(
     let mut db = context.open_mailbox()?;
     recover_stale_session_generations(&mut db, context)?;
     // The monitor is ready before Starting can grant any spawn authority.
+    #[cfg(target_os = "linux")]
     if context.launch_custody.get().is_none() {
         let path = oulipoly_core::launch_custody::proof_path(db.path(), &context.generation_id.to_string());
         let custody = oulipoly_core::launch_custody::LaunchCustody::start(path)
@@ -474,7 +475,10 @@ fn register_generation_starting(
         context.launch_custody.set(std::sync::Arc::new(custody))
             .map_err(|_| "concurrent starting custody initialization".to_string())?;
     }
-    let proof_path = oulipoly_core::launch_custody::proof_path(db.path(), &context.generation_id.to_string());
+    #[cfg(target_os = "linux")]
+    let proof_path = Some(oulipoly_core::launch_custody::proof_path(db.path(), &context.generation_id.to_string()));
+    #[cfg(not(target_os = "linux"))]
+    let proof_path: Option<PathBuf> = None;
     let mutation = db
         .runtime_lifecycle()
         .create_runtime_generation_with_custody(CreateRuntimeGeneration {
@@ -487,7 +491,7 @@ fn register_generation_starting(
             pty_control_path: context.pty_control_path.as_deref(),
             models_dir: context.models_dir.as_deref(),
             effective_cwd: context.effective_cwd.as_deref(),
-        }, Some(&proof_path))
+        }, proof_path.as_deref())
         .map_err(|err| err.to_string())?;
     // Release the sidecar authority fence before any error finalizer reopens it.
     drop(db);
@@ -529,10 +533,13 @@ fn configure_registered_custody(
     command: &mut std::process::Command,
     context: Option<&SpawnIdentityContext>,
 ) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
     if let Some(context) = context {
         context.launch_custody.get().ok_or("starting custody not registered")?
             .configure(command).map_err(|e| e.to_string())?;
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (command, context); // Preserve native launch behavior, without Linux custody.
     Ok(())
 }
 
