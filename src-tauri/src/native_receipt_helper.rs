@@ -314,6 +314,13 @@ fn command(once: bool) -> Result<Command, String> {
     if let Some(command) = TEST_COMMAND.with_borrow(|factory| factory.as_ref().map(|f| f(once))) {
         return Ok(command);
     }
+    // Detached notify/resume can run from the pinned memfd executable. Linux
+    // current_exe() then returns a non-reopenable "(deleted)" display path.
+    // /proc/self/exe resolves the actual caller image during child exec, without
+    // looking up replacement installation bytes or falling back to PATH.
+    #[cfg(target_os = "linux")]
+    let mut command = Command::new("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
     let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
     command.arg(ARG);
     if once {
