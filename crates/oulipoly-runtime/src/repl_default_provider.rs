@@ -307,7 +307,7 @@ where
     {
         finalize_default_provider_live_session_error(&lifecycle, input.state, invocation_row_id)?;
         return Err(format!(
-            "{LIVE_SESSION_IDENTITY_UNAVAILABLE}: provider {} exited successfully without reporting and binding its exact live session; nested asynchronous completion is unavailable",
+            "{LIVE_SESSION_IDENTITY_UNAVAILABLE}: provider {} exited successfully without reporting and binding its exact live session; nested asynchronous completion is unavailable. Check provider registration/binding diagnostics and selected account metadata/cwd/resume identity. Provider integration validation does not establish effective native policy: ask its administrator about hook exclusions or redirected settings; do not bypass trust or adopt another store",
             input.provider_name
         ));
     }
@@ -1476,6 +1476,8 @@ executable = "{}"
         )
         .unwrap_err();
         assert!(error.contains(LIVE_SESSION_IDENTITY_UNAVAILABLE), "{error}");
+        assert!(error.contains("does not establish effective native policy"), "{error}");
+        assert!(error.contains("do not bypass trust or adopt another store"), "{error}");
         let (_, _, status, session, capture) = invocation_row(&state_path);
         assert_eq!(status, "failed");
         assert_eq!(session, None);
