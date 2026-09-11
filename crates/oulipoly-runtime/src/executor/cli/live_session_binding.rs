@@ -208,17 +208,22 @@ fn serve_live_session_reports(
     spawn_context: SpawnIdentityContext,
     generation: RunningRuntimeGeneration,
 ) {
+    let mut acknowledged = None;
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let result = handle_live_session_report(
-                    &mut stream,
-                    &context,
-                    &token,
-                    &session_state,
-                    &spawn_context,
-                    &generation,
-                );
+                let result = if let Some(session) = acknowledged.as_ref() {
+                    acknowledge_duplicate(&mut stream, &context, &token, session)
+                } else {
+                    handle_live_session_report(
+                        &mut stream,
+                        &context,
+                        &token,
+                        &session_state,
+                        &spawn_context,
+                        &generation,
+                    )
+                };
                 let response = match result {
                     Ok(session) => LiveSessionResponse {
                         ok: true,
@@ -233,7 +238,9 @@ fn serve_live_session_reports(
                 };
                 let _ = write_response(&mut stream, &response);
                 if response.ok {
-                    return;
+                    // The first success owns identity for this listener's lifetime.
+                    // Later authenticated exact reports only replay its acknowledgement.
+                    acknowledged = response.session;
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -250,6 +257,27 @@ fn serve_live_session_reports(
             Err(_) => return,
         }
     }
+}
+
+#[cfg(unix)]
+fn acknowledge_duplicate(
+    stream: &mut UnixStream,
+    context: &InteractiveLiveSessionBinding,
+    token: &str,
+    session: &oulipoly_state::SessionMarkerPayload,
+) -> Result<oulipoly_state::SessionMarkerPayload, String> {
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    let report = read_report(stream)?;
+    validate_report(&report, context, token)?;
+    if session.provider_session_id.as_deref() != Some(report.provider_session_id.as_str()) {
+        return Err("Live-session identity cannot be reassigned after acknowledgement".into());
+    }
+    Ok(session.clone())
 }
 
 #[cfg(unix)]
@@ -674,6 +702,81 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.invocation_uuid, INVOCATION_UUID);
         assert_eq!(runtime.session_id.as_deref(), Some(SESSION_ID));
+    }
+
+    #[test]
+    fn age356_exact_duplicates_replay_first_success_but_conflicts_cannot_reassign() {
+        let fixture = LiveBindingFixture::new();
+        assert!(
+            report_live_session_binding(
+                &fixture.server.socket_path,
+                &fixture.server.token,
+                INVOCATION_UUID,
+                SESSION_ID,
+            )
+            .unwrap()
+        );
+        // After first success the provider is not called again, even for exact
+        // duplicates from a subsequent submitted turn or the Bash bridge.
+        std::fs::remove_file(fixture._temp.path().join("fake-provider")).unwrap();
+        for _ in 0..3 {
+            assert!(
+                report_live_session_binding(
+                    &fixture.server.socket_path,
+                    &fixture.server.token,
+                    INVOCATION_UUID,
+                    SESSION_ID,
+                )
+                .unwrap()
+            );
+        }
+        let conflict = report_live_session_binding(
+            &fixture.server.socket_path,
+            &fixture.server.token,
+            INVOCATION_UUID,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        )
+        .unwrap_err();
+        assert!(conflict.contains("cannot be reassigned"));
+        assert!(
+            report_live_session_binding(
+                &fixture.server.socket_path,
+                "wrong-token",
+                INVOCATION_UUID,
+                SESSION_ID,
+            )
+            .unwrap_err()
+            .contains("token mismatch")
+        );
+        assert!(
+            report_live_session_binding(
+                &fixture.server.socket_path,
+                &fixture.server.token,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                SESSION_ID,
+            )
+            .unwrap_err()
+            .contains("invocation mismatch")
+        );
+        assert!(
+            report_live_session_binding(
+                &fixture.server.socket_path,
+                &fixture.server.token,
+                INVOCATION_UUID,
+                SESSION_ID,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            StateDb::open(&fixture.state_path)
+                .unwrap()
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap()
+                .provider_session_id
+                .as_deref(),
+            Some(SESSION_ID)
+        );
     }
 
     #[test]

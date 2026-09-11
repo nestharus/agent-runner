@@ -3,6 +3,11 @@
 
 #[path = "../src/mailbox_delivery.rs"]
 mod mailbox_delivery;
+// Keep the sweep's receipt dependency on the production implementation and registry wiring.
+#[path = "../src/native_receipt.rs"]
+mod native_receipt;
+#[path = "../src/wiring.rs"]
+mod wiring;
 #[path = "../src/wake_coordinator/mod.rs"]
 mod wake_coordinator;
 
