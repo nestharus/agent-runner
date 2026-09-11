@@ -178,7 +178,7 @@ fn execute_with_supervisor(
             break outcome;
         }
 
-        match drains.rx.recv_timeout(SUPERVISOR_POLL_INTERVAL) {
+        match receive_with_poll_cadence(&drains.rx, SUPERVISOR_POLL_INTERVAL) {
             Ok((stream, chunk)) => drain_chunks::append_output_chunk(
                 stream,
                 chunk,
@@ -269,4 +269,61 @@ fn live_quota_terminal_outcome(
         return Ok(None);
     }
     live_quota::terminate_for_live_quota(custody, live_signal).map(Some)
+}
+
+// EOF is not process/tree exit. Preserve polling cadence once both output
+// senders have gone; recv_timeout alone returns immediately on disconnection.
+fn receive_with_poll_cadence<T>(
+    rx: &mpsc::Receiver<T>,
+    interval: Duration,
+) -> Result<T, mpsc::RecvTimeoutError> {
+    let result = rx.recv_timeout(interval);
+    if matches!(result, Err(mpsc::RecvTimeoutError::Disconnected)) {
+        std::thread::sleep(interval);
+    }
+    result
+}
+
+#[cfg(test)]
+mod eof_tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_eof_does_not_spin_while_proxy_waits_for_descendant() {
+        let root = tempfile::tempdir().unwrap();
+        let custody = oulipoly_core::launch_custody::LaunchCustody::start(root.path().join("proof")).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec >/dev/null 2>&1; (n=0; while [ ! -f release ]; do n=$((n + 1)); [ $n -lt 500 ] || exit 75; /bin/sleep 0.01; done) & exit 7"])
+            .current_dir(root.path()).env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        custody.configure(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        let drains = drain::start_child_drains(&mut child).unwrap();
+        assert!(matches!(drains.rx.recv_timeout(Duration::from_secs(2)), Err(mpsc::RecvTimeoutError::Disconnected)));
+        assert!(child.try_wait().unwrap().is_none(), "proxy must still own a live descendant");
+        let start = Instant::now();
+        for _ in 0..3 {
+            assert!(matches!(receive_with_poll_cadence(&drains.rx, SUPERVISOR_POLL_INTERVAL), Err(mpsc::RecvTimeoutError::Disconnected)));
+        }
+        assert!(start.elapsed() >= SUPERVISOR_POLL_INTERVAL * 3);
+        std::fs::write(root.path().join("release"), b"").unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(7));
+        drain::finish_child_drains(drains, &mut Vec::new(), &mut Vec::new(), &mut Instant::now());
+        custody.seal();
+    }
+
+    #[test]
+    fn disconnected_output_retains_poll_cadence() {
+        let (tx, rx) = mpsc::channel::<()>();
+        drop(tx);
+        let start = Instant::now();
+        for _ in 0..3 {
+            assert_eq!(receive_with_poll_cadence(&rx, SUPERVISOR_POLL_INTERVAL),
+                Err(mpsc::RecvTimeoutError::Disconnected));
+        }
+        assert!(start.elapsed() >= SUPERVISOR_POLL_INTERVAL * 3);
+    }
 }
