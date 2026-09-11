@@ -457,7 +457,7 @@ pub(crate) fn supervise(
             let mut stdout = stdout;
             let mut byte = [0u8];
             while stdout.read_exact(&mut byte).is_ok() {
-                if byte == [b'!'] {
+                if byte == *b"!" {
                     completion.store(true, Ordering::SeqCst);
                 }
                 let _ = send.try_send(());
