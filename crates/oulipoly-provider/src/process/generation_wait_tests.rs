@@ -391,27 +391,48 @@ fn published_spawn_observer_retains_legacy_kill_group_proxy() {
 
 #[test]
 fn remote_timeout_retains_escaped_tree_and_consuming_cleanup_owner() {
+    escaped_timeout(false);
+    escaped_timeout(true);
+}
+
+fn escaped_timeout(empty_group: bool) {
     let fixture = Fixture::new();
     let generation = Arc::new(LaunchCustody::start(fixture.0.join("proof")).unwrap());
     let scope = LaunchScope::enter(Some(Arc::clone(&generation)));
     let started = Instant::now();
+    let command = if empty_group {
+        // Move only this private root into C's group before exiting. Its escaped
+        // leaf stays separate. Unlike a retained group-leader zombie, this really
+        // leaves no members in W's original group and the signal returns ESRCH.
+        ProcessCommand::new("/usr/bin/python3").arg("-c").arg(r#"
+import os
+os.setpgid(0, os.getppid())
+root = os.environ['ROOT']
+with open(root + '/helper-root', 'w') as f: f.write(str(os.getpid()))
+if os.fork() == 0:
+    os.setsid()
+    os.execv('/bin/bash', ['/bin/bash', '-c', 'exec 3<>"$ROOT/helper-release"; echo $$ > "$ROOT/helper-leaf"; read -t 8 -u 3 release'])
+print('helper-output', end='', flush=True)
+os._exit(7)
+"#)
+    } else {
+        ProcessCommand::new("/bin/bash")
+            .arg("-c")
+            .arg(HELPER_SCRIPT)
+    };
     let error = ProcessRunner::new(ProcessLimits {
         timeout: Duration::from_millis(150),
         kill_after_grace: Duration::from_millis(25),
         ..ProcessLimits::default()
     })
-    .run(
-        ProcessCommand::new("/bin/bash")
-            .arg("-c")
-            .arg(HELPER_SCRIPT),
-        vec![],
-        [("ROOT", &fixture.0)],
-    )
+    .run(command, vec![], [("ROOT", &fixture.0)])
     .unwrap_err();
     let elapsed = started.elapsed();
     let leaf = fixture_pid(&fixture.0, "helper-leaf");
     let owner = process_row(leaf).1;
-    println!("escaped timeout elapsed={elapsed:?}; {error:?}; retained C={owner}, leaf={leaf}");
+    println!(
+        "escaped timeout empty_group={empty_group} elapsed={elapsed:?}; {error:?}; retained C={owner}, leaf={leaf}"
+    );
     assert_eq!(error.transport_kind(), "host_timeout");
     assert!(
         elapsed < Duration::from_secs(3),
@@ -426,9 +447,10 @@ fn remote_timeout_retains_escaped_tree_and_consuming_cleanup_owner() {
             .contains("cleanup_pending")
     );
     assert!(!error.diagnostics().process_was_reaped);
-    assert!(
-        !error.diagnostics().process_was_force_killed,
-        "empty group acknowledgement is not an executed kill"
+    assert_eq!(
+        error.diagnostics().process_was_force_killed,
+        !empty_group,
+        "distinguish an ESRCH acknowledgement from a successful signal syscall (even to a zombie-only group)"
     );
     assert_eq!(process_row(owner).1, std::process::id() as i32);
     drop(scope);
