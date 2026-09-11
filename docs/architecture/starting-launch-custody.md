@@ -216,8 +216,13 @@ there is no fixed child-count buffer. The scan is not ancestry reconstruction or
 cessation proof: the final ECHILD is still mandatory. Procfs/signalfd failures lose
 certification rather than relaxing the predicate. Disconnected creators do not
 cancel or relinquish C's tree. One-second control-response bounds mark uncertainty
-and disable further signals on that channel; a delayed acknowledgement cannot be
-misattributed to a later signal. There is no owner-resurrection fallback.
+and retain exactly one outstanding request. A later call first consumes that
+request's acknowledgement, discarding its syscall result, then admits the new
+signal under the same call deadline. No second request is sent while the prior
+reply is unknown, so a late TERM reply cannot certify KILL and repeated stalls
+cannot grow a request backlog. Sends are nonblocking. A resumed C can therefore
+process later escalation without numeric-PID fallback; a lost C still cannot be
+resurrected or supply a tree certificate.
 
 Private provider tests measure the earlier two-command held fixture at 7 processes
 and the new path at 6 total / 5 non-zombies: two P processes removed, with one exited
@@ -229,3 +234,25 @@ signalfd in C. M and its wait thread remain shared per generation as before.
 Published launches retain P. Earlier amplification estimates above describe the
 legacy topology, not an assertion that all commands still use it. No global
 materialization or legacy-unknown recovery decision changes in this continuation.
+
+
+### Late Starting finalization with a surviving creator
+
+A failed standalone external dispatch still seals its exact generation and waits
+at most two seconds for Q. If that bounded finalization returns Unknown or a
+storage failure, it now retains the exact context in a creator-owned finalization
+queue and reports the original failure. Provider retained cleanup continues to
+own C and its worker handles; the runtime queue owns only generation/admission
+finalization, never signals or waits on those children. Actual eventual Q connects
+the two obligations without treating a timeout or cleanup return as cessation.
+
+A single queue worker checks ready Q without spending a per-row seal deadline,
+then retries StartupFailed with the retained generation UUID and spawn-invocation
+fence. State's exact proof-inode predicate and transactional admission settlement
+remain unchanged. No arbitrary live-creator Starting row becomes recoverable.
+Storage failures retain the duty; fence rejection is logged, never redirected to
+a successor. Worker-start failure leaves the queue intact and is reported; another
+enqueue can retry startup. A permanently lost monitor can retain a queue entry
+indefinitely. This is bounded foreground latency, not a guarantee of eventual Q,
+unbounded-population capacity, or persistence beyond creator death (which retains
+the separate conservative orphan-recovery rule).

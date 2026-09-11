@@ -109,7 +109,9 @@ pub(super) fn attempt_account_dispatch(
     if result.is_err() && context.attempt.is_none() {
         // Preflight/policy now run under Starting too. A failed standalone
         // attempt must revoke its authority before a candidate rotation.
-        let _ = crate::executor::cli::spawn_identity::mark_runtime_generation_spawn_failed(custody_identity.as_ref());
+        if let Err(error) = crate::executor::cli::spawn_identity::finalize_or_retain_starting_failure(custody_identity.as_ref()) {
+            tracing::warn!(%error, "Standalone dispatch failed; Starting finalization pending or rejected");
+        }
     }
     result
 }

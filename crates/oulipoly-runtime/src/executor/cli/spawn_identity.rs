@@ -690,6 +690,26 @@ fn warn_child_identity_record_failed(context: &SpawnIdentityContext, child_id: u
     );
 }
 
+mod pending_starting;
+
+/// A failed standalone dispatch retains the exact creator finalization duty if
+/// cleanup is still pending. The returned failure remains truthful and bounded.
+pub(crate) fn finalize_or_retain_starting_failure(
+    context: Option<&SpawnIdentityContext>,
+) -> Result<(), String> {
+    let result =
+        exit_runtime_generation_outcome(context, RuntimeTerminalReason::StartupFailed, None);
+    if matches!(
+        result,
+        Err(GenerationOperationError::Unknown | GenerationOperationError::StorageFailure)
+    ) {
+        if let Some(context) = context.filter(|c| c.launch_custody.get().is_some()) {
+            pending_starting::retain(context)?;
+        }
+    }
+    result.map(|_| ()).map_err(|e| e.to_string())
+}
+
 pub(crate) fn mark_runtime_generation_spawn_failed(
     context: Option<&SpawnIdentityContext>,
 ) -> Result<(), String> {

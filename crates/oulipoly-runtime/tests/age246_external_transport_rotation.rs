@@ -1276,3 +1276,259 @@ fn age354_allocated_describe_and_policy_crashes_retain_unpublished_helper_custod
         creator.0.wait().unwrap();
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn age354_standalone_late_q_finalizes_with_live_creator() {
+    use oulipoly_state::{mailbox::*, pid_identity};
+    use std::time::Instant;
+    fn eventually(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "late-Q fixture deadline");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let fixture = make_fixture(&[], &[]);
+    let root = fixture._dir.path();
+    write_executable(
+        &fixture.provider_path,
+        &format!(
+            r#"#!/usr/bin/python3
+import os,sys,time,pathlib,json
+sys.stdin.read()
+root = pathlib.Path({root})
+(root / 'owner').write_text(str(os.getppid()))
+if os.fork() == 0:
+    os.setsid()
+    (root / 'escaped').write_text(str(os.getpid()))
+    deadline = time.monotonic() + 12
+    while not (root / 'release').exists() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    os._exit(0)
+time.sleep(12)
+"#,
+            root = serde_json::to_string(&root.display().to_string()).unwrap()
+        ),
+    );
+    let model = rotation_model(&fixture, &["fast-1"]);
+    let registry = registry_with_client_options(
+        &model,
+        &fixture,
+        ProviderClientOptions::default().with_timeout(Duration::from_millis(150)),
+    );
+    let service = executor::RuntimeExecutorService::new(Arc::new(registry));
+    let invocation = "93111111-1111-4111-8111-111111111111";
+    let successor_invocation = "93111111-1111-4111-8111-111111111112";
+    let creator = pid_identity::read_live_process_identity(std::process::id().into())
+        .unwrap()
+        .unwrap();
+    let mut db = MailboxDb::open_default().unwrap();
+    db.session_admissions()
+        .enqueue(invocation, invocation, None, &creator, 1)
+        .unwrap();
+    assert!(matches!(
+        db.session_admissions()
+            .try_admit_next("original", 2, 0)
+            .unwrap(),
+        SessionAdmissionAttempt::Admitted(_)
+    ));
+    assert!(
+        db.session_admissions()
+            .begin_launch(invocation, "original", 3)
+            .unwrap()
+    );
+    let start = Instant::now();
+    let result = service.execute(ExecutorServiceRequest::Facade {
+        model,
+        provider_index: 0,
+        prompt: "private late-Q".into(),
+        working_dir: None,
+        models_dir: None,
+        extra_inputs: HashMap::new(),
+        parent_invocation_env: Some(format!(r#"{{"source":"opencode3","id":"{invocation}"}}"#)),
+    });
+    let elapsed = start.elapsed();
+    assert!(result.is_err(), "standalone describe must time out");
+    assert!(elapsed >= Duration::from_secs(2));
+    assert!(elapsed < Duration::from_secs(5));
+    assert!(root.join("escaped").exists());
+    let admission = db.session_admissions().row(invocation).unwrap().unwrap();
+    assert_eq!(admission.state, "launching");
+    let generation =
+        RuntimeGenerationId::parse(admission.runtime_generation_uuid.as_ref().unwrap()).unwrap();
+    let proof = oulipoly_core::launch_custody::proof_path(db.path(), &generation.to_string());
+    assert!(!oulipoly_core::launch_custody::is_quiescent(&proof));
+    let before = db
+        .runtime_lifecycle_reader()
+        .runtime_generation(&generation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.lifecycle_state, RuntimeLifecycleState::Starting);
+    assert_eq!(
+        before.creator_process_evidence,
+        ExactProcessEvidence::Recorded(creator.clone())
+    );
+    assert_eq!(
+        before.exact_process_evidence,
+        ExactProcessEvidence::NotRecorded
+    );
+    db.session_admissions()
+        .enqueue(
+            successor_invocation,
+            successor_invocation,
+            None,
+            &creator,
+            4,
+        )
+        .unwrap();
+    assert!(matches!(
+        db.session_admissions()
+            .try_admit_next("successor", 5, 0)
+            .unwrap(),
+        SessionAdmissionAttempt::LaunchMaterializing
+    ));
+    fs::write(root.join("release"), b"release").unwrap();
+    eventually(|| oulipoly_core::launch_custody::is_quiescent(&proof));
+    eprintln!(
+        "observed real late Q after {elapsed:?} foreground failure; creator exact-live={}, original reservation={}",
+        pid_identity::read_live_process_identity(creator.os_pid).unwrap() == Some(creator.clone()),
+        db.session_admissions()
+            .row(invocation)
+            .unwrap()
+            .unwrap()
+            .state
+    );
+    // No admission drain or orphan-recovery call: the retained creator duty
+    // must itself settle the exact reservation after real owned cleanup.
+    eventually(|| {
+        db.session_admissions()
+            .row(invocation)
+            .unwrap()
+            .unwrap()
+            .state
+            == "settled"
+    });
+    let after = db
+        .runtime_lifecycle_reader()
+        .runtime_generation(&generation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.lifecycle_state, RuntimeLifecycleState::Exited);
+    assert_eq!(
+        after.terminal_reason,
+        Some(RuntimeTerminalReason::StartupFailed)
+    );
+    assert_eq!(
+        pid_identity::read_live_process_identity(creator.os_pid).unwrap(),
+        Some(creator.clone())
+    );
+    let owner: u32 = fs::read_to_string(root.join("owner"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    eventually(|| {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        (unsafe {
+            libc::waitid(
+                libc::P_PID,
+                owner,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        }) == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+    });
+    assert!(matches!(
+        db.session_admissions()
+            .try_admit_next("successor", 6, 0)
+            .unwrap(),
+        SessionAdmissionAttempt::Admitted(_)
+    ));
+    assert!(
+        db.session_admissions()
+            .begin_launch(successor_invocation, "successor", 7)
+            .unwrap()
+    );
+    let successor = RuntimeGenerationId::new();
+    let successor_custody =
+        oulipoly_core::launch_custody::LaunchCustody::start(root.join("successor-proof")).unwrap();
+    assert!(matches!(
+        db.runtime_lifecycle()
+            .create_runtime_generation_with_custody(
+                CreateRuntimeGeneration {
+                    generation_id: &successor,
+                    spawn_invocation_uuid: successor_invocation,
+                    session_id: None,
+                    runtime_mode: "headless",
+                    provider_name: "fixture",
+                    model_name: None,
+                    pty_control_path: None,
+                    models_dir: None,
+                    effective_cwd: None,
+                },
+                Some(&root.join("successor-proof"))
+            )
+            .unwrap(),
+        GenerationMutation::Applied(_)
+    ));
+    // Even a genuine successor Q cannot let an old invocation finish it.
+    successor_custody.seal();
+    eventually(|| successor_custody.quiescent());
+    assert!(matches!(
+        db.runtime_lifecycle()
+            .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
+                fence: RuntimeGenerationFence {
+                    generation_id: &successor,
+                    spawn_invocation_uuid: invocation
+                },
+                reason: RuntimeTerminalReason::StartupFailed,
+                exit_code: None,
+            })
+            .unwrap(),
+        GenerationMutation::Rejected(_)
+    ));
+    assert!(matches!(
+        db.runtime_lifecycle()
+            .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
+                fence: RuntimeGenerationFence {
+                    generation_id: &generation,
+                    spawn_invocation_uuid: invocation
+                },
+                reason: RuntimeTerminalReason::StartupFailed,
+                exit_code: None,
+            })
+            .unwrap(),
+        GenerationMutation::AlreadyApplied(_)
+    ));
+    assert_eq!(
+        db.session_admissions()
+            .row(successor_invocation)
+            .unwrap()
+            .unwrap()
+            .state,
+        "launching"
+    );
+    assert_eq!(
+        db.runtime_lifecycle_reader()
+            .runtime_generation(&successor)
+            .unwrap()
+            .unwrap()
+            .lifecycle_state,
+        RuntimeLifecycleState::Starting
+    );
+    eprintln!(
+        "standalone failure returned {elapsed:?}; escaped leaf released afterward; exact C reaped; original StartupFailed/settled with creator live; stale successor fence rejected"
+    );
+    // Exact owner cleanup for the test-created successor, not orphan inference.
+    db.runtime_lifecycle()
+        .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
+            fence: RuntimeGenerationFence {
+                generation_id: &successor,
+                spawn_invocation_uuid: successor_invocation,
+            },
+            reason: RuntimeTerminalReason::StartupFailed,
+            exit_code: None,
+        })
+        .unwrap();
+}
