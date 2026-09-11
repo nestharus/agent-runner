@@ -307,7 +307,7 @@ where
     {
         finalize_default_provider_live_session_error(&lifecycle, input.state, invocation_row_id)?;
         return Err(format!(
-            "{LIVE_SESSION_IDENTITY_UNAVAILABLE}: provider {} exited successfully without reporting and binding its exact live session; nested asynchronous completion is unavailable",
+            "{LIVE_SESSION_IDENTITY_UNAVAILABLE}: provider {} exited successfully without reporting and binding its exact live session; nested asynchronous completion is unavailable. Check provider registration/binding diagnostics and selected account metadata/cwd/resume identity. Provider integration validation does not establish effective native policy: ask its administrator about hook exclusions or redirected settings; do not bypass trust or adopt another store",
             input.provider_name
         ));
     }
@@ -1446,6 +1446,42 @@ executable = "{}"
 
         assert_eq!(code, 0);
         assert_eq!(launcher.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn age356_success_without_required_identity_retains_incident_failure_signal() {
+        struct UnboundLauncher;
+        impl InteractiveLauncher for UnboundLauncher {
+            fn launch(
+                &self,
+                _: &ProviderConfig,
+                _: Option<&Path>,
+                _: Option<&str>,
+                _: Option<&Path>,
+                _: Option<InteractiveLiveSessionBinding>,
+            ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
+                let mut result = successful_interactive_result();
+                result.live_session_capture_required = true;
+                Ok(result)
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        StateDb::open(&state_path).unwrap();
+        write_config(temp.path(), r#"default_provider = "generic""#);
+        write_providers(temp.path(), &provider_fixture("generic"));
+        let error = run_repl_with_default_provider_with_launcher(
+            runtime_services_with_state(temp.path().to_path_buf(), state_path.clone()),
+            &UnboundLauncher,
+        )
+        .unwrap_err();
+        assert!(error.contains(LIVE_SESSION_IDENTITY_UNAVAILABLE), "{error}");
+        assert!(error.contains("does not establish effective native policy"), "{error}");
+        assert!(error.contains("do not bypass trust or adopt another store"), "{error}");
+        let (_, _, status, session, capture) = invocation_row(&state_path);
+        assert_eq!(status, "failed");
+        assert_eq!(session, None);
+        assert_eq!(capture, None);
     }
 
     #[test]

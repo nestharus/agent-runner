@@ -1074,3 +1074,35 @@ fn age355_correction_global_selection_does_not_overlap() {
         "both observers entered registry preparation for the sole attempt"
     );
 }
+
+#[test]
+fn native_receipt_survives_projection_fault_and_recovers_without_replay() {
+    let mut f = Fixture::new();
+    f.anchored_submit();
+    let connection = rusqlite::Connection::open(f.db.path()).unwrap();
+    connection.execute_batch(
+        "CREATE TRIGGER reject_receipt_projection BEFORE UPDATE OF delivered_at ON mailbox
+         WHEN NEW.delivered_at IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'projection fault'); END;"
+    ).unwrap();
+    let error = observe_delivery_with(&f.db, &f.attempt, &f.anchor, |_, index, sequence, _| {
+        Ok(page(&f.anchor, index, sequence, true, 1))
+    }).unwrap_err();
+    assert!(error.contains("projection fault"), "{error}");
+    f.restart();
+    assert_eq!(f.db.delivery_observation_confirmation(&f.attempt).unwrap().as_deref(), Some("native-user-0"));
+    assert_eq!(f.db.list_pending(SESSION).unwrap().len(), 1);
+    let diagnostic: String = connection.query_row(
+        "SELECT observation_error FROM mailbox_delivery_attempts WHERE attempt_id = ?1",
+        [&f.attempt], |row| row.get(0),
+    ).unwrap();
+    assert!(diagnostic.contains("projection fault"));
+    assert!(f.submit().is_err(), "admitted work must not be replayed");
+    assert!(prepare_headless_resume_delivery_on(&mut f.db, SESSION, "chain", None, None).is_err());
+    connection.execute_batch("DROP TRIGGER reject_receipt_projection").unwrap();
+    assert_eq!(deliverable_pending_count_on(&mut f.db, &f.state, SESSION).unwrap(), 0);
+    assert_eq!(f.submissions, 1);
+    let row = f.db.list_mailbox(SESSION, true).unwrap().remove(0);
+    assert_eq!(row.delivered_by_invocation_uuid.as_deref(), Some("native-invocation"));
+    assert!(row.delivered_at.is_some());
+}

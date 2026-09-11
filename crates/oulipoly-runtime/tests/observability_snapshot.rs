@@ -1220,6 +1220,18 @@ fn stale_runtime_snapshot_emits_diagnostic_without_mutating_runtime_row() {
         })
         .unwrap();
     drop(mailbox);
+    // Creation records this test process as the live creator. A stale child
+    // alone is still busy: make the creator stale too before observing recovery.
+    let changed = rusqlite::Connection::open(fixture.sidecar_path())
+        .unwrap()
+        .execute(
+            "UPDATE runtime_generation SET creator_identity_os_pid_starttime_ticks = ?1
+             WHERE generation_uuid = ?2",
+            params![stale.os_pid_starttime_ticks, generation.to_string()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+
     let before = runtime_row_bytes(&fixture.sidecar_path(), SESSION_ID);
 
     let snapshot = fixture

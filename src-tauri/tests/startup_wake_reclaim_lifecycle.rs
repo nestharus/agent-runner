@@ -492,6 +492,17 @@ fn seed_recoverable_wake_candidate(
         .unwrap();
     incumbent.kill().unwrap();
     incumbent.wait().unwrap();
+    // Creation records this still-live test process. Recovery requires both
+    // creator and child to have ceased matching their recorded identities.
+    let changed = rusqlite::Connection::open(mailbox.path())
+        .unwrap()
+        .execute(
+            "UPDATE runtime_generation SET creator_identity_os_boot_id = 'fixture-previous-boot'
+             WHERE generation_uuid = ?1",
+            [generation_id.to_string()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
 }
 
 fn snapshot_helper_count(root: &Path) -> usize {

@@ -4235,6 +4235,32 @@ impl MailboxDb {
         if changed == 0 {
             return Ok(false);
         }
+        // Native evidence is monotonic and independent from its mailbox
+        // projection. A failing projection must not erase an exact receipt or
+        // make admitted work eligible for retransmission.
+        tx.commit().map_err(|e| e.to_string())?;
+        if let Err(error) = self.project_native_delivery_receipt(
+            attempt_id, invocation_uuid, &anchor.provider_session_id, &now,
+        ) {
+            self.conn.execute(
+                "UPDATE mailbox_delivery_attempts SET observation_error = ?3
+                 WHERE attempt_id = ?1 AND delivery_invocation_uuid = ?2
+                   AND resolved_at IS NULL AND observation_confirmed_at IS NOT NULL",
+                params![attempt_id, invocation_uuid, truncate_utf8(&error, 1024)],
+            ).map_err(|storage| format!("{error}; receipt projection diagnostic: {storage}"))?;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    fn project_native_delivery_receipt(
+        &self,
+        attempt_id: &str,
+        invocation_uuid: &str,
+        session_id: &str,
+        now: &str,
+    ) -> Result<(), String> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
         tx.execute(
             "UPDATE mailbox SET delivered_at = ?2, delivered_by_invocation_uuid = ?3,
                 delivery_attempts = delivery_attempts + 1, delivery_error = NULL
@@ -4247,9 +4273,9 @@ impl MailboxDb {
             acknowledgement_reason = COALESCE(acknowledgement_reason, 'native_receipt')
             WHERE mailbox_seq IN (SELECT mailbox_seq FROM mailbox_delivery_attempt_items WHERE attempt_id = ?1)",
             params![attempt_id, now]).map_err(|e| e.to_string())?;
-        resolve_completed_delivery_attempts(&tx, &anchor.provider_session_id, &now, None)?;
+        resolve_completed_delivery_attempts(&tx, session_id, now, None)?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(true)
+        Ok(())
     }
 
     pub fn pending_delivery_observations(

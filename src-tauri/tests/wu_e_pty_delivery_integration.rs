@@ -344,6 +344,20 @@ impl Fixture {
             .unwrap();
     }
 
+    fn mark_generation_creator_stale(&self) {
+        // A live creator retains authority even if its child is dead. Model a
+        // previous-boot creator as well; do not weaken runtime liveness checks.
+        let changed = rusqlite::Connection::open(self.sidecar_path())
+            .unwrap()
+            .execute(
+                "UPDATE runtime_generation SET creator_identity_os_boot_id = 'fixture-previous-boot'
+                 WHERE generation_uuid = ?1",
+                [LIVE_INVOCATION],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+
     fn mailbox(&self) -> MailboxDb {
         MailboxDb::open(&self.sidecar_path()).unwrap()
     }
@@ -834,6 +848,7 @@ fn notify_stale_socket_cleans_runtime_and_does_not_report_busy() {
     let stale_socket = fixture.socket_path("stale.sock");
     fs::write(&stale_socket, "stale").unwrap();
     fixture.mark_live_pty_runtime(&stale_identity, &stale_socket);
+    fixture.mark_generation_creator_stale();
 
     let output = fixture.run_notify("h-stale", owner_metadata(SESSION_A, INVOCATION_A));
 
@@ -1762,6 +1777,7 @@ fn resumed_repl_retries_pending_mailbox_after_replacing_stale_runtime() {
         &stale_identity,
         &fixture.socket_path("pre-reboot-stale.sock"),
     );
+    fixture.mark_generation_creator_stale();
     fixture.seed_mailbox("h-pre-reboot-pending");
 
     let pty = OuterPty::open(30, 100);

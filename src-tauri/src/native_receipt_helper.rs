@@ -216,13 +216,52 @@ fn try_scan_admission() -> Result<Option<File>, String> {
     try_admit(db.path(), "receipt-scan")
 }
 
+fn wait_for_scan_admission(
+    mut acquire: impl FnMut() -> Result<Option<File>, String>,
+    bound: Duration,
+) -> Result<File, String> {
+    let deadline = Instant::now() + bound;
+    loop {
+        if let Some(admission) = acquire()? {
+            return Ok(admission);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("receipt target scan admission deadline; attempt remains pending".into());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn targeted_scan_waits_for_admission_and_bounds_persistent_contention() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("mailbox.db");
+    let held = try_admit(&path, "receipt-scan").unwrap().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(held);
+    });
+    let admitted = wait_for_scan_admission(
+        || try_admit(&path, "receipt-scan"),
+        Duration::from_secs(2),
+    ).unwrap();
+    release.join().unwrap();
+    let error = wait_for_scan_admission(
+        || try_admit(&path, "receipt-scan"),
+        Duration::from_millis(50),
+    ).unwrap_err();
+    assert!(error.contains("admission deadline"));
+    drop(admitted);
+}
+
 fn inspect_target(target: Target) -> Result<(), String> {
-    // Targeted startup/terminal requests bypass the periodic cadence, but not
-    // scan admission. Contention skips inspection, not the durable pending attempt.
-    // Ok means this helper completed, never confirmation or permission to resend.
-    let Some(admission) = try_scan_admission()? else {
-        return Ok(());
-    };
+    // Unlike an opportunistic periodic tick, a terminal request owes one
+    // bounded opportunity after a contending scanner releases admission. Do not
+    // equate a skipped scan with absence of native evidence at turn completion.
+    // This wait is inside the contained helper, below its 30s stall watchdog.
+    let admission = wait_for_scan_admission(try_scan_admission, Duration::from_secs(5))?;
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
@@ -275,6 +314,13 @@ fn command(once: bool) -> Result<Command, String> {
     if let Some(command) = TEST_COMMAND.with_borrow(|factory| factory.as_ref().map(|f| f(once))) {
         return Ok(command);
     }
+    // Detached notify/resume can run from the pinned memfd executable. Linux
+    // current_exe() then returns a non-reopenable "(deleted)" display path.
+    // /proc/self/exe resolves the actual caller image during child exec, without
+    // looking up replacement installation bytes or falling back to PATH.
+    #[cfg(target_os = "linux")]
+    let mut command = Command::new("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
     let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
     command.arg(ARG);
     if once {
