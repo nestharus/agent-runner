@@ -33,10 +33,6 @@ fn run_ack_case(completed: bool, unpause_mode: &str) {
         &format!("python3 '{}' initial", hook.display()),
         &format!("python3 '{}' resume", hook.display()),
         "early-ack-receipt-${WU_D_PROVIDER_RESUME_INDEX}.txt",
-    )
-    .replace(
-        "env.update({\"work\":",
-        "env[\"FIXTURE_PROVIDER_PID\"] = str(os.getpid())\n    env.update({\"work\":",
     );
     let completion = if completed {
         r#"    if code == 0:
