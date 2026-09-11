@@ -702,10 +702,9 @@ pub(crate) fn finalize_or_retain_starting_failure(
     if matches!(
         result,
         Err(GenerationOperationError::Unknown | GenerationOperationError::StorageFailure)
-    ) {
-        if let Some(context) = context.filter(|c| c.launch_custody.get().is_some()) {
-            pending_starting::retain(context)?;
-        }
+    ) && let Some(context) = context.filter(|c| c.launch_custody.get().is_some())
+    {
+        pending_starting::retain(context)?;
     }
     result.map(|_| ()).map_err(|e| e.to_string())
 }

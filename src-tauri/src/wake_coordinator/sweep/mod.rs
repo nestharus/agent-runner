@@ -221,10 +221,10 @@ fn run_wake_reclaim_sweep_or_warn_with_cancel_and_owner(
     owned_lease: Option<&Mutex<Option<String>>>,
 ) {
     // Once per trigger, outside the admission retry loop and all wake locks.
-    if !is_cancelled() {
-        if let Err(error) = crate::native_receipt::poll_headless_receipt_tick() {
-            tracing::warn!("Bounded headless receipt tick: {error}");
-        }
+    if !is_cancelled()
+        && let Err(error) = crate::native_receipt::poll_headless_receipt_tick()
+    {
+        tracing::warn!("Bounded headless receipt tick: {error}");
     }
     run_wake_reclaim_sweep_or_warn_with_runner(trigger, is_cancelled, || {
         run_wake_reclaim_sweep_with_owner(trigger, is_cancelled, owned_lease)

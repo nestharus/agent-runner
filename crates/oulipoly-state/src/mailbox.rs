@@ -1566,10 +1566,10 @@ impl RuntimeLifecycleRepository<'_> {
             .map_err(generation_storage_error(
                 "insert starting runtime generation",
             ))?;
-        if changed == 1 {
-            if let Some(path) = custody_proof {
-                register_custody_proof_on(&tx, request.generation_id, path)?;
-            }
+        if changed == 1
+            && let Some(path) = custody_proof
+        {
+            register_custody_proof_on(&tx, request.generation_id, path)?;
         }
         let row = runtime_generation_by_id_on(&tx, request.generation_id)?.ok_or_else(|| {
             GenerationStorageError::new("Runtime generation missing after create".to_string())
@@ -8937,8 +8937,10 @@ fn generation_boot_has_ended(generation: &RuntimeGenerationRow) -> bool {
     let ExactProcessEvidence::Recorded(creator) = &generation.creator_process_evidence else {
         return false;
     };
-    if let ExactProcessEvidence::Recorded(child) = &generation.exact_process_evidence {
-        if child.os_boot_id != creator.os_boot_id { return false; }
+    if let ExactProcessEvidence::Recorded(child) = &generation.exact_process_evidence
+        && child.os_boot_id != creator.os_boot_id
+    {
+        return false;
     }
     pid_identity::recorded_boot_has_ended(&creator.os_boot_id)
 }

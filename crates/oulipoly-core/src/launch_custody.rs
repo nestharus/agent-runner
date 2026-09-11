@@ -1142,7 +1142,9 @@ mod tests {
         if phase == "stopped_preexec" || phase == "stopped_proxy" {
             std::fs::write(root.join("monitor"), custody.monitor_pid.to_string()).unwrap();
         }
-        if matches!(
+        // Retain creator ownership until it is crashed; the private subreaper
+        // adopts and reaps the recorded child in the stopped-process fixtures.
+        let _owned_child = if matches!(
             phase.as_str(),
             "after_spawn" | "stopped_preexec" | "stopped_proxy" | "remote_after_spawn"
         ) {
@@ -1174,16 +1176,19 @@ mod tests {
                 custody.configure(&mut command).unwrap();
                 None
             };
-            let _owned = command.spawn().unwrap();
-            std::fs::write(root.join("reaper"), _owned.id().to_string()).unwrap();
+            let owned = command.spawn().unwrap();
+            std::fs::write(root.join("reaper"), owned.id().to_string()).unwrap();
             drop(command);
             eventually(|| root.join("descendant").exists());
             if phase == "stopped_proxy" {
                 // Signal our retained, directly spawned Child, not a scan result.
-                assert_eq!(unsafe { libc::kill(_owned.id() as i32, libc::SIGSTOP) }, 0);
-                eventually(|| process_is_stopped(_owned.id() as i32));
+                assert_eq!(unsafe { libc::kill(owned.id() as i32, libc::SIGSTOP) }, 0);
+                eventually(|| process_is_stopped(owned.id() as i32));
             }
-        }
+            Some(owned)
+        } else {
+            None
+        };
         std::fs::write(root.join("ready"), b"ready").unwrap();
         // Parent kills this creator and deliberately keeps it unreaped.
         std::thread::sleep(Duration::from_secs(10));
@@ -1304,7 +1309,7 @@ mod tests {
         assert!(term.is_err());
         assert!(term_elapsed < Duration::from_secs(2));
         assert!(withheld);
-        assert_eq!(kill.unwrap(), true);
+        assert!(kill.unwrap());
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         assert!(kill_start.elapsed() < Duration::from_secs(2));

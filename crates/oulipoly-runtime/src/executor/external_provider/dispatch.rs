@@ -376,13 +376,13 @@ fn attempt_account_dispatch_with_custody(
             )));
         }
     };
-    if spawn_identity.is_some() {
-        if require_recorded_external_generation(&recorded_generation).is_err() {
-            let _ = finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
-            return Err(terminal_attempt_error(protocol_service_error(
-                "runtime_generation_bind_failed",
-            )));
-        }
+    if spawn_identity.is_some()
+        && require_recorded_external_generation(&recorded_generation).is_err()
+    {
+        let _ = finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+        return Err(terminal_attempt_error(protocol_service_error(
+            "runtime_generation_bind_failed",
+        )));
     }
     // Classification is provider work in this same still-open generation. Its
     // process and descendants must be accounted for before seal/quiescence,
