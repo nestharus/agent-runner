@@ -7928,6 +7928,9 @@ fn validate_recovered_dead_process(
     before: &RuntimeGenerationRow,
     request: &ExitRuntimeGenerationNonOrderly<'_>,
 ) -> Result<(), GenerationRejection> {
+    if request.reason == RuntimeTerminalReason::RecoveredDead && generation_boot_has_ended(before) {
+        return Ok(());
+    }
     if !custody_allows_terminal(conn, before) {
         return Err(GenerationRejection::InvariantViolation);
     }
@@ -8902,7 +8905,20 @@ fn register_custody_proof_on(
     { let _ = (conn, generation, path); Err(GenerationStorageError::new("custody unsupported".into())) }
 }
 
+// This sidecar's identity evidence is host-local. Cross-host copied state is
+// not a recovery authority (see pid_identity::recorded_boot_has_ended).
+fn generation_boot_has_ended(generation: &RuntimeGenerationRow) -> bool {
+    let ExactProcessEvidence::Recorded(creator) = &generation.creator_process_evidence else {
+        return false;
+    };
+    if let ExactProcessEvidence::Recorded(child) = &generation.exact_process_evidence {
+        if child.os_boot_id != creator.os_boot_id { return false; }
+    }
+    pid_identity::recorded_boot_has_ended(&creator.os_boot_id)
+}
+
 fn custody_allows_recovery(conn: &Connection, generation: &RuntimeGenerationRow) -> bool {
+    if generation_boot_has_ended(generation) { return true; }
     custody_proof_observation(conn, generation)
         .unwrap_or(!cfg!(target_os = "linux")
             || generation.lifecycle_state != RuntimeLifecycleState::Starting)
@@ -8971,6 +8987,10 @@ fn classify_generation_liveness_read_only(
     }
     let mut stale = RuntimeGenerationReadOnlyLiveness::StaleMissingIdentity;
     for generation in generations {
+        if generation_boot_has_ended(generation) {
+            stale = RuntimeGenerationReadOnlyLiveness::StaleDead;
+            continue;
+        }
         if !custody_allows_recovery(conn, generation) {
             return RuntimeGenerationReadOnlyLiveness::Busy;
         }
@@ -11088,8 +11108,8 @@ fn reconcile_dead_starting_generations_on(
     let Some(row) = runtime_generation_by_id_on(conn, &id).map_err(|e| e.to_string())? else {
         return Ok(());
     };
-    let recover = custody_allows_recovery(conn, &row)
-        && reservation_owner_has_exited(&creator, observe_session_admission_owner(creator.os_pid));
+    let recover = generation_boot_has_ended(&row) || (custody_allows_recovery(conn, &row)
+        && reservation_owner_has_exited(&creator, observe_session_admission_owner(creator.os_pid)));
     if !recover {
         return Ok(());
     }
@@ -11923,6 +11943,40 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(schema_version, schema::CURRENT_VERSION);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn starting_boot_recovery_uses_epoch_evidence_not_missing_proof_or_pid_absence() {
+        for (boot, previous_boot) in [(current_identity().os_boot_id, false), ("unverifiable".into(), false), (uuid::Uuid::new_v4().to_string(), true)] {
+            for route in ["session", "global"] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+                let id = RuntimeGenerationId::new();
+                let proof = directory.path().join("never-certified");
+                std::fs::write(&proof, b"").unwrap();
+                db.runtime_lifecycle().create_runtime_generation_with_custody(CreateRuntimeGeneration {
+                    generation_id: &id, spawn_invocation_uuid: "old-invocation", session_id: Some("old-session"),
+                    runtime_mode: "headless", provider_name: "fixture", model_name: None,
+                    pty_control_path: None, models_dir: None, effective_cwd: None,
+                }, Some(&proof)).unwrap();
+                // Private persisted-epoch fixture, NOT a production rewrite or
+                // an executed reboot. Retain a current live PID deliberately.
+                db.conn.execute("UPDATE runtime_generation SET creator_identity_os_boot_id = ?1 WHERE generation_uuid = ?2",
+                    params![boot, id.to_string()]).unwrap();
+                if route == "session" {
+                    assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("old-session").unwrap(),
+                        if previous_boot { SessionLiveness::Idle } else { SessionLiveness::Busy });
+                } else {
+                    db.session_admissions().enqueue("successor", "successor", None, &current_identity(), 1).unwrap();
+                    assert_eq!(matches!(db.session_admissions().try_admit_next("claim", 0, 2).unwrap(),
+                        SessionAdmissionAttempt::Admitted(_)), previous_boot);
+                }
+                let row = db.runtime_lifecycle_reader().runtime_generation(&id).unwrap().unwrap();
+                assert_eq!(row.lifecycle_state, if previous_boot { RuntimeLifecycleState::Exited } else { RuntimeLifecycleState::Starting });
+                assert_eq!(std::fs::read(&proof).unwrap(), b""); // Never fabricate Q.
+            }
+        }
     }
 
     #[test]
