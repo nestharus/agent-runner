@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 16;
+pub(super) const CURRENT_VERSION: i64 = 17;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -128,7 +128,17 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         owner: SidecarEntity::MailboxDelivery,
         apply: migrate_receipt_scan,
     },
+    MigrationStep {
+        target_version: 17,
+        owner: SidecarEntity::RuntimeLifecycle,
+        apply: migrate_starting_custody,
+    },
 ];
+
+fn migrate_starting_custody(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0017_starting_custody.sql"))
+        .map_err(|error| error.to_string())
+}
 
 pub(super) fn ensure(conn: &mut Connection) -> Result<(), String> {
     let stored_version = sidecar_version(conn)?;

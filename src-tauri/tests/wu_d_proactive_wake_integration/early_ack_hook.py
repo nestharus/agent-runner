@@ -32,8 +32,28 @@ def await_rows(sql, args):
 
 if sys.argv[1] == 'initial':
     owner = json.loads(os.environ['OULIPOLY_PARENT_INVOCATION'])['id']
-    await_rows('SELECT os_pid FROM pid_identity WHERE os_pid=? AND invocation_uuid=? AND session_id=?',
-               (int(os.environ['FIXTURE_PROVIDER_PID']), owner, os.environ['session']))
+    # The generation creator is the runner; the provider executable is a
+    # separately custodied process. Join by invocation, then independently
+    # verify the live identity rather than trusting ancestry or a wake claim.
+    generations = await_rows(
+        'SELECT creator_identity_os_pid, creator_identity_os_boot_id, '
+        'creator_identity_os_pid_starttime_ticks, identity_os_pid, '
+        'identity_os_boot_id, identity_os_pid_starttime_ticks '
+        'FROM runtime_generation WHERE spawn_invocation_uuid=?', (owner,))
+    assert len(generations) == 1, generations
+    creator = generations[0][:3]
+    published = generations[0][3:]
+    for pid, boot, start in (creator, published):
+        assert Path('/proc/sys/kernel/random/boot_id').read_text().strip() == boot
+        stat = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
+        assert int(stat[19]) == start
+        assert os.path.samefile(f'/proc/{pid}/exe', runner)
+    # pid_identity publishes P, not creator R (nor provider executable W).
+    # Both identities above were checked against the actual live processes.
+    found = await_rows(
+        'SELECT os_pid, os_boot_id, os_pid_starttime_ticks FROM pid_identity '
+        'WHERE invocation_uuid=? AND session_id=?', (owner, os.environ['session']))
+    assert found == [published], found
     if UNPAUSE_MODE != 'none':
         pause = subprocess.run([runner, 'mailbox', 'pause', '--session-id', os.environ['session'], '--json'],
                                capture_output=True, text=True, timeout=15)

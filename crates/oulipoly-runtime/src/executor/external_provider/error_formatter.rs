@@ -156,7 +156,14 @@ fn format_first_failure(description: Option<&str>) -> String {
     };
     if !matches!(
         operation,
-        "waitid_wnowait" | "owned_wait" | "owned_try_wait" | "cleanup_admission_or_signal"
+        "waitid_wnowait"
+            | "owned_wait"
+            | "owned_try_wait"
+            | "cleanup_admission_or_signal"
+            | "cleanup_waitid_wnowait"
+            | "cleanup_identity"
+            | "cleanup_remote_signal"
+            | "cleanup_group_kill"
     ) {
         return "redacted".into();
     }
@@ -167,7 +174,12 @@ fn format_first_failure(description: Option<&str>) -> String {
             .map_or_else(|_| "redacted".into(), |value| value.to_string()),
         None => "absent".into(),
     };
-    format!("{operation}; errno={errno}; detail=redacted")
+    let custody = match detail.split("; ").next() {
+        Some("actor_custody=present") => "; actor_custody=present",
+        Some("actor_custody=absent") => "; actor_custody=absent",
+        _ => "",
+    };
+    format!("{operation}; errno={errno}{custody}; detail=redacted")
 }
 
 fn format_transport_status(status: Option<&oulipoly_provider::generated::ProcessStatus>) -> String {
@@ -186,6 +198,31 @@ fn format_transport_status(status: Option<&oulipoly_provider::generated::Process
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_failure_preserves_boundary_errno_and_only_typed_custody() {
+        for operation in [
+            "cleanup_waitid_wnowait",
+            "cleanup_identity",
+            "cleanup_remote_signal",
+            "cleanup_group_kill",
+        ] {
+            for custody in ["present", "absent"] {
+                assert_eq!(
+                    format_first_failure(Some(&format!(
+                        "first_failure: {operation}: actor_custody={custody}; errno=3; collection: secret"
+                    ))),
+                    format!("{operation}; errno=3; actor_custody={custody}; detail=redacted")
+                );
+            }
+        }
+        assert_eq!(
+            format_first_failure(Some(
+                "first_failure: cleanup_group_kill: actor_custody=secret; errno=secret"
+            )),
+            "cleanup_group_kill; errno=redacted; detail=redacted"
+        );
+    }
 
     #[test]
     fn first_failure_projects_only_allowlisted_boundary_and_errno() {

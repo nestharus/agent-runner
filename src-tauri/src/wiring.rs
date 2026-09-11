@@ -462,10 +462,11 @@ impl ReceiptRegistryCache {
             "{:?}|{:?}|{:?}",
             paths.config_root, paths.data_root, accounts
         );
-        if let Some((prior, registry)) = &self.entry {
-            if *prior == key && registry.receipt_endpoints_unchanged() {
-                return Ok(registry.clone());
-            }
+        if let Some((prior, registry)) = &self.entry
+            && *prior == key
+            && registry.receipt_endpoints_unchanged()
+        {
+            return Ok(registry.clone());
         }
         // Never use an invalidated endpoint as fallback on reconstruction error.
         self.entry = None;

@@ -38,8 +38,8 @@ pub(crate) fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once(
 
     let initial = fixture.run_agent("dispatch delayed nested work");
     assert_delayed_dispatch_exit_code_zero(&fixture, &initial);
-    assert_eq!(invocation_count(&fixture), 2);
-
+    // Wake registration may precede the initial caller's return. Count only
+    // after the actual receipt and assistant invocation have settled below.
     let handle = dispatch_handle(&fixture, "agent-bash-dispatch.json");
     let prompt = wait_for_file(&fixture.prompt_file("acr329-resumed-input.txt"));
     assert_prompt_contains_handle(&prompt, &handle);
@@ -115,7 +115,39 @@ fn assert_delayed_completion_outcome(fixture: &Fixture, session_id: &str, handle
     assert_eq!(rows[0].handle, handle);
     assert_outer_listener_preserved(fixture);
     let delivery_invocation = rows[0].delivered_by_invocation_uuid.as_deref().unwrap();
-    assert_age270_invocation(fixture, delivery_invocation);
+    wait_until("delayed assistant invocation finalized", || {
+        fixture
+            .state()
+            .get_invocation_by_uuid(delivery_invocation)
+            .unwrap()
+            .is_some_and(|row| row.finished_at.is_some())
+    });
+    let invocation = fixture
+        .state()
+        .get_invocation_by_uuid(delivery_invocation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        invocation.status,
+        oulipoly_state::InvocationStatus::Succeeded
+    );
+    assert_eq!(invocation.success, Some(true));
+    assert_eq!(invocation.exit_code, Some(0));
+    assert!(invocation.error_category.is_none());
+    assert_eq!(rows[0].delivery_attempts, 1);
+    assert!(rows[0].delivery_error.is_none());
+    assert_pending_mailbox_empty(fixture, session_id);
+    let listeners = fixture
+        .mailbox()
+        .completion_event_listeners(handle)
+        .unwrap();
+    assert_eq!(listeners.len(), 1);
+    assert!(listeners[0].acknowledged_at.is_some());
+    assert_eq!(
+        listeners[0].acknowledgement_reason.as_deref(),
+        Some("native_receipt")
+    );
+    assert_delayed_assistant_turns(fixture, handle);
     fixture.assert_delivery_invocation_is_child_of_owner(session_id);
     assert_eq!(invocation_count(fixture), 3);
 
@@ -129,8 +161,51 @@ fn assert_delayed_completion_outcome(fixture: &Fixture, session_id: &str, handle
         1
     );
     assert_eq!(invocation_count(fixture), 3);
+    assert_delayed_assistant_turns(fixture, handle);
+    assert_eq!(
+        fixture.mailbox().list_mailbox(session_id, true).unwrap(),
+        rows
+    );
+    assert_eq!(
+        fixture
+            .mailbox()
+            .completion_event_listeners(handle)
+            .unwrap(),
+        listeners
+    );
     assert_no_wake_claim(fixture, session_id);
     assert_xdg_isolated(fixture);
+}
+
+fn assert_delayed_assistant_turns(fixture: &Fixture, handle: &str) {
+    let mut paths = std::fs::read_dir(fixture.prompt_file("session-turns"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    let turns = paths
+        .iter()
+        .map(|path| {
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        turns.len(),
+        2,
+        "exactly one receipt and one assistant completion"
+    );
+    assert_eq!(turns[0]["role"], "user");
+    assert_prompt_contains_handle(turns[0]["body"][0]["text"].as_str().unwrap(), handle);
+    assert_eq!(turns[1]["role"], "assistant");
+    assert_eq!(
+        turns[1]["body"][0]["text"],
+        "Completed the nested work notification."
+    );
+    assert_eq!(
+        wait_for_file(&fixture.prompt_file("provider-resume-sequence.txt")),
+        "1"
+    );
 }
 
 fn assert_outer_listener_preserved(fixture: &Fixture) {

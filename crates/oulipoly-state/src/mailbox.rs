@@ -1520,6 +1520,16 @@ impl RuntimeLifecycleRepository<'_> {
         &mut self,
         request: CreateRuntimeGeneration<'_>,
     ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
+        self.create_runtime_generation_with_custody(request, None)
+    }
+
+    /// The caller must establish independent custody before creating Starting.
+    /// Persist the exact proof inode atomically with generation/admission fences.
+    pub fn create_runtime_generation_with_custody(
+        &mut self,
+        request: CreateRuntimeGeneration<'_>,
+        custody_proof: Option<&Path>,
+    ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
         validate_runtime_generation_create(&request)?;
         let creator_process_identity = current_runtime_creator_identity()?;
         let now = now_rfc3339();
@@ -1556,6 +1566,11 @@ impl RuntimeLifecycleRepository<'_> {
             .map_err(generation_storage_error(
                 "insert starting runtime generation",
             ))?;
+        if changed == 1
+            && let Some(path) = custody_proof
+        {
+            register_custody_proof_on(&tx, request.generation_id, path)?;
+        }
         let row = runtime_generation_by_id_on(&tx, request.generation_id)?.ok_or_else(|| {
             GenerationStorageError::new("Runtime generation missing after create".to_string())
         })?;
@@ -1796,7 +1811,7 @@ impl RuntimeLifecycleReader<'_> {
         let sql = format_runtime_generations_for_session_sql(true);
         let generations = runtime_generations_for_session_on(self.conn, session_id, &sql)
             .map_err(|error| error.to_string())?;
-        Ok(classify_generation_liveness_read_only(&generations))
+        Ok(classify_generation_liveness_read_only(self.conn, &generations))
     }
 }
 
@@ -1810,7 +1825,7 @@ impl RuntimeLifecycleRepository<'_> {
             .map_err(|error| error.to_string())?;
         let mut observed_busy = false;
         for generation in generations {
-            match generation_liveness_observation(&generation) {
+            match generation_liveness_observation(self.conn, &generation) {
                 GenerationLivenessObservation::Busy => observed_busy = true,
                 GenerationLivenessObservation::Stale => {
                     let result = self
@@ -2235,7 +2250,7 @@ impl RuntimeLifecycleRepository<'_> {
             ))?;
             return Ok(result);
         }
-        if let Err(rejection) = validate_recovered_dead_process(&before, &request) {
+        if let Err(rejection) = validate_recovered_dead_process(&tx, &before, &request) {
             tx.commit().map_err(generation_storage_error(
                 "commit live generation recovery rejection",
             ))?;
@@ -2487,6 +2502,9 @@ impl RuntimeLifecycleRepository<'_> {
                 return Ok(DrainFinishResult::NotDraining(actual));
             }
             Some(_) => unreachable!("only predecessor dispositions are mapped"),
+        }
+        if !custody_allows_terminal(&tx, &before) {
+            return Ok(DrainFinishResult::Rejected(GenerationRejection::InvariantViolation));
         }
         if let Err(rejection) = validate_drain_finish_claim(&before) {
             tx.commit().map_err(generation_storage_error(
@@ -7932,11 +7950,21 @@ fn validate_generation_fence(
 }
 
 fn validate_recovered_dead_process(
+    conn: &Connection,
     before: &RuntimeGenerationRow,
     request: &ExitRuntimeGenerationNonOrderly<'_>,
 ) -> Result<(), GenerationRejection> {
+    if request.reason == RuntimeTerminalReason::RecoveredDead && generation_boot_has_ended(before) {
+        return Ok(());
+    }
+    if !custody_allows_terminal(conn, before) {
+        return Err(GenerationRejection::InvariantViolation);
+    }
     if request.reason != RuntimeTerminalReason::RecoveredDead {
         return Ok(());
+    }
+    if !custody_allows_recovery(conn, before) {
+        return Err(GenerationRejection::InvariantViolation);
     }
     for evidence in generation_liveness_processes(before) {
         let ExactProcessEvidence::Recorded(recorded) = evidence else {
@@ -8880,10 +8908,87 @@ enum GenerationLivenessObservation {
     Stale,
 }
 
+fn register_custody_proof_on(
+    conn: &Connection,
+    generation: &RuntimeGenerationId,
+    path: &Path,
+) -> Result<(), GenerationStorageError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
+            .open(path).map_err(|e| GenerationStorageError::new(e.to_string()))?;
+        let metadata = file.metadata().map_err(|e| GenerationStorageError::new(e.to_string()))?;
+        if !metadata.is_file() || metadata.len() != 0 {
+            return Err(GenerationStorageError::new("custody proof is not fresh".into()));
+        }
+        conn.execute("INSERT INTO runtime_generation_custody VALUES (?1, ?2, ?3, ?4)",
+            params![generation.to_string(), path.to_string_lossy(), metadata.dev() as i64, metadata.ino() as i64])
+            .map_err(generation_storage_error("register independent launch custody"))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (conn, generation, path); Err(GenerationStorageError::new("custody unsupported".into())) }
+}
+
+// This sidecar's identity evidence is host-local. Cross-host copied state is
+// not a recovery authority (see pid_identity::recorded_boot_has_ended).
+fn generation_boot_has_ended(generation: &RuntimeGenerationRow) -> bool {
+    let ExactProcessEvidence::Recorded(creator) = &generation.creator_process_evidence else {
+        return false;
+    };
+    if let ExactProcessEvidence::Recorded(child) = &generation.exact_process_evidence
+        && child.os_boot_id != creator.os_boot_id
+    {
+        return false;
+    }
+    pid_identity::recorded_boot_has_ended(&creator.os_boot_id)
+}
+
+fn custody_allows_recovery(conn: &Connection, generation: &RuntimeGenerationRow) -> bool {
+    if generation_boot_has_ended(generation) { return true; }
+    custody_proof_observation(conn, generation)
+        .unwrap_or(!cfg!(target_os = "linux")
+            || generation.lifecycle_state != RuntimeLifecycleState::Starting)
+}
+
+fn custody_allows_terminal(conn: &Connection, generation: &RuntimeGenerationRow) -> bool {
+    custody_proof_observation(conn, generation).unwrap_or(true)
+}
+
+fn custody_proof_observation(conn: &Connection, generation: &RuntimeGenerationRow) -> Option<bool> {
+    let proof = conn.query_row(
+        "SELECT proof_path, proof_device, proof_inode FROM runtime_generation_custody WHERE generation_uuid = ?1",
+        params![generation.generation_id.to_string()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+    ).optional();
+    match proof {
+        Ok(None) => None,
+        Ok(Some((path, device, inode))) => Some(exact_custody_proof_is_quiescent(&path, device, inode)),
+        Err(_) => Some(false),
+    }
+}
+
+fn exact_custody_proof_is_quiescent(path: &str, device: i64, inode: i64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let Ok(mut file) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) else { return false; };
+        let Ok(metadata) = file.metadata() else { return false; };
+        if !metadata.is_file() || metadata.len() != 1 || metadata.dev() as i64 != device || metadata.ino() as i64 != inode { return false; }
+        let mut bytes = [0; 2];
+        file.read(&mut bytes).is_ok_and(|n| n == 1 && bytes[0] == b'Q')
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (path, device, inode); false }
+}
+
 fn generation_liveness_observation(
+    conn: &Connection,
     generation: &RuntimeGenerationRow,
 ) -> GenerationLivenessObservation {
-    match classify_generation_liveness_read_only(std::slice::from_ref(generation)) {
+    match classify_generation_liveness_read_only(conn, std::slice::from_ref(generation)) {
         RuntimeGenerationReadOnlyLiveness::Busy => GenerationLivenessObservation::Busy,
         _ => GenerationLivenessObservation::Stale,
     }
@@ -8902,6 +9007,7 @@ fn generation_liveness_processes(
 }
 
 fn classify_generation_liveness_read_only(
+    conn: &Connection,
     generations: &[RuntimeGenerationRow],
 ) -> RuntimeGenerationReadOnlyLiveness {
     if generations.is_empty() {
@@ -8909,6 +9015,13 @@ fn classify_generation_liveness_read_only(
     }
     let mut stale = RuntimeGenerationReadOnlyLiveness::StaleMissingIdentity;
     for generation in generations {
+        if generation_boot_has_ended(generation) {
+            stale = RuntimeGenerationReadOnlyLiveness::StaleDead;
+            continue;
+        }
+        if !custody_allows_recovery(conn, generation) {
+            return RuntimeGenerationReadOnlyLiveness::Busy;
+        }
         for evidence in generation_liveness_processes(generation) {
             let ExactProcessEvidence::Recorded(recorded) = evidence else {
                 return RuntimeGenerationReadOnlyLiveness::Busy;
@@ -10775,12 +10888,14 @@ fn unmaterialized_session_admission_exists_on(conn: &Connection) -> Result<bool,
              OR EXISTS (
                  SELECT 1
                  FROM runtime_generation generation
-                 JOIN session_admission_queue admission
-                   ON admission.runtime_generation_uuid = generation.generation_uuid
                  WHERE generation.lifecycle_state = 'starting'
-                   AND admission.state = 'launching'
+                   AND (?1 OR EXISTS (
+                       SELECT 1 FROM session_admission_queue admission
+                       WHERE admission.runtime_generation_uuid = generation.generation_uuid
+                         AND admission.state = 'launching'
+                   ))
              )",
-        [],
+        params![cfg!(target_os = "linux")],
         |row| row.get(0),
     )
     .map_err(|err| format!("Failed to inspect materializing session admissions: {err}"))
@@ -10989,49 +11104,47 @@ fn reconcile_dead_starting_generations_on(
     conn: &Connection,
     now_unix_ms: i64,
 ) -> Result<(), String> {
-    let generation = conn
-        .query_row(
-            "SELECT generation_uuid, creator_identity_os_pid,
-                    creator_identity_os_boot_id,
-                    creator_identity_os_pid_starttime_ticks
-             FROM runtime_generation
-             WHERE lifecycle_state = 'starting'
-               AND identity_os_pid IS NULL
-               AND creator_identity_os_pid IS NOT NULL
-             ORDER BY created_at
-             LIMIT 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    ProcessIdentity {
-                        os_pid: row.get(1)?,
-                        os_boot_id: row.get(2)?,
-                        os_pid_starttime_ticks: row.get(3)?,
-                    },
-                ))
-            },
-        )
-        .optional()
-        .map_err(|err| format!("Failed to read starting-generation creator: {err}"))?;
-    let Some((generation_uuid, creator)) = generation else {
+    // Eligibility is per generation. An old unknown row still blocks admission,
+    // but must not hide affirmative cessation evidence belonging to later rows.
+    // Snapshot candidates before mutating the lifecycle index being scanned.
+    for generation_uuid in unpublished_starting_generation_ids_on(conn)? {
+        reconcile_dead_starting_generation_on(conn, &generation_uuid, now_unix_ms)?;
+    }
+    Ok(())
+}
+
+fn unpublished_starting_generation_ids_on(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut statement = conn.prepare(
+        "SELECT generation_uuid FROM runtime_generation
+         WHERE lifecycle_state = 'starting'
+           AND identity_os_pid IS NULL
+           AND creator_identity_os_pid IS NOT NULL
+         ORDER BY created_at, generation_uuid",
+    ).map_err(|err| format!("Failed to prepare starting-generation scan: {err}"))?;
+    statement.query_map([], |row| row.get(0))
+        .map_err(|err| format!("Failed to scan starting generations: {err}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|err| format!("Failed to read starting-generation identity: {err}"))
+}
+
+fn reconcile_dead_starting_generation_on(
+    conn: &Connection,
+    generation_uuid: &str,
+    now_unix_ms: i64,
+) -> Result<(), String> {
+    let id = RuntimeGenerationId::parse(generation_uuid).map_err(|e| e.to_string())?;
+    let Some(row) = runtime_generation_by_id_on(conn, &id).map_err(|e| e.to_string())? else {
         return Ok(());
     };
-    // Tighten unknown evidence without extending recovery to unreaped creators.
-    // Starting may already have an unpublished OS child. Existing absent/replaced
-    // creator recovery is not proof of whole-tree cessation; broadening that
-    // custody policy (including zombie creators) needs a separate decision.
-    let recover = match observe_session_admission_owner(creator.os_pid) {
-        pid_identity::FinalizerProcessIdentityObservation::ExactLive(live) => live != creator,
-        pid_identity::FinalizerProcessIdentityObservation::Dead => true,
-        pid_identity::FinalizerProcessIdentityObservation::ExactExited(_)
-        | pid_identity::FinalizerProcessIdentityObservation::Unsupported
-        | pid_identity::FinalizerProcessIdentityObservation::ReadError(_) => false,
+    let ExactProcessEvidence::Recorded(ref creator) = row.creator_process_evidence else {
+        return Ok(());
     };
+    let recover = generation_boot_has_ended(&row) || (custody_allows_recovery(conn, &row)
+        && reservation_owner_has_exited(creator, observe_session_admission_owner(creator.os_pid)));
     if !recover {
         return Ok(());
     }
-    conn.execute(
+    let changed = conn.execute(
         "UPDATE runtime_generation
          SET lifecycle_state = 'exited', exited_at = ?2,
              terminal_reason = 'recovered_dead'
@@ -11050,6 +11163,9 @@ fn reconcile_dead_starting_generations_on(
         ],
     )
     .map_err(|err| format!("Failed to reconcile dead starting generation: {err}"))?;
+    if changed != 1 {
+        return Ok(());
+    }
     conn.execute(
         "UPDATE session_admission_queue
           SET state = 'settled', queue_reason = 'settled', updated_at_unix_ms = ?2
@@ -11566,11 +11682,7 @@ fn settle_unverifiable_runtime_generations(conn: &Connection) -> Result<(), Stri
              active_delivery_claim_uuid = NULL,
              active_delivery_claimed_at = NULL,
              active_delivery_seqs_json = NULL
-         WHERE (lifecycle_state = 'starting'
-                AND creator_identity_os_pid IS NULL
-                AND creator_identity_os_boot_id IS NULL
-                AND creator_identity_os_pid_starttime_ticks IS NULL)
-            OR (lifecycle_state IN ('running', 'draining')
+         WHERE (lifecycle_state IN ('running', 'draining')
                 AND identity_os_pid IS NULL
                 AND identity_os_boot_id IS NULL
                 AND identity_os_pid_starttime_ticks IS NULL)",
@@ -11835,6 +11947,10 @@ fn now_unix_millis() -> Result<i64, String> {
         .map_err(|_| "mailbox evidence timestamp exceeds i64".to_string())
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "mailbox/starting_recovery_tests.rs"]
+mod starting_recovery_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11867,6 +11983,46 @@ mod tests {
         assert_eq!(schema_version, schema::CURRENT_VERSION);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn starting_boot_recovery_uses_epoch_evidence_not_missing_proof_or_pid_absence() {
+        let current = current_identity().os_boot_id;
+        let previous = if current == "11111111-1111-4111-8111-111111111111" {
+            "22222222-2222-4222-8222-222222222222"
+        } else {
+            "11111111-1111-4111-8111-111111111111"
+        };
+        for (boot, previous_boot) in [(current, false), ("unverifiable".into(), false), (previous.into(), true)] {
+            for route in ["session", "global"] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+                let id = RuntimeGenerationId::new();
+                let proof = directory.path().join("never-certified");
+                std::fs::write(&proof, b"").unwrap();
+                db.runtime_lifecycle().create_runtime_generation_with_custody(CreateRuntimeGeneration {
+                    generation_id: &id, spawn_invocation_uuid: "old-invocation", session_id: Some("old-session"),
+                    runtime_mode: "headless", provider_name: "fixture", model_name: None,
+                    pty_control_path: None, models_dir: None, effective_cwd: None,
+                }, Some(&proof)).unwrap();
+                // Private persisted-epoch fixture, NOT a production rewrite or
+                // an executed reboot. Retain a current live PID deliberately.
+                db.conn.execute("UPDATE runtime_generation SET creator_identity_os_boot_id = ?1 WHERE generation_uuid = ?2",
+                    params![boot, id.to_string()]).unwrap();
+                if route == "session" {
+                    assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("old-session").unwrap(),
+                        if previous_boot { SessionLiveness::Idle } else { SessionLiveness::Busy });
+                } else {
+                    db.session_admissions().enqueue("successor", "successor", None, &current_identity(), 1).unwrap();
+                    assert_eq!(matches!(db.session_admissions().try_admit_next("claim", 0, 2).unwrap(),
+                        SessionAdmissionAttempt::Admitted(_)), previous_boot);
+                }
+                let row = db.runtime_lifecycle_reader().runtime_generation(&id).unwrap().unwrap();
+                assert_eq!(row.lifecycle_state, if previous_boot { RuntimeLifecycleState::Exited } else { RuntimeLifecycleState::Starting });
+                assert_eq!(std::fs::read(&proof).unwrap(), b""); // Never fabricate Q.
+            }
+        }
+    }
+
     #[test]
     fn starting_runtime_generation_fixture() {
         let Some(path) = std::env::var_os(STARTING_GENERATION_FIXTURE_PATH) else {
@@ -11875,9 +12031,12 @@ mod tests {
         let generation_id =
             RuntimeGenerationId::parse("90111111-1111-4111-8111-111111111111").unwrap();
         let mut db = MailboxDb::open(Path::new(&path)).unwrap();
+        let phase = std::env::var("OULIPOLY_TEST_CUSTODY_PHASE").ok();
+        let proof_path = oulipoly_core::launch_custody::proof_path(Path::new(&path), &generation_id.to_string());
+        let custody = phase.as_ref().map(|_| oulipoly_core::launch_custody::LaunchCustody::start(proof_path.clone()).unwrap());
         let GenerationMutation::Applied(row) = db
             .runtime_lifecycle()
-            .create_runtime_generation(CreateRuntimeGeneration {
+            .create_runtime_generation_with_custody(CreateRuntimeGeneration {
                 generation_id: &generation_id,
                 spawn_invocation_uuid: "starting-fixture-invocation",
                 session_id: Some("starting-fixture-session"),
@@ -11887,7 +12046,7 @@ mod tests {
                 pty_control_path: None,
                 models_dir: None,
                 effective_cwd: None,
-            })
+            }, custody.as_ref().map(|_| proof_path.as_path()))
             .unwrap()
         else {
             panic!("fixture generation was not created");
@@ -11896,6 +12055,102 @@ mod tests {
             row.creator_process_evidence,
             ExactProcessEvidence::Recorded(_)
         ));
+        #[cfg(target_os = "linux")]
+        if let Some(phase) = phase {
+            let root = Path::new(&path).parent().unwrap();
+            if phase == "unpublished" {
+                use std::os::unix::process::CommandExt;
+                let mut command = std::process::Command::new("/bin/sh");
+                command.args(["-c", "/usr/bin/setsid /bin/sh -c 'echo ready > descendant; /bin/sleep 1' & exit 0"])
+                    .env_clear().current_dir(root).process_group(0);
+                custody.as_ref().unwrap().configure(&mut command).unwrap();
+                let _child = command.spawn().unwrap();
+                drop(command);
+                custody_eventually(|| root.join("descendant").exists());
+            }
+            if phase == "sealed_live" { custody.as_ref().unwrap().seal(); }
+            std::fs::write(root.join("ready"), b"ready").unwrap();
+            std::thread::sleep(StdDuration::from_secs(10));
+            panic!("fixture creator not crashed");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct CustodyTestCreator(std::process::Child);
+    #[cfg(target_os = "linux")]
+    impl std::ops::Deref for CustodyTestCreator {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target { &self.0 }
+    }
+    #[cfg(target_os = "linux")]
+    impl std::ops::DerefMut for CustodyTestCreator {
+        fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+    }
+    #[cfg(target_os = "linux")]
+    impl Drop for CustodyTestCreator {
+        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn custody_eventually(mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+        while !condition() {
+            assert!(std::time::Instant::now() < deadline, "private custody deadline");
+            std::thread::sleep(StdDuration::from_millis(5));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn starting_custody_recovery_consumers_require_real_tree_quiescence_and_creator_exit() {
+        for phase in ["before_spawn", "unpublished", "sealed_live"] {
+            for route in ["session", "global"] {
+                let directory = tempfile::tempdir().unwrap();
+                let sidecar = directory.path().join("pid-identity.db");
+                let mut creator = CustodyTestCreator(std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "mailbox::tests::starting_runtime_generation_fixture"])
+                    .env_clear().env("HOME", directory.path()).env("XDG_CONFIG_HOME", directory.path())
+                    .env("XDG_DATA_HOME", directory.path()).env(STARTING_GENERATION_FIXTURE_PATH, &sidecar)
+                    .env("OULIPOLY_TEST_CUSTODY_PHASE", phase)
+                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+                custody_eventually(|| directory.path().join("ready").exists());
+                let id = RuntimeGenerationId::parse("90111111-1111-4111-8111-111111111111").unwrap();
+                let mut db = MailboxDb::open(&sidecar).unwrap();
+                db.session_admissions().enqueue("successor", "successor", None, &current_identity(), 1).unwrap();
+                assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("starting-fixture-session").unwrap(), SessionLiveness::Busy);
+                assert!(!matches!(db.session_admissions().try_admit_next("claim", 0, 2).unwrap(), SessionAdmissionAttempt::Admitted(_)));
+                creator.kill().unwrap();
+                custody_eventually(|| matches!(pid_identity::observe_finalizer_process_identity(creator.id().into()), pid_identity::FinalizerProcessIdentityObservation::ExactExited(_)));
+                if phase == "unpublished" {
+                    assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("starting-fixture-session").unwrap(), SessionLiveness::Busy);
+                    assert!(!matches!(db.session_admissions().try_admit_next("claim", 0, 3).unwrap(), SessionAdmissionAttempt::Admitted(_)));
+                }
+                let proof = oulipoly_core::launch_custody::proof_path(&sidecar, &id.to_string());
+                custody_eventually(|| oulipoly_core::launch_custody::is_quiescent(&proof));
+                // Different inode with the same bytes cannot release this row.
+                let retained = proof.with_extension("retained");
+                std::fs::rename(&proof, &retained).unwrap();
+                std::fs::write(&proof, b"Q").unwrap();
+                assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("starting-fixture-session").unwrap(), SessionLiveness::Busy);
+                std::fs::remove_file(&proof).unwrap();
+                std::fs::rename(retained, &proof).unwrap();
+                if route == "session" {
+                    assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("starting-fixture-session").unwrap(), SessionLiveness::Idle);
+                }
+                assert!(matches!(db.session_admissions().try_admit_next("claim", 0, 4).unwrap(), SessionAdmissionAttempt::Admitted(_)));
+                let row = db.runtime_lifecycle_reader().runtime_generation(&id).unwrap().unwrap();
+                assert_eq!(row.lifecycle_state, RuntimeLifecycleState::Exited);
+                assert_eq!(row.terminal_reason, Some(RuntimeTerminalReason::RecoveredDead));
+                let identity = current_identity();
+                assert!(matches!(db.runtime_lifecycle().bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                    fence: RuntimeGenerationFence { generation_id: &id, spawn_invocation_uuid: "starting-fixture-invocation" },
+                    spawned_os_pid: identity.os_pid, exact_process_identity: &identity, os_pgid: None,
+                }).unwrap(), GenerationMutation::Rejected(_)));
+                // Preserve the real creator zombie until successor admission and
+                // attempted late publication have both been checked.
+                creator.wait().unwrap();
+            }
+        }
     }
 
     #[test]
@@ -11907,7 +12162,7 @@ mod tests {
     }
 
     #[test]
-    fn dead_starting_generation_creator_is_recovered_after_restart() {
+    fn legacy_dead_starting_generation_remains_unknown_after_restart() {
         let directory = tempfile::tempdir().unwrap();
         let sidecar_path = directory.path().join("pid-identity.db");
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -11936,17 +12191,17 @@ mod tests {
             db.runtime_lifecycle()
                 .reconcile_session_liveness("starting-fixture-session")
                 .unwrap(),
-            SessionLiveness::Idle
+            SessionLiveness::Busy
         );
         let after = db
             .runtime_lifecycle_reader()
             .runtime_generation(&generation_id)
             .unwrap()
             .unwrap();
-        assert_eq!(after.lifecycle_state, RuntimeLifecycleState::Exited);
+        assert_eq!(after.lifecycle_state, RuntimeLifecycleState::Starting);
         assert_eq!(
             after.terminal_reason,
-            Some(RuntimeTerminalReason::RecoveredDead)
+            None
         );
     }
 
@@ -13014,7 +13269,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_drain_reconciles_dead_sessionless_starting_generation() {
+    fn admission_drain_retains_legacy_dead_sessionless_starting_generation() {
         let directory = tempfile::tempdir().unwrap();
         let sidecar_path = directory.path().join("pid-identity.db");
         let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
@@ -13060,10 +13315,7 @@ mod tests {
             .session_admissions()
             .try_admit_next("live-claim", 0, 3)
             .unwrap();
-        let SessionAdmissionAttempt::Admitted(admitted) = admitted else {
-            panic!("live admission was not admitted after dead generation recovery");
-        };
-        assert_eq!(admitted.registration_identity, "live-registration");
+        assert!(!matches!(admitted, SessionAdmissionAttempt::Admitted(_)));
         assert_eq!(
             mailbox
                 .runtime_lifecycle_reader()
@@ -13071,7 +13323,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .lifecycle_state,
-            RuntimeLifecycleState::Exited
+            RuntimeLifecycleState::Starting
         );
     }
 
@@ -13138,7 +13390,7 @@ mod tests {
             assert!(columns.iter().any(|candidate| candidate == column));
         }
         for (generation_uuid, expected_state, expected_reason) in [
-            ("legacy-starting", "exited", Some("startup_failed")),
+            ("legacy-starting", "starting", None),
             (
                 "legacy-unverified-running",
                 "exited",

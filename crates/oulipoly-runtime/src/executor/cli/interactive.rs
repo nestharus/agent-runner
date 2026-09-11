@@ -268,6 +268,7 @@ fn execute_interactive_with_result_and_monitor_context(
     configure_interactive_stdio(&mut cmd);
     configure_direct_interactive_process_group(&mut cmd);
     register_runtime_generation_starting(spawn_identity.as_ref())?;
+    crate::executor::cli::spawn_identity::configure_launch_custody(&mut cmd, spawn_identity.as_ref())?;
     let child = match spawn_interactive_child(cmd, provider) {
         Ok(child) => child,
         Err(err) => {

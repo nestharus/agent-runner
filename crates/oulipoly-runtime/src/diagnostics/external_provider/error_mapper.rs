@@ -10,8 +10,16 @@ pub(crate) fn registry_error(_error: ProviderRegistryError) -> ServiceError {
     classify_error(TerminalClassifyError::registry())
 }
 
-pub(crate) fn client_error(_error: ProviderClientError) -> ServiceError {
-    classify_error(TerminalClassifyError::provider_client())
+pub(crate) fn client_error(error: ProviderClientError) -> ServiceError {
+    // Keep a transport/protocol discriminator without copying provider output
+    // (which may contain private data) into a terminal diagnostic.
+    ServiceError::Dependency {
+        message: format!(
+            "{};kind={}",
+            format_terminal_classify_error(&TerminalClassifyError::provider_client()),
+            error.transport_kind(),
+        ),
+    }
 }
 
 pub(crate) fn projection_error(_error: serde_json::Error) -> ServiceError {

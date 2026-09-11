@@ -543,3 +543,93 @@ fn repl_exits_one_when_provider_has_no_interactive_args() {
         "stderr should mention interactive_args: {stderr}"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repl_single_parent_term_bounds_resistant_workload_and_escaped_descendant() {
+    let fixture = Fixture::new();
+    let ready = fixture.dir.path().join("resistant-ready");
+    let escaped = fixture.dir.path().join("resistant-escaped");
+    let script = fixture.write_script(
+        "resistant-provider.sh",
+        &format!(
+            r#"
+exec /usr/bin/python3 - <<'PY'
+import os,pathlib,signal,time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child=os.fork()
+if child==0:
+    os.setsid()
+    pathlib.Path({escaped:?}).write_text(str(os.getpid()))
+    time.sleep(5)
+    os._exit(92)
+pathlib.Path({ready:?}).write_text(str(os.getpid()))
+time.sleep(5)
+os._exit(93)
+PY
+"#,
+            escaped = escaped.to_str().unwrap(),
+            ready = ready.to_str().unwrap()
+        ),
+    );
+    fixture.write_model("fixture", "fixture-provider", &script);
+    let mut child = fixture.spawn_repl("fixture", None);
+    wait_for_path(&ready);
+    wait_for_path(&escaped);
+    let workload: i32 = fs::read_to_string(ready).unwrap().parse().unwrap();
+    let descendant: i32 = fs::read_to_string(escaped).unwrap().parse().unwrap();
+    let published = unsafe { libc::getpgid(workload) };
+    assert!(published > 0);
+    assert_ne!(published, workload);
+    assert_eq!(unsafe { libc::getpgid(descendant) }, descendant);
+    let start = Instant::now();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let end = start + Duration::from_secs(3);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= end {
+            // Failure-only bounded cleanup. Finite fake descendants also have
+            // their own backstop; this is never part of the success oracle.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("single TERM failed to settle the resistant interactive launch");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(137), "{output:?}");
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.exit_code, Some(137));
+    assert_eq!(row.terminal_reason.as_deref(), Some("signal:SIGKILL"));
+    assert_eq!(row.status, InvocationStatus::Failed);
+    assert!(row.finished_at.is_some());
+    for pid in [workload, descendant] {
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+    assert_eq!(unsafe { libc::killpg(published, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    let proofs = fixture
+        .db_path()
+        .with_file_name("pid-identity.db")
+        .with_extension("starting-custody-v1");
+    let proofs: Vec<_> = fs::read_dir(proofs)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(proofs.len(), 1);
+    assert!(oulipoly_core::launch_custody::is_quiescent(&proofs[0]));
+    eprintln!(
+        "single R TERM: actual W SIGKILL transported by P; elapsed={:?} W={workload} escaped={descendant} P={published} all_absent Q=true group=ESRCH",
+        start.elapsed()
+    );
+}

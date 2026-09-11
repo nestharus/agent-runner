@@ -771,7 +771,7 @@ fn assert_cargo_inventory_matches(workflow_name: &str, workflow: &Value) {
     let mut allowed = vec![
         (
             "rust-lib-check",
-            r"^cargo\s+test\s+-p\s+\$\{\{\s*matrix\.crate\s*\}\}\s*$",
+            r"^cargo\s+test\s+-p\s+\$\{\{\s*matrix\.crate\s*\}\}(\s+--no-fail-fast)?\s*$",
         ),
         (
             "rust-lib-check",
@@ -779,7 +779,7 @@ fn assert_cargo_inventory_matches(workflow_name: &str, workflow: &Value) {
         ),
         (
             "rust-client-check",
-            r"^cargo\s+test\s+-p\s+\$\{\{\s*matrix\.client\.name\s*\}\}\s*$",
+            r"^cargo\s+test\s+-p\s+\$\{\{\s*matrix\.client\.name\s*\}\}(\s+--no-fail-fast)?\s*$",
         ),
         (
             "rust-client-check",
@@ -802,7 +802,7 @@ fn assert_cargo_inventory_matches(workflow_name: &str, workflow: &Value) {
         for job in ["rust-state-windows", "rust-state-macos"] {
             allowed.push((
                 job,
-                r"^cargo\s+test\s+-p\s+oulipoly-state\s+read_only_snapshot\s*$",
+                r"^cargo\s+test\s+-p\s+oulipoly-state\s+read_only_snapshot(\s+--\s+--nocapture)?\s*$",
             ));
             allowed.push((
                 job,
@@ -821,6 +821,10 @@ fn assert_cargo_inventory_matches(workflow_name: &str, workflow: &Value) {
             (
                 "rust-native-wake",
                 r"^cargo\s+test\s+-p\s+oulipoly-agent-runner\s+--test\s+age309_native_wake_domain\s+native_count_five_startup_sweep_reaches_one_detached_provider_turn\s+--\s+--exact\s+--nocapture\s*$",
+            ),
+            (
+                "rust-native-wake",
+                r"^cargo\s+test\s+-p\s+oulipoly-provider\s+--lib\s+native_group_diagnostic_tests\s+--\s+--nocapture\s*$",
             ),
             (
                 "rust-native-wake",
@@ -925,15 +929,19 @@ fn assert_apt_packages(workflow_name: &str, workflow: &Value, job_name: &str) {
         1,
         "A13: {workflow_name} {job_name} must contain exactly one apt-get install step, found: {apt_steps:?}"
     );
+    let mut expected = BTreeSet::from([
+        "libwebkit2gtk-4.1-dev".to_string(),
+        "libgtk-3-dev".to_string(),
+        "libsoup-3.0-dev".to_string(),
+        "libjavascriptcoregtk-4.1-dev".to_string(),
+    ]);
+    if workflow_name == "ci.yml" {
+        expected.extend(["ripgrep", "util-linux", "ncurses-bin"].map(str::to_string));
+    }
     assert_eq!(
         apt_install_packages(apt_steps[0]),
-        BTreeSet::from([
-            "libwebkit2gtk-4.1-dev".to_string(),
-            "libgtk-3-dev".to_string(),
-            "libsoup-3.0-dev".to_string(),
-            "libjavascriptcoregtk-4.1-dev".to_string()
-        ]),
-        "A13: {workflow_name} {job_name} apt-get install step must list exactly the preserved Linux Tauri/WebKit packages"
+        expected,
+        "A13: {workflow_name} {job_name} must preserve Linux Tauri/WebKit and the workflow's explicit executable test dependencies"
     );
 }
 
@@ -1720,4 +1728,90 @@ fn assertion_a17_agents_release_process_documented() {
             "A17: AGENTS.md Release Process section must contain {needle:?}"
         );
     }
+}
+
+#[test]
+fn ci_preserves_later_tests_and_strict_checks_after_failure() {
+    let workflow = ci_workflow();
+    for name in ["rust-lib-check", "rust-client-check", "rust-integration"] {
+        let steps = job_steps(&workflow, name, "CI");
+        let test = steps
+            .iter()
+            .find(|step| {
+                mapping_get(step, "run")
+                    .and_then(Value::as_str)
+                    .is_some_and(|run| run.starts_with("cargo test"))
+            })
+            .unwrap();
+        assert!(string_field(test, "run", "package tests").contains("--no-fail-fast"));
+        assert!(mapping_get(test, "timeout-minutes").is_some());
+        for step in steps {
+            let Some(run) = mapping_get(step, "run").and_then(Value::as_str) else {
+                continue;
+            };
+            if run.starts_with("cargo clippy") || run.starts_with("cargo fmt") {
+                assert_eq!(
+                    string_field(step, "if", "strict check"),
+                    "${{ !cancelled() }}"
+                );
+                assert!(mapping_get(step, "continue-on-error").is_none());
+            }
+        }
+    }
+    assert_eq!(
+        string_field(
+            job(&workflow, "rust-integration", "CI"),
+            "if",
+            "integration"
+        ),
+        "${{ !cancelled() }}"
+    );
+    for name in ["rust-state-windows", "rust-state-macos", "rust-native-wake"] {
+        let tests: Vec<_> = job_steps(&workflow, name, "CI")
+            .iter()
+            .filter(|step| {
+                mapping_get(step, "run")
+                    .and_then(Value::as_str)
+                    .is_some_and(|run| run.starts_with("cargo test"))
+            })
+            .collect();
+        for step in tests.iter().skip(1) {
+            assert_eq!(
+                string_field(step, "if", "later native test"),
+                "${{ !cancelled() }}"
+            );
+            assert!(mapping_get(step, "continue-on-error").is_none());
+        }
+    }
+}
+
+#[test]
+fn ci_runtime_unit_tests_have_sized_pty_without_redirecting_client_tests() {
+    let workflow = ci_workflow();
+    for name in ["rust-lib-check", "rust-integration"] {
+        let step = step_by_name(
+            &workflow,
+            "CI",
+            name,
+            if name == "rust-lib-check" {
+                "Package tests (retain every target outcome)"
+            } else {
+                "Workspace tests (retain every target outcome)"
+            },
+        );
+        assert_eq!(
+            value_at(
+                step,
+                "runner",
+                &["env", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER"]
+            )
+            .as_str(),
+            Some("bash ${{ github.workspace }}/.github/scripts/ci-test-runner.sh")
+        );
+    }
+    let runner = read_text("../../.github/scripts/ci-test-runner.sh");
+    assert!(runner.contains("oulipoly_runtime-*)"));
+    assert!(runner.contains("script --quiet --return --command"));
+    assert!(runner.contains("stty rows 24 cols 80"));
+    assert!(runner.contains("*) exec \"$@\""));
 }

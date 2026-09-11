@@ -21,10 +21,10 @@ impl IdentityCache {
     pub fn digest(&self, pinned: &File) -> Result<String, String> {
         let before = stamp(pinned)?;
         let mut cache = self.0.lock().map_err(|e| e.to_string())?;
-        if let Some((previous, digest)) = cache.as_ref() {
-            if *previous == before {
-                return Ok(digest.clone());
-            }
+        if let Some((previous, digest)) = cache.as_ref()
+            && *previous == before
+        {
+            return Ok(digest.clone());
         }
         // Linux native pins are O_PATH. This is a descriptor reopen, not a
         // pathname lookup; a renamed/replaced executable cannot donate bytes.

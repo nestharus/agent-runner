@@ -62,6 +62,7 @@ fn terminal_schedule(path: TerminalPath, failed_worker: Option<&str>) -> bool {
         &command,
         std::iter::empty::<(&str, &str)>(),
         limits.custody.clone(),
+        limits.spawn_observer.is_none(),
     )
     .unwrap();
     let (publisher, events) = process_event_bus();
@@ -374,6 +375,7 @@ fn supervisor_preserves_actual_waitid_error_after_owned_reap() {
         &command,
         std::iter::empty::<(&str, &str)>(),
         limits.custody.clone(),
+        limits.spawn_observer.is_none(),
     )
     .unwrap();
     let (publisher, events) = process_event_bus();

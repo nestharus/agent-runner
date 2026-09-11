@@ -25,18 +25,27 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const LARGE_PROMPT_BYTES: usize = 200 * 1024;
 const PROMPT_INSTRUCTION_PREFIX: &str = "Follow the instructions in ";
 static TEST_DATA_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
+// Custody forks can retain another test's writable script FD without exec,
+// even with CLOEXEC. Serialize publication AND execution, not just writer close.
+static SCRIPT_LIFECYCLE: Mutex<()> = Mutex::new(());
+
 struct FixtureScript {
     _dir: tempfile::TempDir,
     path: PathBuf,
+    // Fields drop in declaration order: remove the script before unlocking.
+    _lifecycle: MutexGuard<'static, ()>,
 }
 
 fn fixture_script(body: &str) -> FixtureScript {
+    let lifecycle = SCRIPT_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     TEST_DATA_DIR.get_or_init(|| {
         let dir = tempfile::tempdir().expect("test data dir");
         unsafe {
@@ -57,7 +66,11 @@ fn fixture_script(body: &str) -> FixtureScript {
         .permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).expect("chmod provider script");
-    FixtureScript { _dir: dir, path }
+    FixtureScript {
+        _dir: dir,
+        path,
+        _lifecycle: lifecycle,
+    }
 }
 
 fn provider_for(script: &FixtureScript) -> ProviderConfig {

@@ -376,11 +376,10 @@ pub(crate) fn retain_observation_failure(
     error: oulipoly_runtime::session_provider::SessionProviderError,
 ) -> String {
     let message = error.to_string();
-    if let Some(reason) = error.fixed_observation_stop_reason() {
-        if let Err(storage) = db.stop_mailbox_observation(session_id, attempt_id, reason, &message)
-        {
-            return format!("{message}; {storage}");
-        }
+    if let Some(reason) = error.fixed_observation_stop_reason()
+        && let Err(storage) = db.stop_mailbox_observation(session_id, attempt_id, reason, &message)
+    {
+        return format!("{message}; {storage}");
     }
     message
 }

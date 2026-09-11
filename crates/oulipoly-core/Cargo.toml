@@ -11,4 +11,5 @@ name = "oulipoly_core"
 test-support = []
 
 [dependencies]
+libc.workspace = true
 serde.workspace = true

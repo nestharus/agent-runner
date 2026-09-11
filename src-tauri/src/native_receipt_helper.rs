@@ -190,12 +190,11 @@ fn inspect(once: bool, target: Option<Target>) -> Result<(), String> {
         write!(owner, "{now}").map_err(|e| e.to_string())?;
         // Reopen under real shared custody every visit; rebuild may have
         // replaced the DB while idle. No stale connection/anchor survives it.
-        if let Some(mut db) = MailboxDb::open_default_if_exists()? {
-            if let Err(error) =
+        if let Some(mut db) = MailboxDb::open_default_if_exists()?
+            && let Err(error) =
                 super::poll_headless_receipt_tick_with(&mut db, |dir| registry.registry(dir))
-            {
-                eprintln!("receipt inspection: {error}");
-            }
+        {
+            eprintln!("receipt inspection: {error}");
         }
         std::io::stdout()
             .write_all(b".")
@@ -458,7 +457,7 @@ pub(crate) fn supervise(
             let mut stdout = stdout;
             let mut byte = [0u8];
             while stdout.read_exact(&mut byte).is_ok() {
-                if byte == [b'!'] {
+                if byte == *b"!" {
                     completion.store(true, Ordering::SeqCst);
                 }
                 let _ = send.try_send(());

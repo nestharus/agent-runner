@@ -5,6 +5,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  TERM: xterm-256color
   OULIPOLY_DATA_DIR: ${{ github.workspace }}/target/ci-data
   OULIPOLY_DATA_HOME: ${{ github.workspace }}/target/ci-data-home
   XDG_CONFIG_HOME: ${{ github.workspace }}/target/ci-config-home
@@ -49,6 +51,7 @@ jobs:
     needs: prepare-matrix
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         crate: ${{ fromJSON(needs.prepare-matrix.outputs.libs) }}
     steps:
@@ -61,16 +64,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: lib-${{ matrix.crate }}
-      - if: matrix.crate == 'oulipoly-provider'
-        name: Install ripgrep
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - run: cargo test -p ${{ matrix.crate }}
-      - run: cargo clippy -p ${{ matrix.crate }} -- -D warnings
+      - name: Install executable test dependencies
+        run: sudo apt-get update && sudo apt-get install -y ripgrep util-linux ncurses-bin
+      - run: rg --version && script --version && command -v tput
+      - name: Package tests (retain every target outcome)
+        timeout-minutes: 30
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: bash ${{ github.workspace }}/.github/scripts/ci-test-runner.sh
+        run: cargo test -p ${{ matrix.crate }} --no-fail-fast
+      - if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo clippy -p ${{ matrix.crate }} -- -D warnings
 
   rust-client-check:
     needs: prepare-matrix
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         client: ${{ fromJSON(needs.prepare-matrix.outputs.clients) }}
     steps:
@@ -87,12 +97,17 @@ jobs:
         name: Install system deps (Linux)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev ripgrep util-linux ncurses-bin
       - if: matrix.client.name == 'oulipoly-agent-runner'
         name: Install pinned agent-bash
         uses: ./.github/actions/install-agent-bash
-      - run: cargo test -p ${{ matrix.client.name }}
-      - run: cargo clippy -p ${{ matrix.client.name }} -- -D warnings
+      - run: rg --version && script --version && command -v tput
+      - name: Package tests (retain every target outcome)
+        timeout-minutes: 45
+        run: cargo test -p ${{ matrix.client.name }} --no-fail-fast
+      - if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo clippy -p ${{ matrix.client.name }} -- -D warnings
 
   rust-state-windows:
     runs-on: windows-latest
@@ -102,8 +117,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: state-windows
-      - run: cargo test -p oulipoly-state read_only_snapshot
-      - run: cargo test -p oulipoly-state pid_identity::tests
+      - timeout-minutes: 20
+        run: cargo test -p oulipoly-state read_only_snapshot -- --nocapture
+      - if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p oulipoly-state pid_identity::tests
 
   rust-state-macos:
     runs-on: macos-latest
@@ -113,8 +131,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: state-macos
-      - run: cargo test -p oulipoly-state read_only_snapshot
-      - run: cargo test -p oulipoly-state pid_identity::tests
+      - timeout-minutes: 20
+        run: cargo test -p oulipoly-state read_only_snapshot -- --nocapture
+      - if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p oulipoly-state pid_identity::tests
 
   rust-native-wake:
     strategy:
@@ -131,12 +152,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - run: cargo test -p oulipoly-agent-runner --test age330_native_delivery_domain -- --nocapture
-      - run: cargo test -p oulipoly-agent-runner --lib wake_coordinator::admission::tests::native_memory_observer_matches_host_and_drives_default_admission -- --exact --nocapture
-      - run: cargo test -p oulipoly-agent-runner --lib wake_coordinator::admission::tests::unavailable_memory_observation_returns_visible_error_without_stranding_queue -- --exact
-      - run: cargo test -p oulipoly-agent-runner --test age309_native_wake_domain native_count_five_startup_sweep_reaches_one_detached_provider_turn -- --exact --nocapture
+      - if: ${{ !cancelled() && runner.os == 'macOS' }}
+        name: Native retained group diagnostics (no settlement exemption)
+        timeout-minutes: 10
+        run: cargo test -p oulipoly-provider --lib native_group_diagnostic_tests -- --nocapture
+      - if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo test -p oulipoly-agent-runner --test age330_native_delivery_domain -- --nocapture
+      - if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: cargo test -p oulipoly-agent-runner --lib wake_coordinator::admission::tests::native_memory_observer_matches_host_and_drives_default_admission -- --exact --nocapture
+      - if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: cargo test -p oulipoly-agent-runner --lib wake_coordinator::admission::tests::unavailable_memory_observation_returns_visible_error_without_stranding_queue -- --exact
+      - if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: cargo test -p oulipoly-agent-runner --test age309_native_wake_domain native_count_five_startup_sweep_reaches_one_detached_provider_turn -- --exact --nocapture
 
   rust-integration:
+    if: ${{ !cancelled() }}
     needs: [rust-lib-check, rust-client-check, rust-state-windows, rust-state-macos, rust-native-wake]
     runs-on: ubuntu-latest
     steps:
@@ -153,9 +187,18 @@ jobs:
         name: Install system deps (Linux)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev ripgrep util-linux ncurses-bin
       - name: Install pinned agent-bash
         uses: ./.github/actions/install-agent-bash
-      - run: cargo test --workspace
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace -- -D warnings
+      - run: rg --version && script --version && command -v tput
+      - name: Workspace tests (retain every target outcome)
+        timeout-minutes: 60
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: bash ${{ github.workspace }}/.github/scripts/ci-test-runner.sh
+        run: cargo test --workspace --no-fail-fast
+      - if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: cargo fmt --all -- --check
+      - if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo clippy --workspace -- -D warnings

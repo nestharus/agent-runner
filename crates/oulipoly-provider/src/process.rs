@@ -599,7 +599,12 @@ impl ProcessRunner {
         P: StdoutProcessor,
     {
         let argv = command.argv();
-        let mut child = spawn_provider_process(&command, envs, self.limits.custody.clone())?;
+        let mut child = spawn_provider_process(
+            &command,
+            envs,
+            self.limits.custody.clone(),
+            self.limits.spawn_observer.is_none(),
+        )?;
         if let Err(error) = notify_spawn_observer(&self.limits.spawn_observer, child.id()) {
             return Err(terminate_after_spawn_observer_failure(
                 child,
@@ -789,7 +794,7 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
         }
         let terminated = TerminatedProcess {
             status: reap_after_kill(&mut self.child, admitted),
-            force_killed: admitted,
+            force_killed: self.child.force_was_delivered(admitted),
         };
         let status = terminated.status.map(process_status);
         let joined = collect_or_retain_process_threads(self.threads, self.child);
@@ -858,6 +863,7 @@ fn spawn_provider_process<I, K, V>(
     command: &ProcessCommand,
     envs: I,
     custody: Option<crate::custody::OperationCustody>,
+    private_handle: bool,
 ) -> Result<Child, ProviderClientError>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -873,6 +879,21 @@ where
         ));
     }
     let mut process = build_provider_process(command, envs);
+    #[cfg(target_os = "linux")]
+    if private_handle && receipt_group() == 0 {
+        return oulipoly_core::launch_custody::spawn_current_remote(process, |process| {
+            crate::process_custody::configure_containment(process, custody.is_some());
+        })
+        .map(|(child, remote)| Child::new(child, custody).with_remote(remote))
+        .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error));
+    }
+    let _ = private_handle;
+    // Published runtime identities still expose a numeric kill-group leader.
+    // Do not publish C as that leader: external cancellation would kill the
+    // custodian. Those launches retain P until their handle API migrates.
+    oulipoly_core::launch_custody::configure_current(&mut process)
+        .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error))?;
+    // The filter is workload-only, after the independent owner's setup.
     crate::process_custody::configure_containment(&mut process, custody.is_some());
     process
         .spawn()
@@ -1080,11 +1101,24 @@ fn poll_child_status(
     // the whole group, including descendants after a direct operation exits.
     // Killing that group here would kill the cache/DB owner after every describe.
     // Normal invocation custody retains its existing per-operation teardown.
-    if receipt_group() == 0 && !kill_tree(child) {
-        return Err(wait_operation_error(
-            command,
-            "cleanup_admission_or_signal",
-            std::io::Error::other("process cleanup admission unavailable"),
+    if receipt_group() == 0
+        && let Err((operation, error)) = kill_tree_checked(child)
+    {
+        let errno = error
+            .raw_os_error()
+            .map_or_else(|| "unavailable".into(), |n| n.to_string());
+        let custody = if child.has_actor_custody() {
+            "present"
+        } else {
+            "absent"
+        };
+        return Err(ProviderClientError::host_transport(
+            HostErrorKind::WaitFailed,
+            subcommand_for_error(command),
+            None,
+            ProviderDiagnostics::with_description(format!(
+                "{operation}: actor_custody={custody}; errno={errno}"
+            )),
         ));
     }
     child
@@ -1273,7 +1307,7 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
             }
             Ok(false) if should_force_kill(&grace_started, kill_after_grace) => {
                 let admitted = kill_tree(child);
-                force_killed = admitted;
+                force_killed = child.force_was_delivered(admitted);
                 if admitted {
                     child.forced();
                 }
@@ -1318,7 +1352,7 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
             Ok(Some(status)) => break Some(status),
             Ok(None) if should_force_kill(&grace_started, kill_after_grace) => {
                 let admitted = kill_tree(child);
-                force_killed = admitted;
+                force_killed = child.force_was_delivered(admitted);
                 if admitted {
                     child.forced();
                 }
@@ -1778,6 +1812,12 @@ fn terminate_tree(child: &mut Child) {
         child.uncertain();
         return;
     }
+    if let Some(result) = child.signal_remote(libc::SIGTERM) {
+        if result.is_err() {
+            child.uncertain();
+        }
+        return;
+    }
     let group = -if receipt_group() != 0 {
         receipt_group()
     } else {
@@ -1809,21 +1849,37 @@ fn terminate_tree(child: &mut Child) {
 
 #[cfg(unix)]
 fn kill_tree(child: &mut Child) -> bool {
-    if !child.can_signal_group() {
+    kill_tree_checked(child).is_ok()
+}
+
+#[cfg(unix)]
+fn kill_tree_checked(child: &mut Child) -> Result<(), (&'static str, std::io::Error)> {
+    if let Err(error) = child.check_signal_group() {
         child.uncertain();
-        return false;
+        return Err(error);
+    }
+    if let Some(result) = child.signal_remote(libc::SIGKILL) {
+        if result.is_err() {
+            child.uncertain();
+        }
+        return result
+            .map(|_| ())
+            .map_err(|error| ("cleanup_remote_signal", error));
     }
     let group = -if receipt_group() != 0 {
         receipt_group()
     } else {
         child.id() as i32
     };
-    let signal_ok = unsafe { libc::kill(group, libc::SIGKILL) } == 0;
-    child.confirm_group_dead(signal_ok);
-    if !signal_ok {
+    let result = unsafe { libc::kill(group, libc::SIGKILL) };
+    // Retain the actual group-signal error, not an error from confirmation.
+    let error = (result != 0).then(std::io::Error::last_os_error);
+    child.confirm_group_dead(result == 0);
+    if let Some(error) = error {
         child.uncertain();
+        return Err(("cleanup_group_kill", error));
     }
-    signal_ok
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -1855,6 +1911,10 @@ pub(crate) fn is_executable(path: &Path) -> bool {
         true
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "process/generation_wait_tests.rs"]
+mod generation_wait_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2450,3 +2510,7 @@ fn collect_or_retain_process_threads<T: StdoutDrainOutput>(
     });
     joined
 }
+
+#[cfg(all(test, unix))]
+#[path = "process/cleanup_diagnostic_tests.rs"]
+mod cleanup_diagnostic_tests;

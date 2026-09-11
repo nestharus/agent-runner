@@ -6,6 +6,9 @@ use std::process::{Child, ExitStatus};
 
 pub(crate) struct OwnedChild {
     child: Child,
+    #[cfg(target_os = "linux")]
+    remote: Option<oulipoly_core::launch_custody::RemoteStatus>,
+    remote_force_delivered: bool,
     reaped: bool,
     custody: Option<OperationCustody>,
     confined: bool,
@@ -38,10 +41,42 @@ impl OwnedChild {
             #[cfg(all(test, target_os = "linux"))]
             identity_fault: IDENTITY_FAULT.get(),
             child,
+            #[cfg(target_os = "linux")]
+            remote: None,
+            remote_force_delivered: false,
             reaped: false,
             confined: custody.is_some() && containment_supported(),
             custody,
         }
+    }
+    #[cfg(target_os = "linux")]
+    pub fn with_remote(
+        mut self,
+        remote: Option<oulipoly_core::launch_custody::RemoteStatus>,
+    ) -> Self {
+        self.remote = remote;
+        self
+    }
+    #[cfg(unix)]
+    pub fn signal_remote(&mut self, signal: i32) -> Option<std::io::Result<bool>> {
+        #[cfg(target_os = "linux")]
+        if let Some(remote) = &self.remote {
+            let result = remote.signal(signal);
+            if signal == libc::SIGKILL {
+                self.remote_force_delivered = matches!(result, Ok(true));
+            }
+            return Some(result);
+        }
+        let _ = signal;
+        None
+    }
+    pub fn force_was_delivered(&self, admitted: bool) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.remote.is_some() {
+            return admitted && self.remote_force_delivered;
+        }
+        let _ = self.remote_force_delivered;
+        admitted
     }
     fn current_identity(&self) -> std::io::Result<ProcessIdentity> {
         #[cfg(all(test, target_os = "linux"))]
@@ -67,33 +102,52 @@ impl OwnedChild {
         }
     }
     pub fn can_signal_group(&self) -> bool {
+        self.check_signal_group().is_ok()
+    }
+    #[cfg(unix)]
+    pub fn has_actor_custody(&self) -> bool {
+        self.custody.is_some()
+    }
+    pub fn check_signal_group(&self) -> Result<(), (&'static str, std::io::Error)> {
         #[cfg(unix)]
         {
             let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-            let retained = unsafe {
+            let result = unsafe {
                 libc::waitid(
                     libc::P_PID,
                     self.child.id() as libc::id_t,
                     info.as_mut_ptr(),
                     libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
                 )
-            } == 0;
-            if !retained {
+            };
+            if result != 0 {
+                // Capture errno before locks or other cleanup can overwrite it.
+                let error = std::io::Error::last_os_error();
                 self.uncertain();
-                return false;
+                return Err(("cleanup_waitid_wnowait", error));
             }
             if let Some(c) = &self.custody {
                 let r = c.0.lock().unwrap_or_else(|e| e.into_inner());
-                return !r.leader_reaped
-                    && r.exact_process_identity
+                if r.leader_reaped
+                    || !r
+                        .exact_process_identity
                         .as_ref()
-                        .is_some_and(|p| self.current_identity().ok().as_ref() == Some(p));
+                        .is_some_and(|p| self.current_identity().ok().as_ref() == Some(p))
+                {
+                    return Err((
+                        "cleanup_identity",
+                        std::io::Error::other("identity unavailable"),
+                    ));
+                }
             }
-            true
+            Ok(())
         }
         #[cfg(not(unix))]
         {
-            false
+            Err((
+                "cleanup_unsupported",
+                std::io::Error::other("unsupported group signaling"),
+            ))
         }
     }
     pub fn cancellation(&self) {
@@ -104,6 +158,9 @@ impl OwnedChild {
         }
     }
     pub fn forced(&self) {
+        if !self.force_was_delivered(true) {
+            return;
+        }
         if let Some(c) = &self.custody {
             c.0.lock().unwrap_or_else(|e| e.into_inner()).force_killed = true;
         }
@@ -111,12 +168,22 @@ impl OwnedChild {
     pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
         let result = self.child.wait();
         self.reaped |= result.is_ok();
+        #[cfg(target_os = "linux")]
+        let result = result.and_then(|owner_status| match &self.remote {
+            Some(remote) if owner_status.success() => remote.wait_status(),
+            Some(_) => Err(std::io::Error::other("command custodian failed")),
+            None => Ok(owner_status),
+        });
         if let Some(c) = &self.custody {
             let mut r = c.0.lock().unwrap_or_else(|e| e.into_inner());
             match &result {
                 Ok(status) => {
                     r.leader_reaped = true;
                     r.process_status = Some(status_value(*status));
+                    #[cfg(target_os = "linux")]
+                    if self.remote.is_some() {
+                        r.process_tree_terminated = true;
+                    }
                 }
                 Err(_) => r.uncertain = true,
             }
@@ -127,6 +194,12 @@ impl OwnedChild {
     // seccomp filter is inherited and irreversible: no descendant can escape
     // this group or create/join a PID namespace. Zombies cannot produce effects.
     pub fn confirm_group_dead(&self, signal_ok: bool) {
+        // Remote group signals are acknowledgements, not tree certificates.
+        // Only the owner's ECHILD-backed status consumed in wait certifies it.
+        #[cfg(target_os = "linux")]
+        if self.remote.is_some() {
+            return;
+        }
         let Some(c) = &self.custody else {
             return;
         };
@@ -640,5 +713,100 @@ mod supervisor_identity_tests {
     #[test]
     fn supervisor_identity_unavailable_exited_leader_pipe_holder() {
         unavailable_identity_terminal(false, true, true);
+    }
+}
+
+// Native diagnostic fixtures, not a relaxation of check_signal_group or a
+// provider-tree completion contract. Each child here executes no descendants.
+#[cfg(all(test, target_os = "macos"))]
+mod native_group_diagnostic_tests {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            // Exact retained direct child only; never a discovered PID sweep.
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn group_signal(pid: u32, signal: i32) -> (i32, Option<i32>) {
+        let rc = unsafe { libc::kill(-(pid as i32), signal) };
+        let errno = (rc != 0)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten();
+        (rc, errno)
+    }
+
+    #[test]
+    fn retained_native_group_zombie_and_live_controls() {
+        for exited in [true, false] {
+            let mut command = if exited {
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", "exit 0"]);
+                command
+            } else {
+                let mut command = Command::new("/bin/sleep");
+                command.arg("2");
+                command
+            };
+            let mut child = OwnedChild(command.env_clear().process_group(0).spawn().unwrap());
+            let pid = child.0.id();
+            let started = Instant::now();
+            if exited {
+                loop {
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    let rc = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            pid,
+                            &mut info,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        )
+                    };
+                    assert_eq!(
+                        rc,
+                        0,
+                        "native retained wait: {:?}",
+                        std::io::Error::last_os_error()
+                    );
+                    if unsafe { info.si_pid() } == pid as i32 {
+                        break;
+                    }
+                    assert!(started.elapsed() < Duration::from_secs(2));
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            let state = Command::new("/bin/ps")
+                .args([
+                    "-p",
+                    &pid.to_string(),
+                    "-o",
+                    "pid,ppid,pgid,state,lstart,comm",
+                ])
+                .env_clear()
+                .output()
+                .unwrap();
+            let probe = group_signal(pid, 0);
+            let kill = group_signal(pid, libc::SIGKILL);
+            let status = child.0.wait().unwrap();
+            let after = group_signal(pid, 0);
+            eprintln!(
+                "native-group no-descendant-fixture exited={exited} retained_child={pid} ps={} probe={probe:?} kill={kill:?} collected={status:?} after_collection={after:?}",
+                String::from_utf8_lossy(&state.stdout)
+            );
+            if exited {
+                assert!(status.success());
+                // EPERM and success are observations, not a product permission
+                // exemption. An unexpected errno still remains a fixture failure.
+                assert!(kill == (0, None) || kill == (-1, Some(libc::EPERM)));
+            } else {
+                assert_eq!(kill, (0, None));
+                assert_eq!(status.signal(), Some(libc::SIGKILL));
+            }
+        }
     }
 }
