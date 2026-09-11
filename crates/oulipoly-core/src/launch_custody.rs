@@ -34,7 +34,7 @@ pub fn is_quiescent(path: &Path) -> bool {
 pub struct LaunchCustody {
     path: PathBuf,
     #[cfg(target_os = "linux")]
-    endpoint: Mutex<Option<std::os::fd::OwnedFd>>,
+    endpoint: Mutex<Option<Arc<std::os::fd::OwnedFd>>>,
     #[cfg(all(test, target_os = "linux"))]
     monitor_pid: i32,
 }
@@ -254,7 +254,7 @@ mod linux {
             .spawn(move || owner.wait())?;
         Ok(LaunchCustody {
             path,
-            endpoint: Mutex::new(Some(client)),
+            endpoint: Mutex::new(Some(Arc::new(client))),
             #[cfg(test)]
             monitor_pid: pid,
         })
@@ -265,11 +265,10 @@ mod linux {
         let endpoint = endpoint
             .as_ref()
             .ok_or_else(|| io::Error::other("launch custody sealed"))?;
-        let fd = unsafe { libc::fcntl(endpoint.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let inherited = unsafe { OwnedFd::from_raw_fd(fd) };
+        // A Command needs a retained reference, not a new descriptor. Fork
+        // already duplicates the descriptor table. This avoids EMFILE during
+        // configuration after Starting and reduces per-command FD pressure.
+        let inherited = Arc::clone(endpoint);
         unsafe {
             command.pre_exec(move || {
                 let fd = inherited.as_raw_fd();

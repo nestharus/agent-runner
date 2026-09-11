@@ -475,7 +475,7 @@ fn register_generation_starting(
             .map_err(|_| "concurrent starting custody initialization".to_string())?;
     }
     let proof_path = oulipoly_core::launch_custody::proof_path(db.path(), &context.generation_id.to_string());
-    match db
+    let mutation = db
         .runtime_lifecycle()
         .create_runtime_generation_with_custody(CreateRuntimeGeneration {
             generation_id: &context.generation_id,
@@ -488,9 +488,12 @@ fn register_generation_starting(
             models_dir: context.models_dir.as_deref(),
             effective_cwd: context.effective_cwd.as_deref(),
         }, Some(&proof_path))
-        .map_err(|err| err.to_string())?
-    {
-        GenerationMutation::Applied(_) => starting_custody_test_barrier("before_spawn"),
+        .map_err(|err| err.to_string())?;
+    // Release the sidecar authority fence before any error finalizer reopens it.
+    drop(db);
+    match mutation {
+        GenerationMutation::Applied(_) => finalize_starting_error(
+            starting_custody_test_barrier("before_spawn"), Some(context)),
         GenerationMutation::AlreadyApplied(_) if !fresh_only => Ok(()),
         GenerationMutation::AlreadyApplied(_) => {
             Err("allocated_runtime_generation_already_exists".into())
@@ -519,11 +522,31 @@ pub(crate) fn configure_launch_custody(
     command: &mut std::process::Command,
     context: Option<&SpawnIdentityContext>,
 ) -> Result<(), String> {
+    finalize_starting_error(configure_registered_custody(command, context), context)
+}
+
+fn configure_registered_custody(
+    command: &mut std::process::Command,
+    context: Option<&SpawnIdentityContext>,
+) -> Result<(), String> {
     if let Some(context) = context {
         context.launch_custody.get().ok_or("starting custody not registered")?
             .configure(command).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+fn finalize_starting_error(
+    result: Result<(), String>,
+    context: Option<&SpawnIdentityContext>,
+) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => match mark_runtime_generation_spawn_failed(context) {
+            Ok(()) => Err(error),
+            Err(finalization) => Err(format!("{error}; Starting finalization failed: {finalization}")),
+        },
+    }
 }
 
 pub(crate) fn launch_custody_scope(
@@ -845,6 +868,47 @@ mod tests {
             },
         };
         (context, generation)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configuration_fd_pressure_and_error_finalize_with_live_creator() {
+        const CHILD: &str = "AGE354_CONFIG_FD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "executor::cli::spawn_identity::tests::configuration_fd_pressure_and_error_finalize_with_live_creator", "--nocapture"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let context = context_from_parent_invocation_env(Some(CURRENT), "fixture", None,
+            None, SpawnRuntimeMode::Headless, None, None).unwrap()
+            .with_mailbox_db_path(path.clone());
+        register_runtime_generation_starting(Some(&context)).unwrap();
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        let exhausted = libc::rlimit { rlim_cur: 0, rlim_max: limit.rlim_max };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted) }, 0);
+        let mut command = std::process::Command::new("/bin/true");
+        let configured = configure_launch_custody(&mut command, Some(&context));
+        let open_error = std::fs::File::open("/dev/null").unwrap_err();
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        assert_eq!(open_error.raw_os_error(), Some(libc::EMFILE));
+        configured.unwrap(); // No new fd required after Starting.
+        drop(command);
+        // Exercise the remaining configuration error and its fenced finalizer.
+        context.launch_custody.get().unwrap().seal();
+        let error = configure_launch_custody(&mut std::process::Command::new("/bin/true"),
+            Some(&context)).unwrap_err();
+        assert!(error.contains("sealed"), "{error}");
+        assert!(!error.contains("finalization failed"), "{error}");
+        let db = MailboxDb::open(&path).unwrap();
+        let row = db.runtime_lifecycle_reader().runtime_generation(&context.generation_id)
+            .unwrap().unwrap();
+        assert_eq!(row.lifecycle_state, RuntimeLifecycleState::Exited);
+        assert_eq!(row.terminal_reason, Some(RuntimeTerminalReason::StartupFailed));
+        assert!(pid_identity::read_live_process_identity(std::process::id().into()).unwrap().is_some());
     }
 
     #[test]
