@@ -114,7 +114,7 @@ pub(super) fn reconcile_pending_headless_delivery_observations(
             continue;
         }
         if let Err(error) =
-            crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
+            let observation = crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
                 attempt_id: pending.attempt_id,
                 anchor_identity: crate::native_receipt::helper::anchor_identity(&pending.anchor),
                 model_name: resolved.model_name.clone().unwrap_or_default(),
@@ -500,12 +500,21 @@ fn confirm_mailbox_delivery_from_anchor(
         model_name: input.resolved.model_name.clone().unwrap_or_default(),
         cwd: input.effective_spawn_cwd.to_path_buf(),
         config_root: input.env.config_root.clone(),
-    })?;
-    // Only committed exact native evidence counts, never helper exit status.
+    });
+    // Projection or helper teardown may fail after the exact native receipt
+    // commits. Always read back that independent evidence before interpreting
+    // the operational error; helper completion alone never confirms delivery.
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(false);
     };
-    Ok(db.delivery_observation_confirmation(attempt_id)?.is_some())
+    let confirmed = db.delivery_observation_confirmation(attempt_id)?.is_some();
+    if let Err(error) = observation {
+        if !confirmed {
+            return Err(error);
+        }
+        formatter::emit_stderr(&format!("Warning: receipt confirmed with observation/projection error: {error}"));
+    }
+    Ok(confirmed)
 }
 
 pub(super) fn validated_prompt_acceptance_for_resume(
