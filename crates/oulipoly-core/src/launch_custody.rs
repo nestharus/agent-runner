@@ -76,6 +76,29 @@ pub fn configure_current(command: &mut Command) -> io::Result<()> {
     })
 }
 
+/// Launch a private provider command once. The consuming Command boundary keeps
+/// each status socket exclusive to one launch. Workload-only filters are added
+/// after custody setup; existing opaque pre_exec setup stays in the exec child.
+/// The std Child owns C; RemoteStatus supplies W's tree-complete status/signals.
+#[cfg(target_os = "linux")]
+pub fn spawn_current_remote(
+    mut command: Command,
+    configure_workload: impl FnOnce(&mut Command),
+) -> io::Result<(std::process::Child, Option<RemoteStatus>)> {
+    let remote = CURRENT.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .map(|custody| linux::remote::configure(custody, &mut command))
+            .transpose()
+    })?;
+    configure_workload(&mut command);
+    command.spawn().map(|child| (child, remote))
+}
+
+#[cfg(target_os = "linux")]
+pub use linux::remote::RemoteStatus;
+
 impl LaunchCustody {
     pub fn start(path: PathBuf) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
@@ -124,6 +147,7 @@ impl LaunchCustody {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    pub(super) mod remote;
     use super::*;
     use std::fs::OpenOptions;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -642,7 +666,7 @@ mod tests {
             return;
         }
         let custody = LaunchCustody::start(root.join("proof")).unwrap();
-        if phase == "after_spawn" || phase == "stopped_preexec" {
+        if phase == "after_spawn" || phase == "stopped_preexec" || phase == "remote_after_spawn" {
             use std::os::fd::AsRawFd;
             let mut command = Command::new("/bin/sh");
             command
@@ -665,7 +689,12 @@ mod tests {
                     });
                 }
             }
-            custody.configure(&mut command).unwrap();
+            let _remote = if phase == "remote_after_spawn" {
+                Some(linux::remote::configure(&custody, &mut command).unwrap())
+            } else {
+                custody.configure(&mut command).unwrap();
+                None
+            };
             let _owned = command.spawn().unwrap();
             std::fs::write(root.join("reaper"), _owned.id().to_string()).unwrap();
             drop(command);
@@ -710,6 +739,57 @@ mod tests {
         fixture.crash_unreaped();
         assert!(!is_quiescent(&fixture.root.join("proof")));
         eventually(|| is_quiescent(&fixture.root.join("proof")));
+    }
+
+    #[test]
+    fn remote_owner_survives_creator_and_control_channel_loss() {
+        let fixture = Fixture::new("remote_after_spawn");
+        fixture.wait_ready();
+        fixture.crash_unreaped();
+        assert!(!is_quiescent(&fixture.root.join("proof")));
+        eventually(|| is_quiescent(&fixture.root.join("proof")));
+    }
+
+    #[test]
+    fn stopped_remote_owner_bounds_signal_response_without_releasing_custody() {
+        let root = std::env::temp_dir().join(format!("remote-stopped-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let custody = LaunchCustody::start(root.join("proof")).unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("0.2").env_clear();
+        let remote = linux::remote::configure(&custody, &mut command).unwrap();
+        let mut owner = command.spawn().unwrap();
+        drop(command);
+        assert_eq!(unsafe { libc::kill(owner.id() as i32, libc::SIGSTOP) }, 0);
+        custody.seal();
+        let start = Instant::now();
+        let result = remote.signal(libc::SIGKILL);
+        let elapsed = start.elapsed();
+        let withheld = !custody.quiescent();
+        // Always resume before assertions so a failed assertion cannot strand C.
+        assert_eq!(unsafe { libc::kill(owner.id() as i32, libc::SIGCONT) }, 0);
+        assert!(owner.wait().unwrap().success());
+        let status = remote.wait_status().unwrap();
+        assert!(status.success());
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(2));
+        assert!(withheld);
+        eventually(|| custody.quiescent());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lost_remote_owner_never_certifies_generation() {
+        let fixture = Fixture::new("remote_after_spawn");
+        fixture.wait_ready();
+        let owner: i32 = std::fs::read_to_string(fixture.root.join("reaper"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(owner, libc::SIGKILL) }, 0);
+        fixture.crash_unreaped();
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(!is_quiescent(&fixture.root.join("proof")));
     }
 
     #[test]

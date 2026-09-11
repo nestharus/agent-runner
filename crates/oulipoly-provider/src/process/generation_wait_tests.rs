@@ -1,9 +1,20 @@
-//! Characterizes existing command-tree wait semantics inside a shared generation.
-//! This is not a shared-launch-owner implementation or per-generation ECHILD proof.
+//! Actual provider caller independent command-tree waits and measured owner topology.
 use super::*;
 use oulipoly_core::launch_custody::{LaunchCustody, LaunchScope};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::mpsc;
+
+const HELPER_SCRIPT: &str = r#"
+            echo $$ > "$ROOT/helper-root"
+            /usr/bin/setsid /bin/bash -c '
+                exec 3<>"$ROOT/helper-release"
+                echo $$ > "$ROOT/helper-leaf"
+                read -t 8 -u 3 release || exit 75
+                exit 0
+            ' </dev/null >/dev/null 2>&1 &
+            printf 'helper-output'
+            exit 7
+        "#;
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -96,6 +107,22 @@ fn direct_children() -> std::collections::BTreeSet<i32> {
         .collect()
 }
 
+fn descendant_set(mut pending: Vec<i32>) -> std::collections::BTreeSet<i32> {
+    let mut observed = std::collections::BTreeSet::new();
+    while let Some(pid) = pending.pop() {
+        if !observed.insert(pid) {
+            continue;
+        }
+        let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap();
+        pending.extend(
+            children
+                .split_whitespace()
+                .map(|p| p.parse::<i32>().unwrap()),
+        );
+    }
+    observed
+}
+
 #[test]
 fn helper_tree_wait_completes_independently_of_live_command_in_same_generation() {
     // Count only this fixture's children, even when the outer library suite
@@ -137,21 +164,7 @@ fn helper_tree_wait_completes_independently_of_live_command_in_same_generation()
     let helper_root = fixture.0.clone();
     let (sender, receiver) = mpsc::channel();
     let helper = thread::spawn(move || {
-        let outcome = run(
-            helper_custody,
-            helper_root,
-            r#"
-            echo $$ > "$ROOT/helper-root"
-            /usr/bin/setsid /bin/bash -c '
-                exec 3<>"$ROOT/helper-release"
-                echo $$ > "$ROOT/helper-leaf"
-                read -t 8 -u 3 release || exit 75
-                exit 0
-            ' </dev/null >/dev/null 2>&1 &
-            printf 'helper-output'
-            exit 7
-        "#,
-        );
+        let outcome = run(helper_custody, helper_root, HELPER_SCRIPT);
         sender.send(outcome).unwrap();
     });
     eventually(|| fixture.0.join("helper-leaf").exists());
@@ -166,18 +179,68 @@ fn helper_tree_wait_completes_independently_of_live_command_in_same_generation()
         parent != helper_root_pid && parent != main_owner && group == leaf_pid
     });
     let (_, helper_owner, _) = process_row(leaf_pid);
-    let (_, main_proxy, _) = process_row(main_owner);
-    let (_, helper_proxy, _) = process_row(helper_owner);
+    assert_eq!(process_row(main_owner).1, std::process::id() as i32);
+    assert_eq!(process_row(helper_owner).1, std::process::id() as i32);
+    assert_eq!(
+        process_row(helper_root_pid).0,
+        'Z',
+        "remote owner pins workload group until completion"
+    );
     let children = direct_children();
-    assert_eq!(children.len(), 3, "M plus two direct P children");
-    assert!(children.contains(&main_proxy));
-    assert!(children.contains(&helper_proxy));
+    assert_eq!(children.len(), 3, "M plus two direct C children");
+    assert!(children.contains(&main_owner));
+    assert!(children.contains(&helper_owner));
     let monitor = *children
         .iter()
-        .find(|&&pid| pid != main_proxy && pid != helper_proxy)
+        .find(|&&pid| pid != main_owner && pid != helper_owner)
         .unwrap();
     println!(
-        "held same-generation topology (7 processes): M={monitor}; main P={main_proxy} C={main_owner} W={main_pid}; helper P={helper_proxy} C={helper_owner} adopted-leaf={leaf_pid}; helper root={helper_root_pid} exited"
+        "held same-generation topology (6 processes, 5 non-zombies): M={monitor}; main C={main_owner} W={main_pid}; helper C={helper_owner} adopted-leaf={leaf_pid}; helper root={helper_root_pid} retained zombie; no P proxies"
+    );
+    let observed = descendant_set(children.iter().copied().collect());
+    assert_eq!(
+        observed,
+        [
+            monitor,
+            main_owner,
+            main_pid,
+            helper_owner,
+            helper_root_pid,
+            leaf_pid
+        ]
+        .into_iter()
+        .collect()
+    );
+    println!(
+        "measured total={} non_zombies={}",
+        observed.len(),
+        observed
+            .iter()
+            .filter(|&&pid| process_row(pid).0 != 'Z')
+            .count()
+    );
+    // A second arbitrary escaped helper overlaps the first, not merely a native
+    // sibling. Releasing one helper must leave both other operations pending.
+    let second_fixture = Fixture::new();
+    let second_root = second_fixture.0.clone();
+    let second_custody = Arc::clone(&custody);
+    let second = thread::spawn(move || run(second_custody, second_root, HELPER_SCRIPT));
+    eventually(|| second_fixture.0.join("helper-leaf").exists());
+    let second_leaf = fixture_pid(&second_fixture.0, "helper-leaf");
+    let second_root_pid = fixture_pid(&second_fixture.0, "helper-root");
+    eventually(|| process_row(second_leaf).1 != second_root_pid);
+    let second_owner = process_row(second_leaf).1;
+    let overlapping = descendant_set(direct_children().into_iter().collect());
+    let mut expected = observed.clone();
+    expected.extend([second_leaf, second_root_pid, second_owner]);
+    assert_eq!(overlapping, expected);
+    println!(
+        "two overlapping escaped helpers: measured total={} non_zombies={}",
+        overlapping.len(),
+        overlapping
+            .iter()
+            .filter(|&&pid| process_row(pid).0 != 'Z')
+            .count()
     );
     assert!(matches!(
         receiver.recv_timeout(Duration::from_millis(100)),
@@ -195,6 +258,15 @@ fn helper_tree_wait_completes_independently_of_live_command_in_same_generation()
     );
     assert!(!custody.quiescent());
     println!("helper completed while main pid={main_pid} remained live");
+    assert!(
+        !second.is_finished(),
+        "first helper must not settle second helper"
+    );
+    second_fixture.release("helper-release");
+    let second_outcome = second.join().unwrap();
+    assert_eq!(second_outcome.status, ProcessStatus::Exited { code: 7 });
+    assert_eq!(second_outcome.stdout.bytes, b"helper-output");
+    assert!(!main.is_finished());
     fixture.release("main-release");
     assert_eq!(
         main.join().unwrap().status,
@@ -202,4 +274,163 @@ fn helper_tree_wait_completes_independently_of_live_command_in_same_generation()
     );
     custody.seal();
     eventually(|| custody.quiescent());
+}
+
+#[test]
+fn remote_provider_wait_signal_timeout_cancel_and_spawn_failure() {
+    use crate::custody::AttemptActorCustody;
+    for mode in [
+        "success",
+        "signal",
+        "timeout",
+        "cancel",
+        "spawn-failure",
+        "exited-root",
+    ] {
+        let fixture = Fixture::new();
+        let generation = Arc::new(LaunchCustody::start(fixture.0.join("proof")).unwrap());
+        let scope = LaunchScope::enter(Some(Arc::clone(&generation)));
+        let actor = AttemptActorCustody::new(uuid::Uuid::new_v4());
+        let guard = actor.begin("session.capture");
+        let token = CancellationToken::new();
+        if mode == "cancel" {
+            token.cancel_after(Duration::from_millis(150));
+        }
+        let script = match mode {
+            "success" => "printf 'exact-output'; exit 7",
+            "signal" => "kill -TERM $$",
+            "exited-root" => "(trap '' TERM; /bin/sleep 4) & exit 9",
+            _ => "trap '' TERM; /bin/sleep 4",
+        };
+        let result = ProcessRunner::new(ProcessLimits {
+            custody: Some(guard.0.clone()),
+            cancellation: Some(token),
+            timeout: Duration::from_millis(300),
+            kill_after_grace: Duration::from_millis(25),
+            ..ProcessLimits::default()
+        })
+        .run(
+            if mode == "spawn-failure" {
+                ProcessCommand::new("/nonexistent/age354-command")
+            } else {
+                ProcessCommand::new("/bin/bash").arg("-c").arg(script)
+            },
+            vec![],
+            Vec::<(String, String)>::new(),
+        );
+        drop(guard);
+        let receipt = actor.receipts().remove(0);
+        println!("remote mode={mode}: {result:?}; {receipt:?}");
+        assert!(receipt.effect_incapable(), "{receipt:?}");
+        match mode {
+            "success" => {
+                let output = result.unwrap();
+                assert_eq!(output.stdout.bytes, b"exact-output");
+                assert_eq!(output.status, ProcessStatus::Exited { code: 7 });
+            }
+            "signal" => assert_eq!(
+                result.unwrap().status,
+                ProcessStatus::SignalTerminated {
+                    signal: libc::SIGTERM
+                }
+            ),
+            "spawn-failure" => {
+                assert!(result.is_err());
+                assert!(!receipt.spawned);
+            }
+            _ => {
+                assert_eq!(
+                    result.unwrap_err().transport_kind(),
+                    if mode == "cancel" {
+                        "host_cancelled"
+                    } else {
+                        "host_timeout"
+                    }
+                );
+                assert!(receipt.force_killed);
+                if mode == "exited-root" {
+                    assert_eq!(
+                        receipt.process_status,
+                        Some(ProcessStatus::Exited { code: 9 })
+                    );
+                }
+            }
+        }
+        drop(scope);
+        generation.seal();
+        eventually(|| generation.quiescent());
+    }
+}
+
+#[test]
+fn published_spawn_observer_retains_legacy_kill_group_proxy() {
+    let fixture = Fixture::new();
+    let generation = Arc::new(LaunchCustody::start(fixture.0.join("proof")).unwrap());
+    let scope = LaunchScope::enter(Some(Arc::clone(&generation)));
+    let result = ProcessRunner::new(ProcessLimits {
+        spawn_observer: Some(ProcessSpawnObserver::new(|pid| {
+            assert_eq!(process_row(pid as i32).2, pid as i32);
+            assert_eq!(unsafe { libc::killpg(pid as i32, libc::SIGKILL) }, 0);
+            Err("private external cancellation".into())
+        })),
+        ..ProcessLimits::default()
+    })
+    .run(
+        ProcessCommand::new("/bin/sleep").arg("0.5"),
+        vec![],
+        Vec::<(String, String)>::new(),
+    );
+    assert_eq!(
+        result.unwrap_err().transport_kind(),
+        "spawn_observer_failed"
+    );
+    drop(scope);
+    generation.seal();
+    eventually(|| generation.quiescent());
+}
+
+#[test]
+fn remote_timeout_retains_escaped_tree_and_consuming_cleanup_owner() {
+    let fixture = Fixture::new();
+    let generation = Arc::new(LaunchCustody::start(fixture.0.join("proof")).unwrap());
+    let scope = LaunchScope::enter(Some(Arc::clone(&generation)));
+    let started = Instant::now();
+    let error = ProcessRunner::new(ProcessLimits {
+        timeout: Duration::from_millis(150),
+        kill_after_grace: Duration::from_millis(25),
+        ..ProcessLimits::default()
+    })
+    .run(
+        ProcessCommand::new("/bin/bash")
+            .arg("-c")
+            .arg(HELPER_SCRIPT),
+        vec![],
+        [("ROOT", &fixture.0)],
+    )
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    let leaf = fixture_pid(&fixture.0, "helper-leaf");
+    let owner = process_row(leaf).1;
+    println!("escaped timeout elapsed={elapsed:?}; {error:?}; retained C={owner}, leaf={leaf}");
+    assert_eq!(error.transport_kind(), "host_timeout");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "must not wait for leaf watchdog"
+    );
+    assert!(
+        error
+            .diagnostics()
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .contains("cleanup_pending")
+    );
+    assert!(!error.diagnostics().process_was_reaped);
+    assert_eq!(process_row(owner).1, std::process::id() as i32);
+    drop(scope);
+    generation.seal();
+    assert!(!generation.quiescent());
+    fixture.release("helper-release");
+    eventually(|| generation.quiescent());
+    eventually(|| !Path::new(&format!("/proc/{owner}")).exists());
 }

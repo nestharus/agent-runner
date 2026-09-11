@@ -6,6 +6,8 @@ use std::process::{Child, ExitStatus};
 
 pub(crate) struct OwnedChild {
     child: Child,
+    #[cfg(target_os = "linux")]
+    remote: Option<oulipoly_core::launch_custody::RemoteStatus>,
     reaped: bool,
     custody: Option<OperationCustody>,
     confined: bool,
@@ -38,10 +40,29 @@ impl OwnedChild {
             #[cfg(all(test, target_os = "linux"))]
             identity_fault: IDENTITY_FAULT.get(),
             child,
+            #[cfg(target_os = "linux")]
+            remote: None,
             reaped: false,
             confined: custody.is_some() && containment_supported(),
             custody,
         }
+    }
+    #[cfg(target_os = "linux")]
+    pub fn with_remote(
+        mut self,
+        remote: Option<oulipoly_core::launch_custody::RemoteStatus>,
+    ) -> Self {
+        self.remote = remote;
+        self
+    }
+    #[cfg(unix)]
+    pub fn signal_remote(&self, signal: i32) -> Option<std::io::Result<()>> {
+        #[cfg(target_os = "linux")]
+        if let Some(remote) = &self.remote {
+            return Some(remote.signal(signal));
+        }
+        let _ = signal;
+        None
     }
     fn current_identity(&self) -> std::io::Result<ProcessIdentity> {
         #[cfg(all(test, target_os = "linux"))]
@@ -111,12 +132,22 @@ impl OwnedChild {
     pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
         let result = self.child.wait();
         self.reaped |= result.is_ok();
+        #[cfg(target_os = "linux")]
+        let result = result.and_then(|owner_status| match &self.remote {
+            Some(remote) if owner_status.success() => remote.wait_status(),
+            Some(_) => Err(std::io::Error::other("command custodian failed")),
+            None => Ok(owner_status),
+        });
         if let Some(c) = &self.custody {
             let mut r = c.0.lock().unwrap_or_else(|e| e.into_inner());
             match &result {
                 Ok(status) => {
                     r.leader_reaped = true;
                     r.process_status = Some(status_value(*status));
+                    #[cfg(target_os = "linux")]
+                    if self.remote.is_some() {
+                        r.process_tree_terminated = true;
+                    }
                 }
                 Err(_) => r.uncertain = true,
             }
@@ -127,6 +158,12 @@ impl OwnedChild {
     // seccomp filter is inherited and irreversible: no descendant can escape
     // this group or create/join a PID namespace. Zombies cannot produce effects.
     pub fn confirm_group_dead(&self, signal_ok: bool) {
+        // Remote group signals are acknowledgements, not tree certificates.
+        // Only the owner's ECHILD-backed status consumed in wait certifies it.
+        #[cfg(target_os = "linux")]
+        if self.remote.is_some() {
+            return;
+        }
         let Some(c) = &self.custody else {
             return;
         };

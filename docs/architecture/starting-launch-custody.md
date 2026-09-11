@@ -5,7 +5,10 @@ an unreaped zombie, cannot by itself certify cessation of an unpublished tree.
 AGE-354 adds prospective independent custody rather than reconstructing a child
 PID after a crash.
 
-## Ownership topology
+## Published/native ownership topology
+
+Private provider operations use the incremental handle topology described below.
+This diagram remains the published-PID/native compatibility path.
 
 ```
 creator ── readiness-acknowledged detached monitor M
@@ -44,8 +47,8 @@ for escaped descendants. Natural completion waits for the tree, not just W.
 Creator death no longer supplies the executable's lifetime boundary. This may
 retain a generation while a deliberately long-lived descendant remains active.
 
-Only the launch operation's P is published as Running. Describe/policy helpers
-have their own proxies/custodians but are never published as runtime launches.
+Only the launch operation's P is published as Running. Private describe/policy
+helpers are never published as runtime launches and now use the handle path below.
 Thus the published PID names a runner-owned status proxy, not the executable W.
 PID consumers must treat it as the owned runtime-tree identity, not assume its
 `cmdline`, immediate parent, or executable image identifies the provider binary.
@@ -132,14 +135,14 @@ provider/model or production-state experiment is implied.
 ## Correction limits and unresolved topology
 
 The supervisor keeps its 50ms polling cadence after both output drains disconnect;
-EOF does not establish proxy/tree exit. Configuration no longer allocates a new
-FD after Starting. Configuration errors and errors from the post-registration
+EOF does not establish proxy/tree exit. Legacy configuration no longer duplicates
+the launch endpoint FD after Starting; the remote path adds its own control socket. Configuration errors and errors from the post-registration
 private barrier attempt fenced StartupFailed finalization and retain any cleanup
 failure diagnostic. General resource/storage failure can still prevent durable
 finalization; no successful mutation is promised under unavailable storage or
 process-wide exhaustion.
 
-Resident costs are not solved by the descriptor reduction: one monitor M and its
+Legacy resident costs are not solved by the descriptor reduction: one monitor M and its
 wait thread per generation, plus P and C per active command, remain. Ten thousand
 one hundred simultaneously active one-command generations imply 30,300 extra
 processes and 10,100 extra monitor-wait threads over direct W children, excluding
@@ -171,5 +174,58 @@ single-producer/global-resource invariant or only session overlap. Sessionless
 unpublished work needs an explicit affected-authority boundary or stays globally
 uncertain. No count cap, age expiry, assumed missing-proof clearance, or silent
 change of that admission invariant is implemented. Existing Running sessions are
-not automatically stopped by this predicate. Root must decide the topology and
-availability scope before treating this candidate as complete.
+not automatically stopped by this predicate. Root retains integration and acceptance ownership. The bounded private-operation
+improvement below does not depend on broader topology consolidation.
+
+## Incremental proxy-free private provider operations
+
+The continuation retains dedicated arbitrary-subtree ownership and replaces P
+for **private provider operations** with a consuming launch/status handle:
+
+```
+creator ── existing generation monitor M (shared with legacy native launches)
+   └── owned std Child C (independent process group, dedicated subreaper)
+         └── W (own process group; retained zombie after exit until tree completion)
+               └── arbitrary descendants
+creator ── RemoteStatus socket ── C
+```
+
+`spawn_current_remote` consumes the Command, configures custody before workload
+filters, and spawns exactly once for its returned socket. The actual `ProcessRunner`
+uses it when no spawn observer publishes a numeric runtime identity and the call
+is not a receipt-inspection-group operation. Describe, policy and live-binding
+capture calls use this path under their existing generation scope. No scope means
+an ordinary direct Child, unchanged. Published launch observers and native/PTY
+callers retain the earlier P/C implementation: external PID/group consumers must
+migrate before C can safely replace their exposed kill-group leader. This is a
+bounded usable improvement, not a single-G launcher or full launch-API migration.
+
+C receives signal requests and performs group signalling itself. W stays its
+unreaped child, pinning the numeric workload group until C closes signal authority.
+C remains outside that group. A group with no members can acknowledge a signal
+as a no-op; **neither that acknowledgement nor ESRCH certifies tree completion**.
+Escaped descendants still hold C's tree obligation. Status is W's raw exit status,
+including signals, sent only after C consumes W and obtains dedicated ECHILD.
+The creator consumes C's wait and the remote status rather than interpreting C's
+exit code as W's. A failed/lost owner is uncertainty, not a synthetic workload exit.
+
+C uses signalfd plus the control socket, not a per-command polling thread or timer.
+A syscall-only streaming `/proc/thread-self/children` scan supplies *direct owned
+children* for selective waits, so W can stay unreaped. Reaping restarts the scan;
+there is no fixed child-count buffer. The scan is not ancestry reconstruction or
+cessation proof: the final ECHILD is still mandatory. Procfs/signalfd failures lose
+certification rather than relaxing the predicate. Disconnected creators do not
+cancel or relinquish C's tree. One-second control-response bounds mark uncertainty
+and disable further signals on that channel; a delayed acknowledgement cannot be
+misattributed to a later signal. There is no owner-resurrection fallback.
+
+Private provider tests measure the earlier two-command held fixture at 7 processes
+and the new path at 6 total / 5 non-zombies: two P processes removed, with one exited
+W retained as a zombie for signal identity. Two overlapping escaped helpers plus a
+live native-like command measure 9 total / 7 non-zombies and settle independently.
+These are small actual process counts, not RSS, throughput or capacity measurements.
+Per-command C remains, plus one remote socket endpoint in the creator and a
+signalfd in C. M and its wait thread remain shared per generation as before.
+Published launches retain P. Earlier amplification estimates above describe the
+legacy topology, not an assertion that all commands still use it. No global
+materialization or legacy-unknown recovery decision changes in this continuation.

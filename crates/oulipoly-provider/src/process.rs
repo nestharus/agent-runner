@@ -599,7 +599,12 @@ impl ProcessRunner {
         P: StdoutProcessor,
     {
         let argv = command.argv();
-        let mut child = spawn_provider_process(&command, envs, self.limits.custody.clone())?;
+        let mut child = spawn_provider_process(
+            &command,
+            envs,
+            self.limits.custody.clone(),
+            self.limits.spawn_observer.is_none(),
+        )?;
         if let Err(error) = notify_spawn_observer(&self.limits.spawn_observer, child.id()) {
             return Err(terminate_after_spawn_observer_failure(
                 child,
@@ -858,6 +863,7 @@ fn spawn_provider_process<I, K, V>(
     command: &ProcessCommand,
     envs: I,
     custody: Option<crate::custody::OperationCustody>,
+    private_handle: bool,
 ) -> Result<Child, ProviderClientError>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -873,10 +879,21 @@ where
         ));
     }
     let mut process = build_provider_process(command, envs);
+    #[cfg(target_os = "linux")]
+    if private_handle && receipt_group() == 0 {
+        return oulipoly_core::launch_custody::spawn_current_remote(process, |process| {
+            crate::process_custody::configure_containment(process, custody.is_some());
+        })
+        .map(|(child, remote)| Child::new(child, custody).with_remote(remote))
+        .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error));
+    }
+    let _ = private_handle;
+    // Published runtime identities still expose a numeric kill-group leader.
+    // Do not publish C as that leader: external cancellation would kill the
+    // custodian. Those launches retain P until their handle API migrates.
     oulipoly_core::launch_custody::configure_current(&mut process)
         .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error))?;
-    // This filter is workload-only: the independent custodian must be able to
-    // leave the workload kill group before it authorizes the actual fork.
+    // The filter is workload-only, after the independent owner's setup.
     crate::process_custody::configure_containment(&mut process, custody.is_some());
     process
         .spawn()
@@ -1782,6 +1799,12 @@ fn terminate_tree(child: &mut Child) {
         child.uncertain();
         return;
     }
+    if let Some(result) = child.signal_remote(libc::SIGTERM) {
+        if result.is_err() {
+            child.uncertain();
+        }
+        return;
+    }
     let group = -if receipt_group() != 0 {
         receipt_group()
     } else {
@@ -1816,6 +1839,12 @@ fn kill_tree(child: &mut Child) -> bool {
     if !child.can_signal_group() {
         child.uncertain();
         return false;
+    }
+    if let Some(result) = child.signal_remote(libc::SIGKILL) {
+        if result.is_err() {
+            child.uncertain();
+        }
+        return result.is_ok();
     }
     let group = -if receipt_group() != 0 {
         receipt_group()
