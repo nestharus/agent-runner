@@ -1010,6 +1010,23 @@ impl Drop for ReceiptRouteTestGuard {
 // Only the helper executable/env and watchdog duration are injected: config,
 // preparation, hashing, scan admission and publication run in the real binary.
 fn correction3_resume_route(p: &Paired, config_home: &Path, startup: bool) -> Result<bool, String> {
+    correction3_resume_route_with(
+        p,
+        config_home,
+        startup,
+        confirm_mailbox_delivery_from_anchor,
+    )
+}
+
+fn correction3_resume_route_with(
+    p: &Paired,
+    config_home: &Path,
+    startup: bool,
+    terminal: impl FnOnce(
+        &ResumeAttemptInput<'_>,
+        &oulipoly_config::ProviderConfig,
+    ) -> Result<bool, String>,
+) -> Result<bool, String> {
     use crate::migration_providers::ResumeExecutionEnvironment;
     let root = p.f.root.path();
     let services = crate::wiring::AgentRuntimeServices::production(crate::wiring::RuntimePaths {
@@ -1076,7 +1093,7 @@ fn correction3_resume_route(p: &Paired, config_home: &Path, startup: bool) -> Re
         zero_turn_confirmation: &mut zero_turn,
         provider_prompt_accepted: &mut accepted,
     };
-    confirm_mailbox_delivery_from_anchor(
+    terminal(
         &input,
         &oulipoly_config::ProviderConfig::model_provider("account", vec![]),
     )
@@ -1118,7 +1135,7 @@ fn age355_paired_correction3_startup_terminal_paths_are_owned_and_exact() {
                     command
                 }))
             });
-            crate::native_receipt::helper::TEST_BOUND.set(Some(if blocked || locked {
+            crate::native_receipt::helper::TEST_BOUND.set(Some(if blocked {
                 Duration::from_millis(500)
             } else {
                 Duration::from_secs(10)
@@ -1147,7 +1164,14 @@ fn age355_paired_correction3_startup_terminal_paths_are_owned_and_exact() {
                     start.elapsed() < Duration::from_secs(3),
                     "startup={startup}: {result:?}"
                 );
-                assert!(!result.unwrap_or(false));
+                if locked {
+                    assert!(
+                        !result.unwrap(),
+                        "contention should complete without a watchdog error"
+                    );
+                } else {
+                    assert!(!result.unwrap_or(false));
+                }
                 if blocked {
                     let pid: i32 = fs::read_to_string(root.join("blocked-pid"))
                         .unwrap()
@@ -1398,4 +1422,181 @@ fn age355_paired_correction3_changed_settings_cannot_publish_cached_match() {
             .unwrap(),
         p.f.anchor
     );
+}
+
+fn correction4_install_target(p: &Paired, config_home: &Path) -> ReceiptRouteTestGuard {
+    let guard = ReceiptRouteTestGuard(std::env::var_os("OULIPOLY_DATA_DIR"));
+    let root = p.f.root.path().to_path_buf();
+    unsafe {
+        std::env::set_var("OULIPOLY_DATA_DIR", &root);
+    }
+    let config_home = config_home.to_path_buf();
+    crate::native_receipt::helper::TEST_COMMAND.with_borrow_mut(|c| {
+        *c = Some(Box::new(move |once| {
+            correction3_helper_command(&root, &config_home, once)
+        }))
+    });
+    // Long enough to distinguish prompt skipping from watchdog expiry. Tests
+    // require the entire contended call to return in less than three seconds.
+    crate::native_receipt::helper::TEST_BOUND.set(Some(Duration::from_secs(10)));
+    guard
+}
+
+fn correction4_pending_snapshot(p: &Paired) -> Vec<(String, String, String, String)> {
+    let conn = rusqlite::Connection::open(p.f.db.path()).unwrap();
+    p.f.db.pending_delivery_observations(SESSION, 10).unwrap().iter().map(|pending| {
+        let (started, state): (String, String) = conn.query_row(
+            "SELECT submission_started_at, headless_submission_state FROM mailbox_delivery_attempts WHERE attempt_id = ?1 AND resolved_at IS NULL",
+            [&pending.attempt_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        (pending.attempt_id.clone(), started, state, crate::native_receipt::helper::anchor_identity(&pending.anchor))
+    }).collect()
+}
+
+#[test]
+#[ignore = "requires source-built Runner/provider; offline held-lock startup batch"]
+fn age355_paired_correction4_startup_skips_all_contended_attempts_without_watchdogs() {
+    let _lock = crate::mailbox_delivery::DATA_DIR_ENV_LOCK.lock().unwrap();
+    let mut p = Paired::new();
+    p.anchor_and_submit();
+    for id in ["correction4-a", "correction4-b", "correction4-c"] {
+        let seq = enqueue_additional(&mut p.f, id);
+        p.f.db
+            .register_headless_delivery_attempt(id, SESSION, None, id, &[seq], 0)
+            .unwrap();
+        p.f.db
+            .record_delivery_observation_anchor(id, SESSION, &p.f.anchor)
+            .unwrap();
+        p.f.db
+            .begin_headless_delivery_submission(id, SESSION, id, true)
+            .unwrap();
+    }
+    let config_home = prepare_correction3_helper(&p, &p.proxy);
+    let _guard = correction4_install_target(&p, &config_home);
+    let admission = crate::native_receipt::helper::try_admit(p.f.db.path(), "receipt-scan")
+        .unwrap()
+        .unwrap();
+    let before = correction4_pending_snapshot(&p);
+    assert_eq!(before.len(), 4);
+    let operations = fs::read_to_string(p.f.root.path().join("inspection-operations")).unwrap();
+    let count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let calls = count.clone();
+    crate::native_receipt::helper::TEST_COMMAND.with_borrow_mut(|c| {
+        let factory = c.take().unwrap();
+        *c = Some(Box::new(move |once| {
+            calls.set(calls.get() + 1);
+            factory(once)
+        }));
+    });
+    let start = std::time::Instant::now();
+    assert!(!correction3_resume_route(&p, &config_home, true).unwrap());
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "startup waited on scan admission"
+    );
+    assert_eq!(
+        count.get(),
+        4,
+        "all pending attempts must remain eligible for startup observation"
+    );
+    assert_eq!(correction4_pending_snapshot(&p), before);
+    assert_eq!(p.f.db.list_pending(SESSION).unwrap().len(), 4);
+    assert_eq!(
+        fs::read_to_string(p.f.root.path().join("inspection-operations")).unwrap(),
+        operations
+    );
+    assert!(p.f.submit().is_err());
+    assert!(
+        prepare_headless_resume_delivery_on(&mut p.f.db, SESSION, "chain", None, None).is_err()
+    );
+    drop(admission);
+}
+
+#[test]
+#[ignore = "requires source-built Runner/provider; offline full terminal disposition and later exact settlement"]
+fn age355_paired_correction4_contended_terminal_retains_pending_then_settles_exactly() {
+    let _lock = crate::mailbox_delivery::DATA_DIR_ENV_LOCK.lock().unwrap();
+    let mut p = Paired::new();
+    p.anchor_and_submit();
+    // The provider has already accepted the exact native input. Contention
+    // prevents observing it; exit 1 must not be interpreted as non-submission.
+    let record = json!({"timestamp":"2026-09-07T12:00:02Z","type":"response_item",
+        "payload":{"type":"message","role":"user", "internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]},
+        "content":[{"type":"input_text","text":p.f.envelope}]}});
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&p.transcript)
+            .unwrap(),
+        "{record}"
+    )
+    .unwrap();
+    let config_home = prepare_correction3_helper(&p, &p.proxy);
+    let _guard = correction4_install_target(&p, &config_home);
+    let admission = crate::native_receipt::helper::try_admit(p.f.db.path(), "receipt-scan")
+        .unwrap()
+        .unwrap();
+    let before = correction4_pending_snapshot(&p);
+    let operations = fs::read_to_string(p.f.root.path().join("inspection-operations")).unwrap();
+    let mut invocation_id = String::new();
+    let start = std::time::Instant::now();
+    correction3_resume_route_with(&p, &config_home, false, |input, provider| {
+        invocation_id =
+            super::super::super::terminal::races_tests::correction4_unconfirmed_terminal(
+                input, provider,
+            );
+        Ok(false)
+    })
+    .unwrap();
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "terminal waited on scan admission"
+    );
+    assert_eq!(
+        fs::read_to_string(p.f.root.path().join("inspection-operations")).unwrap(),
+        operations
+    );
+    assert_eq!(correction4_pending_snapshot(&p), before);
+    let rows = p.f.db.list_pending(SESSION).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].delivery_error.as_deref(),
+        Some("mailbox_delivery_unconfirmed")
+    );
+    p.f.assert_pending_without_replay();
+    assert!(p.f.submit().is_err());
+    drop(admission);
+    assert!(correction3_resume_route(&p, &config_home, true).unwrap());
+    assert!(p.f.db.list_pending(SESSION).unwrap().is_empty());
+    assert!(
+        p.f.db
+            .delivery_attempt_fully_settled(&p.f.attempt, SESSION, Some("chain"), &[p.f.seq])
+            .unwrap()
+    );
+    let confirmation =
+        p.f.db
+            .delivery_observation_confirmation(&p.f.attempt)
+            .unwrap()
+            .unwrap();
+    assert!(correction3_resume_route(&p, &config_home, false).unwrap());
+    assert_eq!(
+        p.f.db
+            .delivery_observation_confirmation(&p.f.attempt)
+            .unwrap()
+            .unwrap(),
+        confirmation
+    );
+    let invocation =
+        p.f.state
+            .get_invocation_by_uuid(&invocation_id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(invocation.success, Some(false));
+    assert_eq!(invocation.exit_code, Some(1));
+    assert_eq!(
+        invocation.error_category.as_deref(),
+        Some("mailbox_delivery_unconfirmed")
+    );
+    assert_eq!(p.f.submissions, 1);
+    p.assert_staging_untouched();
 }

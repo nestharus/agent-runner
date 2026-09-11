@@ -370,3 +370,46 @@ fn ack_after_terminal_evidence_keeps_provider_failure() {
 fn incomplete_partial_ack_still_requires_observation() {
     terminal_ack_race("no_ack", true, "none", 0);
 }
+
+// Paired offline tests supply real held scan admission and a native receipt.
+// Keep this bridge beside the private production terminal handler rather than
+// widening its production visibility just for cross-module fixtures.
+pub(in crate::run::resume) fn correction4_unconfirmed_terminal(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+) -> String {
+    let mut bound =
+        super::super::lifecycle::setup_bound_resume_attempt(input, provider, 0).unwrap();
+    let result = super::tests::clean_result();
+    let outcome = handle_ordinary_resume_attempt_terminal_signal(
+        input,
+        &mut bound.attempt,
+        provider,
+        input.session_id,
+        &result,
+        wake::ResumeCompletionEvidence {
+            zero_turn_action: ZeroTurnAction::Continue,
+            recovered_generic_nonzero: false,
+            prompt_acceptance_confirmation: None,
+        },
+        true,
+        None,
+    )
+    .unwrap();
+    assert!(matches!(outcome, ResumeAttemptLoopControl::Return(1)));
+    let id = bound.attempt.invocation.id.clone();
+    let invocation = input
+        .env
+        .state
+        .get_invocation_by_uuid(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(invocation.success, Some(false));
+    assert_eq!(invocation.exit_code, Some(1));
+    assert_eq!(
+        invocation.error_category.as_deref(),
+        Some("mailbox_delivery_unconfirmed")
+    );
+    assert_eq!(invocation.terminal_reason, result.terminal_reason);
+    id
+}

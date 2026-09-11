@@ -207,27 +207,20 @@ fn inspect(once: bool, target: Option<Target>) -> Result<(), String> {
     }
 }
 
-fn wait_for_scan_admission() -> Result<Option<File>, String> {
+fn try_scan_admission() -> Result<Option<File>, String> {
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(None);
     };
-    // Bind the independent lock inode under real custody once. Rebuild leaves
-    // this file intact; contention retries need neither DB opens nor fences.
-    let file = admission_file(db.path(), "receipt-scan")?;
-    drop(db);
-    loop {
-        match <File as fs4::FileExt>::try_lock(&file) {
-            Ok(()) => return Ok(Some(file)),
-            Err(fs4::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
-            Err(error) => return Err(error.to_string()),
-        }
-    }
+    // Bind the independent inode under real custody. Rebuild leaves it intact.
+    // Opportunistic observation must not wait behind another namespace scan.
+    try_admit(db.path(), "receipt-scan")
 }
 
 fn inspect_target(target: Target) -> Result<(), String> {
     // Targeted startup/terminal requests bypass the periodic cadence, but not
-    // scan admission. Wait without holding ordinary DB/rebuild custody.
-    let Some(admission) = wait_for_scan_admission()? else {
+    // scan admission. Contention skips inspection, not the durable pending attempt.
+    // Ok means this helper completed, never confirmation or permission to resend.
+    let Some(admission) = try_scan_admission()? else {
         return Ok(());
     };
     let Some(db) = MailboxDb::open_default_if_exists()? else {

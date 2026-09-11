@@ -535,6 +535,9 @@ fn normalized_text_sha256(text: &str) -> String {
     sha256_hex(normalized.trim().as_bytes())
 }
 
+// Exit 1 records this invocation's inability to establish confirmation, not
+// provider failure, non-submission, or resend permission. The pending attempt
+// and anchor remain eligible for later observation; history need not be rewritten.
 fn finalize_unconfirmed_mailbox_delivery(
     input: &ResumeAttemptInput<'_>,
     attempt: &mut ResumeInvocationAttempt<'_>,
