@@ -955,3 +955,447 @@ fn age355_paired_process_helper_cache_admission_invalidation_and_receipt() {
     assert!(p.f.db.list_pending(SESSION).unwrap().is_empty());
     p.assert_staging_untouched();
 }
+
+fn prepare_correction3_helper(p: &Paired, executable: &Path) -> PathBuf {
+    let root = p.f.root.path();
+    let config_home = root.join("helper-config");
+    let config = config_home.join("oulipoly-agent-runner");
+    fs::create_dir_all(&config).unwrap();
+    let discovered = profile(root);
+    fs::write(config.join("providers.toml"), format!(
+        "[account]\nsettings_id = {:?}\nimplementation = {{ family = {:?}, executable = {:?} }}\n",
+        discovered.settings_id, discovered.family, executable.display().to_string()
+    )).unwrap();
+    config_home
+}
+
+fn correction3_helper_command(
+    root: &Path,
+    config_home: &Path,
+    once: bool,
+) -> std::process::Command {
+    let binary = std::env::var("AGE355_RUNNER_BINARY").expect("explicit source-built Runner");
+    let mut command = std::process::Command::new(binary);
+    command.arg(crate::native_receipt::helper::ARG);
+    if once {
+        command.arg("once");
+    }
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", root.join("home"))
+        .env("OULIPOLY_DATA_DIR", root)
+        .env("OULIPOLY_CONFIG_HOME", config_home)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("TMPDIR", root);
+    command
+}
+
+struct ReceiptRouteTestGuard(Option<std::ffi::OsString>);
+impl Drop for ReceiptRouteTestGuard {
+    fn drop(&mut self) {
+        crate::native_receipt::helper::TEST_COMMAND.with_borrow_mut(|c| *c = None);
+        crate::native_receipt::helper::TEST_BOUND.set(None);
+        unsafe {
+            match self.0.as_ref() {
+                Some(value) => std::env::set_var("OULIPOLY_DATA_DIR", value),
+                None => std::env::remove_var("OULIPOLY_DATA_DIR"),
+            }
+        }
+    }
+}
+
+// Calls the actual production resume startup / terminal observation functions.
+// Only the helper executable/env and watchdog duration are injected: config,
+// preparation, hashing, scan admission and publication run in the real binary.
+fn correction3_resume_route(p: &Paired, config_home: &Path, startup: bool) -> Result<bool, String> {
+    use crate::migration_providers::ResumeExecutionEnvironment;
+    let root = p.f.root.path();
+    let services = crate::wiring::AgentRuntimeServices::production(crate::wiring::RuntimePaths {
+        config_root: config_home.join("oulipoly-agent-runner"),
+        models_dir: root.join("models"),
+        agents_dir: root.join("agents"),
+        data_root: root.into(),
+        state_db_path: root.join("state.db"),
+        lock_dir: root.join("locks"),
+        working_dir: root.into(),
+    })
+    .unwrap();
+    let mut resolved = oulipoly_state::ResolvedResume {
+        chain_id: "chain".into(),
+        active_session_id: SESSION.into(),
+        active_provider: "account".into(),
+        model_name: Some("offline-paired".into()),
+        model: None,
+    };
+    if startup {
+        reconcile_pending_headless_delivery_observations(
+            &resolved,
+            Path::new("/offline"),
+            &config_home.join("oulipoly-agent-runner"),
+        )?;
+        return Ok(p
+            .f
+            .db
+            .delivery_observation_confirmation(&p.f.attempt)?
+            .is_some());
+    }
+    let env = ResumeExecutionEnvironment {
+        state: oulipoly_state::StateDb::open(&root.join("state.db")).unwrap(),
+        providers_cfg: ProvidersConfig {
+            entries: HashMap::new(),
+        },
+        models: HashMap::new(),
+        sessions_cfg: oulipoly_config::SessionsConfig {
+            entries: HashMap::new(),
+        },
+        config_root: config_home.join("oulipoly-agent-runner"),
+        models_dir: root.join("models"),
+    };
+    let mut zero_turn = crate::zero_turn_orchestration::ZeroTurnConfirmationState::new();
+    let mut accepted = false;
+    let seqs = [p.f.seq];
+    let input = ResumeAttemptInput {
+        agent_runtime_services: &services,
+        env: &env,
+        resolved: &mut resolved,
+        answer: Some(&p.f.envelope),
+        mailbox_session_id: SESSION,
+        mailbox_delivery_seqs: &seqs,
+        mailbox_delivery_nonce: Some(&p.f.attempt),
+        mailbox_delivery_requires_turn_confirmation: true,
+        manual_migrate: None,
+        reservation: None,
+        session_id: SESSION,
+        working_dir: Some(root),
+        attempts: 1,
+        max_attempts: 1,
+        parent_invocation_id: None,
+        effective_spawn_cwd: Path::new("/offline"),
+        zero_turn_confirmation: &mut zero_turn,
+        provider_prompt_accepted: &mut accepted,
+    };
+    confirm_mailbox_delivery_from_anchor(
+        &input,
+        &oulipoly_config::ProviderConfig::model_provider("account", vec![]),
+    )
+}
+
+#[test]
+#[ignore = "requires source-built Runner/provider; actual startup and terminal routes, offline only"]
+fn age355_paired_correction3_startup_terminal_paths_are_owned_and_exact() {
+    let _lock = crate::mailbox_delivery::DATA_DIR_ENV_LOCK.lock().unwrap();
+    for startup in [true, false] {
+        for mode in ["blocked", "locked", "exact"] {
+            let blocked = mode == "blocked";
+            let locked = mode == "locked";
+            let mut p = Paired::new();
+            p.anchor_and_submit();
+            let root = p.f.root.path();
+            let _guard = ReceiptRouteTestGuard(std::env::var_os("OULIPOLY_DATA_DIR"));
+            unsafe {
+                std::env::set_var("OULIPOLY_DATA_DIR", root);
+            }
+            let executable = if blocked {
+                let path = root.join("blocked-preparation.py");
+                fs::write(&path, format!("#!/usr/bin/python3\nimport os,time\nopen({:?},'w').write(str(os.getpid()))\ntime.sleep(30)\n", root.join("blocked-pid").display().to_string())).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                path
+            } else {
+                p.proxy.clone()
+            };
+            let config_home = prepare_correction3_helper(&p, &executable);
+            let owned_root = root.to_path_buf();
+            let owned_config = config_home.clone();
+            crate::native_receipt::helper::TEST_COMMAND.with_borrow_mut(|c| {
+                *c = Some(Box::new(move |once| {
+                    let mut command = correction3_helper_command(&owned_root, &owned_config, once);
+                    command.env(
+                        "OULIPOLY_CONFIG_HOME",
+                        owned_root.join("not-selected-config"),
+                    );
+                    command
+                }))
+            });
+            crate::native_receipt::helper::TEST_BOUND.set(Some(if blocked || locked {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(10)
+            }));
+            let record = json!({"timestamp":"2026-09-07T12:00:02Z","type":"response_item",
+                "payload":{"type":"message","role":"user", "internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]},
+                "content":[{"type":"input_text","text":p.f.envelope}]}});
+            writeln!(
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&p.transcript)
+                    .unwrap(),
+                "{record}"
+            )
+            .unwrap();
+            let _admission = if locked {
+                crate::native_receipt::helper::try_admit(p.f.db.path(), "receipt-scan").unwrap()
+            } else {
+                None
+            };
+            let operations_before = fs::read_to_string(root.join("inspection-operations")).unwrap();
+            let start = std::time::Instant::now();
+            let result = correction3_resume_route(&p, &config_home, startup);
+            if blocked || locked {
+                assert!(
+                    start.elapsed() < Duration::from_secs(3),
+                    "startup={startup}: {result:?}"
+                );
+                assert!(!result.unwrap_or(false));
+                if blocked {
+                    let pid: i32 = fs::read_to_string(root.join("blocked-pid"))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    assert_process_not_live(pid);
+                } else {
+                    assert_eq!(
+                        fs::read_to_string(root.join("inspection-operations")).unwrap(),
+                        operations_before,
+                        "target inspected while global scan admission was held"
+                    );
+                }
+                assert!(
+                    p.f.db
+                        .delivery_observation_confirmation(&p.f.attempt)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                assert!(result.unwrap(), "startup={startup}");
+                assert!(p.f.db.list_pending(SESSION).unwrap().is_empty());
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_process_not_live(pid: i32) {
+    let start = std::time::Instant::now();
+    loop {
+        let live = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .is_some_and(|stat| {
+                !matches!(
+                    stat.rsplit_once(')')
+                        .unwrap()
+                        .1
+                        .split_whitespace()
+                        .next()
+                        .unwrap(),
+                    "Z" | "X"
+                )
+            });
+        if !live {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "process {pid} remains live"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn assert_process_not_live(pid: i32) {
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "private subprocess entry for parent-death test only"]
+fn age355_correction3_private_supervisor() {
+    let root = PathBuf::from(std::env::var_os("AGE355_ORPHAN_ROOT").unwrap());
+    let mut command = correction3_helper_command(&root, &root.join("helper-config"), false);
+    let _ = crate::native_receipt::helper::supervise(
+        &mut command,
+        &CancellationToken::new(),
+        Duration::from_secs(10),
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires source-built Runner/provider; parent death and TERM-resistant descendants"]
+fn age355_paired_correction3_parent_death_heartbeat_and_timeout_kill_descendants() {
+    for mode in ["heartbeat", "timeout", "self-exit"] {
+        let timeout = mode == "timeout";
+        let mut p = Paired::new();
+        p.anchor_and_submit();
+        p.f.db
+            .wake_sessions()
+            .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+                session_id: SESSION,
+                mode: "headless",
+                invocation_uuid: Some("native-invocation"),
+                provider_name: Some("account"),
+                model_name: Some("offline-paired"),
+                models_dir: None,
+                effective_cwd: Some("/offline"),
+            })
+            .unwrap();
+        let root = p.f.root.path();
+        let wrapper = root.join("orphan-provider.py");
+        fs::write(&wrapper, format!(r#"#!/usr/bin/python3
+import os,sys,subprocess,time,pathlib
+root=pathlib.Path({root:?})
+if sys.argv[1] == 'describe':
+    child=subprocess.Popen(['/usr/bin/python3','-c',"import signal,time,os; signal.signal(signal.SIGTERM,signal.SIG_IGN); open("+repr(str(root/'descendant-pid'))+",'w').write(str(os.getpid())); time.sleep(30)"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    (root/'helper-pid').write_text(str(os.getppid()))
+    while not (root/'release').exists(): time.sleep(.005)
+    if {timeout}: time.sleep(30)
+os.execv({proxy:?},[{proxy:?}]+sys.argv[1:])
+"#, root=root.display().to_string(), proxy=p.proxy.display().to_string(), timeout=if timeout {"True"} else {"False"})).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_correction3_helper(&p, &wrapper);
+        let mut supervisor = if mode == "self-exit" {
+            use std::os::unix::process::CommandExt;
+            let mut command = correction3_helper_command(root, &root.join("helper-config"), true);
+            command
+                .process_group(0)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null());
+            let mut child = command.spawn().unwrap();
+            child.stdin.take().unwrap().write_all(&[1]).unwrap();
+            child
+        } else {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "run::resume::wake::observation_tests::paired_tests::age355_correction3_private_supervisor", "--nocapture"])
+                .env("AGE355_ORPHAN_ROOT", root).stdout(std::process::Stdio::null()).spawn().unwrap()
+        };
+        let start = std::time::Instant::now();
+        while !root.join("descendant-pid").exists() {
+            if start.elapsed() > Duration::from_secs(5) {
+                let _ = supervisor.kill();
+                let _ = supervisor.wait();
+                panic!("no descendant fixture");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let helper: i32 = fs::read_to_string(root.join("helper-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        struct Cleanup(i32);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(-self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _cleanup = Cleanup(helper);
+        let descendant: i32 = fs::read_to_string(root.join("descendant-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        // Demonstrate resistance before removing the supervising parent.
+        assert_eq!(unsafe { libc::kill(descendant, libc::SIGTERM) }, 0);
+        if mode != "self-exit" {
+            supervisor.kill().unwrap();
+            supervisor.wait().unwrap();
+        }
+        fs::write(root.join("release"), "go").unwrap();
+        assert_process_not_live(helper);
+        assert_process_not_live(descendant);
+        if mode == "self-exit" {
+            // No OwnedHelper parent sent this signal. Successful entry itself
+            // must discharge descendants before exiting, even with open stdout.
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(supervisor.wait().unwrap().signal(), Some(libc::SIGKILL));
+        }
+        assert!(
+            crate::native_receipt::helper::try_admit(p.f.db.path(), "receipt-owner")
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires source-built provider; completed-checkpoint settings admission"]
+fn age355_paired_correction3_changed_settings_cannot_publish_cached_match() {
+    let mut p = Paired::new();
+    p.anchor_and_submit();
+    let endpoint = p.registry.preflight_account("account").unwrap();
+    let reader = endpoint
+        .client()
+        .pinned_executable_identity_sha256()
+        .unwrap();
+    // A crash after checkpoint publication and before final CAS can leave this
+    // complete match. Seed that state to isolate semantic admission, not parsing.
+    let checkpoint = serde_json::to_string(&ObservationProgress {
+        receipt_policy: 1,
+        reader_identity: Some(reader),
+        complete: true,
+        matching_turns: 1,
+        matching_turn_id: Some("retained-exact-match".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    p.f.db
+        .advance_delivery_observation_progress(&p.f.attempt, None, &checkpoint)
+        .unwrap();
+    let discovered = profile(p.f.root.path());
+    let providers = ProvidersConfig {
+        entries: HashMap::from([(
+            "account".into(),
+            ProviderEntry {
+                implementation: Some(ProviderEndpointConfig {
+                    family: discovered.family,
+                    executable: p.proxy.display().to_string(),
+                }),
+                settings_id: Some("different-settings".into()),
+                ..ProviderEntry::default()
+            },
+        )]),
+    };
+    let changed = ProviderRegistry::from_configs(
+        &[],
+        &providers,
+        ProviderRegistryOptions::default()
+            .with_config_root(p.f.root.path().join("config"))
+            .with_data_root(p.f.root.path().join("data")),
+    )
+    .unwrap();
+    let error = confirm_delivery_observation(
+        &p.f.db,
+        &p.f.attempt,
+        &changed,
+        identity(p.f.root.path()),
+        Path::new("/offline"),
+        &p.f.anchor,
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("receipt endpoint identity changed"),
+        "{error}"
+    );
+    assert!(
+        p.f.db
+            .delivery_observation_confirmation(&p.f.attempt)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        p.f.db
+            .delivery_observation_progress(&p.f.attempt)
+            .unwrap()
+            .as_deref(),
+        Some(checkpoint.as_str())
+    );
+    assert_eq!(
+        p.f.db
+            .delivery_observation_anchor(&p.f.attempt)
+            .unwrap()
+            .unwrap(),
+        p.f.anchor
+    );
+}

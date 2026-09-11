@@ -113,9 +113,9 @@ pub(in crate::run) fn prepare_headless_resume_execution(
     let parent_invocation_id = crate::dispatch::resolve_parent_invocation_id(&env.state);
     let max_attempts = headless_resume_retry_budget(&resolved);
     if let Err(error) = wake::reconcile_pending_headless_delivery_observations(
-        agent_runtime_services,
         &resolved,
         &effective_spawn_cwd,
+        &env.config_root,
     ) {
         formatter::emit_stderr(&format!(
             "Warning: Pending mailbox delivery observation recovery failed: {error}"

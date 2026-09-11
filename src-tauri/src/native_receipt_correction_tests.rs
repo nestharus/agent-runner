@@ -207,3 +207,86 @@ fn age355_scope_cancellation_terminates_contained_descendants() {
     }
     assert!(!root.path().join("descendant-finished").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn age355_idle_helper_releases_rebuild_custody_without_splitting_owner() {
+    use std::io::Read;
+    let root = tempfile::tempdir().unwrap();
+    let state_path = root.path().join("state.db");
+    drop(oulipoly_state::StateDb::open(&state_path).unwrap());
+    let path = MailboxDb::path_for_state_db(&state_path);
+    let db = MailboxDb::open(&path).unwrap();
+    let generation = db.sidecar_generation().unwrap();
+    drop(db);
+    let mut command = private_child(root.path(), "entry");
+    command.env("OULIPOLY_DATA_DIR", root.path());
+    let guard = helper::start_command(command).unwrap();
+    let owner_path = path.with_extension("receipt-owner");
+    wait_for_file(&owner_path);
+    let started = Instant::now();
+    while std::fs::read(&owner_path).unwrap().is_empty() {
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let state_authority = oulipoly_state::StateDb::acquire_rebuild_authority(&state_path).unwrap();
+    let mut rebuild = MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
+    assert!(helper::try_admit(&path, "receipt-owner").unwrap().is_none());
+    rebuild.reset().unwrap();
+    rebuild.initialize_after_rebuild().unwrap();
+    assert!(helper::try_admit(&path, "receipt-owner").unwrap().is_none());
+    drop(rebuild);
+    drop(state_authority);
+    let reopened = MailboxDb::open(&path).unwrap();
+    assert_ne!(generation, reopened.sidecar_generation().unwrap());
+    drop(reopened);
+    let before = std::fs::read_to_string(&owner_path).unwrap();
+    let start = Instant::now();
+    loop {
+        let mut stamp = String::new();
+        std::fs::File::open(&owner_path)
+            .unwrap()
+            .read_to_string(&mut stamp)
+            .unwrap();
+        if !stamp.is_empty() && stamp != before {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(guard);
+    assert!(helper::try_admit(&path, "receipt-owner").unwrap().is_some());
+}
+
+#[test]
+fn age355_target_anchor_binding_is_framed_and_bounded_for_large_tokens() {
+    let mut anchor = MailboxDeliveryObservationAnchor {
+        provider_name: "account".into(),
+        provider_instance_id: "instance".into(),
+        settings_id: "settings".into(),
+        provider_session_id: "session".into(),
+        resume_token: Some("x".repeat(256 * 1024)),
+        expected_sha256: "digest".into(),
+    };
+    let original = helper::anchor_identity(&anchor);
+    let target = helper::Target {
+        attempt_id: "nonce".into(),
+        anchor_identity: original.clone(),
+        model_name: "model".into(),
+        cwd: "/private".into(),
+        config_root: "/private/config".into(),
+    };
+    assert!(serde_json::to_vec(&target).unwrap().len() < 512);
+    anchor.resume_token.as_mut().unwrap().push('y');
+    assert_ne!(helper::anchor_identity(&anchor), original);
+    anchor.resume_token = None;
+    let absent = helper::anchor_identity(&anchor);
+    anchor.resume_token = Some(String::new());
+    assert_ne!(helper::anchor_identity(&anchor), absent);
+    anchor.provider_name = "ab".into();
+    anchor.provider_instance_id = "c".into();
+    let framed = helper::anchor_identity(&anchor);
+    anchor.provider_name = "a".into();
+    anchor.provider_instance_id = "bc".into();
+    assert_ne!(helper::anchor_identity(&anchor), framed);
+}

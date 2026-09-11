@@ -22,6 +22,7 @@ use oulipoly_runtime::session_provider::{
 };
 use oulipoly_state::mailbox::{MailboxDb, MailboxDeliveryObservationAnchor};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::time::Duration;
 
 use super::lifecycle::ResumeInvocationAttempt;
@@ -94,54 +95,36 @@ pub(super) fn prepare_headless_resume_delivery(
 }
 
 pub(super) fn reconcile_pending_headless_delivery_observations(
-    agent_runtime_services: &crate::wiring::AgentRuntimeServices,
     resolved: &oulipoly_state::ResolvedResume,
     effective_cwd: &std::path::Path,
+    config_root: &std::path::Path,
 ) -> Result<(), String> {
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
     ensure_observation_not_stopped(&db, &resolved.active_session_id)?;
     prepare_legacy_observation_recovery(&db, resolved)?;
-    let registry = agent_runtime_services.provider_registry_handle.current();
-    for pending in db.pending_delivery_observations(
+    let pending = db.pending_delivery_observations(
         &resolved.active_session_id,
         OBSERVATION_MAX_PENDING_ATTEMPTS,
-    )? {
-        let anchor = pending.anchor;
-        let Some(provider_identity) = crate::session_ingest_cli::session_external_provider_identity(
-            agent_runtime_services,
-            resolved.model.as_ref(),
-            &anchor.provider_name,
-        ) else {
-            continue;
-        };
-        let identity = SessionProviderIdentity {
-            model_name: provider_identity.model_name,
-            provider_name: provider_identity.provider_name,
-            provider_instance_id: provider_identity.provider_instance_id,
-            settings_id: provider_identity.settings_id,
-        };
-        let Some(provider_instance_id) = identity.provider_instance_id.as_deref() else {
-            continue;
-        };
-        if provider_instance_id != anchor.provider_instance_id
-            || identity.settings_id != anchor.settings_id
-            || anchor.provider_session_id != resolved.active_session_id
-        {
+    )?;
+    drop(db);
+    for pending in pending {
+        if pending.anchor.provider_session_id != resolved.active_session_id {
             continue;
         }
-        if let Err(error) = confirm_delivery_observation(
-            &db,
-            &pending.attempt_id,
-            registry.as_ref(),
-            identity,
-            effective_cwd,
-            &anchor,
-        ) {
+        if let Err(error) =
+            crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
+                attempt_id: pending.attempt_id,
+                anchor_identity: crate::native_receipt::helper::anchor_identity(&pending.anchor),
+                model_name: resolved.model_name.clone().unwrap_or_default(),
+                cwd: effective_cwd.to_path_buf(),
+                config_root: config_root.to_path_buf(),
+            })
+        {
             formatter::emit_stderr(&format!(
                 "Warning: Bounded recovery observation failed for {}: {error}",
-                anchor.provider_name
+                pending.anchor.provider_name
             ));
         }
     }
@@ -510,28 +493,19 @@ fn confirm_mailbox_delivery_from_anchor(
     {
         return Ok(false);
     }
-    let identity = observation_identity(input, provider)?;
-    let provider_instance_id = identity
-        .provider_instance_id
-        .clone()
-        .ok_or_else(|| "session_provider_instance_identity_missing".to_string())?;
-    if provider_instance_id != anchor.provider_instance_id
-        || identity.settings_id != anchor.settings_id
-    {
+    drop(db);
+    crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
+        attempt_id: attempt_id.to_string(),
+        anchor_identity: crate::native_receipt::helper::anchor_identity(&anchor),
+        model_name: input.resolved.model_name.clone().unwrap_or_default(),
+        cwd: input.effective_spawn_cwd.to_path_buf(),
+        config_root: input.env.config_root.clone(),
+    })?;
+    // Only committed exact native evidence counts, never helper exit status.
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(false);
-    }
-    let registry = input
-        .agent_runtime_services
-        .provider_registry_handle
-        .current();
-    confirm_delivery_observation(
-        &db,
-        attempt_id,
-        registry.as_ref(),
-        identity,
-        input.effective_spawn_cwd,
-        &anchor,
-    )
+    };
+    Ok(db.delivery_observation_confirmation(attempt_id)?.is_some())
 }
 
 pub(super) fn validated_prompt_acceptance_for_resume(

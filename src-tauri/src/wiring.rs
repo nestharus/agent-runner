@@ -443,7 +443,17 @@ impl ReceiptRegistryCache {
         &mut self,
         _models_dir: Option<&std::path::Path>,
     ) -> Result<std::sync::Arc<ProviderRegistry>, String> {
-        let paths = default_cli_runtime_paths()?;
+        self.registry_at(None)
+    }
+
+    pub(crate) fn registry_at(
+        &mut self,
+        config_root: Option<&Path>,
+    ) -> Result<std::sync::Arc<ProviderRegistry>, String> {
+        let mut paths = default_cli_runtime_paths()?;
+        if let Some(config_root) = config_root {
+            paths.config_root = config_root.to_path_buf();
+        }
         let providers = load_registry_providers(&paths)?;
         let accounts: std::collections::BTreeMap<_, _> = providers.entries.iter().collect();
         // Account fields use ordered collections. This private in-memory key

@@ -1784,7 +1784,16 @@ fn terminate_tree(child: &mut Child) {
         child.id() as i32
     };
     unsafe {
-        libc::kill(group, libc::SIGTERM);
+        // This group includes the helper's lifetime/teardown owner. TERM
+        // could kill it before escalation while resistant descendants survive.
+        libc::kill(
+            group,
+            if receipt_group() != 0 {
+                libc::SIGKILL
+            } else {
+                libc::SIGTERM
+            },
+        );
     }
 }
 

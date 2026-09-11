@@ -61,8 +61,20 @@ fn process_entrypoint() -> ExitCode {
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(native_receipt::helper::ARG))
     {
-        return match native_receipt::helper::entry(
+        let target = match std::env::args()
+            .nth(3)
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+        {
+            Ok(target) => target,
+            Err(error) => {
+                eprintln!("invalid receipt target: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return match native_receipt::helper::entry_target(
             std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("once")),
+            target,
         ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

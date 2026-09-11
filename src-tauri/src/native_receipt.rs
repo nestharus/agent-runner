@@ -90,6 +90,18 @@ pub(crate) fn confirm_delivery_observation_bounded(
     let endpoint = registry
         .preflight_account(&identity.provider_name)
         .map_err(|e| e.to_string())?;
+    // Validate live semantic admission even when a completed checkpoint needs
+    // no further page. Parsed configuration equality is not receipt authority.
+    if endpoint.account_name() != anchor.provider_name
+        || format!("{}-instance", endpoint.capabilities().provider_id)
+            != anchor.provider_instance_id
+        || endpoint.settings_id().map_err(|e| e.to_string())? != anchor.settings_id
+        || identity.provider_name != anchor.provider_name
+        || identity.provider_instance_id.as_deref() != Some(anchor.provider_instance_id.as_str())
+        || identity.settings_id != anchor.settings_id
+    {
+        return Err("receipt endpoint identity changed".into());
+    }
     // Existing pinned-client identity, not a provider version-string claim. A
     // changed adapter cannot inherit weaker cached matches or later cursors.
     let reader_identity = endpoint.client().pinned_executable_identity_sha256()?;

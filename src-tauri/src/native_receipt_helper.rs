@@ -19,14 +19,18 @@ const STALL_BOUND: Duration = Duration::from_secs(30);
 // running. Registry/hash reuse lasts across ticks, not across helper generations.
 const MAX_LIFETIME: Duration = Duration::from_secs(60);
 
-pub(crate) fn try_admit(path: &Path, suffix: &str) -> Result<Option<File>, String> {
-    let file = OpenOptions::new()
+fn admission_file(path: &Path, suffix: &str) -> Result<File, String> {
+    OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(path.with_extension(suffix))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) fn try_admit(path: &Path, suffix: &str) -> Result<Option<File>, String> {
+    let file = admission_file(path, suffix)?;
     match <File as fs4::FileExt>::try_lock(&file) {
         Ok(()) => Ok(Some(file)),
         Err(fs4::TryLockError::WouldBlock) => Ok(None),
@@ -55,7 +59,56 @@ fn receipt_admission_cadence_recovers_from_clock_rollback() {
 
 /// Called before CLI discovery, config loading, DB opening or any model path.
 /// The parent's gate byte means process containment is installed before IO.
+#[cfg(test)]
 pub(crate) fn entry(once: bool) -> Result<(), String> {
+    entry_target(once, None)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct Target {
+    pub attempt_id: String,
+    pub anchor_identity: String,
+    pub model_name: String,
+    pub cwd: std::path::PathBuf,
+    pub config_root: std::path::PathBuf,
+}
+
+// Bound the target argv independently of provider-owned opaque token length.
+// This hashes already-read anchor bytes only, not executable/filesystem IO.
+// Length framing plus Option presence preserves every original anchor field.
+pub(crate) fn anchor_identity(
+    anchor: &oulipoly_state::mailbox::MailboxDeliveryObservationAnchor,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for field in [
+        anchor.provider_name.as_str(),
+        anchor.provider_instance_id.as_str(),
+        anchor.settings_id.as_str(),
+        anchor.provider_session_id.as_str(),
+        anchor.resume_token.as_deref().unwrap_or_default(),
+        anchor.expected_sha256.as_str(),
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    digest.update([u8::from(anchor.resume_token.is_some())]);
+    format!("{:x}", digest.finalize())
+}
+
+// Every returning/error/unwinding entry tears down the whole group, including
+// itself. Do not leave cleanup to a timer thread that dies with the helper.
+struct LocalTeardown;
+impl Drop for LocalTeardown {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-libc::getpgrp(), libc::SIGKILL);
+        }
+    }
+}
+
+pub(crate) fn entry_target(once: bool, target: Option<Target>) -> Result<(), String> {
     let mut gate = [0u8];
     std::io::stdin()
         .read_exact(&mut gate)
@@ -65,6 +118,7 @@ pub(crate) fn entry(once: bool) -> Result<(), String> {
     }
     #[cfg(unix)]
     oulipoly_provider::client::enter_receipt_inspection_group()?;
+    let _teardown = LocalTeardown;
     // A parent crash must not leave a namespace owner alive indefinitely. The
     // timer lives inside the disposable process, not in the caller's scope.
     std::thread::Builder::new()
@@ -78,16 +132,36 @@ pub(crate) fn entry(once: bool) -> Result<(), String> {
             std::process::exit(1);
         })
         .map_err(|e| e.to_string())?;
-    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
+    let result = inspect(once, target);
+    if let Err(error) = &result {
+        eprintln!("receipt helper: {error}");
+    }
+    if result.is_ok() {
+        // Process completion only, never receipt evidence. Unix cleanup kills
+        // this helper too, so communicate completion before group teardown.
+        std::io::stdout()
+            .write_all(b"!")
+            .map_err(|e| e.to_string())?;
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+    }
+    result
+}
+
+fn inspect(once: bool, target: Option<Target>) -> Result<(), String> {
+    if let Some(target) = target {
+        return inspect_target(target);
+    }
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
     let Some(mut owner) = try_admit(db.path(), "receipt-owner")? else {
         return Ok(());
     };
+    // The independent owner inode survives rebuild (only SQLite members are
+    // reset). Never retain a connection or namespace fence through idle sleep.
+    drop(db);
     let mut registry = crate::wiring::ReceiptRegistryCache::default();
     loop {
-        // Durable admission cadence survives owner handoff. Serializing each
-        // observer and then running its identical tick is intentionally avoided.
         let mut bytes = Vec::new();
         use std::io::{Seek, SeekFrom};
         owner.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
@@ -114,12 +188,14 @@ pub(crate) fn entry(once: bool) -> Result<(), String> {
         owner.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         owner.set_len(0).map_err(|e| e.to_string())?;
         write!(owner, "{now}").map_err(|e| e.to_string())?;
-        if let Err(error) =
-            super::poll_headless_receipt_tick_with(&mut db, |dir| registry.registry(dir))
-        {
-            // A failed preparation cannot
-            // poison the cache into reusing stale endpoints on a later visit.
-            eprintln!("receipt inspection: {error}");
+        // Reopen under real shared custody every visit; rebuild may have
+        // replaced the DB while idle. No stale connection/anchor survives it.
+        if let Some(mut db) = MailboxDb::open_default_if_exists()? {
+            if let Err(error) =
+                super::poll_headless_receipt_tick_with(&mut db, |dir| registry.registry(dir))
+            {
+                eprintln!("receipt inspection: {error}");
+            }
         }
         std::io::stdout()
             .write_all(b".")
@@ -131,7 +207,81 @@ pub(crate) fn entry(once: bool) -> Result<(), String> {
     }
 }
 
+fn wait_for_scan_admission() -> Result<Option<File>, String> {
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
+        return Ok(None);
+    };
+    // Bind the independent lock inode under real custody once. Rebuild leaves
+    // this file intact; contention retries need neither DB opens nor fences.
+    let file = admission_file(db.path(), "receipt-scan")?;
+    drop(db);
+    loop {
+        match <File as fs4::FileExt>::try_lock(&file) {
+            Ok(()) => return Ok(Some(file)),
+            Err(fs4::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+fn inspect_target(target: Target) -> Result<(), String> {
+    // Targeted startup/terminal requests bypass the periodic cadence, but not
+    // scan admission. Wait without holding ordinary DB/rebuild custody.
+    let Some(admission) = wait_for_scan_admission()? else {
+        return Ok(());
+    };
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
+        return Ok(());
+    };
+    let Some(anchor) = db.delivery_observation_anchor(&target.attempt_id)? else {
+        return Ok(());
+    };
+    if anchor_identity(&anchor) != target.anchor_identity {
+        return Err("receipt target anchor changed".into());
+    }
+    super::ensure_observation_not_stopped(&db, &anchor.provider_session_id)?;
+    let mut cache = crate::wiring::ReceiptRegistryCache::default();
+    let registry = cache.registry_at(Some(&target.config_root))?;
+    let identity = oulipoly_runtime::session_provider::SessionProviderIdentity {
+        model_name: target.model_name,
+        provider_name: anchor.provider_name.clone(),
+        provider_instance_id: Some(anchor.provider_instance_id.clone()),
+        settings_id: anchor.settings_id.clone(),
+    };
+    super::confirm_delivery_observation(
+        &db,
+        &target.attempt_id,
+        registry.as_ref(),
+        identity,
+        &target.cwd,
+        &anchor,
+    )?;
+    drop(db);
+    drop(admission);
+    Ok(())
+}
+
+pub(crate) fn observe_target(target: Target) -> Result<(), String> {
+    let mut command = command(true)?;
+    command.arg(serde_json::to_string(&target).map_err(|e| e.to_string())?);
+    #[cfg(test)]
+    let bound = TEST_BOUND.get().unwrap_or(STALL_BOUND);
+    #[cfg(not(test))]
+    let bound = STALL_BOUND;
+    supervise(&mut command, &CancellationToken::new(), bound)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_COMMAND: std::cell::RefCell<Option<Box<dyn Fn(bool) -> Command>>> = Default::default();
+    pub(crate) static TEST_BOUND: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
 fn command(once: bool) -> Result<Command, String> {
+    #[cfg(test)]
+    if let Some(command) = TEST_COMMAND.with_borrow(|factory| factory.as_ref().map(|f| f(once))) {
+        return Ok(command);
+    }
     let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
     command.arg(ARG);
     if once {
@@ -261,12 +411,17 @@ pub(crate) fn supervise(
         .take()
         .ok_or("receipt helper missing stdout")?;
     let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let completed = Arc::new(AtomicBool::new(false));
+    let completion = completed.clone();
     let reader = std::thread::Builder::new()
         .name("receipt-heartbeat".into())
         .spawn(move || {
             let mut stdout = stdout;
             let mut byte = [0u8];
             while stdout.read_exact(&mut byte).is_ok() {
+                if byte == [b'!'] {
+                    completion.store(true, Ordering::SeqCst);
+                }
                 let _ = send.try_send(());
             }
         })
@@ -299,7 +454,12 @@ pub(crate) fn supervise(
     reader
         .join()
         .map_err(|_| "receipt heartbeat reader panicked")?;
-    match (result?, status?) {
+    let result = result?;
+    let status = status?;
+    if completed.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    match (result, status) {
         (true, status) if !status.success() => Err(format!("receipt helper exited: {status}")),
         _ => Ok(()),
     }
