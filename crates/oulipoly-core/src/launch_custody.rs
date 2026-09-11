@@ -692,9 +692,7 @@ mod linux {
                 if rc == 4 {
                     break;
                 }
-                if rc >= 0
-                    || (rc < 0 && ![libc::EAGAIN, libc::EINTR].contains(&*libc::__errno_location()))
-                {
+                if rc >= 0 || ![libc::EAGAIN, libc::EINTR].contains(&*libc::__errno_location()) {
                     let mut ignored = 0;
                     wait_exact(custodian, &mut ignored);
                     libc::_exit(125);
@@ -739,14 +737,13 @@ mod linux {
                         libc::_exit(125);
                     }
                     let signal = event.ssi_signo as i32;
-                    if !started {
-                        if let Some(index) =
+                    if !started
+                        && let Some(index) =
                             [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT]
                                 .iter()
                                 .position(|candidate| *candidate == signal)
-                        {
-                            early[index] = true;
-                        }
+                    {
+                        early[index] = true;
                     }
                     if [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT].contains(&signal)
                         && !shutdown_sent
