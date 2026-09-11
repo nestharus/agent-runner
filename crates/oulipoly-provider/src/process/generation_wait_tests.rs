@@ -460,3 +460,60 @@ os._exit(7)
     eventually(|| generation.quiescent());
     eventually(|| !Path::new(&format!("/proc/{owner}")).exists());
 }
+
+#[test]
+fn stopped_owner_recovers_through_retained_provider_cleanup() {
+    let fixture = Fixture::new();
+    let generation = Arc::new(LaunchCustody::start(fixture.0.join("proof")).unwrap());
+    let scope = LaunchScope::enter(Some(Arc::clone(&generation)));
+    // Test-only stop of the actual C. W resists TERM and its natural bound is
+    // longer than the resumed-cleanup oracle; production never signals C.
+    let command = ProcessCommand::new("/usr/bin/python3").arg("-c").arg(
+        r#"
+import os,signal,time,pathlib
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+root = pathlib.Path(os.environ['ROOT'])
+(root / 'owner').write_text(str(os.getppid()))
+os.kill(os.getppid(), signal.SIGSTOP)
+time.sleep(10)
+"#,
+    );
+    let start = Instant::now();
+    let result = ProcessRunner::new(ProcessLimits {
+        timeout: Duration::from_millis(150),
+        kill_after_grace: Duration::from_millis(25),
+        ..ProcessLimits::default()
+    })
+    .run(command, vec![], [("ROOT", &fixture.0)]);
+    let elapsed = start.elapsed();
+    let owner = fixture_pid(&fixture.0, "owner");
+    let stopped = process_row(owner);
+    drop(scope);
+    generation.seal();
+    let withheld = !generation.quiescent();
+    // C is still stopped (and directly owned), even if W's watchdog elapsed.
+    assert_eq!(unsafe { libc::kill(owner, libc::SIGCONT) }, 0);
+    let resumed = Instant::now();
+    let error = result.unwrap_err();
+    assert_eq!(stopped.0, 'T');
+    assert_eq!(stopped.1, std::process::id() as i32);
+    assert!(withheld);
+    assert_eq!(error.transport_kind(), "host_timeout");
+    assert!(!error.diagnostics().process_was_reaped);
+    assert!(!error.diagnostics().process_was_force_killed);
+    assert!(
+        error
+            .diagnostics()
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .contains("cleanup_pending")
+    );
+    assert!(elapsed < Duration::from_secs(5));
+    eventually(|| generation.quiescent());
+    eventually(|| !Path::new(&format!("/proc/{owner}")).exists());
+    println!(
+        "stopped actual ProcessRunner C: returned uncertainty in {elapsed:?}; retained cleanup achieved Q and consumed C {:?} after resume",
+        resumed.elapsed()
+    );
+}

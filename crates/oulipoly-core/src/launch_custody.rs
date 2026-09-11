@@ -779,6 +779,56 @@ mod tests {
     }
 
     #[test]
+    fn resumed_remote_owner_recovers_term_timeout_before_kill() {
+        let root = std::env::temp_dir().join(format!("remote-recovery-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let custody = LaunchCustody::start(root.join("proof")).unwrap();
+        let mut command = Command::new("/usr/bin/python3");
+        command.args(["-c", "import signal,time,pathlib,sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); pathlib.Path(sys.argv[1]).touch(); time.sleep(8)"])
+            .arg(root.join("ready")).env_clear();
+        let remote = linux::remote::configure(&custody, &mut command).unwrap();
+        let mut owner = command.spawn().unwrap();
+        drop(command);
+        eventually(|| root.join("ready").exists());
+        assert_eq!(unsafe { libc::kill(owner.id() as i32, libc::SIGSTOP) }, 0);
+        custody.seal();
+        let start = Instant::now();
+        let term = remote.signal(libc::SIGTERM);
+        let term_elapsed = start.elapsed();
+        let withheld = !custody.quiescent();
+        // Another independent owner must still complete while this C is stopped.
+        let sibling_custody = LaunchCustody::start(root.join("sibling-proof")).unwrap();
+        let mut sibling_command = Command::new("/bin/true");
+        let sibling = linux::remote::configure(&sibling_custody, &mut sibling_command).unwrap();
+        let mut sibling_owner = sibling_command.spawn().unwrap();
+        drop(sibling_command);
+        assert!(sibling_owner.wait().unwrap().success());
+        assert!(sibling.wait_status().unwrap().success());
+        sibling_custody.seal();
+        eventually(|| sibling_custody.quiescent());
+        assert_eq!(unsafe { libc::kill(owner.id() as i32, libc::SIGCONT) }, 0);
+        let kill_start = Instant::now();
+        let kill = remote.signal(libc::SIGKILL);
+        // Reap before assertions; the fixture's natural bound also prevents leaks
+        // when run against the old permanent-veto implementation.
+        assert!(owner.wait().unwrap().success());
+        let status = remote.wait_status().unwrap();
+        eprintln!(
+            "owner recovery TERM={term:?} elapsed={term_elapsed:?} KILL={kill:?} status={status:?} kill_to_wait={:?}",
+            kill_start.elapsed()
+        );
+        assert!(term.is_err());
+        assert!(term_elapsed < Duration::from_secs(2));
+        assert!(withheld);
+        assert_eq!(kill.unwrap(), true);
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(kill_start.elapsed() < Duration::from_secs(2));
+        eventually(|| custody.quiescent());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn lost_remote_owner_never_certifies_generation() {
         let fixture = Fixture::new("remote_after_spawn");
         fixture.wait_ready();

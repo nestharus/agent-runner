@@ -9,73 +9,74 @@ pub struct RemoteStatus(Mutex<Channel>);
 struct Channel {
     fd: OwnedFd,
     status: Option<i32>,
-    signal_failed: bool,
+    // Exactly one request may be outstanding. A timeout retains its slot, not
+    // a permanent cancellation veto. Drain its reply before sending another.
+    pending_signal: bool,
+}
+impl Channel {
+    fn response(&mut self, deadline: std::time::Instant) -> io::Result<Option<bool>> {
+        match receive_until(self.fd.as_raw_fd(), deadline)? {
+            [kind, status] if kind == b'X' as i32 => {
+                self.status = Some(status);
+                self.pending_signal = false;
+                Ok(None)
+            }
+            [kind, errno] if kind == b'A' as i32 && self.pending_signal => {
+                self.pending_signal = false;
+                match errno {
+                    0 => Ok(Some(true)),
+                    libc::ESRCH => Ok(Some(false)),
+                    _ => Err(io::Error::from_raw_os_error(errno)),
+                }
+            }
+            _ => Err(io::Error::other("invalid command owner response")),
+        }
+    }
 }
 impl RemoteStatus {
     pub fn wait_status(&self) -> io::Result<std::process::ExitStatus> {
         let mut channel = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if channel.status.is_none() {
-            let mut message = receive(channel.fd.as_raw_fd())?;
-            if channel.signal_failed && message[0] == b'A' as i32 {
-                message = receive(channel.fd.as_raw_fd())?;
-            }
-            if message[0] != b'X' as i32 {
-                return Err(io::Error::other("invalid command completion message"));
-            }
-            channel.status = Some(message[1]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while channel.status.is_none() {
+            channel.response(deadline)?;
         }
         Ok(std::process::ExitStatus::from_raw(channel.status.unwrap()))
     }
 
-    /// Requests are serialized with the owner's consuming root wait. A final
-    /// tree status is also a successful no-op signal result, not ESRCH inference.
-    /// Returns true only when the group signal syscall actually succeeded.
+    /// Serialized, bounded requests. A late reply belongs only to the retained
+    /// request; it can never certify a later KILL. Final status is a no-op,
+    /// never an inference that a signal syscall killed the whole tree.
     pub fn signal(&self, signal: i32) -> io::Result<bool> {
+        if ![libc::SIGTERM, libc::SIGKILL].contains(&signal) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported command signal",
+            ));
+        }
         let mut channel = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        if channel.pending_signal {
+            // Discard the OLD syscall result, including its error. A valid
+            // response frees the slot; a transport error leaves it outstanding.
+            let old = channel.response(deadline);
+            if channel.pending_signal {
+                old?;
+            }
+        }
         if channel.status.is_some() {
             return Ok(false);
         }
-        if channel.signal_failed {
-            return Err(io::Error::other("command signalling previously failed"));
+        let sent = unsafe { packet(channel.fd.as_raw_fd(), [b'S' as i32, signal]) };
+        if sent {
+            channel.pending_signal = true;
         }
-        let result = (|| {
-            // Completion can already be queued after the owner has closed its end.
-            let mut poll = libc::pollfd {
-                fd: channel.fd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            if unsafe { libc::poll(&mut poll, 1, 0) } > 0 {
-                let message = receive(channel.fd.as_raw_fd())?;
-                if message[0] == b'X' as i32 {
-                    channel.status = Some(message[1]);
-                    return Ok(false);
-                }
-                return Err(io::Error::other("unexpected command status message"));
-            }
-            // Even if sending races completion, read the queued final certificate.
-            let sent = unsafe { packet(channel.fd.as_raw_fd(), [b'S' as i32, signal]) };
-            let message = receive(channel.fd.as_raw_fd())?;
-            match message {
-                [kind, status] if kind == b'X' as i32 => {
-                    channel.status = Some(status);
-                    Ok(false)
-                }
-                [kind, 0] if sent && kind == b'A' as i32 => Ok(true),
-                [kind, libc::ESRCH] if sent && kind == b'A' as i32 => Ok(false),
-                [kind, errno] if sent && kind == b'A' as i32 => {
-                    Err(io::Error::from_raw_os_error(errno))
-                }
-                _ => Err(io::Error::other("invalid command signal acknowledgement")),
-            }
-        })();
-        channel.signal_failed |= result.is_err();
-        result
+        // Even if sending races owner completion, consume the queued X.
+        let response = channel.response(deadline)?;
+        Ok(response.unwrap_or(false))
     }
 }
-fn receive(fd: RawFd) -> io::Result<[i32; 2]> {
+fn receive_until(fd: RawFd, deadline: std::time::Instant) -> io::Result<[i32; 2]> {
     let mut message = [0i32; 2];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -111,7 +112,14 @@ fn receive(fd: RawFd) -> io::Result<[i32; 2]> {
 }
 unsafe fn packet(fd: RawFd, message: [i32; 2]) -> bool {
     loop {
-        let rc = unsafe { libc::send(fd, message.as_ptr().cast(), 8, libc::MSG_NOSIGNAL) };
+        let rc = unsafe {
+            libc::send(
+                fd,
+                message.as_ptr().cast(),
+                8,
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+            )
+        };
         if rc == 8 {
             return true;
         }
@@ -179,7 +187,7 @@ pub(in crate::launch_custody) fn configure(
     Ok(RemoteStatus(Mutex::new(Channel {
         fd: client,
         status: None,
-        signal_failed: false,
+        pending_signal: false,
     })))
 }
 
