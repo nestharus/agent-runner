@@ -348,7 +348,9 @@ mod linux {
         unsafe {
             reset_handlers();
             close_except(fd, proof);
-            libc::setsid();
+            if libc::setsid() < 0 {
+                libc::_exit(125);
+            }
             if !send(fd, b'R') {
                 libc::_exit(125);
             }
@@ -556,6 +558,47 @@ mod tests {
             return;
         };
         let phase = std::env::var("CUSTODY_PRIVATE_PHASE").unwrap();
+        if phase == "deny_detach" {
+            // This filter is installed only in the private fixture process.
+            let mut filter = [
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 1,
+                    k: libc::SYS_setsid as u32,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: 0x00050000 | libc::EPERM as u32,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: 0x7fff0000,
+                },
+            ];
+            let program = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_mut_ptr(),
+            };
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+                0
+            );
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_SECCOMP, 2, &program) }, 0);
+            assert!(LaunchCustody::start(root.join("proof")).is_err());
+            std::fs::write(root.join("ready"), b"rejected").unwrap();
+            return;
+        }
         let custody = LaunchCustody::start(root.join("proof")).unwrap();
         if phase == "after_spawn" || phase == "stopped_preexec" {
             use std::os::fd::AsRawFd;
@@ -590,6 +633,23 @@ mod tests {
         // Parent kills this creator and deliberately keeps it unreaped.
         std::thread::sleep(Duration::from_secs(10));
         panic!("fixture creator was not crashed");
+    }
+
+    #[test]
+    fn denied_monitor_detachment_never_grants_launch_authority() {
+        let mut fixture = Fixture::new("deny_detach");
+        fixture.wait_ready();
+        eventually(|| {
+            fixture
+                .creator
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_some()
+        });
+        assert!(fixture.creator.as_mut().unwrap().wait().unwrap().success());
+        assert!(!is_quiescent(&fixture.root.join("proof")));
     }
 
     #[test]
