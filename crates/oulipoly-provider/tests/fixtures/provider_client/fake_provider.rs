@@ -153,6 +153,7 @@ fn dispatch_fake_provider_mode(mode: &str) -> i32 {
         "launch-duplicate-exit" => launch_duplicate_exit(),
         "launch-event-after-exit" => launch_event_after_exit(),
         "launch-partial-hang" => launch_partial_hang(),
+        "launch-quiet-then-exit" => launch_quiet_then_exit(),
         "launch-heartbeats-then-exit" => launch_heartbeats_then_exit(),
         "launch-heartbeat-then-child-grandchild-hang" => {
             launch_heartbeat_then_child_grandchild_hang()
@@ -1174,6 +1175,17 @@ fn launch_partial_hang() -> i32 {
     write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
     let _ = io::stdout().flush();
     sleep_forever()
+}
+
+fn launch_quiet_then_exit() -> i32 {
+    let request_id = read_request_id();
+    thread::sleep(Duration::from_millis(200));
+    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+    thread::sleep(Duration::from_millis(200));
+    write_jsonl(&exit_event(&request_id, 2, 0));
+    // A final event is not a substitute for actual process exit/collection.
+    thread::sleep(Duration::from_millis(200));
+    0
 }
 
 fn launch_heartbeats_then_exit() -> i32 {

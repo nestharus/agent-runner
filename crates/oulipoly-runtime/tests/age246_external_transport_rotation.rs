@@ -7,7 +7,7 @@
 //! The fake provider spawned here is the single shared artifact for every
 //! account in the model; it branches on `params.settings_id` (the per-account
 //! identity) so one account can hang past the host handshake timeout or launch
-//! heartbeat gap while a sibling account answers immediately.
+//! silence before actual exit while a sibling account answers immediately.
 
 use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ProviderEndpointConfig, ProviderEntry,
@@ -407,7 +407,7 @@ fn external_provider_unavailable_fails_closed_before_sibling_account() {
 }
 
 #[test]
-fn external_launch_heartbeat_gap_timeout_fails_closed_before_sibling_account() {
+fn external_quiet_launch_missing_final_exit_fails_closed_before_sibling_account() {
     let fixture = make_fixture_with_launch_stalls(&[], &[], &["stall-1"]);
     let model = rotation_model(&fixture, &["stall-1", "fast-2"]);
 
@@ -415,18 +415,18 @@ fn external_launch_heartbeat_gap_timeout_fails_closed_before_sibling_account() {
         &fixture,
         model,
         0,
-        ProviderClientOptions::default().with_launch_heartbeat_gap(HANDSHAKE_TIMEOUT),
+        ProviderClientOptions::default().with_timeout(HANDSHAKE_TIMEOUT),
     )
     .expect_err("single-account failure; no sibling authority");
 
-    assert_honest_error(result, "host_timeout");
+    assert_honest_error(result, "missing_final_exit");
     assert_eq!(
         order_lines(&fixture.order_path),
         [
             format!("policy:{}", settings_id("stall-1")),
             format!("launch:{}", settings_id("stall-1")),
         ],
-        "launch gap timeout must not invoke the sibling account"
+        "actual exit without a final event must not invoke the sibling account"
     );
 }
 
@@ -603,7 +603,7 @@ fn allocated_policy_failures_account_for_cold_and_cached_describe_without_siblin
     );
 }
 #[test]
-fn allocated_launch_timeout_settles_exact_generation_and_strict_empty_channel() {
+fn allocated_quiet_launch_exit_settles_exact_generation_and_strict_empty_channel() {
     let fixture = make_fixture_with_launch_stalls(&[], &[], &["stall-1"]);
     let model = rotation_model(&fixture, &["stall-1", "fast-2"]);
     let registry = registry_with_client_options(
@@ -626,11 +626,7 @@ fn allocated_launch_timeout_settles_exact_generation_and_strict_empty_channel() 
     let executor::ProviderLaunchAttemptOutcome::Failed(failure) = outcome else {
         panic!("{outcome:?}");
     };
-    assert_eq!(
-        failure.rotatable_kind,
-        Some(oulipoly_state::RotatableLaunchFailureKind::HostTimeout),
-        "{failure:?}"
-    );
+    assert_eq!(failure.rotatable_kind, None, "{failure:?}");
     assert_eq!(failure.actor_settlement.len(), 3);
     assert!(
         failure
@@ -655,11 +651,8 @@ fn allocated_launch_timeout_settles_exact_generation_and_strict_empty_channel() 
         "partial stdout and heartbeat are not promotion"
     );
     if let executor::ProviderLaunchFailure::Provider(error) = &failure.error {
-        assert_eq!(
-            error.request_id(),
-            None,
-            "host timeout has no observed response ID"
-        );
+        assert_eq!(error.transport_kind(), "missing_final_exit");
+        assert!(error.request_id().is_some());
     }
     assert_eq!(failure.requests.len(), 3);
     assert_eq!(
@@ -752,10 +745,11 @@ fn assert_allocated_failure_retains_artifacts(versioned: bool) {
     let executor::ProviderLaunchAttemptOutcome::Failed(failure) = outcome else {
         panic!("{outcome:?}");
     };
-    assert_eq!(
-        failure.rotatable_kind,
-        Some(oulipoly_state::RotatableLaunchFailureKind::HostTimeout)
-    );
+    assert_eq!(failure.rotatable_kind, None);
+    let executor::ProviderLaunchFailure::Provider(error) = &failure.error else {
+        panic!("{:?}", failure.error);
+    };
+    assert_eq!(error.transport_kind(), "missing_final_exit");
     assert!(failure.observations.returned_artifact && failure.observations.captured_child);
     assert!(failure.observations.transfer_forbidden());
     assert_eq!(failure.captured_child_invocations.len(), 1);
@@ -878,7 +872,7 @@ fn concurrent_same_lease_entries_admit_only_one_process_capable_attempt() {
     );
 }
 
-fn decoded_final_stderr_timeout(chunks: &[&str], expected_child: bool) {
+fn decoded_final_stderr_missing_exit(chunks: &[&str], expected_child: bool) {
     let fixture = make_fixture_with_launch_stalls(&[], &[], &["stall-1"]);
     let emission = format!(
         r#"        import base64
@@ -921,15 +915,12 @@ fn decoded_final_stderr_timeout(chunks: &[&str], expected_child: bool) {
         failure.runtime_settlement.spawn_invocation_uuid,
         owner.invocation_uuid
     );
-    assert_eq!(
-        failure.rotatable_kind,
-        Some(oulipoly_state::RotatableLaunchFailureKind::HostTimeout)
-    );
+    assert_eq!(failure.rotatable_kind, None);
     let executor::ProviderLaunchFailure::Provider(error) = &failure.error else {
         panic!("{:?}", failure.error);
     };
-    assert_eq!(error.transport_kind(), "host_timeout");
-    assert_eq!(error.request_id(), None);
+    assert_eq!(error.transport_kind(), "missing_final_exit");
+    assert!(error.request_id().is_some());
     assert!(
         error.diagnostics().stderr.bytes.is_empty(),
         "fixture must not write raw OS stderr"
@@ -998,8 +989,8 @@ fn decoded_final_stderr_timeout(chunks: &[&str], expected_child: bool) {
 }
 
 #[test]
-fn allocated_decoded_final_marker_without_newline_promotes_on_timeout() {
-    decoded_final_stderr_timeout(
+fn allocated_decoded_final_marker_without_newline_promotes_on_missing_exit() {
+    decoded_final_stderr_missing_exit(
         &[
             r#"OULIPOLY_INVOCATION={"source":"decoded-child","id":"22222222-2222-4222-8222-222222222222"}"#,
         ],
@@ -1008,8 +999,8 @@ fn allocated_decoded_final_marker_without_newline_promotes_on_timeout() {
 }
 
 #[test]
-fn allocated_decoded_final_marker_split_across_events_promotes_on_timeout() {
-    decoded_final_stderr_timeout(
+fn allocated_decoded_final_marker_split_across_events_promotes_on_missing_exit() {
+    decoded_final_stderr_missing_exit(
         &[
             "OULIPOLY_INVO",
             r#"CATION={"source":"decoded-child","id":"22222222-2222-4222-8222-222222222222"}"#,
@@ -1019,9 +1010,9 @@ fn allocated_decoded_final_marker_split_across_events_promotes_on_timeout() {
 }
 
 #[test]
-fn allocated_decoded_final_partial_bytes_do_not_promote_on_timeout() {
-    decoded_final_stderr_timeout(&["unpublished ", "partial bytes"], false);
-    decoded_final_stderr_timeout(
+fn allocated_decoded_final_partial_bytes_do_not_promote_on_missing_exit() {
+    decoded_final_stderr_missing_exit(&["unpublished ", "partial bytes"], false);
+    decoded_final_stderr_missing_exit(
         &[
             "OULIPOLY_INVOCATION=",
             r#"{"source":"decoded-child","id":"22222222-2222-4222-8222-222222222222""#,

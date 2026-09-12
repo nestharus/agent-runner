@@ -82,12 +82,6 @@ pub use crate::process::{CancellationToken, ProcessSpawnObserver};
 /// the next pool account rather than terminal-failing the dispatch).
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Maximum gap between launch JSONL events before the host tears down the
-/// provider process tree. The launch turn itself has no total deadline; real
-/// agent turns can run for tens of minutes as long as the provider keeps
-/// emitting events or heartbeat events within this 120s liveness window.
-const DEFAULT_LAUNCH_HEARTBEAT_GAP: Duration = Duration::from_secs(120);
-
 /// Grace period between SIGTERM and SIGKILL when tearing down a timed-out or
 /// cancelled provider process tree.
 const DEFAULT_KILL_AFTER_GRACE: Duration = Duration::from_millis(100);
@@ -96,8 +90,6 @@ const DEFAULT_KILL_AFTER_GRACE: Duration = Duration::from_millis(100);
 pub struct ProviderTimeouts {
     /// Total timeout for non-launch handshake subcommands.
     pub default: Duration,
-    /// Maximum gap between launch stdout JSONL event lines.
-    pub launch: Duration,
     /// Grace period between SIGTERM and SIGKILL during teardown.
     pub kill_after_grace: Duration,
 }
@@ -106,7 +98,6 @@ impl Default for ProviderTimeouts {
     fn default() -> Self {
         Self {
             default: DEFAULT_HANDSHAKE_TIMEOUT,
-            launch: DEFAULT_LAUNCH_HEARTBEAT_GAP,
             kill_after_grace: DEFAULT_KILL_AFTER_GRACE,
         }
     }
@@ -132,6 +123,7 @@ pub struct ProviderClientOptions {
     pub attempt_custody: Option<crate::custody::AttemptActorCustody>,
     pub timeouts: ProviderTimeouts,
     pub output_limits: ProviderOutputLimits,
+    /// Total non-launch timeout; never applied to launch, including via invoke_json.
     pub timeout: Duration,
     pub cancellation: Option<CancellationToken>,
     pub resolver: ProviderResolveOptions,
@@ -194,15 +186,10 @@ impl ProviderClientOptions {
         self
     }
 
+    /// Sets the non-launch operation timeout. Launch has no silence or total deadline.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self.timeouts.default = timeout;
-        self.timeouts.launch = timeout;
-        self
-    }
-
-    pub fn with_launch_heartbeat_gap(mut self, gap: Duration) -> Self {
-        self.timeouts.launch = gap;
         self
     }
 
@@ -484,7 +471,7 @@ impl ProviderClient {
         let command = process_command_from_resolved(resolved, subcommand, &self.options);
         let runner = ProcessRunner::new(limits);
         if subcommand == "launch" {
-            runner.run_with_stdout_line_gap_timeout(command, request_bytes, envs.into_env_vec())
+            runner.run_without_deadline(command, request_bytes, envs.into_env_vec())
         } else {
             runner.run(command, request_bytes, envs.into_env_vec())
         }
@@ -502,14 +489,16 @@ impl ProviderClient {
     {
         let request_id = request_id_from(&request);
         let request_bytes = serialize_request_bytes("launch", &request, request_id.clone())?;
-        let mut limits = process_limits_for("launch", self.options.timeouts.launch, &self.options);
+        // ProcessLimits also serves explicitly bounded non-launch utilities. Its
+        // timeout is ignored by the structurally deadline-free launch runner.
+        let mut limits = process_limits_for("launch", self.options.timeout, &self.options);
         limits.custody = custody;
         let command = process_command_from_resolved(resolved, "launch", &self.options);
         let stdout_processor =
             LaunchStdoutProcessor::new(request_id.clone().unwrap_or_default(), limits.stdout_limit)
                 .with_event_observer(self.options.launch_event_observer.clone());
         let runner = ProcessRunner::new(limits);
-        runner.run_with_stdout_line_gap_timeout_and_stdout_processor(
+        runner.run_without_deadline_and_stdout_processor(
             command,
             request_bytes,
             envs.into_env_vec(),

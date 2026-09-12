@@ -42,7 +42,7 @@
 //!       - ByteLimit, CapturedBytes, and accumulator truncation semantics
 //!       - ProcessLimits lifecycle inputs using the shared core CancellationToken
 //!       - ProcessCommand, ProcessOutcome, and ProcessRunner public surfaces
-//!       - total-runtime and stdout-line-gap timeout behavior
+//!       - explicit total-runtime bounds and deadline-free launch supervision
 //!       - cross-platform process group termination and executable checks
 //! ```
 
@@ -490,7 +490,8 @@ struct TerminatedProcess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeoutMode {
     TotalRuntime,
-    StdoutLineGap,
+    /// Local launch lifetime is governed by exit, cancellation, or protocol failure.
+    NoDeadline,
 }
 
 struct ProcessSupervisor<'a, T: StdoutDrainOutput> {
@@ -513,6 +514,8 @@ impl ProcessRunner {
         Self { limits }
     }
 
+    /// Explicitly bounded utility: uses ProcessLimits::timeout as a total budget.
+    /// ProviderClient launch entrypoints deliberately do not call this method.
     pub fn run<I, K, V>(
         &self,
         command: ProcessCommand,
@@ -527,7 +530,8 @@ impl ProcessRunner {
         self.run_with_timeout_mode(command, stdin_bytes, envs, TimeoutMode::TotalRuntime)
     }
 
-    pub(crate) fn run_with_stdout_line_gap_timeout<I, K, V>(
+    /// Launch supervision ignores ProcessLimits::timeout; cancellation and collection remain active.
+    pub(crate) fn run_without_deadline<I, K, V>(
         &self,
         command: ProcessCommand,
         stdin_bytes: Vec<u8>,
@@ -538,10 +542,10 @@ impl ProcessRunner {
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
     {
-        self.run_with_timeout_mode(command, stdin_bytes, envs, TimeoutMode::StdoutLineGap)
+        self.run_with_timeout_mode(command, stdin_bytes, envs, TimeoutMode::NoDeadline)
     }
 
-    pub(crate) fn run_with_stdout_line_gap_timeout_and_stdout_processor<I, K, V, P>(
+    pub(crate) fn run_without_deadline_and_stdout_processor<I, K, V, P>(
         &self,
         command: ProcessCommand,
         stdin_bytes: Vec<u8>,
@@ -558,7 +562,7 @@ impl ProcessRunner {
             command,
             stdin_bytes,
             envs,
-            TimeoutMode::StdoutLineGap,
+            TimeoutMode::NoDeadline,
             stdout_processor,
         )
     }
@@ -703,10 +707,8 @@ impl<'a, T: StdoutDrainOutput> ProcessSupervisor<'a, T> {
     fn next_wait(&self) -> Duration {
         let timeout_remaining = match self.timeout_mode {
             TimeoutMode::TotalRuntime => self.limits.timeout.saturating_sub(self.started.elapsed()),
-            TimeoutMode::StdoutLineGap => self
-                .limits
-                .timeout
-                .saturating_sub(self.last_stdout_line.elapsed()),
+            // This is only the next process-status observation, not a kill deadline.
+            TimeoutMode::NoDeadline => STATUS_POLL_INTERVAL,
         };
         let cancellation_remaining = self
             .cancellation_started
@@ -1190,7 +1192,7 @@ fn stdout_line_activity_publisher(
     event_publisher: &ProcessEventPublisher,
 ) -> Option<ProcessEventPublisher> {
     match timeout_mode {
-        TimeoutMode::StdoutLineGap => Some(event_publisher.clone()),
+        TimeoutMode::NoDeadline => Some(event_publisher.clone()),
         TimeoutMode::TotalRuntime => None,
     }
 }
@@ -1274,12 +1276,12 @@ impl ProcessEventSubscriber {
 fn timeout_expired(
     mode: TimeoutMode,
     started: Instant,
-    last_stdout_line: Instant,
+    _last_stdout_line: Instant,
     timeout: Duration,
 ) -> bool {
     match mode {
         TimeoutMode::TotalRuntime => started.elapsed() >= timeout,
-        TimeoutMode::StdoutLineGap => last_stdout_line.elapsed() >= timeout,
+        TimeoutMode::NoDeadline => false,
     }
 }
 
@@ -2283,7 +2285,7 @@ mod tests {
             custody: cfg!(target_os = "linux").then(|| guard.0.clone()),
             ..ProcessLimits::default()
         })
-        .run_with_stdout_line_gap_timeout_and_stdout_processor(
+        .run_without_deadline_and_stdout_processor(
             ProcessCommand::new(fake.path()).arg("launch"),
             serde_json::to_vec(&describe_request()).expect("request should serialize"),
             FakeProviderMode::LaunchPartialHang.env(),

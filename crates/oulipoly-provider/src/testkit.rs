@@ -315,6 +315,7 @@ pub enum FakeProviderMode {
     LaunchDuplicateExit,
     LaunchEventAfterExit,
     LaunchPartialHang,
+    LaunchQuietThenExit,
     LaunchHeartbeatsThenExit,
     LaunchHeartbeatThenChildGrandchildHang,
 }
@@ -387,6 +388,7 @@ impl FakeProviderMode {
             Self::LaunchDuplicateExit => "launch-duplicate-exit",
             Self::LaunchEventAfterExit => "launch-event-after-exit",
             Self::LaunchPartialHang => "launch-partial-hang",
+            Self::LaunchQuietThenExit => "launch-quiet-then-exit",
             Self::LaunchHeartbeatsThenExit => "launch-heartbeats-then-exit",
             Self::LaunchHeartbeatThenChildGrandchildHang => {
                 "launch-heartbeat-then-child-grandchild-hang"
