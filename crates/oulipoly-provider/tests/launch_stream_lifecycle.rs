@@ -47,13 +47,16 @@ fn launch_forced_kill_without_final_event_is_host_cancellation_not_missing_final
 }
 
 #[test]
-fn launch_timeout_cleans_descendants_and_preserves_stderr_diagnostics() {
+fn launch_cancellation_cleans_descendants_and_preserves_stderr_diagnostics() {
     let fake = FakeProvider::compile(fake_provider_source());
     let leak_probe = LeakProbe::new();
+    let token = CancellationToken::new();
+    token.cancel_after(Duration::from_millis(500));
     let client = ProviderClient::new(
         ProviderArtifactRef::Path { path: fake.path() },
         ProviderClientOptions::default()
-            .with_timeout(Duration::from_millis(150))
+            .with_timeout(Duration::from_millis(50))
+            .with_cancellation(Some(token))
             .with_kill_after_grace(Duration::from_millis(25)),
     );
 
@@ -62,29 +65,29 @@ fn launch_timeout_cleans_descendants_and_preserves_stderr_diagnostics() {
             launch_request(),
             FakeProviderMode::ChildGrandchild.env_with_probe(&leak_probe),
         )
-        .expect_err("launch timeout should fail");
+        .expect_err("explicit launch cancellation should fail");
 
-    assert_eq!(error.transport_kind(), "host_timeout");
+    assert_eq!(error.transport_kind(), "host_cancelled");
     assert_eq!(
         error.request_id(),
         None,
-        "host timeout has no response envelope"
+        "host cancellation has no response envelope"
     );
     assert!(error.diagnostics().stderr.captured_len <= error.diagnostics().stderr.limit);
     leak_probe.assert_no_descendants();
 }
 
 #[test]
-fn launch_heartbeat_gap_does_not_cap_total_turn_runtime() {
+fn launch_heartbeats_do_not_cap_total_turn_runtime() {
     let fake = FakeProvider::compile(fake_provider_source());
-    let client = launch_gap_client(fake.path(), Duration::from_millis(120));
+    let client = short_handshake_client(fake.path(), Duration::from_millis(120));
 
     let result = client
         .launch(
             launch_request(),
             FakeProviderMode::LaunchHeartbeatsThenExit.env(),
         )
-        .expect("heartbeat activity should keep a long launch alive");
+        .expect("optional heartbeat events remain accepted without a total launch deadline");
 
     assert_eq!(result.exit.status, ProcessStatus::Exited { code: 0 });
     assert!(
@@ -98,23 +101,30 @@ fn launch_heartbeat_gap_does_not_cap_total_turn_runtime() {
 }
 
 #[test]
-fn launch_heartbeat_gap_timeout_kills_process_tree_after_stream_stalls() {
+fn explicit_cancellation_kills_process_tree_after_stream_stalls() {
     let fake = FakeProvider::compile(fake_provider_source());
     let leak_probe = LeakProbe::new();
-    let client = launch_gap_client(fake.path(), Duration::from_millis(200));
+    let token = CancellationToken::new();
+    token.cancel_after(Duration::from_millis(500));
+    let client = ProviderClient::new(
+        ProviderArtifactRef::Path { path: fake.path() },
+        ProviderClientOptions::default()
+            .with_timeout(Duration::from_millis(50))
+            .with_cancellation(Some(token)),
+    );
 
     let error = client
         .launch(
             launch_request(),
             FakeProviderMode::LaunchHeartbeatThenChildGrandchildHang.env_with_probe(&leak_probe),
         )
-        .expect_err("stalled launch stream should hit the heartbeat gap timeout");
+        .expect_err("explicit cancellation should stop the stalled launch");
 
-    assert_eq!(error.transport_kind(), "host_timeout");
+    assert_eq!(error.transport_kind(), "host_cancelled");
     assert_eq!(
         error.request_id(),
-        None,
-        "host timeout has no response envelope"
+        Some(REQUEST_ID),
+        "stream cancellation retains the launch request identity"
     );
     leak_probe.assert_no_descendants();
 }
@@ -132,11 +142,35 @@ fn launch_client(
     )
 }
 
-fn launch_gap_client(path: impl Into<std::path::PathBuf>, gap: Duration) -> ProviderClient {
+fn short_handshake_client(
+    path: impl Into<std::path::PathBuf>,
+    timeout: Duration,
+) -> ProviderClient {
     ProviderClient::new(
         ProviderArtifactRef::Path { path: path.into() },
         ProviderClientOptions::default()
-            .with_launch_heartbeat_gap(gap)
+            .with_timeout(timeout)
             .with_kill_after_grace(Duration::from_millis(50)),
     )
+}
+
+#[test]
+fn quiet_launch_outlives_handshake_budget_and_waits_for_actual_exit() {
+    let fake = FakeProvider::compile(fake_provider_source());
+    let client = short_handshake_client(fake.path(), Duration::from_millis(50));
+    let started = std::time::Instant::now();
+    let result = client
+        .launch(
+            launch_request(),
+            FakeProviderMode::LaunchQuietThenExit.env(),
+        )
+        .expect("initial silence, inter-event silence, and post-final silence are valid");
+    assert_eq!(result.exit.status, ProcessStatus::Exited { code: 0 });
+    assert!(started.elapsed() >= Duration::from_millis(600));
+    assert!(
+        !result
+            .events
+            .iter()
+            .any(|event| matches!(event, DecodedLaunchEvent::Heartbeat { .. }))
+    );
 }

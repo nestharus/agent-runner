@@ -111,7 +111,7 @@ fn terminal_schedule(path: TerminalPath, failed_worker: Option<&str>) -> bool {
         },
         events,
         timeout_mode: if matches!(path, TerminalPath::CancelledStreamCompleted) {
-            TimeoutMode::StdoutLineGap
+            TimeoutMode::NoDeadline
         } else {
             TimeoutMode::TotalRuntime
         },
@@ -421,4 +421,21 @@ fn supervisor_preserves_actual_waitid_error_after_owned_reap() {
     let receipt = custody.receipts().remove(0);
     assert!(receipt.leader_reaped && receipt.uncertain);
     assert!(!receipt.effect_incapable());
+}
+
+#[test]
+fn launch_deadline_is_absent_even_when_generic_budget_is_zero() {
+    let now = Instant::now();
+    assert!(!timeout_expired(
+        TimeoutMode::NoDeadline,
+        now,
+        now,
+        Duration::ZERO
+    ));
+    assert!(timeout_expired(
+        TimeoutMode::TotalRuntime,
+        now,
+        now,
+        Duration::ZERO
+    ));
 }

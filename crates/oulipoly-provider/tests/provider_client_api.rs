@@ -20,7 +20,6 @@ fn downstream_can_construct_client_resolver_options_and_name_errors() {
         ProviderClientOptions {
             timeouts: ProviderTimeouts {
                 default: Duration::from_secs(5),
-                launch: Duration::from_secs(30),
                 kill_after_grace: Duration::from_millis(100),
             },
             output_limits: ProviderOutputLimits {
