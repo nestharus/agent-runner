@@ -1305,8 +1305,41 @@ fn recovered_native_observation_preserves_original_uncertainty_and_fences() {
         db.retain_native_recovered_attempt_custody(&lease.owner, &original)
             .is_err()
     );
+    let runtime = serde_json::json!({"original_runtime_observation":"recovered_dead","additional_original_evidence":"never_invoked_and_cancelled_drain"});
+    db.retain_native_runtime_cancellation(&lease.owner, &runtime)
+        .unwrap();
+    db.retain_native_runtime_cancellation(&lease.owner, &runtime)
+        .unwrap();
+    let preserved: String = db
+        .connection()
+        .query_row(
+            "SELECT result_json FROM provider_launch_transition_replays WHERE operation_key=?1",
+            [format!(
+                "{}/native-runtime-cancellation-receipts",
+                lease.owner.attempt_id
+            )],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&preserved).unwrap(),
+        runtime
+    );
+    assert!(
+        db.retain_native_runtime_cancellation(&lease.owner, &original)
+            .is_err()
+    );
+    assert_eq!(
+        db.native_attempt_custody(lease.runtime_generation_uuid, lease.owner.invocation_uuid)
+            .unwrap(),
+        Some(original)
+    );
     let mut wrong = lease.owner.clone();
     wrong.owner_epoch += 1;
+    assert!(
+        db.retain_native_runtime_cancellation(&wrong, &runtime)
+            .is_err()
+    );
     assert!(
         db.retain_native_recovered_attempt_custody(&wrong, &recovery)
             .is_err()

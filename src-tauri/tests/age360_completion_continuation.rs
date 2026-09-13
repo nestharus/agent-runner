@@ -1041,7 +1041,16 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
         }
         let replacement = wait(|| {
             let current = f.mailbox().completion_continuation_owner().ok()??;
-            (current.owner_generation != owner.owner_generation).then_some(current)
+            // MailboxDb reads a copied SQLite snapshot; sidecar_connection reads
+            // the live WAL view. Do not infer the live attempt transition from
+            // a different snapshot's owner row. Observe both in one live query.
+            let (published_generation, phase): (String, String) = f.sidecar_connection().query_row(
+                "SELECT o.generation,a.phase FROM completion_continuation_owner o JOIN completion_continuation_attempt a ON a.domain_id=o.domain_id WHERE o.phase='running' AND a.attempt_id=?1",
+                [&attempt.attempt_id], |r| Ok((r.get(0)?,r.get(1)?))).ok()?;
+            (current.owner_generation != owner.owner_generation
+                && published_generation == current.owner_generation
+                && phase == "unknown_custody")
+                .then_some(current)
         });
         if owner_loss == 4 {
             assert_eq!(replacement.guardian_identity, owner.driver_identity);
@@ -1633,6 +1642,7 @@ impl Drop for Fixture {
                 "session_wake_claim",
                 "session_runtime",
                 "session_metadata",
+                "runtime_generation",
             ] {
                 let Ok(mut statement) = db.prepare(&format!("SELECT * FROM {table}")) else {
                     continue;

@@ -200,7 +200,13 @@ fn missing_output_before_acceptance(
         let selected = directory.join("selected-log-v2.bin");
         let metadata = fs::metadata(&selected).unwrap();
         assert!(metadata.len() > 0);
-        let live = fs::metadata(directory.join("log")).unwrap();
+        // writer-done means the workload finished its pipe writes, not that
+        // the independent logger consumed them. Observe the real rollover
+        // before removing/shortening a selected inode that could still be live.
+        let live = wait(|| {
+            let live = fs::metadata(directory.join("log")).ok()?;
+            ((live.dev(), live.ino()) != (metadata.dev(), metadata.ino())).then_some(live)
+        });
         assert_ne!((live.dev(), live.ino()), (metadata.dev(), metadata.ino()));
         if f.case == "missing_pin" {
             fs::remove_file(&selected).unwrap();

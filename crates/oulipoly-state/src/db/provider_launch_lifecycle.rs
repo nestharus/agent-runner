@@ -881,6 +881,32 @@ impl StateDb {
             .transpose()
     }
 
+    /// Preserve the original generic runtime observation alongside stronger
+    /// cancellation-only evidence. This does not rewrite runtime history or
+    /// grant successor-transfer authority.
+    pub fn retain_native_runtime_cancellation(
+        &self,
+        owner: &ProviderLaunchOwnerFence,
+        evidence: &serde_json::Value,
+    ) -> Result<(), String> {
+        if serde_json::to_vec(evidence)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 4 * 1024 * 1024
+        {
+            return Err("native_attempt_evidence_too_large".into());
+        }
+        self.launch_transition(owner, "native-runtime-cancellation", evidence, |tx| {
+            remember(
+                tx,
+                owner.logical_launch_id,
+                &format!("{}/native-runtime-cancellation-receipts", owner.attempt_id),
+                &digest(evidence)?,
+                evidence,
+            )
+        })
+    }
+
     /// Continuing quarantine/cleanup custody survives logical terminalization.
     /// No channel path, sidecar, or accepted artifact is released by this record.
     pub fn retain_native_channel_duty(

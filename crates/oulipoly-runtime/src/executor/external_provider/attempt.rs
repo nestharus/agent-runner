@@ -165,11 +165,17 @@ pub fn settle_retained_native_cancellation(
         )?;
     }
     let mailbox_path = MailboxDb::path_for_state_db(state.path());
-    if retained.recovery_evidence.is_some()
+    let mut runtime = runtime_receipt_for(&retained.lease, &mailbox_path, &retained.actors);
+    // A complete original aggregate can precede native runtime finalization.
+    // Its existence must not suppress projection from the later original drain.
+    // The mailbox transition still requires that exact activation's accepted
+    // cancellation and integrated original custody, never a replacement census.
+    if !runtime.effect_incapable
+        && complete_actor_receipts(&retained.actors)
         && retained
             .actors
             .iter()
-            .all(ActorSettlementReceipt::effect_incapable)
+            .all(|actor| actor.attempt_id == retained.lease.owner.attempt_id)
     {
         MailboxDb::open(&mailbox_path)?.exit_native_cancelled_after_original_drain(
             &generation.to_string(),
@@ -178,8 +184,8 @@ pub fn settle_retained_native_cancellation(
                 a.operation == ProviderOperation::Launch && !a.spawned && a.effect_incapable()
             }),
         )?;
+        runtime = runtime_receipt_for(&retained.lease, &mailbox_path, &retained.actors);
     }
-    let runtime = runtime_receipt_for(&retained.lease, &mailbox_path, &retained.actors);
     let continuing = match &retained.channel {
         ReturnChannelSettlement::Quarantined {
             path, artifacts, ..
@@ -211,8 +217,63 @@ pub fn settle_retained_native_cancellation(
         }
         _ => None,
     };
-    let proof = cancellation_proof(&retained, &runtime, continuing)?;
+    let supplement = retain_recovered_dead_prelaunch_cancellation(state, &retained, &runtime)?;
+    let proof = cancellation_proof(&retained, &runtime, continuing, supplement.as_ref())?;
     state.settle_cancel(&retained.lease.owner, &proof)
+}
+
+/// Generic Starting recovery is an honest `recovered_dead` observation, not
+/// proof of an uninvoked launch. Keep that row unchanged. Only complete original
+/// operation receipts and the exact original cancelled activation drain can
+/// additionally establish prelaunch cancellation semantics for this consumer.
+fn retain_recovered_dead_prelaunch_cancellation(
+    state: &StateDb,
+    retained: &RetainedAttemptCustody,
+    runtime: &RuntimeSettlementReceipt,
+) -> Result<Option<serde_json::Value>, String> {
+    if runtime.effect_incapable {
+        return Ok(None);
+    }
+    let Some(row) = &runtime.row else {
+        return Ok(None);
+    };
+    if row.terminal_reason != Some(RuntimeTerminalReason::RecoveredDead)
+        || !complete_actor_receipts(&retained.actors)
+        || retained
+            .actors
+            .iter()
+            .any(|actor| actor.attempt_id != retained.lease.owner.attempt_id)
+    {
+        return Ok(None);
+    }
+    let mut interpretation = row.clone();
+    interpretation.terminal_reason = Some(RuntimeTerminalReason::StartupFailed);
+    // This existing validator requires no runtime process, an explicit complete
+    // never-invoked Launch receipt, exact generation/invocation and no claims.
+    if !matches!(
+        row.exact_process_evidence,
+        ExactProcessEvidence::NotRecorded
+    ) || !runtime_row_effect_incapable(&retained.lease, &interpretation, &retained.actors)
+    {
+        return Ok(None);
+    }
+    let drain = MailboxDb::open_read_only(&MailboxDb::path_for_state_db(state.path()))?
+        .native_original_drain(
+            &retained.lease.runtime_generation_uuid.to_string(),
+            &retained.lease.owner.invocation_uuid.to_string(),
+        )?
+        .ok_or("native_original_drain_absent")?;
+    if !drain["receipt"]["accepted_cancellation"].is_string() {
+        return Err("original_native_cancellation_absent".into());
+    }
+    let evidence = serde_json::json!({
+        "classification":"original_never_invoked_after_recovered_dead",
+        "lease":retained.lease,"original_runtime_row":row,
+        "original_drain":drain,"original_actor_receipts":retained.actors,
+        "cancellation_terminal_code":"startup_failed"
+    });
+    state.retain_native_runtime_cancellation(&retained.lease.owner, &evidence)?;
+    Ok(Some(evidence))
 }
 
 fn complete_actor_receipts(actors: &[ActorSettlementReceipt]) -> bool {
@@ -230,11 +291,14 @@ fn cancellation_proof(
     retained: &RetainedAttemptCustody,
     runtime: &RuntimeSettlementReceipt,
     continuing: Option<oulipoly_state::ProviderLaunchChannelSettlement>,
+    runtime_supplement: Option<&serde_json::Value>,
 ) -> Result<oulipoly_state::ProviderLaunchCustodyProof, String> {
     use oulipoly_state::{
         ProviderLaunchActorSettlement as Actor, ProviderLaunchChannelSettlement as Channel,
     };
-    if retained.retention_failure.is_some() || !runtime.effect_incapable {
+    if retained.retention_failure.is_some()
+        || (!runtime.effect_incapable && runtime_supplement.is_none())
+    {
         return Err("native_runtime_or_evidence_custody_unsettled".into());
     }
     let mut actors = Vec::new();
@@ -284,7 +348,10 @@ fn cancellation_proof(
         .row
         .as_ref()
         .ok_or("native_runtime_receipt_absent")?;
-    let reason = serde_json::to_value(row.terminal_reason)
+    let reason = runtime_supplement
+        .map(|value| value["cancellation_terminal_code"].clone())
+        .map(Ok)
+        .unwrap_or_else(|| serde_json::to_value(row.terminal_reason))
         .map_err(|e| e.to_string())?
         .as_str()
         .ok_or("native_runtime_terminal_reason_absent")?
@@ -299,10 +366,16 @@ fn cancellation_proof(
         runtime_process_identity_sha256: launch_identity,
         runtime_exited: row.lifecycle_state == RuntimeLifecycleState::Exited,
         active_delivery_claim: row.active_delivery_claim_id.is_some(),
-        runtime_settlement_sha256: runtime
-            .row_sha256
-            .clone()
-            .ok_or("native_runtime_digest_absent")?,
+        runtime_settlement_sha256: match runtime_supplement {
+            Some(value) => format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(value).map_err(|e| e.to_string())?)
+            ),
+            None => runtime
+                .row_sha256
+                .clone()
+                .ok_or("native_runtime_digest_absent")?,
+        },
         return_channel_id: retained.lease.return_channel_id.clone(),
         channel,
         return_channel_settlement_sha256: format!(
@@ -1448,6 +1521,48 @@ mod tests {
                 .unwrap()
                 .promotions
                 .persistence_failed
+        );
+    }
+    #[test]
+    fn recovered_dead_prelaunch_requires_original_cancelled_drain() {
+        let (_dir, attempt, _) = fixture();
+        register_allocated_runtime_generation_starting(&attempt.spawn).unwrap();
+        for operation in ["describe", "policy.evaluate", "launch"] {
+            attempt.actors.record_not_invoked(operation);
+        }
+        exit_runtime_generation_outcome(
+            Some(&attempt.spawn),
+            RuntimeTerminalReason::StartupFailed,
+            None,
+        )
+        .unwrap();
+        let retained = RetainedAttemptCustody {
+            lease: attempt.allocation.lease.clone(),
+            actors: attempt.actors.receipts(),
+            channel: ReturnChannelSettlement::NotCreated,
+            retention_failure: None,
+            recovery_evidence: None,
+        };
+        let mut runtime = runtime_receipt(&attempt.allocation, &retained.actors);
+        let row = runtime.row.as_mut().unwrap();
+        row.terminal_reason = Some(RuntimeTerminalReason::RecoveredDead);
+        assert!(!runtime_row_effect_incapable(
+            &retained.lease,
+            row,
+            &retained.actors
+        ));
+        runtime.effect_incapable = false;
+        let state = attempt.state.lock().unwrap();
+        assert_eq!(
+            retain_recovered_dead_prelaunch_cancellation(&state, &retained, &runtime).unwrap_err(),
+            "native_original_drain_absent"
+        );
+        runtime.row.as_mut().unwrap().terminal_reason =
+            Some(RuntimeTerminalReason::AbnormalTermination);
+        assert!(
+            retain_recovered_dead_prelaunch_cancellation(&state, &retained, &runtime)
+                .unwrap()
+                .is_none()
         );
     }
     #[test]

@@ -567,3 +567,245 @@ fn native_guardian_succession_is_not_blocked_by_live_adopter_announcement() {
         "endpoint succession executed while original adopter remains live; attempt debt explicitly retained"
     );
 }
+
+fn uncertain_aggregate_recovery(restore_producer: bool) {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    let mut initial = f.start_with_hold(true);
+    f.owner();
+    wait(|| {
+        f.root
+            .path()
+            .join("provider-initial-ready")
+            .exists()
+            .then_some(())
+    });
+    f.gate("hold-native-describe");
+    f.gate("native-after-custody-retention.hold");
+    enqueue(&f);
+    f.gate("release-initial-provider");
+    f.wait_initial(&mut initial);
+    reached(&f, "native-describe");
+    let a = attempt(&f);
+    let (generation, invocation) =
+        wait(|| f.mailbox().continuation_runtime_identity(&a).ok().flatten());
+    let generation = uuid::Uuid::parse_str(&generation).unwrap();
+    let invocation = uuid::Uuid::parse_str(&invocation).unwrap();
+    let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+    let source = state
+        .native_attempt_recovery(generation, invocation)
+        .unwrap()
+        .unwrap();
+    let actors = PathBuf::from(source["journal"].as_str().unwrap()).join("actors");
+    let actor = fs::read_dir(&actors)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.join("proxy.stat").exists())
+        .unwrap();
+    let terminal = actor.join("terminal.json");
+    // A real rename-to-directory failure in the producer's terminal journal.
+    // The fixture never writes a receipt, aggregate, wait, or public proof.
+    fs::create_dir(&terminal).unwrap();
+    fs::remove_file(f.root.path().join("hold-native-describe")).unwrap();
+    reached(&f, "native-after-custody-retention");
+    let original = state
+        .native_attempt_custody(generation, invocation)
+        .unwrap()
+        .unwrap();
+    assert!(
+        original["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["uncertain"] == true),
+        "{original}"
+    );
+    assert!(terminal.is_dir());
+    println!(
+        "actual producer-terminal I/O failure retained original uncertain aggregate={original}"
+    );
+    if restore_producer {
+        fs::remove_dir(&terminal).unwrap();
+        // Deferred original cleanup can now preserve the actual terminal wait.
+        wait(|| terminal.is_file().then_some(()));
+        let stronger = fs::read_to_string(&terminal).unwrap();
+        println!("stronger original producer terminal record={stronger}");
+    }
+    // Otherwise keep the producer journal unavailable through cancellation:
+    // only the original AC/adopter's actual adopted WNOWAIT can recover it.
+    request_linked_cancel(&f, &a);
+    let token = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
+    let launch = token.split(':').next().unwrap();
+    wait(|| {
+        let status: String = state
+            .connection()
+            .query_row(
+                "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+                [launch],
+                |r| r.get(0),
+            )
+            .ok()?;
+        (status == "cancelled").then_some(())
+    });
+    assert_eq!(
+        state
+            .native_attempt_custody(generation, invocation)
+            .unwrap()
+            .unwrap(),
+        original
+    );
+    let recovered = state
+        .native_recovered_attempt_custody(generation, invocation)
+        .unwrap()
+        .unwrap();
+    assert!(recovered["recovery_evidence"].is_object());
+    let observations = recovered["recovery_evidence"]["actor_observations"]
+        .as_array()
+        .unwrap();
+    if restore_producer {
+        assert!(
+            observations
+                .iter()
+                .any(|v| v["terminal"]["producer_terminal"].is_string())
+        );
+    } else {
+        assert!(
+            terminal.is_dir(),
+            "no producer terminal record was repaired by the fixture"
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|v| v["terminal"]["observation"] == "waitid_wnowait")
+        );
+    }
+    assert!(
+        recovered["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["uncertain"] == false)
+    );
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!("original uncertain aggregate unchanged; independent original recovery={recovered}");
+}
+
+#[test]
+fn native_uncertain_aggregate_preserves_observation_after_producer_journal_recovery() {
+    uncertain_aggregate_recovery(true);
+}
+
+#[test]
+fn native_uncertain_aggregate_preserves_observation_after_original_owner_wait() {
+    uncertain_aggregate_recovery(false);
+}
+
+#[test]
+fn native_complete_prelaunch_aggregate_does_not_skip_original_runtime_settlement() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("hold-native-policy.evaluate");
+    f.gate("native-after-custody-retention.hold");
+    start_pre_attachment(&f);
+    let policy = process_identity(reached(&f, "native-policy.evaluate"));
+    let a = attempt(&f);
+    // Real transient sidecar failure while the original executor projects its
+    // startup exit. Custody retention must remain independently usable later.
+    let writable_sidecar = rusqlite::Connection::open(f.data.join("pid-identity.db")).unwrap();
+    writable_sidecar.execute_batch("CREATE TRIGGER fixture_fail_runtime_exit BEFORE UPDATE ON runtime_generation WHEN NEW.lifecycle_state='exited' BEGIN SELECT RAISE(FAIL, 'fixture transient runtime projection failure'); END;").unwrap();
+    // A genuine failed policy process, with the native executor still alive to
+    // retain complete actor receipts; no fabricated terminal/custody records.
+    kill_exact(&policy);
+    reached(&f, "native-after-custody-retention");
+    let (generation, invocation) = f
+        .mailbox()
+        .continuation_runtime_identity(&a)
+        .unwrap()
+        .unwrap();
+    let g = uuid::Uuid::parse_str(&generation).unwrap();
+    let i = uuid::Uuid::parse_str(&invocation).unwrap();
+    let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+    let original = state.native_attempt_custody(g, i).unwrap().unwrap();
+    let actors: Vec<oulipoly_provider::custody::ActorSettlementReceipt> =
+        serde_json::from_value(original["actors"].clone()).unwrap();
+    assert!(
+        actors
+            .iter()
+            .all(oulipoly_provider::custody::ActorSettlementReceipt::effect_incapable)
+    );
+    assert!(actors.iter().any(|a| a.operation
+        == oulipoly_provider::custody::ProviderOperation::Launch
+        && !a.spawned));
+    assert!(
+        state
+            .native_recovered_attempt_custody(g, i)
+            .unwrap()
+            .is_none()
+    );
+    println!("complete original prelaunch aggregate before native finalization={original}");
+    let lifecycle: String = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT lifecycle_state FROM runtime_generation WHERE generation_uuid=?1",
+            [&generation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_ne!(lifecycle, "exited");
+    writable_sidecar
+        .execute_batch("DROP TRIGGER fixture_fail_runtime_exit")
+        .unwrap();
+    request_linked_cancel(&f, &a);
+    let token = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
+    let launch = token.split(':').next().unwrap();
+    wait(|| {
+        let status: String = state
+            .connection()
+            .query_row(
+                "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+                [launch],
+                |r| r.get(0),
+            )
+            .ok()?;
+        (status == "cancelled").then_some(())
+    });
+    assert_eq!(
+        state.native_attempt_custody(g, i).unwrap().unwrap(),
+        original
+    );
+    assert!(
+        state
+            .native_recovered_attempt_custody(g, i)
+            .unwrap()
+            .is_none()
+    );
+    let reason: String = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT terminal_reason FROM runtime_generation WHERE generation_uuid=?1",
+            [&generation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reason, "recovered_dead",
+        "generic observation must not be relabeled"
+    );
+    let supplement: String = state.connection().query_row("SELECT result_json FROM provider_launch_transition_replays WHERE logical_launch_id=?1 AND operation_key LIKE '%/native-runtime-cancellation-receipts'", [launch], |r|r.get(0)).unwrap();
+    let supplement: serde_json::Value = serde_json::from_str(&supplement).unwrap();
+    assert_eq!(
+        supplement["original_runtime_row"]["terminal_reason"],
+        "recovered_dead"
+    );
+    assert_eq!(supplement["cancellation_terminal_code"], "startup_failed");
+    println!("preserved runtime observation and separate cancellation evidence={supplement}");
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!(
+        "complete aggregate + actual original cancellation drain settled without invented recovery evidence"
+    );
+}
