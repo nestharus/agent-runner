@@ -750,6 +750,90 @@ fn original_operation_population_requires_exact_explicit_admissions() {
     );
 }
 
+// Full receipt comparison preserves population, multiplicity and every custody field.
+// Expected values come only from original evidence, never the recovered result.
+fn assert_target_recovery(recovered: &serde_json::Value, expected: &serde_json::Value) {
+    assert!(
+        recovered["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["uncertain"] == false)
+    );
+    assert_eq!(
+        canonical_receipts(&recovered["actors"]),
+        canonical_receipts(&expected["actors"])
+    );
+    let mut actual = recovered.clone();
+    let mut expected = expected.clone();
+    actual.as_object_mut().unwrap().remove("actors");
+    expected.as_object_mut().unwrap().remove("actors");
+    assert_eq!(actual, expected);
+}
+
+fn target_recovery_negative_controls(recovered: &serde_json::Value, expected: &serde_json::Value) {
+    let actors = recovered["actors"].as_array().unwrap();
+    let target = actors
+        .iter()
+        .position(|a| a["operation"] == "Policy")
+        .unwrap();
+    let other = actors
+        .iter()
+        .position(|a| a["operation"] != "Policy")
+        .unwrap();
+    for fault in [
+        "omit-policy",
+        "substitute-policy",
+        "omit-other",
+        "duplicate-policy",
+        "wrong-status",
+        "lost-custody",
+    ] {
+        let mut invalid = recovered.clone();
+        let receipts = invalid["actors"].as_array_mut().unwrap();
+        match fault {
+            "omit-policy" => {
+                receipts.remove(target);
+            }
+            "substitute-policy" => {
+                // Substitute a genuine, certain neighboring operation receipt,
+                // not a structurally invalid synthetic process identity.
+                receipts[target] = receipts[other].clone();
+            }
+            "omit-other" => {
+                receipts.remove(other);
+            }
+            "duplicate-policy" => {
+                receipts.push(receipts[target].clone());
+            }
+            "wrong-status" => {
+                receipts[target]["process_status"] = serde_json::Value::Null;
+            }
+            "lost-custody" => {
+                receipts[target]["process_tree_terminated"] = serde_json::json!(false);
+            }
+            _ => unreachable!(),
+        }
+        // Keep the genuine terminal evidence and all remaining actors certain:
+        // the old generic oracle would accept every one of these neighbors.
+        assert_eq!(invalid["recovery_evidence"], recovered["recovery_evidence"]);
+        assert!(
+            invalid["actors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["uncertain"] == false)
+        );
+        assert!(
+            std::panic::catch_unwind(|| assert_target_recovery(&invalid, expected)).is_err(),
+            "accepted {fault}"
+        );
+        println!(
+            "target recovery negative control rejected {fault}; terminal observation retained"
+        );
+    }
+}
+
 fn uncertain_aggregate_recovery(restore_producer: bool) {
     if private_case(false) {
         return;
@@ -796,6 +880,18 @@ fn uncertain_aggregate_recovery(restore_producer: bool) {
                 })
         })
         .unwrap();
+    // Freeze the attributed proxy identity and intent before obstruction/recovery.
+    let target_identity = serde_json::to_value(
+        oulipoly_provider::custody::durable::attributed_proxy(&actor).unwrap(),
+    )
+    .unwrap();
+    let target_intent: serde_json::Value =
+        serde_json::from_slice(&fs::read(actor.join("intent.json")).unwrap()).unwrap();
+    assert_eq!(target_intent["operation"], "Policy");
+    assert_eq!(
+        target_intent["attempt_id"],
+        source["lease"]["owner"]["attempt_id"]
+    );
     let terminal = actor.join("terminal.json");
     // A real rename-to-directory failure in the producer's terminal journal.
     // The fixture never writes a receipt, aggregate, wait, or public proof.
@@ -806,13 +902,36 @@ fn uncertain_aggregate_recovery(restore_producer: bool) {
         .native_attempt_custody(generation, invocation)
         .unwrap()
         .unwrap();
+    let original_actors = original["actors"].as_array().unwrap();
+    let targets: Vec<_> = original_actors
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| {
+            a["operation"] == "Policy"
+                && a["attempt_id"] == target_intent["attempt_id"]
+                && a["exact_process_identity"] == target_identity
+        })
+        .collect();
+    assert_eq!(
+        targets.len(),
+        1,
+        "exact obstructed Policy must be retained: {original}"
+    );
+    let (target_index, target) = targets[0];
+    assert_eq!(target["spawned"], true);
+    assert_eq!(target["uncertain"], true);
+    assert_eq!(original["channel"], "NotCreated");
     assert!(
-        original["actors"]
-            .as_array()
-            .unwrap()
+        original_actors
             .iter()
-            .any(|a| a["uncertain"] == true),
-        "{original}"
+            .any(|a| a["operation"] == "Launch" && a["spawned"] == false)
+    );
+    assert_eq!(
+        canonical_receipts(&original["actors"]),
+        canonical_receipts(&serde_json::json!(original_operation_population(
+            &actors,
+            &target_intent["attempt_id"]
+        )))
     );
     assert!(terminal.is_dir());
     println!(
@@ -848,38 +967,74 @@ fn uncertain_aggregate_recovery(restore_producer: bool) {
             .unwrap(),
         original
     );
+    // Read original publication and original terminal storage independently BEFORE
+    // reading the recovery supplement. No recovery-derived paths or identities.
+    let drain = MailboxDb::read_native_publication(
+        &f.data.join("pid-identity.db"),
+        &generation.to_string(),
+        &invocation.to_string(),
+    )
+    .unwrap()
+    .original_drain
+    .unwrap();
+    let terminal_observation = if restore_producer {
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&terminal).unwrap()).unwrap();
+        assert_eq!(record[0], target_identity);
+        serde_json::json!({"producer_terminal":terminal,"process":record[0],"status":record[1]})
+    } else {
+        assert!(
+            terminal.is_dir(),
+            "fixture did not repair producer terminal"
+        );
+        let waits =
+            PathBuf::from(drain["result_path"].as_str().unwrap()).with_file_name("owned-waits");
+        let matches: Vec<serde_json::Value> = fs::read_dir(waits)
+            .unwrap()
+            .map(|entry| serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap())
+            .filter(|v: &serde_json::Value| {
+                v["attempt_id"] == drain["attempt_id"]
+                    && v["observation"] == "waitid_wnowait"
+                    && (v["owner"] == drain["custodian"] || v["owner"] == drain["adopter"])
+                    && v["process"]["pid"] == target_identity["os_pid"]
+                    && v["process"]["boot_id"] == target_identity["os_boot_id"]
+                    && v["process"]["starttime_ticks"] == target_identity["os_pid_starttime_ticks"]
+            })
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "one original-owner terminal wait for obstructed Policy"
+        );
+        matches[0].clone()
+    };
+    let status = i32::try_from(terminal_observation["status"].as_i64().unwrap()).unwrap();
+    assert!(libc::WIFEXITED(status) || libc::WIFSIGNALED(status));
+    let mut expected = original.clone();
+    let receipt = &mut expected["actors"][target_index];
+    receipt["process_status"] = if libc::WIFEXITED(status) {
+        serde_json::json!({"kind":"exited","code":libc::WEXITSTATUS(status)})
+    } else {
+        serde_json::json!({"kind":"signal_terminated","signal":libc::WTERMSIG(status)})
+    };
+    for field in [
+        "leader_reaped",
+        "process_tree_terminated",
+        "operation_finished",
+        "host_cancellation_requested",
+    ] {
+        receipt[field] = serde_json::json!(true);
+    }
+    receipt["uncertain"] = serde_json::json!(false);
+    expected["recovery_evidence"] = serde_json::json!({"original_drain":drain,
+        "actor_observations":[{"intent":actor,"terminal":terminal_observation}]});
+    println!("independent target recovery expectation={expected}");
     let recovered = state
         .native_recovered_attempt_custody(generation, invocation)
         .unwrap()
         .unwrap();
-    assert!(recovered["recovery_evidence"].is_object());
-    let observations = recovered["recovery_evidence"]["actor_observations"]
-        .as_array()
-        .unwrap();
-    if restore_producer {
-        assert!(
-            observations
-                .iter()
-                .any(|v| v["terminal"]["producer_terminal"].is_string())
-        );
-    } else {
-        assert!(
-            terminal.is_dir(),
-            "no producer terminal record was repaired by the fixture"
-        );
-        assert!(
-            observations
-                .iter()
-                .any(|v| v["terminal"]["observation"] == "waitid_wnowait")
-        );
-    }
-    assert!(
-        recovered["actors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|a| a["uncertain"] == false)
-    );
+    assert_target_recovery(&recovered, &expected);
+    target_recovery_negative_controls(&recovered, &expected);
     assert!(!f.root.path().join("resume-prompts.jsonl").exists());
     println!("original uncertain aggregate unchanged; independent original recovery={recovered}");
 }
