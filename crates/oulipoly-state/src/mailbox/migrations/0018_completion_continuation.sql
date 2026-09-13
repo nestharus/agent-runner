@@ -1,5 +1,6 @@
--- Explicit fresh-domain initialization only. Ordinary opens do not migrate
--- existing v17 domains into this lane; old v17 writers reject user_version=18.
+-- Additive ordered upgrade for populated domains and fresh construction.
+-- No legacy rows become v2 source/owner/attempt authority. Old v17 writers
+-- reject user_version=18; deployment requires stopped writers.
 CREATE TABLE completion_continuation_domain (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
     domain_id TEXT NOT NULL UNIQUE,

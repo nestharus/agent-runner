@@ -6,9 +6,12 @@ impl CompletionAuthorityFence<'_> {
         event: &str,
         has_binding: bool,
     ) -> Result<(), String> {
-        if !has_binding && domain_on(&self.tx)?.is_some() {
+        // Domain capability does not convert legacy admissions into v2 sources.
+        // Preserve exact legacy registration/repair; an actually bound source
+        // still cannot enter through that lane (State also checks the binding).
+        if !has_binding && bound_event(&self.tx, event)? {
             return Err(format!(
-                "unsupported_transition_required: native v2 domain requires exact source admission binding for {event}"
+                "unsupported_transition_required: v2 source requires exact source admission binding for {event}"
             ));
         }
         Ok(())

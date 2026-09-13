@@ -6,8 +6,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 17;
-const MAX_SUPPORTED_VERSION: i64 = 18;
+pub(super) const CURRENT_VERSION: i64 = 18;
+const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -134,7 +134,25 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         owner: SidecarEntity::RuntimeLifecycle,
         apply: migrate_starting_custody,
     },
+    MigrationStep {
+        target_version: 18,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_completion_continuation,
+    },
 ];
+
+fn migrate_completion_continuation(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0018_completion_continuation.sql"))
+        .map_err(|error| error.to_string())?;
+    // Schema, identity and version commit together. Legacy namespace identity,
+    // admissions and pending work are not converted into v2 recovery authority.
+    conn.execute(
+        "INSERT INTO completion_continuation_domain VALUES(1,?1,'main-native-completion-v2')",
+        [Uuid::new_v4().to_string()],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
 
 fn migrate_starting_custody(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("migrations/0017_starting_custody.sql"))
@@ -146,9 +164,6 @@ pub(super) fn ensure(conn: &mut Connection) -> Result<(), String> {
     validate_supported_version(stored_version)?;
     if stored_version == MAX_SUPPORTED_VERSION {
         return super::completion_continuation::validate_schema_on(conn);
-    }
-    if stored_version == CURRENT_VERSION {
-        return Ok(());
     }
 
     let deadline = Instant::now() + SCHEMA_LOCK_TIMEOUT;
@@ -183,7 +198,7 @@ pub(super) fn ensure(conn: &mut Connection) -> Result<(), String> {
         } else {
             upgrade_installed_schema(&tx, locked_version)?;
         }
-        tx.pragma_update(None, "user_version", 17)
+        tx.pragma_update(None, "user_version", CURRENT_VERSION)
             .map_err(|err| format!("Failed to record PID mailbox sidecar schema version: {err}"))?;
         return tx.commit().map_err(|err| {
             format!("Failed to commit PID mailbox sidecar schema migration: {err}")
@@ -205,7 +220,7 @@ fn create_fresh_schema(conn: &Connection) -> Result<(), String> {
 }
 
 fn upgrade_installed_schema(conn: &Connection, stored_version: i64) -> Result<(), String> {
-    for target_version in (stored_version + 1)..=17 {
+    for target_version in (stored_version + 1)..=CURRENT_VERSION {
         let steps = SCHEMA_STEPS
             .iter()
             .filter(|step| step.target_version == target_version)
@@ -581,4 +596,20 @@ fn ensure_delivery_finalization_schema(conn: &Connection) -> Result<(), String> 
 fn migrate_receipt_scan(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("0016_receipt_scan.sql"))
         .map_err(|err| format!("Failed to migrate receipt scan: {err}"))
+}
+
+/// Existing older-schema fixtures must remove newer objects as well as lower
+/// user_version; this helper is never available to production migration code.
+#[cfg(test)]
+pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
+    conn.execute_batch(
+        "DROP TABLE completion_continuation_attempt;
+        DROP TABLE completion_continuation_source;
+        DROP TABLE completion_continuation_context;
+        DROP TABLE completion_continuation_owner;
+        DROP TABLE completion_continuation_domain;
+        DROP TRIGGER completion_continuation_claim_delete;
+        DROP TRIGGER completion_continuation_claim_replace;",
+    )
+    .unwrap();
 }

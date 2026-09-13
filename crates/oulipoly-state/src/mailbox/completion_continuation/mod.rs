@@ -38,15 +38,11 @@ impl MailboxDb {
         domain_on(&self.conn)
     }
 
-    /// Native independent-root bootstrap uses this only for a previously absent
-    /// sidecar. Existing legacy domains require separately authorized transition.
+    /// Authorized schema entry, not a probe. Existing domains use the same
+    /// ordered additive upgrade as ordinary writable opens. Pair callers must
+    /// finish State migration first and start recovery only after both succeed.
     pub fn open_completion_continuation_domain(path: &Path) -> Result<Self, String> {
         if path.exists() {
-            let probe = Self::open_existing_native_authority(path)?;
-            if probe.completion_continuation_domain()?.is_none() {
-                return Err("unsupported_transition_required: existing domain has no completion-continuation-v2 lineage".into());
-            }
-            drop(probe);
             return Self::open(path);
         }
         let authority =
@@ -56,8 +52,8 @@ impl MailboxDb {
                 "completion domain appeared during bootstrap; retry independent entry".into(),
             );
         }
-        // Publish only a complete fresh domain. A crash during either schema
-        // transaction leaves the real name absent, never a misleading legacy17.
+        // Publish only a complete fresh domain. A crash during schema
+        // construction leaves the real name absent, never a partial domain.
         let staging_directory = tempfile::Builder::new()
             .prefix(".completion-fresh-")
             .tempdir_in(authority.path().parent().ok_or("domain parent absent")?)
@@ -68,10 +64,11 @@ impl MailboxDb {
                 .file_name()
                 .ok_or("domain filename absent")?,
         );
-        let mut staged = Self::open(&staging)?;
+        let staged = Self::open(&staging)?;
+        // Retain the existing fault key; staging now contains the atomic v18
+        // schema and identity, but still has not published the final name.
         #[cfg(feature = "age360-fault-fixtures")]
         crate::completion_continuation::age360_fault_barrier("fresh-schema17");
-        initialize_fresh_domain(&mut staged.conn)?;
         staged
             .conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
@@ -219,24 +216,6 @@ impl MailboxDb {
         .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
-}
-
-fn initialize_fresh_domain(conn: &mut Connection) -> Result<(), String> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| e.to_string())?;
-    tx.execute_batch(include_str!(
-        "../migrations/0018_completion_continuation.sql"
-    ))
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "INSERT INTO completion_continuation_domain VALUES(1,?1,'main-native-completion-v2')",
-        [uuid::Uuid::new_v4().to_string()],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.pragma_update(None, "user_version", 18)
-        .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())
 }
 
 fn domain_on(conn: &Connection) -> Result<Option<String>, String> {
@@ -434,21 +413,22 @@ mod tests {
     }
 
     #[test]
-    fn completion_continuation_existing_legacy_domain_is_not_migrated_by_open_or_probe() {
+    fn completion_continuation_legacy_probe_is_nonmutating() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let db = MailboxDb::open(&path).unwrap();
-        assert_eq!(db.completion_continuation_domain().unwrap(), None);
+        super::super::schema::remove_continuation_schema_for_legacy_fixture(&db.conn);
+        db.conn.pragma_update(None, "user_version", 17).unwrap();
         drop(db);
-        assert!(MailboxDb::open_completion_continuation_domain(&path).is_err());
-        let db = MailboxDb::open(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let probe = MailboxDb::open_read_only(&path).unwrap();
+        assert_eq!(probe.completion_continuation_domain().unwrap(), None);
         assert_eq!(
-            db.conn
-                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
-                .unwrap(),
+            probe.conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(),
             17
         );
-        assert!(db.list_pending("ordinary").unwrap().is_empty());
+        drop(probe);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
     #[test]
     fn source_recovery_population_and_exclusion_survive_repeated_owner_replacement() {
@@ -529,6 +509,30 @@ mod tests {
                 .wake_claim("session")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_claim_without_v2_attempt_is_retained_on_launcher_refusal() {
+        // Final-system custody boundary, not a migration test: neither a current
+        // domain nor a live owner can manufacture an old launcher's v2 attempt.
+        let (_dir, mut db, owner) = fixture();
+        db.conn.execute("INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count) VALUES('legacy-session','legacy-token','2026-09-13T00:00:00Z','fixture',1)", []).unwrap();
+        let child = ProcessIdentity {
+            os_pid: owner.driver_identity.pid,
+            os_boot_id: owner.driver_identity.boot_id,
+            os_pid_starttime_ticks: owner.driver_identity.starttime_ticks,
+        };
+        let tx = db.conn.transaction().unwrap();
+        let error = admit_launcher_on(&tx, "legacy-session", "legacy-token", &child).unwrap_err();
+        assert!(
+            error.contains("unsupported_legacy_activation_recovery"),
+            "{error}"
+        );
+        tx.commit().unwrap();
+        assert!(db.pending_continuation_attempts().unwrap().is_empty());
+        assert!(
+            db.wake_session_reader().wake_claim("legacy-session").unwrap().is_some()
         );
     }
 

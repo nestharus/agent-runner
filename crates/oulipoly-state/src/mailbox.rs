@@ -12466,6 +12466,7 @@ mod tests {
             ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
             )
             .unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection.pragma_update(None, "user_version", 1).unwrap();
         drop(connection);
 
@@ -12504,10 +12505,11 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            // Schema 16 adds the fair cursor and its partial candidate index.
-            // The measured fixed schema-open overhead is 582 VM steps; retain a
-            // tight constant ceiling and the independent no-backfill assertion.
-            current_open_steps < 608,
+            // Schema 18 validates the continuation schema fingerprint on every
+            // current open (measured 1307 VM steps). Keep a tight fixed ceiling,
+            // the no-backfill assertion, and the separate retained-history
+            // growth test; this does not grant a data-size-dependent budget.
+            current_open_steps < 1333,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
         );
     }
@@ -12519,6 +12521,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP INDEX idx_session_admission_state_runtime;
@@ -12561,6 +12564,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP INDEX idx_mailbox_terminal_retention;
@@ -12619,6 +12623,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP INDEX idx_mailbox_payload_reference;
@@ -12661,6 +12666,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
@@ -12761,6 +12767,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TABLE session_wake_claim;
@@ -12814,6 +12821,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TABLE session_admission_queue;
@@ -12854,6 +12862,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TABLE session_admission_queue;
@@ -13343,6 +13352,7 @@ mod tests {
         let sidecar_path = directory.path().join("pid-identity.db");
         drop(MailboxDb::open(&sidecar_path).unwrap());
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TABLE runtime_generation;
@@ -13567,6 +13577,7 @@ mod tests {
                 ))
                 .unwrap();
         }
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection.pragma_update(None, "user_version", 4).unwrap();
         drop(connection);
 
@@ -13689,6 +13700,7 @@ mod tests {
             ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
             )
             .unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&mailbox.connection());
         mailbox
             .connection()
             .pragma_update(None, "user_version", 1)
@@ -13801,6 +13813,7 @@ mod tests {
             ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
             )
             .unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&mailbox.connection());
         mailbox
             .connection()
             .pragma_update(None, "user_version", 1)
@@ -15208,6 +15221,7 @@ mod tests {
         let row = inserted_row(db.enqueue_agent_bash_complete(&input("legacy", "session-a")));
         db.register_delivery_attempt("legacy", "session-a", "native", &[row.seq], 0)
             .unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&db.conn);
         db.conn
             .execute_batch(
                 "DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
@@ -16986,6 +17000,7 @@ mod tests {
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
         let row = inserted_row(db.enqueue_agent_bash_complete(&input("pending", "session-a")));
+        schema::remove_continuation_schema_for_legacy_fixture(&db.conn);
         db.conn
             .execute_batch("DROP TABLE mailbox_delivery_finalizers; PRAGMA user_version = 14;")
             .unwrap();
@@ -19313,6 +19328,7 @@ mod observation_stop_history_tests {
         {
             let db = MailboxDb::open(&path).unwrap();
             // Exact prior schema: v14 adds only the independent stop-history table.
+            schema::remove_continuation_schema_for_legacy_fixture(&db.conn);
             db.conn
                 .execute_batch("DROP TABLE mailbox_observation_stops; PRAGMA user_version = 13;")
                 .unwrap();
@@ -19382,6 +19398,7 @@ mod native_receipt_schema_tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("pid-identity.db");
         let db = MailboxDb::open(&path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&db.conn);
         db.conn
             .execute_batch(
                 "DROP TABLE mailbox_receipt_scan;

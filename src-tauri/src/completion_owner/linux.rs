@@ -120,19 +120,35 @@ pub(super) fn bootstrap() -> Result<(), String> {
     }
     validate_independent_entry()?;
     let path = MailboxDb::default_path()?;
-    if path.exists() {
-        let probe = MailboxDb::open_existing_native_authority(&path)?;
-        if probe.completion_continuation_domain()?.is_none() {
-            // Existing legacy operation remains usable. New v2 registration is
-            // refused locally rather than silently installing a new writer lane.
-            return Ok(());
-        }
-    }
+    // State first: interruption before the additive sidecar upgrade leaves a
+    // resumable pair, not a running recovery owner against a partial transition.
+    // Both opens must succeed before election/join or any recovery fork.
+    // The domain-keyed owner election cannot exist until the second database
+    // has an identity. Serialize independent bootstrap at its stable path first;
+    // this does not replace deployment's all-writers-stopped prerequisite.
+    std::fs::create_dir_all(path.parent().ok_or("sidecar parent absent")?)
+        .map_err(|e| e.to_string())?;
+    let transition = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path.with_extension("completion-bootstrap.lock"))
+        .map_err(|e| e.to_string())?;
+    <std::fs::File as fs4::FileExt>::lock(&transition).map_err(|e| e.to_string())?;
+    let state = oulipoly_state::StateDb::open_default()?;
     let mailbox = MailboxDb::open_completion_continuation_domain(&path)?;
     let domain = mailbox
         .completion_continuation_domain()?
-        .ok_or("missing fresh native domain")?;
+        .ok_or("missing native domain")?;
+    if state.has_legacy_completion_admissions()? {
+        eprintln!("unsupported_legacy_source_recovery: legacy admissions have no v2 recovery binding; retained legacy notify/repair and mailbox delivery remain available. This is not a pending-work count or permission to clear debt.");
+    }
+    drop(state);
     drop(mailbox);
+    drop(transition);
     let directory = PathBuf::from("/tmp")
         .join(format!("oulipoly-completion-{}-{domain}", unsafe {
             libc::geteuid()
@@ -173,10 +189,6 @@ pub(super) fn bootstrap() -> Result<(), String> {
         }
         Err(e) => return Err(e.to_string()),
     }
-    // Finish the normal State migration once, under independent bootstrap
-    // election, before CD and the provider entry can open it concurrently.
-    // This does not alter legacy-domain admission or read-only commands.
-    drop(oulipoly_state::StateDb::open_default()?);
     let (mut ready, announce) = UnixStream::pair().map_err(|e| e.to_string())?;
     ready
         .set_read_timeout(Some(Duration::from_secs(5)))

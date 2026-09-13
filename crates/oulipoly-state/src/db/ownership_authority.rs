@@ -307,6 +307,16 @@ impl StateDb {
         )
     }
 
+    /// Historical admissions without v2 bindings cannot authorize source-image
+    /// recovery. This says nothing about pending delivery or whether a legacy
+    /// supervisor can still submit its original completion through notify.
+    pub fn has_legacy_completion_admissions(&self) -> Result<bool, String> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM invocation_completion_obligations WHERE completion_v2_binding IS NULL)",
+            [], |row| row.get(0),
+        ).map_err(|error| error.to_string())
+    }
+
     /// Enumerate authority, not sidecar projections or uncommitted source files.
     /// Continuity ordinal is the required sidecar repair order after rollback.
     pub fn admitted_completion_continuations(&self) -> Result<Vec<AdmittedSourceBinding>, String> {
@@ -2525,6 +2535,7 @@ mod tests {
                 second_registration,
             )
             .unwrap();
+        assert!(state.has_legacy_completion_admissions().unwrap());
         let obligations = all_completion_obligations_on(state.raw_connection()).unwrap();
         assert_eq!(obligations.len(), 2);
         assert!(
@@ -3500,6 +3511,9 @@ mod completion_continuation_tests {
         let binding = binding();
         let mut state = seed(&path, &binding);
         admit(&mut state, &binding, false, false);
+        // Final-system diagnostic distinguishes exact v2 admissions from legacy
+        // authority; no migration-only fixture is needed for this predicate.
+        assert!(!state.has_legacy_completion_admissions().unwrap());
         let source = binding.registration().unwrap();
         let paths = source.paths();
         let f: serde_json::Value = serde_json::from_str(include_str!(

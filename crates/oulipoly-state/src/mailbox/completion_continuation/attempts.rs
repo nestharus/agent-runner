@@ -205,7 +205,8 @@ pub(in crate::mailbox) fn reserve_activation_on(
     let Some(domain) = domain_on(tx)? else {
         return Ok(());
     };
-    let (generation,driver):(String,String)=tx.query_row("SELECT generation,driver_identity FROM completion_continuation_owner WHERE domain_id=?1 AND phase='running'",[&domain],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
+    let (generation,driver):(String,String)=tx.query_row("SELECT generation,driver_identity FROM completion_continuation_owner WHERE domain_id=?1 AND phase='running'",[&domain],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?
+        .ok_or("completion_owner_unavailable: activation requires an independent owner; schema upgrade grants no actor custody")?;
     let driver: SourceProcessIdentity = serde_json::from_str(&driver).map_err(|e| e.to_string())?;
     let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
         .ok_or("driver identity unavailable")?;
@@ -369,7 +370,8 @@ pub(in crate::mailbox) fn admit_launcher_on(
     if domain_on(tx)?.is_none() {
         return Ok(());
     }
-    let (attempt,custodian,existing):(String,String,Option<String>)=tx.query_row("SELECT attempt_id,custodian_identity,launcher_identity FROM completion_continuation_attempt WHERE session_id=?1 AND claim_token=?2 AND operation='activation' AND phase IN ('starting','running','unknown_custody')",params![session,token],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e|e.to_string())?;
+    let (attempt,custodian,existing):(String,String,Option<String>)=tx.query_row("SELECT attempt_id,custodian_identity,launcher_identity FROM completion_continuation_attempt WHERE session_id=?1 AND claim_token=?2 AND operation='activation' AND phase IN ('starting','running','unknown_custody')",params![session,token],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?
+        .ok_or("unsupported_legacy_activation_recovery: retained wake claim has no admitted v2 attempt; migration cannot invent launcher custody")?;
     let custodian: SourceProcessIdentity =
         serde_json::from_str(&custodian).map_err(|e| e.to_string())?;
     if child.os_pid != i64::from(std::process::id()) {
