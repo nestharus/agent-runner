@@ -3218,3 +3218,246 @@ fn standalone_verified_missing_final_retains_binary_prefix_and_reports_storage_f
         assert!(!fixture.legacy_record_path.exists());
     }
 }
+
+#[test]
+fn native_allocated_cancellation_retains_returned_artifact_custody() {
+    native_return_cancellation("committed");
+}
+#[test]
+fn native_allocated_cancellation_preserves_quarantine_ownership_gap() {
+    native_return_cancellation("quarantined");
+}
+#[test]
+fn native_allocated_cancellation_preserves_cleanup_ownership_gap() {
+    native_return_cancellation("cleanup_failed");
+}
+fn native_return_cancellation(channel_mode: &str) {
+    use oulipoly_state::{
+        BeginProviderLaunchRequest, ProviderLaunchAttemptAllocation, ProviderLaunchCandidate,
+        ProviderLaunchStartMode, StateDb,
+    };
+    if let Ok(channel) = std::env::var("AGE360_NATIVE_RETURN_HELPER_CHANNEL") {
+        native_return_helper(&channel);
+        return;
+    }
+    let _lock = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let _env = EnvScope::set_optional(&[("OULIPOLY_DATA_DIR", Some(data.to_str().unwrap()))]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let model = external_model(&fixture);
+    let registry = dispatch_registry_for_model(&model);
+    let state = StateDb::open(&data.join("state.db")).unwrap();
+    let allocation = ProviderLaunchAttemptAllocation::allocate().unwrap();
+    let lease = state
+        .begin_launch(&BeginProviderLaunchRequest {
+            logical_launch_id: uuid::Uuid::new_v4(),
+            request_identity_sha256: "d".repeat(64),
+            model_name: model.name.clone(),
+            start_mode: ProviderLaunchStartMode::Create,
+            expected_provider_session_id: None,
+            candidates: vec![ProviderLaunchCandidate {
+                provider_index: 0,
+                account_name: model.providers[0].name.clone(),
+            }],
+            parent_invocation_id: None,
+            allocation: allocation.clone(),
+        })
+        .unwrap();
+    state
+        .activate_attempt(&lease, &allocation.completion_authority)
+        .unwrap();
+    // The provider writes a producer-bound receipt on its actual supplied channel,
+    // then remains live. State cancellation is requested only after that write.
+    let script = fs::read_to_string(&fixture.provider_path).unwrap();
+    let insert = r#"    import signal, time, subprocess
+    producer = json.loads(_request['params']['env']['OULIPOLY_PARENT_INVOCATION'])['id']
+    helper_env = dict(os.environ)
+    helper_env['AGE360_NATIVE_RETURN_HELPER_CHANNEL'] = _request['params']['env']['OULIPOLY_RETURN_CHANNEL']
+    helper_env['AGE360_NATIVE_RETURN_HELPER_PRODUCER'] = producer
+    helper_env['AGE360_NATIVE_RETURN_HELPER_DB'] = str(LAUNCH_RECORD.parent / 'native-artifact-store.db')
+    subprocess.run([NATIVE_RETURN_HELPER, '--exact', 'native_allocated_cancellation_retains_returned_artifact_custody'], env=helper_env, check=True, stdout=subprocess.DEVNULL)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    (LAUNCH_RECORD.parent / 'native-return-ready').touch()
+    while True: time.sleep(.01)
+"#;
+    let insert = insert.replace(
+        "[NATIVE_RETURN_HELPER,",
+        &format!(
+            "[{},",
+            serde_json::to_string(&std::env::current_exe().unwrap()).unwrap()
+        ),
+    );
+    let channel_fault = match channel_mode {
+        "quarantined" => {
+            "    with open(_request['params']['env']['OULIPOLY_RETURN_CHANNEL'], 'a') as channel: channel.write('malformed\\n')\n"
+        }
+        "cleanup_failed" => {
+            "    (pathlib.Path(_request['params']['env']['OULIPOLY_RETURN_CHANNEL']).parent / 'retained-cleanup-obligation').touch()\n"
+        }
+        _ => "",
+    };
+    let insert = insert.replace(
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+        &format!("{channel_fault}    signal.signal(signal.SIGTERM, signal.SIG_IGN)"),
+    );
+    fs::write(
+        &fixture.provider_path,
+        script.replace(
+            "    reqid = request_id(_request)\n",
+            &format!("    reqid = request_id(_request)\n{insert}"),
+        ),
+    )
+    .unwrap();
+    let ready = fixture._dir.path().join("native-return-ready");
+    let path = state.path().to_path_buf();
+    let launch = lease.owner.logical_launch_id;
+    let cancel = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "test provider did not reach returned-artifact barrier"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        StateDb::open(&path)
+            .unwrap()
+            .request_cancel(launch)
+            .unwrap();
+    });
+    let outcome = executor::execute_native_allocated_provider_attempt(
+        &registry,
+        ExecutorServiceRequest::Facade {
+            model,
+            provider_index: 0,
+            prompt: "produce then cancel".into(),
+            working_dir: Some(fixture._dir.path().to_path_buf()),
+            models_dir: None,
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: None,
+        },
+        executor::AllocatedProviderLaunchAttempt {
+            lease: lease.clone(),
+            completion_authority: allocation.completion_authority,
+            state_db_path: state.path().to_path_buf(),
+            mailbox_db_path: data.join("pid-identity.db"),
+            channel_root: data.clone(),
+            parent_invocation_uuid: uuid::Uuid::new_v4(),
+        },
+    );
+    cancel.join().unwrap();
+    assert!(
+        matches!(outcome, executor::ProviderLaunchAttemptOutcome::Failed(_)),
+        "{outcome:?}"
+    );
+    let retained = state
+        .native_attempt_custody(lease.runtime_generation_uuid, lease.owner.invocation_uuid)
+        .unwrap()
+        .unwrap();
+    println!("actual retained actor/channel receipts={retained}");
+    let settlement = executor::settle_retained_native_cancellation(
+        &state,
+        lease.runtime_generation_uuid,
+        lease.owner.invocation_uuid,
+    );
+    match channel_mode {
+        "committed" => settlement.unwrap(),
+        "quarantined" => assert_eq!(
+            settlement.unwrap_err(),
+            "native_quarantine_cleanup_owner_unassigned"
+        ),
+        "cleanup_failed" => assert_eq!(
+            settlement.unwrap_err(),
+            "native_failed_cleanup_owner_unassigned"
+        ),
+        _ => unreachable!(),
+    }
+    let refs = state
+        .list_returned_artifacts(lease.owner.invocation_row_id)
+        .unwrap();
+    assert_eq!(refs.len(), 1);
+    use sha2::{Digest, Sha256};
+    let artifact = oulipoly_agent_messenger::show_returned(
+        oulipoly_agent_messenger::ShowReturnedRequest::VersionId {
+            db_path: fixture._dir.path().join("native-artifact-store.db"),
+            version_id: refs[0].version_id.clone(),
+        },
+    )
+    .unwrap();
+    let bytes = artifact.content;
+    assert_eq!(bytes, b"actual-native-return");
+    assert_eq!(refs[0].sha256, format!("{:x}", Sha256::digest(&bytes)));
+    assert_eq!(refs[0].content_len, bytes.len() as u64);
+    assert_eq!(
+        refs[0].producer_invocation_uuid,
+        lease.owner.invocation_uuid
+    );
+    let status: String = state
+        .connection()
+        .query_row(
+            "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+            [launch.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        status,
+        if channel_mode == "committed" {
+            "cancelled"
+        } else {
+            "cancelling"
+        }
+    );
+}
+
+// Executed inside the actual provider tree, with its allocated producer identity
+// and actual return channel. No fabricated store address or pre-linked State row.
+fn native_return_helper(channel: &str) {
+    let db = PathBuf::from(std::env::var("AGE360_NATIVE_RETURN_HELPER_DB").unwrap());
+    let source = include_str!("../../oulipoly-agent-store/src/lib.rs");
+    let schema = source
+        .split("fn install_schema(")
+        .nth(1)
+        .unwrap()
+        .split("r#\"")
+        .nth(1)
+        .unwrap()
+        .split("\"#")
+        .next()
+        .unwrap();
+    let version_sql = source
+        .split("fn initialize_schema_version(")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .nth(1)
+        .unwrap();
+    let connection = Connection::open(&db).unwrap();
+    connection.execute_batch(schema).unwrap();
+    connection.execute(version_sql, []).unwrap();
+    drop(connection);
+    oulipoly_agent_messenger::return_artifact(oulipoly_agent_messenger::ReturnRequest {
+        db_path: db,
+        invocation_uuid: std::env::var("AGE360_NATIVE_RETURN_HELPER_PRODUCER")
+            .unwrap()
+            .parse()
+            .unwrap(),
+        name: oulipoly_agent_messenger::ReturnName::new("result").unwrap(),
+        source: oulipoly_agent_messenger::ReturnSource::InlineBytes(
+            b"actual-native-return".to_vec(),
+        ),
+        format_hint: None,
+        verdict_line: None,
+        return_channel: Some(PathBuf::from(channel)),
+    })
+    .unwrap();
+}

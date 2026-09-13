@@ -1554,6 +1554,25 @@ fn render_mailbox_prefix(
 }
 
 fn render_notification(rendered: &mut String, index: usize, row: &MailboxRow) {
+    // Compacted rows point at the original immutable payload, not the live log.
+    // Do not hydrate potentially large bodies merely to construct a prefix.
+    let inline_v2 = serde_json::from_str::<serde_json::Value>(&row.payload_json)
+        .ok()
+        .is_some_and(|payload| {
+            payload["completion_protocol"] == oulipoly_state::completion_continuation::PROTOCOL
+        });
+    if row.payload_compacted_at.is_some() || inline_v2 {
+        let payload = row
+            .payload_file_path
+            .as_deref()
+            .map(quote_path)
+            .unwrap_or_else(|| format!("mailbox row {} payload_json", row.seq));
+        rendered.push_str(&format!(
+            "{}. kind: {}\n   handle: {}\n   rc: {}\n   immutable_completion_payload: {}\n   original_v2_output: payload.snapshot.output or payload.output_artifact; inspect this payload, not the live diagnostic log, for original notification bytes\n   live_diagnostic_log_not_original_output: {}\n   meta: {}\n   rc_file: {}\n\n",
+            index + 1, sanitize(&row.kind), sanitize(&row.handle), row.rc, payload,
+            quote_path(&row.log_path), quote_path(&row.meta_path), quote_path(&row.rc_path)));
+        return;
+    }
     rendered.push_str(&format!(
         "{}. kind: {}\n   handle: {}\n   rc: {}\n   state_dir: {}\n   meta: {}\n   log: {}\n   rc_file: {}\n\n",
         index + 1,
@@ -1630,6 +1649,52 @@ fn sanitize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_notification_distinguishes_snapshot_from_live_diagnostic_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut mailbox = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let payload = serde_json::json!({
+            "completion_protocol": oulipoly_state::completion_continuation::PROTOCOL,
+            "snapshot": {"output": "immutable original"}
+        })
+        .to_string();
+        let EnqueueResult::Inserted(mut row) = mailbox
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "presentation-session",
+                handle: "presentation-handle",
+                payload_json: &payload,
+                owner_invocation_uuid: None,
+                matched_os_pid: None,
+                matched_os_boot_id: None,
+                matched_os_pid_starttime_ticks: None,
+                matched_chain_index: None,
+                state_dir: "/private/state",
+                meta_path: "/private/meta",
+                log_path: "/private/live.log",
+                rc_path: "/private/rc",
+                rc: 0,
+            })
+            .unwrap()
+        else {
+            panic!("expected inserted notification")
+        };
+        let mut rendered = String::new();
+        render_notification(&mut rendered, 0, &row);
+        assert!(rendered.contains("payload.snapshot.output"));
+        assert!(rendered.contains("payload.output_artifact"));
+        assert!(
+            rendered.contains("live_diagnostic_log_not_original_output: \"/private/live.log\"")
+        );
+        assert!(!rendered.contains("\n   log:"));
+        assert!(rendered.contains(row.payload_file_path.as_ref().unwrap()));
+        row.payload_json = "{}".into();
+        row.payload_compacted_at = None;
+        rendered.clear();
+        render_notification(&mut rendered, 0, &row);
+        assert!(rendered.contains("\n   log: \"/private/live.log\""));
+        assert!(!rendered.contains("immutable_completion_payload"));
+    }
 
     #[cfg(unix)]
     #[test]

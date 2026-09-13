@@ -209,12 +209,17 @@ impl ResumeServicePort for ProductionResumeService {
         &self,
         request: ResumeAcceptanceRequest<'_>,
     ) -> Result<ResumeAcceptanceOutput, ServiceError> {
-        map_resume_acceptance_result(request.state.update_resume_acceptance(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
-            request.invocation_row_id,
-            request.status,
-            request.evidence,
-        ))
+        map_resume_acceptance_result(
+            request.state.update_resume_acceptance(
+                request
+                    .state
+                    .invocation_mutation_scope(request.invocation_row_id)
+                    .authority(),
+                request.invocation_row_id,
+                request.status,
+                request.evidence,
+            ),
+        )
     }
 }
 

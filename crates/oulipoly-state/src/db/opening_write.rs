@@ -211,6 +211,7 @@ impl StateDb {
         let completion_authority_state =
             Self::durable_completion_authority_path(source_path, &db_path);
         let db = StateDb {
+            retained_launch_owners: Default::default(),
             conn,
             db_path,
             completion_authority_state,
@@ -348,6 +349,7 @@ impl StateDb {
         }
 
         Ok(Self {
+            retained_launch_owners: Default::default(),
             conn,
             db_path: source,
             completion_authority_state: None,

@@ -1099,7 +1099,15 @@ fn native_activation_custody(owner_loss: u8) {
             .is_none()
             .then_some(())
     });
-    let receipt:(String,i64,String)=f.sidecar_connection().query_row("SELECT phase,integrated,drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",[attempt.attempt_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    // Wake claim release can precede the original adopter's durable drain
+    // integration. Await that independent obligation, not just claim release.
+    let receipt: (String, i64, String) = wait(|| {
+        f.sidecar_connection().query_row(
+            "SELECT phase,integrated,drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1 AND phase='drained' AND integrated=1 AND drain_receipt IS NOT NULL",
+            [&attempt.attempt_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).ok()
+    });
     assert_eq!(receipt.0, "drained");
     assert_eq!(receipt.1, 1);
     assert!(receipt.2.contains("ECHILD"));
@@ -1118,6 +1126,20 @@ fn native_activation_custody(owner_loss: u8) {
         if matches!(owner_loss, 9 | 10) {
             let expected = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
             assert_eq!(receipt["accepted_cancellation"], expected);
+            let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+            let launch = expected.split(':').next().unwrap();
+            let status: String = state
+                .connection()
+                .query_row(
+                    "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+                    [launch],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let receipts: i64 = state.connection().query_row("SELECT COUNT(*) FROM provider_launch_transition_replays WHERE logical_launch_id=?1 AND operation_key LIKE '%/native-custody-receipts'", [launch], |r| r.get(0)).unwrap();
+            println!(
+                "logical cancellation after physical drain: status={status} retained_producer_receipts={receipts}; physical assertions do not certify logical settlement"
+            );
         }
         assert!(!f.root.path().join("release-descendant").exists());
         assert!(read_live_process_identity(descendant).unwrap().is_none());

@@ -187,6 +187,7 @@ fn attempt_account_dispatch_with_custody(
             spawn_observer,
             launch_event_observer,
             context.attempt.as_ref().map(|a| a.actors.clone()),
+            context.attempt.as_ref().map(|a| a.cancellation.clone()),
         )
         .map_err(classify_provider_client_attempt_error)?;
     let describe = endpoint.capabilities();

@@ -42,11 +42,13 @@ impl ProviderClientFactory {
         spawn_observer: Option<ProcessSpawnObserver>,
         launch_event_observer: Option<LaunchEventObserver>,
         custody: Option<oulipoly_provider::custody::AttemptActorCustody>,
+        cancellation: Option<CancellationToken>,
     ) -> Result<ProviderClient, oulipoly_provider::error::ProviderClientError> {
         pinned.fork_from_pinned(
             self.options
                 .clone()
                 .with_attempt_custody(custody)
+                .with_cancellation(cancellation.or_else(|| self.options.cancellation.clone()))
                 .with_spawn_observer(spawn_observer)
                 .with_launch_event_observer(launch_event_observer),
         )

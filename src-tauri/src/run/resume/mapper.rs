@@ -94,6 +94,7 @@ pub(super) fn resume_invocation_attempt<'state>(
     guard: crate::invocation::finalize::FinalizerGuard<'state>,
 ) -> super::lifecycle::ResumeInvocationAttempt<'state> {
     super::lifecycle::ResumeInvocationAttempt {
+        allocation: None,
         invocation,
         invocation_row_id,
         completion_registration_authority,

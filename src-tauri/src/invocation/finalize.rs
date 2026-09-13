@@ -92,7 +92,7 @@ fn emit_guard_finalize_failure(result: Result<(), String>) {
 
 fn finalize_invocation_from_guard(db: &StateDb, invocation_id: i64) -> Result<(), String> {
     db.finalize_invocation(
-        oulipoly_state::InvocationMutationAuthority::Standalone,
+        db.invocation_mutation_scope(invocation_id).authority(),
         invocation_id,
         false,
         -1,

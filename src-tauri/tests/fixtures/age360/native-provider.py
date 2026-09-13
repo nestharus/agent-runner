@@ -74,7 +74,13 @@ def launch(request):
             else:
                 assert rows[0]["handle"] in prompt
                 if case not in ("large_output", "hash_cancel"):
-                    raw = pathlib.Path(rows[0]["log_path"]).read_bytes()
+                    payload = json.loads(rows[0]["payload_json"])
+                    raw = payload["snapshot"]["output"].encode("utf-8")
+                    if case in ("publication_error", "publication_io_error"):
+                        live = pathlib.Path(rows[0]["log_path"]).read_bytes()
+                        assert len(live) >= len(raw) + 1024 * 1024
+                        assert live[:len(raw)] == raw
+                        pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-live-diagnostic-receipt.json").write_text(json.dumps({"byte_len": len(live), "sha256": hashlib.sha256(live).hexdigest(), "original_byte_len": len(raw)}))
                     assert raw == (b"" if case == "registration_reply_loss" else b"paired-source-output")
                     received_output = {"byte_len": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
                 else:
@@ -148,6 +154,7 @@ def launch(request):
                 extra = ["--ready-sentinel", "paired-source-output"]
                 workload = 'printf paired-source-output; while [ ! -f "$AGE360_ROOT/write-more" ]; do sleep .02; done; head -c 1048576 /dev/zero; touch "$AGE360_ROOT/writer-done"; exec sleep 600'
             elif case == "hash_cancel":
+                env["AGENT_BASH_LOG_MAX_BYTES"] = str(32 * 1024 * 1024)
                 extra = ["--ready-sentinel", "READY"]
                 workload = 'head -c 16777216 /dev/zero; printf "READY\\n"; exec sleep 600'
             workload = 'printf "launch\\n" >> "$AGE360_ROOT/source-launches"; ' + workload

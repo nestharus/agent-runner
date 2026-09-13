@@ -1166,3 +1166,106 @@ fn linked_session_commit_preserves_endpoint_authority_and_rolls_back_rejected_pr
     assert_eq!(promoted, 1);
     assert!(db.request_transfer(&lease.owner, &failure()).is_err());
 }
+
+#[test]
+fn retained_scope_never_reconstructs_or_overrides_a_stale_owner() {
+    let (_dir, db, request) = fixture();
+    let (lease, proof) = transferable(&db, &request);
+    db.retain_launch_owner(&lease.owner).unwrap();
+    assert!(matches!(
+        db.invocation_mutation_scope(lease.owner.invocation_row_id)
+            .authority(),
+        InvocationMutationAuthority::ProviderLaunch(_)
+    ));
+    let reopened = StateDb::open(db.path()).unwrap();
+    assert!(matches!(
+        reopened
+            .invocation_mutation_scope(lease.owner.invocation_row_id)
+            .authority(),
+        InvocationMutationAuthority::Standalone
+    ));
+    let next = ProviderLaunchAttemptAllocation::allocate().unwrap();
+    db.lease_successor(
+        &lease.owner,
+        &request.allocation.completion_authority,
+        &lease.candidate_plan_sha256,
+        &request.candidates[1],
+        &proof,
+        &next,
+    )
+    .unwrap();
+    assert!(
+        db.record_promotion(
+            &lease.owner,
+            Uuid::new_v4(),
+            ProviderLaunchPromotion::ReturnedArtifact
+        )
+        .is_err()
+    );
+    assert!(db.retain_launch_owner(&lease.owner).is_err());
+}
+
+#[test]
+fn cancellation_retains_exact_artifacts_but_does_not_grant_transfer() {
+    use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, StoreAddress};
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    let id = lease.owner.invocation_uuid;
+    let artifact = ReturnedArtifactRef {
+        version_id: format!("store://return/{id}/result/1"),
+        name: "result".into(),
+        store_address: StoreAddress {
+            workflow_run_id: format!("return:{id}"),
+            artifact_name: "result".into(),
+            version: 1,
+        },
+        sha256: "a".repeat(64),
+        content_len: 4,
+        format_hint: None,
+        verdict_line: None,
+        source: ReturnedArtifactSource::Scratchpad {
+            name: "result".into(),
+            version: 1,
+        },
+        producer_invocation_uuid: id,
+        returned_at: chrono::Utc::now(),
+    };
+    db.record_returned_artifacts(
+        InvocationMutationAuthority::ProviderLaunch(&lease.owner),
+        lease.owner.invocation_row_id,
+        &[artifact.clone()],
+    )
+    .unwrap();
+    let mut custody = proof(&lease);
+    custody.channel = ProviderLaunchChannelSettlement::ArtifactsCommitted(vec![artifact.clone()]);
+    assert!(db.request_transfer(&lease.owner, &failure()).is_err());
+    assert!(db.certify_effect_incapable(&lease.owner, &custody).is_err());
+    db.request_cancel(lease.owner.logical_launch_id).unwrap();
+    let mut wrong = custody.clone();
+    if let ProviderLaunchChannelSettlement::ArtifactsCommitted(ref mut refs) = wrong.channel {
+        refs[0].sha256 = "b".repeat(64);
+    }
+    assert!(db.settle_cancel(&lease.owner, &wrong).is_err());
+    db.settle_cancel(&lease.owner, &custody).unwrap();
+    assert_eq!(
+        db.list_returned_artifacts(lease.owner.invocation_row_id)
+            .unwrap(),
+        vec![artifact]
+    );
+    let conn = Connection::open(db.path()).unwrap();
+    let row: (String, String) = conn
+        .query_row(
+            "SELECT status,return_channel_state FROM provider_launch_attempts",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("cancelled".into(), "artifacts_committed".into()));
+    let retained: String = conn.query_row("SELECT result_json FROM provider_launch_transition_replays WHERE operation_key LIKE '%/terminal-custody'", [], |r| r.get(0)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<ProviderLaunchCustodyProof>(&retained).unwrap(),
+        custody
+    );
+}

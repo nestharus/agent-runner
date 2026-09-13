@@ -407,6 +407,17 @@ impl MailboxDb {
 }
 
 impl MailboxDb {
+    pub fn continuation_domain_drained_runtime(
+        &self,
+        domain: &str,
+        generation: &str,
+        invocation: &str,
+    ) -> Result<bool, String> {
+        self.conn.query_row("SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt
+            WHERE domain_id=?1 AND operation='activation' AND phase='drained' AND integrated=1 AND runtime_generation_uuid=?2 AND spawn_invocation_uuid=?3)",
+            params![domain, generation, invocation], |r| r.get(0)).map_err(|e| e.to_string())
+    }
+
     pub fn continuation_runtime_identity(
         &self,
         attempt: &ContinuationAttempt,

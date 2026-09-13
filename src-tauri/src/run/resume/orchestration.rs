@@ -268,14 +268,26 @@ fn run_resume_attempt(
     } else {
         Some(crate::native_receipt::start_headless_receipt_polling()?)
     };
-    let mut result = match execution::execute_resume_attempt_command(
-        &input,
-        &provider,
-        provider_index,
-        target.prompt_mode,
-        &bound_attempt.invocation_env,
-        strategy,
-    ) {
+    let execution = if let Some(allocation) = bound_attempt.attempt.allocation.clone() {
+        execution::execute_allocated_resume_attempt(
+            &input,
+            &provider,
+            provider_index,
+            target.prompt_mode,
+            &bound_attempt.invocation_env,
+            allocation,
+        )
+    } else {
+        execution::execute_resume_attempt_command(
+            &input,
+            &provider,
+            provider_index,
+            target.prompt_mode,
+            &bound_attempt.invocation_env,
+            strategy,
+        )
+    };
+    let mut result = match execution {
         Ok(result) => result,
         Err(spawn_err) => {
             formatter::emit_resume_spawn_error(&spawn_err);
@@ -293,7 +305,27 @@ fn run_resume_attempt(
         account_endpoint_configured,
     )?;
 
-    terminal::handle_resume_attempt_result(&mut input, &mut bound_attempt, &provider, &mut result)
+    let control = terminal::handle_resume_attempt_result(
+        &mut input,
+        &mut bound_attempt,
+        &provider,
+        &mut result,
+    )?;
+    if let Some(allocation) = &bound_attempt.attempt.allocation {
+        // The original activation owner still owes physical drain. Its domain
+        // driver may settle cancellation only afterward, from retained receipts.
+        if !input
+            .env
+            .state
+            .launch_cancellation_requested(&allocation.lease.owner)?
+        {
+            input
+                .env
+                .state
+                .complete_native_launch(&allocation.lease.owner)?;
+        }
+    }
+    Ok(control)
 }
 
 fn prepare_resume_wake(session_id: &str) -> Result<Option<i32>, String> {

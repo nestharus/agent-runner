@@ -881,6 +881,26 @@ where
         ));
     }
     let mut process = build_provider_process(command, envs);
+    if custody.as_ref().is_some_and(|c| c.1) {
+        #[cfg(target_os = "linux")]
+        {
+            // Typed original-tree mode fails admission if no original launch owner
+            // exists. Group-based proof is disabled for this mode; only its own
+            // ECHILD-backed receipt may certify the tree, even after proxy KILL.
+            let receipt = oulipoly_core::launch_custody::configure_current_receipted(&mut process)
+                .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error))?;
+            return process
+                .spawn()
+                .map(|child| Child::new(child, custody).with_published_receipt(receipt))
+                .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error));
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(host_process_error(
+            HostErrorKind::SpawnFailed,
+            command,
+            std::io::Error::other("original tree custody unsupported"),
+        ));
+    }
     #[cfg(target_os = "linux")]
     if private_handle && receipt_group() == 0 {
         return oulipoly_core::launch_custody::spawn_current_remote(process, |process| {

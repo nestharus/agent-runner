@@ -2,11 +2,11 @@
 //! never reconstructed from diagnostics or a PID supplied by a caller.
 //! Roles: accessor, validator, orchestration.
 use crate::generated::ProcessStatus;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderOperation {
     Describe,
     Policy,
@@ -25,13 +25,13 @@ impl ProviderOperation {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessIdentity {
     pub os_pid: i64,
     pub os_boot_id: String,
     pub os_pid_starttime_ticks: i64,
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActorSettlementReceipt {
     pub attempt_id: Uuid,
     pub operation: ProviderOperation,
@@ -62,11 +62,17 @@ impl ActorSettlementReceipt {
 #[derive(Debug, Clone)]
 pub struct AttemptActorCustody {
     attempt_id: Uuid,
+    original_tree: bool,
     records: Arc<Mutex<Vec<OperationCustody>>>,
     requests: Arc<Mutex<Vec<GeneratedRequestIdentity>>>,
 }
 #[derive(Debug, Clone)]
-pub struct OperationCustody(pub(crate) Arc<Mutex<ActorSettlementReceipt>>);
+pub struct OperationCustody(
+    pub(crate) Arc<Mutex<ActorSettlementReceipt>>,
+    pub(crate) bool,
+    #[cfg(target_os = "linux")]
+    pub(crate)  Arc<Mutex<Option<Arc<oulipoly_core::launch_custody::PublishedTreeReceipt>>>>,
+);
 pub(crate) struct OperationGuard(pub OperationCustody);
 impl Drop for OperationGuard {
     fn drop(&mut self) {
@@ -79,24 +85,38 @@ impl AttemptActorCustody {
     pub fn new(attempt_id: Uuid) -> Self {
         Self {
             attempt_id,
+            original_tree: false,
             records: Arc::default(),
             requests: Arc::default(),
         }
     }
+    /// Native launches preserve arbitrary descendant session/group creation.
+    /// Their custody MUST come from the original subreaper receipt, not a group probe.
+    pub fn original_tree(attempt_id: Uuid) -> Self {
+        Self {
+            original_tree: true,
+            ..Self::new(attempt_id)
+        }
+    }
     pub(crate) fn begin(&self, subcommand: &str) -> OperationGuard {
-        let record = OperationCustody(Arc::new(Mutex::new(ActorSettlementReceipt {
-            attempt_id: self.attempt_id,
-            operation: ProviderOperation::from_subcommand(subcommand),
-            spawned: false,
-            exact_process_identity: None,
-            process_status: None,
-            process_tree_terminated: false,
-            leader_reaped: false,
-            force_killed: false,
-            host_cancellation_requested: false,
-            operation_finished: false,
-            uncertain: false,
-        })));
+        let record = OperationCustody(
+            Arc::new(Mutex::new(ActorSettlementReceipt {
+                attempt_id: self.attempt_id,
+                operation: ProviderOperation::from_subcommand(subcommand),
+                spawned: false,
+                exact_process_identity: None,
+                process_status: None,
+                process_tree_terminated: false,
+                leader_reaped: false,
+                force_killed: false,
+                host_cancellation_requested: false,
+                operation_finished: false,
+                uncertain: false,
+            })),
+            self.original_tree,
+            #[cfg(target_os = "linux")]
+            Arc::default(),
+        );
         self.records
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -112,13 +132,27 @@ impl AttemptActorCustody {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|r| r.0.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .map(|r| {
+                let mut receipt = r.0.lock().unwrap_or_else(|e| e.into_inner());
+                #[cfg(target_os = "linux")]
+                if receipt.leader_reaped
+                    && r.1
+                    && r.2
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .is_some_and(|published| published.settled().is_ok())
+                {
+                    receipt.process_tree_terminated = true;
+                }
+                receipt.clone()
+            })
             .collect()
     }
 }
 
 /// Host-generated correlation and the verbatim wire ID are distinct values.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedRequestIdentity {
     pub operation: ProviderOperation,
     pub correlation: Uuid,

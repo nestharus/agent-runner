@@ -192,7 +192,9 @@ fn enqueue_external_canonical_ingestion(
         .ok_or_else(external_provider_instance_identity_unavailable)?;
     state
         .commit_finalized_provider_session_authority(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            state
+                .invocation_mutation_scope(invocation_row_id)
+                .authority(),
             invocation_row_id,
             &FinalizedProviderSessionAuthority {
                 provider_session_id: session_id,

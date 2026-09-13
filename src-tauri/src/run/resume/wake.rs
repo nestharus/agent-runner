@@ -559,7 +559,11 @@ fn finalize_unconfirmed_mailbox_delivery(
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            input
+                .env
+                .state
+                .invocation_mutation_scope(attempt.invocation_row_id)
+                .authority(),
             mapper::finalize_request(
                 &input.env.state,
                 attempt.invocation_row_id,

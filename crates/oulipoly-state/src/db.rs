@@ -271,6 +271,8 @@ use std::sync::Mutex;
 use uuid::Uuid;
 
 pub struct StateDb {
+    retained_launch_owners:
+        std::cell::RefCell<std::collections::HashMap<i64, ProviderLaunchOwnerFence>>,
     conn: sqlite::Connection,
     db_path: PathBuf,
     // Completion authority rejoins the accepted source path to one canonical local file identity.

@@ -153,7 +153,7 @@ impl ExecutionOutputSpool {
                 .expect("sealed output spool has a summary")
         };
         state.record_invocation_output_pending(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            state.invocation_mutation_scope(invocation_id).authority(),
             invocation_id,
             invocation_uuid,
             &paths,

@@ -8,6 +8,8 @@ pub(crate) struct OwnedChild {
     child: Child,
     #[cfg(target_os = "linux")]
     remote: Option<oulipoly_core::launch_custody::RemoteStatus>,
+    #[cfg(target_os = "linux")]
+    published_receipt: Option<std::sync::Arc<oulipoly_core::launch_custody::PublishedTreeReceipt>>,
     remote_force_delivered: bool,
     reaped: bool,
     custody: Option<OperationCustody>,
@@ -43,9 +45,11 @@ impl OwnedChild {
             child,
             #[cfg(target_os = "linux")]
             remote: None,
+            #[cfg(target_os = "linux")]
+            published_receipt: None,
             remote_force_delivered: false,
             reaped: false,
-            confined: custody.is_some() && containment_supported(),
+            confined: custody.as_ref().is_some_and(|c| !c.1) && containment_supported(),
             custody,
         }
     }
@@ -55,6 +59,18 @@ impl OwnedChild {
         remote: Option<oulipoly_core::launch_custody::RemoteStatus>,
     ) -> Self {
         self.remote = remote;
+        self
+    }
+    #[cfg(target_os = "linux")]
+    pub fn with_published_receipt(
+        mut self,
+        receipt: oulipoly_core::launch_custody::PublishedTreeReceipt,
+    ) -> Self {
+        let receipt = std::sync::Arc::new(receipt);
+        if let Some(custody) = &self.custody {
+            *custody.2.lock().unwrap_or_else(|e| e.into_inner()) = Some(receipt.clone());
+        }
+        self.published_receipt = Some(receipt);
         self
     }
     #[cfg(unix)]
@@ -183,6 +199,13 @@ impl OwnedChild {
                     #[cfg(target_os = "linux")]
                     if self.remote.is_some() {
                         r.process_tree_terminated = true;
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Some(receipt) = &self.published_receipt {
+                        match receipt.wait() {
+                            Ok(_) => r.process_tree_terminated = true,
+                            Err(_) => r.uncertain = true,
+                        }
                     }
                 }
                 Err(_) => r.uncertain = true,

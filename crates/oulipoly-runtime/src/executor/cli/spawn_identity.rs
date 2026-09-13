@@ -79,6 +79,11 @@ impl SpawnIdentityContext {
         })
     }
 
+    pub(crate) fn with_start_known_session(mut self, session: Option<String>) -> Self {
+        self.session_id = session;
+        self
+    }
+
     pub(super) fn invocation_uuid(&self) -> &str {
         &self.invocation_uuid
     }

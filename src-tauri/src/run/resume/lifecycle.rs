@@ -30,6 +30,7 @@ use crate::invocation::finalize::FinalizerGuard;
 use crate::quota_zero_turn::zero_turn_record_baseline;
 
 pub(super) struct ResumeInvocationAttempt<'state> {
+    pub(super) allocation: Option<oulipoly_runtime::executor::AllocatedProviderLaunchAttempt>,
     pub(super) invocation: oulipoly_state::CompositeInvocationId,
     pub(super) invocation_row_id: i64,
     pub(super) completion_registration_authority: oulipoly_state::CompletionRegistrationAuthority,
@@ -88,6 +89,88 @@ fn start_resume_invocation<'state>(
     provider_index: usize,
 ) -> Result<ResumeInvocationAttempt<'state>, String> {
     let invocation = super::composite_invocation_id(&provider.name, input.reservation);
+    if (input.reservation.is_some() || crate::wake_coordinator::is_auto_wake_invocation())
+        && input
+            .agent_runtime_services
+            .provider_registry_handle
+            .current()
+            .has_account_endpoint(&provider.name)
+    {
+        use oulipoly_state::{
+            BeginProviderLaunchRequest, ProviderLaunchAttemptAllocation, ProviderLaunchCandidate,
+            ProviderLaunchStartMode,
+        };
+        use sha2::{Digest, Sha256};
+        let parent = input
+            .parent_invocation_id
+            .ok_or("native launch parent missing")?;
+        let parent = input
+            .env
+            .state
+            .get_invocation_by_id(parent)?
+            .ok_or("native launch parent absent")?;
+        let parent_uuid =
+            uuid::Uuid::parse_str(&parent.invocation_uuid).map_err(|e| e.to_string())?;
+        let channel_root = oulipoly_state::paths::data_dir()?;
+        let mut allocation = ProviderLaunchAttemptAllocation::allocate()?;
+        allocation.invocation_uuid =
+            uuid::Uuid::parse_str(&invocation.id).map_err(|e| e.to_string())?;
+        let request = BeginProviderLaunchRequest {
+            logical_launch_id: uuid::Uuid::new_v4(),
+            request_identity_sha256: format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&serde_json::json!([
+                        invocation.id,
+                        provider.name,
+                        provider_index,
+                        input.resolved.active_session_id,
+                        input.answer,
+                        input.mailbox_delivery_nonce,
+                        input.parent_invocation_id,
+                        input.effective_spawn_cwd
+                    ]))
+                    .map_err(|e| e.to_string())?
+                )
+            ),
+            model_name: input
+                .resolved
+                .model_name
+                .clone()
+                .unwrap_or_else(|| "<unknown>".into()),
+            start_mode: ProviderLaunchStartMode::Resume,
+            expected_provider_session_id: Some(input.resolved.active_session_id.clone()),
+            candidates: vec![ProviderLaunchCandidate {
+                provider_index,
+                account_name: provider.name.clone(),
+            }],
+            parent_invocation_id: input.parent_invocation_id,
+            allocation: allocation.clone(),
+        };
+        let lease = input.env.state.begin_launch(&request)?;
+        input.env.state.retain_launch_owner(&lease.owner)?;
+        input
+            .env
+            .state
+            .activate_attempt(&lease, &allocation.completion_authority)?;
+        let row = lease.owner.invocation_row_id;
+        return Ok(ResumeInvocationAttempt {
+            invocation,
+            invocation_row_id: row,
+            completion_registration_authority: allocation.completion_authority.clone(),
+            guard: FinalizerGuard::new(&input.env.state, row),
+            allocation: Some(oulipoly_runtime::executor::AllocatedProviderLaunchAttempt {
+                lease,
+                completion_authority: allocation.completion_authority,
+                state_db_path: input.env.state.path().to_path_buf(),
+                mailbox_db_path: oulipoly_state::mailbox::MailboxDb::path_for_state_db(
+                    input.env.state.path(),
+                ),
+                channel_root,
+                parent_invocation_uuid: parent_uuid,
+            }),
+        });
+    }
     let invocation_start = mapper::resume_invocation_start(
         &invocation,
         input.resolved.model_name.as_deref(),
@@ -128,7 +211,11 @@ fn bind_resume_attempt_session(
         return Ok(());
     }
     input.env.state.bind_invocation_provider_session_start(
-        oulipoly_state::InvocationMutationAuthority::Standalone,
+        input
+            .env
+            .state
+            .invocation_mutation_scope(invocation_row_id)
+            .authority(),
         invocation_row_id,
         &mapper::resumed_provider_session_binding(
             provider,
@@ -138,7 +225,11 @@ fn bind_resume_attempt_session(
     )?;
     if should_record_legacy_resume_input(input.manual_migrate) {
         input.env.state.record_legacy_resume_input_session_id(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            input
+                .env
+                .state
+                .invocation_mutation_scope(invocation_row_id)
+                .authority(),
             invocation_row_id,
             input.session_id,
         )?;
@@ -236,11 +327,29 @@ pub(super) fn finalize_resume_spawn_error(
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            input
+                .env
+                .state
+                .invocation_mutation_scope(attempt.invocation_row_id)
+                .authority(),
             mapper::spawn_error_finalize_request(&input.env.state, attempt.invocation_row_id),
         )
         .map_err(|err| err.to_string())?;
     attempt.guard.mark_finalized();
+    if let Some(allocation) = &attempt.allocation {
+        // The original activation owner still owes physical drain. Its domain
+        // driver may settle cancellation only afterward, from retained receipts.
+        if !input
+            .env
+            .state
+            .launch_cancellation_requested(&allocation.lease.owner)?
+        {
+            input
+                .env
+                .state
+                .complete_native_launch(&allocation.lease.owner)?;
+        }
+    }
     wake::mark_resume_attempt_idle(
         &input.resolved.active_session_id,
         &attempt.invocation.id,

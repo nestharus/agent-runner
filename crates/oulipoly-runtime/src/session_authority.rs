@@ -145,7 +145,10 @@ pub fn commit_session_authority(
     request
         .state
         .commit_invocation_provider_session_authority(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            request
+                .state
+                .invocation_mutation_scope(request.invocation_row_id)
+                .authority(),
             request.invocation_row_id,
             &ProviderSessionAuthorityCommit {
                 invocation_uuid: request.invocation_uuid,

@@ -321,6 +321,45 @@ pub(super) fn execute_resume_attempt_command(
     )
 }
 
+pub(super) fn execute_allocated_resume_attempt(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_index: usize,
+    prompt_mode: oulipoly_config::PromptMode,
+    invocation_env: &str,
+    allocation: executor::AllocatedProviderLaunchAttempt,
+) -> Result<executor::ExecutionResult, String> {
+    let fallback;
+    let model = if let Some(model) = input.resolved.model.as_ref() {
+        model
+    } else {
+        fallback = provider_only_resume_model(input, provider, prompt_mode);
+        &fallback
+    };
+    let request = provider_ref_resume_executor_request(
+        input,
+        model,
+        provider,
+        provider_index,
+        prompt_mode,
+        invocation_env,
+    );
+    match executor::execute_native_allocated_provider_attempt(
+        &input
+            .agent_runtime_services
+            .provider_registry_handle
+            .current(),
+        request,
+        allocation,
+    ) {
+        executor::ProviderLaunchAttemptOutcome::Completed(result) => Ok(result),
+        executor::ProviderLaunchAttemptOutcome::Failed(failure) => Err(format!(
+            "native allocated launch failed: {:?}",
+            failure.error
+        )),
+    }
+}
+
 fn provider_only_resume_model(
     input: &ResumeAttemptInput<'_>,
     provider: &oulipoly_config::ProviderConfig,

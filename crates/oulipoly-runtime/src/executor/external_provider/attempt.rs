@@ -113,16 +113,138 @@ pub enum ProviderLaunchAttemptOutcome {
     Failed(ProviderLaunchAttemptFailure),
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct RetainedAttemptCustody {
+    lease: ProviderLaunchLease,
+    actors: Vec<ActorSettlementReceipt>,
+    channel: ReturnChannelSettlement,
+    retention_failure: Option<String>,
+}
+
+/// Original producer receipts remain the authority even when outer activation
+/// custody later drains. Outer ECHILD never substitutes for missing receipts.
+pub fn settle_retained_native_cancellation(
+    state: &StateDb,
+    generation: Uuid,
+    invocation: Uuid,
+) -> Result<(), String> {
+    let raw = state
+        .native_attempt_custody(generation, invocation)?
+        .ok_or("native_actor_channel_custody_not_retained")?;
+    let retained: RetainedAttemptCustody =
+        serde_json::from_value(raw).map_err(|e| e.to_string())?;
+    if retained.lease.runtime_generation_uuid != generation
+        || retained.lease.owner.invocation_uuid != invocation
+    {
+        return Err("native_custody_identity_mismatch".into());
+    }
+    let mailbox_path = MailboxDb::path_for_state_db(state.path());
+    let runtime = runtime_receipt_for(&retained.lease, &mailbox_path, &retained.actors);
+    let proof = cancellation_proof(&retained, &runtime)?;
+    state.settle_cancel(&retained.lease.owner, &proof)
+}
+
+fn cancellation_proof(
+    retained: &RetainedAttemptCustody,
+    runtime: &RuntimeSettlementReceipt,
+) -> Result<oulipoly_state::ProviderLaunchCustodyProof, String> {
+    use oulipoly_state::{
+        ProviderLaunchActorSettlement as Actor, ProviderLaunchChannelSettlement as Channel,
+    };
+    if retained.retention_failure.is_some() || !runtime.effect_incapable {
+        return Err("native_runtime_or_evidence_custody_unsettled".into());
+    }
+    let mut actors = Vec::new();
+    let mut launch_identity = None;
+    for receipt in &retained.actors {
+        if receipt.attempt_id != retained.lease.owner.attempt_id || !receipt.effect_incapable() {
+            return Err("native_actor_custody_unsettled".into());
+        }
+        let operation = match receipt.operation {
+            ProviderOperation::Describe => "describe",
+            ProviderOperation::Policy => "policy",
+            ProviderOperation::Launch => "launch",
+            ProviderOperation::TerminalClassify => "terminal_classify",
+            _ => return Err("native_actor_operation_unrepresented".into()),
+        }
+        .to_string();
+        actors.push(if let Some(identity) = &receipt.exact_process_identity {
+            let digest = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(identity).map_err(|e| e.to_string())?)
+            );
+            if receipt.operation == ProviderOperation::Launch {
+                launch_identity = Some(digest.clone());
+            }
+            Actor::Reaped {
+                operation,
+                process_identity_sha256: digest,
+                process_tree_terminated: receipt.process_tree_terminated,
+                leader_reaped: receipt.leader_reaped,
+            }
+        } else {
+            Actor::NeverSpawned { operation }
+        });
+    }
+    let channel = match &retained.channel {
+        ReturnChannelSettlement::NotCreated => Channel::NotCreated,
+        ReturnChannelSettlement::EmptyRemoved => Channel::EmptyRemoved,
+        ReturnChannelSettlement::ArtifactsCommitted(refs) => {
+            Channel::ArtifactsCommitted(refs.clone())
+        }
+        // These paths are durably retained with refs and uncertainty, but no
+        // continuing cleanup owner exists yet. Do not certify logical settlement.
+        ReturnChannelSettlement::Quarantined { .. } => {
+            return Err("native_quarantine_cleanup_owner_unassigned".into());
+        }
+        ReturnChannelSettlement::CleanupFailed { .. } => {
+            return Err("native_failed_cleanup_owner_unassigned".into());
+        }
+    };
+    let row = runtime
+        .row
+        .as_ref()
+        .ok_or("native_runtime_receipt_absent")?;
+    let reason = serde_json::to_value(row.terminal_reason)
+        .map_err(|e| e.to_string())?
+        .as_str()
+        .ok_or("native_runtime_terminal_reason_absent")?
+        .to_string();
+    Ok(oulipoly_state::ProviderLaunchCustodyProof {
+        attempt_id: retained.lease.owner.attempt_id,
+        runtime_generation_uuid: retained.lease.runtime_generation_uuid,
+        spawn_invocation_uuid: retained.lease.owner.invocation_uuid,
+        actors,
+        runtime_terminal_code: reason,
+        runtime_never_bound: launch_identity.is_none(),
+        runtime_process_identity_sha256: launch_identity,
+        runtime_exited: row.lifecycle_state == RuntimeLifecycleState::Exited,
+        active_delivery_claim: row.active_delivery_claim_id.is_some(),
+        runtime_settlement_sha256: runtime
+            .row_sha256
+            .clone()
+            .ok_or("native_runtime_digest_absent")?,
+        return_channel_id: retained.lease.return_channel_id.clone(),
+        channel,
+        return_channel_settlement_sha256: format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&retained.channel).map_err(|e| e.to_string())?)
+        ),
+    })
+}
+
 pub(crate) struct AttemptExecution {
     pub allocation: AllocatedProviderLaunchAttempt,
     state: Mutex<StateDb>,
     pub actors: AttemptActorCustody,
+    pub cancellation: oulipoly_core::CancellationToken,
     pub spawn: SpawnIdentityContext,
     pub evidence: Mutex<AttemptEvidence>,
 }
 #[derive(Default)]
 pub(crate) struct AttemptEvidence {
     pub promotions: ProviderLaunchPromotionSummary,
+    pub endpoint: Option<oulipoly_state::ProviderLaunchEndpoint>,
     pub channel: Option<ReturnChannel>,
     pub channel_settlement: Option<ReturnChannelSettlement>,
     pub children: Vec<CapturedChildInvocation>,
@@ -177,10 +299,16 @@ impl AttemptExecution {
         &self,
         endpoint: &crate::provider_registry::PinnedProviderEndpoint,
     ) -> Result<(), String> {
+        let identity = endpoint.endpoint_identity()?;
         self.state
             .lock()
             .map_err(|_| "endpoint_state_unavailable")?
-            .bind_launch_endpoint(&self.allocation.lease.owner, &endpoint.endpoint_identity()?)
+            .bind_launch_endpoint(&self.allocation.lease.owner, &identity)?;
+        self.evidence
+            .lock()
+            .map_err(|_| "endpoint_evidence_unavailable")?
+            .endpoint = Some(identity);
+        Ok(())
     }
     pub(crate) fn observe(
         &self,
@@ -209,6 +337,30 @@ impl AttemptExecution {
             self.retain_children(&String::from_utf8_lossy(&lines))?;
         }
         let session = match event {
+            DecodedLaunchEvent::Marker { name, value, .. } if name == PROMPT_ACCEPTED_MARKER_V1 => {
+                let observed =
+                    super::launch_result_mapper::parse_prompt_acceptance_attestation_marker(value)
+                        .ok_or("prompt_acceptance_invalid")?;
+                let evidence = self
+                    .evidence
+                    .lock()
+                    .map_err(|_| "prompt_evidence_unavailable")?;
+                let expected = evidence
+                    .prompt
+                    .as_ref()
+                    .ok_or("prompt_acceptance_not_negotiated")?;
+                let session = evidence
+                    .verified_session
+                    .as_deref()
+                    .or(context.start_known_provider_session_id.as_deref());
+                if expected.prompt_sha256 != observed.prompt_sha256
+                    || expected.delivery_nonce != observed.delivery_nonce
+                    || session != Some(observed.provider_session_id.as_str())
+                {
+                    return Err("prompt_acceptance_mismatch".into());
+                }
+                Some(observed.provider_session_id)
+            }
             DecodedLaunchEvent::Exit(exit) => exit
                 .session
                 .as_ref()
@@ -227,6 +379,38 @@ impl AttemptExecution {
                 }),
             )
             .map_err(|e| e.to_string())?;
+            if let Some(endpoint) = self
+                .evidence
+                .lock()
+                .map_err(|_| "endpoint_evidence_unavailable")?
+                .endpoint
+                .clone()
+            {
+                self.state
+                    .lock()
+                    .map_err(|_| "session_state_unavailable")?
+                    .commit_invocation_provider_session_authority(
+                        InvocationMutationAuthority::ProviderLaunch(&self.allocation.lease.owner),
+                        self.allocation.lease.owner.invocation_row_id,
+                        &oulipoly_state::ProviderSessionAuthorityCommit {
+                            invocation_uuid: &self
+                                .allocation
+                                .lease
+                                .owner
+                                .invocation_uuid
+                                .to_string(),
+                            provider_name: &context.provider.name,
+                            provider_instance_id: &endpoint.provider_instance_id,
+                            settings_id: &endpoint.settings_id,
+                            binding: &oulipoly_state::ProviderSessionBinding {
+                                provider_session_id: session.clone(),
+                                capture_method: "external_provider_launch",
+                                resume_input_id: context.start_known_provider_session_id.clone(),
+                                provider_session_resolved_account: None,
+                            },
+                        },
+                    )?;
+            }
             self.promote(ProviderLaunchPromotion::ProviderSessionObserved)?;
             self.evidence
                 .lock()
@@ -305,6 +489,28 @@ impl AttemptExecution {
         drop(evidence);
         self.promote(ProviderLaunchPromotion::CapturedChild)
     }
+    fn retain_custody(&self) -> Result<(), String> {
+        let evidence = self
+            .evidence
+            .lock()
+            .map_err(|_| "attempt_evidence_unavailable")?;
+        let retained = RetainedAttemptCustody {
+            lease: self.allocation.lease.clone(),
+            actors: self.actors.receipts(),
+            channel: evidence
+                .channel_settlement
+                .clone()
+                .ok_or("channel_settlement_absent")?,
+            retention_failure: evidence.retention_failure.clone(),
+        };
+        self.state
+            .lock()
+            .map_err(|_| "attempt_state_unavailable")?
+            .retain_native_attempt_custody(
+                &self.allocation.lease.owner,
+                &serde_json::to_value(retained).map_err(|e| e.to_string())?,
+            )
+    }
     pub(crate) fn seal_channel(&self) -> Vec<crate::executor::ReturnedArtifactRef> {
         let channel = self
             .evidence
@@ -346,6 +552,21 @@ pub fn execute_allocated_provider_attempt(
     request: ExecutorServiceRequest,
     allocation: AllocatedProviderLaunchAttempt,
 ) -> ProviderLaunchAttemptOutcome {
+    execute_allocated_attempt(registry, request, allocation, false)
+}
+pub fn execute_native_allocated_provider_attempt(
+    registry: &ProviderRegistry,
+    request: ExecutorServiceRequest,
+    allocation: AllocatedProviderLaunchAttempt,
+) -> ProviderLaunchAttemptOutcome {
+    execute_allocated_attempt(registry, request, allocation, true)
+}
+fn execute_allocated_attempt(
+    registry: &ProviderRegistry,
+    request: ExecutorServiceRequest,
+    allocation: AllocatedProviderLaunchAttempt,
+    original_tree: bool,
+) -> ProviderLaunchAttemptOutcome {
     let owner = allocation.lease.owner.clone();
     let setup = || -> Result<(ExternalProviderDispatchContext, Arc<AttemptExecution>), String> {
         let mut context = crate::executor::external_provider_context_from_request(request)
@@ -358,6 +579,7 @@ pub fn execute_allocated_provider_attempt(
             return Err("allocated_attempt_context_mismatch".into());
         }
         let state = StateDb::open(&allocation.state_db_path)?;
+        state.retain_launch_owner(&allocation.lease.owner)?;
         state
             .validate_active_launch_attempt(&allocation.lease, &allocation.completion_authority)?;
         let spawn = SpawnIdentityContext::for_allocated_attempt(
@@ -366,6 +588,11 @@ pub fn execute_allocated_provider_attempt(
             context.model.name.clone(),
             context.working_dir.as_deref(),
             context.models_dir.as_deref(),
+        )?
+        .with_start_known_session(context.start_known_provider_session_id.clone());
+        state.validate_launch_start_session(
+            &owner,
+            context.start_known_provider_session_id.as_deref(),
         )?;
         let mut identity = serde_json::json!({"source":context.provider.name,"id":owner.invocation_uuid.to_string()});
         identity[oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD] = allocation
@@ -376,7 +603,12 @@ pub fn execute_allocated_provider_attempt(
         let attempt = Arc::new(AttemptExecution {
             allocation: allocation.clone(),
             state: Mutex::new(state),
-            actors: AttemptActorCustody::new(owner.attempt_id),
+            actors: if original_tree {
+                AttemptActorCustody::original_tree(owner.attempt_id)
+            } else {
+                AttemptActorCustody::new(owner.attempt_id)
+            },
+            cancellation: oulipoly_core::CancellationToken::new(),
             spawn,
             evidence: Mutex::new(AttemptEvidence::default()),
         });
@@ -391,6 +623,7 @@ pub fn execute_allocated_provider_attempt(
         // Do not exit or otherwise mutate a generation owned by an earlier call.
         return setup_failure(allocation, message);
     }
+    let _cancel_watch = NativeCancellationWatch::start(&allocation, attempt.cancellation.clone());
     let result = super::dispatch::attempt_account_dispatch(registry, &context);
     attempt.finish_child_markers();
     // Paths rejected before an operation call are explicitly accounted by the
@@ -427,7 +660,7 @@ pub fn execute_allocated_provider_attempt(
         let _ = exit_runtime_generation_outcome(Some(&attempt.spawn), reason, None);
     }
     attempt.refresh_promotions();
-    match result {
+    let outcome = match result {
         Ok(mut result) => {
             // Missing-final is a mapped failed execution, not the Err arm below.
             // Persist its incomplete prefix before this attempt owner is dropped.
@@ -499,8 +732,56 @@ pub fn execute_allocated_provider_attempt(
                 evidence_retention_failure: evidence.retention_failure.clone(),
             })
         }
+    };
+    if let Err(error) = attempt.retain_custody() {
+        tracing::error!(%error, "native attempt custody retention failed; settlement unavailable");
+    }
+    outcome
+}
+
+struct NativeCancellationWatch {
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl NativeCancellationWatch {
+    fn start(
+        allocation: &AllocatedProviderLaunchAttempt,
+        token: oulipoly_core::CancellationToken,
+    ) -> Self {
+        let (stop, receiver) = std::sync::mpsc::channel();
+        let path = allocation.state_db_path.clone();
+        let owner = allocation.lease.owner.clone();
+        let worker = std::thread::spawn(move || {
+            // Read failures are uncertainty, never cancellation or proof of drain.
+            while receiver.try_recv().is_err() {
+                if let Ok(state) = StateDb::open(&path) {
+                    if state.launch_cancellation_requested(&owner).unwrap_or(false) {
+                        token.cancel();
+                        return;
+                    }
+                }
+                if receiver.recv_timeout(std::time::Duration::from_millis(25))
+                    != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
+                    return;
+                }
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
     }
 }
+impl Drop for NativeCancellationWatch {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 fn setup_failure(
     allocation: AllocatedProviderLaunchAttempt,
     message: String,
@@ -540,19 +821,25 @@ fn runtime_receipt(
     allocation: &AllocatedProviderLaunchAttempt,
     actors: &[ActorSettlementReceipt],
 ) -> RuntimeSettlementReceipt {
+    runtime_receipt_for(&allocation.lease, &allocation.mailbox_db_path, actors)
+}
+fn runtime_receipt_for(
+    lease: &ProviderLaunchLease,
+    mailbox_path: &std::path::Path,
+    actors: &[ActorSettlementReceipt],
+) -> RuntimeSettlementReceipt {
     let mut receipt = RuntimeSettlementReceipt {
-        runtime_generation_uuid: allocation.lease.runtime_generation_uuid,
-        spawn_invocation_uuid: allocation.lease.owner.invocation_uuid,
+        runtime_generation_uuid: lease.runtime_generation_uuid,
+        spawn_invocation_uuid: lease.owner.invocation_uuid,
         row: None,
         row_sha256: None,
         effect_incapable: false,
         uncertainty: None,
     };
     let read = || -> Result<RuntimeGenerationRow, String> {
-        let db = MailboxDb::open_read_only(&allocation.mailbox_db_path)?;
-        let generation =
-            RuntimeGenerationId::parse(&allocation.lease.runtime_generation_uuid.to_string())
-                .map_err(|e| e.to_string())?;
+        let db = MailboxDb::open_read_only(mailbox_path)?;
+        let generation = RuntimeGenerationId::parse(&lease.runtime_generation_uuid.to_string())
+            .map_err(|e| e.to_string())?;
         db.runtime_lifecycle_reader()
             .runtime_generation(&generation)
             .map_err(|e| e.to_string())?
@@ -565,8 +852,7 @@ fn runtime_receipt(
                 .ok()
                 .map(|b| format!("{:x}", Sha256::digest(b)));
             receipt.effect_incapable =
-                runtime_row_effect_incapable(&allocation.lease, &row, actors)
-                    && receipt.row_sha256.is_some();
+                runtime_row_effect_incapable(lease, &row, actors) && receipt.row_sha256.is_some();
             if !receipt.effect_incapable {
                 receipt.uncertainty = Some("runtime_custody_not_proven".into());
             }
@@ -599,7 +885,14 @@ fn runtime_row_effect_incapable(
                             && p.os_pid_starttime_ticks == identity.os_pid_starttime_ticks
                     })
             }) && row.spawned_os_pid == Some(identity.os_pid)
-                && row.terminal_reason == Some(RuntimeTerminalReason::AbnormalTermination)
+                && matches!(
+                    row.terminal_reason,
+                    Some(
+                        RuntimeTerminalReason::AbnormalTermination
+                            | RuntimeTerminalReason::OrderlyCompletion
+                            | RuntimeTerminalReason::Cancelled
+                    )
+                )
         }
     };
     row.generation_id.to_string() == lease.runtime_generation_uuid.to_string()
@@ -665,6 +958,7 @@ mod tests {
             allocation,
             state: Mutex::new(state),
             actors: AttemptActorCustody::new(lease.owner.attempt_id),
+            cancellation: oulipoly_core::CancellationToken::new(),
             spawn,
             evidence: Mutex::new(AttemptEvidence::default()),
         };

@@ -31,6 +31,19 @@ pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> 
             let _ = super::custody::replay_result(path, &attempt);
         }
         let mut state = StateDb::open_default()?;
+        // Runtime/channel receipts come from the original allocated executor;
+        // physical activation drain alone cannot settle a logical cancellation.
+        for (generation, invocation) in state.cancelling_native_attempts()? {
+            if MailboxDb::open(path)?.continuation_domain_drained_runtime(
+                &owner.domain_id,
+                &generation.to_string(),
+                &invocation.to_string(),
+            )? {
+                let _ = oulipoly_runtime::executor::settle_retained_native_cancellation(
+                    &state, generation, invocation,
+                );
+            }
+        }
         let obligations = state.admitted_completion_continuations()?;
         for binding in obligations {
             let source = binding.registration()?;

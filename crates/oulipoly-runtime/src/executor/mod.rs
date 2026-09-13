@@ -107,7 +107,7 @@ impl ExecutionResult {
             return Ok(());
         }
         let artifacts = state.record_returned_artifacts(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            state.invocation_mutation_scope(invocation_id).authority(),
             invocation_id,
             &self.returned_artifacts,
         );
@@ -649,7 +649,8 @@ pub use cli::ipc::return_channel::{ReturnChannel, ReturnChannelSettlement};
 pub use external_provider::attempt::{
     AllocatedProviderLaunchAttempt, ProviderLaunchAttemptFailure, ProviderLaunchAttemptOutcome,
     ProviderLaunchFailure, ProviderLaunchPromotionSummary, RuntimeSettlementReceipt,
-    execute_allocated_provider_attempt,
+    execute_allocated_provider_attempt, execute_native_allocated_provider_attempt,
+    settle_retained_native_cancellation,
 };
 
 #[cfg(test)]

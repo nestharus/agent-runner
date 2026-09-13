@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub const MAX_RETURN_CHANNEL_BYTES: u64 = 1024 * 1024;
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReturnChannelSettlement {
     NotCreated,
     EmptyRemoved,

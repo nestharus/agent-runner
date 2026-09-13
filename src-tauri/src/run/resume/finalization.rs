@@ -145,7 +145,11 @@ fn persist_returned_artifacts(input: &CompletedAttemptInput<'_, '_>) -> Result<(
         .env
         .state
         .record_returned_artifacts(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            input
+                .env
+                .state
+                .invocation_mutation_scope(input.invocation_row_id)
+                .authority(),
             input.invocation_row_id,
             &input.result.returned_artifacts,
         )
@@ -161,7 +165,11 @@ fn handle_returned_artifacts_persist_failure(
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            input
+                .env
+                .state
+                .invocation_mutation_scope(input.invocation_row_id)
+                .authority(),
             mapper::returned_artifacts_finalize_request(&input.env.state, input.invocation_row_id),
         )
         .map(|_| ())
@@ -224,7 +232,9 @@ pub(super) fn finalize_confirmed_delivery(
     let delivery_ids = [settlement.delivery_id.to_string()];
     let acceptance = result.resume_acceptance.as_ref();
     state.apply_provider_turn_effects(
-        oulipoly_state::InvocationMutationAuthority::Standalone,
+        state
+            .invocation_mutation_scope(invocation_row_id)
+            .authority(),
         oulipoly_state::ProviderTurnEffectInput {
             invocation_row_id,
             delivery_ids: &delivery_ids,
