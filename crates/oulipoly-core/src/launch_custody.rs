@@ -12,6 +12,17 @@ use std::{cell::RefCell, io};
 /// cancellation retains its own configured grace policy.
 pub const TERMINATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Signal only this thread's direct unreaped children. The caller must retain
+/// exclusive wait ownership and repeat after adoption to consume an escaped tree.
+#[cfg(target_os = "linux")]
+pub fn signal_owned_children(signal: i32) -> bool {
+    if !matches!(signal, libc::SIGTERM | libc::SIGKILL) {
+        return false;
+    }
+    // No PID lookup is used as authority: numeric identities are pinned by wait ownership.
+    unsafe { linux::signal_owned_children(signal) }
+}
+
 pub fn proof_path(database: &Path, generation: &str) -> PathBuf {
     database
         .with_extension("starting-custody-v1")
@@ -862,6 +873,10 @@ mod linux {
     // descendants, including escaped groups; repeat until consuming ECHILD.
     // No global PID scan, allocation, status-carrier kill or stale group lookup.
     unsafe fn kill_owned_children() -> bool {
+        unsafe { signal_owned_children(libc::SIGKILL) }
+    }
+
+    pub(super) unsafe fn signal_owned_children(signal: i32) -> bool {
         unsafe {
             let fd = libc::open(
                 c"/proc/thread-self/children".as_ptr(),
@@ -887,9 +902,7 @@ mod linux {
                     };
                     pid = next;
                 } else if *byte == b' ' && pid > 0 {
-                    if libc::kill(pid, libc::SIGKILL) != 0
-                        && *libc::__errno_location() != libc::ESRCH
-                    {
+                    if libc::kill(pid, signal) != 0 && *libc::__errno_location() != libc::ESRCH {
                         return false;
                     }
                     pid = 0;

@@ -236,12 +236,41 @@ pub(super) fn entry() -> Result<(), String> {
     let spawn_failed = child.is_none();
     let mut root_status = None;
     let mut root_wait_status = None;
+    let mut cancellation: Option<(String, std::time::Instant)> = None;
     loop {
+        if cancellation.is_none()
+            && attempt.operation == "activation"
+            && let Ok(Some(identity)) = accepted_activation_cancellation(path, attempt)
+        {
+            cancellation = Some((identity, std::time::Instant::now()));
+        }
+        if let Some((_, started)) = &cancellation {
+            let signal =
+                if started.elapsed() >= oulipoly_core::launch_custody::TERMINATION_GRACE_PERIOD {
+                    libc::SIGKILL
+                } else {
+                    libc::SIGTERM
+                };
+            // All direct children belong to this exact activation AC. The
+            // original Bash source tree is never in this custody boundary.
+            let _ = oulipoly_core::launch_custody::signal_owned_children(signal);
+        }
         // Keep the wait result through DB/result integration failures;
         // never repeat a wait for an already reaped root.
         if let Some(process) = child.as_mut()
             && let Some(status) = process.try_wait().map_err(|e| e.to_string())?
         {
+            if cancellation.is_none()
+                && attempt.operation == "activation"
+                && matches!(status.signal(), Some(libc::SIGTERM | libc::SIGINT))
+            {
+                // A waited terminal signal on our exact native launcher is an
+                // actual cancellation action, unlike missing PID/ordinary exit.
+                cancellation = Some((
+                    format!("native_launcher_wait_signal:{}", status.signal().unwrap()),
+                    std::time::Instant::now(),
+                ));
+            }
             root_status = status.code();
             root_wait_status = Some(status.into_raw());
             child = None;
@@ -261,7 +290,7 @@ pub(super) fn entry() -> Result<(), String> {
     } else {
         serde_json::json!({"classification":"native_wait_result"})
     };
-    let receipt=serde_json::json!({"attempt_id":attempt.attempt_id,"custodian":identity,"root_exit_code":root_status,"root_wait_status":root_wait_status,"spawn_failed":spawn_failed,"spawn_error":spawn_error,"response":classification,"owned_children":"ECHILD","result_retained":true}).to_string();
+    let receipt=serde_json::json!({"attempt_id":attempt.attempt_id,"custodian":identity,"root_exit_code":root_status,"root_wait_status":root_wait_status,"spawn_failed":spawn_failed,"spawn_error":spawn_error,"accepted_cancellation":cancellation.as_ref().map(|v|&v.0),"response":classification,"owned_children":"ECHILD","result_retained":true}).to_string();
     // Persist the complete wait/drain result before its DB integration.
     persist_result_until_retained(Path::new(&attempt.result_path), receipt.as_bytes());
     loop {
@@ -464,4 +493,27 @@ fn persist_result_until_retained(path: &Path, bytes: &[u8]) {
     while durable_write(path, bytes).is_err() {
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn accepted_activation_cancellation(
+    path: &Path,
+    attempt: &ContinuationAttempt,
+) -> Result<Option<String>, String> {
+    let bound = Duration::from_millis(20);
+    let (_, mailbox) =
+        MailboxDb::open_read_only_with_pid_identity_and_work_timeout(path, bound, bound, &|| {
+            false
+        })?;
+    let Some((generation, invocation)) = mailbox.continuation_runtime_identity(attempt)? else {
+        return Ok(None);
+    };
+    let state = oulipoly_state::StateDb::open_read_only_with_retry_and_work_timeout_and_cancel(
+        &oulipoly_state::StateDb::default_path()?,
+        bound,
+        bound,
+        &|| false,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    use rusqlite::OptionalExtension;
+    state.connection().query_row("SELECT l.logical_launch_id || ':' || l.cancel_requested_at FROM provider_launch_attempts a JOIN provider_logical_launches l ON l.logical_launch_id=a.logical_launch_id WHERE a.runtime_generation_uuid=?1 AND a.invocation_uuid=?2 AND l.cancel_requested_at IS NOT NULL",rusqlite::params![generation,invocation],|r|r.get(0)).optional().map_err(|e|e.to_string())
 }

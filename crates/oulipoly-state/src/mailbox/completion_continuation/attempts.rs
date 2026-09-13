@@ -384,3 +384,13 @@ impl MailboxDb {
         Ok(())
     }
 }
+
+impl MailboxDb {
+    pub fn continuation_runtime_identity(
+        &self,
+        attempt: &ContinuationAttempt,
+    ) -> Result<Option<(String, String)>, String> {
+        require_exact_attempt(&self.conn, attempt)?;
+        self.conn.query_row("SELECT runtime_generation_uuid,spawn_invocation_uuid FROM completion_continuation_attempt WHERE attempt_id=?1 AND runtime_generation_uuid IS NOT NULL AND spawn_invocation_uuid IS NOT NULL",[&attempt.attempt_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())
+    }
+}

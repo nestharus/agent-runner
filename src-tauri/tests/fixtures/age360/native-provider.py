@@ -76,8 +76,17 @@ def launch(request):
             ack = subprocess.run([runner,"mailbox","ack","--session-id",known,"--from-seq",sequence,"--to-seq",sequence,"--json"],capture_output=True,check=True,timeout=10)
             pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-exact-ack.json").write_bytes(ack.stdout)
         if os.environ.get("AGE360_DESCENDANT") == "1":
-            child = subprocess.Popen(["/bin/sh", "-c", 'while [ ! -f "$AGE360_DESCENDANT_GATE" ]; do sleep 0.02; done'], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cancelling = pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("cancel-probe-enabled").exists()
+            if cancelling:
+                import signal
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                os.environ["AGE360_CANCEL_TEST"] = "1"
+            child = subprocess.Popen(["/bin/sh", "-c", 'if [ "$AGE360_CANCEL_TEST" = 1 ]; then trap "" TERM; touch "$AGE360_ROOT/cancel-descendant-ready"; fi; while [ ! -f "$AGE360_DESCENDANT_GATE" ]; do sleep 0.02; done'], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("descendant.pid").write_text(str(child.pid))
+            if cancelling:
+                deadline=time.monotonic()+45
+                while time.monotonic()<deadline: time.sleep(0.02)
+                raise RuntimeError("accepted native cancellation failed to stop held provider")
     else:
         known = SESSION
         event(request, seq, "marker", name="oulipoly.provider_session", value={"provider_session_id": known})

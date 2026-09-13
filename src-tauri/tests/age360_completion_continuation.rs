@@ -558,9 +558,19 @@ fn native_both_owner_loss_restart_preserves_original_custodian_debt() {
     }
     native_activation_custody(2);
 }
+#[test]
+fn native_accepted_cancellation_drains_resistant_activation_without_source_signal() {
+    if private_case(false) {
+        return;
+    }
+    native_activation_custody(3);
+}
 fn native_activation_custody(owner_loss: u8) {
     let f = Fixture::new("owner_only");
     f.gate("test-descendant-enabled");
+    if owner_loss == 3 {
+        f.gate("cancel-probe-enabled");
+    }
     f.gate("release-resume");
     let mut initial = f.start_with_hold(true);
     let owner = f.owner();
@@ -612,7 +622,7 @@ fn native_activation_custody(owner_loss: u8) {
         serde_json::to_string(&owner).unwrap(),
         serde_json::to_string(&attempt).unwrap()
     );
-    if owner_loss != 0 {
+    if matches!(owner_loss, 1 | 2) {
         assert!(current_identity_matches(&owner.driver_identity));
         assert_eq!(
             unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
@@ -685,7 +695,25 @@ fn native_activation_custody(owner_loss: u8) {
     ));
     drop(writer);
     drop(mailbox);
-    f.gate("release-descendant");
+    if owner_loss == 3 {
+        wait(|| {
+            f.root
+                .path()
+                .join("cancel-descendant-ready")
+                .exists()
+                .then_some(())
+        });
+        let launcher: oulipoly_state::completion_continuation::SourceProcessIdentity =
+            serde_json::from_str(&launcher).unwrap();
+        assert!(current_identity_matches(&launcher));
+        assert_eq!(unsafe { libc::kill(launcher.pid as i32, libc::SIGTERM) }, 0);
+        println!(
+            "terminal cancellation exact launcher={}",
+            serde_json::to_string(&launcher).unwrap()
+        );
+    } else {
+        f.gate("release-descendant");
+    }
     wait(|| {
         f.mailbox()
             .wake_session_reader()
@@ -698,6 +726,12 @@ fn native_activation_custody(owner_loss: u8) {
     assert_eq!(receipt.0, "drained");
     assert_eq!(receipt.1, 1);
     assert!(receipt.2.contains("ECHILD"));
+    if owner_loss == 3 {
+        let receipt: serde_json::Value = serde_json::from_str(&receipt.2).unwrap();
+        assert!(receipt["accepted_cancellation"].is_string(), "{receipt}");
+        assert!(!f.root.path().join("release-descendant").exists());
+        assert!(read_live_process_identity(descendant).unwrap().is_none());
+    }
 }
 
 impl Drop for Fixture {
