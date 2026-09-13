@@ -5,6 +5,9 @@
 #[cfg(feature = "age360-fault-fixtures")]
 #[path = "fixtures/age360/custody_faults.rs"]
 mod custody_faults;
+#[cfg(feature = "age360-fault-fixtures")]
+#[path = "fixtures/age360/paired_faults.rs"]
+mod paired_faults;
 mod provider_authority_fixture;
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::read_live_process_identity;
@@ -16,6 +19,12 @@ use std::time::{Duration, Instant};
 const SESSION: &str = "ses_age360_native_wake";
 const MODEL: &str = "age360-native-model";
 const PROVIDER: &str = "age360-native-provider";
+
+fn runner() -> PathBuf {
+    std::env::var_os("AGE360_RUNNER_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_oulipoly-agent-runner")))
+}
 
 fn counterpart() -> PathBuf {
     let requested=std::env::var_os("AGE360_AGENT_BASH_BIN").expect("AGE360_AGENT_BASH_BIN must identify the exact built counterpart; no installed/fake fallback");
@@ -30,6 +39,7 @@ fn private_case(paired: bool) -> bool {
     let name = std::thread::current().name().unwrap().to_owned();
     let net = fs::read_link("/proc/self/ns/net").unwrap();
     let bash = paired.then(counterpart);
+    let runner = fs::canonicalize(runner()).expect("exact runner binary must exist");
     if std::env::var("AGE360_PRIVATE_CASE").as_deref() == Ok(&name) {
         assert_ne!(
             net.as_os_str(),
@@ -40,6 +50,18 @@ fn private_case(paired: bool) -> bool {
             net.display(),
             std::process::id()
         );
+        println!(
+            "runner={} sha256={}",
+            runner.display(),
+            oulipoly_state::completion_continuation::sha256(&fs::read(&runner).unwrap())
+        );
+        if let Some(bash) = &bash {
+            println!(
+                "bash={} sha256={}",
+                bash.display(),
+                oulipoly_state::completion_continuation::sha256(&fs::read(bash).unwrap())
+            );
+        }
         return false;
     }
     let homes = tempfile::tempdir().unwrap();
@@ -66,7 +88,8 @@ fn private_case(paired: bool) -> bool {
         .env("XDG_CONFIG_HOME", homes.path().join("config"))
         .env("XDG_STATE_HOME", homes.path().join("state"))
         .env("AGE360_PRIVATE_CASE", &name)
-        .env("AGE360_PARENT_NET", &net);
+        .env("AGE360_PARENT_NET", &net)
+        .env("AGE360_RUNNER_BIN", runner);
     if let Some(bash) = bash {
         command.env("AGE360_AGENT_BASH_BIN", bash);
     }
@@ -123,7 +146,7 @@ impl Fixture {
         }
     }
     fn command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        let mut cmd = Command::new(runner());
         cmd.env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.root.path().join("home"))
@@ -158,16 +181,22 @@ impl Fixture {
                 "AGE360_WORKLOAD_GATE",
                 self.root.path().join("release-workload"),
             )
-            .env(
-                "AGENT_BASH_AGENT_RUNNER_BIN",
-                env!("CARGO_BIN_EXE_oulipoly-agent-runner"),
-            )
+            .env("AGENT_BASH_AGENT_RUNNER_BIN", runner())
             .current_dir(self.root.path());
         #[cfg(feature = "age360-fault-fixtures")]
         cmd.env("AGE360_FAULT_ROOT", self.root.path()).env(
             "AGE360_FAULT_PARENT_NET",
             std::env::var_os("AGE360_PARENT_NET").unwrap(),
         );
+        let fault = match self.case {
+            "publication_race" => Some("after-terminal-metadata"),
+            "publication_error" | "publication_io_error" => Some("publication-error"),
+            "hash_cancel" => Some("during-output-hash"),
+            _ => None,
+        };
+        if let Some(fault) = fault {
+            cmd.env("AGENT_BASH_SOURCE_FAULT", fault);
+        }
         if self.case != "owner_only" {
             cmd.env("AGE360_AGENT_BASH_BIN", counterpart());
         }
@@ -387,6 +416,8 @@ fn native_unmarked_nested_entry_cannot_elect_descendant_owner() {
 
 fn paired_case(mode: &'static str) {
     let f = Fixture::new(mode);
+    #[cfg(feature = "age360-fault-fixtures")]
+    paired_faults::prepare(&f);
     f.gate("release-resume");
     let mut initial = f.start();
     let owner = f.owner();
@@ -394,14 +425,50 @@ fn paired_case(mode: &'static str) {
     let source = binding.registration().unwrap();
     assert_eq!(source.domain_id, owner.domain_id);
     assert_eq!(source.owner_session_id, SESSION);
+    #[cfg(feature = "age360-fault-fixtures")]
+    paired_faults::after_registration(&f);
     println!(
         "owner={} source={}",
         serde_json::to_string(&owner).unwrap(),
         serde_json::to_string(&source).unwrap()
     );
+    if mode == "pause" {
+        let output = f
+            .command()
+            .args(["mailbox", "pause", "--session-id", SESSION])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if mode == "driver_replacement" {
+        assert!(current_identity_matches(&owner.driver_identity));
+        assert_eq!(
+            unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
+            0
+        );
+        let successor = wait(|| {
+            let current = f.mailbox().completion_continuation_owner().ok()??;
+            (current.owner_generation != owner.owner_generation).then_some(current)
+        });
+        assert_eq!(successor.guardian_identity, owner.guardian_identity);
+        println!(
+            "paired original guardian replaced driver={}",
+            serde_json::to_string(&successor).unwrap()
+        );
+    }
     if mode != "sync" {
-        f.wait_initial(&mut initial);
+        // Original physical workload fencing is intact: the native launcher
+        // cannot finish while this fixture deliberately holds its Bash tree.
         f.gate("release-workload");
+    }
+    #[cfg(feature = "age360-fault-fixtures")]
+    paired_faults::before_acceptance(&f, &source);
+    if !matches!(mode, "sync" | "acceptance_reply_loss") {
+        f.wait_initial(&mut initial);
     }
     let acceptance = wait(|| {
         let value = f
@@ -411,6 +478,67 @@ fn paired_case(mode: &'static str) {
         (value["phase"] == "accepted").then_some(value)
     });
     println!("acceptance={acceptance}");
+    #[cfg(feature = "age360-fault-fixtures")]
+    paired_faults::after_acceptance(&f);
+    if mode == "acceptance_reply_loss" {
+        f.wait_initial(&mut initial);
+    }
+    if mode == "pause" {
+        let listeners = f
+            .mailbox()
+            .completion_event_listeners(&source.handle)
+            .unwrap();
+        assert!(!listeners.is_empty());
+        assert!(listeners.iter().all(|l| l.acknowledged_at.is_none()));
+        assert!(!f.root.path().join("recipient-byte-receipt.json").exists());
+        let output = f
+            .command()
+            .args(["mailbox", "resume", "--session-id", SESSION])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        println!("actual paused listener retained then resumed");
+    }
+    if matches!(
+        mode,
+        "publication_race" | "publication_error" | "publication_io_error" | "hash_cancel"
+    ) {
+        let evidence =
+            oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
+                &binding,
+            )
+            .unwrap();
+        assert_eq!(
+            evidence.outcome.kind,
+            if mode == "publication_race" {
+                "exit_root"
+            } else {
+                "ready"
+            }
+        );
+        println!(
+            "immutable original outcome after cancellation={}",
+            serde_json::to_string(&evidence.outcome).unwrap()
+        );
+    }
+    if mode == "registration_reply_loss" {
+        let evidence =
+            oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
+                &binding,
+            )
+            .unwrap();
+        assert_eq!(evidence.outcome.kind, "never_launched");
+        assert!(
+            !PathBuf::from(&source.handle_dir)
+                .join("registration-receipt-v2.json")
+                .exists()
+        );
+        println!("exact committed registration recovered without original workload launch");
+    }
     if mode == "early_exit" {
         let evidence =
             oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
@@ -479,12 +607,35 @@ fn paired_case(mode: &'static str) {
             .all(|l| l.acknowledged_at.is_some())
             .then_some(())
     });
+    let byte_receipt: serde_json::Value = serde_json::from_slice(
+        &fs::read(f.root.path().join("recipient-byte-receipt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(byte_receipt["output_checked"], true);
+    println!("actual native adapter byte receipt={byte_receipt}");
     // Both modes have completed their mode-specific initial observation above.
     assert!(initial.wait().unwrap().success());
     let prompt = fs::read_to_string(f.root.path().join("resume-prompts.jsonl")).unwrap();
     assert!(
         prompt.contains(&source.handle),
         "native resumed recipient did not receive exact source"
+    );
+    let launch_count = fs::read_to_string(f.root.path().join("source-launches"))
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert_eq!(
+        launch_count,
+        if mode == "registration_reply_loss" {
+            0
+        } else {
+            1
+        },
+        "completion recovery must not replay original workload"
+    );
+    println!(
+        "actual workload launches={launch_count} native recipient invocations={}",
+        prompt.lines().count()
     );
     let listeners = f
         .mailbox()
@@ -509,6 +660,29 @@ fn paired_case(mode: &'static str) {
             .is_empty()
             .then_some(())
     });
+    let (attempts, integrated): (i64, i64) = f.sidecar_connection().query_row(
+        "SELECT COUNT(*),COALESCE(SUM(integrated),0) FROM completion_continuation_attempt WHERE source_registration_id=?1",
+        [&source.registration_id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    fn retained(path: &std::path::Path) -> (u64, u64) {
+        let mut count = 0;
+        let mut bytes = 0;
+        for entry in fs::read_dir(path).unwrap().flatten() {
+            let metadata = entry.metadata().unwrap();
+            if metadata.is_dir() {
+                let (nested_count, nested_bytes) = retained(&entry.path());
+                count += nested_count;
+                bytes += nested_bytes;
+            } else if metadata.is_file() {
+                count += 1;
+                bytes += metadata.len();
+            }
+        }
+        (count, bytes)
+    }
+    let (files, bytes) = retained(f.root.path());
+    println!(
+        "paired resources source_recovery_attempts={attempts} integrated={integrated} retained_fixture_files={files} retained_fixture_bytes={bytes}; fixture teardown is not product release authority"
+    );
 }
 #[test]
 fn normal_sleeping_recipient() {
@@ -1149,6 +1323,34 @@ impl Drop for Fixture {
             }
         }
         logs(&self.data.join("completion-continuation"));
+        // Retain exact paired helper failure evidence, without dumping raw output,
+        // pinned binaries or the private launch capability/environment.
+        fn source_logs(path: &std::path::Path) {
+            let Ok(entries) = fs::read_dir(path) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if entry.path().is_dir() {
+                    source_logs(&entry.path());
+                } else if !name.contains("environment")
+                    && !name.contains("request")
+                    && (name.ends_with(".json")
+                        || name.ends_with(".txt")
+                        || name.ends_with(".stderr")
+                        || name.ends_with(".stdout"))
+                    && fs::metadata(entry.path()).is_ok_and(|m| m.len() < 65536)
+                    && let Ok(bytes) = fs::read(entry.path())
+                {
+                    eprintln!(
+                        "paired source {}: {}",
+                        entry.path().display(),
+                        String::from_utf8_lossy(&bytes)
+                    );
+                }
+            }
+        }
+        source_logs(&self.root.path().join("spool/agent-bash"));
         if let Ok(db) = rusqlite::Connection::open_with_flags(
             self.data.join("pid-identity.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1222,5 +1424,18 @@ fn native_state_linked_token_cancellation_drains_resistant_activation() {
 fn native_state_linked_token_cancellation_after_ac_loss_drains_original_adopter() {
     if !private_case(false) {
         native_activation_custody(10);
+    }
+}
+
+#[test]
+fn paired_pause_retains_event_until_real_resume_and_ack() {
+    if !private_case(true) {
+        paired_case("pause");
+    }
+}
+#[test]
+fn paired_driver_replacement_does_not_replay_original_source() {
+    if !private_case(true) {
+        paired_case("driver_replacement");
     }
 }

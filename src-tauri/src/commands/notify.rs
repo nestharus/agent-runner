@@ -300,7 +300,10 @@ pub(super) fn validate_continuation_registration_context(
     {
         return Err("immutable v2 owner binding conflict".into());
     }
-    let state = StateDb::open_read_only(&StateDb::default_path()?).map_err(|e| format!("{e:?}"))?;
+    // Reconciliation may bind a running invocation's first session using the
+    // exact live caller ancestry. Like legacy registration, this is a writer
+    // operation, not a read-only context check. All identity checks still apply.
+    let state = StateDb::open_default()?;
     reconcile_owner_binding(&state, &owner, &metadata)
 }
 

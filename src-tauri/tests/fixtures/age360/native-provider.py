@@ -29,8 +29,12 @@ def output_completion(request, seq, stdout):
 
 def launch(request):
     params = request.get("params", {})
+    # The provider launch contract carries workload environment in params.env,
+    # not the adapter process environment. Apply the real runner-supplied values.
+    os.environ.update(params.get("env") or {})
     known = params.get("session", {}).get("known_provider_session_id")
     prompt = params.get("model", {}).get("inputs", {}).get("prompt", "")
+    case = os.environ.get("AGE360_CASE")
     seq = 1
     if known:
         marker = pathlib.Path(os.environ["AGE360_NATIVE_WAKE_MARKER"])
@@ -64,12 +68,15 @@ def launch(request):
             listed = subprocess.run([runner,"mailbox","list","--session-id",known,"--json"],capture_output=True,check=True,timeout=10)
             rows = json.loads(listed.stdout)["rows"]
             assert len(rows) == 1
+            received_output = None
             if os.environ.get("AGE360_CASE") == "owner_only":
                 assert "native-custody-input" in prompt
             else:
                 assert rows[0]["handle"] in prompt
-                if os.environ.get("AGE360_CASE") != "large_output":
-                    assert pathlib.Path(rows[0]["log_path"]).read_bytes() == b"paired-source-output"
+                if case not in ("large_output", "hash_cancel"):
+                    raw = pathlib.Path(rows[0]["log_path"]).read_bytes()
+                    assert raw == (b"" if case == "registration_reply_loss" else b"paired-source-output")
+                    received_output = {"byte_len": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
                 else:
                     payload = json.loads(rows[0]["payload_json"])
                     artifact = payload["output_artifact"]
@@ -77,14 +84,20 @@ def launch(request):
                     size = 0
                     with open(artifact["path"], "rb") as body:
                         while block := body.read(65536):
-                            assert block == b"\0" * len(block)
+                            if case == "large_output":
+                                assert block == b"\0" * len(block)
                             digest.update(block)
                             size += len(block)
-                    assert size == artifact["byte_len"] == 16 * 1024 * 1024
+                    expected_size = 16 * 1024 * 1024 + (6 if case == "hash_cancel" else 0)
+                    assert size == artifact["byte_len"] == expected_size
+                    if case == "hash_cancel":
+                        assert pathlib.Path(artifact["path"]).read_bytes() == b"\0" * (16 * 1024 * 1024) + b"READY\n"
                     assert digest.hexdigest() == artifact["sha256"]
+                    received_output = {"byte_len": size, "sha256": digest.hexdigest()}
                 if rows[0].get("payload_file_path"):
                     payload = pathlib.Path(rows[0]["payload_file_path"]).read_bytes()
                     assert hashlib.sha256(payload).hexdigest() == rows[0]["payload_sha256"]
+            pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-byte-receipt.json").write_text(json.dumps({"seq": rows[0]["seq"], "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "output_checked": case != "owner_only", "artifact": case in ("large_output", "hash_cancel"), "output": received_output}))
             sequence = str(rows[0]["seq"])
             ack = subprocess.run([runner,"mailbox","ack","--session-id",known,"--from-seq",sequence,"--to-seq",sequence,"--json"],capture_output=True,check=True,timeout=10)
             pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-exact-ack.json").write_bytes(ack.stdout)
@@ -107,11 +120,13 @@ def launch(request):
         if os.environ.get("AGE360_CASE") != "owner_only":
             root = pathlib.Path(os.environ["AGE360_ROOT"])
             parent = json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"]
-            # Native stream ingestion, not a fixture-written owner/session row.
+            # Native stream ingestion binds the sidecar runtime first. Registration
+            # itself binds State through verified live ancestry; waiting for that
+            # State effect before registration would deadlock this fixture.
             deadline = time.monotonic() + 20
             while True:
-                with sqlite3.connect("file:" + os.environ["OULIPOLY_DATA_DIR"] + "/state.db?mode=ro", uri=True) as db:
-                    row = db.execute("SELECT provider_session_id FROM invocations WHERE invocation_uuid=?", (parent,)).fetchone()
+                with sqlite3.connect("file:" + os.environ["OULIPOLY_DATA_DIR"] + "/pid-identity.db?mode=ro", uri=True) as db:
+                    row = db.execute("SELECT session_id FROM runtime_generation WHERE spawn_invocation_uuid=?", (parent,)).fetchone()
                 if row and row[0] == SESSION: break
                 if time.monotonic() > deadline: raise RuntimeError("native session binding was not ingested")
                 time.sleep(0.02)
@@ -125,12 +140,33 @@ def launch(request):
                 extra = ["--ready-sentinel", "NEVER-SEEN"]
             elif os.environ["AGE360_CASE"] == "large_output":
                 workload = 'head -c 16777216 /dev/zero'
-            result = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "run", "--delivery", mode, "--completion-scope", "tree", *extra, "--", "/bin/sh", "-c", workload], env=env, capture_output=True, timeout=30)
+            scope = "tree"
+            if case == "publication_race":
+                scope = "root"
+                workload = 'sleep 600 >/dev/null 2>&1 & printf paired-source-output'
+            elif case in ("publication_error", "publication_io_error"):
+                extra = ["--ready-sentinel", "paired-source-output"]
+                workload = 'printf paired-source-output; while [ ! -f "$AGE360_ROOT/write-more" ]; do sleep .02; done; head -c 1048576 /dev/zero; touch "$AGE360_ROOT/writer-done"; exec sleep 600'
+            elif case == "hash_cancel":
+                extra = ["--ready-sentinel", "READY"]
+                workload = 'head -c 16777216 /dev/zero; printf "READY\\n"; exec sleep 600'
+            workload = 'printf "launch\\n" >> "$AGE360_ROOT/source-launches"; ' + workload
+            result = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "run", "--delivery", mode, "--completion-scope", scope, *extra, "--", "/bin/sh", "-c", workload], env=env, capture_output=True, timeout=30)
             (root / "bash-dispatch.stdout").write_bytes(result.stdout)
             (root / "bash-dispatch.stderr").write_bytes(result.stderr)
             allowed = (0, 37) if os.environ["AGE360_CASE"] == "early_exit" else (0,)
             if result.returncode not in allowed: raise RuntimeError("actual paired Bash dispatch failed: " + result.stderr.decode(errors="replace"))
             (root / "provider-dispatched").touch()
+            if case in ("publication_race", "publication_error", "publication_io_error", "hash_cancel"):
+                # Actual original owner issues cancellation through the exact Bash
+                # CLI; the namespace controller cannot impersonate its ancestry.
+                deadline = time.monotonic() + 45
+                while not (root / "cancel-source").exists():
+                    if time.monotonic() > deadline: raise RuntimeError("test did not request owner cancellation")
+                    time.sleep(.02)
+                handle = json.loads(result.stdout)["handle"]
+                cancelled = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "cancel", handle], env=env, capture_output=True, timeout=10)
+                (root / "source-cancel-result.json").write_text(json.dumps({"rc": cancelled.returncode, "stdout": cancelled.stdout.decode(), "stderr": cancelled.stderr.decode(), "owner_pid": os.getpid()}))
             if mode == "sync":
                 deadline = time.monotonic() + 30
                 while not (root / "release-initial-provider").exists():
