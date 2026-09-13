@@ -21,6 +21,38 @@ pub(super) fn spawn_detached_resume(
     claim_token: &str,
     auto_wake_count: i64,
 ) -> Result<i64, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = oulipoly_state::mailbox::MailboxDb::default_path()?;
+        let mailbox = oulipoly_state::mailbox::MailboxDb::open(&path)?;
+        if mailbox.completion_continuation_domain()?.is_some() {
+            let attempt = mailbox
+                .continuation_activation(session_id, claim_token)?
+                .ok_or("native wake has no authoritative activation reservation")?;
+            if attempt.request_sha256
+                != oulipoly_state::mailbox::activation_request_sha256(
+                    session_id,
+                    runtime,
+                    claim_token,
+                    auto_wake_count,
+                )
+            {
+                return Err("activation launch request changed after reservation".into());
+            }
+            drop(mailbox);
+            return crate::completion_owner::spawn_activation(&path, &attempt, || {
+                let mut command = Command::new("/proc/self/exe");
+                configure_resume_command(
+                    &mut command,
+                    session_id,
+                    runtime,
+                    claim_token,
+                    auto_wake_count,
+                );
+                Ok(command)
+            });
+        }
+    }
     let mut launch = current_agents_command()?;
     configure_resume_command(
         &mut launch.command,

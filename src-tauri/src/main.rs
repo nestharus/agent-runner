@@ -22,6 +22,7 @@ mod agent_resolution;
 mod captured_child;
 mod cli;
 mod commands;
+mod completion_owner;
 mod diagnostics_payloads;
 mod dispatch;
 mod error_emit;
@@ -54,6 +55,16 @@ mod zero_turn_orchestration;
 use crate::usage::cli::Cli;
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = completion_owner::custodian_entry() {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     process_entrypoint()
 }
 
@@ -83,8 +94,6 @@ fn process_entrypoint() -> ExitCode {
             }
         };
     }
-    initialize_tracing();
-
     if wake_coordinator::is_wake_reclaim_handoff_invocation() {
         return cli_exit_to_code(&cli_exit(
             wake_coordinator::run_wake_reclaim_handoff_invocation().map(|()| 0),
@@ -99,12 +108,16 @@ fn process_entrypoint() -> ExitCode {
 }
 
 fn run_gui_entrypoint() -> ExitCode {
+    initialize_tracing();
     agent_runner_lib::run_tauri();
     ExitCode::SUCCESS
 }
 
 fn run_cli_entrypoint() -> ExitCode {
-    let exit = cli_exit(dispatch::run(parse_cli()));
+    let cli = parse_cli();
+    let bootstrap = completion_owner::bootstrap(&cli);
+    initialize_tracing();
+    let exit = cli_exit(bootstrap.and_then(|()| dispatch::run(cli)));
     emit_cli_error_if_needed(&exit);
     cli_exit_to_code(&exit)
 }

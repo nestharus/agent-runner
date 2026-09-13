@@ -108,6 +108,7 @@ fn schema_18_migration_installs_the_running_projection_index() {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
+             ALTER TABLE invocation_completion_obligations DROP COLUMN completion_v2_binding;
              DROP TABLE provider_launch_transition_replays;
              DROP TABLE provider_logical_launches;
              DROP TABLE provider_launch_attempts;
@@ -309,6 +310,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             20,
             21,
             22,
+            23,
             CURRENT_SCHEMA_VERSION,
         ],
         "schema-4 DBs must take every ordered migration through the current schema"
@@ -335,6 +337,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0021_invocation_output_delivery",
             "0022_provider_session_authority",
             "0023_provider_launch_lifecycle",
+            "0024_completion_continuation_binding",
         ]
     );
 }

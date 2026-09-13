@@ -227,6 +227,16 @@ pub fn create_full_state_schema(conn: &Connection, user_version: i32) {
         "
     ))
     .unwrap();
+    if user_version >= 24 {
+        conn.execute_batch(include_str!(
+            "../../migrations/0014_invocation_completion_obligations.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(include_str!(
+            "../../migrations/0024_completion_continuation_binding.sql"
+        ))
+        .unwrap();
+    }
     if user_version >= 23 {
         conn.execute_batch(include_str!(
             "../../migrations/0023_provider_launch_lifecycle.sql"

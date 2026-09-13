@@ -310,6 +310,18 @@ pub(crate) enum Subcommands {
 
 #[derive(Clone, Debug, Subcommand)]
 pub(crate) enum NotifySubcommands {
+    /// Admit this live actor's later listener to an already committed v2 source.
+    #[command(name = "agent-bash-listen")]
+    Listen {
+        #[arg(long)]
+        registration_file: PathBuf,
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        owner_invocation_uuid: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Register an agent-bash completion event and its owner listener before launch.
     #[command(name = "agent-bash-register")]
     Register {
@@ -341,6 +353,12 @@ pub(crate) enum NotifySubcommands {
         #[arg(long)]
         repair_admitted: bool,
 
+        /// Explicit paired notification protocol (requires exact retained request).
+        #[arg(long, requires = "registration_file")]
+        completion_protocol: Option<String>,
+        #[arg(long)]
+        registration_file: Option<PathBuf>,
+
         /// Emit structured JSON.
         #[arg(long)]
         json: bool,
@@ -354,6 +372,31 @@ pub(crate) enum NotifySubcommands {
         handle: String,
 
         /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Read-only exact State registration confirmation; never registration replay.
+    #[command(name = "agent-bash-registration")]
+    Registration {
+        #[arg(long)]
+        registration_file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Read-only acceptance, exact listener ACK and physical attempt projections.
+    #[command(name = "agent-bash-completion-state")]
+    CompletionState {
+        #[arg(long)]
+        registration_file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Nonmutating new-lane domain capability probe; never owner bootstrap.
+    #[command(name = "agent-bash-capability")]
+    Capability {
         #[arg(long)]
         json: bool,
     },
@@ -385,9 +428,12 @@ pub(crate) enum NotifySubcommands {
         #[arg(long)]
         rc: PathBuf,
 
-        /// The caller already consumed the terminal result in-band.
+        #[arg(long, requires = "registration_file")]
+        completion_protocol: Option<String>,
         #[arg(long)]
-        consumed: bool,
+        registration_file: Option<PathBuf>,
+        #[arg(long, requires = "registration_file")]
+        snapshot: Option<PathBuf>,
 
         /// Emit structured JSON.
         #[arg(long)]

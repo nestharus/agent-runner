@@ -81,7 +81,7 @@ fn fresh_migration_registration_and_partial_current_schema_fail_closed() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        23
+        i64::from(CURRENT_SCHEMA_VERSION)
     );
     assert!(
         migrations::plan(22, 23)
@@ -95,12 +95,12 @@ fn fresh_migration_registration_and_partial_current_schema_fail_closed() {
     assert!(StateDb::open_read_only(db.path()).is_err());
 }
 #[test]
-fn schema_22_migrates_once_to_23() {
+fn schema_22_migrates_provider_ownership_once_to_current() {
     let (dir, db, _) = fixture();
     let path = db.path().to_path_buf();
     drop(db);
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE provider_launch_transition_replays; DROP TABLE provider_logical_launches; DROP TABLE provider_launch_attempts; PRAGMA user_version=22;").unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=OFF; ALTER TABLE invocation_completion_obligations DROP COLUMN completion_v2_binding; DROP TABLE provider_launch_transition_replays; DROP TABLE provider_logical_launches; DROP TABLE provider_launch_attempts; PRAGMA user_version=22;").unwrap();
     drop(conn);
     let db = StateDb::open(&path).unwrap();
     assert_eq!(count(&db, "provider_logical_launches"), 0);

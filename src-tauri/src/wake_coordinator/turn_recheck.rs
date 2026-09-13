@@ -85,14 +85,13 @@ fn turn_end_pending_count_on(
     state: &StateDb,
     session_id: &str,
 ) -> Result<usize, String> {
-    super::consumed_completion::reconcile_late_consumed_completions_on(db, session_id)?;
     crate::mailbox_delivery::deliverable_pending_count_on(db, state, session_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wake_coordinator::consumed_completion::ConsumedCompletionFixture;
+    use crate::wake_coordinator::local_receipt_fixture::LocalReceiptFixture;
 
     #[test]
     fn terminal_attempt_recheck_ignores_former_cap_at_five() {
@@ -145,46 +144,41 @@ mod tests {
     }
 
     #[test]
-    fn turn_end_pending_count_reconciles_late_consumption() {
-        let fixture = ConsumedCompletionFixture::new();
-        fixture.mark_consumed();
+    fn turn_end_pending_count_does_not_acknowledge_local_receipt() {
+        let fixture = LocalReceiptFixture::new();
+        fixture.mark_local_receipt();
         let mut db = fixture.mailbox();
         let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
 
         assert_eq!(
-            turn_end_pending_count_on(&mut db, &state, ConsumedCompletionFixture::SESSION_ID)
-                .unwrap(),
-            0
+            turn_end_pending_count_on(&mut db, &state, LocalReceiptFixture::SESSION_ID).unwrap(),
+            1
         );
         assert!(
-            db.list_pending(ConsumedCompletionFixture::SESSION_ID)
+            !db.list_pending(LocalReceiptFixture::SESSION_ID)
                 .unwrap()
                 .is_empty()
         );
         let listener = db
-            .completion_event_listeners(ConsumedCompletionFixture::EVENT_ID)
+            .completion_event_listeners(LocalReceiptFixture::EVENT_ID)
             .unwrap()
             .pop()
             .unwrap();
-        assert_eq!(
-            listener.acknowledgement_reason.as_deref(),
-            Some("consumed_in_call")
-        );
+        assert_eq!(listener.acknowledgement_reason.as_deref(), None);
     }
 
     #[test]
     fn turn_end_pending_count_keeps_unconsumed_completion_pending() {
-        let fixture = ConsumedCompletionFixture::new();
+        let fixture = LocalReceiptFixture::new();
         let mut db = fixture.mailbox();
         let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
 
         assert_eq!(
-            turn_end_pending_count_on(&mut db, &state, ConsumedCompletionFixture::SESSION_ID)
-                .unwrap(),
+            turn_end_pending_count_on(&mut db, &state, LocalReceiptFixture::SESSION_ID).unwrap(),
             1
         );
         let listener = db
-            .completion_event_listeners(ConsumedCompletionFixture::EVENT_ID)
+            .completion_event_listeners(LocalReceiptFixture::EVENT_ID)
             .unwrap()
             .pop()
             .unwrap();

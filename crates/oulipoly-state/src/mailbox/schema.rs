@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub(super) const CURRENT_VERSION: i64 = 17;
+const MAX_SUPPORTED_VERSION: i64 = 18;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -143,6 +144,9 @@ fn migrate_starting_custody(conn: &Connection) -> Result<(), String> {
 pub(super) fn ensure(conn: &mut Connection) -> Result<(), String> {
     let stored_version = sidecar_version(conn)?;
     validate_supported_version(stored_version)?;
+    if stored_version == MAX_SUPPORTED_VERSION {
+        return super::completion_continuation::validate_schema_on(conn);
+    }
     if stored_version == CURRENT_VERSION {
         return Ok(());
     }
@@ -165,7 +169,10 @@ pub(super) fn ensure(conn: &mut Connection) -> Result<(), String> {
         };
         let locked_version = sidecar_version(&tx)?;
         validate_supported_version(locked_version)?;
-        if locked_version == CURRENT_VERSION {
+        if locked_version >= CURRENT_VERSION {
+            if locked_version == MAX_SUPPORTED_VERSION {
+                super::completion_continuation::validate_schema_on(&tx)?;
+            }
             return tx.commit().map_err(|err| {
                 format!("Failed to finish PID mailbox sidecar schema check: {err}")
             });
@@ -176,7 +183,7 @@ pub(super) fn ensure(conn: &mut Connection) -> Result<(), String> {
         } else {
             upgrade_installed_schema(&tx, locked_version)?;
         }
-        tx.pragma_update(None, "user_version", CURRENT_VERSION)
+        tx.pragma_update(None, "user_version", 17)
             .map_err(|err| format!("Failed to record PID mailbox sidecar schema version: {err}"))?;
         return tx.commit().map_err(|err| {
             format!("Failed to commit PID mailbox sidecar schema migration: {err}")
@@ -185,11 +192,11 @@ pub(super) fn ensure(conn: &mut Connection) -> Result<(), String> {
 }
 
 fn validate_supported_version(version: i64) -> Result<(), String> {
-    if (0..=CURRENT_VERSION).contains(&version) {
+    if (0..=MAX_SUPPORTED_VERSION).contains(&version) {
         return Ok(());
     }
     Err(format!(
-        "Unsupported PID mailbox sidecar schema version {version}; expected 0..={CURRENT_VERSION}"
+        "Unsupported PID mailbox sidecar schema version {version}; expected 0..={MAX_SUPPORTED_VERSION}"
     ))
 }
 
@@ -198,7 +205,7 @@ fn create_fresh_schema(conn: &Connection) -> Result<(), String> {
 }
 
 fn upgrade_installed_schema(conn: &Connection, stored_version: i64) -> Result<(), String> {
-    for target_version in (stored_version + 1)..=CURRENT_VERSION {
+    for target_version in (stored_version + 1)..=17 {
         let steps = SCHEMA_STEPS
             .iter()
             .filter(|step| step.target_version == target_version)

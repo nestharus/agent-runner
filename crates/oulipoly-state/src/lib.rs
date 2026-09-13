@@ -31,6 +31,7 @@
 //! ```
 
 mod chain_segments;
+pub mod completion_continuation;
 pub mod continuation;
 mod db;
 pub mod deployment;

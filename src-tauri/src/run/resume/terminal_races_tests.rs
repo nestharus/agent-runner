@@ -8,8 +8,10 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Duration;
 
+type CheckpointCallback = Box<dyn FnMut(&str)>;
+
 thread_local! {
-    static CHECKPOINT: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = Default::default();
+    static CHECKPOINT: std::cell::RefCell<Option<CheckpointCallback>> = Default::default();
 }
 pub(in crate::run::resume) fn checkpoint(point: &str) {
     CHECKPOINT.with_borrow_mut(|hook| {

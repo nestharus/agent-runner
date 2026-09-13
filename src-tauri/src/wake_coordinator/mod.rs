@@ -6,9 +6,10 @@
 mod admission;
 mod auto_wake_env;
 mod constants;
-mod consumed_completion;
 mod diagnostics;
 mod idle;
+#[cfg(test)]
+mod local_receipt_fixture;
 mod retry_cadence;
 mod spawn;
 mod sweep;

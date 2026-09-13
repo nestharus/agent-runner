@@ -82,21 +82,6 @@ pub(super) fn enqueue_and_wait(
     )
 }
 
-#[cfg(test)]
-fn enqueue_and_wait_at(
-    mailbox_path: &Path,
-    registration_identity: &str,
-    session_id: Option<&str>,
-) -> Result<SessionAdmissionGuard, String> {
-    enqueue_and_wait_at_with_memory_observer(
-        mailbox_path,
-        registration_identity,
-        session_id,
-        observe_system_memory,
-        false,
-    )
-}
-
 fn enqueue_and_wait_at_with_memory_observer(
     mailbox_path: &Path,
     registration_identity: &str,

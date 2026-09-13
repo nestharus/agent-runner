@@ -30,6 +30,8 @@ pub(crate) struct AgentBashRegisterArgs<'a> {
     pub log: &'a Path,
     pub rc: &'a Path,
     pub repair_admitted: bool,
+    pub completion_protocol: Option<&'a str>,
+    pub registration_file: Option<&'a Path>,
     pub json: bool,
 }
 
@@ -47,7 +49,10 @@ pub(crate) struct AgentBashCompleteArgs<'a> {
     pub meta: &'a Path,
     pub log: &'a Path,
     pub rc: &'a Path,
-    pub consumed: bool,
+
+    pub completion_protocol: Option<&'a str>,
+    pub registration_file: Option<&'a Path>,
+    pub snapshot: Option<&'a Path>,
     pub json: bool,
 }
 
@@ -131,6 +136,12 @@ struct NotifyPathStrings {
 }
 
 pub(crate) fn run_agent_bash_register(args: AgentBashRegisterArgs<'_>) -> Result<i32, String> {
+    if let Some(path) = args.registration_file {
+        return super::notify_continuation::register(args, path);
+    }
+    if args.completion_protocol.is_some() {
+        return Err("completion protocol requires registration file".into());
+    }
     match register_completion_event(&args) {
         Ok(result) => {
             let owner = result.listeners.first();
@@ -181,6 +192,15 @@ pub(crate) fn run_agent_bash_activate(args: AgentBashActivateArgs<'_>) -> Result
 }
 
 pub(crate) fn run_agent_bash_complete(args: AgentBashCompleteArgs<'_>) -> Result<i32, String> {
+    if let Some(path) = args.registration_file {
+        let snapshot = args
+            .snapshot
+            .ok_or("v2 completion requires immutable snapshot")?;
+        return super::notify_continuation::complete(path, snapshot, args);
+    }
+    if args.completion_protocol.is_some() || args.snapshot.is_some() {
+        return Err("completion protocol requires registration file".into());
+    }
     match trigger_completion_event(&args) {
         Ok((result, pty_deliveries, wake)) => {
             let owner = result.listeners.first();
@@ -258,7 +278,36 @@ fn register_completion_event(
     }
 }
 
-fn completion_obligation_admission_id(event_id: &str, owner_invocation_uuid: &str) -> String {
+pub(super) fn validate_continuation_registration_context(
+    args: &AgentBashRegisterArgs<'_>,
+    binding: &oulipoly_state::completion_continuation::AdmittedSourceBinding,
+) -> Result<(), String> {
+    let source = binding.registration()?;
+    let paths = source.paths();
+    if args.handle != source.handle
+        || args.delivery_mode != source.delivery_mode
+        || args.state_dir != Path::new(&source.handle_dir)
+        || args.meta != Path::new(&paths[0])
+        || args.log != Path::new(&paths[1])
+        || args.rc != Path::new(&paths[2])
+    {
+        return Err("immutable v2 registration route/path conflict".into());
+    }
+    let metadata = read_metadata(args.meta)?;
+    let owner = parse_owner_binding(&metadata)?;
+    if owner.session_id != source.owner_session_id
+        || owner.invocation_uuid != source.owner_invocation_uuid
+    {
+        return Err("immutable v2 owner binding conflict".into());
+    }
+    let state = StateDb::open_read_only(&StateDb::default_path()?).map_err(|e| format!("{e:?}"))?;
+    reconcile_owner_binding(&state, &owner, &metadata)
+}
+
+pub(super) fn completion_obligation_admission_id(
+    event_id: &str,
+    owner_invocation_uuid: &str,
+) -> String {
     format!(
         "completion:{}:{event_id}:owner:{}:{owner_invocation_uuid}",
         event_id.len(),
@@ -318,7 +367,6 @@ fn trigger_completion_event(
             log_path: &paths.log_path,
             rc_path: &paths.rc_path,
             rc,
-            consumed: args.consumed,
         },
     )?;
     let (delivery, wake) = deliver_and_wake_event_listeners(&mut mailbox, &result.mailbox_rows);
@@ -940,7 +988,6 @@ mod tests {
             log_path: "/state/log",
             rc_path: "/state/rc",
             rc: 7,
-            consumed: false,
         };
         let first = mailbox.trigger_completion_event(input).unwrap();
         let incoming = serde_json::to_string(&completion_payload_identity(legacy_payload)).unwrap();

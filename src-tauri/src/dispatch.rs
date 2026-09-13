@@ -236,8 +236,7 @@ fn startup_wake_reclaim_sweep_enabled(cli: &Cli) -> bool {
         // startup/maintenance triggers retain their recovery opportunities.
         Some(Subcommands::Session {
             command: SessionSubcommands::Export { .. },
-        })
-            | Some(Subcommands::Notify { .. })
+        }) | Some(Subcommands::Notify { .. })
             | Some(Subcommands::Resume { .. })
             | Some(Subcommands::Repl {
                 resume: Some(_),
@@ -430,6 +429,16 @@ fn dispatch_subcommand(
 
 fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String> {
     match command {
+        NotifySubcommands::Listen {
+            registration_file,
+            session_id,
+            owner_invocation_uuid,
+            ..
+        } => crate::commands::notify_continuation::listen(
+            &registration_file,
+            &session_id,
+            &owner_invocation_uuid,
+        ),
         NotifySubcommands::Register {
             handle,
             delivery_mode,
@@ -438,6 +447,8 @@ fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String>
             log,
             rc,
             repair_admitted,
+            completion_protocol,
+            registration_file,
             json,
         } => crate::commands::notify::run_agent_bash_register(
             crate::commands::notify::AgentBashRegisterArgs {
@@ -448,9 +459,18 @@ fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String>
                 log: &log,
                 rc: &rc,
                 repair_admitted,
+                completion_protocol: completion_protocol.as_deref(),
+                registration_file: registration_file.as_deref(),
                 json,
             },
         ),
+        NotifySubcommands::Registration {
+            registration_file, ..
+        } => crate::commands::notify_continuation::readback(&registration_file, false),
+        NotifySubcommands::CompletionState {
+            registration_file, ..
+        } => crate::commands::notify_continuation::readback(&registration_file, true),
+        NotifySubcommands::Capability { .. } => crate::commands::notify_continuation::capability(),
         NotifySubcommands::Activate { handle, json } => {
             crate::commands::notify::run_agent_bash_activate(
                 crate::commands::notify::AgentBashActivateArgs {
@@ -466,7 +486,10 @@ fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String>
             meta,
             log,
             rc,
-            consumed,
+
+            completion_protocol,
+            registration_file,
+            snapshot,
             json,
         } => crate::commands::notify::run_agent_bash_complete(
             crate::commands::notify::AgentBashCompleteArgs {
@@ -476,7 +499,10 @@ fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String>
                 meta: &meta,
                 log: &log,
                 rc: &rc,
-                consumed,
+
+                completion_protocol: completion_protocol.as_deref(),
+                registration_file: registration_file.as_deref(),
+                snapshot: snapshot.as_deref(),
                 json,
             },
         ),
@@ -859,10 +885,8 @@ mod tests {
 
     #[test]
     fn session_export_does_not_schedule_incidental_startup_recovery() {
-        let cli = Cli::try_parse_from([
-            "oulipoly-agent-runner", "session", "export", "session-id",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["oulipoly-agent-runner", "session", "export", "session-id"])
+            .unwrap();
         assert!(!startup_wake_reclaim_sweep_enabled(&cli));
     }
 

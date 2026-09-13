@@ -40,6 +40,11 @@ pub(crate) fn trigger_notify_wake(session_id: &str) -> WakeDiagnostic {
 }
 
 pub(super) fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
+    match crate::completion_owner::defer_wake_to_owner() {
+        Ok(true) => return WakeDiagnostic::status("independent_owner_pending"),
+        Err(error) => return storage_error_diagnostic(error),
+        Ok(false) => {}
+    }
     let claim_token = Uuid::new_v4().to_string();
     let mut context = match prepare_wake_start_context(input, &claim_token) {
         Ok(context) => context,
@@ -78,8 +83,6 @@ fn prepare_wake_start_context_with_db<'a>(
     let runtime =
         session_metadata_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
     let input = normalize_start_wake_input(input, runtime.as_ref());
-    super::consumed_completion::reconcile_late_consumed_completions_on(&mut db, input.session_id)
-        .map_err(storage_error_diagnostic)?;
     let liveness = wake_runtime_liveness(&mut db, input.session_id)?;
     cleanup_idle_runtime(&liveness);
     if wake_liveness_busy(&liveness) {
@@ -200,6 +203,11 @@ fn session_metadata_for_wake(
 }
 
 fn record_wake_pid_or_warn(db: &mut MailboxDb, session_id: &str, claim_token: &str, wake_pid: i64) {
+    // In v2 the returned PID is the independently reaping custodian. Native
+    // child admission records its own launcher PID; never overwrite it with AC.
+    if db.completion_continuation_domain().ok().flatten().is_some() {
+        return;
+    }
     if let Err(err) =
         db.wake_sessions()
             .record_wake_claim_pid_identity(session_id, claim_token, wake_pid)
@@ -215,13 +223,13 @@ fn warn_wake_pid_record_failed(session_id: &str, claim_token: &str, err: String)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wake_coordinator::consumed_completion::ConsumedCompletionFixture;
+    use crate::wake_coordinator::local_receipt_fixture::LocalReceiptFixture;
     use oulipoly_state::mailbox::{SessionMetadataUpsert, WakeClaimRequest};
 
     #[test]
     fn unpause_concurrent_sleeping_requests_admit_only_one_owner_without_replay() {
-        let fixture = ConsumedCompletionFixture::new();
-        let session = ConsumedCompletionFixture::SESSION_ID;
+        let fixture = LocalReceiptFixture::new();
+        let session = LocalReceiptFixture::SESSION_ID;
         fixture
             .mailbox()
             .set_notifications_paused(session, true)
@@ -313,8 +321,8 @@ mod tests {
 
     #[test]
     fn stopped_observation_rejects_notify_retry_and_restart_sweep_without_claim_takeover() {
-        let fixture = ConsumedCompletionFixture::new();
-        let session = ConsumedCompletionFixture::SESSION_ID;
+        let fixture = LocalReceiptFixture::new();
+        let session = LocalReceiptFixture::SESSION_ID;
         let mut db = fixture.mailbox();
         let rows = db.list_pending(session).unwrap();
         let seq = rows[0].seq;
@@ -408,7 +416,7 @@ mod tests {
             );
             assert_eq!(db.list_pending(session).unwrap().len(), 1);
             assert_eq!(
-                db.completion_event_listeners(ConsumedCompletionFixture::EVENT_ID)
+                db.completion_event_listeners(LocalReceiptFixture::EVENT_ID)
                     .unwrap()[0]
                     .acknowledgement_reason,
                 None
@@ -452,13 +460,13 @@ mod tests {
 
     #[test]
     fn maximum_persisted_count_acquires_exact_wake_claim() {
-        let fixture = ConsumedCompletionFixture::new();
+        let fixture = LocalReceiptFixture::new();
         let mut db = fixture.mailbox();
         db.wake_sessions()
             .upsert_session_metadata(SessionMetadataUpsert {
-                session_id: ConsumedCompletionFixture::SESSION_ID,
+                session_id: LocalReceiptFixture::SESSION_ID,
                 mode: "headless",
-                invocation_uuid: Some(ConsumedCompletionFixture::INVOCATION_UUID),
+                invocation_uuid: Some(LocalReceiptFixture::INVOCATION_UUID),
                 provider_name: Some("fixture-provider"),
                 model_name: Some("fixture-model"),
                 models_dir: None,
@@ -468,7 +476,7 @@ mod tests {
         let seeded = db
             .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
-                session_id: ConsumedCompletionFixture::SESSION_ID,
+                session_id: LocalReceiptFixture::SESSION_ID,
                 claim_token: "seed-count-token",
                 reason: "fixture",
                 auto_wake_count: i64::MAX,
@@ -478,12 +486,12 @@ mod tests {
             .unwrap();
         assert!(matches!(seeded, WakeClaimAcquireResult::Acquired(_)));
         db.wake_sessions()
-            .release_wake_claim(ConsumedCompletionFixture::SESSION_ID, "seed-count-token")
+            .release_wake_claim(LocalReceiptFixture::SESSION_ID, "seed-count-token")
             .unwrap();
 
         let context = prepare_wake_start_context_with_db(
             StartWakeInput {
-                session_id: ConsumedCompletionFixture::SESSION_ID,
+                session_id: LocalReceiptFixture::SESSION_ID,
                 reason: "notify_idle",
                 auto_wake_count: 1,
                 renew_token: None,
@@ -504,7 +512,7 @@ mod tests {
             context
                 .db
                 .wake_session_reader()
-                .wake_claim(ConsumedCompletionFixture::SESSION_ID)
+                .wake_claim(LocalReceiptFixture::SESSION_ID)
                 .unwrap()
                 .unwrap()
                 .claim_token,
@@ -513,46 +521,32 @@ mod tests {
     }
 
     #[test]
-    fn wake_start_reconciles_late_consumption_before_claim() {
-        let fixture = ConsumedCompletionFixture::new();
-        fixture.mark_consumed();
-
-        let diagnostic = match prepare_wake_start_context_with_db(
+    fn local_receipt_does_not_suppress_wake_admission() {
+        let fixture = LocalReceiptFixture::new();
+        fixture.mark_local_receipt();
+        let context = prepare_wake_start_context_with_db(
             StartWakeInput {
-                session_id: ConsumedCompletionFixture::SESSION_ID,
+                session_id: LocalReceiptFixture::SESSION_ID,
                 reason: "test",
                 auto_wake_count: 1,
                 renew_token: None,
             },
             "claim-token",
             fixture.mailbox(),
-        ) {
-            Err(diagnostic) => diagnostic,
-            Ok(_) => panic!("consumed completion must stop wake preparation"),
-        };
-
-        assert_eq!(diagnostic.status, "no_pending");
-        assert!(!diagnostic.attempted);
+        );
+        assert!(context.is_ok());
         let db = fixture.mailbox();
-        assert!(
-            db.list_pending(ConsumedCompletionFixture::SESSION_ID)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            db.wake_session_reader()
-                .wake_claim(ConsumedCompletionFixture::SESSION_ID)
-                .unwrap()
-                .is_none()
-        );
-        let listener = db
-            .completion_event_listeners(ConsumedCompletionFixture::EVENT_ID)
-            .unwrap()
-            .pop()
-            .unwrap();
         assert_eq!(
-            listener.acknowledgement_reason.as_deref(),
-            Some("consumed_in_call")
+            db.list_pending(LocalReceiptFixture::SESSION_ID)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            db.completion_event_listeners(LocalReceiptFixture::EVENT_ID)
+                .unwrap()[0]
+                .acknowledged_at
+                .is_none()
         );
     }
 }

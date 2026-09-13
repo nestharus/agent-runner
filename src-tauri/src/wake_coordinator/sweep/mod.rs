@@ -3,7 +3,6 @@
 //! `orchestration`
 
 mod candidate;
-mod consumed;
 mod handoff;
 mod lease;
 mod live_pty_retry;

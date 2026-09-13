@@ -177,15 +177,6 @@ impl Fixture {
     }
 
     fn run_notify_artifacts(&self, handle: &str, artifacts: &NotifyArtifacts) -> Output {
-        self.run_notify_artifacts_with_consumed(handle, artifacts, false)
-    }
-
-    fn run_notify_artifacts_with_consumed(
-        &self,
-        handle: &str,
-        artifacts: &NotifyArtifacts,
-        consumed: bool,
-    ) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("notify")
             .arg("agent-bash-complete")
@@ -202,9 +193,6 @@ impl Fixture {
             .arg("--rc")
             .arg(&artifacts.rc)
             .arg("--json");
-        if consumed {
-            cmd.arg("--consumed");
-        }
         self.run(cmd)
     }
 
@@ -1250,7 +1238,7 @@ fn completion_trigger_replay_accepts_delivery_bookkeeping_after_receipt() {
 }
 
 #[test]
-fn completion_trigger_replay_accepts_bookkeeping_after_consumed_payload_reclamation() {
+fn completion_trigger_replay_accepts_bookkeeping_after_exact_ack_payload_reclamation() {
     let fixture = Fixture::new();
     fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
     let handle = "h-consumed-replay";
@@ -1258,9 +1246,14 @@ fn completion_trigger_replay_accepts_bookkeeping_after_consumed_payload_reclamat
     let artifacts = fixture.write_notify_artifacts(handle, metadata.clone(), 7);
     let registration = fixture.run_register_artifacts(handle, "sync", &artifacts);
     assert!(registration.status.success(), "{registration:?}");
-    let first = fixture.run_notify_artifacts_with_consumed(handle, &artifacts, true);
+    let first = fixture.run_notify_artifacts(handle, &artifacts);
     assert!(first.status.success(), "{first:?}");
-    let db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+    let mut db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+    let activated = db.activate_completion_event_listeners(handle).unwrap();
+    let seq = activated.mailbox_rows[0].seq;
+    assert!(activated.listeners[0].acknowledged_at.is_none());
+    db.acknowledge_range(SESSION_A, seq, seq, INVOCATION_A)
+        .unwrap();
     let original = db.completion_event(handle).unwrap().unwrap();
     let listeners = db.completion_event_listeners(handle).unwrap();
     assert!(original.payload_reclaimed_at.is_some());
@@ -1270,11 +1263,11 @@ fn completion_trigger_replay_accepts_bookkeeping_after_consumed_payload_reclamat
     metadata["updated_at_unix_ms"] = json!(1788585398898_i64);
     fs::write(&artifacts.meta, notify_metadata_content(&metadata)).unwrap();
 
-    let replay = fixture.run_notify_artifacts_with_consumed(handle, &artifacts, true);
+    let replay = fixture.run_notify_artifacts(handle, &artifacts);
     assert!(replay.status.success(), "{replay:?}");
     assert_eq!(stdout_json(&replay)["status"], "already_triggered");
     assert_eq!(stdout_json(&replay)["pty_deliveries"], json!([]));
-    assert!(fixture.mailbox_rows(SESSION_A, true).is_empty());
+    assert_eq!(fixture.mailbox_rows(SESSION_A, true).len(), 1);
     let replayed = db.completion_event(handle).unwrap().unwrap();
     assert_eq!(replayed.payload_sha256, original.payload_sha256);
     assert_eq!(replayed.payload_byte_len, original.payload_byte_len);
@@ -1324,7 +1317,6 @@ fn completion_trigger_replay_preserves_preexisting_payload_bytes() {
             log_path: artifacts.log.to_str().unwrap(),
             rc_path: artifacts.rc.to_str().unwrap(),
             rc: 7,
-            consumed: false,
         })
         .unwrap();
     db.mark_delivered(SESSION_A, None, &[seeded.mailbox_rows[0].seq], INVOCATION_A)

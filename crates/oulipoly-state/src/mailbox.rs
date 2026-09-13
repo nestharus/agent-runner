@@ -23,9 +23,13 @@ use uuid::Uuid;
 
 use crate::pid_identity::{self, ProcessIdentity};
 
+mod completion_continuation;
 mod finalization;
 #[path = "mailbox/schema.rs"]
 mod schema;
+pub use completion_continuation::{
+    CompletionDomainOwner, ContinuationAttempt, activation_request_sha256,
+};
 pub use finalization::DeliveryFinalizationGuard;
 
 pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
@@ -596,7 +600,6 @@ pub struct CompletionEventTriggerInput<'a> {
     pub log_path: &'a str,
     pub rc_path: &'a str,
     pub rc: i32,
-    pub consumed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1096,8 +1099,18 @@ impl CompletionAuthorityFence<'_> {
         self,
         input: CompletionEventRegistrationInput<'_>,
         continuity: &CompletionContinuityHead,
+        binding: Option<&crate::completion_continuation::AdmittedSourceBinding>,
     ) -> Result<CompletionEventRegistrationResult, String> {
         let inserted = register_completion_event_on(&self.tx, &input, &now_rfc3339())?;
+        if let Some(binding) = binding {
+            self.materialize_continuation_binding(binding)?;
+            let event = completion_event_by_id_on(&self.tx, input.event_id)?
+                .ok_or("registered source disappeared")?;
+            if event.state == "triggered" {
+                self.tx.execute("UPDATE completion_event_listener SET active=1 WHERE event_id=?1 AND acknowledged_at IS NULL",[input.event_id]).map_err(|e|e.to_string())?;
+                materialize_completion_event_listeners(&self.tx, &event, &now_rfc3339())?;
+            }
+        }
         append_completion_continuity_on(&self.tx, continuity)?;
         let result = completion_event_registration_on(&self.tx, input.event_id, inserted)?;
         self.tx
@@ -1539,6 +1552,8 @@ impl RuntimeLifecycleRepository<'_> {
             .map_err(generation_storage_error(
                 "start generation creation transaction",
             ))?;
+        completion_continuation::bind_generation_on(&tx, request, &creator_process_identity)
+            .map_err(GenerationStorageError::new)?;
         let changed = tx
             .execute(
                 "INSERT OR IGNORE INTO runtime_generation (
@@ -1667,6 +1682,8 @@ impl RuntimeLifecycleRepository<'_> {
             runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
                 GenerationStorageError::new("Runtime generation missing after binding".to_string())
             })?;
+        completion_continuation::mark_activation_running_on(&tx, request.fence.generation_id)
+            .map_err(GenerationStorageError::new)?;
         project_running_generation_on(&tx, &row)?;
         tx.commit().map_err(generation_storage_error(
             "commit generation binding transaction",
@@ -1811,7 +1828,10 @@ impl RuntimeLifecycleReader<'_> {
         let sql = format_runtime_generations_for_session_sql(true);
         let generations = runtime_generations_for_session_on(self.conn, session_id, &sql)
             .map_err(|error| error.to_string())?;
-        Ok(classify_generation_liveness_read_only(self.conn, &generations))
+        Ok(classify_generation_liveness_read_only(
+            self.conn,
+            &generations,
+        ))
     }
 }
 
@@ -2504,7 +2524,9 @@ impl RuntimeLifecycleRepository<'_> {
             Some(_) => unreachable!("only predecessor dispositions are mapped"),
         }
         if !custody_allows_terminal(&tx, &before) {
-            return Ok(DrainFinishResult::Rejected(GenerationRejection::InvariantViolation));
+            return Ok(DrainFinishResult::Rejected(
+                GenerationRejection::InvariantViolation,
+            ));
         }
         if let Err(rejection) = validate_drain_finish_claim(&before) {
             tx.commit().map_err(generation_storage_error(
@@ -2598,6 +2620,31 @@ impl MailboxDb {
         &mut self,
         input: CompletionEventTriggerInput<'_>,
     ) -> Result<CompletionEventTriggerResult, String> {
+        self.trigger_completion_event_bound(input, None)
+    }
+
+    pub fn trigger_completion_continuation(
+        &mut self,
+        input: CompletionEventTriggerInput<'_>,
+        binding: &crate::completion_continuation::AdmittedSourceBinding,
+        evidence: &crate::completion_continuation::VerifiedCompletion,
+    ) -> Result<CompletionEventTriggerResult, String> {
+        if evidence.snapshot.identity != binding.identity()?
+            || input.event_id != evidence.snapshot.identity.handle
+        {
+            return Err("completion acceptance identity conflict".into());
+        }
+        self.trigger_completion_event_bound(input, Some((binding, evidence)))
+    }
+
+    fn trigger_completion_event_bound(
+        &mut self,
+        input: CompletionEventTriggerInput<'_>,
+        continuation: Option<(
+            &crate::completion_continuation::AdmittedSourceBinding,
+            &crate::completion_continuation::VerifiedCompletion,
+        )>,
+    ) -> Result<CompletionEventTriggerResult, String> {
         validate_completion_event_trigger(&input)?;
         let published = self
             .payloads()
@@ -2611,6 +2658,11 @@ impl MailboxDb {
                 format!("Failed to start completion event trigger transaction: {err}")
             })?;
         verify_published_payload(&published)?;
+        if let Some((binding, evidence)) = continuation {
+            completion_continuation::accept_on(&tx, binding, evidence, &published)?;
+        } else {
+            completion_continuation::reject_unbound_v2_trigger(&tx, input.event_id)?;
+        }
         let event = completion_event_by_id_on(&tx, input.event_id)?
             .ok_or_else(|| format!("Completion event {} is not registered", input.event_id))?;
         validate_completion_event_trigger_source(&event, &input)?;
@@ -2628,8 +2680,8 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to refresh replayed completion payload: {err}"))?;
             false
         };
-        if input.consumed {
-            acknowledge_consumed_completion_event_listeners(&tx, input.event_id, &now)?;
+        if continuation.is_some() {
+            tx.execute("UPDATE completion_event_listener SET active=1 WHERE event_id=?1 AND acknowledged_at IS NULL", [input.event_id]).map_err(|e| e.to_string())?;
         }
         let event = completion_event_by_id_on(&tx, input.event_id)?
             .ok_or_else(|| format!("Completion event {} disappeared", input.event_id))?;
@@ -2649,37 +2701,6 @@ impl MailboxDb {
         event_id: &str,
     ) -> Result<Vec<CompletionEventListenerRow>, String> {
         completion_event_listeners_on(&self.conn, event_id)
-    }
-
-    pub fn acknowledge_consumed_completion_event_for_mailbox_seq(
-        &mut self,
-        mailbox_seq: i64,
-        consumer_session_id: &str,
-        consumer_invocation_uuid: &str,
-    ) -> Result<Option<String>, String> {
-        let now = now_rfc3339();
-        let tx = begin_consumed_completion_acknowledgement(&mut self.conn)?;
-        let Some(binding) = consumed_completion_binding(&tx, mailbox_seq)? else {
-            commit_consumed_completion_acknowledgement(tx)?;
-            return Ok(None);
-        };
-        if !binding.owner_matches(consumer_session_id, consumer_invocation_uuid) {
-            commit_consumed_completion_acknowledgement(tx)?;
-            return Ok(None);
-        }
-        if binding.is_settled() || completion_consumption_claimed(&tx, &binding.event_id)? {
-            commit_consumed_completion_acknowledgement(tx)?;
-            return Ok(None);
-        }
-        let mailbox_changed =
-            consume_completion_mailbox_row(&tx, mailbox_seq, &now, &binding.owner_invocation_uuid)?;
-        validate_consumed_completion_change(mailbox_changed, "mailbox row", mailbox_seq)?;
-        let listener_changed = acknowledge_consumed_completion_listener(&tx, mailbox_seq, &now)?;
-        validate_consumed_completion_change(listener_changed, "listener", mailbox_seq)?;
-        resolve_completed_delivery_attempts_for_mailbox_seq(&tx, mailbox_seq, &now)?;
-        commit_consumed_completion_acknowledgement(tx)?;
-        self.maintain_terminal_history();
-        Ok(Some(binding.event_id))
     }
 
     fn completion_event_trigger_result(
@@ -3082,7 +3103,7 @@ impl MailboxDb {
                 |row| row.get(0),
             )
             .map_err(|err| format!("Failed to inspect mailbox payload references: {err}"))?;
-        if live {
+        if live || completion_continuation::retained_payload(&tx, &payload.sha256)? {
             tx.commit()
                 .map_err(|err| format!("Failed to finish mailbox payload inspection: {err}"))?;
             return Ok(PayloadReclaimResult::default());
@@ -4258,14 +4279,19 @@ impl MailboxDb {
         // make admitted work eligible for retransmission.
         tx.commit().map_err(|e| e.to_string())?;
         if let Err(error) = self.project_native_delivery_receipt(
-            attempt_id, invocation_uuid, &anchor.provider_session_id, &now,
+            attempt_id,
+            invocation_uuid,
+            &anchor.provider_session_id,
+            &now,
         ) {
-            self.conn.execute(
-                "UPDATE mailbox_delivery_attempts SET observation_error = ?3
+            self.conn
+                .execute(
+                    "UPDATE mailbox_delivery_attempts SET observation_error = ?3
                  WHERE attempt_id = ?1 AND delivery_invocation_uuid = ?2
                    AND resolved_at IS NULL AND observation_confirmed_at IS NOT NULL",
-                params![attempt_id, invocation_uuid, truncate_utf8(&error, 1024)],
-            ).map_err(|storage| format!("{error}; receipt projection diagnostic: {storage}"))?;
+                    params![attempt_id, invocation_uuid, truncate_utf8(&error, 1024)],
+                )
+                .map_err(|storage| format!("{error}; receipt projection diagnostic: {storage}"))?;
             return Err(error);
         }
         Ok(true)
@@ -4278,7 +4304,10 @@ impl MailboxDb {
         session_id: &str,
         now: &str,
     ) -> Result<(), String> {
-        let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
         tx.execute(
             "UPDATE mailbox SET delivered_at = ?2, delivered_by_invocation_uuid = ?3,
                 delivery_attempts = delivery_attempts + 1, delivery_error = NULL
@@ -5571,6 +5600,7 @@ impl WakeSessionRepository<'_> {
             return Ok(WakeClaimAcquireResult::AlreadyInFlight(existing));
         }
         let claim = acquire_wake_claim_tx(&tx, input, &now, min_seq, max_seq)?;
+        completion_continuation::reserve_activation_on(&tx, input)?;
         commit_wake_claim_transaction(tx)?;
         Ok(WakeClaimAcquireResult::Acquired(claim))
     }
@@ -5616,6 +5646,7 @@ impl WakeSessionRepository<'_> {
                 .map_err(|err| format!("Failed to commit retained manual wake claim: {err}"))?;
             return Ok(false);
         }
+        completion_continuation::cancel_unaccepted_activation_on(&tx, session_id, claim_token)?;
         let changed = tx
             .execute(
                 "DELETE FROM session_wake_claim
@@ -5854,6 +5885,7 @@ impl WakeSessionRepository<'_> {
                 .map_err(|err| format!("Failed to commit rejected wake-child admission: {err}"))?;
             return Ok(false);
         };
+        completion_continuation::admit_launcher_on(&tx, session_id, claim_token, child_identity)?;
         if claim.wake_invocation_uuid.is_some() {
             let replay_matches =
                 wake_claim_has_matching_live_process_identity(&tx, &claim, child_identity)?;
@@ -6244,187 +6276,6 @@ fn resolve_completed_delivery_attempts(
     )
     .map(|_| ())
     .map_err(|err| format!("Failed to resolve completed mailbox delivery attempts: {err}"))
-}
-
-struct ConsumedCompletionBinding {
-    event_id: String,
-    owner_session_id: String,
-    owner_invocation_uuid: String,
-    acknowledged_at: Option<String>,
-    delivered_at: Option<String>,
-}
-
-impl ConsumedCompletionBinding {
-    fn owner_matches(&self, session_id: &str, invocation_uuid: &str) -> bool {
-        self.owner_session_id == session_id && self.owner_invocation_uuid == invocation_uuid
-    }
-
-    fn is_settled(&self) -> bool {
-        self.acknowledged_at.is_some() || self.delivered_at.is_some()
-    }
-}
-
-fn begin_consumed_completion_acknowledgement(
-    conn: &mut Connection,
-) -> Result<Transaction<'_>, String> {
-    conn.transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(format_consumed_completion_transaction_start_error)
-}
-
-fn format_consumed_completion_transaction_start_error(err: rusqlite::Error) -> String {
-    format!("Failed to start consumed completion acknowledgement transaction: {err}")
-}
-
-fn consumed_completion_binding(
-    tx: &Transaction<'_>,
-    mailbox_seq: i64,
-) -> Result<Option<ConsumedCompletionBinding>, String> {
-    tx.query_row(
-        "SELECT listener.event_id, listener.session_id,
-                listener.owner_invocation_uuid, listener.acknowledged_at,
-                mailbox.delivered_at
-         FROM completion_event_listener AS listener
-         JOIN mailbox ON mailbox.seq = listener.mailbox_seq
-         WHERE listener.mailbox_seq = ?1",
-        params![mailbox_seq],
-        map_consumed_completion_binding,
-    )
-    .optional()
-    .map_err(format_consumed_completion_binding_error)
-}
-
-fn map_consumed_completion_binding(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<ConsumedCompletionBinding> {
-    Ok(ConsumedCompletionBinding {
-        event_id: row.get(0)?,
-        owner_session_id: row.get(1)?,
-        owner_invocation_uuid: row.get(2)?,
-        acknowledged_at: row.get(3)?,
-        delivered_at: row.get(4)?,
-    })
-}
-
-fn format_consumed_completion_binding_error(err: rusqlite::Error) -> String {
-    format!("Failed to resolve mailbox completion event: {err}")
-}
-
-fn completion_consumption_claimed(tx: &Transaction<'_>, event_id: &str) -> Result<bool, String> {
-    tx.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM completion_event_listener
-            WHERE event_id = ?1
-              AND acknowledgement_reason = 'consumed_in_call'
-         )",
-        params![event_id],
-        |row| row.get(0),
-    )
-    .map_err(format_completion_consumption_claim_error)
-}
-
-fn format_completion_consumption_claim_error(err: rusqlite::Error) -> String {
-    format!("Failed to inspect completion consumption claim: {err}")
-}
-
-fn consume_completion_mailbox_row(
-    tx: &Transaction<'_>,
-    mailbox_seq: i64,
-    acknowledged_at: &str,
-    owner_invocation_uuid: &str,
-) -> Result<usize, String> {
-    tx.execute(
-        "UPDATE mailbox
-         SET delivered_at = ?2,
-             delivered_by_invocation_uuid = ?3,
-             delivery_attempts = delivery_attempts + 1,
-             delivery_error = NULL
-         WHERE seq = ?1 AND delivered_at IS NULL",
-        params![mailbox_seq, acknowledged_at, owner_invocation_uuid],
-    )
-    .map_err(format_consumed_completion_mailbox_error)
-}
-
-fn format_consumed_completion_mailbox_error(err: rusqlite::Error) -> String {
-    format!("Failed to consume completion event mailbox row: {err}")
-}
-
-fn acknowledge_consumed_completion_listener(
-    tx: &Transaction<'_>,
-    mailbox_seq: i64,
-    acknowledged_at: &str,
-) -> Result<usize, String> {
-    tx.execute(
-        "UPDATE completion_event_listener
-         SET active = 0,
-             acknowledged_at = ?2,
-             acknowledgement_reason = 'consumed_in_call'
-         WHERE mailbox_seq = ?1 AND acknowledged_at IS NULL",
-        params![mailbox_seq, acknowledged_at],
-    )
-    .map_err(format_consumed_completion_listener_error)
-}
-
-fn format_consumed_completion_listener_error(err: rusqlite::Error) -> String {
-    format!("Failed to acknowledge consumed completion listener: {err}")
-}
-
-fn validate_consumed_completion_change(
-    changed: usize,
-    target: &str,
-    mailbox_seq: i64,
-) -> Result<(), String> {
-    if changed == 1 {
-        return Ok(());
-    }
-    Err(format_consumed_completion_change_error(target, mailbox_seq))
-}
-
-fn format_consumed_completion_change_error(target: &str, mailbox_seq: i64) -> String {
-    format!(
-        "Completion event {target} for mailbox row {mailbox_seq} changed while it was being consumed"
-    )
-}
-
-fn commit_consumed_completion_acknowledgement(tx: Transaction<'_>) -> Result<(), String> {
-    tx.commit()
-        .map_err(format_consumed_completion_transaction_commit_error)
-}
-
-fn format_consumed_completion_transaction_commit_error(err: rusqlite::Error) -> String {
-    format!("Failed to commit consumed completion acknowledgement: {err}")
-}
-
-fn resolve_completed_delivery_attempts_for_mailbox_seq(
-    tx: &Transaction<'_>,
-    mailbox_seq: i64,
-    resolved_at: &str,
-) -> Result<(), String> {
-    tx.execute(
-        "UPDATE mailbox_delivery_attempts AS attempt
-         SET resolved_at = COALESCE(resolved_at, ?2)
-         WHERE resolved_at IS NULL
-           AND EXISTS (
-                 SELECT 1
-                 FROM mailbox_delivery_attempt_items AS consumed
-                 WHERE consumed.attempt_id = attempt.attempt_id
-                   AND consumed.mailbox_seq = ?1
-             )
-           AND NOT EXISTS (
-                 SELECT 1
-                 FROM mailbox_delivery_attempt_items AS unresolved
-                 JOIN mailbox ON mailbox.seq = unresolved.mailbox_seq
-                 WHERE unresolved.attempt_id = attempt.attempt_id
-                   AND mailbox.delivered_at IS NULL
-             )",
-        params![mailbox_seq, resolved_at],
-    )
-    .map(|_| ())
-    .map_err(format_exact_row_delivery_attempt_resolution_error)
-}
-
-fn format_exact_row_delivery_attempt_resolution_error(err: rusqlite::Error) -> String {
-    format!("Failed to resolve exact-row mailbox delivery attempts: {err}")
 }
 
 fn payload_address(sha256: &str) -> String {
@@ -7097,11 +6948,13 @@ fn terminal_history_retention_stats_on(
     )?;
     let reclaimable_payload_files = count_rows(
         conn,
-        "SELECT COUNT(*) FROM (
+        &format!(
+            "SELECT COUNT(*) FROM (
              SELECT DISTINCT event.payload_sha256
              FROM completion_event AS event
              WHERE event.state = 'triggered'
                AND event.payload_reclaimed_at IS NULL
+               {}
                AND event.payload_file_path IS NOT NULL
                AND event.payload_sha256 IS NOT NULL
                AND NOT EXISTS (
@@ -7117,6 +6970,8 @@ fn terminal_history_retention_stats_on(
                      AND listener.acknowledged_at IS NULL
                )
          )",
+            continuation_payload_retention_predicate(conn)?
+        ),
         [],
         "reclaimable terminal payload files",
     )?;
@@ -7236,16 +7091,29 @@ fn prunable_terminal_mailbox_rows(
         .map_err(|err| format!("Failed to read terminal mailbox row: {err}"))
 }
 
+fn continuation_payload_retention_predicate(conn: &Connection) -> Result<&'static str, String> {
+    let has_domain:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='completion_continuation_domain')",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if has_domain {
+        completion_continuation::validate_schema_on(conn)?;
+        Ok(
+            "AND NOT EXISTS (SELECT 1 FROM completion_continuation_source source WHERE source.payload_sha256=event.payload_sha256 AND source.phase='accepted')",
+        )
+    } else {
+        Ok("")
+    }
+}
+
 fn reclaimable_completion_payloads(
     conn: &Connection,
     limit: i64,
 ) -> Result<Vec<RetiredPayload>, String> {
     let mut statement = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT event.payload_file_path, event.payload_sha256
              FROM completion_event AS event
              WHERE event.state = 'triggered'
                AND event.payload_reclaimed_at IS NULL
+               {}
                AND event.payload_file_path IS NOT NULL
                AND event.payload_sha256 IS NOT NULL
                AND NOT EXISTS (
@@ -7263,7 +7131,8 @@ fn reclaimable_completion_payloads(
              GROUP BY event.payload_sha256
              ORDER BY MIN(event.triggered_at), event.payload_sha256
              LIMIT ?1",
-        )
+            continuation_payload_retention_predicate(conn)?
+        ))
         .map_err(|err| format!("Failed to prepare terminal payload reclamation: {err}"))?;
     let rows = statement
         .query_map(params![limit], |row| {
@@ -8916,19 +8785,38 @@ fn register_custody_proof_on(
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
-            .open(path).map_err(|e| GenerationStorageError::new(e.to_string()))?;
-        let metadata = file.metadata().map_err(|e| GenerationStorageError::new(e.to_string()))?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| GenerationStorageError::new(e.to_string()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| GenerationStorageError::new(e.to_string()))?;
         if !metadata.is_file() || metadata.len() != 0 {
-            return Err(GenerationStorageError::new("custody proof is not fresh".into()));
+            return Err(GenerationStorageError::new(
+                "custody proof is not fresh".into(),
+            ));
         }
-        conn.execute("INSERT INTO runtime_generation_custody VALUES (?1, ?2, ?3, ?4)",
-            params![generation.to_string(), path.to_string_lossy(), metadata.dev() as i64, metadata.ino() as i64])
-            .map_err(generation_storage_error("register independent launch custody"))?;
+        conn.execute(
+            "INSERT INTO runtime_generation_custody VALUES (?1, ?2, ?3, ?4)",
+            params![
+                generation.to_string(),
+                path.to_string_lossy(),
+                metadata.dev() as i64,
+                metadata.ino() as i64
+            ],
+        )
+        .map_err(generation_storage_error(
+            "register independent launch custody",
+        ))?;
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
-    { let _ = (conn, generation, path); Err(GenerationStorageError::new("custody unsupported".into())) }
+    {
+        let _ = (conn, generation, path);
+        Err(GenerationStorageError::new("custody unsupported".into()))
+    }
 }
 
 // This sidecar's identity evidence is host-local. Cross-host copied state is
@@ -8946,10 +8834,12 @@ fn generation_boot_has_ended(generation: &RuntimeGenerationRow) -> bool {
 }
 
 fn custody_allows_recovery(conn: &Connection, generation: &RuntimeGenerationRow) -> bool {
-    if generation_boot_has_ended(generation) { return true; }
-    custody_proof_observation(conn, generation)
-        .unwrap_or(!cfg!(target_os = "linux")
-            || generation.lifecycle_state != RuntimeLifecycleState::Starting)
+    if generation_boot_has_ended(generation) {
+        return true;
+    }
+    custody_proof_observation(conn, generation).unwrap_or(
+        !cfg!(target_os = "linux") || generation.lifecycle_state != RuntimeLifecycleState::Starting,
+    )
 }
 
 fn custody_allows_terminal(conn: &Connection, generation: &RuntimeGenerationRow) -> bool {
@@ -8964,7 +8854,9 @@ fn custody_proof_observation(conn: &Connection, generation: &RuntimeGenerationRo
     ).optional();
     match proof {
         Ok(None) => None,
-        Ok(Some((path, device, inode))) => Some(exact_custody_proof_is_quiescent(&path, device, inode)),
+        Ok(Some((path, device, inode))) => {
+            Some(exact_custody_proof_is_quiescent(&path, device, inode))
+        }
         Err(_) => Some(false),
     }
 }
@@ -8974,14 +8866,32 @@ fn exact_custody_proof_is_quiescent(path: &str, device: i64, inode: i64) -> bool
     {
         use std::io::Read;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let Ok(mut file) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) else { return false; };
-        let Ok(metadata) = file.metadata() else { return false; };
-        if !metadata.is_file() || metadata.len() != 1 || metadata.dev() as i64 != device || metadata.ino() as i64 != inode { return false; }
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        else {
+            return false;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        if !metadata.is_file()
+            || metadata.len() != 1
+            || metadata.dev() as i64 != device
+            || metadata.ino() as i64 != inode
+        {
+            return false;
+        }
         let mut bytes = [0; 2];
-        file.read(&mut bytes).is_ok_and(|n| n == 1 && bytes[0] == b'Q')
+        file.read(&mut bytes)
+            .is_ok_and(|n| n == 1 && bytes[0] == b'Q')
     }
     #[cfg(not(target_os = "linux"))]
-    { let _ = (path, device, inode); false }
+    {
+        let _ = (path, device, inode);
+        false
+    }
 }
 
 fn generation_liveness_observation(
@@ -9537,7 +9447,7 @@ fn preflight_completion_event_registration_on(
             owner_invocation_uuid,
         );
     }
-    if event.state == "triggered" {
+    if event.state == "triggered" && !completion_continuation::bound_event(conn, input.event_id)? {
         return Err(format!(
             "Completion event {} cannot register a listener after it was triggered",
             input.event_id
@@ -9562,7 +9472,8 @@ fn register_completion_event_on(
     register_completion_event_listener(
         tx,
         input,
-        existing.is_some_and(|event| event.state == "triggered"),
+        existing.is_some_and(|event| event.state == "triggered")
+            && !completion_continuation::bound_event(tx, input.event_id)?,
         now,
     )?;
     Ok(inserted)
@@ -9863,64 +9774,6 @@ fn validate_completion_event_trigger_replay(
             input.event_id
         ))
     }
-}
-
-fn acknowledge_consumed_completion_event_listeners(
-    tx: &Transaction<'_>,
-    event_id: &str,
-    now: &str,
-) -> Result<(), String> {
-    let session_ids = completion_event_listener_session_ids(tx, event_id)?;
-    tx.execute(
-        "UPDATE mailbox
-         SET delivered_at = COALESCE(delivered_at, ?2),
-             delivered_by_invocation_uuid = COALESCE(
-                 delivered_by_invocation_uuid,
-                 (SELECT owner_invocation_uuid
-                  FROM completion_event_listener
-                  WHERE completion_event_listener.mailbox_seq = mailbox.seq)
-             ),
-             delivery_attempts = delivery_attempts + 1,
-             delivery_error = NULL
-         WHERE seq IN (
-             SELECT mailbox_seq
-             FROM completion_event_listener
-             WHERE event_id = ?1 AND mailbox_seq IS NOT NULL
-         ) AND delivered_at IS NULL",
-        params![event_id, now],
-    )
-    .map_err(|err| format!("Failed to consume completion event mailbox rows: {err}"))?;
-    tx.execute(
-        "UPDATE completion_event_listener
-         SET active = 0,
-             acknowledged_at = COALESCE(acknowledged_at, ?2),
-             acknowledgement_reason = COALESCE(acknowledgement_reason, 'consumed_in_call')
-         WHERE event_id = ?1",
-        params![event_id, now],
-    )
-    .map_err(|err| format!("Failed to acknowledge consumed completion listeners: {err}"))?;
-    for session_id in session_ids {
-        resolve_completed_delivery_attempts(tx, &session_id, now, None)?;
-    }
-    Ok(())
-}
-
-fn completion_event_listener_session_ids(
-    conn: &Connection,
-    event_id: &str,
-) -> Result<Vec<String>, String> {
-    let mut statement = conn
-        .prepare(
-            "SELECT DISTINCT session_id
-             FROM completion_event_listener
-             WHERE event_id = ?1 AND mailbox_seq IS NOT NULL",
-        )
-        .map_err(|err| format!("Failed to prepare completion listener session query: {err}"))?;
-    let rows = statement
-        .query_map(params![event_id], |row| row.get(0))
-        .map_err(|err| format!("Failed to query completion listener sessions: {err}"))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("Failed to read completion listener session: {err}"))
 }
 
 fn materialize_completion_event_listeners(
@@ -11114,14 +10967,17 @@ fn reconcile_dead_starting_generations_on(
 }
 
 fn unpublished_starting_generation_ids_on(conn: &Connection) -> Result<Vec<String>, String> {
-    let mut statement = conn.prepare(
-        "SELECT generation_uuid FROM runtime_generation
+    let mut statement = conn
+        .prepare(
+            "SELECT generation_uuid FROM runtime_generation
          WHERE lifecycle_state = 'starting'
            AND identity_os_pid IS NULL
            AND creator_identity_os_pid IS NOT NULL
          ORDER BY created_at, generation_uuid",
-    ).map_err(|err| format!("Failed to prepare starting-generation scan: {err}"))?;
-    statement.query_map([], |row| row.get(0))
+        )
+        .map_err(|err| format!("Failed to prepare starting-generation scan: {err}"))?;
+    statement
+        .query_map([], |row| row.get(0))
         .map_err(|err| format!("Failed to scan starting generations: {err}"))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|err| format!("Failed to read starting-generation identity: {err}"))
@@ -11139,13 +10995,18 @@ fn reconcile_dead_starting_generation_on(
     let ExactProcessEvidence::Recorded(ref creator) = row.creator_process_evidence else {
         return Ok(());
     };
-    let recover = generation_boot_has_ended(&row) || (custody_allows_recovery(conn, &row)
-        && reservation_owner_has_exited(creator, observe_session_admission_owner(creator.os_pid)));
+    let recover = generation_boot_has_ended(&row)
+        || (custody_allows_recovery(conn, &row)
+            && reservation_owner_has_exited(
+                creator,
+                observe_session_admission_owner(creator.os_pid),
+            ));
     if !recover {
         return Ok(());
     }
-    let changed = conn.execute(
-        "UPDATE runtime_generation
+    let changed = conn
+        .execute(
+            "UPDATE runtime_generation
          SET lifecycle_state = 'exited', exited_at = ?2,
              terminal_reason = 'recovered_dead'
          WHERE generation_uuid = ?1
@@ -11154,15 +11015,15 @@ fn reconcile_dead_starting_generation_on(
            AND creator_identity_os_pid = ?3
            AND creator_identity_os_boot_id = ?4
            AND creator_identity_os_pid_starttime_ticks = ?5",
-        params![
-            &generation_uuid,
-            now_rfc3339(),
-            creator.os_pid,
-            &creator.os_boot_id,
-            creator.os_pid_starttime_ticks,
-        ],
-    )
-    .map_err(|err| format!("Failed to reconcile dead starting generation: {err}"))?;
+            params![
+                &generation_uuid,
+                now_rfc3339(),
+                creator.os_pid,
+                &creator.os_boot_id,
+                creator.os_pid_starttime_ticks,
+            ],
+        )
+        .map_err(|err| format!("Failed to reconcile dead starting generation: {err}"))?;
     if changed != 1 {
         return Ok(());
     }
@@ -11992,32 +11853,75 @@ mod tests {
         } else {
             "11111111-1111-4111-8111-111111111111"
         };
-        for (boot, previous_boot) in [(current, false), ("unverifiable".into(), false), (previous.into(), true)] {
+        for (boot, previous_boot) in [
+            (current, false),
+            ("unverifiable".into(), false),
+            (previous.into(), true),
+        ] {
             for route in ["session", "global"] {
                 let directory = tempfile::tempdir().unwrap();
                 let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
                 let id = RuntimeGenerationId::new();
                 let proof = directory.path().join("never-certified");
                 std::fs::write(&proof, b"").unwrap();
-                db.runtime_lifecycle().create_runtime_generation_with_custody(CreateRuntimeGeneration {
-                    generation_id: &id, spawn_invocation_uuid: "old-invocation", session_id: Some("old-session"),
-                    runtime_mode: "headless", provider_name: "fixture", model_name: None,
-                    pty_control_path: None, models_dir: None, effective_cwd: None,
-                }, Some(&proof)).unwrap();
+                db.runtime_lifecycle()
+                    .create_runtime_generation_with_custody(
+                        CreateRuntimeGeneration {
+                            generation_id: &id,
+                            spawn_invocation_uuid: "old-invocation",
+                            session_id: Some("old-session"),
+                            runtime_mode: "headless",
+                            provider_name: "fixture",
+                            model_name: None,
+                            pty_control_path: None,
+                            models_dir: None,
+                            effective_cwd: None,
+                        },
+                        Some(&proof),
+                    )
+                    .unwrap();
                 // Private persisted-epoch fixture, NOT a production rewrite or
                 // an executed reboot. Retain a current live PID deliberately.
                 db.conn.execute("UPDATE runtime_generation SET creator_identity_os_boot_id = ?1 WHERE generation_uuid = ?2",
                     params![boot, id.to_string()]).unwrap();
                 if route == "session" {
-                    assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("old-session").unwrap(),
-                        if previous_boot { SessionLiveness::Idle } else { SessionLiveness::Busy });
+                    assert_eq!(
+                        db.runtime_lifecycle()
+                            .reconcile_session_liveness("old-session")
+                            .unwrap(),
+                        if previous_boot {
+                            SessionLiveness::Idle
+                        } else {
+                            SessionLiveness::Busy
+                        }
+                    );
                 } else {
-                    db.session_admissions().enqueue("successor", "successor", None, &current_identity(), 1).unwrap();
-                    assert_eq!(matches!(db.session_admissions().try_admit_next("claim", 0, 2).unwrap(),
-                        SessionAdmissionAttempt::Admitted(_)), previous_boot);
+                    db.session_admissions()
+                        .enqueue("successor", "successor", None, &current_identity(), 1)
+                        .unwrap();
+                    assert_eq!(
+                        matches!(
+                            db.session_admissions()
+                                .try_admit_next("claim", 0, 2)
+                                .unwrap(),
+                            SessionAdmissionAttempt::Admitted(_)
+                        ),
+                        previous_boot
+                    );
                 }
-                let row = db.runtime_lifecycle_reader().runtime_generation(&id).unwrap().unwrap();
-                assert_eq!(row.lifecycle_state, if previous_boot { RuntimeLifecycleState::Exited } else { RuntimeLifecycleState::Starting });
+                let row = db
+                    .runtime_lifecycle_reader()
+                    .runtime_generation(&id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    row.lifecycle_state,
+                    if previous_boot {
+                        RuntimeLifecycleState::Exited
+                    } else {
+                        RuntimeLifecycleState::Starting
+                    }
+                );
                 assert_eq!(std::fs::read(&proof).unwrap(), b""); // Never fabricate Q.
             }
         }
@@ -12032,21 +11936,27 @@ mod tests {
             RuntimeGenerationId::parse("90111111-1111-4111-8111-111111111111").unwrap();
         let mut db = MailboxDb::open(Path::new(&path)).unwrap();
         let phase = std::env::var("OULIPOLY_TEST_CUSTODY_PHASE").ok();
-        let proof_path = oulipoly_core::launch_custody::proof_path(Path::new(&path), &generation_id.to_string());
-        let custody = phase.as_ref().map(|_| oulipoly_core::launch_custody::LaunchCustody::start(proof_path.clone()).unwrap());
+        let proof_path =
+            oulipoly_core::launch_custody::proof_path(Path::new(&path), &generation_id.to_string());
+        let custody = phase.as_ref().map(|_| {
+            oulipoly_core::launch_custody::LaunchCustody::start(proof_path.clone()).unwrap()
+        });
         let GenerationMutation::Applied(row) = db
             .runtime_lifecycle()
-            .create_runtime_generation_with_custody(CreateRuntimeGeneration {
-                generation_id: &generation_id,
-                spawn_invocation_uuid: "starting-fixture-invocation",
-                session_id: Some("starting-fixture-session"),
-                runtime_mode: "headless",
-                provider_name: "provider-a",
-                model_name: Some("model-a"),
-                pty_control_path: None,
-                models_dir: None,
-                effective_cwd: None,
-            }, custody.as_ref().map(|_| proof_path.as_path()))
+            .create_runtime_generation_with_custody(
+                CreateRuntimeGeneration {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: "starting-fixture-invocation",
+                    session_id: Some("starting-fixture-session"),
+                    runtime_mode: "headless",
+                    provider_name: "provider-a",
+                    model_name: Some("model-a"),
+                    pty_control_path: None,
+                    models_dir: None,
+                    effective_cwd: None,
+                },
+                custody.as_ref().map(|_| proof_path.as_path()),
+            )
             .unwrap()
         else {
             panic!("fixture generation was not created");
@@ -12064,11 +11974,16 @@ mod tests {
                 command.args(["-c", "/usr/bin/setsid /bin/sh -c 'echo ready > descendant; /bin/sleep 1' & exit 0"])
                     .env_clear().current_dir(root).process_group(0);
                 custody.as_ref().unwrap().configure(&mut command).unwrap();
+                // This fixture intentionally dies before local wait; its
+                // supervising test owns the crash and descendant-reap oracle.
+                #[allow(clippy::zombie_processes)]
                 let _child = command.spawn().unwrap();
                 drop(command);
                 custody_eventually(|| root.join("descendant").exists());
             }
-            if phase == "sealed_live" { custody.as_ref().unwrap().seal(); }
+            if phase == "sealed_live" {
+                custody.as_ref().unwrap().seal();
+            }
             std::fs::write(root.join("ready"), b"ready").unwrap();
             std::thread::sleep(StdDuration::from_secs(10));
             panic!("fixture creator not crashed");
@@ -12080,22 +11995,32 @@ mod tests {
     #[cfg(target_os = "linux")]
     impl std::ops::Deref for CustodyTestCreator {
         type Target = std::process::Child;
-        fn deref(&self) -> &Self::Target { &self.0 }
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
     }
     #[cfg(target_os = "linux")]
     impl std::ops::DerefMut for CustodyTestCreator {
-        fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
     }
     #[cfg(target_os = "linux")]
     impl Drop for CustodyTestCreator {
-        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     #[cfg(target_os = "linux")]
     fn custody_eventually(mut condition: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
         while !condition() {
-            assert!(std::time::Instant::now() < deadline, "private custody deadline");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "private custody deadline"
+            );
             std::thread::sleep(StdDuration::from_millis(5));
         }
     }
@@ -12107,23 +12032,62 @@ mod tests {
             for route in ["session", "global"] {
                 let directory = tempfile::tempdir().unwrap();
                 let sidecar = directory.path().join("pid-identity.db");
-                let mut creator = CustodyTestCreator(std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "mailbox::tests::starting_runtime_generation_fixture"])
-                    .env_clear().env("HOME", directory.path()).env("XDG_CONFIG_HOME", directory.path())
-                    .env("XDG_DATA_HOME", directory.path()).env(STARTING_GENERATION_FIXTURE_PATH, &sidecar)
-                    .env("OULIPOLY_TEST_CUSTODY_PHASE", phase)
-                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+                let mut creator = CustodyTestCreator(
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "mailbox::tests::starting_runtime_generation_fixture",
+                        ])
+                        .env_clear()
+                        .env("HOME", directory.path())
+                        .env("XDG_CONFIG_HOME", directory.path())
+                        .env("XDG_DATA_HOME", directory.path())
+                        .env(STARTING_GENERATION_FIXTURE_PATH, &sidecar)
+                        .env("OULIPOLY_TEST_CUSTODY_PHASE", phase)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                );
                 custody_eventually(|| directory.path().join("ready").exists());
-                let id = RuntimeGenerationId::parse("90111111-1111-4111-8111-111111111111").unwrap();
+                let id =
+                    RuntimeGenerationId::parse("90111111-1111-4111-8111-111111111111").unwrap();
                 let mut db = MailboxDb::open(&sidecar).unwrap();
-                db.session_admissions().enqueue("successor", "successor", None, &current_identity(), 1).unwrap();
-                assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("starting-fixture-session").unwrap(), SessionLiveness::Busy);
-                assert!(!matches!(db.session_admissions().try_admit_next("claim", 0, 2).unwrap(), SessionAdmissionAttempt::Admitted(_)));
+                db.session_admissions()
+                    .enqueue("successor", "successor", None, &current_identity(), 1)
+                    .unwrap();
+                assert_eq!(
+                    db.runtime_lifecycle()
+                        .reconcile_session_liveness("starting-fixture-session")
+                        .unwrap(),
+                    SessionLiveness::Busy
+                );
+                assert!(!matches!(
+                    db.session_admissions()
+                        .try_admit_next("claim", 0, 2)
+                        .unwrap(),
+                    SessionAdmissionAttempt::Admitted(_)
+                ));
                 creator.kill().unwrap();
-                custody_eventually(|| matches!(pid_identity::observe_finalizer_process_identity(creator.id().into()), pid_identity::FinalizerProcessIdentityObservation::ExactExited(_)));
+                custody_eventually(|| {
+                    matches!(
+                        pid_identity::observe_finalizer_process_identity(creator.id().into()),
+                        pid_identity::FinalizerProcessIdentityObservation::ExactExited(_)
+                    )
+                });
                 if phase == "unpublished" {
-                    assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("starting-fixture-session").unwrap(), SessionLiveness::Busy);
-                    assert!(!matches!(db.session_admissions().try_admit_next("claim", 0, 3).unwrap(), SessionAdmissionAttempt::Admitted(_)));
+                    assert_eq!(
+                        db.runtime_lifecycle()
+                            .reconcile_session_liveness("starting-fixture-session")
+                            .unwrap(),
+                        SessionLiveness::Busy
+                    );
+                    assert!(!matches!(
+                        db.session_admissions()
+                            .try_admit_next("claim", 0, 3)
+                            .unwrap(),
+                        SessionAdmissionAttempt::Admitted(_)
+                    ));
                 }
                 let proof = oulipoly_core::launch_custody::proof_path(&sidecar, &id.to_string());
                 custody_eventually(|| oulipoly_core::launch_custody::is_quiescent(&proof));
@@ -12131,21 +12095,53 @@ mod tests {
                 let retained = proof.with_extension("retained");
                 std::fs::rename(&proof, &retained).unwrap();
                 std::fs::write(&proof, b"Q").unwrap();
-                assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("starting-fixture-session").unwrap(), SessionLiveness::Busy);
+                assert_eq!(
+                    db.runtime_lifecycle()
+                        .reconcile_session_liveness("starting-fixture-session")
+                        .unwrap(),
+                    SessionLiveness::Busy
+                );
                 std::fs::remove_file(&proof).unwrap();
                 std::fs::rename(retained, &proof).unwrap();
                 if route == "session" {
-                    assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("starting-fixture-session").unwrap(), SessionLiveness::Idle);
+                    assert_eq!(
+                        db.runtime_lifecycle()
+                            .reconcile_session_liveness("starting-fixture-session")
+                            .unwrap(),
+                        SessionLiveness::Idle
+                    );
                 }
-                assert!(matches!(db.session_admissions().try_admit_next("claim", 0, 4).unwrap(), SessionAdmissionAttempt::Admitted(_)));
-                let row = db.runtime_lifecycle_reader().runtime_generation(&id).unwrap().unwrap();
+                assert!(matches!(
+                    db.session_admissions()
+                        .try_admit_next("claim", 0, 4)
+                        .unwrap(),
+                    SessionAdmissionAttempt::Admitted(_)
+                ));
+                let row = db
+                    .runtime_lifecycle_reader()
+                    .runtime_generation(&id)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(row.lifecycle_state, RuntimeLifecycleState::Exited);
-                assert_eq!(row.terminal_reason, Some(RuntimeTerminalReason::RecoveredDead));
+                assert_eq!(
+                    row.terminal_reason,
+                    Some(RuntimeTerminalReason::RecoveredDead)
+                );
                 let identity = current_identity();
-                assert!(matches!(db.runtime_lifecycle().bind_runtime_generation_running(BindRuntimeGenerationRunning {
-                    fence: RuntimeGenerationFence { generation_id: &id, spawn_invocation_uuid: "starting-fixture-invocation" },
-                    spawned_os_pid: identity.os_pid, exact_process_identity: &identity, os_pgid: None,
-                }).unwrap(), GenerationMutation::Rejected(_)));
+                assert!(matches!(
+                    db.runtime_lifecycle()
+                        .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                            fence: RuntimeGenerationFence {
+                                generation_id: &id,
+                                spawn_invocation_uuid: "starting-fixture-invocation"
+                            },
+                            spawned_os_pid: identity.os_pid,
+                            exact_process_identity: &identity,
+                            os_pgid: None,
+                        })
+                        .unwrap(),
+                    GenerationMutation::Rejected(_)
+                ));
                 // Preserve the real creator zombie until successor admission and
                 // attempted late publication have both been checked.
                 creator.wait().unwrap();
@@ -12199,10 +12195,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after.lifecycle_state, RuntimeLifecycleState::Starting);
-        assert_eq!(
-            after.terminal_reason,
-            None
-        );
+        assert_eq!(after.terminal_reason, None);
     }
 
     #[cfg(unix)]
@@ -14200,7 +14193,6 @@ mod tests {
     fn completion_trigger<'a>(
         event_id: &'a str,
         payload_json: &'a str,
-        consumed: bool,
     ) -> CompletionEventTriggerInput<'a> {
         CompletionEventTriggerInput {
             event_id,
@@ -14210,7 +14202,6 @@ mod tests {
             log_path: "/tmp/state/log",
             rc_path: "/tmp/state/rc",
             rc: 0,
-            consumed,
         }
     }
 
@@ -14324,7 +14315,6 @@ mod tests {
             .trigger_completion_event(completion_trigger(
                 event_id,
                 r#"{"schema_version":2,"handle":"ab_event"}"#,
-                false,
             ))
             .unwrap();
         assert!(triggered.triggered);
@@ -14339,7 +14329,6 @@ mod tests {
             .trigger_completion_event(completion_trigger(
                 event_id,
                 r#"{"schema_version":2,"handle":"ab_event"}"#,
-                false,
             ))
             .unwrap();
         assert!(!duplicate.triggered);
@@ -14358,8 +14347,7 @@ mod tests {
         assert!(
             db.trigger_completion_event(completion_trigger(
                 event_id,
-                r#"{"schema_version":2,"handle":"different"}"#,
-                false,
+                r#"{"schema_version":2,"handle":"different"}"#
             ))
             .is_err()
         );
@@ -14424,11 +14412,7 @@ mod tests {
         let trigger_error = db
             .trigger_completion_event(CompletionEventTriggerInput {
                 state_dir: "/tmp/different-state",
-                ..completion_trigger(
-                    event_id,
-                    r#"{"schema_version":2,"handle":"ab_identity"}"#,
-                    false,
-                )
+                ..completion_trigger(event_id, r#"{"schema_version":2,"handle":"ab_identity"}"#)
             })
             .unwrap_err();
         assert!(trigger_error.contains("does not match its registered source"));
@@ -14479,7 +14463,6 @@ mod tests {
             .trigger_completion_event(completion_trigger(
                 event_id,
                 r#"{"schema_version":2,"handle":"ab_sync"}"#,
-                false,
             ))
             .unwrap();
         assert!(triggered.triggered);
@@ -14492,366 +14475,45 @@ mod tests {
     }
 
     #[test]
-    fn consumed_completion_acknowledges_listener_without_mailbox_delivery() {
+    fn completion_replay_and_transport_receipt_do_not_acknowledge_listeners() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
-        let event_id = "ab_consumed";
+        let event_id = "ab_receipt_not_ack";
+        let owner = "11111111-1111-4111-8111-111111111111";
+        let payload = r#"{"schema_version":2,"handle":"ab_receipt_not_ack"}"#;
         db.register_completion_event(completion_registration(
             event_id,
             "async",
             "session-a",
-            "11111111-1111-4111-8111-111111111111",
+            owner,
         ))
         .unwrap();
-
-        let triggered = db
-            .trigger_completion_event(completion_trigger(
-                event_id,
-                r#"{"schema_version":2,"handle":"ab_consumed"}"#,
-                true,
-            ))
+        let first = db
+            .trigger_completion_event(completion_trigger(event_id, payload))
             .unwrap();
-        assert!(triggered.triggered);
-        assert!(triggered.mailbox_rows.is_empty());
-        assert!(!triggered.listeners[0].active);
-        assert!(triggered.listeners[0].acknowledged_at.is_some());
-        assert_eq!(
-            triggered.listeners[0].acknowledgement_reason.as_deref(),
-            Some("consumed_in_call")
-        );
-    }
-
-    #[test]
-    fn consumed_completion_resolves_an_existing_delivery_attempt() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
-        let event_id = "ab_consumed_replay";
-        let invocation_uuid = "11111111-1111-4111-8111-111111111111";
-        let payload = r#"{"schema_version":2,"handle":"ab_consumed_replay"}"#;
-        db.register_completion_event(completion_registration(
-            event_id,
-            "async",
-            "session-a",
-            invocation_uuid,
-        ))
-        .unwrap();
-        let triggered = db
-            .trigger_completion_event(completion_trigger(event_id, payload, false))
+        let seq = first.mailbox_rows[0].seq;
+        db.register_delivery_attempt("receipt-only", "session-a", owner, &[seq], 0)
             .unwrap();
-        let seq = triggered.mailbox_rows[0].seq;
-        db.register_delivery_attempt("attempt-consumed", "session-a", invocation_uuid, &[seq], 0)
+        db.record_delivery_attempt_transport_ack("receipt-only")
             .unwrap();
-        assert!(
-            db.record_delivery_attempt_transport_ack("attempt-consumed")
-                .unwrap()
-        );
-        db.conn
-            .execute(
-                "UPDATE mailbox SET delivery_attempts = 2, delivery_error = 'transport_error'
-                 WHERE seq = ?1",
-                params![seq],
-            )
+        let replay = db
+            .trigger_completion_event(completion_trigger(event_id, payload))
             .unwrap();
-
-        let consumed = db
-            .trigger_completion_event(completion_trigger(event_id, payload, true))
-            .unwrap();
-
-        let row = &consumed.mailbox_rows[0];
-        assert!(row.delivered_at.is_some());
-        assert_eq!(row.delivery_attempts, 3);
-        assert_eq!(row.delivery_error, None);
-        assert_eq!(
-            db.delivery_attempt_disposition("attempt-consumed").unwrap(),
+        assert!(!replay.triggered);
+        assert!(replay.listeners[0].acknowledged_at.is_none());
+        assert!(replay.listeners[0].active);
+        assert!(replay.mailbox_rows[0].delivered_at.is_none());
+        assert_ne!(
+            db.delivery_attempt_disposition("receipt-only").unwrap(),
             Some(MailboxDeliveryAttemptDisposition::Resolved)
         );
-        assert_eq!(
-            consumed.listeners[0].acknowledgement_reason.as_deref(),
-            Some("consumed_in_call")
-        );
-    }
-
-    struct LateConsumedCompletionFixture {
-        _dir: tempfile::TempDir,
-        db: MailboxDb,
-        event_id: &'static str,
-        unrelated_event_id: &'static str,
-        invocation_uuid: &'static str,
-        sibling_invocation_uuid: &'static str,
-        seq: i64,
-        sibling_seq: i64,
-    }
-
-    const LATE_CONSUMED_EVENT_ID: &str = "ab_late_consumed";
-    const UNRELATED_PENDING_EVENT_ID: &str = "ab_unrelated_pending";
-    const UNRELATED_COMPLETED_EVENT_ID: &str = "ab_unrelated_completed";
-    const LATE_CONSUMED_INVOCATION_UUID: &str = "11111111-1111-4111-8111-111111111111";
-    const LATE_CONSUMED_SIBLING_INVOCATION_UUID: &str = "22222222-2222-4222-8222-222222222222";
-
-    fn late_consumed_completion_fixture() -> LateConsumedCompletionFixture {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
-        let (seq, sibling_seq) = seed_late_consumed_listeners(&mut db);
-        seed_unrelated_pending_completion(&mut db, seq);
-        seed_unrelated_completed_attempt(&mut db);
-        map_late_consumed_completion_fixture(dir, db, seq, sibling_seq)
-    }
-
-    fn seed_late_consumed_listeners(db: &mut MailboxDb) -> (i64, i64) {
-        db.register_completion_event(completion_registration(
-            LATE_CONSUMED_EVENT_ID,
-            "async",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-        ))
-        .unwrap();
-        db.register_completion_event(completion_registration(
-            LATE_CONSUMED_EVENT_ID,
-            "async",
-            "session-b",
-            LATE_CONSUMED_SIBLING_INVOCATION_UUID,
-        ))
-        .unwrap();
-        let triggered = db
-            .trigger_completion_event(completion_trigger(
-                LATE_CONSUMED_EVENT_ID,
-                r#"{"schema_version":2,"handle":"ab_late_consumed"}"#,
-                false,
-            ))
-            .unwrap();
-        (
-            triggered_mailbox_seq(&triggered, "session-a"),
-            triggered_mailbox_seq(&triggered, "session-b"),
-        )
-    }
-
-    fn triggered_mailbox_seq(triggered: &CompletionEventTriggerResult, session_id: &str) -> i64 {
-        triggered
-            .mailbox_rows
-            .iter()
-            .find(|row| row.session_id == session_id)
-            .unwrap()
-            .seq
-    }
-
-    fn seed_unrelated_pending_completion(db: &mut MailboxDb, consumed_seq: i64) {
-        db.register_completion_event(completion_registration(
-            UNRELATED_PENDING_EVENT_ID,
-            "async",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-        ))
-        .unwrap();
-        let unrelated = db
-            .trigger_completion_event(completion_trigger(
-                UNRELATED_PENDING_EVENT_ID,
-                r#"{"schema_version":2,"handle":"ab_unrelated_pending"}"#,
-                false,
-            ))
-            .unwrap();
-        let unrelated_seq = unrelated.mailbox_rows[0].seq;
-        db.register_delivery_attempt(
-            "attempt-late-consumed",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-            &[consumed_seq],
-            0,
-        )
-        .unwrap();
-        db.register_delivery_attempt(
-            "attempt-unrelated",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-            &[unrelated_seq],
-            0,
-        )
-        .unwrap();
-    }
-
-    fn seed_unrelated_completed_attempt(db: &mut MailboxDb) {
-        db.register_completion_event(completion_registration(
-            UNRELATED_COMPLETED_EVENT_ID,
-            "async",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-        ))
-        .unwrap();
-        let unrelated_completed = db
-            .trigger_completion_event(completion_trigger(
-                UNRELATED_COMPLETED_EVENT_ID,
-                r#"{"schema_version":2,"handle":"ab_unrelated_completed"}"#,
-                false,
-            ))
-            .unwrap();
-        let unrelated_completed_seq = unrelated_completed.mailbox_rows[0].seq;
-        db.register_delivery_attempt(
-            "attempt-unrelated-completed",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-            &[unrelated_completed_seq],
-            0,
-        )
-        .unwrap();
-        db.conn
-            .execute(
-                "UPDATE mailbox SET delivered_at = '2026-08-10T00:00:00Z' WHERE seq = ?1",
-                params![unrelated_completed_seq],
-            )
-            .unwrap();
-    }
-
-    fn map_late_consumed_completion_fixture(
-        dir: tempfile::TempDir,
-        db: MailboxDb,
-        seq: i64,
-        sibling_seq: i64,
-    ) -> LateConsumedCompletionFixture {
-        LateConsumedCompletionFixture {
-            _dir: dir,
-            db,
-            event_id: LATE_CONSUMED_EVENT_ID,
-            unrelated_event_id: UNRELATED_PENDING_EVENT_ID,
-            invocation_uuid: LATE_CONSUMED_INVOCATION_UUID,
-            sibling_invocation_uuid: LATE_CONSUMED_SIBLING_INVOCATION_UUID,
-            seq,
-            sibling_seq,
-        }
-    }
-
-    #[test]
-    fn late_consumed_completion_acknowledges_materialized_mailbox_row_once() {
-        let fixture = late_consumed_completion_fixture();
-        let event_id = fixture.event_id;
-        let unrelated_event_id = fixture.unrelated_event_id;
-        let invocation_uuid = fixture.invocation_uuid;
-        let sibling_invocation_uuid = fixture.sibling_invocation_uuid;
-        let seq = fixture.seq;
-        let sibling_seq = fixture.sibling_seq;
-        let mut db = fixture.db;
-
-        assert_eq!(
-            db.acknowledge_consumed_completion_event_for_mailbox_seq(
-                sibling_seq,
-                "session-a",
-                invocation_uuid,
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            db.acknowledge_consumed_completion_event_for_mailbox_seq(
-                seq,
-                "session-a",
-                invocation_uuid,
-            )
-            .unwrap()
-            .as_deref(),
-            Some(event_id)
-        );
-        let first_acknowledged_at = db
-            .completion_event_listeners(event_id)
-            .unwrap()
-            .into_iter()
-            .find(completion_listener_for_session_a)
-            .unwrap()
-            .acknowledged_at
-            .unwrap();
-        assert_eq!(
-            db.acknowledge_consumed_completion_event_for_mailbox_seq(
-                seq,
-                "session-a",
-                invocation_uuid,
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            db.acknowledge_consumed_completion_event_for_mailbox_seq(
-                sibling_seq,
-                "session-a",
-                invocation_uuid,
-            )
-            .unwrap(),
-            None
-        );
-
-        let rows = db.list_mailbox("session-a", true).unwrap();
-        assert_eq!(rows.len(), 3);
-        let consumed_row = mailbox_row_for_seq(&rows, seq);
-        assert!(consumed_row.delivered_at.is_some());
-        assert_eq!(consumed_row.delivery_attempts, 1);
-        assert_eq!(
-            consumed_row.delivered_by_invocation_uuid.as_deref(),
-            Some(invocation_uuid)
-        );
-        assert_eq!(
-            db.delivery_attempt_disposition("attempt-late-consumed")
-                .unwrap(),
-            Some(MailboxDeliveryAttemptDisposition::Resolved)
-        );
-        assert!(
-            db.delivery_attempt_window("attempt-late-consumed")
-                .unwrap()
-                .unwrap()
-                .resolved_at
-                .is_some()
-        );
-        assert_eq!(
-            db.delivery_attempt_disposition("attempt-unrelated")
-                .unwrap(),
-            Some(MailboxDeliveryAttemptDisposition::Pending)
-        );
-        assert!(
-            db.delivery_attempt_window("attempt-unrelated-completed")
-                .unwrap()
-                .unwrap()
-                .resolved_at
-                .is_none()
-        );
-        let pending = db.list_pending("session-a").unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].handle, unrelated_event_id);
+        db.acknowledge_range("session-a", seq, seq, owner).unwrap();
         let listeners = db.completion_event_listeners(event_id).unwrap();
-        let consumed_listener = completion_listener_for_session(&listeners, "session-a");
-        assert_eq!(
-            consumed_listener.acknowledgement_reason.as_deref(),
+        assert!(listeners[0].acknowledged_at.is_some());
+        assert_ne!(
+            listeners[0].acknowledgement_reason.as_deref(),
             Some("consumed_in_call")
         );
-        assert!(!consumed_listener.active);
-        assert_eq!(
-            consumed_listener.acknowledged_at.as_deref(),
-            Some(first_acknowledged_at.as_str())
-        );
-        let sibling_listener = completion_listener_for_session(&listeners, "session-b");
-        assert!(sibling_listener.active);
-        assert!(sibling_listener.acknowledged_at.is_none());
-        let sibling_pending = db.list_pending("session-b").unwrap();
-        assert_eq!(sibling_pending.len(), 1);
-        assert_eq!(
-            sibling_pending[0].owner_invocation_uuid.as_deref(),
-            Some(sibling_invocation_uuid)
-        );
-        let unrelated = db.completion_event_listeners(unrelated_event_id).unwrap();
-        assert!(unrelated[0].active);
-        assert!(unrelated[0].acknowledged_at.is_none());
-    }
-
-    fn completion_listener_for_session_a(listener: &CompletionEventListenerRow) -> bool {
-        listener.session_id == "session-a"
-    }
-
-    fn completion_listener_for_session<'a>(
-        listeners: &'a [CompletionEventListenerRow],
-        session_id: &str,
-    ) -> &'a CompletionEventListenerRow {
-        listeners
-            .iter()
-            .find(|listener| listener.session_id == session_id)
-            .unwrap()
-    }
-
-    fn mailbox_row_for_seq(rows: &[MailboxRow], seq: i64) -> &MailboxRow {
-        rows.iter().find(|row| row.seq == seq).unwrap()
     }
 
     #[test]
@@ -15359,7 +15021,7 @@ mod tests {
             "11111111-1111-4111-8111-111111111111",
         ))
         .unwrap();
-        db.trigger_completion_event(completion_trigger(event_id, "{}", false))
+        db.trigger_completion_event(completion_trigger(event_id, "{}"))
             .unwrap();
         let row = db.list_pending("session-a").unwrap().remove(0);
         db.register_headless_delivery_attempt(
@@ -16509,7 +16171,6 @@ mod tests {
             .trigger_completion_event(completion_trigger(
                 "terminal-event",
                 r#"{"terminal":"payload"}"#,
-                false,
             ))
             .unwrap();
         let event_row = event_result.mailbox_rows.into_iter().next().unwrap();
@@ -16598,7 +16259,6 @@ mod tests {
             .trigger_completion_event(completion_trigger(
                 "terminal-event",
                 r#"{"terminal":"payload"}"#,
-                false,
             ))
             .unwrap();
         assert!(!replay.triggered);

@@ -262,6 +262,7 @@ impl StateDb {
         provider_names: &LegacyProviderNames,
     ) -> Result<(), String> {
         super::provider_launch_lifecycle::validate_launch_schema(conn)?;
+        crate::completion_continuation::validate_admission_schema(conn)?;
         Self::validate_providers_schema(conn)?;
         Self::ensure_invocations_schema(conn, provider_names)?;
         Self::ensure_providers_schema(conn)?;
@@ -336,8 +337,13 @@ impl StateDb {
             .map_err(|error| ReadOnlyOpenError::Operational {
                 message: error.to_string(),
             })?;
-        if version == 23 {
+        if (23..=crate::schema::CURRENT_SCHEMA_VERSION).contains(&version) {
             super::provider_launch_lifecycle::validate_launch_schema(&conn)
+                .map_err(|message| ReadOnlyOpenError::Operational { message })?;
+        }
+
+        if version == crate::schema::CURRENT_SCHEMA_VERSION {
+            crate::completion_continuation::validate_admission_schema(&conn)
                 .map_err(|message| ReadOnlyOpenError::Operational { message })?;
         }
 

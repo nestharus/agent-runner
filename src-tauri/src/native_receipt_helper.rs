@@ -242,15 +242,15 @@ fn targeted_scan_waits_for_admission_and_bounds_persistent_contention() {
         std::thread::sleep(Duration::from_millis(50));
         drop(held);
     });
-    let admitted = wait_for_scan_admission(
-        || try_admit(&path, "receipt-scan"),
-        Duration::from_secs(2),
-    ).unwrap();
+    let admitted =
+        wait_for_scan_admission(|| try_admit(&path, "receipt-scan"), Duration::from_secs(2))
+            .unwrap();
     release.join().unwrap();
     let error = wait_for_scan_admission(
         || try_admit(&path, "receipt-scan"),
         Duration::from_millis(50),
-    ).unwrap_err();
+    )
+    .unwrap_err();
     assert!(error.contains("admission deadline"));
     drop(admitted);
 }
@@ -303,8 +303,11 @@ pub(crate) fn observe_target(target: Target) -> Result<(), String> {
 }
 
 #[cfg(test)]
+type TestCommandFactory = Box<dyn Fn(bool) -> Command>;
+
+#[cfg(test)]
 thread_local! {
-    pub(crate) static TEST_COMMAND: std::cell::RefCell<Option<Box<dyn Fn(bool) -> Command>>> = Default::default();
+    pub(crate) static TEST_COMMAND: std::cell::RefCell<Option<TestCommandFactory>> = Default::default();
     pub(crate) static TEST_BOUND: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 

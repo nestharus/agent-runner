@@ -1,0 +1,126 @@
+//! The driver scans committed State obligations even when no sidecar source row
+//! exists. Blocking recovery executes in separately retained/reaped custodians.
+use oulipoly_state::mailbox::{CompletionDomainOwner, ContinuationAttempt, MailboxDb};
+use oulipoly_state::{InvocationMutationAuthority, StateDb};
+use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+pub(super) fn run(
+    path: &Path,
+    owner: &CompletionDomainOwner,
+    _election: i32,
+) -> Result<(), String> {
+    let mut live: HashMap<i64, String> = HashMap::new();
+    let mut next_retry: HashMap<String, Instant> = HashMap::new();
+    loop {
+        reap(&mut live);
+        let current = MailboxDb::open(path)?
+            .completion_continuation_owner()?
+            .ok_or("driver authority disappeared")?;
+        if current.owner_generation != owner.owner_generation {
+            return Err("driver generation was replaced".into());
+        }
+        let mut state = StateDb::open_default()?;
+        let obligations = state.admitted_completion_continuations()?;
+        for binding in obligations {
+            let source = binding.registration()?;
+            if source.domain_id != owner.domain_id {
+                continue;
+            }
+            // Exact-authority repair is deliberately before any source file read:
+            // losing the registration worker after State commit cannot hide it.
+            if state
+                .repair_admitted_completion_continuation(
+                    InvocationMutationAuthority::Standalone,
+                    &binding,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let snapshot = Path::new(&source.handle_dir).join(&source.snapshot_relative);
+            let accepted =
+                crate::commands::notify_continuation::accept(&binding, &snapshot).is_ok();
+            if accepted {
+                continue;
+            }
+            let already_accepted = MailboxDb::open(path)?
+                .completion_continuation_acceptance(&source.registration_id)?
+                .is_some_and(|v| v["phase"] == "accepted");
+            if already_accepted {
+                continue;
+            }
+            if live
+                .values()
+                .any(|registration| registration == &source.registration_id)
+                || live.len() >= 4
+                || next_retry
+                    .get(&source.registration_id)
+                    .is_some_and(|when| *when > Instant::now())
+            {
+                continue;
+            }
+            let attempt_id = uuid::Uuid::new_v4().to_string();
+            let result = oulipoly_state::paths::data_dir()?
+                .join("completion-continuation")
+                .join(&owner.domain_id)
+                .join("attempts")
+                .join(&attempt_id)
+                .join("result.json");
+            std::fs::create_dir_all(result.parent().ok_or("attempt result missing parent")?)
+                .map_err(|e| e.to_string())?;
+            let attempt = ContinuationAttempt {
+                attempt_id,
+                owner_generation: owner.owner_generation.clone(),
+                operation: "source_recovery".into(),
+                request_sha256: binding.registration_digest().into(),
+                source_registration_id: Some(source.registration_id.clone()),
+                source_listener_revision: Some(source.listener_revision as i64),
+                session_id: None,
+                claim_token: None,
+                result_path: result.to_string_lossy().into_owned(),
+            };
+            MailboxDb::open(path)?.reserve_continuation_attempt(&attempt)?;
+            if let Ok(pid) = super::custody::spawn_source(path, &attempt, &binding) {
+                live.insert(pid, source.registration_id.clone());
+            }
+            next_retry.insert(
+                source.registration_id,
+                Instant::now() + Duration::from_secs(1),
+            );
+        }
+        drop(state);
+        // Existing mailbox transports and admission resources remain in charge;
+        // there is no second resume API and no synchronous wait for recipient ACK.
+        let mut mailbox = MailboxDb::open(path)?;
+        let sessions: BTreeSet<_> = mailbox
+            .wake_sessions()
+            .pending_delivery_session_ids(i64::MAX as usize)?
+            .into_iter()
+            .collect();
+        for session in sessions {
+            let delivery = crate::mailbox_delivery::attempt_pty_mailbox_delivery_with_trigger(
+                &mut mailbox,
+                &session,
+                "completion-independent-owner",
+            );
+            if !delivery.submitted && delivery.status != "paused" {
+                let _ = crate::wake_coordinator::trigger_notify_wake(&session);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn reap(live: &mut HashMap<i64, String>) {
+    loop {
+        let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        if pid <= 0 {
+            break;
+        }
+        // Custodian exit is not converted to drain. Only its exact durable
+        // ECHILD/integration receipt can discharge its own attempt.
+        live.remove(&i64::from(pid));
+    }
+}

@@ -6,10 +6,12 @@ mod mailbox_delivery;
 // Keep the sweep's receipt dependency on the production implementation and registry wiring.
 #[path = "../src/native_receipt.rs"]
 mod native_receipt;
-#[path = "../src/wiring.rs"]
-mod wiring;
 #[path = "../src/wake_coordinator/mod.rs"]
 mod wake_coordinator;
+#[path = "../src/wiring.rs"]
+mod wiring;
+
+use agent_runner_lib::completion_owner;
 
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, MailboxDb,

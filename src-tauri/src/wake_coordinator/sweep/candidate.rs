@@ -8,7 +8,6 @@ use oulipoly_state::mailbox::{
 };
 use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
 
-use super::consumed;
 use super::plan::{WakeSweepAction, WakeSweepRetentionReason};
 
 pub(super) fn wake_sweep_candidate_action(
@@ -25,7 +24,7 @@ pub(super) fn wake_sweep_candidate_action(
             WakeSweepRetentionReason::NotStartable,
         ));
     }
-    if consumed::pending_mailbox_consumed_marker_present(db, state, &candidate.session_id)? {
+    if db.list_pending(&candidate.session_id)?.is_empty() {
         return Ok(WakeSweepAction::Retain(
             WakeSweepRetentionReason::NotStartable,
         ));
