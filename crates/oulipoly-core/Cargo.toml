@@ -13,3 +13,7 @@ test-support = []
 [dependencies]
 libc.workspace = true
 serde.workspace = true
+
+[[test]]
+name = "child_enumeration"
+harness = false

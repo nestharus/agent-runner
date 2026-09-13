@@ -1096,34 +1096,55 @@ mod linux {
             if fd < 0 {
                 return false;
             }
-            let mut bytes = [0u8; 4096];
-            let count = libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len());
+            let result = signal_child_list(fd, signal);
             libc::close(fd);
-            if count < 0 {
-                return false;
-            }
+            result
+        }
+    }
+
+    // procfs children is a seq_file, not a one-read snapshot. Keep its cursor
+    // through EOF and carry partial PID tokens across read boundaries. No wait
+    // is consumed here: a retained zombie prefix must not prevent tail signals.
+    // Exclusive wait ownership keeps enumerated incarnations pinned even when
+    // signaling makes them zombies. Adoption can append children during this
+    // traversal; the caller repeats from a fresh open for later adoptions. EOF
+    // is only the end of this traversal, never ECHILD or proof of tree drain.
+    unsafe fn signal_child_list(fd: RawFd, signal: i32) -> bool {
+        unsafe {
+            let mut bytes = [0u8; 4096];
             let mut pid: i32 = 0;
-            for byte in &bytes[..count as usize] {
-                if byte.is_ascii_digit() {
-                    let Some(next) = pid
-                        .checked_mul(10)
-                        .and_then(|n| n.checked_add(i32::from(*byte - b'0')))
-                    else {
-                        return false;
-                    };
-                    pid = next;
-                } else if *byte == b' ' && pid > 0 {
-                    if libc::kill(pid, signal) != 0 && *libc::__errno_location() != libc::ESRCH {
-                        return false;
+            loop {
+                let count = libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len());
+                if count < 0 {
+                    if *libc::__errno_location() == libc::EINTR {
+                        continue;
                     }
-                    pid = 0;
-                } else {
                     return false;
                 }
+                if count == 0 {
+                    // Every kernel PID token ends with a space.
+                    return pid == 0;
+                }
+                for byte in &bytes[..count as usize] {
+                    if byte.is_ascii_digit() {
+                        let Some(next) = pid
+                            .checked_mul(10)
+                            .and_then(|n| n.checked_add(i32::from(*byte - b'0')))
+                        else {
+                            return false;
+                        };
+                        pid = next;
+                    } else if *byte == b' ' && pid > 0 {
+                        if libc::kill(pid, signal) != 0 && *libc::__errno_location() != libc::ESRCH
+                        {
+                            return false;
+                        }
+                        pid = 0;
+                    } else {
+                        return false;
+                    }
+                }
             }
-            // The kernel list ends each PID with a space. A truncated last
-            // token is skipped; earlier children are killed and reaped first.
-            true
         }
     }
 
