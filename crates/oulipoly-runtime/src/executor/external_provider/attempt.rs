@@ -113,12 +113,22 @@ pub enum ProviderLaunchAttemptOutcome {
     Failed(ProviderLaunchAttemptFailure),
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OriginalRuntimeExitAttempt {
+    terminal_code: String,
+    exit_code: Option<i32>,
+    site: String,
+    projection_result: String,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct RetainedAttemptCustody {
     lease: ProviderLaunchLease,
     actors: Vec<ActorSettlementReceipt>,
     channel: ReturnChannelSettlement,
     retention_failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    runtime_exit_attempts: Vec<OriginalRuntimeExitAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_evidence: Option<serde_json::Value>,
 }
@@ -172,8 +182,8 @@ pub fn settle_retained_native_cancellation(
     // A complete original aggregate can precede native runtime finalization.
     // Its existence must not suppress projection from the later original drain.
     // The mailbox transitions require integrated original custody. Uninvoked
-    // Launch retains startup failure; spawned Launch keeps its observed process
-    // outcome. Neither is relabeled by a later cancellation acceptance.
+    // Launch retains startup failure; spawned Launch keeps the original executor's
+    // attempted runtime outcome. Raw status and late cancellation cannot relabel it.
     if !runtime.effect_incapable
         && complete_actor_receipts(&retained.actors)
         && retained
@@ -192,18 +202,31 @@ pub fn settle_retained_native_cancellation(
                 .exact_process_identity
                 .as_ref()
                 .ok_or("native_launch_identity_absent")?;
-            let (reason, code) = original_launch_outcome(launch)?;
-            mailbox.exit_native_launched_after_original_drain(
-                &generation.to_string(),
-                &invocation.to_string(),
-                &oulipoly_state::completion_continuation::SourceProcessIdentity {
-                    pid: process.os_pid,
-                    boot_id: process.os_boot_id.clone(),
-                    starttime_ticks: process.os_pid_starttime_ticks,
-                },
-                reason,
-                code,
-            )?;
+            let drain = mailbox
+                .native_original_drain(&generation.to_string(), &invocation.to_string())?
+                .ok_or("native_original_drain_absent")?;
+            if drain["receipt"]["accepted_cancellation"].is_string() {
+                // Keep the pre-existing original-cancellation projection. It is
+                // never used to fill an uncancelled original observation.
+                mailbox.exit_native_cancelled_after_original_drain(
+                    &generation.to_string(),
+                    &invocation.to_string(),
+                    false,
+                )?;
+            } else {
+                let (reason, code) = original_runtime_exit_outcome(&retained)?;
+                mailbox.exit_native_launched_after_original_drain(
+                    &generation.to_string(),
+                    &invocation.to_string(),
+                    &oulipoly_state::completion_continuation::SourceProcessIdentity {
+                        pid: process.os_pid,
+                        boot_id: process.os_boot_id.clone(),
+                        starttime_ticks: process.os_pid_starttime_ticks,
+                    },
+                    reason,
+                    code,
+                )?;
+            }
         } else {
             mailbox.exit_native_cancelled_after_original_drain(
                 &generation.to_string(),
@@ -278,11 +301,21 @@ fn retain_recovered_dead_cancellation(
         .iter()
         .find(|a| a.operation == ProviderOperation::Launch)
         .ok_or("native_launch_receipt_absent")?;
+    let drain = MailboxDb::open_read_only(&MailboxDb::path_for_state_db(state.path()))?
+        .native_original_drain(
+            &retained.lease.runtime_generation_uuid.to_string(),
+            &retained.lease.owner.invocation_uuid.to_string(),
+        )?
+        .ok_or("native_original_drain_absent")?;
     let mut interpretation = row.clone();
     let (classification, reason) = if launch.spawned {
         (
             "original_launched_outcome_after_recovered_dead",
-            original_launch_outcome(launch)?.0,
+            if drain["receipt"]["accepted_cancellation"].is_string() {
+                RuntimeTerminalReason::Cancelled
+            } else {
+                original_runtime_exit_outcome(retained)?.0
+            },
         )
     } else {
         (
@@ -296,12 +329,6 @@ fn retain_recovered_dead_cancellation(
     if !runtime_row_effect_incapable(&retained.lease, &interpretation, &retained.actors) {
         return Ok(None);
     }
-    let drain = MailboxDb::open_read_only(&MailboxDb::path_for_state_db(state.path()))?
-        .native_original_drain(
-            &retained.lease.runtime_generation_uuid.to_string(),
-            &retained.lease.owner.invocation_uuid.to_string(),
-        )?
-        .ok_or("native_original_drain_absent")?;
     let cancellation = logical_cancellation_observation(state, &retained.lease)?;
     let mut evidence = serde_json::json!({
         "classification":classification,
@@ -315,32 +342,29 @@ fn retain_recovered_dead_cancellation(
         // separate persisted acceptance observation.
         evidence["logical_cancellation"] = cancellation;
     }
+    if launch.spawned && !retained.runtime_exit_attempts.is_empty() {
+        evidence["original_runtime_exit_attempts"] =
+            serde_json::to_value(&retained.runtime_exit_attempts).map_err(|e| e.to_string())?;
+    }
     state.retain_native_runtime_cancellation(&retained.lease.owner, &evidence)?;
     Ok(Some(evidence))
 }
 
-/// Actual terminal observation, never the later logical cancellation token.
-fn original_launch_outcome(
-    actor: &ActorSettlementReceipt,
+/// Retry what the original executor actually attempted, not a new interpretation
+/// of raw actor status. Classification can supersede a provider's exit code.
+fn original_runtime_exit_outcome(
+    retained: &RetainedAttemptCustody,
 ) -> Result<(RuntimeTerminalReason, Option<i32>), String> {
-    use oulipoly_provider::generated::ProcessStatus;
-    if !actor.spawned || !actor.effect_incapable() {
-        return Err("native_original_launch_unsettled".into());
-    }
-    match actor.process_status {
-        Some(ProcessStatus::Exited { code }) => Ok((
-            if code == 0 {
-                RuntimeTerminalReason::OrderlyCompletion
-            } else {
-                RuntimeTerminalReason::AbnormalTermination
-            },
-            Some(code),
-        )),
-        Some(ProcessStatus::SignalTerminated { .. }) => {
-            Ok((RuntimeTerminalReason::AbnormalTermination, None))
-        }
-        _ => Err("native_original_launch_terminal_status_absent".into()),
-    }
+    let original = retained
+        .runtime_exit_attempts
+        .last()
+        .ok_or("native_original_runtime_exit_attempt_absent")?;
+    let reason = match original.terminal_code.as_str() {
+        "orderly_completion" => RuntimeTerminalReason::OrderlyCompletion,
+        "abnormal_termination" => RuntimeTerminalReason::AbnormalTermination,
+        _ => return Err("native_original_launched_runtime_exit_conflict".into()),
+    };
+    Ok((reason, original.exit_code))
 }
 
 /// The request's persisted timestamp/token is separate from the original drain
@@ -488,8 +512,35 @@ pub(crate) struct AttemptEvidence {
     pub verified_session: Option<String>,
     pub stderr_pending: Vec<u8>,
     pub retention_failure: Option<String>,
+    runtime_exit_attempts: Vec<OriginalRuntimeExitAttempt>,
 }
 impl AttemptExecution {
+    pub(crate) fn record_runtime_exit_attempt(
+        &self,
+        reason: RuntimeTerminalReason,
+        exit_code: Option<i32>,
+        site: &str,
+        result: &impl std::fmt::Debug,
+    ) {
+        let terminal_code = match reason {
+            RuntimeTerminalReason::OrderlyCompletion => "orderly_completion",
+            RuntimeTerminalReason::AbnormalTermination => "abnormal_termination",
+            RuntimeTerminalReason::StartupFailed => "startup_failed",
+            RuntimeTerminalReason::Cancelled => "cancelled",
+            RuntimeTerminalReason::RecoveredDead => "recovered_dead",
+        };
+        self.evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .runtime_exit_attempts
+            .push(OriginalRuntimeExitAttempt {
+                terminal_code: terminal_code.into(),
+                exit_code,
+                site: site.into(),
+                projection_result: format!("{result:?}"),
+            });
+    }
+
     fn refresh_promotions(&self) {
         let observed = self
             .state
@@ -737,6 +788,7 @@ impl AttemptExecution {
                 .clone()
                 .ok_or("channel_settlement_absent")?,
             retention_failure: evidence.retention_failure.clone(),
+            runtime_exit_attempts: evidence.runtime_exit_attempts.clone(),
             recovery_evidence: None,
         };
         self.state
@@ -924,6 +976,7 @@ fn execute_allocated_attempt(
             RuntimeTerminalReason::StartupFailed
         };
         let _projection = exit_runtime_generation_outcome(Some(&attempt.spawn), reason, None);
+        attempt.record_runtime_exit_attempt(reason, None, "outer_attempt", &_projection);
         #[cfg(feature = "age360-fault-fixtures")]
         if _projection.is_err() {
             oulipoly_state::completion_continuation::age360_fault_barrier(
@@ -1344,8 +1397,22 @@ fn recover_native_custody(
             ReturnChannelSettlement::NotCreated
         }
     };
+    let runtime_exit_attempts = state
+        .native_attempt_custody(generation, invocation)?
+        .map(serde_json::from_value::<RetainedAttemptCustody>)
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .map(|original| {
+            if original.lease != lease {
+                return Err("native_original_runtime_exit_lease_conflict".to_string());
+            }
+            Ok(original.runtime_exit_attempts)
+        })
+        .transpose()?
+        .unwrap_or_default();
     let retained = RetainedAttemptCustody {
         lease,
+        runtime_exit_attempts,
         actors,
         channel,
         retention_failure: None,
@@ -1613,56 +1680,57 @@ mod tests {
         );
     }
     #[test]
-    fn launched_original_outcome_does_not_use_cancellation_or_weaken_custody() {
-        use oulipoly_provider::generated::ProcessStatus;
-        let mut actor = ActorSettlementReceipt {
-            attempt_id: Uuid::new_v4(),
-            operation: ProviderOperation::Launch,
-            spawned: true,
-            exact_process_identity: Some(oulipoly_provider::custody::ProcessIdentity {
-                os_pid: 1,
-                os_boot_id: "unit".into(),
-                os_pid_starttime_ticks: 1,
-            }),
-            process_status: Some(ProcessStatus::SignalTerminated { signal: 9 }),
-            process_tree_terminated: true,
-            leader_reaped: true,
-            force_killed: false,
-            host_cancellation_requested: false,
-            operation_finished: true,
-            uncertain: false,
+    fn runtime_exit_replay_uses_original_classification_not_raw_process_status() {
+        let (_dir, attempt, _) = fixture();
+        let mut retained = RetainedAttemptCustody {
+            lease: attempt.allocation.lease.clone(),
+            actors: vec![],
+            channel: ReturnChannelSettlement::NotCreated,
+            retention_failure: None,
+            runtime_exit_attempts: vec![],
+            recovery_evidence: None,
         };
+        assert!(original_runtime_exit_outcome(&retained).is_err());
+        attempt.record_runtime_exit_attempt(
+            RuntimeTerminalReason::OrderlyCompletion,
+            Some(7),
+            "classified_dispatch",
+            &Err::<(), _>("storage"),
+        );
+        retained.runtime_exit_attempts = attempt
+            .evidence
+            .lock()
+            .unwrap()
+            .runtime_exit_attempts
+            .clone();
         assert_eq!(
-            original_launch_outcome(&actor).unwrap(),
+            original_runtime_exit_outcome(&retained).unwrap(),
+            (RuntimeTerminalReason::OrderlyCompletion, Some(7))
+        );
+        attempt.record_runtime_exit_attempt(
+            RuntimeTerminalReason::AbnormalTermination,
+            None,
+            "dispatch_cleanup",
+            &Err::<(), _>("storage"),
+        );
+        retained.runtime_exit_attempts = attempt
+            .evidence
+            .lock()
+            .unwrap()
+            .runtime_exit_attempts
+            .clone();
+        assert_eq!(
+            original_runtime_exit_outcome(&retained).unwrap(),
             (RuntimeTerminalReason::AbnormalTermination, None)
         );
-        actor.host_cancellation_requested = true;
-        assert_eq!(
-            original_launch_outcome(&actor).unwrap(),
-            (RuntimeTerminalReason::AbnormalTermination, None)
-        );
-        actor.process_status = Some(ProcessStatus::Exited { code: 0 });
-        assert_eq!(
-            original_launch_outcome(&actor).unwrap(),
-            (RuntimeTerminalReason::OrderlyCompletion, Some(0))
-        );
-        actor.process_status = Some(ProcessStatus::Exited { code: 7 });
-        assert_eq!(
-            original_launch_outcome(&actor).unwrap(),
-            (RuntimeTerminalReason::AbnormalTermination, Some(7))
-        );
-        actor.leader_reaped = false;
-        assert!(original_launch_outcome(&actor).is_err());
-        actor.leader_reaped = true;
-        actor.process_tree_terminated = false;
-        assert!(original_launch_outcome(&actor).is_err());
-        actor.process_tree_terminated = true;
-        actor.process_status = Some(ProcessStatus::Cancelled);
-        assert!(original_launch_outcome(&actor).is_err());
-        actor.process_status = Some(ProcessStatus::Unknown);
-        assert!(original_launch_outcome(&actor).is_err());
+        assert_eq!(retained.runtime_exit_attempts.len(), 2);
+        retained
+            .runtime_exit_attempts
+            .last_mut()
+            .unwrap()
+            .terminal_code = "cancelled".into();
+        assert!(original_runtime_exit_outcome(&retained).is_err());
     }
-
     #[test]
     fn logical_cancellation_keeps_actual_acceptance_separate_and_exact() {
         let (_dir, attempt, _) = fixture();
@@ -1710,6 +1778,7 @@ mod tests {
             actors: attempt.actors.receipts(),
             channel: ReturnChannelSettlement::NotCreated,
             retention_failure: None,
+            runtime_exit_attempts: vec![],
             recovery_evidence: None,
         };
         let mut runtime = runtime_receipt(&attempt.allocation, &retained.actors);

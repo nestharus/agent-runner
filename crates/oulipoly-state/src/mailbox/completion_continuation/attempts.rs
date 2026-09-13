@@ -656,8 +656,8 @@ impl MailboxDb {
 }
 
 impl MailboxDb {
-    /// Physical launched-process outcome, independent of logical cancellation.
-    /// The runtime producer supplies the original actor outcome; State joins the
+    /// Original launched-runtime exit projection, independent of late cancellation.
+    /// The runtime producer supplies its retained original attempt; State joins the
     /// exact recorded process and integrated original activation drain. No grant,
     /// transfer claim, or existing terminal history is replaced.
     pub fn exit_native_launched_after_original_drain(

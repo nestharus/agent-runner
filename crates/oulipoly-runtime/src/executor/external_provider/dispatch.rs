@@ -290,7 +290,11 @@ fn attempt_account_dispatch_with_custody(
     let returned_artifacts = match read_and_cleanup_return_channel(standalone_channel) {
         Ok(artifacts) => artifacts,
         Err(message) if launch_outcome.is_ok() => {
-            let _ = finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            let _ = finalize_failed_external_launch(
+                spawn_identity.as_ref(),
+                &recorded_generation,
+                context.attempt.as_deref(),
+            );
             return Err(terminal_attempt_error(ServiceError::Dependency { message }));
         }
         Err(message) => {
@@ -304,8 +308,11 @@ fn attempt_account_dispatch_with_custody(
     let launch_result = match launch_outcome {
         Ok(result) => result,
         Err(error) => {
-            let cleanup =
-                finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            let cleanup = finalize_failed_external_launch(
+                spawn_identity.as_ref(),
+                &recorded_generation,
+                context.attempt.as_deref(),
+            );
             // The observer records verified typed custody before returning its transport error.
             // Do not infer attachment failure from provider-controlled diagnostics.
             let live_failure = attachment_failure
@@ -385,7 +392,11 @@ fn attempt_account_dispatch_with_custody(
     {
         Ok(verified) => verified,
         Err(error) => {
-            let _ = finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            let _ = finalize_failed_external_launch(
+                spawn_identity.as_ref(),
+                &recorded_generation,
+                context.attempt.as_deref(),
+            );
             return Err(terminal_attempt_error(protocol_service_error(
                 error.protocol_kind(),
             )));
@@ -394,7 +405,11 @@ fn attempt_account_dispatch_with_custody(
     if spawn_identity.is_some()
         && require_recorded_external_generation(&recorded_generation).is_err()
     {
-        let _ = finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+        let _ = finalize_failed_external_launch(
+            spawn_identity.as_ref(),
+            &recorded_generation,
+            context.attempt.as_deref(),
+        );
         return Err(terminal_attempt_error(protocol_service_error(
             "runtime_generation_bind_failed",
         )));
@@ -428,18 +443,30 @@ fn attempt_account_dispatch_with_custody(
                 // Like headless CLI supervision, settle both generation and
                 // compatibility projection with the classified work outcome,
                 // not the launch exit status that classification superseded.
-                mark_runtime_generation_orderly_completed(
+                let projection = mark_runtime_generation_orderly_completed(
                     spawn_identity.as_ref(),
                     Some(result.exit_code),
                     Some(result.exit_code),
-                )
-                .err()
-                .map(|error| ("runtime_generation_exit_failed", error))
+                );
+                if let Some(attempt) = &context.attempt {
+                    attempt.record_runtime_exit_attempt(
+                        oulipoly_state::mailbox::RuntimeTerminalReason::OrderlyCompletion,
+                        Some(result.exit_code),
+                        "classified_dispatch",
+                        &projection,
+                    );
+                }
+                projection
+                    .err()
+                    .map(|error| ("runtime_generation_exit_failed", error))
             }
         };
         if let Some((stage, error)) = failure {
-            let cleanup =
-                finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            let cleanup = finalize_failed_external_launch(
+                spawn_identity.as_ref(),
+                &recorded_generation,
+                context.attempt.as_deref(),
+            );
             return Ok(failed_finalization_result(
                 result,
                 verified_session.as_ref(),
@@ -588,6 +615,7 @@ fn require_recorded_external_generation(
 fn finalize_failed_external_launch(
     context: Option<&SpawnIdentityContext>,
     recorded_generation: &RecordedLaunchGeneration,
+    attempt: Option<&super::attempt::AttemptExecution>,
 ) -> Result<GenerationOperationOutcome, GenerationOperationError> {
     let spawned = recorded_generation
         .lock()
@@ -600,6 +628,9 @@ fn finalize_failed_external_launch(
         oulipoly_state::mailbox::RuntimeTerminalReason::StartupFailed
     };
     let outcome = exit_runtime_generation_outcome(context, reason, None);
+    if let Some(attempt) = attempt {
+        attempt.record_runtime_exit_attempt(reason, None, "dispatch_cleanup", &outcome);
+    }
     #[cfg(feature = "age360-fault-fixtures")]
     if outcome.is_err() {
         oulipoly_state::completion_continuation::age360_fault_barrier(

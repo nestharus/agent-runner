@@ -1170,25 +1170,33 @@ fn native_birth_composition_live_ac_survives_succession_without_grant() {
 
 #[test]
 fn native_birth_composition_spawned_late_cancel_all_exit_projections_fail() {
-    spawned_late_cancellation(true, false);
+    spawned_late_cancellation(true, false, false);
 }
 
 #[test]
 fn native_birth_composition_spawned_both_projection_errors_observed() {
-    spawned_late_cancellation(true, true);
+    spawned_late_cancellation(true, true, false);
 }
 
 #[test]
 fn native_birth_composition_spawned_successful_projection_control() {
-    spawned_late_cancellation(false, false);
+    spawned_late_cancellation(false, false, false);
 }
 
-fn spawned_late_cancellation(obstruct: bool, observe_errors: bool) {
+#[test]
+fn native_birth_composition_zero_exit_preserves_failed_protocol_runtime_outcome() {
+    spawned_late_cancellation(true, false, true);
+}
+
+fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bool) {
     if private_case(false) {
         return;
     }
     let f = Fixture::new("owner_only");
     f.gate("hold-native-launch");
+    if zero_exit {
+        f.gate("native-launch-exit-zero-without-output");
+    }
     f.gate("native-after-custody-retention.hold");
     start_pre_attachment(&f);
     let launch_process = process_identity(reached(&f, "native-launch"));
@@ -1201,7 +1209,11 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool) {
         f.gate("native-dispatch-exit-projection-failed.hold");
         f.gate("native-outer-exit-projection-failed.hold");
     }
-    kill_exact(&launch_process);
+    if zero_exit {
+        fs::remove_file(f.root.path().join("hold-native-launch")).unwrap();
+    } else {
+        kill_exact(&launch_process);
+    }
     if observe_errors {
         let dispatch_owner = reached(&f, "native-dispatch-exit-projection-failed");
         println!("actual original dispatch cleanup returned failure; owner={dispatch_owner}");
@@ -1233,14 +1245,42 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool) {
         .find(|a| a.operation == oulipoly_provider::custody::ProviderOperation::Launch)
         .unwrap();
     assert!(launch.spawned);
-    assert!(matches!(
-        launch.process_status,
-        Some(
-            oulipoly_provider::generated::ProcessStatus::SignalTerminated {
-                signal: libc::SIGKILL
-            }
-        )
-    ));
+    if zero_exit {
+        assert!(matches!(
+            launch.process_status,
+            Some(oulipoly_provider::generated::ProcessStatus::Exited { code: 0 })
+        ));
+    } else {
+        assert!(matches!(
+            launch.process_status,
+            Some(
+                oulipoly_provider::generated::ProcessStatus::SignalTerminated {
+                    signal: libc::SIGKILL
+                }
+            )
+        ));
+    }
+    // The baseline has no original projection journal. Its discriminating
+    // failure remains the background settlement, not missing new instrumentation.
+    if let Some(attempts) = original["runtime_exit_attempts"].as_array() {
+        assert!(!attempts.is_empty());
+        assert_eq!(
+            attempts.last().unwrap()["terminal_code"],
+            "abnormal_termination"
+        );
+        if obstruct {
+            assert!(attempts.iter().all(|a| {
+                a["projection_result"]
+                    .as_str()
+                    .unwrap()
+                    .contains("StorageFailure")
+            }));
+        }
+        if observe_errors {
+            assert!(attempts.iter().any(|a| a["site"] == "dispatch_cleanup"));
+            assert!(attempts.iter().any(|a| a["site"] == "outer_attempt"));
+        }
+    }
     let lifecycle: String = db
         .query_row(
             "SELECT lifecycle_state FROM runtime_generation WHERE generation_uuid=?1",
@@ -1300,10 +1340,41 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool) {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(
-        reason, "abnormal_termination",
-        "actual SIGKILL outcome, not late cancellation"
-    );
+    if reason == "recovered_dead" {
+        // Generic recovery may win the restored-storage race. Its existing
+        // observation must remain unchanged; the cancellation-only supplement
+        // must carry the exact original executor outcome separately.
+        let raw: String = state.connection().query_row("SELECT result_json FROM provider_launch_transition_replays WHERE logical_launch_id=?1 AND operation_key LIKE '%/native-runtime-cancellation-receipts'", [logical], |r|r.get(0)).unwrap();
+        let supplement: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let id = oulipoly_state::mailbox::RuntimeGenerationId::parse(&generation).unwrap();
+        let row = f
+            .mailbox()
+            .runtime_lifecycle_reader()
+            .runtime_generation(&id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            supplement["original_runtime_row"],
+            serde_json::to_value(row).unwrap()
+        );
+        assert_eq!(
+            supplement["cancellation_terminal_code"],
+            "abnormal_termination"
+        );
+        assert_eq!(
+            supplement["original_runtime_exit_attempts"],
+            original["runtime_exit_attempts"]
+        );
+        assert_eq!(supplement["original_actor_receipts"], original["actors"]);
+        assert_eq!(supplement["original_drain"]["receipt"], drain);
+        assert_eq!(supplement["logical_cancellation"]["token"], token);
+        println!("unchanged generic recovery plus original attempted runtime outcome={supplement}");
+    } else {
+        assert_eq!(
+            reason, "abnormal_termination",
+            "original attempted runtime outcome, not raw process status or late cancellation"
+        );
+    }
     state
         .request_cancel(uuid::Uuid::parse_str(logical).unwrap())
         .unwrap();

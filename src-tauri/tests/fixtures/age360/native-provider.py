@@ -307,6 +307,10 @@ if hold.exists():
     if attributed:
         (root / ("native-" + method + ".reached")).write_text(str(os.getpid()))
         while hold.exists(): time.sleep(0.02)
+        if method == "launch" and root.joinpath("native-launch-exit-zero-without-output").exists():
+            # Actual original process exits normally without producing the
+            # required protocol final. No fixture authors a runtime/custody fact.
+            sys.exit(0)
 if method == "describe":
     print(json.dumps(envelope(request, {
         "provider_id": "age360-native-wake-fixture",
