@@ -370,11 +370,15 @@ impl StateDb {
         let path = self
             .completion_authority_state_path()
             .ok_or("completion retirement requires stable State identity")?;
+        // Open the existing projection before taking State: schema/open work must
+        // not prolong the State writer reservation. All mutable duties are still
+        // read below under State, then revalidated under the sidecar writer.
+        let mut mailbox =
+            MailboxDb::open_existing_native_authority(&MailboxDb::path_for_state_db(path))?;
         let tx =
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
                 .map_err(|e| e.to_string())?;
         let admitted = self.admitted_completion_continuations()?;
-        let mut mailbox = MailboxDb::open(&MailboxDb::path_for_state_db(path))?;
         // Physical drain is not logical cancellation or retained-channel release.
         // Keep the domain steward while its native settlement/cleanup is owed.
         for (generation, invocation) in self.cancelling_native_attempts()? {
@@ -3770,6 +3774,72 @@ mod completion_continuation_tests {
                     &changed,
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn completion_retirement_yields_busy_sidecar_without_blocking_cancellation() {
+        use crate::{
+            BeginProviderLaunchRequest, ProviderLaunchAttemptAllocation, ProviderLaunchCandidate,
+            ProviderLaunchStartMode,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let state = StateDb::open(&path).unwrap();
+        seed_domain(&path);
+        let request = BeginProviderLaunchRequest {
+            logical_launch_id: uuid::Uuid::new_v4(),
+            request_identity_sha256: "a".repeat(64),
+            model_name: "fixture".into(),
+            start_mode: ProviderLaunchStartMode::Create,
+            expected_provider_session_id: None,
+            candidates: vec![ProviderLaunchCandidate {
+                provider_index: 0,
+                account_name: "fixture".into(),
+            }],
+            parent_invocation_id: None,
+            allocation: ProviderLaunchAttemptAllocation::allocate().unwrap(),
+        };
+        state.begin_launch(&request).unwrap();
+        let mailbox = MailboxDb::open(&MailboxDb::path_for_state_db(&path)).unwrap();
+        let owner = mailbox.completion_continuation_owner().unwrap().unwrap();
+        // Known holder and actual successful statement, not inferred proc wchan.
+        mailbox
+            .connection()
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let worker_owner = owner.clone();
+        let worker = std::thread::spawn(move || {
+            let state = StateDb::open(&worker_path).unwrap();
+            send.send(state.close_idle_completion_continuation_owner(&worker_owner))
+                .unwrap();
+        });
+        // The control intentionally keeps the sidecar writer until observation.
+        // This is an experiment bound below SQLite's existing five-second wait,
+        // not a change to the product cancellation budget.
+        let retirement = recv.recv_timeout(std::time::Duration::from_secs(2));
+        let cancellation = if retirement.is_ok() {
+            Some(state.request_cancel(request.logical_launch_id))
+        } else {
+            None
+        };
+        mailbox.connection().execute_batch("ROLLBACK").unwrap();
+        worker.join().unwrap();
+        assert!(!retirement.unwrap().unwrap());
+        assert!(cancellation.unwrap().is_ok());
+        assert_eq!(
+            serde_json::to_value(mailbox.completion_continuation_owner().unwrap()).unwrap(),
+            serde_json::to_value(Some(owner.clone())).unwrap()
+        );
+        assert!(
+            state
+                .close_idle_completion_continuation_owner(&owner)
+                .unwrap()
+        );
+        println!(
+            "known_sidecar_holder=fixture BEGIN_IMMEDIATE=ok retirement=deferred cancellation=accepted ROLLBACK=ok retry=closed"
         );
     }
 

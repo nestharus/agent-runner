@@ -144,10 +144,20 @@ impl MailboxDb {
         owner: &CompletionDomainOwner,
         admitted: &[AdmittedSourceBinding],
     ) -> Result<bool, String> {
-        let tx = self
+        // This connection belongs to this retirement attempt only. While State's
+        // writer is held, sidecar contention is a refusal to retire, not a wait.
+        // The caller drops State and the guardian retries from fresh premises.
+        self.conn
+            .busy_timeout(std::time::Duration::ZERO)
+            .map_err(|e| e.to_string())?;
+        let tx = match self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(tx) => tx,
+            Err(e) if sqlite_error_is_contention(&e) => return Ok(false),
+            Err(e) => return Err(e.to_string()),
+        };
         if domain_on(&tx)?.as_deref() != Some(&owner.domain_id) {
             return Err("completion retirement domain conflict".into());
         }
