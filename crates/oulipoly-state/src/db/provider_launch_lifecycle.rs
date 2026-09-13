@@ -662,6 +662,35 @@ impl StateDb {
             predecessor.invocation_row_id,
             InvocationMutationAuthority::ProviderLaunch(predecessor),
         )?;
+        // Fresh allocation consumes old certification as new authority. Unlike
+        // the immutable replay above, it must revalidate native publication.
+        // Keep State -> namespace -> sidecar guards alive through State commit.
+        let sidecar_path = crate::mailbox::MailboxDb::path_for_state_db(&self.db_path);
+        let needs_publication =
+            super::provider_launch_publication::needs_publication(&tx, predecessor, "successor")?;
+        let authority = needs_publication
+            .then(|| {
+                crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()?;
+        let mut mailbox = authority
+            .as_ref()
+            .map(crate::mailbox::MailboxDb::open_existing_for_completion_authority)
+            .transpose()?;
+        let sidecar_fence = mailbox
+            .as_mut()
+            .map(crate::mailbox::MailboxDb::begin_completion_authority_fence)
+            .transpose()?;
+        if let Some(fence) = &sidecar_fence {
+            super::provider_launch_publication::validate(
+                &tx,
+                fence,
+                predecessor,
+                "successor",
+                &serde_json::to_value(proof).map_err(|e| e.to_string())?,
+            )?;
+        }
         validate_proof(&tx, predecessor, proof)?;
         if !proof.channel.transferable() {
             return Err(conflict());

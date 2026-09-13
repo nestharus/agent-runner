@@ -16,13 +16,18 @@ pub(super) fn needs_publication(
     ) {
         return Ok(true);
     }
-    if !matches!(operation, "settle_cancel" | "certify") && !operation.starts_with("reconcile/") {
+    if !matches!(operation, "settle_cancel" | "certify" | "successor")
+        && !operation.starts_with("reconcile/")
+    {
         return Ok(false);
     }
+    // Any retained native association selects action-time validation; generic
+    // producer-supplied proofs without native records keep their own contract.
     conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM provider_launch_transition_replays WHERE logical_launch_id=?1 AND operation_key IN (?2,?3,?4))",
+        "SELECT EXISTS(SELECT 1 FROM provider_launch_transition_replays WHERE logical_launch_id=?1 AND operation_key IN (?2,?3,?4,?5,?6))",
         params![owner.logical_launch_id.to_string(), format!("{}/native-recovery-receipts", owner.attempt_id),
-            format!("{}/native-custody-receipts", owner.attempt_id), format!("{}/native-recovered-custody-receipts", owner.attempt_id)],
+            format!("{}/native-custody-receipts", owner.attempt_id), format!("{}/native-recovered-custody-receipts", owner.attempt_id),
+            format!("{}/native-runtime-cancellation-receipts", owner.attempt_id), format!("{}/native-channel-duty", owner.attempt_id)],
         |row| row.get(0),
     ).map_err(|e| e.to_string())
 }
@@ -50,7 +55,9 @@ pub(super) fn validate(
         }
         "native-runtime-cancellation" => validate_supplement(&published, input),
         "native-channel-duty-owner" => validate_channel(&published, owner, input),
-        "settle_cancel" | "certify" => validate_settlement(conn, owner, &published, input),
+        "settle_cancel" | "certify" | "successor" => {
+            validate_settlement(conn, owner, &published, input)
+        }
         _ if operation.starts_with("reconcile/") => {
             if input[1].is_null() {
                 Ok(())

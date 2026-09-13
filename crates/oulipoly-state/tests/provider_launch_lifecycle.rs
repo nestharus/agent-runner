@@ -1487,3 +1487,226 @@ fn native_publication_missing_storage_never_grandfathers_detached_evidence() {
         .is_none()
     );
 }
+
+// All evidence in these public-API sequences is synthetic State/sidecar data,
+// not original actor waits, Q, or a claim that terminal actors acquire new work.
+fn native_supplement(
+    db: &StateDb,
+    lease: &ProviderLaunchLease,
+) -> (serde_json::Value, ProviderLaunchCustodyProof) {
+    let (drain, row) = native_publication_fixture(db, lease);
+    let supplement = serde_json::json!({"original_drain":drain,"original_runtime_row":row,"cancellation_terminal_code":"startup_failed"});
+    let mut custody = proof(lease);
+    custody.runtime_settlement_sha256 =
+        completion_continuation::sha256(&serde_json::to_vec(&supplement).unwrap());
+    (supplement, custody)
+}
+
+fn native_history(db: &StateDb) -> Vec<(String, String)> {
+    let connection = db.connection();
+    let mut statement = connection.prepare("SELECT operation_key,result_json FROM provider_launch_transition_replays ORDER BY operation_key").unwrap();
+    statement
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn native_supplement_only_public_settlement_checks_action_time_not_retention_time() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    let (supplement, custody) = native_supplement(&db, &lease);
+    db.retain_native_runtime_cancellation(&lease.owner, &supplement)
+        .unwrap();
+    db.request_cancel(lease.owner.logical_launch_id).unwrap();
+    let history = native_history(&db);
+    assert!(
+        !history
+            .iter()
+            .any(|(key, _)| key.ends_with("/native-custody-receipts")
+                || key.ends_with("/native-recovery-receipts")
+                || key.ends_with("/native-recovered-custody-receipts"))
+    );
+    let sidecar = Connection::open(mailbox::MailboxDb::path_for_state_db(db.path())).unwrap();
+    sidecar.execute("UPDATE runtime_generation SET active_delivery_claim_uuid=?1,active_delivery_claimed_at='now',active_delivery_seqs_json='[1]'", [Uuid::new_v4().to_string()]).unwrap();
+    assert_eq!(
+        db.settle_cancel(&lease.owner, &custody).unwrap_err(),
+        "native_publication_runtime_not_settled"
+    );
+    assert_eq!(native_history(&db), history);
+    sidecar.execute_batch("UPDATE runtime_generation SET active_delivery_claim_uuid=NULL,active_delivery_claimed_at=NULL,active_delivery_seqs_json=NULL;").unwrap();
+    // Successful retention cannot substitute for a new authority transaction.
+    sidecar
+        .execute_batch("BEGIN IMMEDIATE; UPDATE runtime_generation SET exit_code=37")
+        .unwrap();
+    assert_eq!(
+        db.settle_cancel(&lease.owner, &custody).unwrap_err(),
+        "completion_authority_contention: timed out acquiring PID mailbox SQLite writer: database is locked"
+    );
+    assert_eq!(native_history(&db), history);
+    sidecar.execute_batch("ROLLBACK").unwrap();
+    // The claim check is not the only discriminator: a structurally valid but
+    // unrelated digest must not pass merely because retention once succeeded.
+    let mut wrong = custody.clone();
+    wrong.runtime_settlement_sha256 = "d".repeat(64);
+    assert_eq!(
+        db.settle_cancel(&lease.owner, &wrong).unwrap_err(),
+        "native_publication_supplement_conflict"
+    );
+    assert_eq!(native_history(&db), history);
+    db.settle_cancel(&lease.owner, &custody).unwrap();
+    db.settle_cancel(&lease.owner, &custody).unwrap();
+    let settled_history = native_history(&db);
+    sidecar
+        .execute_batch("UPDATE runtime_generation SET exit_code=37")
+        .unwrap();
+    assert_eq!(
+        db.settle_cancel(&lease.owner, &custody).unwrap_err(),
+        "native_publication_runtime_conflict"
+    );
+    assert_eq!(native_history(&db), settled_history);
+    assert_eq!(
+        db.connection()
+            .query_row("SELECT status FROM provider_logical_launches", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+        "cancelled"
+    );
+}
+
+#[test]
+fn native_channel_only_public_settlement_revalidates_publication() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    let (drain, _) = native_publication_fixture(&db, &lease);
+    let sidecar = Connection::open(mailbox::MailboxDb::path_for_state_db(db.path())).unwrap();
+    sidecar
+        .execute_batch("UPDATE runtime_generation SET terminal_reason='startup_failed'")
+        .unwrap();
+    let published = mailbox::MailboxDb::read_native_publication(
+        &mailbox::MailboxDb::path_for_state_db(db.path()),
+        &lease.runtime_generation_uuid.to_string(),
+        &lease.owner.invocation_uuid.to_string(),
+    )
+    .unwrap();
+    let mut custody = proof(&lease);
+    custody.runtime_settlement_sha256 =
+        completion_continuation::sha256(&serde_json::to_vec(&published.runtime.unwrap()).unwrap());
+    custody.channel = ProviderLaunchChannelSettlement::ContinuingCustody {
+        domain_id: drain["domain_id"].as_str().unwrap().into(),
+        original_owner: lease.owner.clone(),
+        disposition: "cleanup_failed".into(),
+        path: "synthetic-test-only".into(),
+        artifacts: vec![],
+    };
+    db.retain_native_channel_duty(&lease.owner, &custody.channel)
+        .unwrap();
+    db.request_cancel(lease.owner.logical_launch_id).unwrap();
+    let history = native_history(&db);
+    sidecar
+        .execute_batch("UPDATE runtime_generation SET exit_code=37")
+        .unwrap();
+    assert_eq!(
+        db.settle_cancel(&lease.owner, &custody).unwrap_err(),
+        "native_publication_supplement_absent"
+    );
+    assert_eq!(native_history(&db), history);
+    sidecar
+        .execute_batch("UPDATE runtime_generation SET exit_code=NULL")
+        .unwrap();
+    db.settle_cancel(&lease.owner, &custody).unwrap();
+    assert_eq!(
+        db.pending_native_channel_duties().unwrap(),
+        vec![custody.channel]
+    );
+}
+
+#[test]
+fn native_fresh_successor_revalidates_old_certification_but_allocated_replay_is_immutable() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    native_publication_fixture(&db, &lease);
+    let sidecar = Connection::open(mailbox::MailboxDb::path_for_state_db(db.path())).unwrap();
+    sidecar
+        .execute_batch("UPDATE runtime_generation SET terminal_reason='startup_failed'")
+        .unwrap();
+    let published = mailbox::MailboxDb::read_native_publication(
+        &mailbox::MailboxDb::path_for_state_db(db.path()),
+        &lease.runtime_generation_uuid.to_string(),
+        &lease.owner.invocation_uuid.to_string(),
+    )
+    .unwrap();
+    let mut custody = proof(&lease);
+    custody.runtime_settlement_sha256 =
+        completion_continuation::sha256(&serde_json::to_vec(&published.runtime.unwrap()).unwrap());
+    db.retain_native_attempt_custody(
+        &lease.owner,
+        &serde_json::json!({"synthetic":"not actor proof"}),
+    )
+    .unwrap();
+    db.request_transfer(&lease.owner, &failure()).unwrap();
+    db.certify_effect_incapable(&lease.owner, &custody).unwrap();
+    let history = native_history(&db);
+    let allocation = ProviderLaunchAttemptAllocation::allocate().unwrap();
+    let allocate = || {
+        db.lease_successor(
+            &lease.owner,
+            &request.allocation.completion_authority,
+            &lease.candidate_plan_sha256,
+            &request.candidates[1],
+            &custody,
+            &allocation,
+        )
+    };
+    // Synthetic stale historical certification: never rewrite the retained
+    // certification, and do not claim this SQL is a legal actor transition.
+    sidecar.execute_batch("UPDATE runtime_generation SET active_delivery_claim_uuid='00000000-0000-4000-8000-000000000001',active_delivery_claimed_at='now',active_delivery_seqs_json='[1]'").unwrap();
+    assert_eq!(
+        allocate().unwrap_err(),
+        "native_publication_runtime_not_settled"
+    );
+    assert_eq!(native_history(&db), history);
+    assert_eq!(count(&db, "provider_launch_attempts"), 1);
+    sidecar.execute_batch("UPDATE runtime_generation SET active_delivery_claim_uuid=NULL,active_delivery_claimed_at=NULL,active_delivery_seqs_json=NULL").unwrap();
+    // Model old certification whose runtime premise is no longer published.
+    // The temporary SQL copy is fixture restoration only, never authority.
+    sidecar.execute_batch("CREATE TEMP TABLE saved_runtime AS SELECT * FROM runtime_generation; DELETE FROM runtime_generation").unwrap();
+    assert_eq!(allocate().unwrap_err(), "native_publication_runtime_absent");
+    assert_eq!(native_history(&db), history);
+    assert_eq!(count(&db, "provider_launch_attempts"), 1);
+    sidecar
+        .execute_batch(
+            "INSERT INTO runtime_generation SELECT * FROM saved_runtime; DROP TABLE saved_runtime",
+        )
+        .unwrap();
+    // A private real SQLite writer blocks action-time authority even though the
+    // previous certification and published row match. This is writer contention,
+    // not a physical-sync/prepublication experiment or inverse-lock deadlock.
+    sidecar
+        .execute_batch("BEGIN IMMEDIATE; UPDATE runtime_generation SET exit_code=37")
+        .unwrap();
+    assert_eq!(
+        allocate().unwrap_err(),
+        "completion_authority_contention: timed out acquiring PID mailbox SQLite writer: database is locked"
+    );
+    assert_eq!(native_history(&db), history);
+    sidecar.execute_batch("ROLLBACK").unwrap();
+    let next = allocate().unwrap();
+    assert_eq!(next.owner.owner_epoch, 2);
+    let allocated_history = native_history(&db);
+    sidecar
+        .execute_batch("BEGIN IMMEDIATE; UPDATE runtime_generation SET exit_code=37")
+        .unwrap();
+    assert_eq!(allocate().unwrap(), next);
+    assert_eq!(native_history(&db), allocated_history);
+    assert_eq!(count(&db, "provider_launch_attempts"), 2);
+    sidecar.execute_batch("ROLLBACK").unwrap();
+}
