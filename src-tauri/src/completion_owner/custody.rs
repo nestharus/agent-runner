@@ -269,28 +269,35 @@ pub(super) fn entry() -> Result<(), String> {
             // original Bash source tree is never in this custody boundary.
             let _ = oulipoly_core::launch_custody::signal_owned_children(signal);
         }
-        // Keep the wait result through DB/result integration failures;
-        // never repeat a wait for an already reaped root.
-        if let Some(process) = child.as_mut()
-            && let Some(status) = process.try_wait().map_err(|e| e.to_string())?
-        {
+        // Persist each waitable incarnation before consuming it. A surviving
+        // original adopter can complete the same record after AC loss.
+        let (waited, status, _) = reap_adopted_child(Some((attempt, &identity)))?;
+        if child.as_ref().is_some_and(|p| p.id() as i32 == waited) {
+            let exit = std::process::ExitStatus::from_raw(status);
             if cancellation.is_none()
                 && attempt.operation == "activation"
-                && matches!(status.signal(), Some(libc::SIGTERM | libc::SIGINT))
+                && matches!(exit.signal(), Some(libc::SIGTERM | libc::SIGINT))
             {
-                // A waited terminal signal on our exact native launcher is an
-                // actual cancellation action, unlike missing PID/ordinary exit.
                 cancellation = Some((
-                    format!("native_launcher_wait_signal:{}", status.signal().unwrap()),
+                    format!("native_launcher_wait_signal:{}", exit.signal().unwrap()),
                     std::time::Instant::now(),
                 ));
             }
-            root_status = status.code();
-            root_wait_status = Some(status.into_raw());
+            root_status = exit.code();
+            root_wait_status = Some(status);
             child = None;
         }
-        if child.is_none() && owned_tree_empty()? {
-            break;
+        if waited < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                if child.is_some() {
+                    return Err("original launcher wait missing".into());
+                }
+                break;
+            }
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.to_string());
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -685,7 +692,7 @@ fn adopt(
                 };
             let _ = oulipoly_core::launch_custody::signal_owned_children(signal);
         }
-        let (waited, status, wait_identity) = reap_adopted_child()?;
+        let (waited, status, wait_identity) = reap_adopted_child(Some((attempt, &adopter)))?;
         if waited == pid {
             custodian_wait = Some(status);
         }
@@ -740,7 +747,12 @@ fn adopt(
 
 /// Inspect the waitable child before consuming its PID, preserving incarnation
 /// identity even if the launcher binding cannot currently be read from SQLite.
-fn reap_adopted_child() -> Result<
+fn reap_adopted_child(
+    journal: Option<(
+        &ContinuationAttempt,
+        &oulipoly_state::completion_continuation::SourceProcessIdentity,
+    )>,
+) -> Result<
     (
         i32,
         i32,
@@ -764,10 +776,45 @@ fn reap_adopted_child() -> Result<
     if pid == 0 {
         return Ok((0, 0, None));
     }
-    let identity = super::linux::identity(i64::from(pid)).ok();
+    let identity = super::linux::identity(i64::from(pid))?;
+    if let Some((attempt, owner)) = journal {
+        let status = if info.si_code == libc::CLD_EXITED {
+            (unsafe { info.si_status() }) << 8
+        } else {
+            (unsafe { info.si_status() })
+                | if info.si_code == libc::CLD_DUMPED {
+                    128
+                } else {
+                    0
+                }
+        };
+        let file = Path::new(&attempt.result_path)
+            .with_file_name("owned-waits")
+            .join(format!(
+                "{}-{}-{}.json",
+                identity.pid, identity.starttime_ticks, owner.pid
+            ));
+        // No aggregation at ECHILD. The receipt binds original owner, operation
+        // boundary, incarnation and an actual WNOWAIT terminal observation.
+        if durable_write(
+            &file,
+            &serde_json::to_vec(&serde_json::json!({
+                "attempt_id": attempt.attempt_id, "owner": owner, "process": identity,
+                "status": status, "observation": "waitid_wnowait"
+            }))
+            .map_err(|e| e.to_string())?,
+        )
+        .is_err()
+        {
+            // Preserve the waitable child and original owner on retention
+            // failure. The caller continues TERM/KILL escalation each turn;
+            // storage failure must not kill both original custody boundaries.
+            return Ok((0, 0, None));
+        }
+    }
     let mut status = 0;
     let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    Ok((waited, status, identity))
+    Ok((waited, status, Some(identity)))
 }
 
 /// Replay only retained wait/drain evidence joined by the DB to its original

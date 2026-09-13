@@ -107,6 +107,19 @@ def launch(request):
             sequence = str(rows[0]["seq"])
             ack = subprocess.run([runner,"mailbox","ack","--session-id",known,"--from-seq",sequence,"--to-seq",sequence,"--json"],capture_output=True,check=True,timeout=10)
             pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-exact-ack.json").write_bytes(ack.stdout)
+        root = pathlib.Path(os.environ["AGE360_ROOT"])
+        if root.joinpath("native-channel-mode").exists():
+            channel = os.environ["OULIPOLY_RETURN_CHANNEL"]
+            helper_env = dict(os.environ,
+                AGE360_NATIVE_RETURN_HELPER_CHANNEL=channel,
+                AGE360_NATIVE_RETURN_HELPER_PRODUCER=json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"],
+                AGE360_NATIVE_RETURN_HELPER_DB=str(root / "native-artifact-store.db"))
+            subprocess.run([root.joinpath("native-channel-helper").read_text(), "--exact", "native_channel_producer_helper"], env=helper_env, check=True, stdout=subprocess.DEVNULL)
+            mode = root.joinpath("native-channel-mode").read_text()
+            if mode == "quarantined":
+                with open(channel, "a") as stream: stream.write("malformed\n")
+            elif mode == "cleanup_failed":
+                pathlib.Path(channel).parent.joinpath("retained-cleanup-obligation").write_bytes(b"retain me")
         if os.environ.get("AGE360_DESCENDANT") == "1":
             cancelling = pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("cancel-probe-enabled").exists()
             if cancelling:

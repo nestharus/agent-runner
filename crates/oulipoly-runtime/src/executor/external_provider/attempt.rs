@@ -119,6 +119,8 @@ struct RetainedAttemptCustody {
     actors: Vec<ActorSettlementReceipt>,
     channel: ReturnChannelSettlement,
     retention_failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_evidence: Option<serde_json::Value>,
 }
 
 /// Original producer receipts remain the authority even when outer activation
@@ -128,9 +130,10 @@ pub fn settle_retained_native_cancellation(
     generation: Uuid,
     invocation: Uuid,
 ) -> Result<(), String> {
-    let raw = state
-        .native_attempt_custody(generation, invocation)?
-        .ok_or("native_actor_channel_custody_not_retained")?;
+    let raw = match state.native_attempt_custody(generation, invocation)? {
+        Some(raw) => raw,
+        None => recover_native_custody(state, generation, invocation)?,
+    };
     let retained: RetainedAttemptCustody =
         serde_json::from_value(raw).map_err(|e| e.to_string())?;
     if retained.lease.runtime_generation_uuid != generation
@@ -139,14 +142,57 @@ pub fn settle_retained_native_cancellation(
         return Err("native_custody_identity_mismatch".into());
     }
     let mailbox_path = MailboxDb::path_for_state_db(state.path());
+    if retained.recovery_evidence.is_some()
+        && retained
+            .actors
+            .iter()
+            .all(ActorSettlementReceipt::effect_incapable)
+    {
+        MailboxDb::open(&mailbox_path)?.exit_native_cancelled_after_original_drain(
+            &generation.to_string(),
+            &invocation.to_string(),
+        )?;
+    }
     let runtime = runtime_receipt_for(&retained.lease, &mailbox_path, &retained.actors);
-    let proof = cancellation_proof(&retained, &runtime)?;
+    let continuing = match &retained.channel {
+        ReturnChannelSettlement::Quarantined {
+            path, artifacts, ..
+        }
+        | ReturnChannelSettlement::CleanupFailed { path, artifacts } => {
+            let drain = MailboxDb::open_read_only(&mailbox_path)?
+                .native_original_drain(&generation.to_string(), &invocation.to_string())?
+                .ok_or("native_channel_continuing_domain_owner_absent")?;
+            let duty = oulipoly_state::ProviderLaunchChannelSettlement::ContinuingCustody {
+                domain_id: drain["domain_id"]
+                    .as_str()
+                    .ok_or("native_channel_domain_absent")?
+                    .to_string(),
+                original_owner: retained.lease.owner.clone(),
+                disposition: if matches!(
+                    retained.channel,
+                    ReturnChannelSettlement::Quarantined { .. }
+                ) {
+                    "quarantined"
+                } else {
+                    "cleanup_failed"
+                }
+                .into(),
+                path: path.to_string_lossy().into_owned(),
+                artifacts: artifacts.clone(),
+            };
+            state.retain_native_channel_duty(&retained.lease.owner, &duty)?;
+            Some(duty)
+        }
+        _ => None,
+    };
+    let proof = cancellation_proof(&retained, &runtime, continuing)?;
     state.settle_cancel(&retained.lease.owner, &proof)
 }
 
 fn cancellation_proof(
     retained: &RetainedAttemptCustody,
     runtime: &RuntimeSettlementReceipt,
+    continuing: Option<oulipoly_state::ProviderLaunchChannelSettlement>,
 ) -> Result<oulipoly_state::ProviderLaunchCustodyProof, String> {
     use oulipoly_state::{
         ProviderLaunchActorSettlement as Actor, ProviderLaunchChannelSettlement as Channel,
@@ -192,13 +238,9 @@ fn cancellation_proof(
         ReturnChannelSettlement::ArtifactsCommitted(refs) => {
             Channel::ArtifactsCommitted(refs.clone())
         }
-        // These paths are durably retained with refs and uncertainty, but no
-        // continuing cleanup owner exists yet. Do not certify logical settlement.
-        ReturnChannelSettlement::Quarantined { .. } => {
-            return Err("native_quarantine_cleanup_owner_unassigned".into());
-        }
-        ReturnChannelSettlement::CleanupFailed { .. } => {
-            return Err("native_failed_cleanup_owner_unassigned".into());
+        ReturnChannelSettlement::Quarantined { .. }
+        | ReturnChannelSettlement::CleanupFailed { .. } => {
+            continuing.ok_or("native_channel_continuing_owner_unassigned")?
         }
     };
     let row = runtime
@@ -502,6 +544,7 @@ impl AttemptExecution {
                 .clone()
                 .ok_or("channel_settlement_absent")?,
             retention_failure: evidence.retention_failure.clone(),
+            recovery_evidence: None,
         };
         self.state
             .lock()
@@ -510,6 +553,22 @@ impl AttemptExecution {
                 &self.allocation.lease.owner,
                 &serde_json::to_value(retained).map_err(|e| e.to_string())?,
             )
+    }
+    pub(crate) fn retain_channel(&self, channel: &mut ReturnChannel) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        if self
+            .state
+            .lock()
+            .map_err(|_| "state unavailable")?
+            .native_attempt_recovery(
+                self.allocation.lease.runtime_generation_uuid,
+                self.allocation.lease.owner.invocation_uuid,
+            )?
+            .is_some()
+        {
+            channel.retain_for_recovery(native_journal(&self.allocation).join("channel"))?;
+        }
+        Ok(())
     }
     pub(crate) fn seal_channel(&self) -> Vec<crate::executor::ReturnedArtifactRef> {
         let channel = self
@@ -600,11 +659,21 @@ fn execute_allocated_attempt(
             .process_environment_value()
             .into();
         context.parent_invocation_env = Some(identity.to_string());
+        if original_tree {
+            let journal = native_journal(&allocation);
+            std::fs::create_dir_all(journal.join("actors")).map_err(|e| e.to_string())?;
+            state.retain_native_attempt_recovery(&owner, &serde_json::json!({
+                "lease":allocation.lease,"journal":journal,
+                "channel_path":allocation.channel_root.join(allocation.parent_invocation_uuid.to_string())
+                    .join(owner.logical_launch_id.to_string()).join(owner.attempt_id.to_string()).join("returns.jsonl")
+            }))?;
+        }
         let attempt = Arc::new(AttemptExecution {
             allocation: allocation.clone(),
             state: Mutex::new(state),
             actors: if original_tree {
                 AttemptActorCustody::original_tree(owner.attempt_id)
+                    .with_journal(native_journal(&allocation).join("actors"))
             } else {
                 AttemptActorCustody::new(owner.attempt_id)
             },
@@ -1231,4 +1300,162 @@ mod tests {
         ));
         assert!(!runtime_row_effect_incapable(&allocation.lease, &row, &[]));
     }
+}
+
+fn native_journal(allocation: &AllocatedProviderLaunchAttempt) -> PathBuf {
+    allocation
+        .state_db_path
+        .with_extension("native-producer-custody")
+        .join(allocation.lease.owner.attempt_id.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn recover_native_custody(
+    state: &StateDb,
+    generation: Uuid,
+    invocation: Uuid,
+) -> Result<serde_json::Value, String> {
+    use oulipoly_provider::custody::{ProcessIdentity, durable};
+    let source = state
+        .native_attempt_recovery(generation, invocation)?
+        .ok_or("native_recovery_intent_absent")?;
+    let lease: ProviderLaunchLease =
+        serde_json::from_value(source["lease"].clone()).map_err(|e| e.to_string())?;
+    if lease.runtime_generation_uuid != generation || lease.owner.invocation_uuid != invocation {
+        return Err("native_recovery_identity_conflict".into());
+    }
+    let mailbox = MailboxDb::open_read_only(&MailboxDb::path_for_state_db(state.path()))?;
+    let drain = mailbox
+        .native_original_drain(&generation.to_string(), &invocation.to_string())?
+        .ok_or("original_native_boundary_not_drained")?;
+    let journal = PathBuf::from(source["journal"].as_str().ok_or("native_journal_absent")?);
+    let waits = PathBuf::from(
+        drain["result_path"]
+            .as_str()
+            .ok_or("original_wait_path_absent")?,
+    )
+    .with_file_name("owned-waits");
+    let mut actors = Vec::new();
+    let mut evidence = Vec::new();
+    for entry in std::fs::read_dir(journal.join("actors")).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        let finished: Result<ActorSettlementReceipt, _> =
+            durable::read_json(&path.join("finished.json"));
+        if let Ok(receipt) = &finished {
+            if receipt.attempt_id == lease.owner.attempt_id && receipt.effect_incapable() {
+                actors.push(receipt.clone());
+                continue;
+            }
+        }
+        let mut actor = durable::intent(&path)?;
+        if actor.attempt_id != lease.owner.attempt_id {
+            return Err("native_actor_intent_conflict".into());
+        }
+        let identity = durable::attributed_proxy(&path)?;
+        let terminal: Result<(ProcessIdentity, i32), _> =
+            durable::read_json(&path.join("terminal.json"));
+        let (status, observation) = if let Ok((observed, status)) = terminal {
+            if observed != identity {
+                return Err("native_terminal_identity_conflict".into());
+            }
+            (
+                status,
+                serde_json::json!({"producer_terminal":path.join("terminal.json"), "process":identity,"status":status}),
+            )
+        } else {
+            let mut observed = None;
+            for entry in std::fs::read_dir(&waits).map_err(|e| e.to_string())? {
+                let value: serde_json::Value =
+                    durable::read_json(&entry.map_err(|e| e.to_string())?.path())?;
+                if value["attempt_id"] == drain["attempt_id"]
+                    && value["observation"] == "waitid_wnowait"
+                    && (value["owner"] == drain["custodian"] || value["owner"] == drain["adopter"])
+                    && value["process"]["pid"] == identity.os_pid
+                    && value["process"]["boot_id"] == identity.os_boot_id
+                    && value["process"]["starttime_ticks"] == identity.os_pid_starttime_ticks
+                {
+                    observed = Some(value);
+                    break;
+                }
+            }
+            let value = observed.ok_or("original_native_actor_wait_absent")?;
+            (
+                value["status"]
+                    .as_i64()
+                    .ok_or("native_wait_status_absent")? as i32,
+                value,
+            )
+        };
+        if !libc::WIFEXITED(status) && !libc::WIFSIGNALED(status) {
+            return Err("nonterminal_native_wait".into());
+        }
+        actor.spawned = true;
+        actor.exact_process_identity = Some(identity);
+        actor.process_status = Some(if libc::WIFEXITED(status) {
+            oulipoly_provider::generated::ProcessStatus::Exited {
+                code: libc::WEXITSTATUS(status),
+            }
+        } else {
+            oulipoly_provider::generated::ProcessStatus::SignalTerminated {
+                signal: libc::WTERMSIG(status),
+            }
+        });
+        // Attribution precedes effects; the genuine terminal wait accounts for
+        // this actor. The enclosing original owner's integrated drain accounts
+        // for descendants after adoption, not an invented WCD1 producer receipt.
+        actor.leader_reaped = true;
+        actor.process_tree_terminated = true;
+        actor.operation_finished = true;
+        actor.host_cancellation_requested = true;
+        actor.uncertain = false;
+        evidence.push(serde_json::json!({"intent":path,"terminal":observation}));
+        actors.push(actor);
+    }
+    if actors.is_empty() {
+        return Err("native_actor_journal_empty".into());
+    }
+    let channel = if journal.join("channel/channel.json").exists() {
+        ReturnChannel::recover_original(&journal.join("channel"), &actors, |refs| {
+            state.record_promotion(
+                &lease.owner,
+                Uuid::new_v4(),
+                ProviderLaunchPromotion::ReturnedArtifact,
+            )?;
+            state.record_returned_artifacts(
+                InvocationMutationAuthority::ProviderLaunch(&lease.owner),
+                lease.owner.invocation_row_id,
+                refs,
+            )
+        })?
+    } else {
+        let path = PathBuf::from(
+            source["channel_path"]
+                .as_str()
+                .ok_or("native_channel_intent_absent")?,
+        );
+        if path.parent().is_some_and(|p| p.exists()) {
+            ReturnChannelSettlement::CleanupFailed {
+                path,
+                artifacts: vec![],
+            }
+        } else {
+            ReturnChannelSettlement::NotCreated
+        }
+    };
+    let retained = RetainedAttemptCustody {
+        lease,
+        actors,
+        channel,
+        retention_failure: None,
+        recovery_evidence: Some(
+            serde_json::json!({"original_drain":drain,"actor_observations":evidence}),
+        ),
+    };
+    let value = serde_json::to_value(&retained).map_err(|e| e.to_string())?;
+    state.retain_native_attempt_custody(&retained.lease.owner, &value)?;
+    Ok(value)
+}
+#[cfg(not(target_os = "linux"))]
+fn recover_native_custody(_: &StateDb, _: Uuid, _: Uuid) -> Result<serde_json::Value, String> {
+    Err("native_original_owner_recovery_unsupported".into())
 }

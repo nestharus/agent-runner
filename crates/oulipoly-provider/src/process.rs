@@ -887,8 +887,13 @@ where
             // Typed original-tree mode fails admission if no original launch owner
             // exists. Group-based proof is disabled for this mode; only its own
             // ECHILD-backed receipt may certify the tree, even after proxy KILL.
-            let receipt = oulipoly_core::launch_custody::configure_current_receipted(&mut process)
+            let attribution = crate::custody::durable::prepare(custody.as_ref().unwrap())
                 .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error))?;
+            let receipt = oulipoly_core::launch_custody::configure_current_receipted_attributed(
+                &mut process,
+                attribution,
+            )
+            .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error))?;
             return process
                 .spawn()
                 .map(|child| Child::new(child, custody).with_published_receipt(receipt))

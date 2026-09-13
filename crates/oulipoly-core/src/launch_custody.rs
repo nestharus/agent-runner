@@ -105,6 +105,7 @@ pub struct PublishedTreeReceipt {
 struct PublishedReceiptWriter {
     file: Arc<std::fs::File>,
     completion: Arc<std::os::fd::OwnedFd>,
+    attribution: Option<Arc<std::fs::File>>,
 }
 #[cfg(target_os = "linux")]
 impl PublishedTreeReceipt {
@@ -167,6 +168,16 @@ impl PublishedTreeReceipt {
 /// falls back to unconfined group signalling or a replacement's empty tree.
 #[cfg(target_os = "linux")]
 pub fn configure_current_receipted(command: &mut Command) -> io::Result<PublishedTreeReceipt> {
+    configure_current_receipted_attributed(command, None)
+}
+
+/// A pre-opened producer journal receives the published proxy's exact proc stat
+/// before any custodian/workload fork. Failed retention prevents effects.
+#[cfg(target_os = "linux")]
+pub fn configure_current_receipted_attributed(
+    command: &mut Command,
+    attribution: Option<Arc<std::fs::File>>,
+) -> io::Result<PublishedTreeReceipt> {
     use std::os::unix::fs::OpenOptionsExt;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     CURRENT.with(|current| {
@@ -209,6 +220,7 @@ pub fn configure_current_receipted(command: &mut Command) -> io::Result<Publishe
             Some(PublishedReceiptWriter {
                 file: file.clone(),
                 completion: Arc::new(writer),
+                attribution,
             }),
         )?;
         Ok(PublishedTreeReceipt {
@@ -586,6 +598,35 @@ mod linux {
                     libc::close(status_pair[0]);
                     libc::close(status_pair[1]);
                     return Err(io::Error::last_os_error());
+                }
+                if let Some(attribution) = receipt.as_ref().and_then(|r| r.attribution.as_ref()) {
+                    // Syscall-only in the raw fork image. Keep the PID pinned;
+                    // this record precedes every process-capable descendant.
+                    let stat = libc::open(
+                        c"/proc/self/stat".as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    );
+                    let mut bytes = [0u8; 4096];
+                    let count = if stat < 0 {
+                        -1
+                    } else {
+                        libc::read(stat, bytes.as_mut_ptr().cast(), bytes.len())
+                    };
+                    if stat >= 0 {
+                        libc::close(stat);
+                    }
+                    if count <= 0
+                        || count == bytes.len() as isize
+                        || libc::pwrite(
+                            attribution.as_raw_fd(),
+                            bytes.as_ptr().cast(),
+                            count as usize,
+                            0,
+                        ) != count
+                        || libc::fsync(attribution.as_raw_fd()) != 0
+                    {
+                        return Err(io::Error::other("pre-effect proxy attribution failed"));
+                    }
                 }
                 let custodian = fork_process();
                 if custodian < 0 {

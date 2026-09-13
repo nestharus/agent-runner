@@ -45,6 +45,7 @@ uuid.workspace = true
 tauri-build.workspace = true
 
 [dev-dependencies]
+oulipoly-agent-store = { path = "../crates/oulipoly-agent-store" }
 base64 = "0.22"
 oulipoly-agent-messenger = { path = "../crates/oulipoly-agent-messenger" }
 rusqlite.workspace = true

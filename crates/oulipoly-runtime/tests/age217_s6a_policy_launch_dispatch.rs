@@ -3373,11 +3373,11 @@ fn native_return_cancellation(channel_mode: &str) {
         "committed" => settlement.unwrap(),
         "quarantined" => assert_eq!(
             settlement.unwrap_err(),
-            "native_quarantine_cleanup_owner_unassigned"
+            "native_channel_continuing_domain_owner_absent"
         ),
         "cleanup_failed" => assert_eq!(
             settlement.unwrap_err(),
-            "native_failed_cleanup_owner_unassigned"
+            "native_channel_continuing_domain_owner_absent"
         ),
         _ => unreachable!(),
     }

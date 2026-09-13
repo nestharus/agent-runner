@@ -100,15 +100,22 @@ pub(super) fn attempt_account_dispatch(
     let custody_identity = external_launch_spawn_identity_context(context);
     if context.attempt.is_none() {
         register_runtime_generation_starting(custody_identity.as_ref()).map_err(|_| {
-            terminal_attempt_error(protocol_service_error("runtime_generation_registration_failed"))
+            terminal_attempt_error(protocol_service_error(
+                "runtime_generation_registration_failed",
+            ))
         })?;
     }
-    let _custody_scope = crate::executor::cli::spawn_identity::launch_custody_scope(custody_identity.as_ref());
+    let _custody_scope =
+        crate::executor::cli::spawn_identity::launch_custody_scope(custody_identity.as_ref());
     let result = attempt_account_dispatch_with_custody(registry, context, custody_identity.clone());
     if result.is_err() && context.attempt.is_none() {
         // Preflight/policy now run under Starting too. A failed standalone
         // attempt must revoke its authority before a candidate rotation.
-        if let Err(error) = crate::executor::cli::spawn_identity::finalize_or_retain_starting_failure(custody_identity.as_ref()) {
+        if let Err(error) =
+            crate::executor::cli::spawn_identity::finalize_or_retain_starting_failure(
+                custody_identity.as_ref(),
+            )
+        {
             tracing::warn!(%error, "Standalone dispatch failed; Starting finalization pending or rejected");
         }
     }
@@ -218,7 +225,7 @@ fn attempt_account_dispatch_with_custody(
         .map_err(classify_provider_client_attempt_error)?;
     let mut candidate = apply_policy_transform(candidate, policy_result)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
-    let return_channel = if let Some(attempt) = &context.attempt {
+    let mut return_channel = if let Some(attempt) = &context.attempt {
         let allocation = &attempt.allocation;
         Some(
             crate::executor::ReturnChannel::for_attempt(
@@ -237,6 +244,13 @@ fn attempt_account_dispatch_with_custody(
             terminal_attempt_error(protocol_service_error("return_channel_create_failed"))
         })?
     };
+    if let (Some(attempt), Some(channel)) = (&context.attempt, return_channel.as_mut()) {
+        attempt.retain_channel(channel).map_err(|_| {
+            terminal_attempt_error(protocol_service_error(
+                "return_channel_custody_retention_failed",
+            ))
+        })?;
+    }
     if let Some(return_channel) = return_channel.as_ref() {
         candidate.env.insert(
             RETURN_CHANNEL_ENV.to_string(),

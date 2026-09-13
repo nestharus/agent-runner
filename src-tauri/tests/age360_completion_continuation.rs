@@ -5,11 +5,11 @@
 #[cfg(feature = "age360-fault-fixtures")]
 #[path = "fixtures/age360/custody_faults.rs"]
 mod custody_faults;
+#[path = "fixtures/age360/live_census.rs"]
+mod live_census;
 #[cfg(feature = "age360-fault-fixtures")]
 #[path = "fixtures/age360/paired_faults.rs"]
 mod paired_faults;
-#[path = "fixtures/age360/live_census.rs"]
-mod live_census;
 mod provider_authority_fixture;
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::read_live_process_identity;
@@ -847,7 +847,21 @@ fn native_adopter_retains_wait_until_delayed_launcher_identity_arrives() {
     native_activation_custody(8);
 }
 fn native_activation_custody(owner_loss: u8) {
+    native_activation_channel_custody(owner_loss, None)
+}
+fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
     let f = Fixture::new("owner_only");
+    if let Some(mode) = channel {
+        fs::write(f.root.path().join("native-channel-mode"), mode).unwrap();
+        fs::write(
+            f.root.path().join("native-channel-helper"),
+            std::env::current_exe()
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+    }
     let receipt_window = match owner_loss {
         11 => Some("native-before-custody-retention"),
         12 => Some("native-after-custody-retention"),
@@ -1043,6 +1057,11 @@ fn native_activation_custody(owner_loss: u8) {
         );
         assert!(read_live_process_identity(descendant).unwrap().is_some());
     }
+    let wait_obstruction = PathBuf::from(&attempt.result_path).with_file_name("owned-waits");
+    if channel == Some("wait_storage_failure") {
+        assert!(!wait_obstruction.exists());
+        fs::write(&wait_obstruction, b"fixture obstruction, not a receipt").unwrap();
+    }
     let mut writer = MailboxDb::open(&f.data.join("pid-identity.db")).unwrap();
     assert!(!matches!(
         writer
@@ -1084,6 +1103,33 @@ fn native_activation_custody(owner_loss: u8) {
         assert!(current_identity_matches(&launcher));
         if matches!(owner_loss, 9 | 10) {
             request_linked_cancel(&f, &attempt);
+            if channel == Some("wait_storage_failure") {
+                wait(|| {
+                    read_live_process_identity(descendant)
+                        .ok()?
+                        .is_none()
+                        .then_some(())
+                });
+                let ac: oulipoly_state::completion_continuation::SourceProcessIdentity =
+                    serde_json::from_str(&custodian).unwrap();
+                let adopter: oulipoly_state::completion_continuation::SourceProcessIdentity =
+                    serde_json::from_str(&adopter).unwrap();
+                assert!(current_identity_matches(&ac) && current_identity_matches(&adopter));
+                assert!(
+                    f.mailbox()
+                        .continuation_activation(SESSION, &claim.claim_token)
+                        .unwrap()
+                        .is_some()
+                );
+                assert_eq!(
+                    fs::read(&wait_obstruction).unwrap(),
+                    b"fixture obstruction, not a receipt"
+                );
+                fs::remove_file(&wait_obstruction).unwrap();
+                println!(
+                    "physical cancellation remained effective with original wait owner retained through actual journal I/O denial"
+                );
+            }
         } else {
             assert_eq!(unsafe { libc::kill(launcher.pid as i32, libc::SIGTERM) }, 0);
             println!(
@@ -1179,6 +1225,71 @@ fn native_activation_custody(owner_loss: u8) {
         println!(
             "actual physical drain AND logical cancellation settled boundary={receipt_window:?}"
         );
+    }
+    if let Some(mode) = channel {
+        let expected = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
+        let launch = expected.split(':').next().unwrap();
+        let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+        let row: i64 = state
+            .connection()
+            .query_row(
+                "SELECT invocation_id FROM provider_launch_attempts WHERE logical_launch_id=?1",
+                [launch],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let refs = state.list_returned_artifacts(row).unwrap();
+        assert_eq!(refs.len(), 1);
+        let artifact = oulipoly_agent_messenger::show_returned(
+            oulipoly_agent_messenger::ShowReturnedRequest::VersionId {
+                db_path: f.root.path().join("native-artifact-store.db"),
+                version_id: refs[0].version_id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(artifact.content, b"actual-native-return");
+        assert_eq!(
+            refs[0].sha256,
+            oulipoly_state::completion_continuation::sha256(&artifact.content)
+        );
+        let duties = state.pending_native_channel_duties().unwrap();
+        if matches!(mode, "committed" | "wait_storage_failure") {
+            assert!(duties.is_empty());
+        } else {
+            assert_eq!(duties.len(), 1);
+            let oulipoly_state::ProviderLaunchChannelSettlement::ContinuingCustody {
+                domain_id,
+                original_owner,
+                disposition,
+                path,
+                artifacts,
+            } = &duties[0]
+            else {
+                panic!("not continuing custody");
+            };
+            assert_eq!(domain_id, &owner.domain_id);
+            assert_eq!(original_owner.logical_launch_id.to_string(), launch);
+            assert_eq!(disposition, mode);
+            assert_eq!(artifacts, &refs);
+            if mode == "quarantined" {
+                assert!(fs::read_to_string(path).unwrap().ends_with("malformed\n"));
+            } else {
+                assert_eq!(
+                    fs::read(
+                        PathBuf::from(path)
+                            .parent()
+                            .unwrap()
+                            .join("retained-cleanup-obligation")
+                    )
+                    .unwrap(),
+                    b"retain me"
+                );
+            }
+            println!(
+                "logical cancellation retains domain-owned continuing duty={:?}",
+                duties[0]
+            );
+        }
     }
 }
 
@@ -1383,6 +1494,8 @@ impl Drop for Fixture {
             }
         }
         logs(&self.data.join("completion-continuation"));
+        logs(&self.data.join("state.native-producer-custody"));
+        logs(&self.data.join("pid-identity.native-recovery-errors"));
         // Retain exact paired helper failure evidence, without dumping raw output,
         // pinned binaries or the private launch capability/environment.
         fn source_logs(path: &std::path::Path) {
@@ -1516,4 +1629,53 @@ fn native_state_cancellation_after_producer_custody_retention_settles() {
         return;
     }
     native_activation_custody(12);
+}
+
+#[test]
+fn native_channel_producer_helper() {
+    let Ok(channel) = std::env::var("AGE360_NATIVE_RETURN_HELPER_CHANNEL") else {
+        return;
+    };
+    let db = PathBuf::from(std::env::var("AGE360_NATIVE_RETURN_HELPER_DB").unwrap());
+    oulipoly_agent_store::Store::init(&db).unwrap();
+    oulipoly_agent_messenger::return_artifact(oulipoly_agent_messenger::ReturnRequest {
+        db_path: db,
+        invocation_uuid: std::env::var("AGE360_NATIVE_RETURN_HELPER_PRODUCER")
+            .unwrap()
+            .parse()
+            .unwrap(),
+        name: oulipoly_agent_messenger::ReturnName::new("result").unwrap(),
+        source: oulipoly_agent_messenger::ReturnSource::InlineBytes(
+            b"actual-native-return".to_vec(),
+        ),
+        format_hint: None,
+        verdict_line: None,
+        return_channel: Some(PathBuf::from(channel)),
+    })
+    .unwrap();
+}
+#[test]
+fn native_original_owner_recovers_committed_return_after_executor_cancellation() {
+    if !private_case(false) {
+        native_activation_channel_custody(9, Some("committed"));
+    }
+}
+#[test]
+fn native_original_adopter_recovers_quarantine_and_keeps_domain_cleanup_owner() {
+    if !private_case(false) {
+        native_activation_channel_custody(10, Some("quarantined"));
+    }
+}
+#[test]
+fn native_original_owner_recovers_failed_cleanup_and_preserves_owned_sidecar() {
+    if !private_case(false) {
+        native_activation_channel_custody(9, Some("cleanup_failed"));
+    }
+}
+
+#[test]
+fn native_cancellation_keeps_original_wait_owner_when_journal_storage_is_unavailable() {
+    if !private_case(false) {
+        native_activation_channel_custody(9, Some("wait_storage_failure"));
+    }
 }

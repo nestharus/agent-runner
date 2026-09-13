@@ -3046,6 +3046,7 @@ dependencies = [
  "fs4",
  "libc",
  "oulipoly-agent-messenger",
+ "oulipoly-agent-store",
  "oulipoly-config",
  "oulipoly-core",
  "oulipoly-provider",

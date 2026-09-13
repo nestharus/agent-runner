@@ -63,6 +63,7 @@ impl ActorSettlementReceipt {
 pub struct AttemptActorCustody {
     attempt_id: Uuid,
     original_tree: bool,
+    journal: Option<std::path::PathBuf>,
     records: Arc<Mutex<Vec<OperationCustody>>>,
     requests: Arc<Mutex<Vec<GeneratedRequestIdentity>>>,
 }
@@ -72,6 +73,8 @@ pub struct OperationCustody(
     pub(crate) bool,
     #[cfg(target_os = "linux")]
     pub(crate)  Arc<Mutex<Option<Arc<oulipoly_core::launch_custody::PublishedTreeReceipt>>>>,
+    #[cfg(not(target_os = "linux"))] pub(crate) (),
+    pub(crate) Option<std::path::PathBuf>,
 );
 pub(crate) struct OperationGuard(pub OperationCustody);
 impl Drop for OperationGuard {
@@ -79,6 +82,11 @@ impl Drop for OperationGuard {
         let mut receipt = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
         receipt.operation_finished = true;
         receipt.uncertain |= std::thread::panicking();
+        if let Some(path) = &self.0.3 {
+            if durable::write_json(&path.join("finished.json"), &*receipt).is_err() {
+                receipt.uncertain = true;
+            }
+        }
     }
 }
 impl AttemptActorCustody {
@@ -86,6 +94,7 @@ impl AttemptActorCustody {
         Self {
             attempt_id,
             original_tree: false,
+            journal: None,
             records: Arc::default(),
             requests: Arc::default(),
         }
@@ -97,6 +106,10 @@ impl AttemptActorCustody {
             original_tree: true,
             ..Self::new(attempt_id)
         }
+    }
+    pub fn with_journal(mut self, path: std::path::PathBuf) -> Self {
+        self.journal = Some(path);
+        self
     }
     pub(crate) fn begin(&self, subcommand: &str) -> OperationGuard {
         let record = OperationCustody(
@@ -116,6 +129,11 @@ impl AttemptActorCustody {
             self.original_tree,
             #[cfg(target_os = "linux")]
             Arc::default(),
+            #[cfg(not(target_os = "linux"))]
+            (),
+            self.journal
+                .as_ref()
+                .map(|p| p.join(Uuid::new_v4().to_string())),
         );
         self.records
             .lock()
@@ -182,3 +200,5 @@ impl AttemptActorCustody {
             .clone()
     }
 }
+
+pub mod durable;

@@ -97,6 +97,8 @@ pub struct ReturnChannel {
     directory: Option<File>,
     producer: Uuid,
     emergency_cleanup: bool,
+    recovery: Option<PathBuf>,
+    recovery_pin: bool,
 }
 impl ReturnChannel {
     pub fn path(&self) -> &Path {
@@ -143,7 +145,103 @@ impl ReturnChannel {
             directory: Some(directory),
             producer,
             emergency_cleanup: true,
+            recovery: None,
+            recovery_pin: false,
         })
+    }
+    /// Persist the opened inode identities before exposing the channel to a
+    /// provider. Native recovery owns retention; Drop must not erase evidence.
+    #[cfg(target_os = "linux")]
+    pub fn retain_for_recovery(&mut self, journal: PathBuf) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or("channel file absent")?
+            .metadata()
+            .map_err(|e| e.to_string())?;
+        let dir = self
+            .directory
+            .as_ref()
+            .ok_or("channel directory absent")?
+            .metadata()
+            .map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&journal).map_err(|e| e.to_string())?;
+        // A durable original-inode pin prevents reuse after executor FD loss.
+        // It is released only after pending cleanup/artifact custody is retained.
+        std::fs::hard_link(&self.path, journal.join("original-channel"))
+            .map_err(|e| e.to_string())?;
+        File::open(&journal)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        self.recovery_pin = true;
+        self.recovery = Some(journal.clone());
+        self.emergency_cleanup = false;
+        oulipoly_provider::custody::durable::write_json(
+            &journal.join("channel.json"),
+            &serde_json::json!({"path":self.path,"producer":self.producer,
+                "file_dev":file.dev(),"file_ino":file.ino(),"dir_dev":dir.dev(),"dir_ino":dir.ino()}),
+        )?;
+        self.emergency_cleanup = false;
+        self.recovery = Some(journal);
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub fn recover_original(
+        journal: &Path,
+        actors: &[ActorSettlementReceipt],
+        commit: impl FnOnce(&[ReturnedArtifactRef]) -> Result<(), String>,
+    ) -> Result<ReturnChannelSettlement, String> {
+        use oulipoly_provider::custody::durable::read_json;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        for name in ["settlement.json", "pending.json"] {
+            if journal.join(name).exists() {
+                return read_json(&journal.join(name));
+            }
+        }
+        let value: serde_json::Value = read_json(&journal.join("channel.json"))?;
+        let path = PathBuf::from(value["path"].as_str().ok_or("channel path absent")?);
+        let dir = path.parent().ok_or("channel parent absent")?.to_path_buf();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&dir)
+            .map_err(|e| e.to_string())?;
+        let pin = std::fs::symlink_metadata(journal.join("original-channel"))
+            .map_err(|e| e.to_string())?;
+        let fm = file.metadata().map_err(|e| e.to_string())?;
+        if !pin.is_file() || pin.dev() != fm.dev() || pin.ino() != fm.ino() || pin.nlink() != 2 {
+            return Err("original channel durable pin conflict".into());
+        }
+        let dm = directory.metadata().map_err(|e| e.to_string())?;
+        for (key, observed) in [
+            ("file_dev", fm.dev()),
+            ("file_ino", fm.ino()),
+            ("dir_dev", dm.dev()),
+            ("dir_ino", dm.ino()),
+        ] {
+            if value[key].as_u64() != Some(observed) {
+                return Err("recovery channel inode substituted".into());
+            }
+        }
+        Ok(Self {
+            path,
+            dir,
+            file: Some(file),
+            directory: Some(directory),
+            producer: serde_json::from_value(value["producer"].clone())
+                .map_err(|e| e.to_string())?,
+            emergency_cleanup: false,
+            recovery: Some(journal.to_path_buf()),
+            recovery_pin: true,
+        }
+        .seal(actors, commit))
     }
     /// Only this explicit operation can produce a settlement. Drop cannot.
     /// Accepted refs must be durably retained on the producing invocation by
@@ -154,10 +252,20 @@ impl ReturnChannel {
         commit: impl FnOnce(&[ReturnedArtifactRef]) -> Result<(), String>,
     ) -> ReturnChannelSettlement {
         self.emergency_cleanup = false;
-        if actors.is_empty() || !actors.iter().all(ActorSettlementReceipt::effect_incapable) {
-            return self.quarantine(None, vec![]);
+        let result =
+            if actors.is_empty() || !actors.iter().all(ActorSettlementReceipt::effect_incapable) {
+                self.quarantine(None, vec![])
+            } else {
+                self.seal_settled(commit)
+            };
+        if let Some(path) = &self.recovery {
+            // Preserve earlier pending custody if the final journal write fails.
+            let _ = oulipoly_provider::custody::durable::write_json(
+                &path.join("settlement.json"),
+                &result,
+            );
         }
-        self.seal_settled(commit)
+        result
     }
     fn seal_settled(
         &mut self,
@@ -218,6 +326,28 @@ impl ReturnChannel {
         if !valid {
             return self.quarantine(digest, artifacts);
         }
+        if let Some(path) = &self.recovery {
+            // Accepted refs are committed above. Before destructive cleanup,
+            // retain the continuing obligation, so death never turns absence
+            // into a fabricated EmptyRemoved receipt.
+            if oulipoly_provider::custody::durable::write_json(
+                &path.join("pending.json"),
+                &self.cleanup_failed(artifacts.clone()),
+            )
+            .is_err()
+            {
+                return self.cleanup_failed(artifacts);
+            }
+        }
+        if self.recovery_pin {
+            if !self.identical()
+                || std::fs::remove_file(self.recovery.as_ref().unwrap().join("original-channel"))
+                    .is_err()
+            {
+                return self.cleanup_failed(artifacts);
+            }
+            self.recovery_pin = false;
+        }
         if !self.remove_consumed_channel(use_kind) {
             return self.cleanup_failed(artifacts);
         }
@@ -268,8 +398,33 @@ impl ReturnChannel {
         let (Some(file), Some(directory)) = (&self.file, &self.directory) else {
             return false;
         };
-        opened_matches_path(file, &self.path, false)
-            && opened_matches_path(directory, &self.dir, true)
+        let file_matches = if self.recovery_pin {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let pin = self.recovery.as_ref().map(|p| p.join("original-channel"));
+                match (
+                    file.metadata(),
+                    pin.and_then(|p| std::fs::symlink_metadata(p).ok()),
+                ) {
+                    (Ok(a), Some(b)) => {
+                        a.dev() == b.dev()
+                            && a.ino() == b.ino()
+                            && b.is_file()
+                            && b.nlink() == 2
+                            && opened_matches_path_links(file, &self.path, false, 2)
+                    }
+                    _ => false,
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        } else {
+            opened_matches_path(file, &self.path, false)
+        };
+        file_matches && opened_matches_path(directory, &self.dir, true)
     }
     fn close_checked(&mut self) -> bool {
         let file_ok = self.file.take().is_some_and(close_file_checked);
@@ -328,12 +483,23 @@ fn close_file_checked(file: File) -> bool {
 }
 #[cfg(unix)]
 fn opened_matches_path(file: &File, path: &Path, directory: bool) -> bool {
+    opened_matches_path_links(file, path, directory, 1)
+}
+#[cfg(unix)]
+fn opened_matches_path_links(file: &File, path: &Path, directory: bool, links: u64) -> bool {
     match (file.metadata(), std::fs::symlink_metadata(path)) {
         (Ok(a), Ok(b)) => {
             use std::os::unix::fs::MetadataExt;
             let mode = if directory { 0o700 } else { 0o600 };
             (if directory { b.is_dir() } else { b.is_file() })
-                && same_file(&a, &b)
+                && (if directory {
+                    same_file(&a, &b)
+                } else {
+                    a.dev() == b.dev()
+                        && a.ino() == b.ino()
+                        && a.nlink() == links
+                        && b.nlink() == links
+                })
                 && a.uid() == unsafe { libc::geteuid() }
                 && b.uid() == a.uid()
                 && a.mode() & 0o7777 == mode
@@ -992,6 +1158,75 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn native_channel_pin_survives_original_handles_and_recovery_keeps_exact_artifacts() {
+        for dirty in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut c = channel(root.path());
+            let path = c.path.clone();
+            let journal = root.path().join("journal");
+            c.retain_for_recovery(journal.clone()).unwrap();
+            let reference = artifact(c.producer);
+            std::fs::write(
+                &path,
+                format!(
+                    "{}\n{}",
+                    serde_json::to_string(&reference).unwrap(),
+                    if dirty { "malformed\n" } else { "" }
+                ),
+            )
+            .unwrap();
+            drop(c); // original executor's handles are gone, not a channel receipt
+            assert!(path.exists() && journal.join("original-channel").exists());
+            let custody = oulipoly_provider::custody::AttemptActorCustody::new(Uuid::new_v4());
+            custody.record_not_invoked("launch");
+            let result = ReturnChannel::recover_original(&journal, &custody.receipts(), |refs| {
+                assert_eq!(refs, &[reference.clone()]);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(result.artifacts(), &[reference]);
+            assert_eq!(
+                matches!(result, ReturnChannelSettlement::Quarantined { .. }),
+                dirty
+            );
+            assert_eq!(path.exists(), dirty);
+            assert_eq!(journal.join("original-channel").exists(), dirty);
+            assert_eq!(
+                ReturnChannel::recover_original(&journal, &custody.receipts(), |_| panic!(
+                    "retained settlement must replay"
+                ))
+                .unwrap(),
+                result
+            );
+        }
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn recovery_refuses_replaced_file_and_never_infers_empty_from_pending_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let mut c = channel(root.path());
+        let path = c.path.clone();
+        let journal = root.path().join("journal");
+        c.retain_for_recovery(journal.clone()).unwrap();
+        drop(c);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        assert!(ReturnChannel::recover_original(&journal, &[], |_| panic!()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        let pending = ReturnChannelSettlement::CleanupFailed {
+            path: path.clone(),
+            artifacts: vec![],
+        };
+        oulipoly_provider::custody::durable::write_json(&journal.join("pending.json"), &pending)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            ReturnChannel::recover_original(&journal, &[], |_| panic!()).unwrap(),
+            pending
+        );
+    }
     #[test]
     fn deterministic_attempt_identity_is_exclusive() {
         let root = tempfile::tempdir().unwrap();

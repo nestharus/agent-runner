@@ -187,6 +187,14 @@ pub enum ProviderLaunchChannelSettlement {
     EmptyRemoved,
     /// Cancellation retains already committed effects; never a transfer receipt.
     ArtifactsCommitted(Vec<oulipoly_agent_messenger::ReturnedArtifactRef>),
+    /// Logical cancellation is separate from retained, domain-owned cleanup.
+    ContinuingCustody {
+        domain_id: String,
+        original_owner: ProviderLaunchOwnerFence,
+        disposition: String,
+        path: String,
+        artifacts: Vec<oulipoly_agent_messenger::ReturnedArtifactRef>,
+    },
 }
 impl ProviderLaunchChannelSettlement {
     fn transferable(&self) -> bool {
@@ -197,6 +205,10 @@ impl ProviderLaunchChannelSettlement {
             Self::NotCreated => "not_created",
             Self::EmptyRemoved => "empty_removed",
             Self::ArtifactsCommitted(_) => "artifacts_committed",
+            Self::ContinuingCustody { disposition, .. } if disposition == "quarantined" => {
+                "quarantined"
+            }
+            Self::ContinuingCustody { .. } => "cleanup_failed",
         }
     }
 }
@@ -733,6 +745,52 @@ impl StateDb {
 
     /// Persist producer-emitted receipts before handing back to outer native custody.
     /// This is evidence retention, not certification or logical settlement.
+    pub fn retain_native_attempt_recovery(
+        &self,
+        owner: &ProviderLaunchOwnerFence,
+        evidence: &serde_json::Value,
+    ) -> Result<(), String> {
+        if serde_json::to_vec(evidence)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 4 * 1024 * 1024
+        {
+            return Err("native_attempt_evidence_too_large".into());
+        }
+        self.launch_transition(owner, "native-recovery", evidence, |tx| {
+            remember(
+                tx,
+                owner.logical_launch_id,
+                &format!("{}/native-recovery-receipts", owner.attempt_id),
+                &digest(evidence)?,
+                evidence,
+            )
+        })
+    }
+
+    pub fn native_attempt_recovery(
+        &self,
+        generation: Uuid,
+        invocation: Uuid,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT r.result_json FROM provider_launch_attempts a
+            JOIN provider_launch_transition_replays r ON r.logical_launch_id=a.logical_launch_id
+            AND r.operation_key=a.attempt_id || '/native-recovery-receipts'
+            WHERE a.runtime_generation_uuid=?1 AND a.invocation_uuid=?2",
+                params![generation.to_string(), invocation.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        raw.map(|v| serde_json::from_str(&v).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    /// Persist producer-emitted receipts before handing back to outer native custody.
+    /// This is evidence retention, not certification or logical settlement.
     pub fn retain_native_attempt_custody(
         &self,
         owner: &ProviderLaunchOwnerFence,
@@ -777,6 +835,33 @@ impl StateDb {
             .transpose()
     }
 
+    /// Continuing quarantine/cleanup custody survives logical terminalization.
+    /// No channel path, sidecar, or accepted artifact is released by this record.
+    pub fn retain_native_channel_duty(
+        &self,
+        owner: &ProviderLaunchOwnerFence,
+        duty: &ProviderLaunchChannelSettlement,
+    ) -> Result<(), String> {
+        self.launch_transition(owner, "native-channel-duty-owner", duty, |tx| {
+            remember(
+                tx,
+                owner.logical_launch_id,
+                &format!("{}/native-channel-duty", owner.attempt_id),
+                &digest(duty)?,
+                duty,
+            )
+        })
+    }
+    pub fn pending_native_channel_duties(
+        &self,
+    ) -> Result<Vec<ProviderLaunchChannelSettlement>, String> {
+        let mut statement = self.conn.prepare("SELECT result_json FROM provider_launch_transition_replays WHERE operation_key LIKE '%/native-channel-duty'").map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(sql_error)?;
+        rows.map(|r| serde_json::from_str(&r.map_err(sql_error)?).map_err(|e| e.to_string()))
+            .collect()
+    }
     pub fn cancelling_native_attempts(&self) -> Result<Vec<(Uuid, Uuid)>, String> {
         let mut statement = self.conn.prepare("SELECT a.runtime_generation_uuid,a.invocation_uuid
             FROM provider_launch_attempts a JOIN provider_logical_launches l ON l.current_attempt_id=a.attempt_id
@@ -1046,6 +1131,38 @@ fn validate_proof(
         .map_err(|e| e.to_string())?;
         if refs.is_empty() || retained != *refs {
             return Err("cancellation_artifact_custody_mismatch".into());
+        }
+    }
+    if let ProviderLaunchChannelSettlement::ContinuingCustody {
+        domain_id,
+        original_owner,
+        disposition,
+        path,
+        artifacts,
+    } = &proof.channel
+    {
+        bounded(domain_id)?;
+        if original_owner != owner
+            || path.is_empty()
+            || !matches!(disposition.as_str(), "quarantined" | "cleanup_failed")
+        {
+            return Err("continuing_native_channel_owner_conflict".into());
+        }
+        let retained = StateDb::parse_returned_artifact_rows(
+            StateDb::load_returned_artifact_rows(conn, owner.invocation_row_id)
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if retained != *artifacts {
+            return Err("continuing_native_channel_artifact_conflict".into());
+        }
+        let obligation: String = conn.query_row("SELECT result_json FROM provider_launch_transition_replays WHERE logical_launch_id=?1 AND operation_key=?2",
+            params![owner.logical_launch_id.to_string(),format!("{}/native-channel-duty", owner.attempt_id)], |r|r.get(0)).map_err(sql_error)?;
+        if serde_json::from_str::<ProviderLaunchChannelSettlement>(&obligation)
+            .map_err(|e| e.to_string())?
+            != proof.channel
+        {
+            return Err("continuing_native_channel_duty_conflict".into());
         }
     }
     valid_digest(&proof.runtime_settlement_sha256)?;

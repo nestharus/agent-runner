@@ -39,9 +39,16 @@ pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> 
                 &generation.to_string(),
                 &invocation.to_string(),
             )? {
-                let _ = oulipoly_runtime::executor::settle_retained_native_cancellation(
+                if let Err(error) = oulipoly_runtime::executor::settle_retained_native_cancellation(
                     &state, generation, invocation,
-                );
+                ) {
+                    let error_path = path
+                        .with_extension("native-recovery-errors")
+                        .join(format!("{generation}.txt"));
+                    if std::fs::read_to_string(&error_path).ok().as_deref() != Some(&error) {
+                        let _ = super::custody::durable_write(&error_path, error.as_bytes());
+                    }
+                }
             }
         }
         let obligations = state.admitted_completion_continuations()?;

@@ -182,6 +182,12 @@ impl OwnedChild {
         }
     }
     pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        #[cfg(target_os = "linux")]
+        if !self.reaped {
+            if let Some(operation) = &self.custody {
+                crate::custody::durable::retain_terminal(operation, self.child.id())?;
+            }
+        }
         let result = self.child.wait();
         self.reaped |= result.is_ok();
         #[cfg(target_os = "linux")]
@@ -302,7 +308,7 @@ fn proc_stat(pid: u32) -> std::io::Result<(char, i64, i64)> {
     ))
 }
 #[cfg(target_os = "linux")]
-fn identity(pid: u32) -> std::io::Result<ProcessIdentity> {
+pub(crate) fn identity(pid: u32) -> std::io::Result<ProcessIdentity> {
     let (_, _, ticks) = proc_stat(pid)?;
     Ok(ProcessIdentity {
         os_pid: pid.into(),

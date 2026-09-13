@@ -375,6 +375,21 @@ impl StateDb {
                 .map_err(|e| e.to_string())?;
         let admitted = self.admitted_completion_continuations()?;
         let mut mailbox = MailboxDb::open(&MailboxDb::path_for_state_db(path))?;
+        // Physical drain is not logical cancellation or retained-channel release.
+        // Keep the domain steward while its native settlement/cleanup is owed.
+        for (generation, invocation) in self.cancelling_native_attempts()? {
+            if mailbox.native_runtime_in_domain(
+                &owner.domain_id,
+                &generation.to_string(),
+                &invocation.to_string(),
+            )? {
+                return Ok(false);
+            }
+        }
+        if self.pending_native_channel_duties()?.iter().any(|d| matches!(d,
+            crate::ProviderLaunchChannelSettlement::ContinuingCustody { domain_id, .. } if domain_id == &owner.domain_id)) {
+            return Ok(false);
+        }
         let closed = mailbox.close_idle_continuation_generation(owner, &admitted)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(closed)

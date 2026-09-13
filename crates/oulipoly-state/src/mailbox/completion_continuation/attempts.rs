@@ -513,3 +513,88 @@ impl MailboxDb {
             .transpose()
     }
 }
+
+impl MailboxDb {
+    /// The immutable native association remains an obligation during both the
+    /// running and drained phases; retirement must not race the drain write.
+    pub fn native_runtime_in_domain(
+        &self,
+        domain: &str,
+        generation: &str,
+        invocation: &str,
+    ) -> Result<bool, String> {
+        if self.completion_continuation_domain()?.is_none() {
+            return Ok(false);
+        }
+        self.conn.query_row("SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE operation='activation' AND domain_id=?1 AND runtime_generation_uuid=?2 AND spawn_invocation_uuid=?3)",
+            params![domain,generation,invocation], |r|r.get(0)).map_err(|e|e.to_string())
+    }
+    /// Exact original enclosing boundary already integrated its drain. This is
+    /// attribution/physical evidence, not actor receipts or channel settlement.
+    pub fn native_original_drain(
+        &self,
+        generation: &str,
+        invocation: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        if self.completion_continuation_domain()?.is_none() {
+            return Ok(None);
+        }
+        let row: Option<(String, String, String, String, String, String)> = self.conn.query_row(
+            "SELECT attempt_id,result_path,custodian_identity,adopter_identity,drain_receipt,domain_id FROM completion_continuation_attempt WHERE operation='activation' AND phase='drained' AND integrated=1 AND runtime_generation_uuid=?1 AND spawn_invocation_uuid=?2",
+            params![generation, invocation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|e|e.to_string())?;
+        row.map(|(attempt, path, ac, adopter, receipt, domain)| -> Result<_, String> {
+            Ok(serde_json::json!({"attempt_id":attempt, "result_path":path,"domain_id":domain,
+                "custodian":serde_json::from_str::<serde_json::Value>(&ac).map_err(|e|e.to_string())?,
+                "adopter":serde_json::from_str::<serde_json::Value>(&adopter).map_err(|e|e.to_string())?,
+                "receipt":serde_json::from_str::<serde_json::Value>(&receipt).map_err(|e|e.to_string())?}))
+        }).transpose()
+    }
+}
+
+impl MailboxDb {
+    /// Cancellation-only runtime projection from its original activation drain.
+    /// The Starting monitor's lost Q is not rewritten. Generic recovery and
+    /// successor-transfer custody fences continue to require their original proof.
+    pub fn exit_native_cancelled_after_original_drain(
+        &mut self,
+        generation: &str,
+        invocation: &str,
+    ) -> Result<(), String> {
+        let drain = self
+            .native_original_drain(generation, invocation)?
+            .ok_or("native_original_drain_absent")?;
+        if !drain["receipt"]["accepted_cancellation"].is_string() {
+            return Err("original_native_cancellation_absent".into());
+        }
+        let id = RuntimeGenerationId::parse(generation).map_err(|e| e.to_string())?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let before = runtime_generation_by_id_on(&tx, &id)
+            .map_err(|e| e.to_string())?
+            .ok_or("native_runtime_absent")?;
+        if before.spawn_invocation_uuid != invocation {
+            return Err("native_runtime_fence_conflict".into());
+        }
+        if before.lifecycle_state == RuntimeLifecycleState::Exited {
+            return Ok(());
+        }
+        // No delivery claim is silently discarded by physical cancellation.
+        if before.active_delivery_claim_id.is_some()
+            || !before.active_delivery_seqs.is_empty()
+            || before.active_delivery_claimed_at.is_some()
+        {
+            return Err("native_delivery_claim_unsettled".into());
+        }
+        let now = now_rfc3339();
+        tx.execute("UPDATE runtime_generation SET lifecycle_state='exited',exited_at=?3,terminal_reason='cancelled',exit_code=NULL WHERE generation_uuid=?1 AND spawn_invocation_uuid=?2",
+            params![generation,invocation,now]).map_err(|e|e.to_string())?;
+        settle_runtime_generation_admission_on(&tx, &id).map_err(|e| e.to_string())?;
+        let row = runtime_generation_by_id_on(&tx, &id)
+            .map_err(|e| e.to_string())?
+            .ok_or("native_runtime_absent_after_exit")?;
+        project_exited_generation_on(&tx, &row, &now, None).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+}
