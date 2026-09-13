@@ -146,6 +146,15 @@ fn validate_settlement(
 ) -> Result<(), String> {
     let proof: ProviderLaunchCustodyProof =
         serde_json::from_value(input.clone()).map_err(|e| e.to_string())?;
+    // Retention is an outstanding duty, not a hint selected by the next DTO's
+    // variant. No API here discharges or transfers it. Check before replay too.
+    if let Some(duty) = retained(conn, owner, "native-channel-duty")?
+        && serde_json::from_value::<ProviderLaunchChannelSettlement>(duty)
+            .map_err(|e| e.to_string())?
+            != proof.channel
+    {
+        return Err("continuing_native_channel_duty_conflict".into());
+    }
     let row = published
         .runtime
         .as_ref()

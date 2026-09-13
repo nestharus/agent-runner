@@ -1710,3 +1710,139 @@ fn native_fresh_successor_revalidates_old_certification_but_allocated_replay_is_
     assert_eq!(count(&db, "provider_launch_attempts"), 2);
     sidecar.execute_batch("ROLLBACK").unwrap();
 }
+
+// Synthetic publication premises; these API tests do not author native custody.
+fn continuing_channel_fixture(
+    db: &StateDb,
+    lease: &ProviderLaunchLease,
+) -> (ProviderLaunchCustodyProof, ProviderLaunchChannelSettlement) {
+    let (drain, _) = native_publication_fixture(db, lease);
+    Connection::open(mailbox::MailboxDb::path_for_state_db(db.path()))
+        .unwrap()
+        .execute_batch("UPDATE runtime_generation SET terminal_reason='startup_failed'")
+        .unwrap();
+    let published = mailbox::MailboxDb::read_native_publication(
+        &mailbox::MailboxDb::path_for_state_db(db.path()),
+        &lease.runtime_generation_uuid.to_string(),
+        &lease.owner.invocation_uuid.to_string(),
+    )
+    .unwrap();
+    let mut custody = proof(lease);
+    custody.runtime_settlement_sha256 =
+        completion_continuation::sha256(&serde_json::to_vec(&published.runtime.unwrap()).unwrap());
+    let duty = ProviderLaunchChannelSettlement::ContinuingCustody {
+        domain_id: drain["domain_id"].as_str().unwrap().into(),
+        original_owner: lease.owner.clone(),
+        disposition: "cleanup_failed".into(),
+        path: "synthetic-test-only".into(),
+        artifacts: vec![],
+    };
+    (custody, duty)
+}
+
+#[test]
+fn native_retained_channel_rejects_variant_conflict_in_settlement() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    let (mut custody, duty) = continuing_channel_fixture(&db, &lease);
+    db.retain_native_channel_duty(&lease.owner, &duty).unwrap();
+    db.request_cancel(lease.owner.logical_launch_id).unwrap();
+    let history = native_history(&db);
+    for channel in [
+        ProviderLaunchChannelSettlement::NotCreated,
+        ProviderLaunchChannelSettlement::EmptyRemoved,
+        ProviderLaunchChannelSettlement::ArtifactsCommitted(vec![]),
+    ] {
+        custody.channel = channel;
+        assert_eq!(
+            db.settle_cancel(&lease.owner, &custody).unwrap_err(),
+            "continuing_native_channel_duty_conflict"
+        );
+        assert_eq!(
+            db.reconcile_incomplete(
+                &lease.owner,
+                ProviderLaunchRecoveryDisposition::Cancelled,
+                Some(&custody),
+                &recovery_join(&db, "a")
+            )
+            .unwrap_err(),
+            "continuing_native_channel_duty_conflict"
+        );
+        assert_eq!(native_history(&db), history);
+        assert_eq!(
+            db.pending_native_channel_duties().unwrap(),
+            vec![duty.clone()]
+        );
+    }
+    custody.channel = duty.clone();
+    db.settle_cancel(&lease.owner, &custody).unwrap();
+    let settled = native_history(&db);
+    db.settle_cancel(&lease.owner, &custody).unwrap();
+    assert_eq!(native_history(&db), settled);
+    assert_eq!(db.pending_native_channel_duties().unwrap(), vec![duty]);
+}
+
+#[test]
+fn native_retained_channel_rejects_variant_conflict_in_certification() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    let (mut custody, duty) = continuing_channel_fixture(&db, &lease);
+    db.retain_native_channel_duty(&lease.owner, &duty).unwrap();
+    db.request_transfer(&lease.owner, &failure()).unwrap();
+    let history = native_history(&db);
+    for channel in [
+        ProviderLaunchChannelSettlement::NotCreated,
+        ProviderLaunchChannelSettlement::EmptyRemoved,
+    ] {
+        custody.channel = channel;
+        assert_eq!(
+            db.certify_effect_incapable(&lease.owner, &custody)
+                .unwrap_err(),
+            "continuing_native_channel_duty_conflict"
+        );
+        assert_eq!(native_history(&db), history);
+        assert_eq!(count(&db, "provider_launch_attempts"), 1);
+    }
+    assert_eq!(db.pending_native_channel_duties().unwrap(), vec![duty]);
+}
+
+#[test]
+fn native_retained_channel_rejects_fresh_successor_after_old_certification() {
+    for channel in [
+        ProviderLaunchChannelSettlement::NotCreated,
+        ProviderLaunchChannelSettlement::EmptyRemoved,
+    ] {
+        let (_dir, db, request) = fixture();
+        let lease = db.begin_launch(&request).unwrap();
+        db.activate_attempt(&lease, &request.allocation.completion_authority)
+            .unwrap();
+        let (mut custody, duty) = continuing_channel_fixture(&db, &lease);
+        custody.channel = channel;
+        db.request_transfer(&lease.owner, &failure()).unwrap();
+        db.certify_effect_incapable(&lease.owner, &custody).unwrap();
+        // Historical certification remains immutable; subsequently retained
+        // responsibility precludes *new* authority from that old proof.
+        db.retain_native_channel_duty(&lease.owner, &duty).unwrap();
+        let history = native_history(&db);
+        let allocation = ProviderLaunchAttemptAllocation::allocate().unwrap();
+        assert_eq!(
+            db.lease_successor(
+                &lease.owner,
+                &request.allocation.completion_authority,
+                &lease.candidate_plan_sha256,
+                &request.candidates[1],
+                &custody,
+                &allocation
+            )
+            .unwrap_err(),
+            "continuing_native_channel_duty_conflict"
+        );
+        assert_eq!(native_history(&db), history);
+        assert_eq!(count(&db, "provider_launch_attempts"), 1);
+        assert_eq!(db.pending_native_channel_duties().unwrap(), vec![duty]);
+    }
+}
