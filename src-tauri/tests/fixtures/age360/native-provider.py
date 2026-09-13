@@ -68,7 +68,20 @@ def launch(request):
                 assert "native-custody-input" in prompt
             else:
                 assert rows[0]["handle"] in prompt
-                assert pathlib.Path(rows[0]["log_path"]).read_bytes() == b"paired-source-output"
+                if os.environ.get("AGE360_CASE") != "large_output":
+                    assert pathlib.Path(rows[0]["log_path"]).read_bytes() == b"paired-source-output"
+                else:
+                    payload = json.loads(rows[0]["payload_json"])
+                    artifact = payload["output_artifact"]
+                    digest = hashlib.sha256()
+                    size = 0
+                    with open(artifact["path"], "rb") as body:
+                        while block := body.read(65536):
+                            assert block == b"\0" * len(block)
+                            digest.update(block)
+                            size += len(block)
+                    assert size == artifact["byte_len"] == 16 * 1024 * 1024
+                    assert digest.hexdigest() == artifact["sha256"]
                 if rows[0].get("payload_file_path"):
                     payload = pathlib.Path(rows[0]["payload_file_path"]).read_bytes()
                     assert hashlib.sha256(payload).hexdigest() == rows[0]["payload_sha256"]
@@ -106,10 +119,17 @@ def launch(request):
             env = dict(os.environ, AGENT_BASH_OWNER_SESSION_ID=SESSION, AGENT_BASH_OWNER_INVOCATION_UUID=parent)
             workload = "printf paired-source-output"
             if mode == "async": workload = 'while [ ! -f "$AGE360_WORKLOAD_GATE" ]; do sleep 0.02; done; printf paired-source-output'
-            result = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "run", "--delivery", mode, "--completion-scope", "tree", "--", "/bin/sh", "-c", workload], env=env, capture_output=True, timeout=30)
+            extra = []
+            if os.environ["AGE360_CASE"] == "early_exit":
+                workload = 'printf paired-source-output; exit 37'
+                extra = ["--ready-sentinel", "NEVER-SEEN"]
+            elif os.environ["AGE360_CASE"] == "large_output":
+                workload = 'head -c 16777216 /dev/zero'
+            result = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "run", "--delivery", mode, "--completion-scope", "tree", *extra, "--", "/bin/sh", "-c", workload], env=env, capture_output=True, timeout=30)
             (root / "bash-dispatch.stdout").write_bytes(result.stdout)
             (root / "bash-dispatch.stderr").write_bytes(result.stderr)
-            if result.returncode != 0: raise RuntimeError("actual paired Bash dispatch failed: " + result.stderr.decode(errors="replace"))
+            allowed = (0, 37) if os.environ["AGE360_CASE"] == "early_exit" else (0,)
+            if result.returncode not in allowed: raise RuntimeError("actual paired Bash dispatch failed: " + result.stderr.decode(errors="replace"))
             (root / "provider-dispatched").touch()
             if mode == "sync":
                 deadline = time.monotonic() + 30

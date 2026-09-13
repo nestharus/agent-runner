@@ -160,6 +160,11 @@ impl Fixture {
                 env!("CARGO_BIN_EXE_oulipoly-agent-runner"),
             )
             .current_dir(self.root.path());
+        #[cfg(feature = "age360-fault-fixtures")]
+        cmd.env("AGE360_FAULT_ROOT", self.root.path()).env(
+            "AGE360_FAULT_PARENT_NET",
+            std::env::var_os("AGE360_PARENT_NET").unwrap(),
+        );
         if self.case != "owner_only" {
             cmd.env("AGE360_AGENT_BASH_BIN", counterpart());
         }
@@ -391,7 +396,7 @@ fn paired_case(mode: &'static str) {
         serde_json::to_string(&owner).unwrap(),
         serde_json::to_string(&source).unwrap()
     );
-    if mode == "async" {
+    if mode != "sync" {
         f.wait_initial(&mut initial);
         f.gate("release-workload");
     }
@@ -403,6 +408,43 @@ fn paired_case(mode: &'static str) {
         (value["phase"] == "accepted").then_some(value)
     });
     println!("acceptance={acceptance}");
+    if mode == "early_exit" {
+        let evidence =
+            oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
+                &binding,
+            )
+            .unwrap();
+        assert_eq!(source.completion_kind, "ready");
+        assert_eq!(evidence.outcome.kind, "exit_tree");
+        assert_eq!(evidence.snapshot.rc, 37);
+        assert_eq!(evidence.outcome.root_wait_status, Some(37 << 8));
+        assert!(evidence.outcome.ready_sentinel.is_none());
+    }
+    if mode == "large_output" {
+        let evidence =
+            oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
+                &binding,
+            )
+            .unwrap();
+        let oulipoly_state::completion_continuation::CompletionOutput::Artifact(artifact) =
+            evidence.snapshot.output
+        else {
+            panic!("large output was not an explicit full artifact");
+        };
+        assert_eq!(artifact.byte_len, 16 * 1024 * 1024);
+        let copy = f
+            .data
+            .join("completion-continuation")
+            .join(&source.domain_id)
+            .join("outputs")
+            .join(&artifact.sha256);
+        assert_eq!(fs::metadata(&copy).unwrap().len(), artifact.byte_len);
+        assert_eq!(
+            oulipoly_state::completion_continuation::sha256(&fs::read(&copy).unwrap()),
+            artifact.sha256
+        );
+    }
+
     if mode == "sync" {
         wait(|| {
             f.root
@@ -565,10 +607,87 @@ fn native_accepted_cancellation_drains_resistant_activation_without_source_signa
     }
     native_activation_custody(3);
 }
+#[test]
+fn native_guardian_only_loss_promotes_live_driver_and_preserves_custody() {
+    if private_case(false) {
+        return;
+    }
+    native_activation_custody(4);
+}
+#[test]
+fn native_ac_loss_original_adopter_integrates_actual_drain() {
+    if private_case(false) {
+        return;
+    }
+    native_activation_custody(5);
+}
+#[test]
+fn native_ac_loss_adopter_cancels_resistant_descendants() {
+    if private_case(false) {
+        return;
+    }
+    native_activation_custody(6);
+}
+#[test]
+fn native_guardian_loss_before_first_source_preserves_live_admission_context() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    let mut initial = f.start_with_hold(true);
+    let owner = f.owner();
+    wait(|| {
+        f.root
+            .path()
+            .join("provider-initial-ready")
+            .exists()
+            .then_some(())
+    });
+    assert!(
+        f.mailbox()
+            .completion_contexts()
+            .unwrap()
+            .iter()
+            .any(|v| v.pid == i64::from(initial.id()))
+    );
+    assert_eq!(
+        unsafe { libc::kill(owner.guardian_identity.pid as i32, libc::SIGKILL) },
+        0
+    );
+    let replacement = wait(|| {
+        let current = f.mailbox().completion_continuation_owner().ok()??;
+        (current.owner_generation != owner.owner_generation).then_some(current)
+    });
+    assert_eq!(replacement.guardian_identity, owner.driver_identity);
+    // Force several request/retirement loop turns without creating a source.
+    for _ in 0..4 {
+        let output = f
+            .command()
+            .args(["-m", "absent-pre-admission-model", "join successor"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output.stderr).contains("absent-pre-admission-model"));
+        assert_eq!(f.owner().owner_generation, replacement.owner_generation);
+    }
+    f.gate("release-initial-provider");
+    f.wait_initial(&mut initial);
+}
+#[cfg(feature = "age360-fault-fixtures")]
+#[test]
+fn native_adopter_retains_wait_until_delayed_launcher_identity_arrives() {
+    if private_case(false) {
+        return;
+    }
+    native_activation_custody(8);
+}
 fn native_activation_custody(owner_loss: u8) {
     let f = Fixture::new("owner_only");
+    if owner_loss == 8 {
+        f.gate("activation-observation.hold");
+        f.gate("adopted-terminal-wait.hold");
+    }
     f.gate("test-descendant-enabled");
-    if owner_loss == 3 {
+    if matches!(owner_loss, 3 | 6 | 8) {
         f.gate("cancel-probe-enabled");
     }
     f.gate("release-resume");
@@ -622,12 +741,46 @@ fn native_activation_custody(owner_loss: u8) {
         serde_json::to_string(&owner).unwrap(),
         serde_json::to_string(&attempt).unwrap()
     );
-    if matches!(owner_loss, 1 | 2) {
-        assert!(current_identity_matches(&owner.driver_identity));
-        assert_eq!(
-            unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
-            0
+    let adopter: String = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT adopter_identity FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    for (role, encoded) in [
+        ("AC", custodian.as_str()),
+        ("original_adopter", adopter.as_str()),
+    ] {
+        let identity: oulipoly_state::completion_continuation::SourceProcessIdentity =
+            serde_json::from_str(encoded).unwrap();
+        let descriptors = fs::read_dir(format!("/proc/{}/fd", identity.pid))
+            .unwrap()
+            .count();
+        let status = fs::read_to_string(format!("/proc/{}/status", identity.pid)).unwrap();
+        let rss = status
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))
+            .unwrap_or("VmRSS unavailable");
+        println!(
+            "resource sample role={role} pid={} fds={descriptors} {rss}",
+            identity.pid
         );
+    }
+    if matches!(owner_loss, 1 | 2 | 4) {
+        if owner_loss != 4 {
+            assert!(current_identity_matches(&owner.driver_identity));
+            assert_eq!(
+                unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
+                0
+            );
+        } else {
+            assert_eq!(
+                unsafe { libc::kill(owner.guardian_identity.pid as i32, libc::SIGKILL) },
+                0
+            );
+        }
         if owner_loss == 2 {
             assert!(current_identity_matches(&owner.guardian_identity));
             assert_eq!(
@@ -658,6 +811,19 @@ fn native_activation_custody(owner_loss: u8) {
             let current = f.mailbox().completion_continuation_owner().ok()??;
             (current.owner_generation != owner.owner_generation).then_some(current)
         });
+        if owner_loss == 4 {
+            assert_eq!(replacement.guardian_identity, owner.driver_identity);
+            let output = f
+                .command()
+                .args(["-m", "absent-succession-model", "join successor"])
+                .output()
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("absent-succession-model"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         if owner_loss == 1 {
             assert_eq!(replacement.guardian_identity, owner.guardian_identity);
         } else {
@@ -686,6 +852,23 @@ fn native_activation_custody(owner_loss: u8) {
             attempt.attempt_id
         );
     }
+    if matches!(owner_loss, 5 | 6 | 8) {
+        let custodian: oulipoly_state::completion_continuation::SourceProcessIdentity =
+            serde_json::from_str(&custodian).unwrap();
+        assert!(current_identity_matches(&custodian));
+        assert_eq!(
+            unsafe { libc::kill(custodian.pid as i32, libc::SIGKILL) },
+            0
+        );
+        // Killing AC is not release: the real adopted descendant remains live.
+        assert!(
+            f.mailbox()
+                .continuation_activation(SESSION, &claim.claim_token)
+                .unwrap()
+                .is_some()
+        );
+        assert!(read_live_process_identity(descendant).unwrap().is_some());
+    }
     let mut writer = MailboxDb::open(&f.data.join("pid-identity.db")).unwrap();
     assert!(!matches!(
         writer
@@ -695,7 +878,7 @@ fn native_activation_custody(owner_loss: u8) {
     ));
     drop(writer);
     drop(mailbox);
-    if owner_loss == 3 {
+    if matches!(owner_loss, 3 | 6 | 8) {
         wait(|| {
             f.root
                 .path()
@@ -711,6 +894,17 @@ fn native_activation_custody(owner_loss: u8) {
             "terminal cancellation exact launcher={}",
             serde_json::to_string(&launcher).unwrap()
         );
+        if owner_loss == 8 {
+            wait(|| {
+                f.root
+                    .path()
+                    .join("adopted-terminal-wait.reached")
+                    .exists()
+                    .then_some(())
+            });
+            fs::remove_file(f.root.path().join("adopted-terminal-wait.hold")).unwrap();
+            fs::remove_file(f.root.path().join("activation-observation.hold")).unwrap();
+        }
     } else {
         f.gate("release-descendant");
     }
@@ -726,12 +920,171 @@ fn native_activation_custody(owner_loss: u8) {
     assert_eq!(receipt.0, "drained");
     assert_eq!(receipt.1, 1);
     assert!(receipt.2.contains("ECHILD"));
-    if owner_loss == 3 {
+    if matches!(owner_loss, 5 | 6 | 8) {
+        let value: serde_json::Value = serde_json::from_str(&receipt.2).unwrap();
+        assert_eq!(
+            value["classification"],
+            "original_adopting_boundary_drained"
+        );
+        assert!(value["adopter"].is_object());
+        assert_eq!(value["custodian_wait_status"], libc::SIGKILL);
+    }
+    if matches!(owner_loss, 3 | 6 | 8) {
         let receipt: serde_json::Value = serde_json::from_str(&receipt.2).unwrap();
         assert!(receipt["accepted_cancellation"].is_string(), "{receipt}");
         assert!(!f.root.path().join("release-descendant").exists());
         assert!(read_live_process_identity(descendant).unwrap().is_none());
     }
+}
+
+#[cfg(feature = "age360-fault-fixtures")]
+#[test]
+fn native_interrupted_fresh_creation_never_publishes_legacy17() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("fresh-schema17.hold");
+    let mut initial = f.start_with_hold(true);
+    wait(|| {
+        f.root
+            .path()
+            .join("fresh-schema17.reached")
+            .exists()
+            .then_some(())
+    });
+    assert!(
+        !f.data.join("pid-identity.db").exists(),
+        "legacy17 must remain staging-only"
+    );
+    initial.kill().unwrap();
+    initial.wait().unwrap();
+    fs::remove_file(f.root.path().join("fresh-schema17.hold")).unwrap();
+    let mut replacement = f.start_with_hold(true);
+    let owner = f.owner();
+    assert!(
+        f.mailbox()
+            .completion_continuation_domain()
+            .unwrap()
+            .is_some()
+    );
+    println!(
+        "fresh crash recovered owner={}",
+        serde_json::to_string(&owner).unwrap()
+    );
+    f.gate("release-initial-provider");
+    f.wait_initial(&mut replacement);
+}
+
+#[cfg(feature = "age360-fault-fixtures")]
+#[test]
+fn native_retained_result_integrates_after_both_result_producers_die() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("test-descendant-enabled");
+    f.gate("release-resume");
+    f.gate("ac-result-retained.hold");
+    let mut initial = f.start_with_hold(true);
+    f.owner();
+    wait(|| {
+        f.root
+            .path()
+            .join("provider-initial-ready")
+            .exists()
+            .then_some(())
+    });
+    MailboxDb::open(&f.data.join("pid-identity.db"))
+        .unwrap()
+        .enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+            submission_token: "native-result-replay",
+            target: oulipoly_state::mailbox::InboxTarget {
+                kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+                id: SESSION,
+            },
+            input: b"native-custody-input",
+        })
+        .unwrap();
+    f.gate("release-initial-provider");
+    f.wait_initial(&mut initial);
+    wait(|| f.root.path().join("descendant.pid").exists().then_some(()));
+    f.gate("driver-replay.hold");
+    wait(|| {
+        f.root
+            .path()
+            .join("driver-replay.reached")
+            .exists()
+            .then_some(())
+    });
+    f.gate("release-descendant");
+    wait(|| {
+        f.root
+            .path()
+            .join("ac-result-retained.reached")
+            .exists()
+            .then_some(())
+    });
+    let claim = f
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
+    let attempt = f
+        .mailbox()
+        .continuation_activation(SESSION, &claim.claim_token)
+        .unwrap()
+        .unwrap();
+    let original = fs::read(&attempt.result_path).unwrap();
+    let (ac,adopter): (String,String) = f.sidecar_connection().query_row("SELECT custodian_identity,adopter_identity FROM completion_continuation_attempt WHERE attempt_id=?1",[&attempt.attempt_id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    for encoded in [adopter, ac] {
+        let identity = serde_json::from_str(&encoded).unwrap();
+        assert!(current_identity_matches(&identity));
+        assert_eq!(unsafe { libc::kill(identity.pid as i32, libc::SIGKILL) }, 0);
+    }
+    assert!(
+        f.mailbox()
+            .continuation_activation(SESSION, &claim.claim_token)
+            .unwrap()
+            .is_some()
+    );
+    fs::remove_file(f.root.path().join("driver-replay.hold")).unwrap();
+    wait(|| {
+        f.mailbox()
+            .continuation_activation(SESSION, &claim.claim_token)
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
+    let integrated: String = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [attempt.attempt_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        integrated.as_bytes(),
+        original,
+        "replay must preserve the exact original AC result"
+    );
+}
+
+#[test]
+fn paired_ready_exit_before_sentinel_is_genuine_exit() {
+    if private_case(true) {
+        return;
+    }
+    paired_case("early_exit");
+}
+#[test]
+fn paired_supported_output_artifact_is_complete_and_retained() {
+    if private_case(true) {
+        return;
+    }
+    paired_case("large_output");
 }
 
 impl Drop for Fixture {

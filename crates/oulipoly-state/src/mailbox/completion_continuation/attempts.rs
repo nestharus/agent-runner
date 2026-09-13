@@ -83,6 +83,19 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
     if !crate::completion_continuation::is_sha256(&request.request_sha256) {
         return Err("invalid continuation request digest".into());
     }
+    if request.operation == "source_recovery" {
+        let registration = request
+            .source_registration_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or("source recovery requires registration")?;
+        let blocked: bool = tx.query_row(
+            "SELECT (SELECT COUNT(*) FROM completion_continuation_attempt WHERE domain_id=?1 AND operation='source_recovery' AND phase NOT IN ('drained','never_started')) >= 4 OR EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE domain_id=?1 AND operation='source_recovery' AND source_registration_id=?2 AND phase NOT IN ('drained','never_started'))",
+            params![domain, registration], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if blocked {
+            return Err("source recovery retained custody bound".into());
+        }
+    }
     if request.operation == "activation" {
         let claim: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2)", params![request.session_id,request.claim_token], |r| r.get(0)).map_err(|e| e.to_string())?;
         if !claim {
@@ -189,8 +202,16 @@ impl MailboxDb {
         attempt: &ContinuationAttempt,
         custodian: &SourceProcessIdentity,
     ) -> Result<(), String> {
+        self.attach_continuation_custodian_with_adopter(attempt, custodian, None)
+    }
+    pub fn attach_continuation_custodian_with_adopter(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        custodian: &SourceProcessIdentity,
+        adopter: Option<&SourceProcessIdentity>,
+    ) -> Result<(), String> {
         require_exact_attempt(&self.conn, attempt)?;
-        let changed=self.conn.execute("UPDATE completion_continuation_attempt SET revision=revision+1,custodian_identity=?3 WHERE attempt_id=?1 AND owner_generation=?2 AND phase='accepted' AND revision=2 AND custodian_identity IS NULL AND EXISTS(SELECT 1 FROM completion_continuation_owner WHERE generation=?2 AND phase='running')",params![attempt.attempt_id,attempt.owner_generation,serde_json::to_string(custodian).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        let changed=self.conn.execute("UPDATE completion_continuation_attempt SET revision=revision+1,custodian_identity=?3,adopter_identity=?4 WHERE attempt_id=?1 AND owner_generation=?2 AND phase='accepted' AND revision=2 AND custodian_identity IS NULL AND EXISTS(SELECT 1 FROM completion_continuation_owner WHERE generation=?2 AND phase='running')",params![attempt.attempt_id,attempt.owner_generation,serde_json::to_string(custodian).map_err(|e|e.to_string())?,adopter.map(serde_json::to_string).transpose().map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
         if changed != 1 {
             return Err("continuation custodian publication lost current reservation".into());
         }
@@ -392,5 +413,92 @@ impl MailboxDb {
     ) -> Result<Option<(String, String)>, String> {
         require_exact_attempt(&self.conn, attempt)?;
         self.conn.query_row("SELECT runtime_generation_uuid,spawn_invocation_uuid FROM completion_continuation_attempt WHERE attempt_id=?1 AND runtime_generation_uuid IS NOT NULL AND spawn_invocation_uuid IS NOT NULL",[&attempt.attempt_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())
+    }
+}
+
+impl MailboxDb {
+    /// Continuing obligations, not a process-local driver population.
+    pub fn pending_continuation_attempts(&self) -> Result<Vec<ContinuationAttempt>, String> {
+        let mut statement = self.conn.prepare("SELECT attempt_id,owner_generation,operation,request_sha256,source_registration_id,source_listener_revision,session_id,claim_token,result_path FROM completion_continuation_attempt WHERE phase NOT IN ('drained','never_started')").map_err(|e| e.to_string())?;
+        statement
+            .query_map([], |r| {
+                Ok(ContinuationAttempt {
+                    attempt_id: r.get(0)?,
+                    owner_generation: r.get(1)?,
+                    operation: r.get(2)?,
+                    request_sha256: r.get(3)?,
+                    source_registration_id: r.get(4)?,
+                    source_listener_revision: r.get(5)?,
+                    session_id: r.get(6)?,
+                    claim_token: r.get(7)?,
+                    result_path: r.get(8)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .map(|r| r.map_err(|e| e.to_string()))
+            .collect()
+    }
+
+    /// Only the retained *original adopting boundary* may certify its drain.
+    /// The caller may replay that immutable receipt after producer loss. A new
+    /// owner, missing PID, ACK, or an empty unrelated tree grants no discharge.
+    pub fn discharge_adopted_continuation_attempt(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        receipt: &str,
+    ) -> Result<(), String> {
+        require_exact_attempt(&self.conn, attempt)?;
+        let value: serde_json::Value = serde_json::from_str(receipt).map_err(|e| e.to_string())?;
+        let (custodian, adopter): (String, String) = self.conn.query_row("SELECT custodian_identity,adopter_identity FROM completion_continuation_attempt WHERE attempt_id=?1", [&attempt.attempt_id], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
+        if value["attempt_id"] != attempt.attempt_id
+            || value["owned_children"] != "ECHILD"
+            || value["custodian"]
+                != serde_json::from_str::<serde_json::Value>(&custodian)
+                    .map_err(|e| e.to_string())?
+            || value["adopter"]
+                != serde_json::from_str::<serde_json::Value>(&adopter).map_err(|e| e.to_string())?
+            || value["custodian_wait_status"].as_i64().is_none()
+        {
+            return Err("adopting drain receipt identity/evidence conflict".into());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let changed = tx.execute("UPDATE completion_continuation_attempt SET phase='drained',revision=revision+1,integrated=1,drain_receipt=?2 WHERE attempt_id=?1 AND phase IN ('accepted','starting','running','unknown_custody')", params![attempt.attempt_id,receipt]).map_err(|e| e.to_string())?;
+        if changed != 1 {
+            let retained: Option<String> = tx.query_row("SELECT drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1 AND phase='drained'", [&attempt.attempt_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+            if retained.as_deref() != Some(receipt) {
+                return Err("adopting result conflicts with terminal evidence".into());
+            }
+        }
+        if attempt.operation == "activation" {
+            tx.execute(
+                "DELETE FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
+                params![attempt.session_id, attempt.claim_token],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+}
+
+impl MailboxDb {
+    pub fn continuation_launcher_identity(
+        &self,
+        attempt: &ContinuationAttempt,
+    ) -> Result<Option<SourceProcessIdentity>, String> {
+        require_exact_attempt(&self.conn, attempt)?;
+        let identity: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT launcher_identity FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&attempt.attempt_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        identity
+            .map(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+            .transpose()
     }
 }

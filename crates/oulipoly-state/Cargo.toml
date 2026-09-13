@@ -8,6 +8,7 @@ rust-version.workspace = true
 name = "oulipoly_state"
 
 [features]
+age360-fault-fixtures = []
 test-support = []
 
 [dependencies]

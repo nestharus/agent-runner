@@ -14,6 +14,11 @@ CREATE TABLE completion_continuation_owner (
     endpoint TEXT NOT NULL
 );
 CREATE UNIQUE INDEX completion_continuation_owner_running ON completion_continuation_owner(domain_id) WHERE phase='running';
+-- Native entry leases are not physical attempt debt. They survive guardian
+-- replacement so a still-running provider can admit its first source later.
+CREATE TABLE completion_continuation_context (
+    identity TEXT PRIMARY KEY
+);
 -- This is a projection of State admission, not a second admission authority.
 CREATE TABLE completion_continuation_source (
     registration_id TEXT PRIMARY KEY,
@@ -52,6 +57,7 @@ CREATE TABLE completion_continuation_attempt (
     phase TEXT NOT NULL CHECK(phase IN ('reserved','accepted','starting','running','unknown_custody','drained','never_started')),
     revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0),
     custodian_identity TEXT,
+    adopter_identity TEXT,
     launcher_identity TEXT,
     spawn_invocation_uuid TEXT,
     runtime_generation_uuid TEXT,
@@ -70,6 +76,7 @@ WHEN NEW.attempt_id IS NOT OLD.attempt_id OR NEW.domain_id IS NOT OLD.domain_id
  OR NEW.source_listener_revision IS NOT OLD.source_listener_revision OR NEW.session_id IS NOT OLD.session_id
  OR NEW.claim_token IS NOT OLD.claim_token OR NEW.result_path IS NOT OLD.result_path
  OR (OLD.custodian_identity IS NOT NULL AND NEW.custodian_identity IS NOT OLD.custodian_identity)
+ OR (OLD.adopter_identity IS NOT NULL AND NEW.adopter_identity IS NOT OLD.adopter_identity)
  OR (OLD.launcher_identity IS NOT NULL AND NEW.launcher_identity IS NOT OLD.launcher_identity)
  OR (OLD.runtime_generation_uuid IS NOT NULL AND NEW.runtime_generation_uuid IS NOT OLD.runtime_generation_uuid)
  OR (OLD.spawn_invocation_uuid IS NOT NULL AND NEW.spawn_invocation_uuid IS NOT OLD.spawn_invocation_uuid)

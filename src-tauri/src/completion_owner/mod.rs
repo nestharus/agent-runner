@@ -77,5 +77,9 @@ pub fn defer_wake_to_owner() -> Result<bool, String> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn custodian_entry() -> Option<Result<(), String>> {
-    (std::env::args().nth(1).as_deref() == Some(custody::CUSTODIAN_ARG)).then(custody::entry)
+    matches!(
+        std::env::args().nth(1).as_deref(),
+        Some(custody::CUSTODIAN_ARG | custody::ADOPTER_ARG)
+    )
+    .then(custody::entry)
 }

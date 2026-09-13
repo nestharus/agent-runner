@@ -344,7 +344,10 @@ mod tests {
 
 mod evidence;
 mod source_files;
-pub use evidence::{CompletionIdentity, CompletionSnapshot, SourceOutcome, VerifiedCompletion};
+pub use evidence::{
+    CompletionIdentity, CompletionOutput, CompletionSnapshot, MAX_OUTPUT_BYTES, OutputArtifact,
+    SourceOutcome, VerifiedCompletion,
+};
 pub use source_files::{open_source_file, read_source_file};
 
 /// Validate the current admission extension without repairing or manufacturing it.
@@ -360,3 +363,35 @@ pub(crate) fn validate_admission_schema(conn: &rusqlite::Connection) -> Result<(
     }
     Ok(())
 }
+
+/// Explicitly compiled fault fixtures; absent from normal binaries. Refuse a
+/// host-network invocation even if someone accidentally inherits fixture vars.
+#[cfg(all(feature = "age360-fault-fixtures", target_os = "linux"))]
+pub fn age360_fault_barrier(name: &str) {
+    let Some(root) = std::env::var_os("AGE360_FAULT_ROOT") else {
+        return;
+    };
+    let Some(parent_net) = std::env::var_os("AGE360_FAULT_PARENT_NET") else {
+        return;
+    };
+    if std::fs::read_link("/proc/self/ns/net")
+        .ok()
+        .is_none_or(|net| net.as_os_str() == parent_net)
+    {
+        return;
+    }
+    let root = Path::new(&root);
+    let hold = root.join(format!("{name}.hold"));
+    if !hold.exists() {
+        return;
+    }
+    let _ = std::fs::write(
+        root.join(format!("{name}.reached")),
+        std::process::id().to_string(),
+    );
+    while hold.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+#[cfg(all(feature = "age360-fault-fixtures", not(target_os = "linux")))]
+pub fn age360_fault_barrier(_name: &str) {}

@@ -184,7 +184,7 @@ pub(super) fn bootstrap() -> Result<(), String> {
     }
     if pid == 0 {
         drop(ready);
-        let code = guardian(&path, &endpoint, &domain, election, announce)
+        let code = guardian(&path, &endpoint, &domain, election, Some(announce))
             .map(|()| 0)
             .unwrap_or(70);
         unsafe { libc::_exit(code) }
@@ -209,7 +209,7 @@ fn guardian(
     endpoint: &Path,
     domain: &str,
     election: std::fs::File,
-    mut announce: UnixStream,
+    mut announce: Option<UnixStream>,
 ) -> Result<(), String> {
     if unsafe { libc::setsid() } < 0
         || unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0
@@ -220,11 +220,11 @@ fn guardian(
     let listener = UnixListener::bind(endpoint).map_err(|e| e.to_string())?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     redirect_stdio()?;
-    close_except(&[
-        listener.as_raw_fd(),
-        election.as_raw_fd(),
-        announce.as_raw_fd(),
-    ]);
+    let mut retained = vec![listener.as_raw_fd(), election.as_raw_fd()];
+    if let Some(socket) = &announce {
+        retained.push(socket.as_raw_fd());
+    }
+    close_except(&retained);
     let mut owner = start_driver(
         path,
         endpoint,
@@ -232,9 +232,14 @@ fn guardian(
         election.as_raw_fd(),
         listener.as_raw_fd(),
     )?;
-    announce.write_all(&[1]).map_err(|e| e.to_string())?;
-    announce.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let mut contexts = vec![announce];
+    let mut contexts = Vec::new();
+    if let Some(mut socket) = announce.take() {
+        let context = identity(peer_pid(&socket)?)?;
+        MailboxDb::open(path)?.retain_completion_context(&context)?;
+        socket.write_all(&[1]).map_err(|e| e.to_string())?;
+        socket.set_nonblocking(true).map_err(|e| e.to_string())?;
+        contexts.push((socket, context));
+    }
     let mut closing = false;
     loop {
         loop {
@@ -275,11 +280,15 @@ fn guardian(
                         if request == *b"hello\n" {
                             let _ = serde_json::to_writer(&mut socket, &owner);
                         } else if request == *b"join!\n"
+                            && let Ok(context) = peer_pid(&socket).and_then(identity)
+                            && MailboxDb::open(path)
+                                .and_then(|db| db.retain_completion_context(&context))
+                                .is_ok()
                             && serde_json::to_writer(&mut socket, &owner).is_ok()
                             && socket.write_all(b"\n").is_ok()
                             && socket.set_nonblocking(true).is_ok()
                         {
-                            contexts.push(socket);
+                            contexts.push((socket, context));
                         }
                     }
                 }
@@ -288,12 +297,16 @@ fn guardian(
                 Err(e) => return Err(e.to_string()),
             }
         }
-        contexts.retain_mut(|socket| {
+        contexts.retain_mut(|(socket, context)| {
             let mut byte = [0];
-            matches!(socket.read(&mut byte), Err(e) if matches!(e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted))
+            let retained = matches!(socket.read(&mut byte), Err(e) if matches!(e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted));
+            if !retained {
+                let _ = MailboxDb::open(path).and_then(|db| db.release_completion_context(context));
+            }
+            retained
         });
-        if !closing && contexts.is_empty() {
+        if !closing && contexts.is_empty() && !retained_native_context(path).unwrap_or(true) {
             // A missing/unreadable State DB is uncertainty, not no obligations.
             if let Ok(state) = oulipoly_state::StateDb::open_default() {
                 closing = state
@@ -303,6 +316,45 @@ fn guardian(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// A lost socket owner does not erase a live native entry's ability to admit
+/// later work. Process identity only settles this *admission lease*, never an
+/// activation or original-workload tree obligation.
+fn retained_native_context(path: &Path) -> Result<bool, String> {
+    let db = MailboxDb::open(path)?;
+    let mut live = false;
+    for context in db.completion_contexts()? {
+        let current = read_live_process_identity(context.pid)?;
+        let matching = current.is_some_and(|id| {
+            id.os_boot_id == context.boot_id && id.os_pid_starttime_ticks == context.starttime_ticks
+        });
+        if matching {
+            live = true;
+        } else {
+            db.release_completion_context(&context)?;
+        }
+    }
+    Ok(live)
+}
+
+/// The original CD holds the same election open description. Parent loss
+/// transfers endpoint/election labor to that live successor, not to a new empty
+/// owner inferred from a stale row. Existing attempt custodians remain retained.
+pub(super) fn succeed_guardian(
+    path: &Path,
+    owner: &CompletionDomainOwner,
+    election: RawFd,
+) -> Result<(), String> {
+    use std::os::fd::FromRawFd;
+    let election = unsafe { std::fs::File::from_raw_fd(election) };
+    guardian(
+        path,
+        Path::new(&owner.endpoint),
+        &owner.domain_id,
+        election,
+        None,
+    )
 }
 
 fn start_driver(

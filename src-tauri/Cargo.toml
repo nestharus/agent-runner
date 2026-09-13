@@ -12,6 +12,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "oulipoly-agent-runner"
 path = "src/main.rs"
 
+[features]
+age360-fault-fixtures = ["oulipoly-state/age360-fault-fixtures"]
+
 [dependencies]
 cap-fs-ext.workspace = true
 cap-std.workspace = true

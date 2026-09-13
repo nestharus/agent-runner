@@ -55,10 +55,75 @@ impl MailboxDb {
                 "completion domain appeared during bootstrap; retry independent entry".into(),
             );
         }
-        let mut mailbox = Self::open_with_authority(&authority)?;
-        initialize_fresh_domain(&mut mailbox.conn)?;
-        mailbox._namespace_authority = Some(authority);
-        Ok(mailbox)
+        // Publish only a complete fresh domain. A crash during either schema
+        // transaction leaves the real name absent, never a misleading legacy17.
+        let staging_directory = tempfile::Builder::new()
+            .prefix(".completion-fresh-")
+            .tempdir_in(authority.path().parent().ok_or("domain parent absent")?)
+            .map_err(|e| e.to_string())?;
+        let staging = staging_directory.path().join(
+            authority
+                .path()
+                .file_name()
+                .ok_or("domain filename absent")?,
+        );
+        let mut staged = Self::open(&staging)?;
+        #[cfg(feature = "age360-fault-fixtures")]
+        crate::completion_continuation::age360_fault_barrier("fresh-schema17");
+        initialize_fresh_domain(&mut staged.conn)?;
+        staged
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .map_err(|e| e.to_string())?;
+        drop(staged);
+        std::fs::File::open(&staging)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        // Namespace election excludes every supported writer of the final name.
+        std::fs::rename(&staging, authority.path()).map_err(|e| e.to_string())?;
+        std::fs::File::open(authority.path().parent().ok_or("domain parent absent")?)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        Self::open_with_owned_authority(authority)
+    }
+
+    pub fn retain_completion_context(
+        &self,
+        identity: &SourceProcessIdentity,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO completion_continuation_context(identity) VALUES(?1)",
+                [serde_json::to_string(identity).map_err(|e| e.to_string())?],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn release_completion_context(
+        &self,
+        identity: &SourceProcessIdentity,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM completion_continuation_context WHERE identity=?1",
+                [serde_json::to_string(identity).map_err(|e| e.to_string())?],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn completion_contexts(&self) -> Result<Vec<SourceProcessIdentity>, String> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT identity FROM completion_continuation_context")
+            .map_err(|e| e.to_string())?;
+        let identities = statement
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        identities
+            .map(|r| {
+                serde_json::from_str(&r.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+            })
+            .collect()
     }
 
     pub fn completion_continuation_owner(&self) -> Result<Option<CompletionDomainOwner>, String> {
@@ -306,6 +371,88 @@ mod tests {
         );
         assert!(db.list_pending("ordinary").unwrap().is_empty());
     }
+    #[test]
+    fn source_recovery_population_and_exclusion_survive_repeated_owner_replacement() {
+        let (_dir, mut db, mut owner) = fixture();
+        let source = |owner: &CompletionDomainOwner, registration: &str| ContinuationAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: owner.owner_generation.clone(),
+            operation: "source_recovery".into(),
+            request_sha256: "a".repeat(64),
+            source_registration_id: Some(registration.into()),
+            source_listener_revision: Some(1),
+            session_id: None,
+            claim_token: None,
+            result_path: "/fixture/result.json".into(),
+        };
+        for n in 0..4 {
+            let request = source(&owner, &format!("source-{n}"));
+            db.reserve_continuation_attempt(&request).unwrap();
+            db.accept_continuation_attempt(&request).unwrap();
+            owner.owner_generation = uuid::Uuid::new_v4().to_string();
+            db.publish_completion_continuation_owner(&owner).unwrap();
+            assert!(
+                db.reserve_continuation_attempt(&source(&owner, &format!("source-{n}")))
+                    .is_err()
+            );
+        }
+        assert!(
+            db.reserve_continuation_attempt(&source(&owner, "fifth-distinct-source"))
+                .is_err()
+        );
+        assert_eq!(db.pending_continuation_attempts().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn adopting_receipt_requires_exact_original_boundary_and_replays_across_replacement() {
+        let (_dir, mut db, owner) = fixture();
+        let request = reservation(&mut db, &owner);
+        db.accept_continuation_attempt(&request).unwrap();
+        db.attach_continuation_custodian_with_adopter(
+            &request,
+            &owner.driver_identity,
+            Some(&owner.guardian_identity),
+        )
+        .unwrap();
+        db.advance_continuation_attempt(
+            &request,
+            3,
+            "accepted",
+            "starting",
+            &owner.driver_identity,
+        )
+        .unwrap();
+        let replacement = CompletionDomainOwner {
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            ..owner.clone()
+        };
+        db.publish_completion_continuation_owner(&replacement)
+            .unwrap();
+        let mut receipt = serde_json::json!({"attempt_id":request.attempt_id,"custodian":owner.driver_identity,"adopter":owner.guardian_identity,"custodian_wait_status":9,"owned_children":"ECHILD"});
+        receipt["adopter"]["pid"] = 999999.into();
+        assert!(
+            db.discharge_adopted_continuation_attempt(&request, &receipt.to_string())
+                .is_err()
+        );
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_some()
+        );
+        receipt["adopter"] = serde_json::to_value(&owner.guardian_identity).unwrap();
+        db.discharge_adopted_continuation_attempt(&request, &receipt.to_string())
+            .unwrap();
+        db.discharge_adopted_continuation_attempt(&request, &receipt.to_string())
+            .unwrap();
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn completion_continuation_schema_fingerprint_rejects_same_version_mutation() {
         let (_dir, db, _owner) = fixture();

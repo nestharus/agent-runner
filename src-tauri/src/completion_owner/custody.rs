@@ -4,7 +4,7 @@ use oulipoly_state::completion_continuation::{
     AdmittedSourceBinding, MAX_REGISTRATION_BYTES, open_source_file, read_source_file, sha256,
 };
 use oulipoly_state::mailbox::{ContinuationAttempt, MailboxDb};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
@@ -12,6 +12,8 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+pub(super) const ADOPTER_ARG: &str = "__completion-continuation-adopter-v2";
 
 pub(super) const CUSTODIAN_ARG: &str = "__completion-continuation-custodian-v2";
 
@@ -160,7 +162,7 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
         // No SQLite operation occurs in this fork image. Inherited SQLite
         // process-global WAL bookkeeping is discarded by exec, not reused.
         let _error = Command::new("/proc/self/exe")
-            .arg(CUSTODIAN_ARG)
+            .arg(ADOPTER_ARG)
             .arg(gate_fd.to_string())
             .arg(request_fd.to_string())
             .exec();
@@ -168,9 +170,12 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
     }
     drop(gate);
     drop(request_file);
-    let identity = super::linux::identity(i64::from(pid))?;
+    let adopter = super::linux::identity(i64::from(pid))?;
+    let mut worker = [0; 4];
+    release.read_exact(&mut worker).map_err(|e| e.to_string())?;
+    let identity = super::linux::identity(i64::from(i32::from_ne_bytes(worker)))?;
     let mut mailbox = MailboxDb::open(path)?;
-    mailbox.attach_continuation_custodian(attempt, &identity)?;
+    mailbox.attach_continuation_custodian_with_adopter(attempt, &identity, Some(&adopter))?;
     mailbox.advance_continuation_attempt(attempt, 3, "accepted", "starting", &identity)?;
     release.write_all(&[1]).map_err(|e| e.to_string())?;
     Ok(i64::from(pid))
@@ -191,15 +196,21 @@ pub(super) fn entry() -> Result<(), String> {
         return Err("invalid custodian descriptor identity".into());
     }
     let mut gate = unsafe { UnixStream::from_raw_fd(gate_fd) };
-    let file = unsafe { std::fs::File::from_raw_fd(request_fd) };
+    let mut file = unsafe { std::fs::File::from_raw_fd(request_fd) };
     let mut bytes = Vec::new();
-    file.take(4 * 1024 * 1024 + 1)
+    (&mut file)
+        .take(4 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if bytes.len() > 4 * 1024 * 1024 {
         return Err("custodian request too large".into());
     }
     let request: CustodianRequest = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if std::env::args().nth(1).as_deref() == Some(ADOPTER_ARG) {
+        file.rewind().map_err(|e| e.to_string())?;
+        return adopt(request, gate, file);
+    }
+    drop(file);
     let path = &request.path;
     let attempt = &request.attempt;
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
@@ -237,10 +248,11 @@ pub(super) fn entry() -> Result<(), String> {
     let mut root_status = None;
     let mut root_wait_status = None;
     let mut cancellation: Option<(String, std::time::Instant)> = None;
+    let observations = activation_observer(path, attempt);
     loop {
         if cancellation.is_none()
-            && attempt.operation == "activation"
-            && let Ok(Some(identity)) = accepted_activation_cancellation(path, attempt)
+            && let Some(identity) =
+                latest_activation_observation(&observations).and_then(|v| v.cancellation)
         {
             cancellation = Some((identity, std::time::Instant::now()));
         }
@@ -293,6 +305,8 @@ pub(super) fn entry() -> Result<(), String> {
     let receipt=serde_json::json!({"attempt_id":attempt.attempt_id,"custodian":identity,"root_exit_code":root_status,"root_wait_status":root_wait_status,"spawn_failed":spawn_failed,"spawn_error":spawn_error,"accepted_cancellation":cancellation.as_ref().map(|v|&v.0),"response":classification,"owned_children":"ECHILD","result_retained":true}).to_string();
     // Persist the complete wait/drain result before its DB integration.
     persist_result_until_retained(Path::new(&attempt.result_path), receipt.as_bytes());
+    #[cfg(feature = "age360-fault-fixtures")]
+    oulipoly_state::completion_continuation::age360_fault_barrier("ac-result-retained");
     loop {
         let result = MailboxDb::open(path).and_then(|mut mailbox| {
             if spawn_failed {
@@ -466,15 +480,10 @@ fn classify_source_reply(attempt: &ContinuationAttempt) -> Result<serde_json::Va
     }
     match value["status"].as_str() {
         Some("source_ready") => {
-            let source = binding.registration()?;
-            let directory = Path::new(&source.handle_dir);
-            let snapshot =
-                read_source_file(directory, &source.snapshot_relative, 16 * 1024 * 1024)?;
-            let outcome =
-                read_source_file(directory, &source.outcome_relative, MAX_REGISTRATION_BYTES)?;
-            let evidence = oulipoly_state::completion_continuation::VerifiedCompletion::from_bytes(
-                &binding, &snapshot, &outcome,
-            )?;
+            let evidence =
+                oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
+                    &binding,
+                )?;
             if value["snapshot_sha256"] != evidence.snapshot_sha256
                 || value["outcome_sha256"] != evidence.outcome_sha256
             {
@@ -495,25 +504,266 @@ fn persist_result_until_retained(path: &Path, bytes: &[u8]) {
     }
 }
 
-fn accepted_activation_cancellation(
+#[derive(Default)]
+struct ActivationObservation {
+    launcher: Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
+    cancellation: Option<String>,
+}
+
+/// Database work cannot block physical reaping or lose a wait result. The
+/// observer owns ordinary writer connections in a separate thread, not snapshot
+/// helper children intermingled with the custodian's wait set. One latest-value
+/// slot bounds transport memory; persisted cancellation is queried until read.
+fn activation_observer(
     path: &Path,
     attempt: &ContinuationAttempt,
-) -> Result<Option<String>, String> {
-    let bound = Duration::from_millis(20);
-    let (_, mailbox) =
-        MailboxDb::open_read_only_with_pid_identity_and_work_timeout(path, bound, bound, &|| {
-            false
-        })?;
+) -> Option<std::sync::mpsc::Receiver<ActivationObservation>> {
+    if attempt.operation != "activation" {
+        return None;
+    }
+    let path = path.to_path_buf();
+    let attempt = attempt.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || observe_activation_database(path, attempt, sender));
+    Some(receiver)
+}
+
+fn observe_activation_database(
+    path: std::path::PathBuf,
+    attempt: ContinuationAttempt,
+    sender: std::sync::mpsc::SyncSender<ActivationObservation>,
+) {
+    loop {
+        #[cfg(feature = "age360-fault-fixtures")]
+        oulipoly_state::completion_continuation::age360_fault_barrier("activation-observation");
+        let observation = read_activation_observation(&path, &attempt).unwrap_or_default();
+        if matches!(
+            sender.try_send(observation),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_))
+        ) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn read_activation_observation(
+    path: &Path,
+    attempt: &ContinuationAttempt,
+) -> Result<ActivationObservation, String> {
+    let mailbox = MailboxDb::open(path)?;
+    let launcher = mailbox.continuation_launcher_identity(attempt)?;
     let Some((generation, invocation)) = mailbox.continuation_runtime_identity(attempt)? else {
-        return Ok(None);
+        return Ok(ActivationObservation {
+            launcher,
+            cancellation: None,
+        });
     };
-    let state = oulipoly_state::StateDb::open_read_only_with_retry_and_work_timeout_and_cancel(
-        &oulipoly_state::StateDb::default_path()?,
-        bound,
-        bound,
-        &|| false,
-    )
-    .map_err(|e| format!("{e:?}"))?;
+    let cancellation = read_activation_cancellation(&generation, &invocation)
+        .ok()
+        .flatten();
+    Ok(ActivationObservation {
+        launcher,
+        cancellation,
+    })
+}
+
+fn read_activation_cancellation(
+    generation: &str,
+    invocation: &str,
+) -> Result<Option<String>, String> {
+    let state = oulipoly_state::StateDb::open_default()?;
     use rusqlite::OptionalExtension;
     state.connection().query_row("SELECT l.logical_launch_id || ':' || l.cancel_requested_at FROM provider_launch_attempts a JOIN provider_logical_launches l ON l.logical_launch_id=a.logical_launch_id WHERE a.runtime_generation_uuid=?1 AND a.invocation_uuid=?2 AND l.cancel_requested_at IS NOT NULL",rusqlite::params![generation,invocation],|r|r.get(0)).optional().map_err(|e|e.to_string())
+}
+
+fn latest_activation_observation(
+    receiver: &Option<std::sync::mpsc::Receiver<ActivationObservation>>,
+) -> Option<ActivationObservation> {
+    receiver.as_ref()?.try_iter().last()
+}
+
+/// An original per-attempt adopting boundary exists before AC starts. This is
+/// not a replacement's empty tree: every launched descendant stays beneath it
+/// on AC loss, independently of domain guardian/driver replacement.
+fn adopt(
+    request: CustodianRequest,
+    mut gate: UnixStream,
+    file: std::fs::File,
+) -> Result<(), String> {
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if pid == 0 {
+        let _error = Command::new("/proc/self/exe")
+            .arg(CUSTODIAN_ARG)
+            .arg(gate.as_raw_fd().to_string())
+            .arg(file.as_raw_fd().to_string())
+            .exec();
+        unsafe { libc::_exit(70) }
+    }
+    let custodian = super::linux::identity(i64::from(pid))?;
+    let adopter = super::linux::identity(i64::from(std::process::id()))?;
+    // Even a broken parent gate does not relinquish the children just forked.
+    let _ = gate.write_all(&pid.to_ne_bytes());
+    drop(gate);
+    drop(file);
+    let path = &request.path;
+    let attempt = &request.attempt;
+    let mut custodian_wait = None;
+    let mut cancellation: Option<(String, std::time::Instant)> = None;
+    let mut launcher = None;
+    let observations = activation_observer(path, attempt);
+    let mut signal_waits = Vec::new();
+    loop {
+        if let Some(observation) = latest_activation_observation(&observations) {
+            launcher = observation.launcher.or(launcher);
+            if cancellation.is_none() {
+                cancellation = observation
+                    .cancellation
+                    .map(|id| (id, std::time::Instant::now()));
+            }
+        }
+        if cancellation.is_none()
+            && let Some(expected) = &launcher
+            && let Some((_, status)) = signal_waits
+                .iter()
+                .find(|(identity, _)| identity == expected)
+        {
+            cancellation = Some((
+                format!(
+                    "adopted_native_launcher_wait_signal:{}",
+                    libc::WTERMSIG(*status)
+                ),
+                std::time::Instant::now(),
+            ));
+        }
+        if custodian_wait.is_some()
+            && let Some((_, started)) = &cancellation
+        {
+            let signal =
+                if started.elapsed() >= oulipoly_core::launch_custody::TERMINATION_GRACE_PERIOD {
+                    libc::SIGKILL
+                } else {
+                    libc::SIGTERM
+                };
+            let _ = oulipoly_core::launch_custody::signal_owned_children(signal);
+        }
+        let (waited, status, wait_identity) = reap_adopted_child()?;
+        if waited == pid {
+            custodian_wait = Some(status);
+        }
+        if let Some(identity) = wait_identity
+            && libc::WIFSIGNALED(status)
+            && matches!(libc::WTERMSIG(status), libc::SIGTERM | libc::SIGINT)
+        {
+            // Retain exact waits even when the DB identity/cancellation read is
+            // unavailable at this instant. Later observation may join them.
+            signal_waits.push((identity, status));
+            #[cfg(feature = "age360-fault-fixtures")]
+            oulipoly_state::completion_continuation::age360_fault_barrier("adopted-terminal-wait");
+        }
+        if waited < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                break;
+            }
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.to_string());
+            }
+        }
+        if waited <= 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    // Preserve the original receipt when AC already retained its actual result.
+    if replay_result(path, attempt).is_ok() {
+        return Ok(());
+    }
+    let receipt = serde_json::json!({"attempt_id":attempt.attempt_id,"custodian":custodian,"adopter":adopter,"custodian_wait_status":custodian_wait.ok_or("original custodian was not waited")?,"owned_children":"ECHILD","accepted_cancellation":cancellation.map(|v|v.0),"classification":"original_adopting_boundary_drained"}).to_string();
+    let result_path = Path::new(&attempt.result_path).with_file_name("adopting-result.json");
+    persist_result_until_retained(&result_path, receipt.as_bytes());
+    loop {
+        // An AC-integrated result wins over the later enclosing-boundary receipt.
+        if !MailboxDb::open(path)?
+            .pending_continuation_attempts()?
+            .iter()
+            .any(|v| v.attempt_id == attempt.attempt_id)
+        {
+            return Ok(());
+        }
+        if MailboxDb::open(path)
+            .and_then(|mut db| db.discharge_adopted_continuation_attempt(attempt, &receipt))
+            .is_ok()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Inspect the waitable child before consuming its PID, preserving incarnation
+/// identity even if the launcher binding cannot currently be read from SQLite.
+fn reap_adopted_child() -> Result<
+    (
+        i32,
+        i32,
+        Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
+    ),
+    String,
+> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_ALL,
+            0,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result < 0 {
+        return Ok((-1, 0, None));
+    }
+    let pid = unsafe { info.si_pid() };
+    if pid == 0 {
+        return Ok((0, 0, None));
+    }
+    let identity = super::linux::identity(i64::from(pid)).ok();
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    Ok((waited, status, identity))
+}
+
+/// Replay only retained wait/drain evidence joined by the DB to its original
+/// producer. A lost process with no receipt is not a replayable result.
+pub(super) fn replay_result(path: &Path, attempt: &ContinuationAttempt) -> Result<(), String> {
+    let result = Path::new(&attempt.result_path);
+    let directory = result.parent().ok_or("result parent absent")?;
+    let primary = read_source_file(directory, "result.json", MAX_REGISTRATION_BYTES);
+    if let Ok(bytes) = primary {
+        let receipt = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if value["attempt_id"] != attempt.attempt_id || value["owned_children"] != "ECHILD" {
+            return Err("retained result evidence conflict".into());
+        }
+        let custodian =
+            serde_json::from_value(value["custodian"].clone()).map_err(|e| e.to_string())?;
+        let mut db = MailboxDb::open(path)?;
+        return if value["gate"] == "unreleased_eof" || value["spawn_failed"] == true {
+            db.cancel_unreleased_continuation_gate(attempt, &custodian, receipt)
+        } else if value["result_retained"] == true && value["root_wait_status"].as_i64().is_some() {
+            db.discharge_continuation_attempt(attempt, &custodian, receipt)
+        } else {
+            Err("retained result lacks launch/wait evidence".into())
+        };
+    }
+    let bytes = read_source_file(directory, "adopting-result.json", MAX_REGISTRATION_BYTES)?;
+    MailboxDb::open(path)?.discharge_adopted_continuation_attempt(
+        attempt,
+        std::str::from_utf8(&bytes).map_err(|e| e.to_string())?,
+    )
 }
