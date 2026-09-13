@@ -133,6 +133,16 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
 }
 
 impl MailboxDb {
+    /// Private catalog observation only: unlike activation(), distinguishes an
+    /// absent row from a terminal row. One SELECT observes row and claim together
+    /// on this reader's actual connection (including its detached snapshot).
+    #[cfg(feature = "age360-fault-fixtures")]
+    pub fn age360_observe_attempt(&self, attempt_id: &str) -> Result<Option<String>, String> {
+        self.conn.query_row(
+            "SELECT json_object('phase',phase,'revision',revision,'integrated',integrated,'receipt',drain_receipt,'claim',EXISTS(SELECT 1 FROM session_wake_claim c WHERE c.session_id=a.session_id AND c.claim_token=a.claim_token)) FROM completion_continuation_attempt a WHERE attempt_id=?1",
+            [attempt_id], |r| r.get(0)).optional().map_err(|e|e.to_string())
+    }
+
     pub fn cancel_unreleased_continuation_gate(
         &mut self,
         attempt: &ContinuationAttempt,
@@ -162,7 +172,16 @@ impl MailboxDb {
             )
             .map_err(|e| e.to_string())?;
         }
-        tx.commit().map_err(|e| e.to_string())
+        #[cfg(feature = "age360-fault-fixtures")]
+        crate::completion_continuation::age360_fault_barrier("unreleased-before-commit");
+        let result = tx.commit().map_err(|e| e.to_string());
+        #[cfg(feature = "age360-fault-fixtures")]
+        crate::completion_continuation::age360_fault_barrier(if result.is_ok() {
+            "unreleased-commit-returned-ok"
+        } else {
+            "unreleased-commit-returned-error"
+        });
+        result
     }
 }
 
