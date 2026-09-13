@@ -8,6 +8,8 @@ mod custody_faults;
 #[cfg(feature = "age360-fault-fixtures")]
 #[path = "fixtures/age360/paired_faults.rs"]
 mod paired_faults;
+#[path = "fixtures/age360/live_census.rs"]
+mod live_census;
 mod provider_authority_fixture;
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::read_live_process_identity;
@@ -665,25 +667,10 @@ fn paired_case(mode: &'static str) {
     let (attempts, integrated): (i64, i64) = f.sidecar_connection().query_row(
         "SELECT COUNT(*),COALESCE(SUM(integrated),0) FROM completion_continuation_attempt WHERE source_registration_id=?1",
         [&source.registration_id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
-    fn retained(path: &std::path::Path) -> (u64, u64) {
-        let mut count = 0;
-        let mut bytes = 0;
-        for entry in fs::read_dir(path).unwrap().flatten() {
-            let metadata = entry.metadata().unwrap();
-            if metadata.is_dir() {
-                let (nested_count, nested_bytes) = retained(&entry.path());
-                count += nested_count;
-                bytes += nested_bytes;
-            } else if metadata.is_file() {
-                count += 1;
-                bytes += metadata.len();
-            }
-        }
-        (count, bytes)
-    }
-    let (files, bytes) = retained(f.root.path());
+    let census = live_census::observe(f.root.path()).expect("live resource traversal");
     println!(
-        "paired resources source_recovery_attempts={attempts} integrated={integrated} retained_fixture_files={files} retained_fixture_bytes={bytes}; fixture teardown is not product release authority"
+        "paired live resource observations source_recovery_attempts={attempts} integrated={integrated} observed_files={} observed_bytes={} disappeared_entries={:?}; non-atomic traversal, unknown sizes for disappeared entries, not a complete snapshot; fixture teardown is not product release authority",
+        census.observed_files, census.observed_bytes, census.disappeared
     );
 }
 #[test]
