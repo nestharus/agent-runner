@@ -733,8 +733,20 @@ fn execute_allocated_attempt(
             })
         }
     };
+    #[cfg(feature = "age360-fault-fixtures")]
+    if original_tree {
+        oulipoly_state::completion_continuation::age360_fault_barrier(
+            "native-before-custody-retention",
+        );
+    }
     if let Err(error) = attempt.retain_custody() {
         tracing::error!(%error, "native attempt custody retention failed; settlement unavailable");
+    }
+    #[cfg(feature = "age360-fault-fixtures")]
+    if original_tree {
+        oulipoly_state::completion_continuation::age360_fault_barrier(
+            "native-after-custody-retention",
+        );
     }
     outcome
 }

@@ -13,7 +13,7 @@ name = "oulipoly-agent-runner"
 path = "src/main.rs"
 
 [features]
-age360-fault-fixtures = ["oulipoly-state/age360-fault-fixtures"]
+age360-fault-fixtures = ["oulipoly-state/age360-fault-fixtures", "oulipoly-runtime/age360-fault-fixtures"]
 
 [dependencies]
 cap-fs-ext.workspace = true

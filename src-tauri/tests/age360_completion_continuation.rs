@@ -848,6 +848,14 @@ fn native_adopter_retains_wait_until_delayed_launcher_identity_arrives() {
 }
 fn native_activation_custody(owner_loss: u8) {
     let f = Fixture::new("owner_only");
+    let receipt_window = match owner_loss {
+        11 => Some("native-before-custody-retention"),
+        12 => Some("native-after-custody-retention"),
+        _ => None,
+    };
+    if let Some(window) = receipt_window {
+        f.gate(&format!("{window}.hold"));
+    }
     if owner_loss == 8 {
         f.gate("activation-observation.hold");
         f.gate("adopted-terminal-wait.hold");
@@ -1044,7 +1052,26 @@ fn native_activation_custody(owner_loss: u8) {
     ));
     drop(writer);
     drop(mailbox);
-    if matches!(owner_loss, 3 | 6 | 8 | 9 | 10) {
+    if let Some(window) = receipt_window {
+        f.gate("release-descendant");
+        wait(|| {
+            f.root
+                .path()
+                .join(format!("{window}.reached"))
+                .exists()
+                .then_some(())
+        });
+        let producer_pid =
+            fs::read_to_string(f.root.path().join(format!("{window}.reached"))).unwrap();
+        let exact: oulipoly_state::completion_continuation::SourceProcessIdentity =
+            serde_json::from_str(&launcher).unwrap();
+        assert_eq!(producer_pid.trim().parse::<i64>().unwrap(), exact.pid);
+        assert!(current_identity_matches(&exact));
+        println!("actual original executor held at receipt boundary={window} pid={producer_pid}");
+        request_linked_cancel(&f, &attempt);
+        // Keep the producer held. Actual AC cancellation, not test release,
+        // terminates it at this exact producer receipt boundary.
+    } else if matches!(owner_loss, 3 | 6 | 8 | 9 | 10) {
         wait(|| {
             f.root
                 .path()
@@ -1098,6 +1125,7 @@ fn native_activation_custody(owner_loss: u8) {
     assert_eq!(receipt.0, "drained");
     assert_eq!(receipt.1, 1);
     assert!(receipt.2.contains("ECHILD"));
+
     if matches!(owner_loss, 5 | 6 | 8 | 10) {
         let value: serde_json::Value = serde_json::from_str(&receipt.2).unwrap();
         assert_eq!(
@@ -1107,10 +1135,10 @@ fn native_activation_custody(owner_loss: u8) {
         assert!(value["adopter"].is_object());
         assert_eq!(value["custodian_wait_status"], libc::SIGKILL);
     }
-    if matches!(owner_loss, 3 | 6 | 8 | 9 | 10) {
+    if matches!(owner_loss, 3 | 6 | 8 | 9 | 10 | 11 | 12) {
         let receipt: serde_json::Value = serde_json::from_str(&receipt.2).unwrap();
         assert!(receipt["accepted_cancellation"].is_string(), "{receipt}");
-        if matches!(owner_loss, 9 | 10) {
+        if matches!(owner_loss, 9 | 10 | 11 | 12) {
             let expected = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
             assert_eq!(receipt["accepted_cancellation"], expected);
             let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
@@ -1128,8 +1156,29 @@ fn native_activation_custody(owner_loss: u8) {
                 "logical cancellation after physical drain: status={status} retained_producer_receipts={receipts}; physical assertions do not certify logical settlement"
             );
         }
-        assert!(!f.root.path().join("release-descendant").exists());
+        if receipt_window.is_none() {
+            assert!(!f.root.path().join("release-descendant").exists());
+        }
         assert!(read_live_process_identity(descendant).unwrap().is_none());
+    }
+    if matches!(owner_loss, 9 | 10 | 11 | 12) {
+        let expected = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
+        let launch = expected.split(':').next().unwrap();
+        wait(|| {
+            let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).ok()?;
+            let status: String = state
+                .connection()
+                .query_row(
+                    "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+                    [launch],
+                    |r| r.get(0),
+                )
+                .ok()?;
+            (status == "cancelled").then_some(())
+        });
+        println!(
+            "actual physical drain AND logical cancellation settled boundary={receipt_window:?}"
+        );
     }
 }
 
@@ -1449,4 +1498,22 @@ fn paired_driver_replacement_does_not_replay_original_source() {
     if !private_case(true) {
         paired_case("driver_replacement");
     }
+}
+
+#[cfg(feature = "age360-fault-fixtures")]
+#[test]
+fn native_state_cancellation_before_producer_custody_retention_settles() {
+    if private_case(false) {
+        return;
+    }
+    native_activation_custody(11);
+}
+
+#[cfg(feature = "age360-fault-fixtures")]
+#[test]
+fn native_state_cancellation_after_producer_custody_retention_settles() {
+    if private_case(false) {
+        return;
+    }
+    native_activation_custody(12);
 }
