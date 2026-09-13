@@ -607,10 +607,12 @@ fn paired_case(mode: &'static str) {
             .all(|l| l.acknowledged_at.is_some())
             .then_some(())
     });
-    let byte_receipt: serde_json::Value = serde_json::from_slice(
-        &fs::read(f.root.path().join("recipient-byte-receipt.json")).unwrap(),
-    )
-    .unwrap();
+    // Listener ACK may race ahead through the normal native acceptance path;
+    // require the adapter's independent byte readback, not ACK as a proxy.
+    let byte_receipt: serde_json::Value = wait(|| {
+        serde_json::from_slice(&fs::read(f.root.path().join("recipient-byte-receipt.json")).ok()?)
+            .ok()
+    });
     assert_eq!(byte_receipt["output_checked"], true);
     println!("actual native adapter byte receipt={byte_receipt}");
     // Both modes have completed their mode-specific initial observation above.

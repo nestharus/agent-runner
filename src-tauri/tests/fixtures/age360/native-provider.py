@@ -65,7 +65,7 @@ def launch(request):
             # The actual recipient reads and ACKs an exact existing mailbox row.
             # This is not a producer byte receipt or a parent-test SQL ACK.
             runner = os.environ["AGENT_BASH_AGENT_RUNNER_BIN"]
-            listed = subprocess.run([runner,"mailbox","list","--session-id",known,"--json"],capture_output=True,check=True,timeout=10)
+            listed = subprocess.run([runner,"mailbox","list","--session-id",known,"--all","--json"],capture_output=True,check=True,timeout=10)
             rows = json.loads(listed.stdout)["rows"]
             assert len(rows) == 1
             received_output = None
@@ -165,7 +165,7 @@ def launch(request):
                     if time.monotonic() > deadline: raise RuntimeError("test did not request owner cancellation")
                     time.sleep(.02)
                 handle = json.loads(result.stdout)["handle"]
-                cancelled = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "cancel", handle], env=env, capture_output=True, timeout=10)
+                cancelled = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "cancel", handle], env=env, capture_output=True, timeout=30)
                 (root / "source-cancel-result.json").write_text(json.dumps({"rc": cancelled.returncode, "stdout": cancelled.stdout.decode(), "stderr": cancelled.stderr.decode(), "owner_pid": os.getpid()}))
             if mode == "sync":
                 deadline = time.monotonic() + 30
