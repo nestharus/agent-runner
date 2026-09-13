@@ -355,6 +355,74 @@ mod tests {
         attempt
     }
     #[test]
+    fn original_birth_attachment_retry_closes_current_generation_start_authority() {
+        let (_dir, mut db, owner) = fixture();
+        let attempt = reservation(&mut db, &owner);
+        db.accept_continuation_attempt(&attempt).unwrap();
+        let driver = &owner.driver_identity;
+        db.attach_original_continuation_custody(&attempt, driver, driver, driver)
+            .unwrap();
+        assert!(
+            db.advance_continuation_attempt(&attempt, 3, "accepted", "starting", driver)
+                .is_err()
+        );
+        let phase: String = db
+            .conn
+            .query_row(
+                "SELECT phase FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&attempt.attempt_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "unknown_custody");
+    }
+
+    #[test]
+    fn original_birth_attachment_survives_succession_without_grant_authority() {
+        let (_dir, mut db, owner) = fixture();
+        let attempt = reservation(&mut db, &owner);
+        db.accept_continuation_attempt(&attempt).unwrap();
+        let mut successor = owner.clone();
+        successor.owner_generation = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_continuation_owner(&successor)
+            .unwrap();
+        let driver = &owner.driver_identity;
+        let mut wrong = driver.clone();
+        wrong.starttime_ticks += 1;
+        assert!(
+            db.attach_original_continuation_custody(&attempt, &wrong, driver, driver)
+                .is_err()
+        );
+        let mut altered = attempt.clone();
+        altered.request_sha256 = "b".repeat(64);
+        assert!(
+            db.attach_original_continuation_custody(&altered, driver, driver, driver)
+                .is_err()
+        );
+        db.attach_original_continuation_custody(&attempt, driver, driver, driver)
+            .unwrap();
+        db.attach_original_continuation_custody(&attempt, driver, driver, driver)
+            .unwrap();
+        assert!(
+            db.attach_original_continuation_custody(&attempt, driver, &wrong, driver)
+                .is_err()
+        );
+        assert!(
+            db.attach_original_continuation_custody(&attempt, driver, driver, &wrong)
+                .is_err()
+        );
+        assert!(
+            db.advance_continuation_attempt(&attempt, 3, "accepted", "starting", driver)
+                .is_err()
+        );
+        let (phase, revision, integrated): (String, i64, i64) = db.conn.query_row(
+            "SELECT phase,revision,integrated FROM completion_continuation_attempt WHERE attempt_id=?1", [&attempt.attempt_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(phase, "unknown_custody");
+        assert_eq!(revision, 4);
+        assert_eq!(integrated, 0);
+    }
+
+    #[test]
     fn completion_continuation_existing_legacy_domain_is_not_migrated_by_open_or_probe() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");

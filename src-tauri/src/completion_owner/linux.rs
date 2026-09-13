@@ -224,6 +224,7 @@ fn guardian(
     if let Some(socket) = &announce {
         retained.push(socket.as_raw_fd());
     }
+    retained.extend(super::custody::pending_birth_fds());
     close_except(&retained);
     let mut owner = start_driver(
         path,
@@ -242,6 +243,7 @@ fn guardian(
     }
     let mut closing = false;
     loop {
+        super::custody::retry_unreleased();
         loop {
             let mut status = 0;
             let pid = super::custody::reap_unprotected(&mut status);
@@ -372,6 +374,7 @@ fn start_driver(
     if pid == 0 {
         drop(release);
         unsafe { libc::close(listener) };
+        let _ = super::custody::pending_birth_fds();
         close_except(&[election, gate.as_raw_fd()]);
         let mut bytes = Vec::new();
         let result = gate

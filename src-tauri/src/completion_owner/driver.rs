@@ -158,6 +158,7 @@ pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> 
 }
 
 fn reap(live: &mut HashMap<i64, String>) {
+    super::custody::retry_unreleased();
     loop {
         let pid = super::custody::reap_unprotected(&mut 0);
         if pid <= 0 {

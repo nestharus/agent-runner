@@ -993,3 +993,322 @@ fn prepublication_recovery(succeed_guardian: bool) {
     assert!(!f.root.path().join("resume-prompts.jsonl").exists());
     println!("storage recovery retained exact original wait={receipt}");
 }
+
+#[test]
+fn native_birth_composition_early_guardian_loss_before_eof() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("adopter-before-ac-fork.hold");
+    let owner = start_pre_attachment(&f);
+    let adopter = process_identity(reached(&f, "adopter-before-ac-fork"));
+    let a = attempt(&f);
+    stop_exact(&owner.driver_identity);
+    kill_exact(&owner.guardian_identity);
+    wait_parent_change(&owner.driver_identity, owner.guardian_identity.pid);
+    kill_exact(&adopter);
+    wait_task_state(&adopter, "Z");
+    continue_exact(&owner.driver_identity);
+    let next = wait(|| {
+        let next = f.owner();
+        (next.owner_generation != owner.owner_generation).then_some(next)
+    });
+    assert_eq!(next.guardian_identity, owner.driver_identity);
+    let receipt = wait_drained_attempt(&f, &a);
+    assert_eq!(receipt["gate"], "unreleased_announcement_eof");
+    let reason: serde_json::Value =
+        serde_json::from_str(receipt["reason"].as_str().unwrap()).unwrap();
+    assert_eq!(reason["adopter"], serde_json::to_value(&adopter).unwrap());
+    assert_eq!(reason["si_status"], libc::SIGKILL);
+    assert_eq!(reason["execution_grant"], "not_sent");
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!("early guardian loss before EOF registration original wait={receipt}");
+}
+
+fn stop_exact(identity: &SourceProcessIdentity) {
+    assert!(current_identity_matches(identity));
+    assert_eq!(unsafe { libc::kill(identity.pid as i32, libc::SIGSTOP) }, 0);
+    wait_task_state(identity, "T");
+}
+// Scheduling observations only. The fixture never promotes these proc states
+// into custody; assertions below require the original producers' actual waits.
+fn wait_task_state(identity: &SourceProcessIdentity, state: &str) {
+    wait(|| {
+        let stat = fs::read_to_string(format!("/proc/{}/stat", identity.pid)).ok()?;
+        let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        (fields[0] == state && fields[19].parse::<i64>().ok()? == identity.starttime_ticks)
+            .then_some(())
+    });
+}
+fn wait_parent_change(driver: &SourceProcessIdentity, guardian: i64) {
+    wait(|| {
+        let stat = fs::read_to_string(format!("/proc/{}/stat", driver.pid)).ok()?;
+        let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        (fields[0] == "T"
+            && fields[1].parse::<i64>().ok()? != guardian
+            && fields[19].parse::<i64>().ok()? == driver.starttime_ticks)
+            .then_some(())
+    });
+    println!(
+        "original driver {} remains stopped after actual guardian reparenting, before its next birth read",
+        driver.pid
+    );
+}
+
+fn continue_exact(identity: &SourceProcessIdentity) {
+    assert!(current_identity_matches(identity));
+    assert_eq!(unsafe { libc::kill(identity.pid as i32, libc::SIGCONT) }, 0);
+}
+
+#[test]
+fn native_birth_composition_guardian_loss_with_dead_ac() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("ac-created-before-announce.hold");
+    let owner = start_pre_attachment(&f);
+    let ac = process_identity(reached(&f, "ac-created-before-announce"));
+    let a = attempt(&f);
+    stop_exact(&owner.driver_identity);
+    kill_exact(&ac);
+    wait_task_state(&ac, "Z");
+    kill_exact(&owner.guardian_identity);
+    wait_parent_change(&owner.driver_identity, owner.guardian_identity.pid);
+    continue_exact(&owner.driver_identity);
+    let next = wait(|| {
+        let next = f.owner();
+        (next.owner_generation != owner.owner_generation).then_some(next)
+    });
+    assert_eq!(next.guardian_identity, owner.driver_identity);
+    assert_original_adopting_drain(&f, &a, &ac);
+}
+
+#[test]
+fn native_birth_composition_attachment_precommit_failure() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("ac-created-before-announce.hold");
+    let owner = start_pre_attachment(&f);
+    let ac = process_identity(reached(&f, "ac-created-before-announce"));
+    let a = attempt(&f);
+    let db = rusqlite::Connection::open(f.data.join("pid-identity.db")).unwrap();
+    db.execute_batch("CREATE TABLE fixture_attachment_failures(n INTEGER); CREATE TRIGGER fixture_fail_attachment BEFORE UPDATE OF custodian_identity ON completion_continuation_attempt WHEN OLD.custodian_identity IS NULL AND NEW.custodian_identity IS NOT NULL BEGIN INSERT INTO fixture_attachment_failures VALUES(1); SELECT RAISE(FAIL, 'fixture actual attachment precommit failure'); END;").unwrap();
+    f.gate("driver-replay.hold");
+    kill_exact(&ac);
+    assert_eq!(reached(&f, "driver-replay"), owner.driver_identity.pid);
+    let failures: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM fixture_attachment_failures",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(failures >= 1, "must execute actual failed attachment");
+    let attachment: Option<String> = db
+        .query_row(
+            "SELECT custodian_identity FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&a.attempt_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(attachment.is_none());
+    println!(
+        "actual attachment precommit failures={failures}; custodian NULL before storage recovery"
+    );
+    db.execute_batch("DROP TRIGGER fixture_fail_attachment")
+        .unwrap();
+    remove_hold(&f, "driver-replay");
+    assert_original_adopting_drain(&f, &a, &ac);
+}
+
+fn assert_original_adopting_drain(
+    f: &Fixture,
+    a: &ContinuationAttempt,
+    ac: &SourceProcessIdentity,
+) {
+    let receipt = wait_drained_attempt(f, a);
+    assert_eq!(
+        receipt["classification"],
+        "original_adopting_boundary_drained"
+    );
+    assert_eq!(receipt["custodian"], serde_json::to_value(ac).unwrap());
+    assert_eq!(receipt["custodian_wait_status"], libc::SIGKILL);
+    assert_eq!(receipt["owned_children"], "ECHILD");
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!("original dead AC custody after birth composition={receipt}");
+}
+
+#[test]
+fn native_birth_composition_live_ac_survives_succession_without_grant() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("ac-created-before-announce.hold");
+    let owner = start_pre_attachment(&f);
+    let ac = process_identity(reached(&f, "ac-created-before-announce"));
+    let a = attempt(&f);
+    kill_exact(&owner.guardian_identity);
+    let next = wait(|| {
+        let next = f.owner();
+        (next.owner_generation != owner.owner_generation).then_some(next)
+    });
+    assert_eq!(next.guardian_identity, owner.driver_identity);
+    assert!(current_identity_matches(&ac));
+    assert_unresolved(&f, &a);
+    remove_hold(&f, "ac-created-before-announce");
+    let receipt = wait_drained_attempt(&f, &a);
+    assert_eq!(receipt["gate"], "unreleased_eof");
+    assert_eq!(receipt["custodian"], serde_json::to_value(&ac).unwrap());
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!("held live AC was not terminal/granted; original self drain after release={receipt}");
+}
+
+#[test]
+fn native_birth_composition_spawned_late_cancel_all_exit_projections_fail() {
+    spawned_late_cancellation(true, false);
+}
+
+#[test]
+fn native_birth_composition_spawned_both_projection_errors_observed() {
+    spawned_late_cancellation(true, true);
+}
+
+#[test]
+fn native_birth_composition_spawned_successful_projection_control() {
+    spawned_late_cancellation(false, false);
+}
+
+fn spawned_late_cancellation(obstruct: bool, observe_errors: bool) {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("hold-native-launch");
+    f.gate("native-after-custody-retention.hold");
+    start_pre_attachment(&f);
+    let launch_process = process_identity(reached(&f, "native-launch"));
+    let a = attempt(&f);
+    let db = rusqlite::Connection::open(f.data.join("pid-identity.db")).unwrap();
+    if obstruct {
+        db.execute_batch("CREATE TRIGGER fixture_fail_all_exit BEFORE UPDATE ON runtime_generation WHEN NEW.lifecycle_state='exited' BEGIN SELECT RAISE(FAIL, 'fixture all actual exit projections fail'); END;").unwrap();
+    }
+    if observe_errors {
+        f.gate("native-dispatch-exit-projection-failed.hold");
+        f.gate("native-outer-exit-projection-failed.hold");
+    }
+    kill_exact(&launch_process);
+    if observe_errors {
+        let dispatch_owner = reached(&f, "native-dispatch-exit-projection-failed");
+        println!("actual original dispatch cleanup returned failure; owner={dispatch_owner}");
+        remove_hold(&f, "native-dispatch-exit-projection-failed");
+        let outer_owner = reached(&f, "native-outer-exit-projection-failed");
+        assert_eq!(outer_owner, dispatch_owner);
+        println!("actual original outer runtime exit returned failure; owner={outer_owner}");
+        remove_hold(&f, "native-outer-exit-projection-failed");
+    }
+    reached(&f, "native-after-custody-retention");
+    let (generation, invocation) = f
+        .mailbox()
+        .continuation_runtime_identity(&a)
+        .unwrap()
+        .unwrap();
+    let g = uuid::Uuid::parse_str(&generation).unwrap();
+    let i = uuid::Uuid::parse_str(&invocation).unwrap();
+    let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+    let original = state.native_attempt_custody(g, i).unwrap().unwrap();
+    let actors: Vec<oulipoly_provider::custody::ActorSettlementReceipt> =
+        serde_json::from_value(original["actors"].clone()).unwrap();
+    assert!(
+        actors
+            .iter()
+            .all(oulipoly_provider::custody::ActorSettlementReceipt::effect_incapable)
+    );
+    let launch = actors
+        .iter()
+        .find(|a| a.operation == oulipoly_provider::custody::ProviderOperation::Launch)
+        .unwrap();
+    assert!(launch.spawned);
+    assert!(matches!(
+        launch.process_status,
+        Some(
+            oulipoly_provider::generated::ProcessStatus::SignalTerminated {
+                signal: libc::SIGKILL
+            }
+        )
+    ));
+    let lifecycle: String = db
+        .query_row(
+            "SELECT lifecycle_state FROM runtime_generation WHERE generation_uuid=?1",
+            [&generation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(lifecycle == "exited", !obstruct);
+    println!(
+        "exit UPDATE obstruction={obstruct} across dispatch/outer finalization; lifecycle={lifecycle}; original spawned aggregate={original}"
+    );
+    // Keep the returning obstruction across launcher death and genuine drain;
+    // no exit projection is allowed to establish a hidden successful prefix.
+    kill_exact(
+        &f.mailbox()
+            .continuation_launcher_identity(&a)
+            .unwrap()
+            .unwrap(),
+    );
+    let drain = wait_drained_attempt(&f, &a);
+    assert!(drain["accepted_cancellation"].is_null());
+    assert_eq!(drain["root_wait_status"], libc::SIGKILL);
+    println!("spawned uncancelled original drain BEFORE API acceptance={drain}");
+    if obstruct {
+        db.execute_batch("DROP TRIGGER fixture_fail_all_exit")
+            .unwrap();
+    }
+    request_linked_cancel(&f, &a);
+    let token = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
+    let logical = token.split(':').next().unwrap();
+    wait(|| {
+        let status: String = state
+            .connection()
+            .query_row(
+                "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+                [logical],
+                |r| r.get(0),
+            )
+            .ok()?;
+        (status == "cancelled").then_some(())
+    });
+    assert_eq!(
+        state.native_attempt_custody(g, i).unwrap().unwrap(),
+        original
+    );
+    assert!(
+        state
+            .native_recovered_attempt_custody(g, i)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(wait_drained_attempt(&f, &a), drain);
+    let reason: String = db
+        .query_row(
+            "SELECT terminal_reason FROM runtime_generation WHERE generation_uuid=?1",
+            [&generation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reason, "abnormal_termination",
+        "actual SIGKILL outcome, not late cancellation"
+    );
+    state
+        .request_cancel(uuid::Uuid::parse_str(logical).unwrap())
+        .unwrap();
+    oulipoly_runtime::executor::settle_retained_native_cancellation(&state, g, i).unwrap();
+    println!(
+        "late acceptance token={token}; settled logical cancellation with original runtime outcome={reason}"
+    );
+}

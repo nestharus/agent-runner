@@ -600,6 +600,12 @@ fn finalize_failed_external_launch(
         oulipoly_state::mailbox::RuntimeTerminalReason::StartupFailed
     };
     let outcome = exit_runtime_generation_outcome(context, reason, None);
+    #[cfg(feature = "age360-fault-fixtures")]
+    if outcome.is_err() {
+        oulipoly_state::completion_continuation::age360_fault_barrier(
+            "native-dispatch-exit-projection-failed",
+        );
+    }
     // Also retain cleanup evidence on the earlier provider/authority failure paths.
     tracing::warn!(cleanup = ?outcome, "External launch failure cleanup");
     outcome

@@ -243,6 +243,63 @@ impl MailboxDb {
         }
         Ok(())
     }
+    /// Retained birth testimony from the SAME original driver, not a successor's
+    /// inferred identity. This records custody only and moves an unfinished
+    /// starting gate to unknown custody, never restoring execution authority.
+    /// The immutable actor attachment and revision schema remain enforced.
+    pub fn attach_original_continuation_custody(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        driver: &SourceProcessIdentity,
+        custodian: &SourceProcessIdentity,
+        adopter: &SourceProcessIdentity,
+    ) -> Result<(), String> {
+        require_exact_attempt(&self.conn, attempt)?;
+        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
+            .ok_or("original driver absent")?;
+        if driver.pid != live.os_pid
+            || driver.boot_id != live.os_boot_id
+            || driver.starttime_ticks != live.os_pid_starttime_ticks
+        {
+            return Err("original birth driver identity conflict".into());
+        }
+        let driver = serde_json::to_string(driver).map_err(|e| e.to_string())?;
+        let custodian = serde_json::to_string(custodian).map_err(|e| e.to_string())?;
+        let adopter = serde_json::to_string(adopter).map_err(|e| e.to_string())?;
+        let recorded_driver: String = self
+            .conn
+            .query_row(
+                "SELECT driver_identity FROM completion_continuation_owner WHERE generation=?1",
+                [&attempt.owner_generation],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if recorded_driver != driver {
+            return Err("original birth driver generation conflict".into());
+        }
+        let (old_custodian, old_adopter, phase): (Option<String>, Option<String>, String) = self.conn.query_row(
+            "SELECT custodian_identity,adopter_identity,phase FROM completion_continuation_attempt WHERE attempt_id=?1", [&attempt.attempt_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e|e.to_string())?;
+        if old_custodian.as_ref().is_some_and(|v| v != &custodian)
+            || old_adopter.as_ref().is_some_and(|v| v != &adopter)
+            || !matches!(
+                phase.as_str(),
+                "accepted" | "starting" | "unknown_custody" | "drained" | "never_started"
+            )
+        {
+            return Err("original birth attachment fence conflict".into());
+        }
+        if old_custodian.is_some()
+            && old_adopter.is_some()
+            && !matches!(phase.as_str(), "accepted" | "starting")
+        {
+            return Ok(());
+        }
+        let changed = self.conn.execute("UPDATE completion_continuation_attempt SET revision=revision+1,custodian_identity=?3,adopter_identity=?4,phase=CASE WHEN phase IN ('accepted','starting') THEN 'unknown_custody' ELSE phase END WHERE attempt_id=?1 AND owner_generation=?2 AND phase IN ('accepted','starting','unknown_custody','drained','never_started') AND (custodian_identity IS NULL OR custodian_identity=?3) AND (adopter_identity IS NULL OR adopter_identity=?4)", params![attempt.attempt_id,attempt.owner_generation,custodian,adopter]).map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("original birth attachment fence conflict".into());
+        }
+        Ok(())
+    }
     pub fn continuation_activation(
         &self,
         session_id: &str,
@@ -599,6 +656,64 @@ impl MailboxDb {
 }
 
 impl MailboxDb {
+    /// Physical launched-process outcome, independent of logical cancellation.
+    /// The runtime producer supplies the original actor outcome; State joins the
+    /// exact recorded process and integrated original activation drain. No grant,
+    /// transfer claim, or existing terminal history is replaced.
+    pub fn exit_native_launched_after_original_drain(
+        &mut self,
+        generation: &str,
+        invocation: &str,
+        process: &SourceProcessIdentity,
+        reason: RuntimeTerminalReason,
+        exit_code: Option<i32>,
+    ) -> Result<(), String> {
+        self.native_original_drain(generation, invocation)?
+            .ok_or("native_original_drain_absent")?;
+        if !matches!(
+            reason,
+            RuntimeTerminalReason::OrderlyCompletion | RuntimeTerminalReason::AbnormalTermination
+        ) {
+            return Err("native_original_process_outcome_absent".into());
+        }
+        let id = RuntimeGenerationId::parse(generation).map_err(|e| e.to_string())?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let before = runtime_generation_by_id_on(&tx, &id)
+            .map_err(|e| e.to_string())?
+            .ok_or("native_runtime_absent")?;
+        let exact = matches!(&before.exact_process_evidence, ExactProcessEvidence::Recorded(p)
+            if p.os_pid == process.pid && p.os_boot_id == process.boot_id && p.os_pid_starttime_ticks == process.starttime_ticks);
+        if before.spawn_invocation_uuid != invocation
+            || before.spawned_os_pid != Some(process.pid)
+            || !exact
+        {
+            return Err("native_original_process_identity_conflict".into());
+        }
+        if before.active_delivery_claim_id.is_some()
+            || !before.active_delivery_seqs.is_empty()
+            || before.active_delivery_claimed_at.is_some()
+        {
+            return Err("native_delivery_claim_unsettled".into());
+        }
+        if before.lifecycle_state == RuntimeLifecycleState::Exited {
+            return Ok(());
+        }
+        let reason = match reason {
+            RuntimeTerminalReason::OrderlyCompletion => "orderly_completion",
+            _ => "abnormal_termination",
+        };
+        let now = now_rfc3339();
+        tx.execute("UPDATE runtime_generation SET lifecycle_state='exited',exited_at=?3,terminal_reason=?4,exit_code=?5 WHERE generation_uuid=?1 AND spawn_invocation_uuid=?2", params![generation,invocation,now,reason,exit_code]).map_err(|e| e.to_string())?;
+        settle_runtime_generation_admission_on(&tx, &id).map_err(|e| e.to_string())?;
+        let row = runtime_generation_by_id_on(&tx, &id)
+            .map_err(|e| e.to_string())?
+            .ok_or("native_runtime_absent_after_exit")?;
+        project_exited_generation_on(&tx, &row, &now, row.exit_code).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
     /// Cancellation-only runtime projection from its original activation drain.
     /// The Starting monitor's lost Q is not rewritten. Generic recovery and
     /// successor-transfer custody fences continue to require their original proof.

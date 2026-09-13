@@ -199,31 +199,38 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
     drop(request_file);
     let adopter = super::linux::identity(i64::from(pid))?;
     let mut worker = [0; 4];
-    if let Err(error) = read_ac_announcement(path, &driver, &mut release, &mut worker) {
-        // Only EOF can lead to an original terminal wait. Guardian succession
-        // must not block behind a live stalled adopter or infer its drain.
-        if error.kind() == std::io::ErrorKind::UnexpectedEof {
-            // Register retry ownership before the first fallible observation or
-            // publication. The generic reaper must never consume this wait.
-            PENDING_UNRELEASED.with_borrow_mut(|pending| {
-                pending.push(PendingUnreleased {
-                    path: path.into(),
-                    attempt: attempt.clone(),
-                    adopter,
-                    driver,
-                })
-            });
-            retry_unreleased();
-        }
-        return Err(error.to_string());
+    let mut custodian = None;
+    let result = (|| {
+        read_ac_announcement(path, &driver, &mut release, &mut worker)
+            .map_err(|e| e.to_string())?;
+        custodian = Some(super::linux::identity(i64::from(i32::from_ne_bytes(
+            worker,
+        )))?);
+        #[cfg(feature = "age360-fault-fixtures")]
+        oulipoly_state::completion_continuation::age360_fault_barrier("attempt-before-attachment");
+        let identity = custodian.as_ref().ok_or("birth identity absent")?;
+        let mut mailbox = MailboxDb::open(path)?;
+        mailbox.attach_continuation_custodian_with_adopter(attempt, identity, Some(&adopter))?;
+        mailbox.advance_continuation_attempt(attempt, 3, "accepted", "starting", identity)?;
+        release.write_all(&[1]).map_err(|e| e.to_string())
+    })();
+    if let Err(error) = result {
+        // Preserve the original read/attachment/wait obligation on EVERY unwind,
+        // including guardian loss before EOF and an attachment precommit error.
+        // Retry can attach for custody only; it can never send an execution grant.
+        PENDING_UNRELEASED.with_borrow_mut(|pending| {
+            pending.push(PendingUnreleased {
+                path: path.into(),
+                attempt: attempt.clone(),
+                adopter,
+                driver,
+                socket: Some(release),
+                custodian,
+            })
+        });
+        retry_unreleased();
+        return Err(error);
     }
-    #[cfg(feature = "age360-fault-fixtures")]
-    oulipoly_state::completion_continuation::age360_fault_barrier("attempt-before-attachment");
-    let identity = super::linux::identity(i64::from(i32::from_ne_bytes(worker)))?;
-    let mut mailbox = MailboxDb::open(path)?;
-    mailbox.attach_continuation_custodian_with_adopter(attempt, &identity, Some(&adopter))?;
-    mailbox.advance_continuation_attempt(attempt, 3, "accepted", "starting", &identity)?;
-    release.write_all(&[1]).map_err(|e| e.to_string())?;
     Ok(i64::from(pid))
 }
 
@@ -353,21 +360,66 @@ struct PendingUnreleased {
     attempt: ContinuationAttempt,
     adopter: oulipoly_state::completion_continuation::SourceProcessIdentity,
     driver: oulipoly_state::completion_continuation::SourceProcessIdentity,
+    socket: Option<UnixStream>,
+    custodian: Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
 }
 thread_local! {
     static PENDING_UNRELEASED: std::cell::RefCell<Vec<PendingUnreleased>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// One try per pending attempt per reap pass, not a retry-until-success loop. Other children and
-/// endpoint/recovery work remain serviceable during one receipt's I/O failure.
-fn retry_unreleased() {
+// Only the original process owns these descriptors and kernel waits. Discard
+// fork copies BEFORE close_except or descriptor reuse, not on a later reap.
+pub(super) fn pending_birth_fds() -> Vec<i32> {
     let current = i64::from(std::process::id());
     PENDING_UNRELEASED.with_borrow_mut(|pending| {
-        // fork copies memory but never transfers the parent's wait authority.
         pending.retain(|p| p.driver.pid == current);
-        pending.retain(|p| {
-            retain_unreleased_adopter_loss(&p.path, &p.attempt, &p.adopter, &p.driver).is_err()
-        });
+        pending
+            .iter()
+            .filter_map(|p| p.socket.as_ref().map(AsRawFd::as_raw_fd))
+            .collect()
+    })
+}
+
+impl PendingUnreleased {
+    fn retry(&mut self) -> Result<(), String> {
+        if self.custodian.is_none()
+            && let Some(socket) = &mut self.socket
+        {
+            socket.set_nonblocking(true).map_err(|e| e.to_string())?;
+            let mut bytes = [0; 4];
+            match socket.read(&mut bytes) {
+                Ok(0) => self.socket = None, // actual original EOF, not parent loss
+                Ok(4) => {
+                    self.custodian = Some(super::linux::identity(i64::from(i32::from_ne_bytes(
+                        bytes,
+                    )))?);
+                }
+                Ok(_) => return Err("incomplete birth packet".into()),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        if let Some(custodian) = &self.custodian {
+            // Attachment is original-driver testimony, including after promotion.
+            // It does not revive the old generation's starting/grant authority.
+            MailboxDb::open(&self.path)?.attach_original_continuation_custody(
+                &self.attempt,
+                &self.driver,
+                custodian,
+                &self.adopter,
+            )?;
+            self.socket = None; // close unsent grant; original adopter owns drain
+            return Ok(());
+        }
+        retain_unreleased_adopter_loss(&self.path, &self.attempt, &self.adopter, &self.driver)
+    }
+}
+
+/// One attempt per pending owner per OUTER reap pass, not per reaped child.
+/// Returning storage errors do not cause a retry-until-success loop.
+pub(super) fn retry_unreleased() {
+    let _ = pending_birth_fds();
+    PENDING_UNRELEASED.with_borrow_mut(|pending| {
+        pending.retain_mut(|p| p.retry().is_err());
     });
 }
 
@@ -375,7 +427,6 @@ fn retry_unreleased() {
 /// then reap unprotected exact child PIDs. Enumerating candidates is not drain
 /// evidence; only waitpid/waitid supply terminal/ECHILD observations.
 pub(super) fn reap_unprotected(status: &mut i32) -> i32 {
-    retry_unreleased();
     let protected = PENDING_UNRELEASED
         .with_borrow(|pending| pending.iter().map(|p| p.adopter.pid).collect::<Vec<_>>());
     if protected.is_empty() {
