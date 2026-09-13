@@ -17,14 +17,9 @@ fn cancel_source(
     let value: serde_json::Value =
         serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
     println!("actual original owner cancellation receipt={result}");
+    assert_eq!(value["handle"], source.handle);
     assert_eq!(value["requested"], true, "{value}");
-    wait(|| {
-        PathBuf::from(&source.handle_dir)
-            .join("cancel-workload-drained")
-            .exists()
-            .then_some(())
-    });
-    println!("actual source cancellation={value}");
+    println!("actual source cancellation accepted, drain still separate={value}");
 }
 
 pub(super) fn before_acceptance(
@@ -78,6 +73,12 @@ pub(super) fn before_acceptance(
         cancel_source(f, source);
     }
     fs::write(path.join(format!("fault-{fault}.release")), b"release").unwrap();
+    // Cancellation acceptance above occurs before publication. This retained
+    // drain marker can be produced by the original guardian after observer
+    // retirement, which the publication barrier intentionally prevents. Require
+    // actual recorded drain after releasing it, not retirement while held.
+    wait(|| path.join("cancel-workload-drained").exists().then_some(()));
+    println!("original source recorded cancellation drain after publication release");
 }
 
 #[test]
