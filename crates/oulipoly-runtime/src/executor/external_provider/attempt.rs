@@ -320,6 +320,11 @@ fn retain_recovered_dead_cancellation(
             if drain["receipt"]["accepted_cancellation"].is_string() {
                 RuntimeTerminalReason::Cancelled
             } else {
+                MailboxDb::open(&MailboxDb::path_for_state_db(state.path()))?
+                    .require_native_runtime_quiescent(
+                        &retained.lease.runtime_generation_uuid.to_string(),
+                        &retained.lease.owner.invocation_uuid.to_string(),
+                    )?;
                 original_runtime_exit_outcome(retained, row)?.0
             },
         )
@@ -362,7 +367,10 @@ fn retain_recovered_dead_cancellation(
 
 /// Select compatible actual operations, never the last outer helper label.
 /// Contradictory eligible requests stay unresolved; rejected requests remain in
-/// the retained history but cannot authorize a transition.
+/// the retained history. Explicit custody refusals can supply a request for a
+/// NEW recovery operation, not proof that the rejected transition completed.
+/// Both that request and absent-result requests require fresh exact Q at the
+/// authority consumer. Unclassified historical rejections remain unknown.
 fn original_runtime_exit_outcome(
     retained: &RetainedAttemptCustody,
     row: &RuntimeGenerationRow,
@@ -376,11 +384,9 @@ fn original_runtime_exit_outcome(
         {
             return Err("native_exit_journal_identity_conflict".into());
         }
-        if observation
-            .result
-            .as_ref()
-            .is_some_and(|r| r.rejected || r.disposition == ExitDisposition::AlreadyExited)
-        {
+        if observation.result.as_ref().is_some_and(|r| {
+            (r.rejected && !r.custody_refused) || r.disposition == ExitDisposition::AlreadyExited
+        }) {
             continue;
         }
         if row.terminal_reason == Some(RuntimeTerminalReason::RecoveredDead)
@@ -1816,6 +1822,7 @@ mod tests {
             result: Some(ExitResult {
                 disposition: ExitDisposition::Failed,
                 rejected: false,
+                custody_refused: false,
                 returned: "Err(StorageFailure)".into(),
             }),
         };
@@ -1828,6 +1835,7 @@ mod tests {
         rejected.result = Some(ExitResult {
             disposition: ExitDisposition::Rejected,
             rejected: true,
+            custody_refused: false,
             returned: "Err(Rejected(IllegalPredecessor))".into(),
         });
         retained.runtime_exit_operations.push(rejected);
@@ -1854,6 +1862,30 @@ mod tests {
             original_runtime_exit_outcome(&retained, &row).unwrap_err(),
             "native_original_runtime_operations_conflict"
         );
+        retained.runtime_exit_operations = vec![finish.clone()];
+        // No retrospective classification of an old generic invariant refusal.
+        retained.runtime_exit_operations[0].result = Some(serde_json::from_value(serde_json::json!({
+            "disposition":"Rejected", "rejected":true, "returned":"Ok(Rejected(InvariantViolation))"
+        })).unwrap());
+        assert!(original_runtime_exit_outcome(&retained, &row).is_err());
+        // Explicit refusal and missing result expose the same original request,
+        // not a completed transition. Real Q admission is tested at its consumer.
+        retained.runtime_exit_operations[0]
+            .result
+            .as_mut()
+            .unwrap()
+            .custody_refused = true;
+        let original_refusal = serde_json::to_value(&retained.runtime_exit_operations).unwrap();
+        let retry = original_runtime_exit_outcome(&retained, &row).unwrap();
+        assert_eq!(
+            serde_json::to_value(&retained.runtime_exit_operations).unwrap(),
+            original_refusal
+        );
+        retained.runtime_exit_operations[0].result = None;
+        assert_eq!(
+            original_runtime_exit_outcome(&retained, &row).unwrap(),
+            retry
+        );
         retained.runtime_exit_operations = vec![finish];
         row.drain_request_id = Some(oulipoly_state::mailbox::DrainRequestId::new());
         assert!(original_runtime_exit_outcome(&retained, &row).is_err());
@@ -1865,6 +1897,7 @@ mod tests {
         retained.runtime_exit_operations[0].result = Some(ExitResult {
             disposition: ExitDisposition::AlreadyExited,
             rejected: false,
+            custody_refused: false,
             returned: "Ok(AlreadyExited(original row))".into(),
         });
         assert!(original_runtime_exit_outcome(&retained, &row).is_err());

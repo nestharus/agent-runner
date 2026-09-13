@@ -198,14 +198,14 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
     drop(gate);
     drop(request_file);
     let adopter = super::linux::identity(i64::from(pid))?;
-    let mut worker = [0; 4];
+    let mut worker = [0; BIRTH_PACKET_BYTES];
     let mut custodian = None;
-    let mut received_pid = None;
+    let mut announced = None;
     let result = (|| {
         read_ac_announcement(path, &driver, &mut release, &mut worker)
             .map_err(|e| e.to_string())?;
-        received_pid = Some(i64::from(i32::from_ne_bytes(worker)));
-        custodian = Some(birth_identity(received_pid.unwrap())?);
+        announced = Some(decode_birth(&worker)?);
+        custodian = Some(birth_identity(announced.as_ref().unwrap())?);
         #[cfg(feature = "age360-fault-fixtures")]
         oulipoly_state::completion_continuation::age360_fault_barrier("attempt-before-attachment");
         let identity = custodian.as_ref().ok_or("birth identity absent")?;
@@ -226,7 +226,7 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
                 driver,
                 socket: Some(release),
                 custodian,
-                received_pid,
+                announced,
             })
         });
         retry_unreleased();
@@ -237,7 +237,32 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
 
 /// Birth and grant are small whole records. Packet boundaries prevent a child
 /// dying during an announcement from splicing a partial PID with the adopter's
-/// later terminal announcement. Both records carry the same unreaped child PID.
+/// later terminal announcement. Each record carries the original incarnation,
+/// not a number that could be resolved against a later process.
+const BIRTH_PACKET_BYTES: usize = 512;
+fn encode_birth(
+    identity: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+) -> Result<[u8; BIRTH_PACKET_BYTES], String> {
+    let value = serde_json::to_vec(identity).map_err(|e| e.to_string())?;
+    if value.len() >= BIRTH_PACKET_BYTES {
+        return Err("birth identity exceeds packet".into());
+    }
+    let mut packet = [0; BIRTH_PACKET_BYTES];
+    packet[..value.len()].copy_from_slice(&value);
+    Ok(packet)
+}
+fn decode_birth(
+    packet: &[u8; BIRTH_PACKET_BYTES],
+) -> Result<oulipoly_state::completion_continuation::SourceProcessIdentity, String> {
+    let end = packet
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or("unterminated birth identity")?;
+    if packet[end..].iter().any(|b| *b != 0) {
+        return Err("invalid birth padding".into());
+    }
+    serde_json::from_slice(&packet[..end]).map_err(|e| e.to_string())
+}
 fn birth_channel() -> std::io::Result<(UnixStream, UnixStream)> {
     use std::os::fd::FromRawFd;
     let mut fds = [-1; 2];
@@ -356,10 +381,10 @@ fn retain_unreleased_adopter_loss(
     Ok(())
 }
 
-// The packet names the adopter's still-unreaped child. Keep that consumed
-// input until lookup succeeds; another packet is not owed by a healthy AC.
+// Keep the original announced incarnation across returning lookup errors. A
+// current numeric PID lookup can confirm it, never replace its provenance.
 fn birth_identity(
-    pid: i64,
+    announced: &oulipoly_state::completion_continuation::SourceProcessIdentity,
 ) -> Result<oulipoly_state::completion_continuation::SourceProcessIdentity, String> {
     #[cfg(feature = "age360-fault-fixtures")]
     {
@@ -387,7 +412,11 @@ fn birth_identity(
             })?;
         }
     }
-    super::linux::identity(pid)
+    let current = super::linux::identity(announced.pid)?;
+    if current != *announced {
+        return Err("original birth incarnation changed".into());
+    }
+    Ok(current)
 }
 
 struct PendingUnreleased {
@@ -396,7 +425,7 @@ struct PendingUnreleased {
     adopter: oulipoly_state::completion_continuation::SourceProcessIdentity,
     driver: oulipoly_state::completion_continuation::SourceProcessIdentity,
     socket: Option<UnixStream>,
-    received_pid: Option<i64>,
+    announced: Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
     custodian: Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
 }
 thread_local! {
@@ -419,24 +448,24 @@ pub(super) fn pending_birth_fds() -> Vec<i32> {
 impl PendingUnreleased {
     fn retry(&mut self) -> Result<(), String> {
         if self.custodian.is_none()
-            && self.received_pid.is_none()
+            && self.announced.is_none()
             && let Some(socket) = &mut self.socket
         {
             socket.set_nonblocking(true).map_err(|e| e.to_string())?;
-            let mut bytes = [0; 4];
+            let mut bytes = [0; BIRTH_PACKET_BYTES];
             match socket.read(&mut bytes) {
                 Ok(0) => self.socket = None, // actual original EOF, not parent loss
-                Ok(4) => {
-                    self.received_pid = Some(i64::from(i32::from_ne_bytes(bytes)));
+                Ok(BIRTH_PACKET_BYTES) => {
+                    self.announced = Some(decode_birth(&bytes)?);
                 }
                 Ok(_) => return Err("incomplete birth packet".into()),
                 Err(e) => return Err(e.to_string()),
             }
         }
         if self.custodian.is_none()
-            && let Some(pid) = self.received_pid
+            && let Some(announced) = &self.announced
         {
-            self.custodian = Some(birth_identity(pid)?);
+            self.custodian = Some(birth_identity(announced)?);
         }
         if let Some(custodian) = &self.custodian {
             // Attachment is original-driver testimony, including after promotion.
@@ -467,10 +496,21 @@ pub(super) fn retry_unreleased() {
 /// then reap unprotected exact child PIDs. Enumerating candidates is not drain
 /// evidence; only waitpid/waitid supply terminal/ECHILD observations.
 pub(super) fn reap_unprotected(status: &mut i32) -> i32 {
+    #[cfg(feature = "age360-fault-fixtures")]
+    if PENDING_UNRELEASED.with_borrow(|pending| pending.iter().any(|p| p.announced.is_none())) {
+        oulipoly_state::completion_continuation::age360_fault_barrier("birth-unread-before-reap");
+    }
+    // Until the original birth is consumed, a newly adopted child can belong to
+    // this pending operation. Do not consume an unidentified original wait in
+    // the gap between a WouldBlock read and peer announcement/death. This is
+    // retention only, never an ECHILD or drain observation.
+    if PENDING_UNRELEASED.with_borrow(|pending| pending.iter().any(|p| p.announced.is_none())) {
+        return 0;
+    }
     let protected = PENDING_UNRELEASED.with_borrow(|pending| {
         pending
             .iter()
-            .flat_map(|p| [Some(p.adopter.pid), p.received_pid])
+            .flat_map(|p| [Some(p.adopter.pid), p.announced.as_ref().map(|a| a.pid)])
             .flatten()
             .collect::<Vec<_>>()
     });
@@ -951,7 +991,17 @@ fn adopt(
         oulipoly_state::completion_continuation::age360_fault_barrier("ac-created-before-announce");
         // Receiver loss withdraws the only grant; it must not kill the original
         // self-receipt producer. Exec still reaches the unreleased/ECHILD path.
-        let _ = gate.write_all(&unsafe { libc::getpid() }.to_ne_bytes());
+        // A returning identity-read error must not drop the only announcement
+        // while this same AC stays alive waiting for its execution gate.
+        let packet = loop {
+            if let Ok(identity) = super::linux::identity(i64::from(unsafe { libc::getpid() })) {
+                break encode_birth(&identity)?;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let _ = gate.write_all(&packet);
+        #[cfg(feature = "age360-fault-fixtures")]
+        oulipoly_state::completion_continuation::age360_fault_barrier("ac-announced-before-exec");
         drop(gate);
         let gate_fd = ac_gate.as_raw_fd();
         let flags = unsafe { libc::fcntl(gate_fd, libc::F_GETFD) };
@@ -1100,11 +1150,11 @@ fn read_original_grant(
             Err(e) => return Err(e.to_string()),
         }
         if !terminal_announced && exact_child_terminal(pid, custodian)? {
-            // At most one extra four-byte announcement, after AC can no longer
-            // write. If AC already announced, CD has its first complete PID;
+            // At most one extra original-incarnation packet, after AC can no
+            // longer write. If AC announced, CD has its first complete identity;
             // this cannot change attachment or manufacture an execution grant.
             gate.set_nonblocking(false).map_err(|e| e.to_string())?;
-            gate.write_all(&pid.to_ne_bytes())
+            gate.write_all(&encode_birth(custodian)?)
                 .map_err(|e| e.to_string())?;
             gate.set_nonblocking(true).map_err(|e| e.to_string())?;
             terminal_announced = true;

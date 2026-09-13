@@ -841,6 +841,8 @@ fn finalize_runtime_drain(
         Some(drain_request_id.to_string()),
     )?;
     pending.observe_before(context, &db)?;
+    #[cfg(feature = "age360-fault-fixtures")]
+    oulipoly_state::completion_continuation::age360_fault_barrier("native-finish-before-state");
     let result = db
         .runtime_lifecycle()
         .finish_runtime_generation_drain(FinishRuntimeGenerationDrain {

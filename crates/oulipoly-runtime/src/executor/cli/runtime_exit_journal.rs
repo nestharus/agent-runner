@@ -46,6 +46,10 @@ pub(crate) enum ExitDisposition {
 pub(crate) struct ExitResult {
     pub disposition: ExitDisposition,
     pub rejected: bool,
+    // Explicitly classified at the actual State response. Historical generic
+    // invariant rejections remain unknown; never parse Debug strings as proof.
+    #[serde(default)]
+    pub custody_refused: bool,
     pub returned: String,
 }
 
@@ -76,8 +80,17 @@ impl PendingExit {
         };
         // Before any potentially lossy SQL/helper step. Never report successful
         // finalization when this write returns an error.
-        durable::write_json(&path.join("intent.json"), &intent)
-            .map_err(|_| GenerationOperationError::StorageFailure)?;
+        #[cfg(feature = "age360-fault-fixtures")]
+        if intent.operation == ExitOperation::FinishDrain {
+            oulipoly_state::completion_continuation::age360_fault_barrier(
+                "native-finish-before-intent",
+            );
+        }
+        retain_prerequisite(
+            &path.join("intent.json"),
+            &intent,
+            "native-exit-intent-failed",
+        );
         Ok(Self(Some(path)))
     }
     pub(super) fn observe_before(
@@ -88,11 +101,18 @@ impl PendingExit {
         if self.0.is_none() {
             return Ok(());
         }
-        let row = db
-            .runtime_lifecycle_reader()
-            .runtime_generation(&context.generation_id)
-            .map_err(|_| GenerationOperationError::StorageFailure)?
-            .ok_or(GenerationOperationError::MissingGeneration)?;
+        // The original caller still owns this pending transition. A returning
+        // storage error does not hand that ownership to abnormal cleanup.
+        let row = loop {
+            match db
+                .runtime_lifecycle_reader()
+                .runtime_generation(&context.generation_id)
+            {
+                Ok(Some(row)) => break row,
+                Ok(None) => return Err(GenerationOperationError::MissingGeneration),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        };
         self.before(&row)
     }
     pub(super) fn before(
@@ -100,8 +120,15 @@ impl PendingExit {
         row: &RuntimeGenerationRow,
     ) -> Result<(), GenerationOperationError> {
         if let Some(path) = &self.0 {
-            durable::write_json(&path.join("before.json"), row)
-                .map_err(|_| GenerationOperationError::StorageFailure)?;
+            #[cfg(feature = "age360-fault-fixtures")]
+            oulipoly_state::completion_continuation::age360_fault_barrier(
+                "native-exit-before-predecessor-write",
+            );
+            retain_prerequisite(
+                &path.join("before.json"),
+                row,
+                "native-exit-predecessor-failed",
+            );
         }
         Ok(())
     }
@@ -114,7 +141,7 @@ impl PendingExit {
             Err(GenerationOperationError::Rejected(_)) => ExitDisposition::Rejected,
             Err(_) => ExitDisposition::Failed,
         };
-        self.retain_result(&result, disposition)?;
+        self.retain_result(&result, disposition, false)?;
         result
     }
     pub(super) fn finish_drain(
@@ -129,7 +156,13 @@ impl PendingExit {
             }
             Err(_) => ExitDisposition::Failed,
         };
-        self.retain_result(&result, disposition)?;
+        let custody_refused = matches!(
+            &result,
+            Ok(DrainFinishResult::Rejected(
+                GenerationRejection::CustodyNotQuiescent
+            ))
+        );
+        self.retain_result(&result, disposition, custody_refused)?;
         match result? {
             DrainFinishResult::Finished(_) | DrainFinishResult::AlreadyExited(_) => Ok(()),
             DrainFinishResult::NotDraining(actual) => Err(GenerationOperationError::Rejected(
@@ -153,7 +186,13 @@ impl PendingExit {
             Ok(GenerationMutation::Rejected(_)) => ExitDisposition::Rejected,
             Err(_) => ExitDisposition::Failed,
         };
-        self.retain_result(&result, disposition)?;
+        let custody_refused = matches!(
+            &result,
+            Ok(GenerationMutation::Rejected(
+                GenerationRejection::CustodyNotQuiescent
+            ))
+        );
+        self.retain_result(&result, disposition, custody_refused)?;
         match result? {
             GenerationMutation::Applied(_) => Ok(GenerationOperationOutcome::Applied),
             GenerationMutation::AlreadyApplied(_) => Ok(GenerationOperationOutcome::AlreadyApplied),
@@ -164,10 +203,12 @@ impl PendingExit {
         &self,
         result: &impl std::fmt::Debug,
         disposition: ExitDisposition,
+        custody_refused: bool,
     ) -> Result<(), GenerationOperationError> {
         if let Some(path) = &self.0 {
             let observed = ExitResult {
                 rejected: disposition == ExitDisposition::Rejected,
+                custody_refused,
                 disposition,
                 returned: format!("{result:?}"),
             };
@@ -184,6 +225,18 @@ impl PendingExit {
             })?;
         }
         Ok(())
+    }
+}
+
+/// Keep the exact original operation and observation in its living caller until
+/// its existing journal can retain them. No retry creates a new observation or
+/// reconstructs a lost classification. Killing this owner before retention can
+/// still lose those facts; this is not a reboot/all-owner-loss guarantee.
+fn retain_prerequisite(path: &Path, value: &impl Serialize, _failure_boundary: &str) {
+    while durable::write_json(path, value).is_err() {
+        #[cfg(feature = "age360-fault-fixtures")]
+        oulipoly_state::completion_continuation::age360_fault_barrier(_failure_boundary);
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 

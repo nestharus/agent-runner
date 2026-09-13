@@ -346,6 +346,9 @@ pub enum GenerationRejection {
         actual: RuntimeLifecycleState,
     },
     InvariantViolation,
+    /// This exact custody proof was not observed quiescent. This is a refusal,
+    /// not an illegal predecessor and not evidence that Q will later exist.
+    CustodyNotQuiescent,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2525,7 +2528,7 @@ impl RuntimeLifecycleRepository<'_> {
         }
         if !custody_allows_terminal(&tx, &before) {
             return Ok(DrainFinishResult::Rejected(
-                GenerationRejection::InvariantViolation,
+                GenerationRejection::CustodyNotQuiescent,
             ));
         }
         if let Err(rejection) = validate_drain_finish_claim(&before) {
@@ -7828,7 +7831,7 @@ fn validate_recovered_dead_process(
         return Ok(());
     }
     if !custody_allows_terminal(conn, before) {
-        return Err(GenerationRejection::InvariantViolation);
+        return Err(GenerationRejection::CustodyNotQuiescent);
     }
     if request.reason != RuntimeTerminalReason::RecoveredDead {
         return Ok(());

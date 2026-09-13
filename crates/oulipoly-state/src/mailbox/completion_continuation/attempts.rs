@@ -675,6 +675,26 @@ impl MailboxDb {
 }
 
 impl MailboxDb {
+    /// Fresh exact producer Q, read on this caller's live connection. Empty
+    /// current claims or an enclosing AC drain are not substitute Q evidence.
+    /// This does not attest publication of evidence obtained from other snapshots.
+    pub fn require_native_runtime_quiescent(
+        &self,
+        generation: &str,
+        invocation: &str,
+    ) -> Result<(), String> {
+        let id = RuntimeGenerationId::parse(generation).map_err(|e| e.to_string())?;
+        let row = runtime_generation_by_id_on(&self.conn, &id)
+            .map_err(|e| e.to_string())?
+            .ok_or("native_runtime_absent")?;
+        if row.spawn_invocation_uuid != invocation {
+            return Err("native_original_process_identity_conflict".into());
+        }
+        if custody_proof_observation(&self.conn, &row) != Some(true) {
+            return Err("native_original_current_quiescence_absent".into());
+        }
+        Ok(())
+    }
     /// Original launched-runtime exit projection, independent of late cancellation.
     /// The runtime producer supplies its retained original attempt; State joins the
     /// exact recorded process and integrated original activation drain. No grant,
@@ -720,6 +740,12 @@ impl MailboxDb {
         }
         if before.lifecycle_state == RuntimeLifecycleState::Exited {
             return Ok(());
+        }
+        // A pending intent or explicitly retained evidence refusal can support
+        // this NEW legal operation only with actual fresh producer Q. Neither
+        // missing result nor current empty claims supplies historical Q/ACK.
+        if custody_proof_observation(&tx, &before) != Some(true) {
+            return Err("native_original_current_quiescence_absent".into());
         }
         // Physical drain is not new lifecycle authority. Keep the same
         // predecessor distinction as finish-drain and non-orderly exit.

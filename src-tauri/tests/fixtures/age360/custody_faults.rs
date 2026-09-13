@@ -1306,6 +1306,23 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
     if zero_exit {
         f.gate("native-launch-exit-zero-without-output");
     }
+    let orderly = matches!(
+        mode,
+        "draining"
+            | "result-failure"
+            | "intent-failure"
+            | "predecessor-failure"
+            | "q-retained"
+            | "q-lost"
+    );
+    let q_refusal = matches!(mode, "q-retained" | "q-lost");
+    let lose_result = matches!(mode, "result-failure" | "q-lost");
+    if mode == "intent-failure" {
+        f.gate("native-finish-before-intent.hold");
+    }
+    if mode == "predecessor-failure" {
+        f.gate("native-exit-before-predecessor-write.hold");
+    }
     let preaggregate = matches!(mode, "before" | "retention-failure");
     let boundary = if preaggregate {
         "native-before-custody-retention"
@@ -1313,11 +1330,14 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
         "native-after-custody-retention"
     };
     f.gate(&format!("{boundary}.hold"));
-    if mode == "result-failure" {
+    if lose_result || q_refusal {
         f.gate("native-exit-result-retention.hold");
     }
     start_pre_attachment(&f);
     let launch_process = process_identity(reached(&f, "native-launch"));
+    if q_refusal {
+        f.gate("native-finish-before-state.hold");
+    }
     let a = attempt(&f);
     let db = rusqlite::Connection::open(f.data.join("pid-identity.db")).unwrap();
     if obstruct {
@@ -1327,7 +1347,7 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
         f.gate("native-dispatch-exit-projection-failed.hold");
         f.gate("native-outer-exit-projection-failed.hold");
     }
-    if matches!(mode, "draining" | "result-failure") {
+    if orderly {
         f.gate("release-resume");
         fs::remove_file(f.root.path().join("hold-native-launch")).unwrap();
     } else if zero_exit {
@@ -1344,7 +1364,72 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
         println!("actual original outer runtime exit returned failure; owner={outer_owner}");
         remove_hold(&f, "native-outer-exit-projection-failed");
     }
-    if mode == "result-failure" {
+    let mut original_writer = None;
+    if matches!(mode, "intent-failure" | "predecessor-failure") {
+        let (before, failed) = if mode == "intent-failure" {
+            ("native-finish-before-intent", "native-exit-intent-failed")
+        } else {
+            (
+                "native-exit-before-predecessor-write",
+                "native-exit-predecessor-failed",
+            )
+        };
+        let owner = process_identity(reached(&f, before));
+        original_writer = Some(owner.clone());
+        let root = runtime_exit_journal_root(&f);
+        let obstruction = if mode == "intent-failure" {
+            root.clone()
+        } else {
+            finish_operation_path(&root).join("before.json")
+        };
+        let saved = root.with_file_name("runtime-exit-preserved");
+        if mode == "intent-failure" {
+            fs::rename(&root, &saved).unwrap();
+            fs::write(&root, b"actual first-intent parent obstruction").unwrap();
+        } else {
+            fs::create_dir(&obstruction).unwrap();
+        }
+        f.gate(&format!("{failed}.hold"));
+        remove_hold(&f, before);
+        assert_eq!(reached(&f, failed), owner.pid);
+        assert!(current_identity_matches(&owner));
+        let lifecycle: String = db.query_row("SELECT lifecycle_state FROM runtime_generation WHERE generation_uuid=(SELECT runtime_generation_uuid FROM completion_continuation_attempt WHERE attempt_id=?1)", [&a.attempt_id], |r| r.get(0)).unwrap();
+        assert_eq!(lifecycle, "draining");
+        if mode == "intent-failure" {
+            fs::remove_file(&root).unwrap();
+            fs::rename(&saved, &root).unwrap();
+        } else {
+            fs::remove_dir(&obstruction).unwrap();
+        }
+        remove_hold(&f, failed);
+        println!(
+            "actual {mode} write error returned to original owner={owner:?}; storage restored without replacing owner"
+        );
+    }
+    let mut q_path = None;
+    if q_refusal {
+        reached(&f, "native-finish-before-state");
+        let proof: String = db.query_row("SELECT proof_path FROM runtime_generation_custody WHERE generation_uuid=(SELECT runtime_generation_uuid FROM completion_continuation_attempt WHERE attempt_id=?1)", [&a.attempt_id], |r| r.get(0)).unwrap();
+        let proof = PathBuf::from(proof);
+        assert_eq!(
+            fs::read(&proof).unwrap(),
+            b"Q",
+            "Q was authored by actual producer, not the fixture"
+        );
+        fs::rename(&proof, proof.with_extension("held-original-q")).unwrap();
+        remove_hold(&f, "native-finish-before-state");
+        reached(&f, "native-exit-result-retention"); // State call returned with original Q path absent
+        assert!(!proof.exists());
+        fs::rename(proof.with_extension("held-original-q"), &proof).unwrap();
+        q_path = Some(proof);
+        if !lose_result {
+            remove_hold(&f, "native-exit-result-retention");
+        }
+        println!(
+            "independent State finish read refused after actual initial Q; same original proof restored before cleanup"
+        );
+    }
+    if lose_result {
         reached(&f, "native-exit-result-retention");
         let root = fs::read_dir(f.data.join("state.native-producer-custody"))
             .unwrap()
@@ -1377,7 +1462,11 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
             finish.display()
         );
     }
-    reached(&f, boundary);
+    let finished_writer = reached(&f, boundary);
+    if let Some(original) = &original_writer {
+        assert_eq!(finished_writer, original.pid);
+        assert!(current_identity_matches(original));
+    }
     let (generation, invocation) = f
         .mailbox()
         .continuation_runtime_identity(&a)
@@ -1413,15 +1502,20 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
     } else {
         vec![]
     };
+    let original_journal = runtime_exit_journal_bytes(&journal.join("runtime-exit"));
     println!("actual original runtime operations before launcher loss={operations:?}");
-    if matches!(mode, "draining" | "result-failure") && !operations.is_empty() {
+    if orderly && !operations.is_empty() {
         assert!(operations.iter().any(|o| {
             o["intent"]["operation"] == "FinishDrain"
                 && o["before"]["lifecycle_state"] == "draining"
-                && (mode == "result-failure" && o["result"].is_null()
-                    || o["result"]["returned"]
-                        .as_str()
-                        .is_some_and(|r| r.contains("StorageFailure")))
+                && (lose_result && o["result"].is_null()
+                    || o["result"]["returned"].as_str().is_some_and(|r| {
+                        if q_refusal {
+                            r.contains("CustodyNotQuiescent") || r.contains("InvariantViolation")
+                        } else {
+                            r.contains("StorageFailure")
+                        }
+                    }))
         }));
         assert!(operations.iter().any(|o| {
             o["intent"]["operation"] == "NonOrderly"
@@ -1444,7 +1538,7 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
         .find(|a| a.operation == oulipoly_provider::custody::ProviderOperation::Launch)
         .unwrap();
     assert!(launch.spawned);
-    if zero_exit || matches!(mode, "draining" | "result-failure") {
+    if zero_exit || orderly {
         assert!(matches!(
             launch.process_status,
             Some(oulipoly_provider::generated::ProcessStatus::Exited { code: 0 })
@@ -1467,7 +1561,7 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
             attempts.last().unwrap()["terminal_code"],
             "abnormal_termination"
         );
-        if obstruct && !matches!(mode, "draining" | "result-failure") {
+        if obstruct && !orderly {
             assert!(attempts.iter().all(|a| {
                 a["projection_result"]
                     .as_str()
@@ -1488,7 +1582,7 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
         )
         .unwrap();
     assert_eq!(lifecycle == "exited", !obstruct);
-    if matches!(mode, "draining" | "result-failure") {
+    if orderly {
         assert_eq!(lifecycle, "draining");
     }
     println!(
@@ -1506,6 +1600,9 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
     assert!(drain["accepted_cancellation"].is_null());
     assert_eq!(drain["root_wait_status"], libc::SIGKILL);
     println!("spawned uncancelled original drain BEFORE API acceptance={drain}");
+    if let Some(proof) = &q_path {
+        fs::rename(proof, proof.with_extension("held-original-q")).unwrap();
+    }
     if obstruct {
         db.execute_batch("DROP TRIGGER fixture_fail_all_exit")
             .unwrap();
@@ -1519,6 +1616,27 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
     request_linked_cancel(&f, &a);
     let token = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
     let logical = token.split(':').next().unwrap();
+    if let Some(proof) = &q_path {
+        let result = oulipoly_runtime::executor::settle_retained_native_cancellation(&state, g, i);
+        assert!(
+            result.is_err(),
+            "missing current Q must not gain authority from a missing result: {result:?}"
+        );
+        let status: String = state
+            .connection()
+            .query_row(
+                "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+                [logical],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(status, "cancelled");
+        assert_eq!(wait_drained_attempt(&f, &a), drain);
+        fs::rename(proof.with_extension("held-original-q"), proof).unwrap();
+        println!(
+            "recovery refused without current Q; same inode/producer Q now restored; retained observations unchanged"
+        );
+    }
     wait(|| {
         let status: String = state
             .connection()
@@ -1531,6 +1649,11 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
         (status == "cancelled").then_some(())
     });
     assert_eq!(state.native_attempt_custody(g, i).unwrap(), original_stored);
+    assert_eq!(
+        runtime_exit_journal_bytes(&journal.join("runtime-exit")),
+        original_journal,
+        "new recovery must not rewrite original intent, predecessor or rejection bytes"
+    );
     assert_eq!(
         state
             .native_recovered_attempt_custody(g, i)
@@ -1546,7 +1669,7 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
             |r| r.get(0),
         )
         .unwrap();
-    let expected_reason = if matches!(mode, "draining" | "result-failure") {
+    let expected_reason = if orderly {
         "orderly_completion"
     } else {
         "abnormal_termination"
@@ -1705,4 +1828,118 @@ fn native_outcome_retention_orphan_pid_preserves_incarnation_not_drain() {
     println!(
         "retained original announced incarnation after actual orphan adoption={ac:?}; both custodians lost, NO drain/recovery acceptance asserted"
     );
+}
+
+fn runtime_exit_journal_root(f: &Fixture) -> PathBuf {
+    fs::read_dir(f.data.join("state.native-producer-custody"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("runtime-exit")
+}
+fn finish_operation_path(root: &std::path::Path) -> PathBuf {
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            fs::read(entry.path().join("intent.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|intent| intent["operation"] == "FinishDrain")
+        })
+        .unwrap()
+        .path()
+}
+#[test]
+fn native_retained_authority_first_intent_storage_returns() {
+    spawned_outcome_schedule(true, false, false, "intent-failure");
+}
+#[test]
+fn native_retained_authority_predecessor_storage_returns() {
+    spawned_outcome_schedule(true, false, false, "predecessor-failure");
+}
+#[test]
+fn native_retained_authority_q_rejection_retained() {
+    spawned_outcome_schedule(true, false, false, "q-retained");
+}
+#[test]
+fn native_retained_authority_q_rejection_result_absent() {
+    spawned_outcome_schedule(true, false, false, "q-lost");
+}
+#[test]
+fn native_retained_authority_unread_birth_keeps_original_incarnation() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("ac-created-before-announce.hold");
+    f.gate("ac-announced-before-exec.hold");
+    f.gate("birth-unread-before-reap.hold");
+    let owner = start_pre_attachment(&f);
+    let ac = process_identity(reached(&f, "ac-created-before-announce"));
+    let stat = fs::read_to_string(format!("/proc/{}/stat", ac.pid)).unwrap();
+    let adopter = process_identity(
+        stat.rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    let a = attempt(&f);
+    kill_exact(&owner.guardian_identity);
+    assert_eq!(
+        reached(&f, "birth-unread-before-reap"),
+        owner.driver_identity.pid
+    );
+    remove_hold(&f, "ac-created-before-announce");
+    assert_eq!(reached(&f, "ac-announced-before-exec"), ac.pid);
+    kill_exact(&ac);
+    kill_exact(&adopter);
+    wait_task_state(&ac, "Z");
+    wait_task_state(&adopter, "Z");
+    // The original driver has not consumed the queued birth. Its actual generic
+    // reaper, not the fixture, is the next contender for the adopted AC wait.
+    f.gate("birth-pid-consumed.hold");
+    remove_hold(&f, "birth-unread-before-reap");
+    reached(&f, "birth-pid-consumed");
+    assert!(
+        current_identity_matches(&ac),
+        "unread original incarnation must survive generic reaping; otherwise its PID can be reused"
+    );
+    wait_task_state(&ac, "Z");
+    assert_unresolved(&f, &a);
+    remove_hold(&f, "birth-pid-consumed");
+    wait(|| {
+        let identity: Option<String> = f.sidecar_connection().query_row("SELECT custodian_identity FROM completion_continuation_attempt WHERE attempt_id=?1", [&a.attempt_id], |r|r.get(0)).ok()?;
+        (serde_json::from_str::<SourceProcessIdentity>(&identity?).ok()? == ac).then_some(())
+    });
+    assert_unresolved(&f, &a);
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!(
+        "queued original birth survived actual pre-consumption orphan/reap schedule: {ac:?}; attachment is not drain/grant"
+    );
+}
+
+fn runtime_exit_journal_bytes(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut bytes = std::collections::BTreeMap::new();
+    if !root.exists() {
+        return bytes;
+    }
+    for operation in fs::read_dir(root).unwrap() {
+        for entry in fs::read_dir(operation.unwrap().path()).unwrap() {
+            let path = entry.unwrap().path();
+            bytes.insert(
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                fs::read(&path).unwrap(),
+            );
+        }
+    }
+    bytes
 }
