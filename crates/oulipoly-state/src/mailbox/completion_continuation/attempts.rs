@@ -359,13 +359,33 @@ fn require_exact_attempt(conn: &Connection, request: &ContinuationAttempt) -> Re
 
 impl MailboxDb {
     /// Called only by the actual recorded driver after a local gate/fork syscall
-    /// conclusively failed before any custodian existed, or its original adopter
-    /// terminal wait was joined to an explicitly retained unspent AC-fork gate.
+    /// conclusively failed before any custodian existed. Announcement EOF uses
+    /// a separate no-effect classification, not a claim that no AC was forked.
     /// Owner absence or an empty successor is never sufficient for this transition.
     pub fn record_continuation_never_forked(
         &mut self,
         attempt: &ContinuationAttempt,
         reason: &str,
+    ) -> Result<(), String> {
+        self.record_driver_unreleased(attempt, reason, "no_custodian_created")
+    }
+
+    /// Original driver observed announcement EOF while still holding the unsent
+    /// execution grant, then waited its exact adopter. This says no effects were
+    /// released, not that no AC was created. No replacement emptiness qualifies.
+    pub fn record_continuation_unreleased_before_announcement(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        reason: &str,
+    ) -> Result<(), String> {
+        self.record_driver_unreleased(attempt, reason, "unreleased_announcement_eof")
+    }
+
+    fn record_driver_unreleased(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        reason: &str,
+        gate: &str,
     ) -> Result<(), String> {
         require_exact_attempt(&self.conn, attempt)?;
         let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
@@ -388,14 +408,14 @@ impl MailboxDb {
             )
             .map_err(|e| e.to_string())?;
         if driver != encoded || reason.is_empty() {
-            return Err("unforked receipt is not from exact driver".into());
+            return Err("unreleased receipt is not from exact driver".into());
         }
-        let receipt=serde_json::json!({"attempt_id":attempt.attempt_id,"driver":identity,"gate":"no_custodian_created","reason":reason}).to_string();
+        let receipt=serde_json::json!({"attempt_id":attempt.attempt_id,"driver":identity,"gate":gate,"reason":reason}).to_string();
         let changed=tx.execute("UPDATE completion_continuation_attempt SET phase='never_started',revision=revision+1,integrated=1,drain_receipt=?2 WHERE attempt_id=?1 AND phase IN ('accepted','unknown_custody') AND custodian_identity IS NULL",params![attempt.attempt_id,receipt]).map_err(|e|e.to_string())?;
         if changed != 1 {
             let retained:Option<String>=tx.query_row("SELECT drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1 AND phase='never_started' AND custodian_identity IS NULL",[&attempt.attempt_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
             if retained.as_deref() != Some(&receipt) {
-                return Err("pre-fork receipt no longer matches unspent custodian gate".into());
+                return Err("receipt no longer matches original unreleased gate".into());
             }
         }
         if attempt.operation == "activation" {

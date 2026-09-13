@@ -584,6 +584,45 @@ mod tests {
         );
     }
     #[test]
+    fn completion_continuation_unreleased_announcement_does_not_claim_no_fork() {
+        let (_dir, mut db, owner) = fixture();
+        let attempt = reservation(&mut db, &owner);
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.record_continuation_unreleased_before_announcement(
+            &attempt,
+            "original wait, endpoint EOF, unsent grant",
+        )
+        .unwrap();
+        db.record_continuation_unreleased_before_announcement(
+            &attempt,
+            "original wait, endpoint EOF, unsent grant",
+        )
+        .unwrap();
+        assert!(
+            db.record_continuation_never_forked(
+                &attempt,
+                "original wait, endpoint EOF, unsent grant"
+            )
+            .is_err()
+        );
+        let receipt: String = db
+            .conn
+            .query_row(
+                "SELECT drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&attempt.attempt_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(value["gate"], "unreleased_announcement_eof");
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
     fn completion_continuation_unreleased_gate_settles_predecessor_unknown_without_ack() {
         let (_dir, mut db, owner) = fixture();
         let attempt = reservation(&mut db, &owner);

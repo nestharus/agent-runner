@@ -92,15 +92,14 @@ fn start_pre_attachment(f: &Fixture) -> oulipoly_state::mailbox::CompletionDomai
     owner
 }
 
-#[test]
-fn native_original_driver_recovers_adopter_loss_before_ac_fork() {
+fn unreleased_adopter_loss(barrier: &str, admitted: bool) {
     if private_case(false) {
         return;
     }
     let f = Fixture::new("owner_only");
-    f.gate("adopter-before-ac-fork.hold");
+    f.gate(&format!("{barrier}.hold"));
     let owner = start_pre_attachment(&f);
-    let adopter = process_identity(reached(&f, "adopter-before-ac-fork"));
+    let adopter = process_identity(reached(&f, barrier));
     let a = attempt(&f);
     f.gate("driver-reaped-echild.hold");
     kill_exact(&adopter);
@@ -111,10 +110,21 @@ fn native_original_driver_recovers_adopter_loss_before_ac_fork() {
     let (phase, integrated, receipt): (String, i64, String) = f.sidecar_connection().query_row(
         "SELECT phase,integrated,drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1", [&a.attempt_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
     assert_eq!((phase.as_str(), integrated), ("never_started", 1));
-    assert!(receipt.contains("waitid_wnowait"));
+    let value: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(value["gate"], "unreleased_announcement_eof");
+    let reason: serde_json::Value =
+        serde_json::from_str(value["reason"].as_str().unwrap()).unwrap();
+    assert_eq!(reason["original_ac_fork_gate"]["admitted"], admitted);
+    assert_eq!(reason["execution_grant"], "not_sent");
+    assert_eq!(reason["observation"], "waitid_wnowait");
+    assert_eq!(
+        reason["driver"],
+        serde_json::to_value(&owner.driver_identity).unwrap()
+    );
+    assert_eq!(reason["adopter"], serde_json::to_value(&adopter).unwrap());
     assert!(
         PathBuf::from(&a.result_path)
-            .with_file_name("pre-fork-result.json")
+            .with_file_name("unreleased-announcement-result.json")
             .exists()
     );
     assert!(
@@ -125,7 +135,64 @@ fn native_original_driver_recovers_adopter_loss_before_ac_fork() {
             .is_none()
     );
     assert!(!f.root.path().join("resume-prompts.jsonl").exists());
-    println!("original driver integrated actual adopter wait plus explicit unspent fork gate");
+    println!("original unreleased boundary receipt={receipt}; no fork existence claim");
+}
+
+#[test]
+fn native_original_driver_recovers_adopter_loss_before_ac_fork() {
+    unreleased_adopter_loss("adopter-before-ac-fork", false);
+}
+
+#[test]
+fn native_original_driver_recovers_admitted_adopter_loss_before_actual_ac_fork() {
+    unreleased_adopter_loss("adopter-admitted-before-ac-fork", true);
+}
+
+#[test]
+fn native_created_ac_announces_after_adopter_loss_at_fork_return() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("adopter-after-ac-fork.hold");
+    f.gate("ac-created-before-announce.hold");
+    let owner = start_pre_attachment(&f);
+    let adopter = process_identity(reached(&f, "adopter-after-ac-fork"));
+    let ac = process_identity(reached(&f, "ac-created-before-announce"));
+    assert_eq!(parent(ac.pid), adopter.pid);
+    let a = attempt(&f);
+    kill_exact(&adopter);
+    wait(|| (parent(ac.pid) == owner.driver_identity.pid).then_some(()));
+    // The inherited birth endpoint keeps this an outstanding real AC, not EOF.
+    assert_unresolved(&f, &a);
+    remove_hold(&f, "ac-created-before-announce");
+    wait(|| {
+        f.mailbox()
+            .continuation_activation(SESSION, a.claim_token.as_ref().unwrap())
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
+    let receipt: String = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&a.attempt_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(value["gate"], "unreleased_eof");
+    assert_eq!(value["custodian"], serde_json::to_value(ac).unwrap());
+    assert_eq!(value["owned_children"], "ECHILD");
+    assert!(
+        !PathBuf::from(&a.result_path)
+            .with_file_name("unreleased-announcement-result.json")
+            .exists()
+    );
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    assert!(current_identity_matches(&owner.driver_identity));
+    println!("actual forked original AC retained and integrated {receipt}");
 }
 
 #[test]

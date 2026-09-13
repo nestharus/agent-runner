@@ -203,7 +203,7 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
         // Only EOF can lead to an original terminal wait. Guardian succession
         // must not block behind a live stalled adopter or infer its drain.
         if error.kind() == std::io::ErrorKind::UnexpectedEof {
-            retain_pre_fork_adopter_loss(path, attempt, &adopter, &driver)?;
+            retain_unreleased_adopter_loss(path, attempt, &adopter, &driver)?;
         }
         return Err(error.to_string());
     }
@@ -261,9 +261,11 @@ fn read_ac_announcement(
     socket.set_nonblocking(false)
 }
 
-/// EOF alone proves nothing. Join the actual original child's terminal wait
-/// with the explicit unspent gate retained before that child existed.
-fn retain_pre_fork_adopter_loss(
+/// The original announcement endpoint is inherited by AC until it announces
+/// itself. EOF before a complete identity, joined to the original adopter wait
+/// and this driver's unsent execution grant, proves no effects were released.
+/// It does NOT prove no process was forked (a gated AC might also have died).
+fn retain_unreleased_adopter_loss(
     path: &Path,
     attempt: &ContinuationAttempt,
     adopter: &oulipoly_state::completion_continuation::SourceProcessIdentity,
@@ -288,19 +290,22 @@ fn retain_pre_fork_adopter_loss(
     let gate: serde_json::Value = oulipoly_provider::custody::durable::read_json(&gate_path)?;
     if gate["attempt_id"] != attempt.attempt_id
         || gate["driver"] != serde_json::to_value(driver).map_err(|e| e.to_string())?
-        || gate["admitted"] != false
+        || !gate["admitted"].is_boolean()
     {
-        return Err("adopter loss has no unspent original AC-fork gate".into());
+        return Err("adopter loss has no original execution gate".into());
     }
     let receipt = serde_json::json!({"attempt_id":attempt.attempt_id,"driver":driver,
         "adopter":adopter,"observation":"waitid_wnowait","si_code":info.si_code,
-        "si_status":unsafe { info.si_status() },"original_ac_fork_gate":gate});
+        "si_status":unsafe { info.si_status() },"original_ac_fork_gate":gate,
+        "announcement":"eof_before_identity","execution_grant":"not_sent",
+        "classification":"original_unreleased_boundary_closed"});
     let bytes = serde_json::to_vec(&receipt).map_err(|e| e.to_string())?;
     durable_write(
-        &Path::new(&attempt.result_path).with_file_name("pre-fork-result.json"),
+        &Path::new(&attempt.result_path).with_file_name("unreleased-announcement-result.json"),
         &bytes,
     )?;
-    MailboxDb::open(path)?.record_continuation_never_forked(attempt, &receipt.to_string())?;
+    MailboxDb::open(path)?
+        .record_continuation_unreleased_before_announcement(attempt, &receipt.to_string())?;
     // The driver reaper consumes the wait only after this retained integration.
     Ok(())
 }
@@ -721,10 +726,10 @@ fn adopt(
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    // Announcement and launch release have distinct peer lifetimes. AC must
-    // not inherit the CD/adopter endpoint: otherwise adopter loss before its
-    // PID announcement leaves CD waiting for PID and AC waiting for release,
-    // each keeping the other's peer alive forever.
+    // Announcement and launch release have distinct peer lifetimes. AC keeps
+    // the CD/adopter endpoint only until its own birth announcement, never
+    // while waiting for release. Thus adopter death cannot hide a surviving AC
+    // or keep both CD and AC waiting on endpoints owned by each other.
     let (mut ac_release, ac_gate) = UnixStream::pair().map_err(|e| e.to_string())?;
     #[cfg(feature = "age360-fault-fixtures")]
     oulipoly_state::completion_continuation::age360_fault_barrier("adopter-before-ac-fork");
@@ -740,13 +745,28 @@ fn adopt(
         &gate_path,
         &serde_json::to_vec(&fork_gate).map_err(|e| e.to_string())?,
     )?;
+    #[cfg(feature = "age360-fault-fixtures")]
+    oulipoly_state::completion_continuation::age360_fault_barrier(
+        "adopter-admitted-before-ac-fork",
+    );
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
     if pid == 0 {
-        drop(gate);
+        // Keep the original endpoint through the real fork/birth announcement.
+        // A surviving AC announces even if its adopter dies in the fork window;
+        // before announcement it cannot reach exec or read any execution grant.
         drop(ac_release);
+        #[cfg(feature = "age360-fault-fixtures")]
+        oulipoly_state::completion_continuation::age360_fault_barrier("ac-created-before-announce");
+        if gate
+            .write_all(&unsafe { libc::getpid() }.to_ne_bytes())
+            .is_err()
+        {
+            unsafe { libc::_exit(70) }
+        }
+        drop(gate);
         let gate_fd = ac_gate.as_raw_fd();
         let flags = unsafe { libc::fcntl(gate_fd, libc::F_GETFD) };
         if flags < 0
@@ -761,6 +781,8 @@ fn adopt(
             .exec();
         unsafe { libc::_exit(70) }
     }
+    #[cfg(feature = "age360-fault-fixtures")]
+    oulipoly_state::completion_continuation::age360_fault_barrier("adopter-after-ac-fork");
     drop(ac_gate);
     let custodian = super::linux::identity(i64::from(pid))?;
     let adopter = super::linux::identity(i64::from(std::process::id()))?;
@@ -770,10 +792,7 @@ fn adopt(
     // adopter death closes AC's separate gate; AC then retains its own exact
     // unreleased/ECHILD receipt. Neither a new owner nor a timeout grants work.
     let mut grant = [0];
-    if gate.write_all(&pid.to_ne_bytes()).is_ok()
-        && gate.read_exact(&mut grant).is_ok()
-        && grant == [1]
-    {
+    if gate.read_exact(&mut grant).is_ok() && grant == [1] {
         #[cfg(feature = "age360-fault-fixtures")]
         oulipoly_state::completion_continuation::age360_fault_barrier("adopter-before-ac-release");
         let _ = ac_release.write_all(&grant);
@@ -952,18 +971,24 @@ fn reap_adopted_child(
 pub(super) fn replay_result(path: &Path, attempt: &ContinuationAttempt) -> Result<(), String> {
     let result = Path::new(&attempt.result_path);
     let directory = result.parent().ok_or("result parent absent")?;
-    if let Ok(bytes) = read_source_file(directory, "pre-fork-result.json", MAX_REGISTRATION_BYTES) {
+    if let Ok(bytes) = read_source_file(
+        directory,
+        "unreleased-announcement-result.json",
+        MAX_REGISTRATION_BYTES,
+    ) {
         let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         let driver = super::linux::identity(i64::from(std::process::id()))?;
         if value["attempt_id"] != attempt.attempt_id
             || value["driver"] != serde_json::to_value(driver).map_err(|e| e.to_string())?
             || value["observation"] != "waitid_wnowait"
-            || value["original_ac_fork_gate"]["admitted"] != false
+            || value["announcement"] != "eof_before_identity"
+            || value["execution_grant"] != "not_sent"
+            || value["classification"] != "original_unreleased_boundary_closed"
         {
-            return Err("pre-fork replay original owner/evidence conflict".into());
+            return Err("unreleased announcement replay original owner/evidence conflict".into());
         }
         return MailboxDb::open(path)?
-            .record_continuation_never_forked(attempt, &value.to_string());
+            .record_continuation_unreleased_before_announcement(attempt, &value.to_string());
     }
     let primary = read_source_file(directory, "result.json", MAX_REGISTRATION_BYTES);
     if let Ok(bytes) = primary {
