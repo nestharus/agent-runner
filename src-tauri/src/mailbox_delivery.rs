@@ -1523,7 +1523,7 @@ fn render_mailbox_prefix(
     } else {
         rendered.push_str("[OULIPOLY NOTIFICATIONS]\n");
         rendered.push_str(
-            "The following background agent-bash workloads completed while this session was inactive.\n\n",
+            "The following background agent-bash observations are pending delivery. Readiness or root exit does not imply whole-tree completion.\n\n",
         );
     }
     for (index, row) in rows.iter().enumerate() {
@@ -1553,25 +1553,56 @@ fn render_mailbox_prefix(
     Ok(rendered)
 }
 
+#[derive(serde::Deserialize)]
+struct NotificationSummary {
+    completion_protocol: Option<String>,
+    snapshot: Option<NotificationSnapshotSummary>,
+    outcome: Option<NotificationOutcomeSummary>,
+}
+#[derive(serde::Deserialize)]
+struct NotificationSnapshotSummary {
+    status: Option<String>,
+}
+#[derive(serde::Deserialize)]
+struct NotificationOutcomeSummary {
+    kind: Option<String>,
+    original_tree_drained: Option<bool>,
+}
+fn notification_summary(row: &MailboxRow) -> Option<NotificationSummary> {
+    if row.payload_compacted_at.is_some() {
+        let file = std::fs::File::open(row.payload_file_path.as_deref()?).ok()?;
+        serde_json::from_reader(std::io::BufReader::new(file)).ok()
+    } else {
+        serde_json::from_str(&row.payload_json).ok()
+    }
+}
+
 fn render_notification(rendered: &mut String, index: usize, row: &MailboxRow) {
-    // Compacted rows point at the original immutable payload, not the live log.
-    // Do not hydrate potentially large bodies merely to construct a prefix.
-    let inline_v2 = serde_json::from_str::<serde_json::Value>(&row.payload_json)
-        .ok()
-        .is_some_and(|payload| {
-            payload["completion_protocol"] == oulipoly_state::completion_continuation::PROTOCOL
-        });
-    if row.payload_compacted_at.is_some() || inline_v2 {
+    // Storage compaction is not protocol identity. Deserialize only the small
+    // presentation fields; serde skips output bodies without allocating them.
+    let summary = notification_summary(row);
+    if summary.as_ref().is_some_and(|p| {
+        p.completion_protocol.as_deref() == Some(oulipoly_state::completion_continuation::PROTOCOL)
+    }) {
         let payload = row
             .payload_file_path
             .as_deref()
             .map(quote_path)
             .unwrap_or_else(|| format!("mailbox row {} payload_json", row.seq));
+        if let Some(summary) = &summary {
+            rendered.push_str(&format!("   observed_outcome: {}\n   original_tree_drained: {}\n   output_availability: {}\n",
+                sanitize(summary.outcome.as_ref().and_then(|v| v.kind.as_deref()).unwrap_or("inspect immutable payload")),
+                summary.outcome.as_ref().and_then(|v| v.original_tree_drained).map(|v| v.to_string()).unwrap_or_else(|| "not stated".into()),
+                if summary.snapshot.as_ref().and_then(|v| v.status.as_deref()) == Some("original_output_unavailable") { "unavailable (separate from workload outcome)" } else { "inspect immutable payload" }));
+        }
         rendered.push_str(&format!(
             "{}. kind: {}\n   handle: {}\n   rc: {}\n   immutable_completion_payload: {}\n   original_v2_output: payload.snapshot.output or payload.output_artifact; inspect this payload, not the live diagnostic log, for original notification bytes. A missing-original-output-v1 representation explicitly means original output is unavailable, not empty output or invented workload failure; preserve its original outcome and loss evidence\n   live_diagnostic_log_not_original_output: {}\n   meta: {}\n   rc_file: {}\n\n",
             index + 1, sanitize(&row.kind), sanitize(&row.handle), row.rc, payload,
             quote_path(&row.log_path), quote_path(&row.meta_path), quote_path(&row.rc_path)));
         return;
+    }
+    if summary.is_none() && row.payload_compacted_at.is_some() {
+        rendered.push_str(&format!("   protocol_unavailable: could not inspect immutable payload {}; this does not prove original output loss. The log below is not established as original output.\n", row.payload_file_path.as_deref().map(quote_path).unwrap_or_else(|| "path absent".into())));
     }
     rendered.push_str(&format!(
         "{}. kind: {}\n   handle: {}\n   rc: {}\n   state_dir: {}\n   meta: {}\n   log: {}\n   rc_file: {}\n\n",
@@ -1691,11 +1722,39 @@ mod tests {
         assert!(!rendered.contains("\n   log:"));
         assert!(rendered.contains(row.payload_file_path.as_ref().unwrap()));
         row.payload_json = "{}".into();
-        row.payload_compacted_at = None;
+        assert!(row.payload_compacted_at.is_some());
+        let legacy = directory.path().join("legacy-payload.json");
+        std::fs::write(&legacy, b"{}").unwrap();
+        row.payload_file_path = Some(legacy.to_string_lossy().into_owned());
         rendered.clear();
         render_notification(&mut rendered, 0, &row);
         assert!(rendered.contains("\n   log: \"/private/live.log\""));
         assert!(!rendered.contains("immutable_completion_payload"));
+        for compacted in [false, true] {
+            for kind in ["ready", "exit_root"] {
+                let payload = serde_json::json!({"completion_protocol": oulipoly_state::completion_continuation::PROTOCOL,
+                    "outcome":{"kind":kind,"original_tree_drained":false},
+                    "snapshot":{"status":"original_output_unavailable","output":{"representation":"missing-original-output-v1"}}}).to_string();
+                row.payload_json = payload.clone();
+                row.payload_compacted_at = compacted.then(|| "fixture-compacted".into());
+                std::fs::write(&legacy, payload).unwrap();
+                let envelope =
+                    render_mailbox_prefix(std::slice::from_ref(&row), 0, "fixture-nonce").unwrap();
+                assert!(envelope.contains(&format!("observed_outcome: {kind}")));
+                assert!(envelope.contains("original_tree_drained: false"));
+                assert!(
+                    envelope.contains(
+                        "output_availability: unavailable (separate from workload outcome)"
+                    )
+                );
+                assert!(!envelope.contains("workloads completed"));
+            }
+        }
+        std::fs::remove_file(&legacy).unwrap();
+        rendered.clear();
+        render_notification(&mut rendered, 0, &row);
+        assert!(rendered.contains("protocol_unavailable"));
+        assert!(!rendered.contains("original_v2_output"));
     }
 
     #[cfg(unix)]
