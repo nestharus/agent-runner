@@ -289,6 +289,24 @@ def session_turn_page(request):
 
 request = json.loads(sys.stdin.read() or "{}")
 method = sys.argv[1] if len(sys.argv) > 1 else ""
+root = pathlib.Path(__file__).parent
+hold = root / ("hold-native-" + method)
+if hold.exists():
+    # Session-observer/preflight calls can share this provider. Hold only an
+    # actually attributed native attempt actor, not whichever describe ran first.
+    ancestors = {os.getpid()}
+    pid = os.getppid()
+    while pid > 0:
+        ancestors.add(pid)
+        pid = int(pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+    attributed = False
+    for stat in root.glob("data/state.native-producer-custody/*/actors/*/proxy.stat"):
+        raw = stat.read_text()
+        if raw and int(raw.split()[0]) in ancestors:
+            attributed = True
+    if attributed:
+        (root / ("native-" + method + ".reached")).write_text(str(os.getpid()))
+        while hold.exists(): time.sleep(0.02)
 if method == "describe":
     print(json.dumps(envelope(request, {
         "provider_id": "age360-native-wake-fixture",

@@ -196,7 +196,14 @@ impl ReturnChannel {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         for name in ["settlement.json", "pending.json"] {
             if journal.join(name).exists() {
-                return read_json(&journal.join(name));
+                let retained: ReturnChannelSettlement = read_json(&journal.join(name))?;
+                // A channel receipt retains decoded refs, not proof of the separate
+                // invocation-store commit. Retry that idempotent commitment before
+                // replay, without rewriting immutable cleanup/quarantine evidence.
+                if !retained.artifacts().is_empty() {
+                    commit(retained.artifacts())?;
+                }
+                return Ok(retained);
             }
         }
         let value: serde_json::Value = read_json(&journal.join("channel.json"))?;
@@ -1182,11 +1189,11 @@ mod tests {
             let custody = oulipoly_provider::custody::AttemptActorCustody::new(Uuid::new_v4());
             custody.record_not_invoked("launch");
             let result = ReturnChannel::recover_original(&journal, &custody.receipts(), |refs| {
-                assert_eq!(refs, &[reference.clone()]);
+                assert_eq!(refs, std::slice::from_ref(&reference));
                 Ok(())
             })
             .unwrap();
-            assert_eq!(result.artifacts(), &[reference]);
+            assert_eq!(result.artifacts(), std::slice::from_ref(&reference));
             assert_eq!(
                 matches!(result, ReturnChannelSettlement::Quarantined { .. }),
                 dirty
@@ -1194,13 +1201,52 @@ mod tests {
             assert_eq!(path.exists(), dirty);
             assert_eq!(journal.join("original-channel").exists(), dirty);
             assert_eq!(
-                ReturnChannel::recover_original(&journal, &custody.receipts(), |_| panic!(
-                    "retained settlement must replay"
-                ))
+                ReturnChannel::recover_original(&journal, &custody.receipts(), |refs| {
+                    assert_eq!(refs, std::slice::from_ref(&reference));
+                    Ok(())
+                })
                 .unwrap(),
                 result
             );
         }
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn transient_artifact_commit_retries_exact_cached_refs_without_erasing_custody() {
+        let root = tempfile::tempdir().unwrap();
+        let mut c = channel(root.path());
+        let path = c.path.clone();
+        let journal = root.path().join("journal");
+        c.retain_for_recovery(journal.clone()).unwrap();
+        let reference = artifact(c.producer);
+        let bytes = format!("{}\n", serde_json::to_string(&reference).unwrap());
+        std::fs::write(&path, &bytes).unwrap();
+        drop(c);
+        let custody = oulipoly_provider::custody::AttemptActorCustody::new(Uuid::new_v4());
+        custody.record_not_invoked("launch");
+        let failed = ReturnChannel::recover_original(&journal, &custody.receipts(), |_| {
+            Err("transient State artifact commit failure".into())
+        })
+        .unwrap();
+        assert!(matches!(
+            failed,
+            ReturnChannelSettlement::CleanupFailed { .. }
+        ));
+        let original_receipt = std::fs::read(journal.join("settlement.json")).unwrap();
+        let mut committed = Vec::new();
+        let replay = ReturnChannel::recover_original(&journal, &custody.receipts(), |refs| {
+            committed.extend_from_slice(refs);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(committed, vec![reference]);
+        assert_eq!(replay, failed); // cleanup remains a separate continuing duty
+        assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
+        assert_eq!(
+            std::fs::read(journal.join("settlement.json")).unwrap(),
+            original_receipt
+        );
+        assert!(journal.join("original-channel").exists());
     }
     #[test]
     #[cfg(target_os = "linux")]

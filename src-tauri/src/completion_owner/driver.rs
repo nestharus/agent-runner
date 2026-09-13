@@ -29,6 +29,13 @@ pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> 
         oulipoly_state::completion_continuation::age360_fault_barrier("driver-replay");
         for attempt in MailboxDb::open(path)?.pending_continuation_attempts()? {
             let _ = super::custody::replay_result(path, &attempt);
+            // No concurrent source spawn runs in this driver. A still-reserved
+            // source request therefore failed before acceptance; retry its exact
+            // revocation if the first State write also failed. SQL rejects every
+            // accepted/possibly launched or predecessor-owned attempt.
+            if attempt.operation == "source_recovery" {
+                let _ = MailboxDb::open(path)?.revoke_unaccepted_continuation_attempt(&attempt);
+            }
         }
         let mut state = StateDb::open_default()?;
         // Runtime/channel receipts come from the original allocated executor;
@@ -38,16 +45,16 @@ pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> 
                 &owner.domain_id,
                 &generation.to_string(),
                 &invocation.to_string(),
-            )? {
-                if let Err(error) = oulipoly_runtime::executor::settle_retained_native_cancellation(
+            )? && let Err(error) =
+                oulipoly_runtime::executor::settle_retained_native_cancellation(
                     &state, generation, invocation,
-                ) {
-                    let error_path = path
-                        .with_extension("native-recovery-errors")
-                        .join(format!("{generation}.txt"));
-                    if std::fs::read_to_string(&error_path).ok().as_deref() != Some(&error) {
-                        let _ = super::custody::durable_write(&error_path, error.as_bytes());
-                    }
+                )
+            {
+                let error_path = path
+                    .with_extension("native-recovery-errors")
+                    .join(format!("{generation}.txt"));
+                if std::fs::read_to_string(&error_path).ok().as_deref() != Some(&error) {
+                    let _ = super::custody::durable_write(&error_path, error.as_bytes());
                 }
             }
         }
@@ -97,8 +104,6 @@ pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> 
                 .join("attempts")
                 .join(&attempt_id)
                 .join("result.json");
-            std::fs::create_dir_all(result.parent().ok_or("attempt result missing parent")?)
-                .map_err(|e| e.to_string())?;
             let attempt = ContinuationAttempt {
                 attempt_id,
                 owner_generation: owner.owner_generation.clone(),
@@ -116,8 +121,13 @@ pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> 
             {
                 continue; // continuing authoritative attempts, including predecessors, own the bound
             }
-            if let Ok(pid) = super::custody::spawn_source(path, &attempt, &binding) {
-                live.insert(pid, source.registration_id.clone());
+            match super::custody::spawn_source(path, &attempt, &binding) {
+                Ok(pid) => {
+                    live.insert(pid, source.registration_id.clone());
+                }
+                Err(_) => {
+                    let _ = MailboxDb::open(path)?.revoke_unaccepted_continuation_attempt(&attempt);
+                }
             }
             next_retry.insert(
                 source.registration_id,

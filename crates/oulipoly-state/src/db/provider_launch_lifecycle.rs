@@ -835,6 +835,52 @@ impl StateDb {
             .transpose()
     }
 
+    /// Retain supplemental original-owner recovery without rewriting prior observations.
+    /// This is evidence retention, not certification or logical settlement.
+    pub fn retain_native_recovered_attempt_custody(
+        &self,
+        owner: &ProviderLaunchOwnerFence,
+        evidence: &serde_json::Value,
+    ) -> Result<(), String> {
+        if serde_json::to_vec(evidence)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 4 * 1024 * 1024
+        {
+            return Err("native_attempt_evidence_too_large".into());
+        }
+        self.launch_transition(owner, "native-recovered-custody", evidence, |tx| {
+            remember(
+                tx,
+                owner.logical_launch_id,
+                &format!("{}/native-recovered-custody-receipts", owner.attempt_id),
+                &digest(evidence)?,
+                evidence,
+            )
+        })
+    }
+
+    pub fn native_recovered_attempt_custody(
+        &self,
+        generation: Uuid,
+        invocation: Uuid,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT r.result_json FROM provider_launch_attempts a
+            JOIN provider_launch_transition_replays r ON r.logical_launch_id=a.logical_launch_id
+            AND r.operation_key=a.attempt_id || '/native-recovered-custody-receipts'
+            WHERE a.runtime_generation_uuid=?1 AND a.invocation_uuid=?2",
+                params![generation.to_string(), invocation.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        raw.map(|v| serde_json::from_str(&v).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
     /// Continuing quarantine/cleanup custody survives logical terminalization.
     /// No channel path, sidecar, or accepted artifact is released by this record.
     pub fn retain_native_channel_duty(

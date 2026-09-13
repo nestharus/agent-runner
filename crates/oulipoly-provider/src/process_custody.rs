@@ -183,10 +183,10 @@ impl OwnedChild {
     }
     pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
         #[cfg(target_os = "linux")]
-        if !self.reaped {
-            if let Some(operation) = &self.custody {
-                crate::custody::durable::retain_terminal(operation, self.child.id())?;
-            }
+        if !self.reaped
+            && let Some(operation) = &self.custody
+        {
+            crate::custody::durable::retain_terminal(operation, self.child.id())?;
         }
         let result = self.child.wait();
         self.reaped |= result.is_ok();

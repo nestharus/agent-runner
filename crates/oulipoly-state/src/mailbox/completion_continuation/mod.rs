@@ -528,6 +528,35 @@ mod tests {
         );
     }
     #[test]
+    fn same_driver_revokes_only_exact_unaccepted_reservation() {
+        let (_dir, mut db, owner) = fixture();
+        let attempt = reservation(&mut db, &owner);
+        let mut wrong = attempt.clone();
+        wrong.result_path.push_str("-wrong");
+        assert!(db.revoke_unaccepted_continuation_attempt(&wrong).is_err());
+        db.revoke_unaccepted_continuation_attempt(&attempt).unwrap();
+        assert!(
+            !db.pending_continuation_attempts()
+                .unwrap()
+                .iter()
+                .any(|a| a.attempt_id == attempt.attempt_id)
+        );
+        let mut accepted = attempt.clone();
+        accepted.attempt_id = uuid::Uuid::new_v4().to_string();
+        db.reserve_continuation_attempt(&accepted).unwrap();
+        db.accept_continuation_attempt(&accepted).unwrap();
+        assert!(
+            db.revoke_unaccepted_continuation_attempt(&accepted)
+                .is_err()
+        );
+        assert!(
+            db.pending_continuation_attempts()
+                .unwrap()
+                .iter()
+                .any(|a| a.attempt_id == accepted.attempt_id)
+        );
+    }
+    #[test]
     fn completion_continuation_attempt_envelope_and_never_forked_receipt_are_exact() {
         let (_dir, mut db, owner) = fixture();
         let attempt = reservation(&mut db, &owner);

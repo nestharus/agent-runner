@@ -24,18 +24,82 @@ pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<(), Stri
         .map_err(|e| e.to_string())
 }
 
+/// Initialize the dispatch owner's required operation gates before runtime
+/// admission. Each explicit not-admitted receipt is superseded durably before
+/// its operation can create an effect-capable process.
+pub fn initialize_admissions(root: &Path, attempt_id: uuid::Uuid) -> Result<(), String> {
+    // A repeated allocated-call setup must never reset an already spent gate
+    // before runtime-generation exclusivity rejects that second call.
+    std::fs::create_dir(root.join("admissions")).map_err(|e| e.to_string())?;
+    for operation in ["describe", "policy.evaluate", "launch"] {
+        write_json(
+            &root.join("admissions").join(format!("{operation}.json")),
+            &serde_json::json!({"attempt_id":attempt_id,"operation":operation,"admitted":false}),
+        )?;
+    }
+    Ok(())
+}
+
+pub fn unadmitted_operations(
+    root: &Path,
+    attempt_id: uuid::Uuid,
+) -> Result<Vec<ActorSettlementReceipt>, String> {
+    let mut receipts = Vec::new();
+    for operation in ["describe", "policy.evaluate", "launch"] {
+        let value: serde_json::Value =
+            read_json(&root.join("admissions").join(format!("{operation}.json")))?;
+        if value["attempt_id"] != attempt_id.to_string() || value["operation"] != operation {
+            return Err("native operation admission identity conflict".into());
+        }
+        match value["admitted"].as_bool() {
+            Some(false) => receipts.push(ActorSettlementReceipt {
+                attempt_id,
+                operation: super::ProviderOperation::from_subcommand(operation),
+                spawned: false,
+                exact_process_identity: None,
+                process_status: None,
+                process_tree_terminated: false,
+                leader_reaped: false,
+                force_killed: false,
+                host_cancellation_requested: false,
+                operation_finished: true,
+                uncertain: false,
+            }),
+            Some(true) => {}
+            None => return Err("native operation admission state absent".into()),
+        }
+    }
+    Ok(receipts)
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare(operation: &OperationCustody) -> std::io::Result<Option<Arc<File>>> {
     let Some(path) = &operation.3 else {
         return Ok(None);
     };
     use std::os::unix::fs::OpenOptionsExt;
-    std::fs::create_dir_all(path)?;
     let intent = operation
         .0
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let name = match intent.operation {
+        super::ProviderOperation::Describe => Some("describe"),
+        super::ProviderOperation::Policy => Some("policy.evaluate"),
+        super::ProviderOperation::Launch => Some("launch"),
+        _ => None,
+    };
+    if let Some(name) = name {
+        let root = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("actor journal root absent"))?;
+        write_json(
+            &root.join("admissions").join(format!("{name}.json")),
+            &serde_json::json!({"attempt_id":intent.attempt_id,"operation":name,"admitted":true}),
+        )
+        .map_err(std::io::Error::other)?;
+    }
+    std::fs::create_dir_all(path)?;
     write_json(&path.join("intent.json"), &intent).map_err(std::io::Error::other)?;
     write_json(
         &path.join("boot.json"),
@@ -120,4 +184,33 @@ pub fn attributed_proxy(path: &Path) -> Result<ProcessIdentity, String> {
 
 pub fn intent(path: &Path) -> Result<ActorSettlementReceipt, String> {
     read_json(&path.join("intent.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn admission_reinitialization_cannot_erase_an_entered_operation() {
+        let root = std::env::temp_dir().join(format!("age360-admission-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let attempt = uuid::Uuid::new_v4();
+        initialize_admissions(&root, attempt).unwrap();
+        let path = root.join("admissions/describe.json");
+        write_json(
+            &path,
+            &serde_json::json!({"attempt_id":attempt,"operation":"describe","admitted":true}),
+        )
+        .unwrap();
+        assert!(initialize_admissions(&root, attempt).is_err());
+        let receipts = unadmitted_operations(&root, attempt).unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert!(
+            !receipts
+                .iter()
+                .any(|a| a.operation == crate::custody::ProviderOperation::Describe)
+        );
+        std::fs::remove_file(path).unwrap();
+        assert!(unadmitted_operations(&root, attempt).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

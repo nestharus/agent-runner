@@ -82,10 +82,10 @@ impl Drop for OperationGuard {
         let mut receipt = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
         receipt.operation_finished = true;
         receipt.uncertain |= std::thread::panicking();
-        if let Some(path) = &self.0.3 {
-            if durable::write_json(&path.join("finished.json"), &*receipt).is_err() {
-                receipt.uncertain = true;
-            }
+        if let Some(path) = &self.0.3
+            && durable::write_json(&path.join("finished.json"), &*receipt).is_err()
+        {
+            receipt.uncertain = true;
         }
     }
 }
@@ -143,7 +143,16 @@ impl AttemptActorCustody {
     }
     /// Called only by the operation owner when its branch did no process-capable work.
     pub fn record_not_invoked(&self, subcommand: &str) {
-        drop(self.begin(subcommand));
+        let mut guard = self.begin(subcommand);
+        // A never-invoked observation is not an effect admission. Keep its
+        // possibly interrupted atomic write outside the admitted-actor census;
+        // original admission gates independently prove it could not spawn.
+        if let Some(path) = &guard.0.3 {
+            guard.0.3 = path
+                .parent()
+                .map(|root| root.join("not-invoked").join(Uuid::new_v4().to_string()));
+        }
+        drop(guard);
     }
     pub fn receipts(&self) -> Vec<ActorSettlementReceipt> {
         self.records

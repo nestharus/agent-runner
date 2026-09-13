@@ -1645,7 +1645,10 @@ fn external_provider_success_reaps_and_completes_the_exact_generation_orderly() 
         .expect("numeric provider pid");
     assert_external_child_reaped(pid);
     let proxy: libc::pid_t = fs::read_to_string(format!("{}.proxy", pid_path.display()))
-        .expect("validated custody group leader recorded before host cleanup").trim().parse().unwrap();
+        .expect("validated custody group leader recorded before host cleanup")
+        .trim()
+        .parse()
+        .unwrap();
     assert_ne!(pid, proxy);
     assert_external_child_reaped(proxy);
     assert_external_terminal_generation(
@@ -1698,10 +1701,24 @@ fn run_external_child_custody_fault(
         .parse::<libc::pid_t>()
         .expect("numeric provider pid");
     let proxy: libc::pid_t = fs::read_to_string(format!("{}.proxy", pid_path.display()))
-        .expect("validated custody group leader recorded before host cleanup").trim().parse().unwrap();
+        .expect("validated custody group leader recorded before host cleanup")
+        .trim()
+        .parse()
+        .unwrap();
     let custodian: libc::pid_t = fs::read_to_string(format!("{}.custodian", pid_path.display()))
-        .unwrap().trim().parse().unwrap();
-    diagnose_external_custody_return(&data_dir, &pid_path, invocation_uuid, fault, pid, proxy, custodian);
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    diagnose_external_custody_return(
+        &data_dir,
+        &pid_path,
+        invocation_uuid,
+        fault,
+        pid,
+        proxy,
+        custodian,
+    );
     assert_external_child_reaped(pid);
     assert_ne!(pid, proxy);
     assert_external_child_reaped(proxy);
@@ -1727,7 +1744,12 @@ fn diagnose_external_custody_return(
     let start = std::time::Instant::now();
     let immediate = [workload, proxy].map(|pid| {
         let rc = unsafe { libc::kill(pid, 0) };
-        (rc, (rc == -1).then(|| io::Error::last_os_error().raw_os_error()).flatten())
+        (
+            rc,
+            (rc == -1)
+                .then(|| io::Error::last_os_error().raw_os_error())
+                .flatten(),
+        )
     });
     let identities = fs::read_to_string(format!("{}.identities", pid_path.display())).unwrap();
     eprintln!("custody fault={fault} invocation={invocation} captured identities={identities}");
@@ -1737,7 +1759,16 @@ fn diagnose_external_custody_return(
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
-        let row: (String, String, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>) = connection.query_row(
+        type NativeRuntimeObservation = (
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let row: NativeRuntimeObservation = connection.query_row(
             "SELECT generation_uuid,lifecycle_state,spawned_os_pid,running_at,draining_at,exited_at,terminal_reason FROM runtime_generation WHERE spawn_invocation_uuid=?1",
             [invocation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).unwrap();
         let q = oulipoly_core::launch_custody::is_quiescent(
@@ -3084,7 +3115,10 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
         .unwrap();
     assert_external_child_reaped(pid);
     let proxy: libc::pid_t = fs::read_to_string(format!("{}.proxy", pid_path.display()))
-        .expect("published generation proxy").trim().parse().unwrap();
+        .expect("published generation proxy")
+        .trim()
+        .parse()
+        .unwrap();
     assert_ne!(pid, proxy);
     assert_external_child_reaped(proxy);
     assert_external_terminal_generation(

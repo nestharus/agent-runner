@@ -13,6 +13,32 @@ impl MailboxDb {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    /// The same live driver can revoke an unaccepted reservation after request
+    /// I/O failure. Accepted gates and predecessor obligations are never freed.
+    pub fn revoke_unaccepted_continuation_attempt(
+        &mut self,
+        attempt: &ContinuationAttempt,
+    ) -> Result<(), String> {
+        require_exact_attempt(&self.conn, attempt)?;
+        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
+            .ok_or("driver process disappeared")?;
+        let identity = SourceProcessIdentity {
+            pid: live.os_pid,
+            boot_id: live.os_boot_id,
+            starttime_ticks: live.os_pid_starttime_ticks,
+        };
+        let encoded = serde_json::to_string(&identity).map_err(|e| e.to_string())?;
+        let changed = self.conn.execute(
+            "UPDATE completion_continuation_attempt SET phase='never_started',revision=revision+1,integrated=1,drain_receipt=?3 WHERE attempt_id=?1 AND owner_generation=?2 AND phase='reserved' AND revision=1 AND custodian_identity IS NULL AND EXISTS(SELECT 1 FROM completion_continuation_owner WHERE generation=?2 AND phase='running' AND driver_identity=?4)",
+            params![attempt.attempt_id, attempt.owner_generation,
+                serde_json::json!({"attempt_id":attempt.attempt_id,"driver":identity,"gate":"unaccepted_reservation_revoked"}).to_string(), encoded],
+        ).map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("reservation no longer unaccepted under this driver".into());
+        }
+        Ok(())
+    }
+
     pub fn advance_continuation_attempt(
         &mut self,
         attempt: &ContinuationAttempt,
@@ -333,8 +359,9 @@ fn require_exact_attempt(conn: &Connection, request: &ContinuationAttempt) -> Re
 
 impl MailboxDb {
     /// Called only by the actual recorded driver after a local gate/fork syscall
-    /// conclusively failed before any custodian existed. Owner absence is never
-    /// sufficient for this transition.
+    /// conclusively failed before any custodian existed, or its original adopter
+    /// terminal wait was joined to an explicitly retained unspent AC-fork gate.
+    /// Owner absence or an empty successor is never sufficient for this transition.
     pub fn record_continuation_never_forked(
         &mut self,
         attempt: &ContinuationAttempt,
@@ -559,6 +586,7 @@ impl MailboxDb {
         &mut self,
         generation: &str,
         invocation: &str,
+        launch_never_invoked: bool,
     ) -> Result<(), String> {
         let drain = self
             .native_original_drain(generation, invocation)?
@@ -587,9 +615,22 @@ impl MailboxDb {
         {
             return Err("native_delivery_claim_unsettled".into());
         }
+        let reason = if launch_never_invoked {
+            if before.spawned_os_pid.is_some()
+                || !matches!(
+                    before.exact_process_evidence,
+                    ExactProcessEvidence::NotRecorded
+                )
+            {
+                return Err("native_never_invoked_launch_has_runtime_process".into());
+            }
+            "startup_failed"
+        } else {
+            "cancelled"
+        };
         let now = now_rfc3339();
-        tx.execute("UPDATE runtime_generation SET lifecycle_state='exited',exited_at=?3,terminal_reason='cancelled',exit_code=NULL WHERE generation_uuid=?1 AND spawn_invocation_uuid=?2",
-            params![generation,invocation,now]).map_err(|e|e.to_string())?;
+        tx.execute("UPDATE runtime_generation SET lifecycle_state='exited',exited_at=?3,terminal_reason=?4,exit_code=NULL WHERE generation_uuid=?1 AND spawn_invocation_uuid=?2",
+            params![generation,invocation,now,reason]).map_err(|e|e.to_string())?;
         settle_runtime_generation_admission_on(&tx, &id).map_err(|e| e.to_string())?;
         let row = runtime_generation_by_id_on(&tx, &id)
             .map_err(|e| e.to_string())?

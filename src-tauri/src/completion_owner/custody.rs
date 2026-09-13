@@ -127,11 +127,38 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
         recipe,
     };
     let request_path = Path::new(&attempt.result_path).with_file_name("custodian-request.json");
+    #[cfg(feature = "age360-fault-fixtures")]
+    if matches!(request.recipe, LaunchRecipe::Source(_)) {
+        oulipoly_state::completion_continuation::age360_fault_barrier(
+            "source-request-before-write",
+        );
+    }
     durable_write(
         &request_path,
         &serde_json::to_vec(&request).map_err(|e| e.to_string())?,
     )?;
     let request_file = std::fs::File::open(&request_path).map_err(|e| e.to_string())?;
+    let fork_gate = Path::new(&attempt.result_path).with_file_name("adopter-fork-gate.json");
+    let driver = super::linux::identity(i64::from(std::process::id()))?;
+    let mut gate_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&fork_gate)
+        .map_err(|e| e.to_string())?;
+    gate_file
+        .write_all(
+            &serde_json::to_vec(&serde_json::json!({
+                "attempt_id":attempt.attempt_id,"driver":driver,"admitted":false
+            }))
+            .map_err(|e| e.to_string())?,
+        )
+        .and_then(|()| gate_file.sync_all())
+        .map_err(|e| e.to_string())?;
+    std::fs::File::open(fork_gate.parent().ok_or("fork gate parent absent")?)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())?;
+    drop(gate_file);
     MailboxDb::open(path)?.accept_continuation_attempt(attempt)?;
     let (mut release, gate) = match UnixStream::pair() {
         Ok(pair) => pair,
@@ -172,7 +199,14 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
     drop(request_file);
     let adopter = super::linux::identity(i64::from(pid))?;
     let mut worker = [0; 4];
-    release.read_exact(&mut worker).map_err(|e| e.to_string())?;
+    if let Err(error) = read_ac_announcement(path, &driver, &mut release, &mut worker) {
+        // Only EOF can lead to an original terminal wait. Guardian succession
+        // must not block behind a live stalled adopter or infer its drain.
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            retain_pre_fork_adopter_loss(path, attempt, &adopter, &driver)?;
+        }
+        return Err(error.to_string());
+    }
     #[cfg(feature = "age360-fault-fixtures")]
     oulipoly_state::completion_continuation::age360_fault_barrier("attempt-before-attachment");
     let identity = super::linux::identity(i64::from(i32::from_ne_bytes(worker)))?;
@@ -181,6 +215,94 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
     mailbox.advance_continuation_attempt(attempt, 3, "accepted", "starting", &identity)?;
     release.write_all(&[1]).map_err(|e| e.to_string())?;
     Ok(i64::from(pid))
+}
+
+fn read_ac_announcement(
+    path: &Path,
+    driver: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+    socket: &mut UnixStream,
+    bytes: &mut [u8],
+) -> std::io::Result<()> {
+    let owner = MailboxDb::open(path)
+        .and_then(|db| db.completion_continuation_owner())
+        .map_err(std::io::Error::other)?;
+    let guardian = owner
+        .filter(|o| o.driver_identity == *driver)
+        .map(|o| o.guardian_identity.pid);
+    socket.set_nonblocking(true)?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if guardian.is_some_and(|pid| i64::from(unsafe { libc::getppid() }) != pid) {
+            return Err(std::io::Error::other(
+                "original driver must succeed lost guardian",
+            ));
+        }
+        match socket.read(&mut bytes[offset..]) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut fd = libc::pollfd {
+                    fd: socket.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // Responsiveness interval, never a workload/announcement deadline.
+                if unsafe { libc::poll(&mut fd, 1, 100) } < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    socket.set_nonblocking(false)
+}
+
+/// EOF alone proves nothing. Join the actual original child's terminal wait
+/// with the explicit unspent gate retained before that child existed.
+fn retain_pre_fork_adopter_loss(
+    path: &Path,
+    attempt: &ContinuationAttempt,
+    adopter: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+    driver: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+) -> Result<(), String> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            adopter.pid as u32,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if super::linux::identity(adopter.pid)? != *adopter {
+        return Err("waited adopter identity changed".into());
+    }
+    let gate_path = Path::new(&attempt.result_path).with_file_name("adopter-fork-gate.json");
+    let gate: serde_json::Value = oulipoly_provider::custody::durable::read_json(&gate_path)?;
+    if gate["attempt_id"] != attempt.attempt_id
+        || gate["driver"] != serde_json::to_value(driver).map_err(|e| e.to_string())?
+        || gate["admitted"] != false
+    {
+        return Err("adopter loss has no unspent original AC-fork gate".into());
+    }
+    let receipt = serde_json::json!({"attempt_id":attempt.attempt_id,"driver":driver,
+        "adopter":adopter,"observation":"waitid_wnowait","si_code":info.si_code,
+        "si_status":unsafe { info.si_status() },"original_ac_fork_gate":gate});
+    let bytes = serde_json::to_vec(&receipt).map_err(|e| e.to_string())?;
+    durable_write(
+        &Path::new(&attempt.result_path).with_file_name("pre-fork-result.json"),
+        &bytes,
+    )?;
+    MailboxDb::open(path)?.record_continuation_never_forked(attempt, &receipt.to_string())?;
+    // The driver reaper consumes the wait only after this retained integration.
+    Ok(())
 }
 
 pub(super) fn entry() -> Result<(), String> {
@@ -606,6 +728,18 @@ fn adopt(
     let (mut ac_release, ac_gate) = UnixStream::pair().map_err(|e| e.to_string())?;
     #[cfg(feature = "age360-fault-fixtures")]
     oulipoly_state::completion_continuation::age360_fault_barrier("adopter-before-ac-fork");
+    let gate_path =
+        Path::new(&request.attempt.result_path).with_file_name("adopter-fork-gate.json");
+    let mut fork_gate: serde_json::Value =
+        oulipoly_provider::custody::durable::read_json(&gate_path)?;
+    if fork_gate["attempt_id"] != request.attempt.attempt_id || fork_gate["admitted"] != false {
+        return Err("original AC-fork admission conflict".into());
+    }
+    fork_gate["admitted"] = true.into();
+    durable_write(
+        &gate_path,
+        &serde_json::to_vec(&fork_gate).map_err(|e| e.to_string())?,
+    )?;
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error().to_string());
@@ -818,6 +952,19 @@ fn reap_adopted_child(
 pub(super) fn replay_result(path: &Path, attempt: &ContinuationAttempt) -> Result<(), String> {
     let result = Path::new(&attempt.result_path);
     let directory = result.parent().ok_or("result parent absent")?;
+    if let Ok(bytes) = read_source_file(directory, "pre-fork-result.json", MAX_REGISTRATION_BYTES) {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let driver = super::linux::identity(i64::from(std::process::id()))?;
+        if value["attempt_id"] != attempt.attempt_id
+            || value["driver"] != serde_json::to_value(driver).map_err(|e| e.to_string())?
+            || value["observation"] != "waitid_wnowait"
+            || value["original_ac_fork_gate"]["admitted"] != false
+        {
+            return Err("pre-fork replay original owner/evidence conflict".into());
+        }
+        return MailboxDb::open(path)?
+            .record_continuation_never_forked(attempt, &value.to_string());
+    }
     let primary = read_source_file(directory, "result.json", MAX_REGISTRATION_BYTES);
     if let Ok(bytes) = primary {
         let receipt = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;

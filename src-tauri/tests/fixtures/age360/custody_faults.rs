@@ -93,7 +93,7 @@ fn start_pre_attachment(f: &Fixture) -> oulipoly_state::mailbox::CompletionDomai
 }
 
 #[test]
-fn native_observes_unresolved_adopter_loss_before_ac_fork() {
+fn native_original_driver_recovers_adopter_loss_before_ac_fork() {
     if private_case(false) {
         return;
     }
@@ -102,21 +102,30 @@ fn native_observes_unresolved_adopter_loss_before_ac_fork() {
     let owner = start_pre_attachment(&f);
     let adopter = process_identity(reached(&f, "adopter-before-ac-fork"));
     let a = attempt(&f);
-    // Exact original CD will actually wait its only attempt child. The marker
-    // is an ECHILD observation, not a test inference from PID absence/time.
     f.gate("driver-reaped-echild.hold");
     kill_exact(&adopter);
     assert_eq!(
         reached(&f, "driver-reaped-echild"),
         owner.driver_identity.pid
     );
-    assert_unresolved(&f, &a);
+    let (phase, integrated, receipt): (String, i64, String) = f.sidecar_connection().query_row(
+        "SELECT phase,integrated,drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1", [&a.attempt_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!((phase.as_str(), integrated), ("never_started", 1));
+    assert!(receipt.contains("waitid_wnowait"));
+    assert!(
+        PathBuf::from(&a.result_path)
+            .with_file_name("pre-fork-result.json")
+            .exists()
+    );
+    assert!(
+        f.mailbox()
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .unwrap()
+            .is_none()
+    );
     assert!(!f.root.path().join("resume-prompts.jsonl").exists());
-    // Resume a real driver pass, then observe the same retained obligation.
-    f.gate("driver-replay.hold");
-    remove_hold(&f, "driver-reaped-echild");
-    reached(&f, "driver-replay");
-    assert_unresolved(&f, &a);
+    println!("original driver integrated actual adopter wait plus explicit unspent fork gate");
 }
 
 #[test]
@@ -311,4 +320,183 @@ fn native_original_ac_receipt_after_adopter_loss_before_relaying_grant() {
     assert_eq!(fs::read_to_string(&a.result_path).unwrap(), receipt);
     assert!(!f.root.path().join("resume-prompts.jsonl").exists());
     println!("granted but not relayed: original AC receipt={receipt}");
+}
+
+fn prelaunch_cancellation(operation: &str) {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    let mut initial = f.start_with_hold(true);
+    f.owner();
+    wait(|| {
+        f.root
+            .path()
+            .join("provider-initial-ready")
+            .exists()
+            .then_some(())
+    });
+    f.gate(&format!("hold-native-{operation}"));
+    enqueue(&f);
+    f.gate("release-initial-provider");
+    f.wait_initial(&mut initial);
+    reached(&f, &format!("native-{operation}"));
+    let a = attempt(&f);
+    request_linked_cancel(&f, &a);
+    let token = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
+    let launch = token.split(':').next().unwrap();
+    wait(|| {
+        let state = oulipoly_state::StateDb::open_read_only(&f.data.join("state.db")).ok()?;
+        let status: String = state
+            .connection()
+            .query_row(
+                "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+                [launch],
+                |r| r.get(0),
+            )
+            .ok()?;
+        (status == "cancelled").then_some(())
+    });
+    let (phase, integrated): (String, i64) = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT phase,integrated FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&a.attempt_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((phase.as_str(), integrated), ("drained", 1));
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!("actual {operation} cancellation settled before launch; no recipient invocation");
+}
+#[test]
+fn native_prelaunch_describe_cancellation_settles() {
+    prelaunch_cancellation("describe");
+}
+#[test]
+fn native_prelaunch_policy_cancellation_settles() {
+    prelaunch_cancellation("policy.evaluate");
+}
+
+#[test]
+fn native_request_io_failure_recovers_under_same_driver() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("native_missing");
+    f.gate("source-request-before-write.hold");
+    let mut initial = f.start();
+    let owner = f.owner();
+    let source = f.source().registration().unwrap();
+    assert_eq!(
+        reached(&f, "source-request-before-write"),
+        owner.driver_identity.pid
+    );
+    let a = f
+        .mailbox()
+        .pending_continuation_attempts()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.source_registration_id.as_deref() == Some(&source.registration_id))
+        .unwrap();
+    let directory = PathBuf::from(&a.result_path)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    // Actual request I/O obstruction, not a callback stub. No request has been
+    // accepted and no actor can exist for this reserved attempt.
+    fs::create_dir_all(directory.parent().unwrap()).unwrap();
+    fs::write(&directory, b"private non-directory obstruction").unwrap();
+    remove_hold(&f, "source-request-before-write");
+    wait(|| {
+        let phase: String = f
+            .sidecar_connection()
+            .query_row(
+                "SELECT phase FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&a.attempt_id],
+                |r| r.get(0),
+            )
+            .ok()?;
+        (phase == "never_started").then_some(())
+    });
+    fs::remove_file(&directory).unwrap();
+    wait(|| {
+        let count: i64 = f.sidecar_connection().query_row("SELECT COUNT(*) FROM completion_continuation_attempt WHERE source_registration_id=?1 AND attempt_id!=?2 AND phase='drained'", rusqlite::params![source.registration_id,a.attempt_id], |r|r.get(0)).ok()?;
+        (count > 0).then_some(())
+    });
+    assert_eq!(f.owner().owner_generation, owner.owner_generation);
+    assert!(current_identity_matches(&owner.driver_identity));
+    println!(
+        "same live driver revoked unaccepted I/O failure and actually drained a subsequent recovery producer"
+    );
+    initial.kill().unwrap();
+    initial.wait().unwrap();
+}
+
+#[test]
+fn native_repeated_excluded_recovery_allocates_no_untracked_directories() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("native_missing");
+    f.gate("adopter-before-ac-fork.hold");
+    let mut initial = f.start();
+    let owner = f.owner();
+    let source = f.source().registration().unwrap();
+    reached(&f, "adopter-before-ac-fork");
+    let a = f
+        .mailbox()
+        .pending_continuation_attempts()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.source_registration_id.as_deref() == Some(&source.registration_id))
+        .unwrap();
+    kill_exact(&owner.driver_identity);
+    wait(|| (f.owner().owner_generation != owner.owner_generation).then_some(()));
+    let attempts = PathBuf::from(&a.result_path)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let count = || fs::read_dir(&attempts).unwrap().count();
+    let before = count();
+    std::thread::sleep(Duration::from_millis(2300));
+    assert_eq!(
+        count(),
+        before,
+        "rejected scans must not allocate UUID directories"
+    );
+    assert!(
+        f.mailbox()
+            .pending_continuation_attempt_ids(&source.registration_id)
+            .unwrap()
+            .contains(&a.attempt_id)
+    );
+    println!("repeated excluded scans retained predecessor debt without filesystem allocation");
+    initial.kill().unwrap();
+    initial.wait().unwrap();
+}
+
+#[test]
+fn native_guardian_succession_is_not_blocked_by_live_adopter_announcement() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("adopter-before-ac-fork.hold");
+    let owner = start_pre_attachment(&f);
+    let adopter = process_identity(reached(&f, "adopter-before-ac-fork"));
+    let a = attempt(&f);
+    kill_exact(&owner.guardian_identity);
+    let replacement = wait(|| {
+        let next = f.owner();
+        (next.owner_generation != owner.owner_generation).then_some(next)
+    });
+    assert_eq!(replacement.guardian_identity, owner.driver_identity);
+    assert!(current_identity_matches(&adopter));
+    assert_unresolved(&f, &a); // succession is not an attempt-drain certificate
+    println!(
+        "endpoint succession executed while original adopter remains live; attempt debt explicitly retained"
+    );
 }

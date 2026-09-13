@@ -1235,7 +1235,7 @@ fn cancellation_retains_exact_artifacts_but_does_not_grant_transfer() {
     db.record_returned_artifacts(
         InvocationMutationAuthority::ProviderLaunch(&lease.owner),
         lease.owner.invocation_row_id,
-        &[artifact.clone()],
+        std::slice::from_ref(&artifact),
     )
     .unwrap();
     let mut custody = proof(&lease);
@@ -1267,5 +1267,48 @@ fn cancellation_retains_exact_artifacts_but_does_not_grant_transfer() {
     assert_eq!(
         serde_json::from_str::<ProviderLaunchCustodyProof>(&retained).unwrap(),
         custody
+    );
+}
+
+#[test]
+fn recovered_native_observation_preserves_original_uncertainty_and_fences() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    // Evidence retention alone certifies neither input. This checks independent,
+    // immutable custody slots, not execution of a producer-journal failure.
+    let original = serde_json::json!({"observation":"original uncertainty"});
+    let recovery = serde_json::json!({"observation":"later original-owner wait"});
+    db.retain_native_attempt_custody(&lease.owner, &original)
+        .unwrap();
+    db.retain_native_recovered_attempt_custody(&lease.owner, &recovery)
+        .unwrap();
+    assert_eq!(
+        db.native_attempt_custody(lease.runtime_generation_uuid, lease.owner.invocation_uuid)
+            .unwrap(),
+        Some(original.clone())
+    );
+    assert_eq!(
+        db.native_recovered_attempt_custody(
+            lease.runtime_generation_uuid,
+            lease.owner.invocation_uuid
+        )
+        .unwrap(),
+        Some(recovery.clone())
+    );
+    assert!(
+        db.retain_native_attempt_custody(&lease.owner, &recovery)
+            .is_err()
+    );
+    assert!(
+        db.retain_native_recovered_attempt_custody(&lease.owner, &original)
+            .is_err()
+    );
+    let mut wrong = lease.owner.clone();
+    wrong.owner_epoch += 1;
+    assert!(
+        db.retain_native_recovered_attempt_custody(&wrong, &recovery)
+            .is_err()
     );
 }

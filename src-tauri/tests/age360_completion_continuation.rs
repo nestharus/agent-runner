@@ -1101,6 +1101,10 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
         );
         assert!(read_live_process_identity(descendant).unwrap().is_some());
     }
+    if channel == Some("commit_failure") {
+        let state = rusqlite::Connection::open(f.data.join("state.db")).unwrap();
+        state.execute_batch("CREATE TRIGGER fixture_fail_artifact_commit BEFORE INSERT ON invocation_returned_artifacts BEGIN SELECT RAISE(FAIL, 'fixture transient artifact persistence failure'); END;").unwrap();
+    }
     let wait_obstruction = PathBuf::from(&attempt.result_path).with_file_name("owned-waits");
     if channel == Some("wait_storage_failure") {
         assert!(!wait_obstruction.exists());
@@ -1225,10 +1229,10 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
         assert!(value["adopter"].is_object());
         assert_eq!(value["custodian_wait_status"], libc::SIGKILL);
     }
-    if matches!(owner_loss, 3 | 6 | 8 | 9 | 10 | 11 | 12) {
+    if matches!(owner_loss, 3 | 6 | 8 | 9..=12) {
         let receipt: serde_json::Value = serde_json::from_str(&receipt.2).unwrap();
         assert!(receipt["accepted_cancellation"].is_string(), "{receipt}");
-        if matches!(owner_loss, 9 | 10 | 11 | 12) {
+        if matches!(owner_loss, 9..=12) {
             let expected = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
             assert_eq!(receipt["accepted_cancellation"], expected);
             let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
@@ -1251,7 +1255,49 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
         }
         assert!(read_live_process_identity(descendant).unwrap().is_none());
     }
-    if matches!(owner_loss, 9 | 10 | 11 | 12) {
+    if channel == Some("commit_failure") {
+        let journal_root = f
+            .data
+            .join("state.db")
+            .with_extension("native-producer-custody");
+        let (journal, retained) = wait(|| {
+            for entry in fs::read_dir(&journal_root).ok()? {
+                let journal = entry.ok()?.path().join("channel");
+                let bytes = fs::read(journal.join("settlement.json")).ok()?;
+                let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                if value["CleanupFailed"]["artifacts"]
+                    .as_array()
+                    .is_some_and(|v| !v.is_empty())
+                {
+                    return Some((journal, bytes));
+                }
+            }
+            None
+        });
+        let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+        let count: i64 = state
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM invocation_returned_artifacts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "cached decoded refs are not an invocation artifact commit"
+        );
+        rusqlite::Connection::open(f.data.join("state.db"))
+            .unwrap()
+            .execute_batch("DROP TRIGGER fixture_fail_artifact_commit;")
+            .unwrap();
+        assert_eq!(fs::read(journal.join("settlement.json")).unwrap(), retained);
+        assert!(journal.join("original-channel").exists());
+        println!(
+            "actual failed State commit retained exact channel refs; storage recovered under original driver"
+        );
+    }
+    if matches!(owner_loss, 9..=12) {
         let expected = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
         let launch = expected.split(':').next().unwrap();
         wait(|| {
@@ -1313,10 +1359,19 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
             };
             assert_eq!(domain_id, &owner.domain_id);
             assert_eq!(original_owner.logical_launch_id.to_string(), launch);
-            assert_eq!(disposition, mode);
+            assert_eq!(
+                disposition,
+                if mode == "commit_failure" {
+                    "cleanup_failed"
+                } else {
+                    mode
+                }
+            );
             assert_eq!(artifacts, &refs);
             if mode == "quarantined" {
                 assert!(fs::read_to_string(path).unwrap().ends_with("malformed\n"));
+            } else if mode == "commit_failure" {
+                assert!(!fs::read(path).unwrap().is_empty());
             } else {
                 assert_eq!(
                     fs::read(
@@ -1601,11 +1656,12 @@ impl Drop for Fixture {
 // Native token cancellation uses the same State API as runtime cancellation,
 // joined to the actual activation invocation. No fixture-written launch rows.
 fn request_linked_cancel(f: &Fixture, attempt: &oulipoly_state::mailbox::ContinuationAttempt) {
-    let (generation, invocation) = f
-        .mailbox()
-        .continuation_runtime_identity(attempt)
-        .unwrap()
-        .unwrap();
+    let (generation, invocation) = wait(|| {
+        f.mailbox()
+            .continuation_runtime_identity(attempt)
+            .ok()
+            .flatten()
+    });
     let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
     let count: i64 = state
         .connection()
@@ -1822,4 +1878,11 @@ fn native_missing_output_rejects_transient_then_delivers_original_wait_without_c
     println!(
         "native recipient missing output={receipt}; original observation={observed}; settled source recovery attempts={before}"
     );
+}
+
+#[test]
+fn native_transient_artifact_commit_recovers_after_cached_cleanup_failure() {
+    if !private_case(false) {
+        native_activation_channel_custody(9, Some("commit_failure"));
+    }
 }
