@@ -17,8 +17,8 @@ use oulipoly_provider::custody::{
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::stream::DecodedLaunchEvent;
 use oulipoly_state::mailbox::{
-    ExactProcessEvidence, MailboxDb, RuntimeGenerationId, RuntimeGenerationRow,
-    RuntimeLifecycleState, RuntimeTerminalReason,
+    ExactProcessEvidence, MailboxDb, RuntimeGenerationRow, RuntimeLifecycleState,
+    RuntimeTerminalReason,
 };
 use oulipoly_state::{
     CompletionRegistrationAuthority, InvocationMutationAuthority, ProviderLaunchLease,
@@ -80,6 +80,9 @@ pub enum ProviderLaunchFailure {
     Provider(ProviderClientError),
     Execution(ServiceError),
 }
+/// A live published row observation plus independent actor evidence. A digest
+/// does not extend its lifetime into a mutation capability: State revalidates
+/// native facts/claims under its authority fence before retention or settlement.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RuntimeSettlementReceipt {
     pub runtime_generation_uuid: Uuid,
@@ -161,6 +164,14 @@ pub fn settle_retained_native_cancellation(
         || retained.lease.owner.invocation_uuid != invocation
     {
         return Err("native_custody_identity_mismatch".into());
+    }
+    // Reusing an old recovered aggregate requires the actual published drain,
+    // even if its immutable replay was originally retained from detached bytes.
+    if retained.recovery_evidence.is_some() {
+        state.retain_native_recovered_attempt_custody(
+            &retained.lease.owner,
+            &serde_json::to_value(&retained).map_err(|e| e.to_string())?,
+        )?;
     }
     // Aggregate retention is independent of artifact persistence, too. A cached
     // CleanupFailed cannot suppress this retry after State storage recovers.
@@ -247,9 +258,13 @@ pub fn settle_retained_native_cancellation(
             path, artifacts, ..
         }
         | ReturnChannelSettlement::CleanupFailed { path, artifacts } => {
-            let drain = MailboxDb::open_read_only(&mailbox_path)?
-                .native_original_drain(&generation.to_string(), &invocation.to_string())?
-                .ok_or("native_channel_continuing_domain_owner_absent")?;
+            let drain = MailboxDb::read_native_publication(
+                &mailbox_path,
+                &generation.to_string(),
+                &invocation.to_string(),
+            )?
+            .original_drain
+            .ok_or("native_channel_continuing_domain_owner_absent")?;
             let duty = oulipoly_state::ProviderLaunchChannelSettlement::ContinuingCustody {
                 domain_id: drain["domain_id"]
                     .as_str()
@@ -307,12 +322,17 @@ fn retain_recovered_dead_cancellation(
         .iter()
         .find(|a| a.operation == ProviderOperation::Launch)
         .ok_or("native_launch_receipt_absent")?;
-    let drain = MailboxDb::open_read_only(&MailboxDb::path_for_state_db(state.path()))?
-        .native_original_drain(
-            &retained.lease.runtime_generation_uuid.to_string(),
-            &retained.lease.owner.invocation_uuid.to_string(),
-        )?
+    let published = MailboxDb::read_native_publication(
+        &MailboxDb::path_for_state_db(state.path()),
+        &retained.lease.runtime_generation_uuid.to_string(),
+        &retained.lease.owner.invocation_uuid.to_string(),
+    )?;
+    let drain = published
+        .original_drain
         .ok_or("native_original_drain_absent")?;
+    if published.runtime.as_ref() != Some(row) {
+        return Err("native_publication_runtime_changed".into());
+    }
     let mut interpretation = row.clone();
     let (classification, reason) = if launch.spawned {
         (
@@ -1265,6 +1285,18 @@ fn runtime_receipt(
 ) -> RuntimeSettlementReceipt {
     runtime_receipt_for(&allocation.lease, &allocation.mailbox_db_path, actors)
 }
+/// Private fault-catalog observation of the real receipt consumer, not a fake
+/// receipt constructor. Normal images do not export this fixture entry point.
+#[cfg(feature = "age360-fault-fixtures")]
+pub fn age360_observe_native_runtime(
+    lease: &ProviderLaunchLease,
+    mailbox_path: &std::path::Path,
+    actors: &[ActorSettlementReceipt],
+) -> serde_json::Value {
+    serde_json::to_value(runtime_receipt_for(lease, mailbox_path, actors))
+        .expect("receipt serialization")
+}
+
 fn runtime_receipt_for(
     lease: &ProviderLaunchLease,
     mailbox_path: &std::path::Path,
@@ -1279,13 +1311,13 @@ fn runtime_receipt_for(
         uncertainty: None,
     };
     let read = || -> Result<RuntimeGenerationRow, String> {
-        let db = MailboxDb::open_read_only(mailbox_path)?;
-        let generation = RuntimeGenerationId::parse(&lease.runtime_generation_uuid.to_string())
-            .map_err(|e| e.to_string())?;
-        db.runtime_lifecycle_reader()
-            .runtime_generation(&generation)
-            .map_err(|e| e.to_string())?
-            .ok_or("runtime_generation_absent".into())
+        MailboxDb::read_native_publication(
+            mailbox_path,
+            &lease.runtime_generation_uuid.to_string(),
+            &lease.owner.invocation_uuid.to_string(),
+        )?
+        .runtime
+        .ok_or("runtime_generation_absent".into())
     };
     match read() {
         Err(_) => receipt.uncertainty = Some("runtime_row_unreadable_or_absent".into()),
@@ -1369,10 +1401,13 @@ fn recover_native_custody(
     if lease.runtime_generation_uuid != generation || lease.owner.invocation_uuid != invocation {
         return Err("native_recovery_identity_conflict".into());
     }
-    let mailbox = MailboxDb::open_read_only(&MailboxDb::path_for_state_db(state.path()))?;
-    let drain = mailbox
-        .native_original_drain(&generation.to_string(), &invocation.to_string())?
-        .ok_or("original_native_boundary_not_drained")?;
+    let drain = MailboxDb::read_native_publication(
+        &MailboxDb::path_for_state_db(state.path()),
+        &generation.to_string(),
+        &invocation.to_string(),
+    )?
+    .original_drain
+    .ok_or("original_native_boundary_not_drained")?;
     let journal = PathBuf::from(source["journal"].as_str().ok_or("native_journal_absent")?);
     let waits = PathBuf::from(
         drain["result_path"]
@@ -1545,6 +1580,7 @@ fn recover_native_custody(_: &StateDb, _: Uuid, _: Uuid) -> Result<serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oulipoly_state::mailbox::RuntimeGenerationId;
     use oulipoly_state::{
         BeginProviderLaunchRequest, ProviderLaunchAttemptAllocation, ProviderLaunchCandidate,
         ProviderLaunchStartMode,

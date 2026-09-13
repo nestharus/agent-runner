@@ -1297,11 +1297,59 @@ fn native_outcome_retention_draining_rejected_abnormal() {
 fn native_outcome_retention_operation_result_write_failure() {
     spawned_outcome_schedule(true, false, false, "result-failure");
 }
+#[test]
+fn native_published_evidence_original_drain_before_aggregate() {
+    spawned_outcome_schedule(false, false, true, "published-drain");
+}
+
+#[test]
+fn native_published_evidence_original_drain_commit_error() {
+    spawned_outcome_schedule(false, false, true, "published-drain-error");
+}
+#[test]
+fn native_published_evidence_original_drain_writer_loss() {
+    spawned_outcome_schedule(false, false, true, "published-drain-loss");
+}
+
+#[test]
+fn native_published_evidence_runtime_receipt_waits_for_publication() {
+    spawned_outcome_schedule(false, false, true, "published-runtime");
+}
+
 fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: bool, mode: &str) {
     if private_case(false) {
         return;
     }
     let f = Fixture::new("owner_only");
+    let published_drain = mode.starts_with("published-drain");
+    let published_runtime = mode == "published-runtime";
+    if published_drain || published_runtime {
+        fs::write(
+            f.root.path().join("wal-sync-hold.c"),
+            include_str!("wal-sync-hold.c"),
+        )
+        .unwrap();
+        let output = Command::new("cc")
+            .args(["-shared", "-fPIC", "-O2"])
+            .arg(f.root.path().join("wal-sync-hold.c"))
+            .args(["-ldl", "-o"])
+            .arg(f.root.path().join("wal-sync-hold.so"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if published_drain {
+            f.gate("original-drain-before-commit.hold");
+            f.gate("original-drain-commit-returned-ok.hold");
+        }
+        if mode == "published-drain-error" {
+            f.gate("original-drain-commit-returned-error.hold");
+            f.gate("fail-sync");
+        }
+    }
     f.gate("hold-native-launch");
     if zero_exit {
         f.gate("native-launch-exit-zero-without-output");
@@ -1323,7 +1371,7 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
     if mode == "predecessor-failure" {
         f.gate("native-exit-before-predecessor-write.hold");
     }
-    let preaggregate = matches!(mode, "before" | "retention-failure");
+    let preaggregate = matches!(mode, "before" | "retention-failure") || published_drain;
     let boundary = if preaggregate {
         "native-before-custody-retention"
     } else {
@@ -1340,6 +1388,19 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
     }
     let a = attempt(&f);
     let db = rusqlite::Connection::open(f.data.join("pid-identity.db")).unwrap();
+    if published_runtime {
+        f.gate("runtime-exit-before-commit.hold");
+        f.gate("runtime-exit-commit-returned-ok.hold");
+        // Discard initial setup's actual returned-outcome marker, not evidence
+        // from this activation. No runtime commit for the activation happened yet.
+        let marker = f
+            .root
+            .path()
+            .join("runtime-exit-commit-returned-ok.reached");
+        if marker.exists() {
+            fs::remove_file(marker).unwrap();
+        }
+    }
     if obstruct {
         db.execute_batch("CREATE TRIGGER fixture_fail_all_exit BEFORE UPDATE ON runtime_generation WHEN NEW.lifecycle_state='exited' BEGIN SELECT RAISE(FAIL, 'fixture all actual exit projections fail'); END;").unwrap();
     }
@@ -1461,6 +1522,67 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
             "actual operation-result rename failed; original intent/predecessor retained at {}",
             finish.display()
         );
+    }
+    if published_runtime {
+        let writer = reached(&f, "runtime-exit-before-commit");
+        fs::write(f.root.path().join("armed"), writer.to_string()).unwrap();
+        remove_hold(&f, "runtime-exit-before-commit");
+        wait(|| f.root.path().join("synced").exists().then_some(()));
+        let (generation, invocation) = f
+            .mailbox()
+            .continuation_runtime_identity(&a)
+            .unwrap()
+            .unwrap();
+        let g = uuid::Uuid::parse_str(&generation).unwrap();
+        let i = uuid::Uuid::parse_str(&invocation).unwrap();
+        let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+        let source = state.native_attempt_recovery(g, i).unwrap().unwrap();
+        let lease: oulipoly_state::ProviderLaunchLease =
+            serde_json::from_value(source["lease"].clone()).unwrap();
+        let journal = PathBuf::from(source["journal"].as_str().unwrap());
+        let actors: Vec<oulipoly_provider::custody::ActorSettlementReceipt> =
+            fs::read_dir(journal.join("actors"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|e| fs::read(e.path().join("finished.json")).ok())
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                .collect();
+        assert!(actors.iter().any(|a| a.operation
+            == oulipoly_provider::custody::ProviderOperation::Launch
+            && a.effect_incapable()));
+        let copied = f
+            .mailbox()
+            .runtime_lifecycle_reader()
+            .runtime_generation(
+                &oulipoly_state::mailbox::RuntimeGenerationId::parse(&generation).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            copied.lifecycle_state,
+            oulipoly_state::mailbox::RuntimeLifecycleState::Exited
+        );
+        let receipt = oulipoly_runtime::executor::age360_observe_native_runtime(
+            &lease,
+            &f.data.join("pid-identity.db"),
+            &actors,
+        );
+        assert_eq!(receipt["effect_incapable"], false);
+        assert_ne!(receipt["row"]["lifecycle_state"], "exited");
+        println!(
+            "bundled SQLite={} synced real runtime writer={writer}; detached={copied:?}; actual receipt before publication={receipt}",
+            rusqlite::version()
+        );
+        f.gate("release");
+        assert_eq!(reached(&f, "runtime-exit-commit-returned-ok"), writer);
+        let receipt = oulipoly_runtime::executor::age360_observe_native_runtime(
+            &lease,
+            &f.data.join("pid-identity.db"),
+            &actors,
+        );
+        assert_eq!(receipt["effect_incapable"], true, "{receipt}");
+        println!("actual receipt after real publication/COMMIT Ok={receipt}");
+        remove_hold(&f, "runtime-exit-commit-returned-ok");
     }
     let finished_writer = reached(&f, boundary);
     if let Some(original) = &original_writer {
@@ -1588,6 +1710,13 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
     println!(
         "exit UPDATE obstruction={obstruct} across dispatch/outer finalization; lifecycle={lifecycle}; original spawned aggregate={original}"
     );
+    // The publication experiment invokes the exported consumer directly. Pause
+    // background replay before it can hold State while waiting on the deliberately
+    // stopped sidecar writer; otherwise fixture cancellation itself can time out.
+    if published_drain {
+        f.gate("driver-replay.hold");
+        reached(&f, "driver-replay");
+    }
     // Keep the returning obstruction across launcher death and genuine drain;
     // no exit projection is allowed to establish a hidden successful prefix.
     kill_exact(
@@ -1596,6 +1725,138 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
             .unwrap()
             .unwrap(),
     );
+    if published_drain {
+        let writer = reached(&f, "original-drain-before-commit");
+        fs::write(f.root.path().join("armed"), writer.to_string()).unwrap();
+        remove_hold(&f, "original-drain-before-commit");
+        wait(|| f.root.path().join("synced").exists().then_some(()));
+        println!(
+            "bundled SQLite={} genuine commit-frame sync={}",
+            rusqlite::version(),
+            fs::read_to_string(f.root.path().join("synced")).unwrap()
+        );
+        let observed = f
+            .mailbox()
+            .native_original_drain(&generation, &invocation)
+            .unwrap()
+            .unwrap();
+        assert!(
+            MailboxDb::read_native_publication(
+                &f.data.join("pid-identity.db"),
+                &generation,
+                &invocation
+            )
+            .unwrap()
+            .original_drain
+            .is_none()
+        );
+        request_linked_cancel(&f, &a);
+        let result = oulipoly_runtime::executor::settle_retained_native_cancellation(&state, g, i);
+        assert!(
+            result.is_err(),
+            "unpublished original drain promoted: {result:?}"
+        );
+        assert!(
+            state
+                .native_recovered_attempt_custody(g, i)
+                .unwrap()
+                .is_none()
+        );
+        let count: i64 = state.connection().query_row("SELECT COUNT(*) FROM provider_launch_transition_replays WHERE operation_key LIKE '%/native-channel-duty' OR operation_key LIKE '%/native-runtime-cancellation-receipts' OR operation_key LIKE '%/terminal-custody'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "no premature authoritative retention");
+        println!(
+            "detached integrated drain before publication={observed}; actual direct recovery refused={result:?}"
+        );
+        if mode == "published-drain-loss" {
+            let original_writer = process_identity(writer);
+            kill_exact(&original_writer);
+            let live_after_loss = MailboxDb::read_native_publication(
+                &f.data.join("pid-identity.db"),
+                &generation,
+                &invocation,
+            );
+            println!(
+                "original writer killed at synchronized prepublication boundary; actual live/recovery result={live_after_loss:?}"
+            );
+            assert!(
+                !f.root
+                    .path()
+                    .join("original-drain-commit-returned-ok.reached")
+                    .exists()
+            );
+            // The original caller cannot acknowledge this transaction. Recovery
+            // may legitimately publish it; never infer rollback from writer loss.
+            remove_hold(&f, "original-drain-commit-returned-ok");
+            let retry =
+                oulipoly_runtime::executor::settle_retained_native_cancellation(&state, g, i);
+            println!("post-loss actual direct recovery retry={retry:?}");
+            remove_hold(&f, "driver-replay");
+            let later_drain = wait_drained_attempt(&f, &a);
+            wait(|| {
+                let status: String = state
+                    .connection()
+                    .query_row(
+                        "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+                        [source["lease"]["owner"]["logical_launch_id"]
+                            .as_str()
+                            .unwrap()],
+                        |r| r.get(0),
+                    )
+                    .ok()?;
+                (status == "cancelled").then_some(())
+            });
+            println!(
+                "post-loss actual original-owner recovery integration={later_drain}; live logical cancellation settled, not original COMMIT acknowledgment"
+            );
+            assert_eq!(state.native_attempt_custody(g, i).unwrap(), original_stored);
+            assert_eq!(
+                runtime_exit_journal_bytes(&journal.join("runtime-exit")),
+                original_journal
+            );
+            return;
+        }
+        f.gate("release");
+        if mode == "published-drain-error" {
+            assert_eq!(reached(&f, "original-drain-commit-returned-error"), writer);
+            let live_after_error = MailboxDb::read_native_publication(
+                &f.data.join("pid-identity.db"),
+                &generation,
+                &invocation,
+            );
+            println!(
+                "actual COMMIT returned error after injected sync EIO; live/recovery result={live_after_error:?}"
+            );
+            // The one-shot shim no longer intercepts. Release real integration
+            // retry; retain the actual later COMMIT result and writer identity.
+            remove_hold(&f, "original-drain-commit-returned-error");
+        }
+        let publisher = reached(&f, "original-drain-commit-returned-ok");
+        if mode != "published-drain-error" {
+            assert_eq!(publisher, writer);
+        }
+        println!(
+            "actual successful integration writer={publisher}; originally held writer={writer}"
+        );
+        assert_eq!(
+            f.root
+                .path()
+                .join("original-drain-commit-returned-error.reached")
+                .exists(),
+            mode == "published-drain-error"
+        );
+        assert_eq!(
+            MailboxDb::read_native_publication(
+                &f.data.join("pid-identity.db"),
+                &generation,
+                &invocation
+            )
+            .unwrap()
+            .original_drain,
+            Some(observed)
+        );
+        remove_hold(&f, "original-drain-commit-returned-ok");
+        remove_hold(&f, "driver-replay");
+    }
     let drain = wait_drained_attempt(&f, &a);
     assert!(drain["accepted_cancellation"].is_null());
     assert_eq!(drain["root_wait_status"], libc::SIGKILL);

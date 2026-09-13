@@ -1276,10 +1276,11 @@ fn recovered_native_observation_preserves_original_uncertainty_and_fences() {
     let lease = db.begin_launch(&request).unwrap();
     db.activate_attempt(&lease, &request.allocation.completion_authority)
         .unwrap();
-    // Evidence retention alone certifies neither input. This checks independent,
-    // immutable custody slots, not execution of a producer-journal failure.
+    // Synthetic SQL fixture tests publication/replay identity, not execution of
+    // actor waits. The native private experiment separately exercises real custody.
+    let (drain, row) = native_publication_fixture(&db, &lease);
     let original = serde_json::json!({"observation":"original uncertainty"});
-    let recovery = serde_json::json!({"observation":"later original-owner wait"});
+    let recovery = serde_json::json!({"lease":lease, "recovery_evidence":{"original_drain":drain}});
     db.retain_native_attempt_custody(&lease.owner, &original)
         .unwrap();
     db.retain_native_recovered_attempt_custody(&lease.owner, &recovery)
@@ -1305,7 +1306,7 @@ fn recovered_native_observation_preserves_original_uncertainty_and_fences() {
         db.retain_native_recovered_attempt_custody(&lease.owner, &original)
             .is_err()
     );
-    let runtime = serde_json::json!({"original_runtime_observation":"recovered_dead","additional_original_evidence":"never_invoked_and_cancelled_drain"});
+    let runtime = serde_json::json!({"original_runtime_row":row, "original_drain":drain, "cancellation_terminal_code":"startup_failed"});
     db.retain_native_runtime_cancellation(&lease.owner, &runtime)
         .unwrap();
     db.retain_native_runtime_cancellation(&lease.owner, &runtime)
@@ -1343,5 +1344,146 @@ fn recovered_native_observation_preserves_original_uncertainty_and_fences() {
     assert!(
         db.retain_native_recovered_attempt_custody(&wrong, &recovery)
             .is_err()
+    );
+}
+
+// This fixture intentionally seeds published database facts only. It supplies no
+// physical-custody execution evidence and is never used to assert actor Q.
+fn native_publication_fixture(
+    db: &StateDb,
+    lease: &ProviderLaunchLease,
+) -> (serde_json::Value, serde_json::Value) {
+    use oulipoly_state::mailbox::{CompletionDomainOwner, MailboxDb};
+    let path = MailboxDb::path_for_state_db(db.path());
+    let mut mailbox = MailboxDb::open_completion_continuation_domain(&path).unwrap();
+    let identity =
+        oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+            .unwrap()
+            .unwrap();
+    let identity = oulipoly_state::completion_continuation::SourceProcessIdentity {
+        pid: identity.os_pid,
+        boot_id: identity.os_boot_id,
+        starttime_ticks: identity.os_pid_starttime_ticks,
+    };
+    let owner = CompletionDomainOwner {
+        protocol: oulipoly_state::completion_continuation::PROTOCOL.into(),
+        domain_id: mailbox.completion_continuation_domain().unwrap().unwrap(),
+        owner_generation: Uuid::new_v4().to_string(),
+        guardian_identity: identity.clone(),
+        driver_identity: identity.clone(),
+        endpoint: "fixture-only".into(),
+    };
+    mailbox
+        .publish_completion_continuation_owner(&owner)
+        .unwrap();
+    drop(mailbox);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute("INSERT INTO runtime_generation(generation_uuid,lifecycle_state,spawn_invocation_uuid,runtime_mode,provider_name,created_at,exited_at,terminal_reason) VALUES(?1,'exited',?2,'headless','fixture','now','now','recovered_dead')",
+        params![lease.runtime_generation_uuid.to_string(), lease.owner.invocation_uuid.to_string()]).unwrap();
+    conn.execute("INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,session_id,claim_token,phase,revision,custodian_identity,adopter_identity,spawn_invocation_uuid,runtime_generation_uuid,result_path,integrated,drain_receipt) VALUES(?1,?2,?3,'activation',?4,'fixture','claim','drained',1,?5,?5,?6,?7,'fixture',1,?8)",
+        params![Uuid::new_v4().to_string(),owner.domain_id,owner.owner_generation,"a".repeat(64),serde_json::to_string(&identity).unwrap(),lease.owner.invocation_uuid.to_string(),lease.runtime_generation_uuid.to_string(),r#"{"accepted_cancellation":"fixture"}"#]).unwrap();
+    let published = MailboxDb::read_native_publication(
+        &path,
+        &lease.runtime_generation_uuid.to_string(),
+        &lease.owner.invocation_uuid.to_string(),
+    )
+    .unwrap();
+    (
+        published.original_drain.unwrap(),
+        serde_json::to_value(published.runtime.unwrap()).unwrap(),
+    )
+}
+
+#[test]
+fn native_publication_replay_revalidates_actual_drain_and_runtime_without_overwrite() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    let (drain, row) = native_publication_fixture(&db, &lease);
+    let recovery = serde_json::json!({"lease":lease,"recovery_evidence":{"original_drain":drain}});
+    db.retain_native_recovered_attempt_custody(&lease.owner, &recovery)
+        .unwrap();
+    let supplement = serde_json::json!({"original_drain":drain,"original_runtime_row":row,"cancellation_terminal_code":"startup_failed"});
+    db.retain_native_runtime_cancellation(&lease.owner, &supplement)
+        .unwrap();
+    let sidecar = Connection::open(mailbox::MailboxDb::path_for_state_db(db.path())).unwrap();
+    db.request_cancel(lease.owner.logical_launch_id).unwrap();
+    let mut cancellation = proof(&lease);
+    cancellation.runtime_settlement_sha256 =
+        completion_continuation::sha256(&serde_json::to_vec(&supplement).unwrap());
+    sidecar.execute("UPDATE runtime_generation SET active_delivery_claim_uuid=?2,active_delivery_claimed_at='now',active_delivery_seqs_json='[1]' WHERE generation_uuid=?1",
+        params![lease.runtime_generation_uuid.to_string(),Uuid::new_v4().to_string()]).unwrap();
+    assert_eq!(
+        db.settle_cancel(&lease.owner, &cancellation).unwrap_err(),
+        "native_publication_runtime_not_settled"
+    );
+    sidecar.execute("UPDATE runtime_generation SET active_delivery_claim_uuid=NULL,active_delivery_claimed_at=NULL,active_delivery_seqs_json=NULL WHERE generation_uuid=?1",
+        [lease.runtime_generation_uuid.to_string()]).unwrap();
+    let duty = ProviderLaunchChannelSettlement::ContinuingCustody {
+        domain_id: "wrong-domain".into(),
+        original_owner: lease.owner.clone(),
+        disposition: "cleanup_failed".into(),
+        path: "synthetic-test-only".into(),
+        artifacts: vec![],
+    };
+    assert_eq!(
+        db.retain_native_channel_duty(&lease.owner, &duty)
+            .unwrap_err(),
+        "native_publication_channel_owner_conflict"
+    );
+    let mut duty = duty;
+    if let ProviderLaunchChannelSettlement::ContinuingCustody { domain_id, .. } = &mut duty {
+        *domain_id = drain["domain_id"].as_str().unwrap().into();
+    }
+    db.retain_native_channel_duty(&lease.owner, &duty).unwrap();
+    sidecar
+        .execute(
+            "UPDATE runtime_generation SET exit_code=37 WHERE generation_uuid=?1",
+            [lease.runtime_generation_uuid.to_string()],
+        )
+        .unwrap();
+    assert_eq!(
+        db.retain_native_runtime_cancellation(&lease.owner, &supplement)
+            .unwrap_err(),
+        "native_publication_runtime_conflict"
+    );
+    sidecar.execute("UPDATE completion_continuation_attempt SET revision=revision+1,drain_receipt='{}' WHERE attempt_id=?1",[drain["attempt_id"].as_str().unwrap()]).unwrap();
+    assert_eq!(
+        db.retain_native_recovered_attempt_custody(&lease.owner, &recovery)
+            .unwrap_err(),
+        "native_publication_original_drain_conflict"
+    );
+    assert_eq!(
+        db.native_recovered_attempt_custody(
+            lease.runtime_generation_uuid,
+            lease.owner.invocation_uuid
+        )
+        .unwrap(),
+        Some(recovery)
+    );
+}
+
+#[test]
+fn native_publication_missing_storage_never_grandfathers_detached_evidence() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    let path = mailbox::MailboxDb::path_for_state_db(db.path());
+    assert!(!path.exists());
+    let recovery = serde_json::json!({"lease":lease,"recovery_evidence":{"original_drain":{"unpublished":"fixture"}}});
+    assert!(
+        db.retain_native_recovered_attempt_custody(&lease.owner, &recovery)
+            .is_err()
+    );
+    assert!(!path.exists());
+    assert!(
+        db.native_recovered_attempt_custody(
+            lease.runtime_generation_uuid,
+            lease.owner.invocation_uuid
+        )
+        .unwrap()
+        .is_none()
     );
 }

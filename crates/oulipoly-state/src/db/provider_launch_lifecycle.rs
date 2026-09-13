@@ -836,7 +836,8 @@ impl StateDb {
     }
 
     /// Retain supplemental original-owner recovery without rewriting prior observations.
-    /// This is evidence retention, not certification or logical settlement.
+    /// The exact drain must be published under the State-then-sidecar fence,
+    /// including on replay. This does not certify the independent actor waits.
     pub fn retain_native_recovered_attempt_custody(
         &self,
         owner: &ProviderLaunchOwnerFence,
@@ -883,7 +884,8 @@ impl StateDb {
 
     /// Preserve the original generic runtime observation alongside stronger
     /// cancellation-only evidence. This does not rewrite runtime history or
-    /// grant successor-transfer authority.
+    /// grant successor-transfer authority. Actual runtime/drain publication is
+    /// revalidated before retention, including immutable replay reuse.
     pub fn retain_native_runtime_cancellation(
         &self,
         owner: &ProviderLaunchOwnerFence,
@@ -1082,6 +1084,34 @@ impl StateDb {
             if !executable {
                 return Err(conflict());
             }
+        }
+        // State first, sidecar second, held through State commit. No filesystem
+        // journal reconstruction runs here. Replays validate publication too.
+        let sidecar_path = crate::mailbox::MailboxDb::path_for_state_db(&self.db_path);
+        let needs_publication =
+            super::provider_launch_publication::needs_publication(&tx, owner, operation)?;
+        let authority = needs_publication
+            .then(|| {
+                crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()?;
+        let mut mailbox = authority
+            .as_ref()
+            .map(crate::mailbox::MailboxDb::open_existing_for_completion_authority)
+            .transpose()?;
+        let sidecar_fence = mailbox
+            .as_mut()
+            .map(crate::mailbox::MailboxDb::begin_completion_authority_fence)
+            .transpose()?;
+        if let Some(fence) = &sidecar_fence {
+            super::provider_launch_publication::validate(
+                &tx,
+                fence,
+                owner,
+                operation,
+                &serde_json::to_value(input).map_err(|e| e.to_string())?,
+            )?;
         }
         let key = format!("{}/{operation}", owner.attempt_id);
         let hash = digest(&(owner, input))?;

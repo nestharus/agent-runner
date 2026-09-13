@@ -25,11 +25,14 @@ pub(super) fn require_owner(domain_id: &str) -> Result<CompletionDomainOwner, St
     if owner.protocol != PROTOCOL || owner.domain_id != domain_id {
         return Err("completion owner domain/protocol conflict".into());
     }
-    let mailbox = MailboxDb::open_read_only(&MailboxDb::default_path()?)?;
+    let mailbox = MailboxDb::open_existing_native_authority(&MailboxDb::default_path()?)?;
     let current = mailbox
         .completion_continuation_owner()?
         .ok_or("completion owner is no longer running")?;
-    if current.owner_generation != owner.owner_generation
+    // Discovery/handshake only: source admission rechecks live ownership under
+    // the State-then-sidecar fence; this result is not an admission capability.
+    if current.domain_id != owner.domain_id
+        || current.owner_generation != owner.owner_generation
         || current.endpoint != owner.endpoint
         || current.guardian_identity != owner.guardian_identity
         || current.driver_identity != owner.driver_identity
@@ -107,7 +110,7 @@ fn join(endpoint: &Path) -> Result<(), String> {
 pub(super) fn bootstrap() -> Result<(), String> {
     if std::env::var_os(ENDPOINT_ENV).is_some() {
         // Admission checks availability; read/ACK do not bootstrap at all.
-        let mailbox = MailboxDb::open_read_only(&MailboxDb::default_path()?)?;
+        let mailbox = MailboxDb::open_existing_native_authority(&MailboxDb::default_path()?)?;
         let domain = mailbox
             .completion_continuation_domain()?
             .ok_or("inherited endpoint has no native domain")?;
@@ -118,7 +121,7 @@ pub(super) fn bootstrap() -> Result<(), String> {
     validate_independent_entry()?;
     let path = MailboxDb::default_path()?;
     if path.exists() {
-        let probe = MailboxDb::open_read_only(&path)?;
+        let probe = MailboxDb::open_existing_native_authority(&path)?;
         if probe.completion_continuation_domain()?.is_none() {
             // Existing legacy operation remains usable. New v2 registration is
             // refused locally rather than silently installing a new writer lane.

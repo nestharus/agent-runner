@@ -25,6 +25,8 @@ use crate::pid_identity::{self, ProcessIdentity};
 
 mod completion_continuation;
 mod finalization;
+mod native_publication;
+pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
 mod schema;
 pub use completion_continuation::{
@@ -1386,6 +1388,8 @@ impl MailboxDb {
         })
     }
 
+    /// Physically nonmutating detached recovery observation. Recoverable WAL
+    /// bytes can precede live SQLite publication; this is not native authority.
     pub fn open_read_only(path: &Path) -> Result<Self, String> {
         Self::open_read_only_with_cancel(path, &|| false)
     }
@@ -2314,7 +2318,16 @@ impl RuntimeLifecycleRepository<'_> {
                 GenerationStorageError::new("Runtime generation missing after exit".to_string())
             })?;
         project_exited_generation_on(&tx, &row, &now, row.exit_code)?;
-        tx.commit().map_err(generation_storage_error(
+        #[cfg(feature = "age360-fault-fixtures")]
+        crate::completion_continuation::age360_fault_barrier("runtime-exit-before-commit");
+        let committed = tx.commit();
+        #[cfg(feature = "age360-fault-fixtures")]
+        crate::completion_continuation::age360_fault_barrier(if committed.is_ok() {
+            "runtime-exit-commit-returned-ok"
+        } else {
+            "runtime-exit-commit-returned-error"
+        });
+        committed.map_err(generation_storage_error(
             "commit non-orderly generation exit transaction",
         ))?;
         Ok(map_applied_generation(row))

@@ -202,6 +202,11 @@ impl Fixture {
             "AGE360_FAULT_PARENT_NET",
             std::env::var_os("AGE360_PARENT_NET").unwrap(),
         );
+        #[cfg(feature = "age360-fault-fixtures")]
+        if self.root.path().join("wal-sync-hold.so").exists() {
+            cmd.env("LD_PRELOAD", self.root.path().join("wal-sync-hold.so"))
+                .env("AGE360_WAL_ROOT", self.root.path());
+        }
         let fault = match self.case {
             "publication_race" => Some("after-terminal-metadata"),
             "publication_error" | "publication_io_error" => Some("publication-error"),

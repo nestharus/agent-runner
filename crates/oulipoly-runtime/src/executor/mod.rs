@@ -653,6 +653,9 @@ pub use external_provider::attempt::{
     settle_retained_native_cancellation,
 };
 
+#[cfg(feature = "age360-fault-fixtures")]
+pub use external_provider::attempt::age360_observe_native_runtime;
+
 #[cfg(test)]
 mod tests {
     use super::*;

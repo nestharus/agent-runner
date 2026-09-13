@@ -5,6 +5,7 @@ use super::*;
 use crate::completion_continuation::{AdmittedSourceBinding, PROTOCOL, SourceProcessIdentity};
 use serde::{Deserialize, Serialize};
 mod attempts;
+pub(super) use attempts::native_original_drain_on;
 mod source;
 pub(super) use source::{accept_on, bound_event, reject_unbound_v2_trigger, retained_payload};
 
@@ -41,7 +42,7 @@ impl MailboxDb {
     /// sidecar. Existing legacy domains require separately authorized transition.
     pub fn open_completion_continuation_domain(path: &Path) -> Result<Self, String> {
         if path.exists() {
-            let probe = Self::open_read_only(path)?;
+            let probe = Self::open_existing_native_authority(path)?;
             if probe.completion_continuation_domain()?.is_none() {
                 return Err("unsupported_transition_required: existing domain has no completion-continuation-v2 lineage".into());
             }

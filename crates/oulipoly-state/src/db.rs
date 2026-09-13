@@ -123,6 +123,7 @@ mod owned_turn_event_read;
 mod owned_turn_event_write;
 mod ownership_authority;
 mod provider_launch_lifecycle;
+mod provider_launch_publication;
 mod provider_quota_reads;
 mod provider_quota_refresh;
 mod provider_quota_status;

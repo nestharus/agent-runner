@@ -826,8 +826,10 @@ fn classify_source_reply(attempt: &ContinuationAttempt) -> Result<serde_json::Va
         .ok_or("attempt result directory absent")?;
     let bytes = read_source_file(directory, "stdout.json", MAX_REGISTRATION_BYTES)?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    let state = oulipoly_state::StateDb::open_read_only(&oulipoly_state::StateDb::default_path()?)
-        .map_err(|e| format!("{e:?}"))?;
+    // This native custody lane already has State writer authority. Admission
+    // identity must be published even though the response remains an observation,
+    // not acceptance or ACK. Original admitted bindings are immutable.
+    let state = oulipoly_state::StateDb::open_default()?;
     let binding = state
         .admitted_completion_continuations()?
         .into_iter()

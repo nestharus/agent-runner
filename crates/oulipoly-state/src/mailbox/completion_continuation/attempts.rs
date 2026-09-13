@@ -88,7 +88,20 @@ impl MailboxDb {
             )
             .map_err(|e| e.to_string())?;
         }
-        tx.commit().map_err(|e| e.to_string())
+        #[cfg(feature = "age360-fault-fixtures")]
+        if attempt.operation == "activation" && changed == 1 {
+            crate::completion_continuation::age360_fault_barrier("original-drain-before-commit");
+        }
+        let result = tx.commit().map_err(|e| e.to_string());
+        #[cfg(feature = "age360-fault-fixtures")]
+        if attempt.operation == "activation" && changed == 1 {
+            crate::completion_continuation::age360_fault_barrier(if result.is_ok() {
+                "original-drain-commit-returned-ok"
+            } else {
+                "original-drain-commit-returned-error"
+            });
+        }
+        result
     }
 
     pub fn pending_continuation_attempt_ids(
@@ -659,18 +672,7 @@ impl MailboxDb {
         generation: &str,
         invocation: &str,
     ) -> Result<Option<serde_json::Value>, String> {
-        if self.completion_continuation_domain()?.is_none() {
-            return Ok(None);
-        }
-        let row: Option<(String, String, String, String, String, String)> = self.conn.query_row(
-            "SELECT attempt_id,result_path,custodian_identity,adopter_identity,drain_receipt,domain_id FROM completion_continuation_attempt WHERE operation='activation' AND phase='drained' AND integrated=1 AND runtime_generation_uuid=?1 AND spawn_invocation_uuid=?2",
-            params![generation, invocation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|e|e.to_string())?;
-        row.map(|(attempt, path, ac, adopter, receipt, domain)| -> Result<_, String> {
-            Ok(serde_json::json!({"attempt_id":attempt, "result_path":path,"domain_id":domain,
-                "custodian":serde_json::from_str::<serde_json::Value>(&ac).map_err(|e|e.to_string())?,
-                "adopter":serde_json::from_str::<serde_json::Value>(&adopter).map_err(|e|e.to_string())?,
-                "receipt":serde_json::from_str::<serde_json::Value>(&receipt).map_err(|e|e.to_string())?}))
-        }).transpose()
+        native_original_drain_on(&self.conn, generation, invocation)
     }
 }
 
@@ -841,4 +843,23 @@ impl MailboxDb {
         project_exited_generation_on(&tx, &row, &now, None).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
+}
+
+pub(in crate::mailbox) fn native_original_drain_on(
+    conn: &Connection,
+    generation: &str,
+    invocation: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    if domain_on(conn)?.is_none() {
+        return Ok(None);
+    }
+    let row: Option<(String, String, String, String, String, String)> = conn.query_row(
+            "SELECT attempt_id,result_path,custodian_identity,adopter_identity,drain_receipt,domain_id FROM completion_continuation_attempt WHERE operation='activation' AND phase='drained' AND integrated=1 AND runtime_generation_uuid=?1 AND spawn_invocation_uuid=?2",
+            params![generation, invocation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|e|e.to_string())?;
+    row.map(|(attempt, path, ac, adopter, receipt, domain)| -> Result<_, String> {
+            Ok(serde_json::json!({"attempt_id":attempt, "result_path":path,"domain_id":domain,
+                "custodian":serde_json::from_str::<serde_json::Value>(&ac).map_err(|e|e.to_string())?,
+                "adopter":serde_json::from_str::<serde_json::Value>(&adopter).map_err(|e|e.to_string())?,
+                "receipt":serde_json::from_str::<serde_json::Value>(&receipt).map_err(|e|e.to_string())?}))
+        }).transpose()
 }
