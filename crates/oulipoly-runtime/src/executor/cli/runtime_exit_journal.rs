@@ -233,11 +233,80 @@ impl PendingExit {
 /// reconstructs a lost classification. Killing this owner before retention can
 /// still lose those facts; this is not a reboot/all-owner-loss guarantee.
 fn retain_prerequisite(path: &Path, value: &impl Serialize, _failure_boundary: &str) {
-    while durable::write_json(path, value).is_err() {
+    let mut write = PrerequisiteWrite::default();
+    while write.retain(path, value).is_err() {
         #[cfg(feature = "age360-fault-fixtures")]
         oulipoly_state::completion_continuation::age360_fault_barrier(_failure_boundary);
         std::thread::sleep(std::time::Duration::from_millis(100));
+        #[cfg(feature = "age360-fault-fixtures")]
+        oulipoly_state::completion_continuation::age360_fault_barrier(
+            "native-exit-prerequisite-retry",
+        );
     }
+}
+
+// One privately created scratch inode belongs to this living write, not to
+// every retry. Never scan/delete historical or other writers' files.
+#[derive(Default)]
+struct PrerequisiteWrite {
+    scratch: Option<tempfile::NamedTempFile>,
+    published: bool,
+}
+impl PrerequisiteWrite {
+    fn retain(&mut self, path: &Path, value: &impl Serialize) -> Result<(), String> {
+        if !self.published {
+            self.publish(path, value)?;
+        }
+        // A returning directory sync error is not absence of publication.
+        // Keep syncing it, without creating/replacing another scratch file.
+        let parent = path.parent().ok_or("journal parent absent")?;
+        std::fs::File::open(parent)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| e.to_string())
+    }
+
+    fn publish(&mut self, path: &Path, value: &impl Serialize) -> Result<(), String> {
+        if self.scratch.is_none() {
+            self.scratch = Some(prepare_prerequisite(path, value)?);
+        }
+        match self
+            .scratch
+            .take()
+            .expect("prepared private write")
+            .persist(path)
+        {
+            Ok(_) => self.published = true,
+            Err(error) => {
+                let message = error.error.to_string();
+                self.scratch = Some(error.file);
+                return Err(message);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn prepare_prerequisite(
+    path: &Path,
+    value: &impl Serialize,
+) -> Result<tempfile::NamedTempFile, String> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    let parent = path.parent().ok_or("journal parent absent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let mut file = tempfile::Builder::new()
+        .prefix(&format!(
+            "{}.tmp-",
+            path.file_stem().unwrap_or_default().to_string_lossy()
+        ))
+        .tempfile_in(parent)
+        .map_err(|e| e.to_string())?;
+    // Failed preparation drops only this create-new private scratch. Once
+    // prepared, returning rename failures retain/reuse the same file and bytes.
+    file.write_all(&bytes)
+        .and_then(|()| file.as_file().sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok(file)
 }
 
 pub(crate) fn read(

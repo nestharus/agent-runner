@@ -1454,6 +1454,57 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
         remove_hold(&f, before);
         assert_eq!(reached(&f, failed), owner.pid);
         assert!(current_identity_matches(&owner));
+        if mode == "predecessor-failure" {
+            use std::os::unix::fs::MetadataExt;
+            let operation = obstruction.parent().unwrap();
+            let historical = operation.join("before.tmp-historical-evidence");
+            fs::write(&historical, b"foreign retained failure evidence").unwrap();
+            let intent = fs::read(operation.join("intent.json")).unwrap();
+            let scratch = || {
+                fs::read_dir(operation)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_name().to_string_lossy().starts_with("before.tmp-")
+                            && e.path() != historical
+                    })
+                    .map(|e| {
+                        (
+                            e.path(),
+                            e.metadata().unwrap().ino(),
+                            fs::read(e.path()).unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let original = scratch();
+            assert_eq!(original.len(), 1);
+            for round in 0..8 {
+                f.gate("native-exit-prerequisite-retry.hold");
+                remove_hold(&f, failed);
+                assert_eq!(reached(&f, "native-exit-prerequisite-retry"), owner.pid);
+                fs::remove_file(f.root.path().join(format!("{failed}.reached"))).unwrap();
+                f.gate(&format!("{failed}.hold"));
+                fs::remove_file(f.root.path().join("native-exit-prerequisite-retry.reached"))
+                    .unwrap();
+                remove_hold(&f, "native-exit-prerequisite-retry");
+                assert_eq!(reached(&f, failed), owner.pid);
+                assert_eq!(
+                    scratch(),
+                    original,
+                    "same scratch inode/bytes on rename error {round}"
+                );
+                assert_eq!(
+                    fs::read(&historical).unwrap(),
+                    b"foreign retained failure evidence"
+                );
+                assert_eq!(fs::read(operation.join("intent.json")).unwrap(), intent);
+                println!(
+                    "actual returning rename refusal round={round}; private scratch={:?}",
+                    original[0]
+                );
+            }
+        }
         let lifecycle: String = db.query_row("SELECT lifecycle_state FROM runtime_generation WHERE generation_uuid=(SELECT runtime_generation_uuid FROM completion_continuation_attempt WHERE attempt_id=?1)", [&a.attempt_id], |r| r.get(0)).unwrap();
         assert_eq!(lifecycle, "draining");
         if mode == "intent-failure" {
@@ -1463,6 +1514,21 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
             fs::remove_dir(&obstruction).unwrap();
         }
         remove_hold(&f, failed);
+        if mode == "predecessor-failure" {
+            wait(|| obstruction.is_file().then_some(()));
+            let operation = obstruction.parent().unwrap();
+            let remaining: Vec<_> = fs::read_dir(operation)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("before.tmp-"))
+                .map(|e| e.file_name())
+                .collect();
+            assert_eq!(remaining, ["before.tmp-historical-evidence"]);
+            assert_eq!(
+                fs::read(operation.join("before.tmp-historical-evidence")).unwrap(),
+                b"foreign retained failure evidence"
+            );
+        }
         println!(
             "actual {mode} write error returned to original owner={owner:?}; storage restored without replacing owner"
         );
@@ -2203,4 +2269,135 @@ fn runtime_exit_journal_bytes(
         }
     }
     bytes
+}
+
+#[test]
+fn native_owner_retries_pending_eof_does_not_hide_dead_replacement_driver() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("adopter-before-ac-fork.hold");
+    let owner = start_pre_attachment(&f);
+    let adopter = process_identity(reached(&f, "adopter-before-ac-fork"));
+    let a = attempt(&f);
+    let result =
+        PathBuf::from(&a.result_path).with_file_name("unreleased-announcement-result.json");
+    fs::create_dir(&result).unwrap();
+    kill_exact(&owner.guardian_identity);
+    let promoted = wait(|| {
+        let next = f.owner();
+        (next.owner_generation != owner.owner_generation).then_some(next)
+    });
+    assert_eq!(promoted.guardian_identity, owner.driver_identity);
+    // Unread, still-live birth also cannot hide this independently owned child.
+    kill_exact(&promoted.driver_identity);
+    let replacement = wait(|| {
+        let next = f.owner();
+        (next.driver_identity != promoted.driver_identity).then_some(next)
+    });
+    assert_eq!(replacement.guardian_identity, owner.driver_identity);
+    assert!(current_identity_matches(&adopter));
+    assert_unresolved(&f, &a);
+    kill_exact(&adopter);
+    wait_task_state(&adopter, "Z");
+    wait(|| {
+        fs::read_dir(result.parent().unwrap())
+            .ok()?
+            .filter_map(Result::ok)
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("unreleased-announcement-result.tmp-")
+            })
+            .then_some(())
+    });
+    // Known EOF + actual failed original receipt publication, not just unread.
+    kill_exact(&replacement.driver_identity);
+    let next = wait(|| {
+        let next = f.owner();
+        (next.driver_identity != replacement.driver_identity).then_some(next)
+    });
+    assert_eq!(next.guardian_identity, owner.driver_identity);
+    wait_task_state(&adopter, "Z");
+    assert_unresolved(&f, &a);
+    println!("independent replacement recovered across unread and failed-EOF receipt: {next:?}");
+    fs::remove_dir(&result).unwrap();
+    let receipt = wait_drained_attempt(&f, &a);
+    assert_eq!(receipt["gate"], "unreleased_announcement_eof");
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!("original wait retained after receipt restoration={receipt}");
+}
+
+#[test]
+fn native_owner_retries_adopter_identity_read_preserves_original_wait() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    let shim = f.root.path().join("identity-read-fail.c");
+    fs::write(&shim, include_str!("identity-read-fail.c")).unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror", "-o"])
+            .arg(f.root.path().join("identity-read-fail.so"))
+            .arg(&shim)
+            .arg("-ldl")
+            .status()
+            .unwrap()
+            .success()
+    );
+    f.gate("adopter-before-ac-release.hold");
+    start_pre_attachment(&f);
+    let adopter = process_identity(reached(&f, "adopter-before-ac-release"));
+    let a = attempt(&f);
+    let ac: String = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT custodian_identity FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&a.attempt_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let ac: SourceProcessIdentity = serde_json::from_str(&ac).unwrap();
+    f.gate("adopted-before-identity.hold");
+    f.gate("adopted-identity-failed.hold");
+    kill_exact(&ac);
+    wait_task_state(&ac, "Z");
+    remove_hold(&f, "adopter-before-ac-release");
+    assert_eq!(reached(&f, "adopted-before-identity"), adopter.pid);
+    assert_unresolved(&f, &a);
+    let arm = f.root.path().join("identity-read-target");
+    fs::write(&arm, format!("{} {}", adopter.pid, ac.pid)).unwrap();
+    remove_hold(&f, "adopted-before-identity");
+    assert_eq!(reached(&f, "adopted-identity-failed"), adopter.pid);
+    assert!(current_identity_matches(&adopter));
+    assert_unresolved(&f, &a);
+    // A second real failed read, retaining the same owner and wait.
+    f.gate("adopted-before-identity.hold");
+    fs::remove_file(f.root.path().join("adopted-before-identity.reached")).unwrap();
+    remove_hold(&f, "adopted-identity-failed");
+    assert_eq!(reached(&f, "adopted-before-identity"), adopter.pid);
+    f.gate("adopted-identity-failed.hold");
+    fs::remove_file(f.root.path().join("adopted-identity-failed.reached")).unwrap();
+    remove_hold(&f, "adopted-before-identity");
+    assert_eq!(reached(&f, "adopted-identity-failed"), adopter.pid);
+    fs::remove_file(&arm).unwrap();
+    let actual_reads = fs::read_to_string(f.root.path().join("identity-read-errors")).unwrap();
+    assert_eq!(actual_reads.lines().count(), 2);
+    println!("actual exact-caller proc-stat read errors after WNOWAIT={actual_reads}");
+    wait_task_state(&ac, "Z");
+    assert!(current_identity_matches(&adopter));
+    assert_unresolved(&f, &a);
+    remove_hold(&f, "adopted-identity-failed");
+    let receipt = wait_drained_attempt(&f, &a);
+    println!("actual restored identity read; original adopter wait/drain={receipt}");
+    assert_eq!(
+        receipt["classification"],
+        "original_adopting_boundary_drained"
+    );
+    assert_eq!(receipt["adopter"], serde_json::to_value(&adopter).unwrap());
+    assert_eq!(receipt["custodian_wait_status"], libc::SIGKILL);
+    assert_eq!(receipt["owned_children"], "ECHILD");
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
 }

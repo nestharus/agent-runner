@@ -207,6 +207,11 @@ impl Fixture {
             cmd.env("LD_PRELOAD", self.root.path().join("wal-sync-hold.so"))
                 .env("AGE360_WAL_ROOT", self.root.path());
         }
+        #[cfg(feature = "age360-fault-fixtures")]
+        if self.root.path().join("identity-read-fail.so").exists() {
+            cmd.env("LD_PRELOAD", self.root.path().join("identity-read-fail.so"))
+                .env("AGE360_IDENTITY_ROOT", self.root.path());
+        }
         let fault = match self.case {
             "publication_race" => Some("after-terminal-metadata"),
             "publication_error" | "publication_io_error" => Some("publication-error"),

@@ -1221,7 +1221,20 @@ fn reap_adopted_child(
     if pid == 0 {
         return Ok((0, 0, None));
     }
-    let identity = super::linux::identity(i64::from(pid))?;
+    #[cfg(feature = "age360-fault-fixtures")]
+    oulipoly_state::completion_continuation::age360_fault_barrier("adopted-before-identity");
+    let identity = match super::linux::identity(i64::from(pid)) {
+        Ok(identity) => identity,
+        Err(_) => {
+            // WNOWAIT left this exact incarnation owned and unreaped. A
+            // returning read failure cannot transfer the original wait duty.
+            #[cfg(feature = "age360-fault-fixtures")]
+            oulipoly_state::completion_continuation::age360_fault_barrier(
+                "adopted-identity-failed",
+            );
+            return Ok((0, 0, None));
+        }
+    };
     if let Some((attempt, owner)) = journal {
         let status = if info.si_code == libc::CLD_EXITED {
             (unsafe { info.si_status() }) << 8

@@ -249,7 +249,21 @@ fn guardian(
         super::custody::retry_unreleased();
         loop {
             let mut status = 0;
-            let pid = super::custody::reap_unprotected(&mut status);
+            // This child has independent, exact custody from start_driver; an
+            // unrelated unread birth must not hide its terminal wait.
+            let driver_pid =
+                if identity(owner.driver_identity.pid).as_ref() == Ok(&owner.driver_identity) {
+                    unsafe {
+                        libc::waitpid(owner.driver_identity.pid as i32, &mut status, libc::WNOHANG)
+                    }
+                } else {
+                    0
+                };
+            let pid = if driver_pid > 0 {
+                driver_pid
+            } else {
+                super::custody::reap_unprotected(&mut status)
+            };
             if pid <= 0 {
                 if closing
                     && pid < 0
