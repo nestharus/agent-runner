@@ -149,6 +149,69 @@ impl Drop for EnvScope {
     }
 }
 
+const ISOLATED_CASE_ENV: &str = "AGE360_DISPATCH_ISOLATED_CASE";
+
+fn isolated_case() -> bool {
+    if std::env::var_os(ISOLATED_CASE_ENV).is_some() {
+        return false;
+    }
+    let name = std::thread::current()
+        .name()
+        .expect("named test")
+        .to_owned();
+    let data = tempfile::tempdir().expect("private dispatch data");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+        .env(ISOLATED_CASE_ENV, "1")
+        .env(oulipoly_state::paths::DATA_DIR_ENV, data.path())
+        .env_remove(CHILD_CUSTODY_FAULT_ENV)
+        .env_remove(CHILD_CUSTODY_READY_FILE_ENV)
+        .output()
+        .expect("isolated dispatch test");
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "isolated node {name}: {}",
+        output.status
+    );
+    true
+}
+
+// A prospective controlled exposure, not attribution of the historical failure.
+#[test]
+fn dispatch_environment_exposure_control() {
+    if isolated_case() {
+        return;
+    }
+    let target =
+        "external_provider_launch_request_carries_selected_settings_id_and_effective_inputs";
+    let poisoned = tempfile::tempdir().unwrap();
+    let run = |bypass: bool| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", target, "--nocapture", "--test-threads=1"])
+            .env(oulipoly_state::paths::DATA_DIR_ENV, poisoned.path())
+            .env(CHILD_CUSTODY_FAULT_ENV, "external_spawn_observer")
+            .env_remove(CHILD_CUSTODY_READY_FILE_ENV);
+        if bypass {
+            cmd.env(ISOLATED_CASE_ENV, "1");
+        } else {
+            cmd.env_remove(ISOLATED_CASE_ENV);
+        }
+        cmd.output().unwrap()
+    };
+    let exposed = run(true);
+    assert!(!exposed.status.success());
+    assert!(String::from_utf8_lossy(&exposed.stderr).contains("spawn_observer_failed"));
+    let isolated = run(false);
+    assert!(isolated.status.success());
+    // Allowlisted causal fields only: no provider diagnostic descriptions.
+    println!(
+        "controlled_fault_site=external_spawn_observer exposed_status={} observer_failure=true isolated_status={}",
+        exposed.status, isolated.status
+    );
+}
+
 fn env_lock() -> MutexGuard<'static, ()> {
     env_mutex().lock().unwrap_or_else(|err| err.into_inner())
 }
@@ -1088,6 +1151,9 @@ fn assert_external_dispatch_failure(
 
 #[test]
 fn runtime_executor_dispatch_no_ref_preserves_legacy_bytes_with_unrelated_registry() {
+    if isolated_case() {
+        return;
+    }
     let legacy = fixture_script(
         r#"printf 'out:%b:%s\n' '\000\377' "$1"
 printf 'err:%b:%s\n' '\376' "$1" >&2"#,
@@ -1139,6 +1205,9 @@ printf 'err:%b:%s\n' '\376' "$1" >&2"#,
 
 #[test]
 fn runtime_executor_dispatch_no_ref_does_not_construct_or_invoke_provider_client() {
+    if isolated_case() {
+        return;
+    }
     let legacy = fixture_script("printf 'legacy:%s\\n' \"$1\"");
     let counter = tempfile::NamedTempFile::new().expect("counter");
     fs::write(counter.path(), "0").expect("initialize counter");
@@ -1185,6 +1254,9 @@ fn runtime_executor_dispatch_no_ref_does_not_construct_or_invoke_provider_client
 
 #[test]
 fn model_scoped_crate_reference_does_not_create_account_endpoint_authority() {
+    if isolated_case() {
+        return;
+    }
     let legacy = fixture_script("printf 'legacy fallback\\n'; exit 77");
     let model = crate_external_model(&legacy);
     let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
@@ -1209,6 +1281,9 @@ fn model_scoped_crate_reference_does_not_create_account_endpoint_authority() {
 
 #[test]
 fn external_provider_missing_policy_or_launch_capability_fails_without_builtin_fallback() {
+    if isolated_case() {
+        return;
+    }
     for capabilities in [
         Capabilities {
             policy: false,
@@ -1232,6 +1307,9 @@ fn external_provider_missing_policy_or_launch_capability_fails_without_builtin_f
 
 #[test]
 fn external_provider_missing_launch_output_capability_requires_provider_upgrade() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -1257,6 +1335,9 @@ fn external_provider_missing_launch_output_capability_requires_provider_upgrade(
 
 #[test]
 fn external_provider_policy_evaluate_runs_before_launch_and_uses_selected_provider_settings() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -1305,6 +1386,9 @@ fn external_provider_policy_evaluate_runs_before_launch_and_uses_selected_provid
 
 #[test]
 fn external_dispatch_keeps_the_capability_advertiser_after_path_replacement() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_describe_replacing_external_fixture();
 
     let result = execute_external_fixture(&fixture)
@@ -1323,6 +1407,9 @@ fn external_dispatch_keeps_the_capability_advertiser_after_path_replacement() {
 
 #[test]
 fn external_provider_policy_request_passes_hybrid_launch_shape() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -1361,6 +1448,9 @@ fn external_provider_policy_request_passes_hybrid_launch_shape() {
 
 #[test]
 fn external_provider_launch_request_carries_selected_settings_id_and_effective_inputs() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -1536,6 +1626,9 @@ fn assert_no_arg_mode_stdin(launch: &Value) {
 
 #[test]
 fn unrelated_fixture_cannot_publish_or_clear_custody_markers_from_ambient_env() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let dir = tempfile::tempdir().unwrap();
     let pid = dir.path().join("selected.pid");
@@ -1585,6 +1678,9 @@ fn unrelated_fixture_cannot_publish_or_clear_custody_markers_from_ambient_env() 
 
 #[test]
 fn external_provider_post_spawn_failures_reap_before_fenced_generation_exit() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     for (fault, invocation_uuid, terminal_reason, expect_bound_pid) in [
         (
@@ -1606,6 +1702,9 @@ fn external_provider_post_spawn_failures_reap_before_fenced_generation_exit() {
 
 #[test]
 fn external_provider_success_reaps_and_completes_the_exact_generation_orderly() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let dir = tempfile::tempdir().expect("custody tempdir");
     let data_dir = dir.path().join("data");
@@ -1862,6 +1961,9 @@ fn assert_external_terminal_generation(
 
 #[test]
 fn external_provider_launch_env_inherits_parent_environment_with_runner_overrides() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let xdg_data = tempdir_path("xdg data tempdir");
     let expected_data_dir = runner_data_dir_from_xdg(&xdg_data.path);
@@ -1908,6 +2010,9 @@ fn external_provider_launch_env_inherits_parent_environment_with_runner_override
 
 #[test]
 fn external_provider_launch_env_separates_completion_authority_from_parent_identity() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let data_dir = tempdir_path("completion authority data tempdir");
     let _env = EnvScope::set_optional(&[
@@ -1971,6 +2076,9 @@ fn external_provider_launch_env_separates_completion_authority_from_parent_ident
 
 #[test]
 fn external_provider_launch_env_inherits_application_agnostic_parent_entries() {
+    if isolated_case() {
+        return;
+    }
     const JIRA_ENV: &str = "JIRA_API_KEY_REALLY";
     const JIRA_VALUE: &str = "synthetic-jira-api-key-really";
     const SENTINEL_ENV: &str = "UNRELATED_AMBIENT_SENTINEL";
@@ -2013,6 +2121,9 @@ fn external_provider_launch_env_inherits_application_agnostic_parent_entries() {
 
 #[test]
 fn external_provider_launch_env_removes_runner_private_entries() {
+    if isolated_case() {
+        return;
+    }
     assert_test_catalog_extension();
     let private_names = runner_private_environment_names();
     let _lock = env_lock();
@@ -2052,6 +2163,9 @@ fn external_provider_launch_env_removes_runner_private_entries() {
 
 #[test]
 fn external_provider_subcommands_do_not_inherit_runner_private_authority() {
+    if isolated_case() {
+        return;
+    }
     assert_test_catalog_extension();
     let private_names = runner_private_environment_names();
     let _lock = env_lock();
@@ -2115,6 +2229,9 @@ fn external_provider_subcommands_do_not_inherit_runner_private_authority() {
 
 #[test]
 fn external_provider_policy_cannot_reintroduce_runner_private_launch_authority() {
+    if isolated_case() {
+        return;
+    }
     assert_test_catalog_extension();
     let auto_wake_names = auto_wake_environment_names();
     let _lock = env_lock();
@@ -2178,6 +2295,9 @@ fn external_provider_policy_cannot_reintroduce_runner_private_launch_authority()
 
 #[test]
 fn external_provider_launch_env_applies_configured_removals_then_overlays() {
+    if isolated_case() {
+        return;
+    }
     const REMOVED_ENV: &str = "CONFIG_REMOVED_ENV";
     const OVERLAID_ENV: &str = "CONFIG_OVERLAID_ENV";
 
@@ -2275,6 +2395,9 @@ fn assert_host_linkage_envs(
 
 #[test]
 fn external_provider_launch_env_does_not_apply_opencode_account_policy() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let home = tempdir_path("home tempdir");
     let ambient_xdg = tempdir_path("ambient xdg tempdir");
@@ -2345,6 +2468,9 @@ fn assert_provider_neutral_parent_envs(
 
 #[test]
 fn external_provider_launch_env_preserves_ambient_xdg_for_provider_policy() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let ambient_xdg = tempdir_path("ambient xdg tempdir");
     let _env = EnvScope::set(&[
@@ -2427,6 +2553,9 @@ fn env_string<'a>(env: &'a serde_json::Map<String, Value>, key: &str) -> Option<
 
 #[test]
 fn external_provider_validates_schema_inputs_before_policy_or_launch() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2482,6 +2611,9 @@ fn external_provider_validates_schema_inputs_before_policy_or_launch() {
 
 #[test]
 fn external_provider_policy_rejection_skips_launch() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2515,6 +2647,9 @@ fn external_provider_policy_rejection_skips_launch() {
 
 #[test]
 fn external_provider_policy_request_preserves_provider_owned_settings_id() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2575,6 +2710,9 @@ fn external_provider_policy_request_preserves_provider_owned_settings_id() {
 
 #[test]
 fn external_provider_policy_transform_applies_once_and_no_legacy_double_policy() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2617,6 +2755,9 @@ fn external_provider_policy_transform_applies_once_and_no_legacy_double_policy()
 
 #[test]
 fn explicit_account_endpoint_dispatches_without_legacy_fallback() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2638,6 +2779,9 @@ fn explicit_account_endpoint_dispatches_without_legacy_fallback() {
 
 #[test]
 fn explicit_account_endpoint_receives_negotiated_prompt_acceptance() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2674,6 +2818,9 @@ fn explicit_account_endpoint_receives_negotiated_prompt_acceptance() {
 
 #[test]
 fn external_provider_launch_preserves_stdout_bytes_and_maps_stderr_boundary() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2701,6 +2848,9 @@ fn external_provider_launch_preserves_stdout_bytes_and_maps_stderr_boundary() {
 
 #[test]
 fn external_provider_launch_spools_output_beyond_diagnostic_retention() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2726,6 +2876,9 @@ fn external_provider_launch_spools_output_beyond_diagnostic_retention() {
 
 #[test]
 fn external_provider_launch_nonzero_final_exit_is_execution_result() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2744,6 +2897,9 @@ fn external_provider_launch_nonzero_final_exit_is_execution_result() {
 
 #[test]
 fn external_provider_launch_provider_nonzero_after_final_is_diagnostic_only() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2762,6 +2918,9 @@ fn external_provider_launch_provider_nonzero_after_final_is_diagnostic_only() {
 
 #[test]
 fn external_provider_launch_malformed_stream_is_protocol_failure_not_model_exit() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2780,6 +2939,9 @@ fn external_provider_launch_malformed_stream_is_protocol_failure_not_model_exit(
 
 #[test]
 fn external_provider_launch_missing_final_is_protocol_failure_not_model_exit() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2798,6 +2960,9 @@ fn external_provider_launch_missing_final_is_protocol_failure_not_model_exit() {
 
 #[test]
 fn external_provider_launch_invalid_base64_is_protocol_failure_not_model_exit() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2816,6 +2981,9 @@ fn external_provider_launch_invalid_base64_is_protocol_failure_not_model_exit() 
 
 #[test]
 fn external_provider_launch_timeout_or_host_transport_failure_is_not_model_exit() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2834,6 +3002,9 @@ fn external_provider_launch_timeout_or_host_transport_failure_is_not_model_exit(
 
 #[test]
 fn external_provider_launch_host_cancelled_before_final_uses_cancellation_fallback_message() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2875,6 +3046,9 @@ fn external_provider_launch_host_cancelled_before_final_uses_cancellation_fallba
 
 #[test]
 fn external_provider_launch_provider_nonzero_before_final_is_transport_failure_not_model_exit() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2893,6 +3067,9 @@ fn external_provider_launch_provider_nonzero_before_final_is_transport_failure_n
 
 #[test]
 fn external_provider_launch_provider_emitted_cancelled_final_event_maps_minimal_cancel_outcome() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2911,6 +3088,9 @@ fn external_provider_launch_provider_emitted_cancelled_final_event_maps_minimal_
 
 #[test]
 fn external_provider_launch_minimal_terminal_scope_uses_final_event_not_standalone_classify() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2934,6 +3114,9 @@ fn external_provider_launch_minimal_terminal_scope_uses_final_event_not_standalo
 
 #[test]
 fn live_attachment_error_dispatch_retains_partial_output_and_new_return_reference() {
+    if isolated_case() {
+        return;
+    }
     use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
     use sha2::{Digest, Sha256};
     let _lock = env_lock();
@@ -3153,6 +3336,9 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
 
 #[test]
 fn standalone_verified_missing_final_retains_binary_prefix_and_reports_storage_failure() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
@@ -3255,14 +3441,23 @@ fn standalone_verified_missing_final_retains_binary_prefix_and_reports_storage_f
 
 #[test]
 fn native_allocated_cancellation_retains_returned_artifact_custody() {
+    if isolated_case() {
+        return;
+    }
     native_return_cancellation("committed");
 }
 #[test]
 fn native_allocated_cancellation_preserves_quarantine_ownership_gap() {
+    if isolated_case() {
+        return;
+    }
     native_return_cancellation("quarantined");
 }
 #[test]
 fn native_allocated_cancellation_preserves_cleanup_ownership_gap() {
+    if isolated_case() {
+        return;
+    }
     native_return_cancellation("cleanup_failed");
 }
 fn native_return_cancellation(channel_mode: &str) {
