@@ -705,6 +705,15 @@ fn native_uncertain_aggregate_preserves_observation_after_original_owner_wait() 
 
 #[test]
 fn native_complete_prelaunch_aggregate_does_not_skip_original_runtime_settlement() {
+    complete_prelaunch_runtime_settlement(false);
+}
+
+#[test]
+fn native_birth_recovery_cancel_after_uncancelled_drain() {
+    complete_prelaunch_runtime_settlement(true);
+}
+
+fn complete_prelaunch_runtime_settlement(late_cancel: bool) {
     if private_case(false) {
         return;
     }
@@ -760,6 +769,21 @@ fn native_complete_prelaunch_aggregate_does_not_skip_original_runtime_settlement
     writable_sidecar
         .execute_batch("DROP TRIGGER fixture_fail_runtime_exit")
         .unwrap();
+    let original_drain = if late_cancel {
+        let launcher = f
+            .mailbox()
+            .continuation_launcher_identity(&a)
+            .unwrap()
+            .unwrap();
+        kill_exact(&launcher);
+        let drain = wait_drained_attempt(&f, &a);
+        assert!(drain["accepted_cancellation"].is_null());
+        assert_eq!(drain["root_wait_status"], libc::SIGKILL);
+        println!("original uncancelled physical drain before cancellation API={drain}");
+        Some(drain)
+    } else {
+        None
+    };
     request_linked_cancel(&f, &a);
     let token = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
     let launch = token.split(':').next().unwrap();
@@ -803,9 +827,169 @@ fn native_complete_prelaunch_aggregate_does_not_skip_original_runtime_settlement
         "recovered_dead"
     );
     assert_eq!(supplement["cancellation_terminal_code"], "startup_failed");
+    if let Some(drain) = original_drain {
+        assert_eq!(wait_drained_attempt(&f, &a), drain);
+        assert_eq!(supplement["original_drain"]["receipt"], drain);
+        assert!(supplement["original_drain"]["receipt"]["accepted_cancellation"].is_null());
+        assert_eq!(supplement["logical_cancellation"]["token"], token);
+        // Public API and native settlement replay must preserve both observations.
+        state
+            .request_cancel(uuid::Uuid::parse_str(launch).unwrap())
+            .unwrap();
+        oulipoly_runtime::executor::settle_retained_native_cancellation(&state, g, i).unwrap();
+    }
     println!("preserved runtime observation and separate cancellation evidence={supplement}");
     assert!(!f.root.path().join("resume-prompts.jsonl").exists());
     println!(
         "complete aggregate + actual original cancellation drain settled without invented recovery evidence"
     );
+}
+
+#[test]
+fn native_birth_recovery_dead_ac_before_announcement() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("ac-created-before-announce.hold");
+    let owner = start_pre_attachment(&f);
+    let ac = process_identity(reached(&f, "ac-created-before-announce"));
+    let a = attempt(&f);
+    assert_unresolved(&f, &a);
+    kill_exact(&ac);
+    let receipt = wait_drained_attempt(&f, &a);
+    assert_eq!(
+        receipt["classification"],
+        "original_adopting_boundary_drained"
+    );
+    assert_eq!(receipt["custodian"], serde_json::to_value(&ac).unwrap());
+    assert_eq!(receipt["custodian_wait_status"], libc::SIGKILL);
+    assert_eq!(receipt["owned_children"], "ECHILD");
+    assert!(current_identity_matches(&owner.driver_identity));
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!("dead unannounced AC actual adopter wait/drain={receipt}");
+}
+
+fn wait_drained_attempt(f: &Fixture, a: &ContinuationAttempt) -> serde_json::Value {
+    wait(|| {
+        let receipt: String = f.sidecar_connection().query_row(
+            "SELECT drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1 AND integrated=1 AND phase IN ('drained','never_started')",
+            [&a.attempt_id], |r| r.get(0)).ok()?;
+        serde_json::from_str(&receipt).ok()
+    })
+}
+
+#[test]
+fn native_birth_recovery_closed_driver_receiver() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("ac-created-before-announce.hold");
+    let owner = start_pre_attachment(&f);
+    let ac = process_identity(reached(&f, "ac-created-before-announce"));
+    let a = attempt(&f);
+    kill_exact(&owner.driver_identity);
+    wait(|| (f.owner().owner_generation != owner.owner_generation).then_some(()));
+    remove_hold(&f, "ac-created-before-announce");
+    let receipt = wait_drained_attempt(&f, &a);
+    assert_eq!(receipt["gate"], "unreleased_eof");
+    assert_eq!(receipt["custodian"], serde_json::to_value(&ac).unwrap());
+    assert_eq!(receipt["owned_children"], "ECHILD");
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!("closed original receiver self-receipt={receipt}");
+}
+
+#[test]
+fn native_birth_recovery_guardian_loss_then_adopter_resumes() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("adopter-before-ac-fork.hold");
+    let owner = start_pre_attachment(&f);
+    let adopter = process_identity(reached(&f, "adopter-before-ac-fork"));
+    let a = attempt(&f);
+    kill_exact(&owner.guardian_identity);
+    let next = wait(|| {
+        let next = f.owner();
+        (next.owner_generation != owner.owner_generation).then_some(next)
+    });
+    assert_eq!(next.guardian_identity, owner.driver_identity);
+    assert!(current_identity_matches(&adopter));
+    assert_unresolved(&f, &a);
+    remove_hold(&f, "adopter-before-ac-fork");
+    let receipt = wait_drained_attempt(&f, &a);
+    assert_eq!(receipt["gate"], "unreleased_eof");
+    assert_eq!(receipt["owned_children"], "ECHILD");
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!("succession followed by original adopter resumption={receipt}");
+}
+
+#[test]
+fn native_birth_recovery_prepublication_failure_retries_original_wait() {
+    prepublication_recovery(false);
+}
+
+#[test]
+fn native_birth_recovery_prepublication_failure_survives_guardian_succession() {
+    prepublication_recovery(true);
+}
+
+fn prepublication_recovery(succeed_guardian: bool) {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("adopter-before-ac-fork.hold");
+    let owner = start_pre_attachment(&f);
+    let adopter = process_identity(reached(&f, "adopter-before-ac-fork"));
+    let a = attempt(&f);
+    let result =
+        PathBuf::from(&a.result_path).with_file_name("unreleased-announcement-result.json");
+    fs::create_dir(&result).unwrap(); // genuine rename failure before publication
+    f.gate("driver-replay.hold");
+    kill_exact(&adopter);
+    assert_eq!(reached(&f, "driver-replay"), owner.driver_identity.pid);
+    // The scan is responsive despite one failing receipt. No fixture writes evidence.
+    assert!(result.is_dir());
+    let temporary = fs::read_dir(result.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("unreleased-announcement-result.tmp-")
+        })
+        .expect("actual publication write must have been attempted before scan resumed");
+    let unpublished: serde_json::Value =
+        serde_json::from_slice(&fs::read(temporary.path()).unwrap()).unwrap();
+    assert_eq!(unpublished["observation"], "waitid_wnowait");
+    assert_eq!(unpublished["attempt_id"], a.attempt_id);
+    println!("actual unpublished producer write before failed rename={unpublished}");
+    assert_unresolved(&f, &a);
+    if succeed_guardian {
+        kill_exact(&owner.guardian_identity);
+        remove_hold(&f, "driver-replay");
+        let next = wait(|| {
+            let next = f.owner();
+            (next.owner_generation != owner.owner_generation).then_some(next)
+        });
+        assert_eq!(next.guardian_identity, owner.driver_identity);
+        assert_unresolved(&f, &a);
+    } else {
+        remove_hold(&f, "driver-replay");
+    }
+    fs::remove_dir(&result).unwrap();
+    let receipt = wait_drained_attempt(&f, &a);
+    assert_eq!(receipt["gate"], "unreleased_announcement_eof");
+    let reason: serde_json::Value =
+        serde_json::from_str(receipt["reason"].as_str().unwrap()).unwrap();
+    assert_eq!(reason["adopter"], serde_json::to_value(adopter).unwrap());
+    assert_eq!(reason["observation"], "waitid_wnowait");
+    assert_eq!(reason["execution_grant"], "not_sent");
+    assert!(current_identity_matches(&owner.driver_identity));
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!("storage recovery retained exact original wait={receipt}");
 }

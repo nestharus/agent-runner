@@ -166,10 +166,13 @@ pub fn settle_retained_native_cancellation(
     }
     let mailbox_path = MailboxDb::path_for_state_db(state.path());
     let mut runtime = runtime_receipt_for(&retained.lease, &mailbox_path, &retained.actors);
+    // Require the authored logical cancellation independently of when original
+    // custody observed it. A later request never changes that immutable drain.
+    let _ = logical_cancellation_observation(state, &retained.lease)?;
     // A complete original aggregate can precede native runtime finalization.
     // Its existence must not suppress projection from the later original drain.
-    // The mailbox transition still requires that exact activation's accepted
-    // cancellation and integrated original custody, never a replacement census.
+    // The mailbox transition requires integrated original custody; a never-
+    // invoked Launch retains startup failure even if cancellation came later.
     if !runtime.effect_incapable
         && complete_actor_receipts(&retained.actors)
         && retained
@@ -224,8 +227,8 @@ pub fn settle_retained_native_cancellation(
 
 /// Generic Starting recovery is an honest `recovered_dead` observation, not
 /// proof of an uninvoked launch. Keep that row unchanged. Only complete original
-/// operation receipts and the exact original cancelled activation drain can
-/// additionally establish prelaunch cancellation semantics for this consumer.
+/// operation receipts and the exact original activation drain can additionally
+/// establish prelaunch settlement for an independently accepted cancellation.
 fn retain_recovered_dead_prelaunch_cancellation(
     state: &StateDb,
     retained: &RetainedAttemptCustody,
@@ -263,17 +266,37 @@ fn retain_recovered_dead_prelaunch_cancellation(
             &retained.lease.owner.invocation_uuid.to_string(),
         )?
         .ok_or("native_original_drain_absent")?;
-    if !drain["receipt"]["accepted_cancellation"].is_string() {
-        return Err("original_native_cancellation_absent".into());
-    }
-    let evidence = serde_json::json!({
+    let cancellation = logical_cancellation_observation(state, &retained.lease)?;
+    let mut evidence = serde_json::json!({
         "classification":"original_never_invoked_after_recovered_dead",
         "lease":retained.lease,"original_runtime_row":row,
         "original_drain":drain,"original_actor_receipts":retained.actors,
         "cancellation_terminal_code":"startup_failed"
     });
+    if !drain["receipt"]["accepted_cancellation"].is_string() {
+        // Keep already-authored cancelled-drain supplements byte-semantically
+        // stable on replay; only the distinct uncancelled ordering needs this
+        // separate persisted acceptance observation.
+        evidence["logical_cancellation"] = cancellation;
+    }
     state.retain_native_runtime_cancellation(&retained.lease.owner, &evidence)?;
     Ok(Some(evidence))
+}
+
+/// The request's persisted timestamp/token is separate from the original drain
+/// observer's cancellation field. NULL there is not backdated into an acceptance.
+fn logical_cancellation_observation(
+    state: &StateDb,
+    lease: &ProviderLaunchLease,
+) -> Result<serde_json::Value, String> {
+    let (launch, requested): (String, String) = state.connection().query_row(
+        "SELECT l.logical_launch_id,l.cancel_requested_at FROM provider_logical_launches l JOIN provider_launch_attempts a ON a.attempt_id=l.current_attempt_id WHERE l.logical_launch_id=?1 AND a.attempt_id=?2 AND a.runtime_generation_uuid=?3 AND a.invocation_uuid=?4 AND l.status IN ('cancelling','cancelled') AND l.cancel_requested_at IS NOT NULL",
+        rusqlite::params![lease.owner.logical_launch_id.to_string(), lease.owner.attempt_id.to_string(), lease.runtime_generation_uuid.to_string(), lease.owner.invocation_uuid.to_string()],
+        |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| format!("native_logical_cancellation_absent: {e}"))?;
+    Ok(
+        serde_json::json!({"logical_launch_id":launch,"requested_at":requested,
+        "token":format!("{launch}:{requested}")}),
+    )
 }
 
 fn complete_actor_receipts(actors: &[ActorSettlementReceipt]) -> bool {
@@ -1524,7 +1547,36 @@ mod tests {
         );
     }
     #[test]
-    fn recovered_dead_prelaunch_requires_original_cancelled_drain() {
+    fn logical_cancellation_keeps_actual_acceptance_separate_and_exact() {
+        let (_dir, attempt, _) = fixture();
+        let state = attempt.state.lock().unwrap();
+        let lease = &attempt.allocation.lease;
+        assert!(logical_cancellation_observation(&state, lease).is_err());
+        state.request_cancel(lease.owner.logical_launch_id).unwrap();
+        let accepted = logical_cancellation_observation(&state, lease).unwrap();
+        assert!(accepted["requested_at"].is_string());
+        assert_eq!(
+            accepted["logical_launch_id"],
+            lease.owner.logical_launch_id.to_string()
+        );
+        state.request_cancel(lease.owner.logical_launch_id).unwrap();
+        assert_eq!(
+            logical_cancellation_observation(&state, lease).unwrap(),
+            accepted
+        );
+        let mut wrong = lease.clone();
+        wrong.runtime_generation_uuid = Uuid::new_v4();
+        assert!(logical_cancellation_observation(&state, &wrong).is_err());
+        let mut wrong = lease.clone();
+        wrong.owner.invocation_uuid = Uuid::new_v4();
+        assert!(logical_cancellation_observation(&state, &wrong).is_err());
+        let mut wrong = lease.clone();
+        wrong.owner.attempt_id = Uuid::new_v4();
+        assert!(logical_cancellation_observation(&state, &wrong).is_err());
+    }
+
+    #[test]
+    fn recovered_dead_prelaunch_requires_original_drain() {
         let (_dir, attempt, _) = fixture();
         register_allocated_runtime_generation_starting(&attempt.spawn).unwrap();
         for operation in ["describe", "policy.evaluate", "launch"] {

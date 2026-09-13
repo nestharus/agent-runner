@@ -159,7 +159,7 @@ pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> 
 
 fn reap(live: &mut HashMap<i64, String>) {
     loop {
-        let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        let pid = super::custody::reap_unprotected(&mut 0);
         if pid <= 0 {
             #[cfg(feature = "age360-fault-fixtures")]
             if pid < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {

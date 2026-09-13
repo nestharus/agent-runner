@@ -244,7 +244,7 @@ fn guardian(
     loop {
         loop {
             let mut status = 0;
-            let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+            let pid = super::custody::reap_unprotected(&mut status);
             if pid <= 0 {
                 if closing
                     && pid < 0

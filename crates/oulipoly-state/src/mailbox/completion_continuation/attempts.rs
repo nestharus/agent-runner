@@ -611,7 +611,10 @@ impl MailboxDb {
         let drain = self
             .native_original_drain(generation, invocation)?
             .ok_or("native_original_drain_absent")?;
-        if !drain["receipt"]["accepted_cancellation"].is_string() {
+        // An explicitly never-invoked Launch projects startup failure from its
+        // original physical drain, not from a claim of earlier cancellation.
+        // Launched work still requires original cancellation evidence.
+        if !launch_never_invoked && !drain["receipt"]["accepted_cancellation"].is_string() {
             return Err("original_native_cancellation_absent".into());
         }
         let id = RuntimeGenerationId::parse(generation).map_err(|e| e.to_string())?;

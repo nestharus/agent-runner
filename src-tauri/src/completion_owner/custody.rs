@@ -160,7 +160,7 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
         .map_err(|e| e.to_string())?;
     drop(gate_file);
     MailboxDb::open(path)?.accept_continuation_attempt(attempt)?;
-    let (mut release, gate) = match UnixStream::pair() {
+    let (mut release, gate) = match birth_channel() {
         Ok(pair) => pair,
         Err(e) => {
             let reason = format!("custodian gate creation failed: {e}");
@@ -203,7 +203,17 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
         // Only EOF can lead to an original terminal wait. Guardian succession
         // must not block behind a live stalled adopter or infer its drain.
         if error.kind() == std::io::ErrorKind::UnexpectedEof {
-            retain_unreleased_adopter_loss(path, attempt, &adopter, &driver)?;
+            // Register retry ownership before the first fallible observation or
+            // publication. The generic reaper must never consume this wait.
+            PENDING_UNRELEASED.with_borrow_mut(|pending| {
+                pending.push(PendingUnreleased {
+                    path: path.into(),
+                    attempt: attempt.clone(),
+                    adopter,
+                    driver,
+                })
+            });
+            retry_unreleased();
         }
         return Err(error.to_string());
     }
@@ -215,6 +225,31 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
     mailbox.advance_continuation_attempt(attempt, 3, "accepted", "starting", &identity)?;
     release.write_all(&[1]).map_err(|e| e.to_string())?;
     Ok(i64::from(pid))
+}
+
+/// Birth and grant are small whole records. Packet boundaries prevent a child
+/// dying during an announcement from splicing a partial PID with the adopter's
+/// later terminal announcement. Both records carry the same unreaped child PID.
+fn birth_channel() -> std::io::Result<(UnixStream, UnixStream)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [-1; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe {
+        (
+            UnixStream::from_raw_fd(fds[0]),
+            UnixStream::from_raw_fd(fds[1]),
+        )
+    })
 }
 
 fn read_ac_announcement(
@@ -277,11 +312,14 @@ fn retain_unreleased_adopter_loss(
             libc::P_PID,
             adopter.pid as u32,
             &mut info,
-            libc::WEXITED | libc::WNOWAIT,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
         )
     } != 0
     {
         return Err(std::io::Error::last_os_error().to_string());
+    }
+    if unsafe { info.si_pid() } == 0 {
+        return Err("original adopter is not yet waitable".into());
     }
     if super::linux::identity(adopter.pid)? != *adopter {
         return Err("waited adopter identity changed".into());
@@ -308,6 +346,58 @@ fn retain_unreleased_adopter_loss(
         .record_continuation_unreleased_before_announcement(attempt, &receipt.to_string())?;
     // The driver reaper consumes the wait only after this retained integration.
     Ok(())
+}
+
+struct PendingUnreleased {
+    path: std::path::PathBuf,
+    attempt: ContinuationAttempt,
+    adopter: oulipoly_state::completion_continuation::SourceProcessIdentity,
+    driver: oulipoly_state::completion_continuation::SourceProcessIdentity,
+}
+thread_local! {
+    static PENDING_UNRELEASED: std::cell::RefCell<Vec<PendingUnreleased>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One try per pending attempt per reap pass, not a retry-until-success loop. Other children and
+/// endpoint/recovery work remain serviceable during one receipt's I/O failure.
+fn retry_unreleased() {
+    let current = i64::from(std::process::id());
+    PENDING_UNRELEASED.with_borrow_mut(|pending| {
+        // fork copies memory but never transfers the parent's wait authority.
+        pending.retain(|p| p.driver.pid == current);
+        pending.retain(|p| {
+            retain_unreleased_adopter_loss(&p.path, &p.attempt, &p.adopter, &p.driver).is_err()
+        });
+    });
+}
+
+/// Shared by CD and its guardian succession: retry original evidence first,
+/// then reap unprotected exact child PIDs. Enumerating candidates is not drain
+/// evidence; only waitpid/waitid supply terminal/ECHILD observations.
+pub(super) fn reap_unprotected(status: &mut i32) -> i32 {
+    retry_unreleased();
+    let protected = PENDING_UNRELEASED
+        .with_borrow(|pending| pending.iter().map(|p| p.adopter.pid).collect::<Vec<_>>());
+    if protected.is_empty() {
+        return unsafe { libc::waitpid(-1, status, libc::WNOHANG) };
+    }
+    let Ok(children) = std::fs::read_to_string("/proc/thread-self/children") else {
+        return 0;
+    };
+    for pid in children
+        .split_whitespace()
+        .filter_map(|v| v.parse::<i32>().ok())
+    {
+        if protected.contains(&i64::from(pid)) {
+            continue;
+        }
+        let waited = unsafe { libc::waitpid(pid, status, libc::WNOHANG) };
+        if waited > 0 {
+            return waited;
+        }
+    }
+    // A protected wait still exists. Never turn enumeration into ECHILD.
+    0
 }
 
 pub(super) fn entry() -> Result<(), String> {
@@ -760,12 +850,9 @@ fn adopt(
         drop(ac_release);
         #[cfg(feature = "age360-fault-fixtures")]
         oulipoly_state::completion_continuation::age360_fault_barrier("ac-created-before-announce");
-        if gate
-            .write_all(&unsafe { libc::getpid() }.to_ne_bytes())
-            .is_err()
-        {
-            unsafe { libc::_exit(70) }
-        }
+        // Receiver loss withdraws the only grant; it must not kill the original
+        // self-receipt producer. Exec still reaches the unreleased/ECHILD path.
+        let _ = gate.write_all(&unsafe { libc::getpid() }.to_ne_bytes());
         drop(gate);
         let gate_fd = ac_gate.as_raw_fd();
         let flags = unsafe { libc::fcntl(gate_fd, libc::F_GETFD) };
@@ -792,7 +879,7 @@ fn adopt(
     // adopter death closes AC's separate gate; AC then retains its own exact
     // unreleased/ECHILD receipt. Neither a new owner nor a timeout grants work.
     let mut grant = [0];
-    if gate.read_exact(&mut grant).is_ok() && grant == [1] {
+    if read_original_grant(&mut gate, pid, &custodian, &mut grant).is_ok() && grant == [1] {
         #[cfg(feature = "age360-fault-fixtures")]
         oulipoly_state::completion_continuation::age360_fault_barrier("adopter-before-ac-release");
         let _ = ac_release.write_all(&grant);
@@ -892,6 +979,64 @@ fn adopt(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// A living unannounced AC retains birth authority. Only its original parent,
+/// observing that exact child with WNOWAIT, may relay its terminal identity.
+/// The wait stays unconsumed until the ordinary adopting journal retains it.
+fn read_original_grant(
+    gate: &mut UnixStream,
+    pid: i32,
+    custodian: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+    grant: &mut [u8; 1],
+) -> Result<(), String> {
+    gate.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let mut terminal_announced = false;
+    loop {
+        match gate.read(grant) {
+            Ok(1) => return Ok(()),
+            Ok(_) => return Err("original grant endpoint closed".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if !terminal_announced && exact_child_terminal(pid, custodian)? {
+            // At most one extra four-byte announcement, after AC can no longer
+            // write. If AC already announced, CD has its first complete PID;
+            // this cannot change attachment or manufacture an execution grant.
+            gate.set_nonblocking(false).map_err(|e| e.to_string())?;
+            gate.write_all(&pid.to_ne_bytes())
+                .map_err(|e| e.to_string())?;
+            gate.set_nonblocking(true).map_err(|e| e.to_string())?;
+            terminal_announced = true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn exact_child_terminal(
+    pid: i32,
+    expected: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+) -> Result<bool, String> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as u32,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(false);
+    }
+    if super::linux::identity(i64::from(pid))? != *expected {
+        return Err("original terminal child incarnation conflict".into());
+    }
+    Ok(true)
 }
 
 /// Inspect the waitable child before consuming its PID, preserving incarnation
