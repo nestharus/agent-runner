@@ -19,6 +19,11 @@ workload is launched by completion recovery.
   original boundary. It polls cancellation and signals only its own children,
   waits the exact AC and then ECHILD, retains an adopting receipt and integrates
   against the exact registered adopter/custodian identities.
+- CD/adopter announcement and adopter/AC launch release use separate sockets.
+  AC closes the announcement endpoint before exec; adopter relays only the real
+  CD grant after attachment. Adopter loss after AC fork therefore closes the
+  original AC's release gate instead of creating a circular CD/AC read. A live
+  original AC can certify the unreleased gate and actual ECHILD without launching.
 - Database observation runs off the physical wait loop. Raw terminal waits retain
   their process incarnation before reaping, so a delayed launcher identity read
   cannot discard cancellation evidence. These reads do not impose a workload
@@ -33,8 +38,16 @@ Simultaneous loss of both per-attempt owners **without a retained result** is
 still unknown physical custody. A replacement domain owner does not certify that
 old tree. The new per-attempt adopting boundary adds a process and retained records;
 it is not a proof against arbitrary repeated owner loss or a production capacity
-claim. Pre-attachment fork/exec failure orders still require further native fault
-coverage and disposition; retained accepted uncertainty is not completion.
+claim. The existing original CD/CG are subreapers, but their shared reap loops do
+not retain per-attempt wait/cancellation association. Their actual domain-wide
+ECHILD is not currently integrated as an original-custody certificate. This is a
+continuing-ownership gap even without losing or replacing CD/CG.
+
+Pre-attachment orders are distinct: adopter death before AC fork produces no AC
+receipt; adopter death after AC fork may leave an original AC able to certify an
+unreleased gate; CD loss before attachment can also leave that genuine original
+AC receipt. AC exec failure or loss of both receipt producers is not covered by
+that counterexample. Retained accepted uncertainty is not completed recovery.
 
 ## Publication and output
 
@@ -88,6 +101,11 @@ Boundaries:
 | `driver-replay` | Driver before retained-result replay |
 | `activation-observation` | Observer thread before DB read, physical wait loop remains live |
 | `adopted-terminal-wait` | Fixture-only pause after retaining an actual terminal wait |
+| `adopter-before-ac-fork` | Original adopter before creating AC; reservation already accepted |
+| `adopter-before-ac-announce` | Original adopter after AC fork, before announcing AC to CD |
+| `attempt-before-attachment` | CD received AC PID, before State custodian/adopter attachment |
+| `adopter-before-ac-release` | Original CD grant received after attachment, before forwarding grant to AC |
+| `driver-reaped-echild` | Actual original CD reap loop observed ECHILD; fixture observation only, never attempt discharge |
 
 `src-tauri/tests/age360_completion_continuation.rs` uses private user/network/PID/
 mount namespaces and an external-process local provider. `native_` cases do not
@@ -96,3 +114,22 @@ claim Bash/source pairing. Four paired cases require explicit
 or simulated fallback. The two added paired cases discriminate early exit and
 complete artifact output. The full root-owned paired fault matrix remains larger
 than these four cases; no fixture or feature flag proves that matrix ran.
+
+`fixtures/age360/custody_faults.rs` discriminates those native pre-attachment and
+combined attempt-owner loss orders. Tests named `observes_unresolved_*` are
+explicit **gap characterizations**, not recovery acceptance tests: a passing test
+means unresolved debt was observed. In particular, observing original CD adopt
+and reap descendants without producing an attempt receipt must not be reported
+as completed recovery. Namespace teardown contains remaining test processes; it
+is never product drain evidence.
+
+Native State-token cancellation tests require an actual logical launch joined to
+the activation's runtime generation and invocation before calling
+`StateDb::request_cancel`, then require the exact token in the AC/adopter receipt.
+They do not insert synthetic launch rows or send terminal signals. **Currently
+both tests fail at the real State join**: the native streaming fixture creates
+no `provider_launch_attempts` row. The observer's logical-launch cancellation
+query is implemented but has no native producer link in this candidate. Actual
+State-linked cancellation is therefore unverified and unfulfilled here, not
+covered by the passing terminal-signal cancellation tests. These red tests are
+retained requirements, not ignored tests or a completed cancellation matrix.

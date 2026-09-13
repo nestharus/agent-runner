@@ -131,6 +131,13 @@ fn reap(live: &mut HashMap<i64, String>) {
     loop {
         let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
         if pid <= 0 {
+            #[cfg(feature = "age360-fault-fixtures")]
+            if pid < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                // Test observation only, never an attempt-discharge certificate.
+                oulipoly_state::completion_continuation::age360_fault_barrier(
+                    "driver-reaped-echild",
+                );
+            }
             break;
         }
         // Custodian exit is not converted to drain. Only its exact durable

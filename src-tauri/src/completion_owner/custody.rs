@@ -173,6 +173,8 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
     let adopter = super::linux::identity(i64::from(pid))?;
     let mut worker = [0; 4];
     release.read_exact(&mut worker).map_err(|e| e.to_string())?;
+    #[cfg(feature = "age360-fault-fixtures")]
+    oulipoly_state::completion_continuation::age360_fault_barrier("attempt-before-attachment");
     let identity = super::linux::identity(i64::from(i32::from_ne_bytes(worker)))?;
     let mut mailbox = MailboxDb::open(path)?;
     mailbox.attach_continuation_custodian_with_adopter(attempt, &identity, Some(&adopter))?;
@@ -594,22 +596,52 @@ fn adopt(
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
+    // Announcement and launch release have distinct peer lifetimes. AC must
+    // not inherit the CD/adopter endpoint: otherwise adopter loss before its
+    // PID announcement leaves CD waiting for PID and AC waiting for release,
+    // each keeping the other's peer alive forever.
+    let (mut ac_release, ac_gate) = UnixStream::pair().map_err(|e| e.to_string())?;
+    #[cfg(feature = "age360-fault-fixtures")]
+    oulipoly_state::completion_continuation::age360_fault_barrier("adopter-before-ac-fork");
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
     if pid == 0 {
+        drop(gate);
+        drop(ac_release);
+        let gate_fd = ac_gate.as_raw_fd();
+        let flags = unsafe { libc::fcntl(gate_fd, libc::F_GETFD) };
+        if flags < 0
+            || unsafe { libc::fcntl(gate_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
+        {
+            unsafe { libc::_exit(70) }
+        }
         let _error = Command::new("/proc/self/exe")
             .arg(CUSTODIAN_ARG)
-            .arg(gate.as_raw_fd().to_string())
+            .arg(gate_fd.to_string())
             .arg(file.as_raw_fd().to_string())
             .exec();
         unsafe { libc::_exit(70) }
     }
+    drop(ac_gate);
     let custodian = super::linux::identity(i64::from(pid))?;
     let adopter = super::linux::identity(i64::from(std::process::id()))?;
-    // Even a broken parent gate does not relinquish the children just forked.
-    let _ = gate.write_all(&pid.to_ne_bytes());
+    #[cfg(feature = "age360-fault-fixtures")]
+    oulipoly_state::completion_continuation::age360_fault_barrier("adopter-before-ac-announce");
+    // Relay only the actual original driver's grant after attachment. EOF or
+    // adopter death closes AC's separate gate; AC then retains its own exact
+    // unreleased/ECHILD receipt. Neither a new owner nor a timeout grants work.
+    let mut grant = [0];
+    if gate.write_all(&pid.to_ne_bytes()).is_ok()
+        && gate.read_exact(&mut grant).is_ok()
+        && grant == [1]
+    {
+        #[cfg(feature = "age360-fault-fixtures")]
+        oulipoly_state::completion_continuation::age360_fault_barrier("adopter-before-ac-release");
+        let _ = ac_release.write_all(&grant);
+    }
+    drop(ac_release);
     drop(gate);
     drop(file);
     let path = &request.path;

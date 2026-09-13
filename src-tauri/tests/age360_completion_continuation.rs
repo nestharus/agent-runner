@@ -2,6 +2,9 @@
 //! Each case re-execs in private user/network/PID/mount namespaces. PID namespace
 //! teardown contains failure descendants; product NoDeadline is not modified.
 #![cfg(target_os = "linux")]
+#[cfg(feature = "age360-fault-fixtures")]
+#[path = "fixtures/age360/custody_faults.rs"]
+mod custody_faults;
 mod provider_authority_fixture;
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::read_live_process_identity;
@@ -687,7 +690,7 @@ fn native_activation_custody(owner_loss: u8) {
         f.gate("adopted-terminal-wait.hold");
     }
     f.gate("test-descendant-enabled");
-    if matches!(owner_loss, 3 | 6 | 8) {
+    if matches!(owner_loss, 3 | 6 | 8 | 9 | 10) {
         f.gate("cancel-probe-enabled");
     }
     f.gate("release-resume");
@@ -852,7 +855,7 @@ fn native_activation_custody(owner_loss: u8) {
             attempt.attempt_id
         );
     }
-    if matches!(owner_loss, 5 | 6 | 8) {
+    if matches!(owner_loss, 5 | 6 | 8 | 10) {
         let custodian: oulipoly_state::completion_continuation::SourceProcessIdentity =
             serde_json::from_str(&custodian).unwrap();
         assert!(current_identity_matches(&custodian));
@@ -878,7 +881,7 @@ fn native_activation_custody(owner_loss: u8) {
     ));
     drop(writer);
     drop(mailbox);
-    if matches!(owner_loss, 3 | 6 | 8) {
+    if matches!(owner_loss, 3 | 6 | 8 | 9 | 10) {
         wait(|| {
             f.root
                 .path()
@@ -889,11 +892,15 @@ fn native_activation_custody(owner_loss: u8) {
         let launcher: oulipoly_state::completion_continuation::SourceProcessIdentity =
             serde_json::from_str(&launcher).unwrap();
         assert!(current_identity_matches(&launcher));
-        assert_eq!(unsafe { libc::kill(launcher.pid as i32, libc::SIGTERM) }, 0);
-        println!(
-            "terminal cancellation exact launcher={}",
-            serde_json::to_string(&launcher).unwrap()
-        );
+        if matches!(owner_loss, 9 | 10) {
+            request_linked_cancel(&f, &attempt);
+        } else {
+            assert_eq!(unsafe { libc::kill(launcher.pid as i32, libc::SIGTERM) }, 0);
+            println!(
+                "terminal cancellation exact launcher={}",
+                serde_json::to_string(&launcher).unwrap()
+            );
+        }
         if owner_loss == 8 {
             wait(|| {
                 f.root
@@ -920,7 +927,7 @@ fn native_activation_custody(owner_loss: u8) {
     assert_eq!(receipt.0, "drained");
     assert_eq!(receipt.1, 1);
     assert!(receipt.2.contains("ECHILD"));
-    if matches!(owner_loss, 5 | 6 | 8) {
+    if matches!(owner_loss, 5 | 6 | 8 | 10) {
         let value: serde_json::Value = serde_json::from_str(&receipt.2).unwrap();
         assert_eq!(
             value["classification"],
@@ -929,9 +936,13 @@ fn native_activation_custody(owner_loss: u8) {
         assert!(value["adopter"].is_object());
         assert_eq!(value["custodian_wait_status"], libc::SIGKILL);
     }
-    if matches!(owner_loss, 3 | 6 | 8) {
+    if matches!(owner_loss, 3 | 6 | 8 | 9 | 10) {
         let receipt: serde_json::Value = serde_json::from_str(&receipt.2).unwrap();
         assert!(receipt["accepted_cancellation"].is_string(), "{receipt}");
+        if matches!(owner_loss, 9 | 10) {
+            let expected = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
+            assert_eq!(receipt["accepted_cancellation"], expected);
+        }
         assert!(!f.root.path().join("release-descendant").exists());
         assert!(read_live_process_identity(descendant).unwrap().is_none());
     }
@@ -1165,5 +1176,51 @@ impl Drop for Fixture {
                 }
             }
         }
+    }
+}
+
+// Native token cancellation uses the same State API as runtime cancellation,
+// joined to the actual activation invocation. No fixture-written launch rows.
+fn request_linked_cancel(f: &Fixture, attempt: &oulipoly_state::mailbox::ContinuationAttempt) {
+    let (generation, invocation) = f
+        .mailbox()
+        .continuation_runtime_identity(attempt)
+        .unwrap()
+        .unwrap();
+    let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+    let count: i64 = state
+        .connection()
+        .query_row("SELECT COUNT(*) FROM provider_launch_attempts", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    println!(
+        "State launch-attempt rows={count}; requiring actual join runtime={generation} invocation={invocation}"
+    );
+    let launch: String = state.connection().query_row(
+        "SELECT logical_launch_id FROM provider_launch_attempts WHERE runtime_generation_uuid=?1 AND invocation_uuid=?2",
+        rusqlite::params![generation, invocation], |r| r.get(0)).expect("native activation lacks actual State logical-launch cancellation link; synthetic rows are forbidden");
+    state
+        .request_cancel(uuid::Uuid::parse_str(&launch).unwrap())
+        .unwrap();
+    let token: String = state.connection().query_row(
+        "SELECT logical_launch_id || ':' || cancel_requested_at FROM provider_logical_launches WHERE logical_launch_id=?1",
+        [&launch], |r| r.get(0)).unwrap();
+    fs::write(f.root.path().join("state-cancel-token"), &token).unwrap();
+    println!(
+        "actual State cancellation token={token} runtime={generation} invocation={invocation}"
+    );
+}
+
+#[test]
+fn native_state_linked_token_cancellation_drains_resistant_activation() {
+    if !private_case(false) {
+        native_activation_custody(9);
+    }
+}
+#[test]
+fn native_state_linked_token_cancellation_after_ac_loss_drains_original_adopter() {
+    if !private_case(false) {
+        native_activation_custody(10);
     }
 }
