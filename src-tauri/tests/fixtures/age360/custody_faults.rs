@@ -625,6 +625,131 @@ fn native_guardian_succession_is_not_blocked_by_live_adopter_announcement() {
     );
 }
 
+// Policy is advertised and evaluated on every dispatch in this fixture, unlike
+// Describe which may legitimately be cached. The barrier remains attributed to
+// the exact original actor; a not-invoked operation cannot satisfy it.
+fn canonical_receipts(value: &serde_json::Value) -> Vec<String> {
+    let mut receipts: Vec<_> = value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| serde_json::to_string(v).unwrap())
+        .collect();
+    receipts.sort();
+    receipts
+}
+
+// Independent original-side census. Never read the recovery supplement here.
+fn original_operation_population(
+    root: &std::path::Path,
+    attempt: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let read = |path: PathBuf| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    };
+    assert!(attempt.as_str().is_some());
+    let mut receipts = Vec::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.file_name().unwrap() == "admissions" || path.file_name().unwrap() == "not-invoked" {
+            continue;
+        }
+        let receipt = read(path.join("finished.json"));
+        assert_eq!(&receipt["attempt_id"], attempt);
+        receipts.push(receipt);
+    }
+    let mut never_invoked = Vec::new();
+    if root.join("not-invoked").exists() {
+        for entry in fs::read_dir(root.join("not-invoked")).unwrap() {
+            let receipt = read(entry.unwrap().path().join("finished.json"));
+            assert_eq!(&receipt["attempt_id"], attempt);
+            assert_eq!(receipt["spawned"], false);
+            never_invoked.push(receipt);
+        }
+    }
+    for (operation, variant) in [
+        ("describe", "Describe"),
+        ("policy.evaluate", "Policy"),
+        ("launch", "Launch"),
+    ] {
+        let admission = read(root.join("admissions").join(format!("{operation}.json")));
+        assert_eq!(&admission["attempt_id"], attempt);
+        assert_eq!(admission["operation"], operation);
+        let admitted = admission["admitted"]
+            .as_bool()
+            .expect("original admission must be explicit");
+        let original: Vec<_> = never_invoked
+            .iter()
+            .filter(|r| r["operation"] == variant)
+            .collect();
+        if admitted {
+            assert!(
+                receipts.iter().any(|r| r["operation"] == variant),
+                "admitted outcome absent"
+            );
+            assert!(
+                original.is_empty(),
+                "conflicting original operation evidence"
+            );
+        } else {
+            assert!(!receipts.iter().any(|r| r["operation"] == variant));
+            let expected = serde_json::json!({"attempt_id":attempt,"operation":variant,
+                "spawned":false,"exact_process_identity":null,"process_status":null,
+                "process_tree_terminated":false,"leader_reaped":false,"force_killed":false,
+                "host_cancellation_requested":false,"operation_finished":true,"uncertain":false});
+            for receipt in original {
+                assert_eq!(receipt, &expected);
+            }
+            receipts.push(expected);
+        }
+    }
+    receipts
+}
+
+#[test]
+fn original_operation_population_requires_exact_explicit_admissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("admissions")).unwrap();
+    let attempt = serde_json::json!(uuid::Uuid::new_v4());
+    for operation in ["describe", "policy.evaluate", "launch"] {
+        fs::write(
+            root.join("admissions").join(format!("{operation}.json")),
+            serde_json::to_vec(
+                &serde_json::json!({"attempt_id":attempt,"operation":operation,"admitted":false}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    let expected = original_operation_population(root, &attempt);
+    assert_eq!(expected.len(), 3);
+    let nested = root.join("not-invoked/original-describe");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(
+        nested.join("finished.json"),
+        serde_json::to_vec(&expected[0]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(original_operation_population(root, &attempt), expected);
+    let gate = root.join("admissions/describe.json");
+    for invalid in [
+        serde_json::json!({"attempt_id":attempt,"operation":"describe"}),
+        serde_json::json!({"attempt_id":"wrong-attempt","operation":"describe","admitted":false}),
+        serde_json::json!({"attempt_id":attempt,"operation":"describe","admitted":true}),
+    ] {
+        fs::write(&gate, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| original_operation_population(root, &attempt)).is_err()
+        );
+    }
+    fs::remove_file(&gate).unwrap();
+    assert!(std::panic::catch_unwind(|| original_operation_population(root, &attempt)).is_err());
+    println!(
+        "original census: nested not-invoked retained; missing, malformed, wrong-attempt, conflicting admissions rejected"
+    );
+}
+
 fn uncertain_aggregate_recovery(restore_producer: bool) {
     if private_case(false) {
         return;
@@ -639,12 +764,12 @@ fn uncertain_aggregate_recovery(restore_producer: bool) {
             .exists()
             .then_some(())
     });
-    f.gate("hold-native-describe");
+    f.gate("hold-native-policy.evaluate");
     f.gate("native-after-custody-retention.hold");
     enqueue(&f);
     f.gate("release-initial-provider");
     f.wait_initial(&mut initial);
-    reached(&f, "native-describe");
+    reached(&f, "native-policy.evaluate");
     let a = attempt(&f);
     let (generation, invocation) =
         wait(|| f.mailbox().continuation_runtime_identity(&a).ok().flatten());
@@ -660,13 +785,22 @@ fn uncertain_aggregate_recovery(restore_producer: bool) {
         .unwrap()
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .find(|p| p.join("proxy.stat").exists())
+        .find(|p| {
+            let intent = fs::read(p.join("intent.json"))
+                .ok()
+                .and_then(|v| serde_json::from_slice::<serde_json::Value>(&v).ok());
+            p.join("proxy.stat").exists()
+                && intent.is_some_and(|v| {
+                    v["operation"] == "Policy"
+                        && v["attempt_id"] == source["lease"]["owner"]["attempt_id"]
+                })
+        })
         .unwrap();
     let terminal = actor.join("terminal.json");
     // A real rename-to-directory failure in the producer's terminal journal.
     // The fixture never writes a receipt, aggregate, wait, or public proof.
     fs::create_dir(&terminal).unwrap();
-    fs::remove_file(f.root.path().join("hold-native-describe")).unwrap();
+    fs::remove_file(f.root.path().join("hold-native-policy.evaluate")).unwrap();
     reached(&f, "native-after-custody-retention");
     let original = state
         .native_attempt_custody(generation, invocation)
@@ -1674,12 +1808,10 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
     let source = state.native_attempt_recovery(g, i).unwrap().unwrap();
     let journal = PathBuf::from(source["journal"].as_str().unwrap());
     let original = original_stored.clone().unwrap_or_else(|| {
-        let actors: Vec<serde_json::Value> = fs::read_dir(journal.join("actors"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter_map(|e| fs::read(e.path().join("finished.json")).ok())
-            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
-            .collect();
+        let actors = original_operation_population(
+            &journal.join("actors"),
+            &source["lease"]["owner"]["attempt_id"],
+        );
         serde_json::json!({"lease":source["lease"],"actors":actors})
     });
     let operations: Vec<serde_json::Value> = if journal.join("runtime-exit").exists() {
@@ -2031,7 +2163,16 @@ fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: boo
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(supplement["original_actor_receipts"], original["actors"]);
+        if preaggregate {
+            // Directory order is not operation identity. Compare every full original
+            // receipt, independently collected before recovery, with multiplicity.
+            assert_eq!(
+                canonical_receipts(&supplement["original_actor_receipts"]),
+                canonical_receipts(&original["actors"])
+            );
+        } else {
+            assert_eq!(supplement["original_actor_receipts"], original["actors"]);
+        }
         assert_eq!(supplement["original_drain"]["receipt"], drain);
         assert_eq!(supplement["logical_cancellation"]["token"], token);
         println!("unchanged generic recovery plus original attempted runtime outcome={supplement}");
