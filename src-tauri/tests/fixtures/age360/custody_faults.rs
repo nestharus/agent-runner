@@ -2401,3 +2401,147 @@ fn native_owner_retries_adopter_identity_read_preserves_original_wait() {
     assert_eq!(receipt["owned_children"], "ECHILD");
     assert!(!f.root.path().join("resume-prompts.jsonl").exists());
 }
+
+fn postlaunch_cancel_with_retained_ac_wait(identity_failure: bool) {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    if identity_failure {
+        let shim = f.root.path().join("identity-read-fail.c");
+        fs::write(&shim, include_str!("identity-read-fail.c")).unwrap();
+        assert!(
+            Command::new("cc")
+                .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror", "-o"])
+                .arg(f.root.path().join("identity-read-fail.so"))
+                .arg(&shim)
+                .arg("-ldl")
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    f.gate("test-descendant-enabled");
+    f.gate("cancel-probe-enabled");
+    f.gate("release-resume");
+    let owner = start_pre_attachment(&f);
+    let descendant = process_identity(wait(|| {
+        fs::read_to_string(f.root.path().join("descendant.pid"))
+            .ok()?
+            .parse()
+            .ok()
+    }));
+    wait(|| {
+        f.root
+            .path()
+            .join("cancel-descendant-ready")
+            .exists()
+            .then_some(())
+    });
+    let a = attempt(&f);
+    let (ac, adopter): (String, String) = f.sidecar_connection().query_row(
+        "SELECT custodian_identity,adopter_identity FROM completion_continuation_attempt WHERE attempt_id=?1",
+        [&a.attempt_id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    let ac: SourceProcessIdentity = serde_json::from_str(&ac).unwrap();
+    let adopter: SourceProcessIdentity = serde_json::from_str(&adopter).unwrap();
+    let waits = PathBuf::from(&a.result_path).with_file_name("owned-waits");
+    let ac_journal = waits.join(format!(
+        "{}-{}-{}.json",
+        ac.pid, ac.starttime_ticks, adopter.pid
+    ));
+    let arm = f.root.path().join("identity-read-target");
+    // Intervene only on acquisition/retention; no fixture creates a receipt.
+    if identity_failure {
+        fs::write(&arm, format!("{} {}", adopter.pid, ac.pid)).unwrap();
+    } else {
+        fs::create_dir_all(&ac_journal).unwrap(); // actual rename-to-directory failure
+    }
+    kill_exact(&ac);
+    wait_task_state(&ac, "Z");
+    // Remove intervening original actors, not the tested descendant, so no
+    // surviving provider/runtime reaper can satisfy the signaling assertion.
+    let mut ancestors = Vec::new();
+    let mut cursor = parent(descendant.pid);
+    while cursor != adopter.pid {
+        assert!(cursor > 1 && cursor != owner.driver_identity.pid);
+        let identity = process_identity(cursor);
+        stop_exact(&identity);
+        cursor = parent(cursor);
+        ancestors.push(identity);
+    }
+    for identity in &ancestors {
+        kill_exact(identity);
+    }
+    wait(|| (parent(descendant.pid) == adopter.pid).then_some(()));
+    assert!(current_identity_matches(&descendant));
+    assert_unresolved(&f, &a);
+    request_linked_cancel(&f, &a); // must return accepted before consequence check
+    // AC cannot signal; its original adopter must progress through TERM/KILL
+    // while the exact AC wait remains unconsumed. No replacement is scheduled.
+    wait_task_state(&descendant, "Z");
+    assert_eq!(parent(descendant.pid), adopter.pid);
+    wait_task_state(&ac, "Z");
+    assert!(current_identity_matches(&adopter));
+    assert!(current_identity_matches(&owner.driver_identity));
+    assert_unresolved(&f, &a);
+    println!(
+        "descendant cancellation observed before restoring AC wait: ac={ac:?} adopter={adopter:?} descendant={descendant:?}"
+    );
+    if identity_failure {
+        let errors = fs::read_to_string(f.root.path().join("identity-read-errors")).unwrap();
+        assert!(!errors.is_empty());
+        assert!(!ac_journal.exists());
+        println!("actual identity obstruction={errors}");
+        fs::remove_file(&arm).unwrap();
+    } else {
+        assert!(ac_journal.is_dir());
+        let prefix = format!("{}-{}-{}.tmp-", ac.pid, ac.starttime_ticks, adopter.pid);
+        let failed_retention = fs::read_dir(&waits)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .expect("original adopter must have attempted real journal retention");
+        println!(
+            "actual failed rename retained temporary observation={}",
+            fs::read_to_string(failed_retention.path()).unwrap()
+        );
+        fs::remove_dir(&ac_journal).unwrap();
+    }
+    let receipt = wait_drained_attempt(&f, &a);
+    assert_eq!(
+        receipt["classification"],
+        "original_adopting_boundary_drained"
+    );
+    assert_eq!(receipt["adopter"], serde_json::to_value(&adopter).unwrap());
+    assert_eq!(receipt["custodian"], serde_json::to_value(&ac).unwrap());
+    assert_eq!(receipt["custodian_wait_status"], libc::SIGKILL);
+    assert_eq!(receipt["owned_children"], "ECHILD");
+    assert!(receipt["accepted_cancellation"].is_string());
+    assert!(ac_journal.is_file());
+    let descendant_journal = waits.join(format!(
+        "{}-{}-{}.json",
+        descendant.pid, descendant.starttime_ticks, adopter.pid
+    ));
+    let observed: serde_json::Value =
+        serde_json::from_slice(&fs::read(descendant_journal).unwrap()).unwrap();
+    assert_eq!(
+        observed["process"],
+        serde_json::to_value(&descendant).unwrap()
+    );
+    assert_eq!(observed["owner"], serde_json::to_value(&adopter).unwrap());
+    assert_eq!(observed["status"], libc::SIGKILL);
+    assert_eq!(observed["observation"], "waitid_wnowait");
+    println!(
+        "restored original wait and genuine discharge={receipt}; descendant actual wait={observed}"
+    );
+}
+
+#[test]
+fn native_channel_cancellation_after_ac_death_with_identity_obstructed() {
+    postlaunch_cancel_with_retained_ac_wait(true);
+}
+
+#[test]
+fn native_channel_cancellation_after_ac_death_with_wait_journal_obstructed() {
+    postlaunch_cancel_with_retained_ac_wait(false);
+}

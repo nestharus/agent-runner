@@ -1068,7 +1068,11 @@ fn adopt(
                 std::time::Instant::now(),
             ));
         }
-        if custodian_wait.is_some()
+        // The original fork child stays pinned by our exclusive wait ownership.
+        // Its terminal observation permits signaling adopted children even when
+        // identity acquisition or durable journaling prevents consuming its wait.
+        // Neither this observation nor signaling supplies a drain receipt.
+        if (custodian_wait.is_some() || original_child_is_waitable(pid))
             && let Some((_, started)) = &cancellation
         {
             let signal =
@@ -1188,6 +1192,21 @@ fn exact_child_terminal(
         return Err("original terminal child incarnation conflict".into());
     }
     Ok(true)
+}
+
+/// Observe only the original, still-owned fork child. Errors/absence are not
+/// death evidence; WNOWAIT preserves the ordinary identity/journal/reap path.
+fn original_child_is_waitable(pid: i32) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    result == 0 && unsafe { info.si_pid() } == pid
 }
 
 /// Inspect the waitable child before consuming its PID, preserving incarnation
