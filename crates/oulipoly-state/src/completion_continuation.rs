@@ -345,8 +345,9 @@ mod tests {
 mod evidence;
 mod source_files;
 pub use evidence::{
-    CompletionIdentity, CompletionOutput, CompletionSnapshot, MAX_OUTPUT_BYTES, OutputArtifact,
-    SourceOutcome, VerifiedCompletion,
+    CompletionIdentity, CompletionOutput, CompletionSnapshot, MAX_OUTPUT_BYTES,
+    MissingOriginalOutput, OriginalOutputSelection, OutputArtifact, SourceOutcome,
+    VerifiedCompletion,
 };
 pub use source_files::{open_source_file, read_source_file};
 

@@ -56,6 +56,73 @@ pub struct OutputArtifact {
 pub enum CompletionOutput {
     Inline(String),
     Artifact(OutputArtifact),
+    Missing(MissingOriginalOutput),
+}
+
+/// Attributable producer evidence about unavailable original output, not a
+/// synthetic terminal outcome. This proof travels inside the immutable snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MissingOriginalOutput {
+    pub representation: String,
+    pub capture_state: String,
+    pub reason: String,
+    pub producer: SourceProcessIdentity,
+    pub original_observer: SourceProcessIdentity,
+    pub completion_revision: u64,
+    pub outcome_sha256: String,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub selection: Option<OriginalOutputSelection>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub observed_byte_len: Option<u64>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalOutputSelection {
+    pub device: u64,
+    pub inode: u64,
+    pub byte_len: u64,
+}
+
+impl MissingOriginalOutput {
+    fn validate(&self, outcome: &SourceOutcome, digest: &str) -> Result<(), String> {
+        let selection_valid = self.selection.as_ref().is_some_and(|selection| {
+            selection.inode > 0 && selection.byte_len <= MAX_OUTPUT_BYTES as u64
+        });
+        let reason_valid = match self.reason.as_str() {
+            "original_selection_not_retained" => {
+                self.selection.is_none() && self.observed_byte_len.is_none()
+            }
+            "selected_storage_lost" => selection_valid && self.observed_byte_len.is_none(),
+            "selected_storage_short" => {
+                selection_valid
+                    && self.selection.as_ref().is_some_and(|s| {
+                        self.observed_byte_len
+                            .is_some_and(|length| length < s.byte_len)
+                    })
+            }
+            _ => false,
+        };
+        if self.representation != "missing-original-output-v1"
+            || self.capture_state != "irrecoverable"
+            || !reason_valid
+            || self.producer.pid <= 0
+            || self.producer.boot_id.is_empty()
+            || self.producer.starttime_ticks < 0
+            || self.original_observer != outcome.observer
+            || self.completion_revision != outcome.completion_revision
+            || self.outcome_sha256 != digest
+            || self.detail.trim().is_empty()
+            || self.detail.len() > 4096
+        {
+            return Err(
+                "missing original output lacks attributable permanent-loss evidence".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +147,52 @@ pub struct VerifiedCompletion {
 }
 
 impl VerifiedCompletion {
+    pub fn original_output_missing(&self) -> bool {
+        matches!(self.snapshot.output, CompletionOutput::Missing(_))
+    }
+
+    /// The missing-output recipient payload must actually carry the validated
+    /// proof, not turn a valid source proof into an empty successful notification.
+    pub(crate) fn validate_missing_payload(&self, payload: &str, rc: i32) -> Result<(), String> {
+        if !self.original_output_missing() {
+            return Ok(());
+        }
+        let value: serde_json::Value = serde_json::from_str(payload).map_err(|e| e.to_string())?;
+        if value["kind"] != "agent_bash_complete"
+            || value["snapshot"]
+                != serde_json::to_value(&self.snapshot).map_err(|e| e.to_string())?
+            || value["outcome"] != serde_json::to_value(&self.outcome).map_err(|e| e.to_string())?
+            || value["rc"] != self.snapshot.rc
+            || rc != self.snapshot.rc
+            || value.get("output_artifact") != Some(&serde_json::Value::Null)
+        {
+            return Err("missing-output payload conflicts with validated original evidence".into());
+        }
+        Ok(())
+    }
+
+    /// A helper reply is diagnostic until public evidence and exact hashes agree.
+    pub fn validate_source_reply(&self, reply: &serde_json::Value) -> Result<(), String> {
+        let expected_status = if self.original_output_missing() {
+            "source_output_missing"
+        } else {
+            "source_ready"
+        };
+        let identity = serde_json::to_value(&self.snapshot.identity).map_err(|e| e.to_string())?;
+        for (key, expected) in identity.as_object().ok_or("invalid source identity")? {
+            if reply.get(key) != Some(expected) {
+                return Err(format!("source reply identity conflict at {key}"));
+            }
+        }
+        if reply["status"] != expected_status
+            || reply["snapshot_sha256"] != self.snapshot_sha256
+            || reply["outcome_sha256"] != self.outcome_sha256
+        {
+            return Err("source reply evidence/status conflict".into());
+        }
+        Ok(())
+    }
+
     pub fn from_bytes(
         binding: &AdmittedSourceBinding,
         snapshot_bytes: &[u8],
@@ -178,6 +291,14 @@ impl VerifiedCompletion {
         {
             return Err("completion outcome lacks required original-source evidence".into());
         }
+        if let CompletionOutput::Missing(missing) = &snapshot.output {
+            missing.validate(&outcome, &outcome_sha256)?;
+            if snapshot.status != "original_output_unavailable" {
+                return Err("missing output requires explicit unavailable status".into());
+            }
+        } else if snapshot.status == "original_output_unavailable" {
+            return Err("unavailable status requires missing output evidence".into());
+        }
         Ok(Self {
             snapshot,
             outcome,
@@ -269,6 +390,97 @@ mod tests {
         .unwrap();
         (binding, fixture)
     }
+    #[test]
+    fn missing_output_wire_requires_permanent_attributable_exact_original_evidence() {
+        let (binding, _) = fixture();
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/age360-missing-output-wire.json"
+        ))
+        .unwrap();
+        let original: serde_json::Value =
+            serde_json::from_str(f["missing_output_snapshot_bytes_utf8"].as_str().unwrap())
+                .unwrap();
+        let outcome = f["outcome_bytes_utf8"].as_str().unwrap().as_bytes();
+        let check = |snapshot: &serde_json::Value| {
+            VerifiedCompletion::from_bytes(
+                &binding,
+                &serde_json::to_vec(snapshot).unwrap(),
+                outcome,
+            )
+        };
+        let exact = VerifiedCompletion::from_bytes(
+            &binding,
+            f["missing_output_snapshot_bytes_utf8"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            outcome,
+        )
+        .unwrap();
+        assert!(exact.original_output_missing());
+        assert_eq!(exact.outcome.root_wait_status, Some(0));
+        assert_eq!(exact.snapshot.rc, 0); // absent output does not invent workload failure
+        exact
+            .validate_source_reply(&f["missing_output_recovery_response"])
+            .unwrap();
+        for (pointer, value) in [
+            ("/output/capture_state", serde_json::json!("pending")),
+            ("/output/reason", serde_json::json!("read_error")),
+            ("/output/producer/pid", serde_json::json!(0)),
+            (
+                "/output/original_observer/starttime_ticks",
+                serde_json::json!(1),
+            ),
+            ("/output/completion_revision", serde_json::json!(2)),
+            ("/output/outcome_sha256", serde_json::json!("a".repeat(64))),
+            ("/output/detail", serde_json::json!(" ")),
+            ("/registration_id", serde_json::json!("wrong")),
+            ("/status", serde_json::json!("completed")),
+        ] {
+            let mut bad = original.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(check(&bad).is_err(), "accepted {pointer}");
+        }
+        for key in [
+            "selection",
+            "observed_byte_len",
+            "producer",
+            "capture_state",
+        ] {
+            let mut bad = original.clone();
+            bad["output"].as_object_mut().unwrap().remove(key);
+            assert!(check(&bad).is_err(), "accepted missing {key}");
+        }
+        let mut lost = original.clone();
+        lost["output"]["reason"] = "selected_storage_lost".into();
+        assert!(check(&lost).is_err());
+        lost["output"]["selection"] = serde_json::json!({"device":1,"inode":2,"byte_len":42});
+        check(&lost).unwrap();
+        lost["output"]["reason"] = "selected_storage_short".into();
+        assert!(check(&lost).is_err());
+        lost["output"]["observed_byte_len"] = 42.into();
+        assert!(check(&lost).is_err());
+        lost["output"]["observed_byte_len"] = 41.into();
+        check(&lost).unwrap();
+        for status in ["pending", "unavailable", "source_ready"] {
+            let mut reply = f["missing_output_recovery_response"].clone();
+            reply["status"] = status.into();
+            assert!(exact.validate_source_reply(&reply).is_err());
+        }
+        let successful = VerifiedCompletion::from_bytes(
+            &binding,
+            f["snapshot_bytes_utf8"].as_str().unwrap().as_bytes(),
+            outcome,
+        )
+        .unwrap();
+        assert!(!successful.original_output_missing());
+        assert!(
+            successful
+                .validate_source_reply(&f["missing_output_recovery_response"])
+                .is_err()
+        );
+    }
+
     #[test]
     fn canonical_source_evidence_is_accepted_and_diagnostic_rc_is_not_wait_status() {
         let (binding, f) = fixture();

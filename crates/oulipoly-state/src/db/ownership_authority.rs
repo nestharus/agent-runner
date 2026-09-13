@@ -3480,6 +3480,15 @@ mod completion_continuation_tests {
 
     #[test]
     fn completion_continuation_sync_acceptance_materializes_without_ack_and_replay_is_exact() {
+        acceptance_materializes_without_ack_and_replay_is_exact(false);
+    }
+
+    #[test]
+    fn completion_continuation_missing_output_retains_late_listener_and_exact_ack() {
+        acceptance_materializes_without_ack_and_replay_is_exact(true);
+    }
+
+    fn acceptance_materializes_without_ack_and_replay_is_exact(missing: bool) {
         use crate::completion_continuation::VerifiedCompletion;
         use crate::mailbox::CompletionEventTriggerInput;
         let directory = tempfile::tempdir().unwrap();
@@ -3489,18 +3498,32 @@ mod completion_continuation_tests {
         admit(&mut state, &binding, false, false);
         let source = binding.registration().unwrap();
         let paths = source.paths();
-        let f: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/age360-paired-wire.json"))
-                .unwrap();
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/age360-missing-output-wire.json"
+        ))
+        .unwrap();
         let evidence = VerifiedCompletion::from_bytes(
             &binding,
-            f["snapshot_bytes_utf8"].as_str().unwrap().as_bytes(),
+            f[if missing {
+                "missing_output_snapshot_bytes_utf8"
+            } else {
+                "snapshot_bytes_utf8"
+            }]
+            .as_str()
+            .unwrap()
+            .as_bytes(),
             f["outcome_bytes_utf8"].as_str().unwrap().as_bytes(),
         )
         .unwrap();
+        assert_eq!(evidence.original_output_missing(), missing);
+        let payload = serde_json::to_string(&serde_json::json!({
+            "kind":"agent_bash_complete", "rc":0,
+            "snapshot":evidence.snapshot, "outcome":evidence.outcome, "output_artifact":null,
+        }))
+        .unwrap();
         let input = CompletionEventTriggerInput {
             event_id: &source.handle,
-            payload_json: r#"{"kind":"agent_bash_complete","rc":0}"#,
+            payload_json: &payload,
             state_dir: &source.handle_dir,
             meta_path: &paths[0],
             log_path: &paths[1],
@@ -3512,6 +3535,39 @@ mod completion_continuation_tests {
             mailbox.trigger_completion_event(input).is_err(),
             "legacy trigger must not bypass v2 source evidence"
         );
+        if missing {
+            let mut wrong: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            wrong["snapshot"]["output"] = "".into();
+            let wrong = wrong.to_string();
+            assert!(
+                mailbox
+                    .trigger_completion_continuation(
+                        CompletionEventTriggerInput {
+                            payload_json: &wrong,
+                            ..input
+                        },
+                        &binding,
+                        &evidence
+                    )
+                    .is_err()
+            );
+            assert!(
+                mailbox
+                    .trigger_completion_continuation(
+                        CompletionEventTriggerInput { rc: 70, ..input },
+                        &binding,
+                        &evidence
+                    )
+                    .is_err()
+            );
+            assert_ne!(
+                mailbox
+                    .completion_continuation_acceptance(&source.registration_id)
+                    .unwrap()
+                    .unwrap()["phase"],
+                "accepted"
+            );
+        }
         let first = mailbox
             .trigger_completion_continuation(input, &binding, &evidence)
             .unwrap();

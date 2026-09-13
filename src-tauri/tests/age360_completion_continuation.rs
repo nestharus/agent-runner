@@ -124,6 +124,18 @@ impl Fixture {
         fs::create_dir_all(root.path().join("home")).unwrap();
         let script = root.path().join("provider.py");
         fs::write(&script, include_str!("fixtures/age360/native-provider.py")).unwrap();
+        fs::write(
+            root.path().join("native-missing-output.py"),
+            include_str!("fixtures/age360/native-missing-output.py"),
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("missing-output-wire.json"),
+            include_str!(
+                "../../crates/oulipoly-state/tests/fixtures/age360-missing-output-wire.json"
+            ),
+        )
+        .unwrap();
         let wrapper = root.path().join("provider.sh");
         fs::write(
             &wrapper,
@@ -194,12 +206,14 @@ impl Fixture {
             "publication_race" => Some("after-terminal-metadata"),
             "publication_error" | "publication_io_error" => Some("publication-error"),
             "hash_cancel" => Some("during-output-hash"),
+            "missing_selection" => Some("selection-error"),
+            "missing_pin" | "missing_short" => Some("before-output-capture"),
             _ => None,
         };
         if let Some(fault) = fault {
             cmd.env("AGENT_BASH_SOURCE_FAULT", fault);
         }
-        if self.case != "owner_only" {
+        if !matches!(self.case, "owner_only" | "native_missing") {
             cmd.env("AGE360_AGENT_BASH_BIN", counterpart());
         }
         cmd
@@ -526,6 +540,36 @@ fn paired_case(mode: &'static str) {
             "immutable original outcome after cancellation={}",
             serde_json::to_string(&evidence.outcome).unwrap()
         );
+    }
+    if matches!(mode, "missing_selection" | "missing_pin" | "missing_short") {
+        let evidence =
+            oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
+                &binding,
+            )
+            .unwrap();
+        assert!(evidence.original_output_missing());
+        assert_eq!(evidence.outcome.kind, "ready");
+        assert_eq!(evidence.outcome.root_wait_status, None);
+        assert_eq!(
+            evidence.outcome.ready_sentinel.as_deref(),
+            Some("paired-source-output")
+        );
+        assert!(!evidence.outcome.original_tree_drained);
+        let receipt: serde_json::Value = wait(|| {
+            serde_json::from_slice(
+                &fs::read(f.root.path().join("recipient-missing-output-receipt.json")).ok()?,
+            )
+            .ok()
+        });
+        assert_eq!(
+            receipt["snapshot"]["output"]["representation"],
+            "missing-original-output-v1"
+        );
+        assert_eq!(
+            receipt["outcome"],
+            serde_json::to_value(&evidence.outcome).unwrap()
+        );
+        println!("paired missing-original-output receipt={receipt}");
     }
     if mode == "registration_reply_loss" {
         let evidence =
@@ -1678,4 +1722,104 @@ fn native_cancellation_keeps_original_wait_owner_when_journal_storage_is_unavail
     if !private_case(false) {
         native_activation_channel_custody(9, Some("wait_storage_failure"));
     }
+}
+
+#[test]
+fn native_missing_output_rejects_transient_then_delivers_original_wait_without_capture_retries() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("native_missing");
+    f.gate("release-resume");
+    let mut initial = f.start();
+    let binding = f.source();
+    let source = binding.registration().unwrap();
+    wait(|| {
+        f.root
+            .path()
+            .join("native-source-invalid-ready")
+            .exists()
+            .then_some(())
+    });
+    let rejected: serde_json::Value = serde_json::from_slice(
+        &fs::read(f.root.path().join("native-source-transient-rejection.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(rejected["status"], "unavailable");
+    let before = f
+        .mailbox()
+        .completion_continuation_acceptance(&source.registration_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(before["phase"], "accepted");
+    assert!(
+        f.mailbox()
+            .completion_event_listeners(&source.handle)
+            .unwrap()
+            .iter()
+            .all(|l| l.mailbox_seq.is_none() && l.acknowledged_at.is_none())
+    );
+    f.gate("release-source-proof");
+    f.wait_initial(&mut initial);
+    let receipt: serde_json::Value = wait(|| {
+        serde_json::from_slice(
+            &fs::read(f.root.path().join("recipient-missing-output-receipt.json")).ok()?,
+        )
+        .ok()
+    });
+    assert_eq!(receipt["outcome"]["root_wait_status"], 37 << 8);
+    assert_eq!(receipt["snapshot"]["output"]["observed_byte_len"], 0);
+    assert!(
+        receipt["snapshot"]["output"]["selection"]["byte_len"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let observed: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            f.root
+                .path()
+                .join("native-source-original-observation.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["snapshot"]["output"], observed["output"]);
+    assert_eq!(
+        receipt["outcome"]["root_wait_status"],
+        observed["root_wait_status"]
+    );
+    wait(|| {
+        f.root
+            .path()
+            .join("recipient-exact-ack.json")
+            .exists()
+            .then_some(())
+    });
+    wait(|| {
+        f.mailbox()
+            .completion_event_listeners(&source.handle)
+            .ok()?
+            .iter()
+            .all(|l| l.acknowledged_at.is_some())
+            .then_some(())
+    });
+    wait(|| {
+        f.mailbox()
+            .pending_continuation_attempt_ids(&source.registration_id)
+            .ok()?
+            .is_empty()
+            .then_some(())
+    });
+    let attempts = || {
+        f.sidecar_connection().query_row("SELECT COUNT(*) FROM completion_continuation_attempt WHERE source_registration_id=?1", [&source.registration_id], |r| r.get::<_,i64>(0)).unwrap()
+    };
+    let before = attempts();
+    // Experiment observation window only; product retains NoDeadline. Covers
+    // multiple native retry intervals after exact acceptance and physical drain.
+    std::thread::sleep(Duration::from_millis(2300));
+    assert_eq!(attempts(), before);
+    println!(
+        "native recipient missing output={receipt}; original observation={observed}; settled source recovery attempts={before}"
+    );
 }

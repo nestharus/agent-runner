@@ -2634,6 +2634,7 @@ impl MailboxDb {
         {
             return Err("completion acceptance identity conflict".into());
         }
+        evidence.validate_missing_payload(input.payload_json, input.rc)?;
         self.trigger_completion_event_bound(input, Some((binding, evidence)))
     }
 

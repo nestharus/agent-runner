@@ -283,6 +283,9 @@ pub(crate) fn accept(
             "already_accepted"
         },
     )?;
+    if evidence.original_output_missing() {
+        response["original_output_missing"] = true.into();
+    }
     response["snapshot_sha256"] = evidence.snapshot_sha256.into();
     response["outcome_sha256"] = evidence.outcome_sha256.into();
     response["payload_sha256"] = json!(result.event.payload_sha256);

@@ -488,16 +488,12 @@ fn classify_source_reply(attempt: &ContinuationAttempt) -> Result<serde_json::Va
         }
     }
     match value["status"].as_str() {
-        Some("source_ready") => {
+        Some("source_ready" | "source_output_missing") => {
             let evidence =
                 oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
                     &binding,
                 )?;
-            if value["snapshot_sha256"] != evidence.snapshot_sha256
-                || value["outcome_sha256"] != evidence.outcome_sha256
-            {
-                return Err("source reply evidence hash conflict".into());
-            }
+            evidence.validate_source_reply(&value)?;
         }
         Some("pending" | "conflict" | "unavailable") => {}
         _ => return Err("source reply missing/unsupported status".into()),

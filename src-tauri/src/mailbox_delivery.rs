@@ -1568,7 +1568,7 @@ fn render_notification(rendered: &mut String, index: usize, row: &MailboxRow) {
             .map(quote_path)
             .unwrap_or_else(|| format!("mailbox row {} payload_json", row.seq));
         rendered.push_str(&format!(
-            "{}. kind: {}\n   handle: {}\n   rc: {}\n   immutable_completion_payload: {}\n   original_v2_output: payload.snapshot.output or payload.output_artifact; inspect this payload, not the live diagnostic log, for original notification bytes\n   live_diagnostic_log_not_original_output: {}\n   meta: {}\n   rc_file: {}\n\n",
+            "{}. kind: {}\n   handle: {}\n   rc: {}\n   immutable_completion_payload: {}\n   original_v2_output: payload.snapshot.output or payload.output_artifact; inspect this payload, not the live diagnostic log, for original notification bytes. A missing-original-output-v1 representation explicitly means original output is unavailable, not empty output or invented workload failure; preserve its original outcome and loss evidence\n   live_diagnostic_log_not_original_output: {}\n   meta: {}\n   rc_file: {}\n\n",
             index + 1, sanitize(&row.kind), sanitize(&row.handle), row.rc, payload,
             quote_path(&row.log_path), quote_path(&row.meta_path), quote_path(&row.rc_path)));
         return;
@@ -1683,6 +1683,8 @@ mod tests {
         render_notification(&mut rendered, 0, &row);
         assert!(rendered.contains("payload.snapshot.output"));
         assert!(rendered.contains("payload.output_artifact"));
+        assert!(rendered.contains("missing-original-output-v1"));
+        assert!(rendered.contains("not empty output or invented workload failure"));
         assert!(
             rendered.contains("live_diagnostic_log_not_original_output: \"/private/live.log\"")
         );

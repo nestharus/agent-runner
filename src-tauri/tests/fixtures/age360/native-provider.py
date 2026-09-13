@@ -73,7 +73,24 @@ def launch(request):
                 assert "native-custody-input" in prompt
             else:
                 assert rows[0]["handle"] in prompt
-                if case not in ("large_output", "hash_cancel"):
+                if case in ("native_missing", "missing_selection", "missing_pin", "missing_short"):
+                    payload = json.loads(rows[0]["payload_json"])
+                    missing = payload["snapshot"]["output"]
+                    assert missing["representation"] == "missing-original-output-v1"
+                    assert payload["snapshot"]["status"] == "original_output_unavailable"
+                    assert payload["output_artifact"] is None
+                    assert missing["capture_state"] == "irrecoverable"
+                    assert missing["original_observer"] == payload["outcome"]["observer"]
+                    assert missing["completion_revision"] == payload["outcome"]["completion_revision"]
+                    assert missing["outcome_sha256"] == payload["snapshot"]["outcome_sha256"]
+                    if case == "native_missing":
+                        assert payload["rc"] == 37
+                        assert payload["outcome"]["root_wait_status"] == 37 << 8
+                        assert payload["outcome"]["original_tree_drained"] is False
+                        assert payload["outcome"]["cancellation_id"] is None
+                    pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-missing-output-receipt.json").write_text(json.dumps(payload))
+                    received_output = {"missing_original_output": True, "proof": missing}
+                elif case not in ("large_output", "hash_cancel"):
                     payload = json.loads(rows[0]["payload_json"])
                     raw = payload["snapshot"]["output"].encode("utf-8")
                     if case in ("publication_error", "publication_io_error"):
@@ -136,7 +153,10 @@ def launch(request):
         known = SESSION
         event(request, seq, "marker", name="oulipoly.provider_session", value={"provider_session_id": known})
         seq += 1
-        if os.environ.get("AGE360_CASE") != "owner_only":
+        if case == "native_missing":
+            import runpy
+            runpy.run_path(str(pathlib.Path(os.environ["AGE360_ROOT"]) / "native-missing-output.py"))["publish"]()
+        elif os.environ.get("AGE360_CASE") != "owner_only":
             root = pathlib.Path(os.environ["AGE360_ROOT"])
             parent = json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"]
             # Native stream ingestion binds the sidecar runtime first. Registration
@@ -163,13 +183,15 @@ def launch(request):
             if case == "publication_race":
                 scope = "root"
                 workload = 'sleep 600 >/dev/null 2>&1 & printf paired-source-output'
-            elif case in ("publication_error", "publication_io_error"):
+            elif case in ("publication_error", "publication_io_error", "missing_selection", "missing_pin", "missing_short"):
                 extra = ["--ready-sentinel", "paired-source-output"]
                 workload = 'printf paired-source-output; while [ ! -f "$AGE360_ROOT/write-more" ]; do sleep .02; done; head -c 1048576 /dev/zero; touch "$AGE360_ROOT/writer-done"; exec sleep 600'
             elif case == "hash_cancel":
                 env["AGENT_BASH_LOG_MAX_BYTES"] = str(32 * 1024 * 1024)
                 extra = ["--ready-sentinel", "READY"]
                 workload = 'head -c 16777216 /dev/zero; printf "READY\\n"; exec sleep 600'
+            if case in ("missing_selection", "missing_pin", "missing_short"):
+                env["AGENT_BASH_LOG_MAX_BYTES"] = "65536"
             workload = 'printf "launch\\n" >> "$AGE360_ROOT/source-launches"; ' + workload
             result = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "run", "--delivery", mode, "--completion-scope", scope, *extra, "--", "/bin/sh", "-c", workload], env=env, capture_output=True, timeout=30)
             (root / "bash-dispatch.stdout").write_bytes(result.stdout)
@@ -177,7 +199,7 @@ def launch(request):
             allowed = (0, 37) if os.environ["AGE360_CASE"] == "early_exit" else (0,)
             if result.returncode not in allowed: raise RuntimeError("actual paired Bash dispatch failed: " + result.stderr.decode(errors="replace"))
             (root / "provider-dispatched").touch()
-            if case in ("publication_race", "publication_error", "publication_io_error", "hash_cancel"):
+            if case in ("publication_race", "publication_error", "publication_io_error", "hash_cancel", "missing_selection", "missing_pin", "missing_short"):
                 # Actual original owner issues cancellation through the exact Bash
                 # CLI; the namespace controller cannot impersonate its ancestry.
                 deadline = time.monotonic() + 45

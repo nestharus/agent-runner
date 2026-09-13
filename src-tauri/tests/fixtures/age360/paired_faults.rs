@@ -26,6 +26,13 @@ pub(super) fn before_acceptance(
     f: &Fixture,
     source: &oulipoly_state::completion_continuation::SourceRegistration,
 ) {
+    if matches!(
+        f.case,
+        "missing_selection" | "missing_pin" | "missing_short"
+    ) {
+        missing_output_before_acceptance(f, source);
+        return;
+    }
     let fault = match f.case {
         "publication_race" => "after-terminal-metadata",
         "publication_error" | "publication_io_error" => "publication-error",
@@ -159,5 +166,102 @@ fn paired_lost_registration_reply_recovers_without_workload_replay() {
 fn paired_lost_acceptance_reply_keeps_exact_event_and_recipient_delivery() {
     if !private_case(true) {
         paired_case("acceptance_reply_loss");
+    }
+}
+
+/// Only fault-injects the private paired source store. It never writes a public
+/// outcome/snapshot or translates Bash staging into accepted runner evidence.
+fn missing_output_before_acceptance(
+    f: &Fixture,
+    source: &oulipoly_state::completion_continuation::SourceRegistration,
+) {
+    use std::os::unix::fs::MetadataExt;
+    let directory = PathBuf::from(&source.handle_dir);
+    let barrier = if f.case == "missing_selection" {
+        "selection-error"
+    } else {
+        "before-output-capture"
+    };
+    let original: oulipoly_state::completion_continuation::SourceProcessIdentity =
+        serde_json::from_value(wait(|| {
+            json_file(&directory.join(format!("fault-{barrier}.reached.json")))
+        }))
+        .unwrap();
+    assert!(current_identity_matches(&original));
+    // Source's original header is observed only for preservation comparison;
+    // acceptance must come from Bash's separately implemented public producer.
+    let original_header = wait(|| fs::read(directory.join("source-observation-v2.json")).ok());
+    // Rollover first: eliminate the live pathname/open logger as a recoverable
+    // alias of the selected inode before injecting permanent selected loss.
+    f.gate("write-more");
+    wait(|| f.root.path().join("writer-done").exists().then_some(()));
+    if f.case != "missing_selection" {
+        assert!(!directory.join("completion-output-v2.bin").exists());
+        let selected = directory.join("selected-log-v2.bin");
+        let metadata = fs::metadata(&selected).unwrap();
+        assert!(metadata.len() > 0);
+        let live = fs::metadata(directory.join("log")).unwrap();
+        assert_ne!((live.dev(), live.ino()), (metadata.dev(), metadata.ino()));
+        if f.case == "missing_pin" {
+            fs::remove_file(&selected).unwrap();
+        } else {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&selected)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+            let after = fs::metadata(&selected).unwrap();
+            assert_eq!((after.dev(), after.ino()), (metadata.dev(), metadata.ino()));
+            assert_eq!(after.len(), 0);
+        }
+        println!(
+            "paired actual selected storage fault dev={} ino={} original_len={} mode={}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            f.case
+        );
+    }
+    // Remove the actual original observer, then cancel through its still-live
+    // admitted owner. Neither disappearance nor cancellation is the loss proof.
+    assert_eq!(unsafe { libc::kill(original.pid as i32, libc::SIGKILL) }, 0);
+    cancel_source(f, source);
+    wait(|| {
+        directory
+            .join("cancel-workload-drained")
+            .exists()
+            .then_some(())
+    });
+    fs::write(
+        directory.join(format!("fault-{barrier}.release")),
+        b"release",
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(directory.join("source-observation-v2.json")).unwrap(),
+        original_header
+    );
+    println!(
+        "original Bash observer lost; actual cancellation drained; public missing-output publication remains native admission duty"
+    );
+}
+
+#[test]
+fn paired_missing_selection_notifies_original_ready_after_owner_loss_and_cancel() {
+    if !private_case(true) {
+        paired_case("missing_selection");
+    }
+}
+#[test]
+fn paired_missing_pin_notifies_original_ready_after_owner_loss_and_cancel() {
+    if !private_case(true) {
+        paired_case("missing_pin");
+    }
+}
+#[test]
+fn paired_short_selected_inode_notifies_original_ready_after_owner_loss_and_cancel() {
+    if !private_case(true) {
+        paired_case("missing_short");
     }
 }
