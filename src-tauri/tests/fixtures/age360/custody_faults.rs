@@ -1189,6 +1189,25 @@ fn native_birth_composition_zero_exit_preserves_failed_protocol_runtime_outcome(
 }
 
 fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bool) {
+    spawned_outcome_schedule(obstruct, observe_errors, zero_exit, "retained");
+}
+#[test]
+fn native_outcome_retention_launcher_loss_before_aggregate() {
+    spawned_outcome_schedule(true, false, true, "before");
+}
+#[test]
+fn native_outcome_retention_aggregate_write_failure() {
+    spawned_outcome_schedule(true, false, true, "retention-failure");
+}
+#[test]
+fn native_outcome_retention_draining_rejected_abnormal() {
+    spawned_outcome_schedule(true, false, false, "draining");
+}
+#[test]
+fn native_outcome_retention_operation_result_write_failure() {
+    spawned_outcome_schedule(true, false, false, "result-failure");
+}
+fn spawned_outcome_schedule(obstruct: bool, observe_errors: bool, zero_exit: bool, mode: &str) {
     if private_case(false) {
         return;
     }
@@ -1197,7 +1216,16 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
     if zero_exit {
         f.gate("native-launch-exit-zero-without-output");
     }
-    f.gate("native-after-custody-retention.hold");
+    let preaggregate = matches!(mode, "before" | "retention-failure");
+    let boundary = if preaggregate {
+        "native-before-custody-retention"
+    } else {
+        "native-after-custody-retention"
+    };
+    f.gate(&format!("{boundary}.hold"));
+    if mode == "result-failure" {
+        f.gate("native-exit-result-retention.hold");
+    }
     start_pre_attachment(&f);
     let launch_process = process_identity(reached(&f, "native-launch"));
     let a = attempt(&f);
@@ -1209,7 +1237,10 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
         f.gate("native-dispatch-exit-projection-failed.hold");
         f.gate("native-outer-exit-projection-failed.hold");
     }
-    if zero_exit {
+    if matches!(mode, "draining" | "result-failure") {
+        f.gate("release-resume");
+        fs::remove_file(f.root.path().join("hold-native-launch")).unwrap();
+    } else if zero_exit {
         fs::remove_file(f.root.path().join("hold-native-launch")).unwrap();
     } else {
         kill_exact(&launch_process);
@@ -1223,7 +1254,40 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
         println!("actual original outer runtime exit returned failure; owner={outer_owner}");
         remove_hold(&f, "native-outer-exit-projection-failed");
     }
-    reached(&f, "native-after-custody-retention");
+    if mode == "result-failure" {
+        reached(&f, "native-exit-result-retention");
+        let root = fs::read_dir(f.data.join("state.native-producer-custody"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("runtime-exit");
+        let finish = fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                let intent: serde_json::Value =
+                    serde_json::from_slice(&fs::read(entry.path().join("intent.json")).unwrap())
+                        .unwrap();
+                intent["operation"] == "FinishDrain"
+            })
+            .unwrap()
+            .path();
+        fs::create_dir(finish.join("result.json")).unwrap();
+        f.gate("native-exit-result-retention-failed.hold");
+        remove_hold(&f, "native-exit-result-retention");
+        reached(&f, "native-exit-result-retention-failed");
+        // The write has actually failed, not merely been scheduled to fail.
+        // Restore the path before allowing that error to return to dispatch.
+        fs::remove_dir(finish.join("result.json")).unwrap();
+        remove_hold(&f, "native-exit-result-retention-failed");
+        println!(
+            "actual operation-result rename failed; original intent/predecessor retained at {}",
+            finish.display()
+        );
+    }
+    reached(&f, boundary);
     let (generation, invocation) = f
         .mailbox()
         .continuation_runtime_identity(&a)
@@ -1232,7 +1296,52 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
     let g = uuid::Uuid::parse_str(&generation).unwrap();
     let i = uuid::Uuid::parse_str(&invocation).unwrap();
     let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
-    let original = state.native_attempt_custody(g, i).unwrap().unwrap();
+    if mode == "retention-failure" {
+        rusqlite::Connection::open(f.data.join("state.db")).unwrap().execute_batch("CREATE TRIGGER fixture_custody_retention_failure BEFORE INSERT ON provider_launch_transition_replays WHEN NEW.operation_key LIKE '%/native-custody-receipts' BEGIN SELECT RAISE(FAIL, 'actual aggregate retention failure'); END;").unwrap();
+        f.gate("native-custody-retention-failed.hold");
+        remove_hold(&f, boundary);
+        reached(&f, "native-custody-retention-failed");
+    }
+    let original_stored = state.native_attempt_custody(g, i).unwrap();
+    assert_eq!(original_stored.is_none(), preaggregate);
+    let source = state.native_attempt_recovery(g, i).unwrap().unwrap();
+    let journal = PathBuf::from(source["journal"].as_str().unwrap());
+    let original = original_stored.clone().unwrap_or_else(|| {
+        let actors: Vec<serde_json::Value> = fs::read_dir(journal.join("actors"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| fs::read(e.path().join("finished.json")).ok())
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+            .collect();
+        serde_json::json!({"lease":source["lease"],"actors":actors})
+    });
+    let operations: Vec<serde_json::Value> = if journal.join("runtime-exit").exists() {
+        fs::read_dir(journal.join("runtime-exit")).unwrap().filter_map(Result::ok).map(|e| {
+            let read = |name| fs::read(e.path().join(name)).ok().map(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+            serde_json::json!({"intent":read("intent.json"),"before":read("before.json"),"result":read("result.json")})
+        }).collect()
+    } else {
+        vec![]
+    };
+    println!("actual original runtime operations before launcher loss={operations:?}");
+    if matches!(mode, "draining" | "result-failure") && !operations.is_empty() {
+        assert!(operations.iter().any(|o| {
+            o["intent"]["operation"] == "FinishDrain"
+                && o["before"]["lifecycle_state"] == "draining"
+                && (mode == "result-failure" && o["result"].is_null()
+                    || o["result"]["returned"]
+                        .as_str()
+                        .is_some_and(|r| r.contains("StorageFailure")))
+        }));
+        assert!(operations.iter().any(|o| {
+            o["intent"]["operation"] == "NonOrderly"
+                && o["result"]["rejected"] == true
+                && o["result"]["returned"]
+                    .as_str()
+                    .unwrap()
+                    .contains("IllegalPredecessor")
+        }));
+    }
     let actors: Vec<oulipoly_provider::custody::ActorSettlementReceipt> =
         serde_json::from_value(original["actors"].clone()).unwrap();
     assert!(
@@ -1245,7 +1354,7 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
         .find(|a| a.operation == oulipoly_provider::custody::ProviderOperation::Launch)
         .unwrap();
     assert!(launch.spawned);
-    if zero_exit {
+    if zero_exit || matches!(mode, "draining" | "result-failure") {
         assert!(matches!(
             launch.process_status,
             Some(oulipoly_provider::generated::ProcessStatus::Exited { code: 0 })
@@ -1268,7 +1377,7 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
             attempts.last().unwrap()["terminal_code"],
             "abnormal_termination"
         );
-        if obstruct {
+        if obstruct && !matches!(mode, "draining" | "result-failure") {
             assert!(attempts.iter().all(|a| {
                 a["projection_result"]
                     .as_str()
@@ -1289,6 +1398,9 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
         )
         .unwrap();
     assert_eq!(lifecycle == "exited", !obstruct);
+    if matches!(mode, "draining" | "result-failure") {
+        assert_eq!(lifecycle, "draining");
+    }
     println!(
         "exit UPDATE obstruction={obstruct} across dispatch/outer finalization; lifecycle={lifecycle}; original spawned aggregate={original}"
     );
@@ -1308,6 +1420,12 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
         db.execute_batch("DROP TRIGGER fixture_fail_all_exit")
             .unwrap();
     }
+    if mode == "retention-failure" {
+        rusqlite::Connection::open(f.data.join("state.db"))
+            .unwrap()
+            .execute_batch("DROP TRIGGER fixture_custody_retention_failure")
+            .unwrap();
+    }
     request_linked_cancel(&f, &a);
     let token = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
     let logical = token.split(':').next().unwrap();
@@ -1322,15 +1440,13 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
             .ok()?;
         (status == "cancelled").then_some(())
     });
+    assert_eq!(state.native_attempt_custody(g, i).unwrap(), original_stored);
     assert_eq!(
-        state.native_attempt_custody(g, i).unwrap().unwrap(),
-        original
-    );
-    assert!(
         state
             .native_recovered_attempt_custody(g, i)
             .unwrap()
-            .is_none()
+            .is_some(),
+        preaggregate
     );
     assert_eq!(wait_drained_attempt(&f, &a), drain);
     let reason: String = db
@@ -1340,6 +1456,11 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
             |r| r.get(0),
         )
         .unwrap();
+    let expected_reason = if matches!(mode, "draining" | "result-failure") {
+        "orderly_completion"
+    } else {
+        "abnormal_termination"
+    };
     if reason == "recovered_dead" {
         // Generic recovery may win the restored-storage race. Its existing
         // observation must remain unchanged; the cancellation-only supplement
@@ -1357,13 +1478,18 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
             supplement["original_runtime_row"],
             serde_json::to_value(row).unwrap()
         );
-        assert_eq!(
-            supplement["cancellation_terminal_code"],
-            "abnormal_termination"
-        );
-        assert_eq!(
-            supplement["original_runtime_exit_attempts"],
-            original["runtime_exit_attempts"]
+        assert_eq!(supplement["cancellation_terminal_code"], expected_reason);
+        if !preaggregate {
+            assert_eq!(
+                supplement["original_runtime_exit_attempts"],
+                original["runtime_exit_attempts"]
+            );
+        }
+        assert!(
+            !supplement["original_runtime_exit_operations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
         assert_eq!(supplement["original_actor_receipts"], original["actors"]);
         assert_eq!(supplement["original_drain"]["receipt"], drain);
@@ -1371,7 +1497,7 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
         println!("unchanged generic recovery plus original attempted runtime outcome={supplement}");
     } else {
         assert_eq!(
-            reason, "abnormal_termination",
+            reason, expected_reason,
             "original attempted runtime outcome, not raw process status or late cancellation"
         );
     }
@@ -1381,5 +1507,112 @@ fn spawned_late_cancellation(obstruct: bool, observe_errors: bool, zero_exit: bo
     oulipoly_runtime::executor::settle_retained_native_cancellation(&state, g, i).unwrap();
     println!(
         "late acceptance token={token}; settled logical cancellation with original runtime outcome={reason}"
+    );
+}
+
+#[test]
+fn native_outcome_retention_consumed_pid_lookup_failure() {
+    consumed_pid_lookup_failure(false);
+}
+#[test]
+fn native_outcome_retention_retry_consumed_pid_lookup_failure() {
+    consumed_pid_lookup_failure(true);
+}
+fn consumed_pid_lookup_failure(retry: bool) {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("birth-pid-consumed.hold");
+    f.gate("birth-identity-lookup-failed.hold");
+    fs::create_dir(f.root.path().join("birth-identity-read-obstructed")).unwrap();
+    if retry {
+        f.gate("ac-created-before-announce.hold");
+    }
+    let owner = start_pre_attachment(&f);
+    if retry {
+        reached(&f, "ac-created-before-announce");
+        kill_exact(&owner.guardian_identity);
+        wait(|| (f.owner().guardian_identity == owner.driver_identity).then_some(()));
+        remove_hold(&f, "ac-created-before-announce");
+    }
+    assert_eq!(reached(&f, "birth-pid-consumed"), owner.driver_identity.pid);
+    let a = attempt(&f);
+    remove_hold(&f, "birth-pid-consumed");
+    assert_eq!(
+        reached(&f, "birth-identity-lookup-failed"),
+        owner.driver_identity.pid
+    );
+    assert_unresolved(&f, &a);
+    // Let the returning read error unwind and retry while the same actual read
+    // remains obstructed. Only then restore readability; no second PID is sent.
+    if !retry {
+        f.gate("driver-replay.hold");
+        remove_hold(&f, "birth-identity-lookup-failed");
+        reached(&f, "driver-replay");
+        assert_unresolved(&f, &a);
+        fs::remove_dir(f.root.path().join("birth-identity-read-obstructed")).unwrap();
+        remove_hold(&f, "driver-replay");
+    } else {
+        fs::remove_dir(f.root.path().join("birth-identity-read-obstructed")).unwrap();
+        remove_hold(&f, "birth-identity-lookup-failed");
+    }
+    let receipt = wait_drained_attempt(&f, &a);
+    assert_eq!(receipt["gate"], "unreleased_eof");
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!(
+        "consumed original PID survived actual returning read error; healthy peers drained without grant={receipt}"
+    );
+}
+
+#[test]
+fn native_outcome_retention_orphan_pid_preserves_incarnation_not_drain() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("ac-created-before-announce.hold");
+    f.gate("birth-identity-lookup-failed.hold");
+    fs::create_dir(f.root.path().join("birth-identity-read-obstructed")).unwrap();
+    let owner = start_pre_attachment(&f);
+    let ac = process_identity(reached(&f, "ac-created-before-announce"));
+    let stat = fs::read_to_string(format!("/proc/{}/stat", ac.pid)).unwrap();
+    let adopter = process_identity(
+        stat.rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    let a = attempt(&f);
+    remove_hold(&f, "ac-created-before-announce");
+    reached(&f, "birth-identity-lookup-failed");
+    kill_exact(&ac);
+    kill_exact(&adopter);
+    wait_task_state(&ac, "Z");
+    wait_task_state(&adopter, "Z");
+    f.gate("driver-replay.hold");
+    remove_hold(&f, "birth-identity-lookup-failed");
+    reached(&f, "driver-replay"); // generic reap has run after the failed lookup
+    assert!(
+        current_identity_matches(&ac),
+        "generic reap must not consume the announced incarnation"
+    );
+    wait_task_state(&ac, "Z");
+    assert_unresolved(&f, &a);
+    fs::remove_dir(f.root.path().join("birth-identity-read-obstructed")).unwrap();
+    remove_hold(&f, "driver-replay");
+    wait(|| {
+        let identity: Option<String> = f.sidecar_connection().query_row("SELECT custodian_identity FROM completion_continuation_attempt WHERE attempt_id=?1", [&a.attempt_id], |r|r.get(0)).ok()?;
+        (serde_json::from_str::<SourceProcessIdentity>(&identity?).ok()? == ac).then_some(())
+    });
+    assert!(current_identity_matches(&owner.driver_identity));
+    assert_unresolved(&f, &a);
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    println!(
+        "retained original announced incarnation after actual orphan adoption={ac:?}; both custodians lost, NO drain/recovery acceptance asserted"
     );
 }

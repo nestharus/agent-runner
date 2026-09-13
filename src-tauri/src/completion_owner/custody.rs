@@ -200,12 +200,12 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
     let adopter = super::linux::identity(i64::from(pid))?;
     let mut worker = [0; 4];
     let mut custodian = None;
+    let mut received_pid = None;
     let result = (|| {
         read_ac_announcement(path, &driver, &mut release, &mut worker)
             .map_err(|e| e.to_string())?;
-        custodian = Some(super::linux::identity(i64::from(i32::from_ne_bytes(
-            worker,
-        )))?);
+        received_pid = Some(i64::from(i32::from_ne_bytes(worker)));
+        custodian = Some(birth_identity(received_pid.unwrap())?);
         #[cfg(feature = "age360-fault-fixtures")]
         oulipoly_state::completion_continuation::age360_fault_barrier("attempt-before-attachment");
         let identity = custodian.as_ref().ok_or("birth identity absent")?;
@@ -226,6 +226,7 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
                 driver,
                 socket: Some(release),
                 custodian,
+                received_pid,
             })
         });
         retry_unreleased();
@@ -355,12 +356,47 @@ fn retain_unreleased_adopter_loss(
     Ok(())
 }
 
+// The packet names the adopter's still-unreaped child. Keep that consumed
+// input until lookup succeeds; another packet is not owed by a healthy AC.
+fn birth_identity(
+    pid: i64,
+) -> Result<oulipoly_state::completion_continuation::SourceProcessIdentity, String> {
+    #[cfg(feature = "age360-fault-fixtures")]
+    {
+        oulipoly_state::completion_continuation::age360_fault_barrier("birth-pid-consumed");
+        if let (Some(root), Some(parent)) = (
+            std::env::var_os("AGE360_FAULT_ROOT"),
+            std::env::var_os("AGE360_FAULT_PARENT_NET"),
+        ) && std::fs::read_link("/proc/self/ns/net")
+            .ok()
+            .is_some_and(|net| net.as_os_str() != parent)
+            && std::path::Path::new(&root)
+                .join("birth-identity-read-obstructed")
+                .exists()
+        {
+            // An actual returning read error at the lookup boundary, scoped to
+            // this driver only; peers' identity acquisition remains untouched.
+            std::fs::read_to_string(
+                std::path::Path::new(&root).join("birth-identity-read-obstructed"),
+            )
+            .map_err(|e| {
+                oulipoly_state::completion_continuation::age360_fault_barrier(
+                    "birth-identity-lookup-failed",
+                );
+                e.to_string()
+            })?;
+        }
+    }
+    super::linux::identity(pid)
+}
+
 struct PendingUnreleased {
     path: std::path::PathBuf,
     attempt: ContinuationAttempt,
     adopter: oulipoly_state::completion_continuation::SourceProcessIdentity,
     driver: oulipoly_state::completion_continuation::SourceProcessIdentity,
     socket: Option<UnixStream>,
+    received_pid: Option<i64>,
     custodian: Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
 }
 thread_local! {
@@ -383,6 +419,7 @@ pub(super) fn pending_birth_fds() -> Vec<i32> {
 impl PendingUnreleased {
     fn retry(&mut self) -> Result<(), String> {
         if self.custodian.is_none()
+            && self.received_pid.is_none()
             && let Some(socket) = &mut self.socket
         {
             socket.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -390,13 +427,16 @@ impl PendingUnreleased {
             match socket.read(&mut bytes) {
                 Ok(0) => self.socket = None, // actual original EOF, not parent loss
                 Ok(4) => {
-                    self.custodian = Some(super::linux::identity(i64::from(i32::from_ne_bytes(
-                        bytes,
-                    )))?);
+                    self.received_pid = Some(i64::from(i32::from_ne_bytes(bytes)));
                 }
                 Ok(_) => return Err("incomplete birth packet".into()),
                 Err(e) => return Err(e.to_string()),
             }
+        }
+        if self.custodian.is_none()
+            && let Some(pid) = self.received_pid
+        {
+            self.custodian = Some(birth_identity(pid)?);
         }
         if let Some(custodian) = &self.custodian {
             // Attachment is original-driver testimony, including after promotion.
@@ -427,8 +467,16 @@ pub(super) fn retry_unreleased() {
 /// then reap unprotected exact child PIDs. Enumerating candidates is not drain
 /// evidence; only waitpid/waitid supply terminal/ECHILD observations.
 pub(super) fn reap_unprotected(status: &mut i32) -> i32 {
-    let protected = PENDING_UNRELEASED
-        .with_borrow(|pending| pending.iter().map(|p| p.adopter.pid).collect::<Vec<_>>());
+    let protected = PENDING_UNRELEASED.with_borrow(|pending| {
+        pending
+            .iter()
+            .flat_map(|p| [Some(p.adopter.pid), p.received_pid])
+            .flatten()
+            .collect::<Vec<_>>()
+    });
+    // A consumed PID still names the original unreaped child. If its adopter
+    // dies, this original subreaper inherits it; do not consume that incarnation
+    // while identity lookup or attachment remains pending.
     if protected.is_empty() {
         return unsafe { libc::waitpid(-1, status, libc::WNOHANG) };
     }

@@ -9,13 +9,13 @@
 
 use oulipoly_state::CompositeInvocationId;
 #[cfg(test)]
-use oulipoly_state::mailbox::ExactProcessEvidence;
+use oulipoly_state::mailbox::{ExactProcessEvidence, RuntimeLifecycleState};
 use oulipoly_state::mailbox::{
     AdvanceRuntimeGenerationDrain, AttachRuntimeGenerationSession, BindRuntimeGenerationRunning,
-    CreateRuntimeGeneration, DrainAdvanceResult, DrainFinishResult, DrainHandoff, DrainRequestId,
+    CreateRuntimeGeneration, DrainAdvanceResult, DrainHandoff, DrainRequestId,
     DrainRequestResult, ExitRuntimeGenerationNonOrderly, FinishRuntimeGenerationDrain,
     GenerationMutation, MailboxDb, RequestRuntimeGenerationDrain, RuntimeGenerationFence,
-    RuntimeGenerationId, RuntimeLifecycleState, RuntimeTerminalReason,
+    RuntimeGenerationId, RuntimeTerminalReason,
 };
 use oulipoly_state::pid_identity::{self, ProcessIdentity};
 use std::path::{Path, PathBuf};
@@ -42,9 +42,10 @@ impl SpawnRuntimeMode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SpawnIdentityContext {
-    generation_id: RuntimeGenerationId,
+    pub(super) generation_id: RuntimeGenerationId,
+    pub(super) native_exit_journal: Option<PathBuf>,
     launch_custody: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<oulipoly_core::launch_custody::LaunchCustody>>>,
-    invocation_uuid: String,
+    pub(super) invocation_uuid: String,
     provider_name: String,
     model_name: Option<String>,
     session_id: Option<String>,
@@ -64,6 +65,7 @@ impl SpawnIdentityContext {
         models_dir: Option<&Path>,
     ) -> Result<Self, String> {
         Ok(Self {
+            native_exit_journal: None,
             launch_custody: Default::default(),
             generation_id: RuntimeGenerationId::parse(&lease.runtime_generation_uuid.to_string())
                 .map_err(|e| e.to_string())?,
@@ -77,6 +79,11 @@ impl SpawnIdentityContext {
             models_dir: models_dir.map(|p| p.to_string_lossy().into_owned()),
             mailbox_db_path: Some(mailbox_path),
         })
+    }
+
+    pub(crate) fn with_native_exit_journal(mut self, path: PathBuf) -> Self {
+        self.native_exit_journal = Some(path);
+        self
     }
 
     pub(crate) fn with_start_known_session(mut self, session: Option<String>) -> Self {
@@ -195,6 +202,7 @@ fn spawn_identity_context_from_invocation(
     models_dir: Option<&Path>,
 ) -> SpawnIdentityContext {
     SpawnIdentityContext {
+        native_exit_journal: None,
         launch_custody: Default::default(),
         generation_id: RuntimeGenerationId::new(),
         invocation_uuid: invocation.id,
@@ -750,8 +758,31 @@ pub(crate) fn mark_runtime_generation_orderly_completed(
     let Some(context) = context else {
         return Ok(());
     };
-    seal_launch_custody(context)?;
+    use super::runtime_exit_journal::{ExitOperation, PendingExit};
     let drain_request_id = DrainRequestId::new();
+    let pending = PendingExit::begin(
+        context,
+        ExitOperation::FinalizeDrain,
+        RuntimeTerminalReason::OrderlyCompletion,
+        exit_code,
+        Some(drain_request_id.to_string()),
+    )?;
+    let result = finalize_runtime_drain(
+        context,
+        exit_code,
+        compatibility_exit_code,
+        &drain_request_id,
+    );
+    pending.finish(result)
+}
+
+fn finalize_runtime_drain(
+    context: &SpawnIdentityContext,
+    exit_code: Option<i32>,
+    compatibility_exit_code: Option<i32>,
+    drain_request_id: &DrainRequestId,
+) -> Result<(), GenerationOperationError> {
+    seal_launch_custody(context)?;
     let mut db = context
         .open_mailbox()
         .map_err(|_| GenerationOperationError::StorageFailure)?;
@@ -759,7 +790,7 @@ pub(crate) fn mark_runtime_generation_orderly_completed(
         .runtime_lifecycle()
         .request_runtime_generation_drain(RequestRuntimeGenerationDrain {
             fence: generation_fence(context),
-            drain_request_id: &drain_request_id,
+            drain_request_id,
             requested_by_invocation_uuid: &context.invocation_uuid,
         })
         .map_err(|_| GenerationOperationError::StorageFailure)?
@@ -783,7 +814,7 @@ pub(crate) fn mark_runtime_generation_orderly_completed(
         .runtime_lifecycle()
         .advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
             fence: generation_fence(context),
-            drain_request_id: &drain_request_id,
+            drain_request_id,
         })
         .map_err(|_| GenerationOperationError::StorageFailure)?
     {
@@ -802,27 +833,24 @@ pub(crate) fn mark_runtime_generation_orderly_completed(
             return Err(GenerationOperationError::Rejected(rejection));
         }
     }
-    match db
+    let pending = super::runtime_exit_journal::PendingExit::begin(
+        context,
+        super::runtime_exit_journal::ExitOperation::FinishDrain,
+        RuntimeTerminalReason::OrderlyCompletion,
+        exit_code,
+        Some(drain_request_id.to_string()),
+    )?;
+    pending.observe_before(context, &db)?;
+    let result = db
         .runtime_lifecycle()
         .finish_runtime_generation_drain(FinishRuntimeGenerationDrain {
             fence: generation_fence(context),
-            drain_request_id: &drain_request_id,
+            drain_request_id,
             exit_code,
             compatibility_exit_code,
         })
-        .map_err(|_| GenerationOperationError::StorageFailure)?
-    {
-        DrainFinishResult::Finished(_) | DrainFinishResult::AlreadyExited(_) => Ok(()),
-        DrainFinishResult::NotDraining(actual) => Err(GenerationOperationError::Rejected(
-            oulipoly_state::mailbox::GenerationRejection::IllegalPredecessor {
-                expected: RuntimeLifecycleState::Draining,
-                actual,
-            },
-        )),
-        DrainFinishResult::Rejected(rejection) => {
-            Err(GenerationOperationError::Rejected(rejection))
-        }
-    }
+        .map_err(|_| GenerationOperationError::StorageFailure);
+    pending.finish_drain(result)
 }
 
 fn exit_runtime_generation(
@@ -843,19 +871,28 @@ pub(crate) fn exit_runtime_generation_outcome(
     let Some(context) = context else {
         return Ok(GenerationOperationOutcome::NotRequired);
     };
-    seal_launch_custody(context)?;
-    let mut db = context
-        .open_mailbox()
-        .map_err(|_| GenerationOperationError::StorageFailure)?;
-    let mutation = db
-        .runtime_lifecycle()
-        .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
-            fence: generation_fence(context),
-            reason,
-            exit_code,
-        })
-        .map_err(|_| GenerationOperationError::StorageFailure)?;
-    generation_operation_outcome(mutation)
+    let pending = super::runtime_exit_journal::PendingExit::begin(
+        context,
+        super::runtime_exit_journal::ExitOperation::NonOrderly,
+        reason,
+        exit_code,
+        None,
+    )?;
+    let result = (|| {
+        seal_launch_custody(context)?;
+        let mut db = context
+            .open_mailbox()
+            .map_err(|_| GenerationOperationError::StorageFailure)?;
+        pending.observe_before(context, &db)?;
+        db.runtime_lifecycle()
+            .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
+                fence: generation_fence(context),
+                reason,
+                exit_code,
+            })
+            .map_err(|_| GenerationOperationError::StorageFailure)
+    })();
+    pending.finish_non_orderly(result)
 }
 
 fn generation_fence(context: &SpawnIdentityContext) -> RuntimeGenerationFence<'_> {

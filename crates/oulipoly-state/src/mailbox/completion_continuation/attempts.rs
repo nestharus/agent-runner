@@ -667,6 +667,7 @@ impl MailboxDb {
         process: &SourceProcessIdentity,
         reason: RuntimeTerminalReason,
         exit_code: Option<i32>,
+        drain_request: Option<&str>,
     ) -> Result<(), String> {
         self.native_original_drain(generation, invocation)?
             .ok_or("native_original_drain_absent")?;
@@ -700,6 +701,25 @@ impl MailboxDb {
         }
         if before.lifecycle_state == RuntimeLifecycleState::Exited {
             return Ok(());
+        }
+        // Physical drain is not new lifecycle authority. Keep the same
+        // predecessor distinction as finish-drain and non-orderly exit.
+        match reason {
+            RuntimeTerminalReason::OrderlyCompletion
+                if before.lifecycle_state == RuntimeLifecycleState::Draining
+                    && drain_request.is_some()
+                    && before
+                        .drain_request_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref()
+                        == drain_request => {}
+            RuntimeTerminalReason::AbnormalTermination
+                if matches!(
+                    before.lifecycle_state,
+                    RuntimeLifecycleState::Starting | RuntimeLifecycleState::Running
+                ) => {}
+            _ => return Err("native_original_runtime_illegal_predecessor".into()),
         }
         let reason = match reason {
             RuntimeTerminalReason::OrderlyCompletion => "orderly_completion",

@@ -1,0 +1,259 @@
+//! Original native executor operations in its existing producer-custody journal.
+//! An intent is not an outcome. Results remain separate, including rejections;
+//! missing results are pending operations and must still satisfy State legality.
+use super::spawn_identity::GenerationOperationOutcome;
+use super::spawn_identity::{GenerationOperationError, SpawnIdentityContext};
+use oulipoly_provider::custody::durable;
+use oulipoly_state::mailbox::{
+    DrainFinishResult, GenerationMutation, GenerationRejection, RuntimeGenerationRow,
+    RuntimeLifecycleState, RuntimeTerminalReason,
+};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ExitOperation {
+    FinalizeDrain,
+    FinishDrain,
+    NonOrderly,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ExitIntent {
+    pub generation: String,
+    pub invocation: String,
+    pub operation: ExitOperation,
+    pub reason: String,
+    pub exit_code: Option<i32>,
+    pub drain_request: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ExitObservation {
+    pub intent: ExitIntent,
+    pub before: Option<serde_json::Value>,
+    pub result: Option<ExitResult>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ExitDisposition {
+    HelperReturned,
+    Applied,
+    AlreadyApplied,
+    Finished,
+    AlreadyExited,
+    Rejected,
+    Failed,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ExitResult {
+    pub disposition: ExitDisposition,
+    pub rejected: bool,
+    pub returned: String,
+}
+
+pub(super) struct PendingExit(Option<PathBuf>);
+impl PendingExit {
+    pub(super) fn begin(
+        context: &SpawnIdentityContext,
+        operation: ExitOperation,
+        reason: RuntimeTerminalReason,
+        exit_code: Option<i32>,
+        drain_request: Option<String>,
+    ) -> Result<Self, GenerationOperationError> {
+        let Some(root) = &context.native_exit_journal else {
+            return Ok(Self(None));
+        };
+        let path = root.join(uuid::Uuid::new_v4().to_string());
+        let intent = ExitIntent {
+            generation: context.generation_id.to_string(),
+            invocation: context.invocation_uuid.clone(),
+            operation,
+            reason: serde_json::to_value(reason)
+                .map_err(|_| GenerationOperationError::Unknown)?
+                .as_str()
+                .ok_or(GenerationOperationError::Unknown)?
+                .to_string(),
+            exit_code,
+            drain_request,
+        };
+        // Before any potentially lossy SQL/helper step. Never report successful
+        // finalization when this write returns an error.
+        durable::write_json(&path.join("intent.json"), &intent)
+            .map_err(|_| GenerationOperationError::StorageFailure)?;
+        Ok(Self(Some(path)))
+    }
+    pub(super) fn observe_before(
+        &self,
+        context: &SpawnIdentityContext,
+        db: &oulipoly_state::mailbox::MailboxDb,
+    ) -> Result<(), GenerationOperationError> {
+        if self.0.is_none() {
+            return Ok(());
+        }
+        let row = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&context.generation_id)
+            .map_err(|_| GenerationOperationError::StorageFailure)?
+            .ok_or(GenerationOperationError::MissingGeneration)?;
+        self.before(&row)
+    }
+    pub(super) fn before(
+        &self,
+        row: &RuntimeGenerationRow,
+    ) -> Result<(), GenerationOperationError> {
+        if let Some(path) = &self.0 {
+            durable::write_json(&path.join("before.json"), row)
+                .map_err(|_| GenerationOperationError::StorageFailure)?;
+        }
+        Ok(())
+    }
+    pub(super) fn finish<T: std::fmt::Debug>(
+        self,
+        result: Result<T, GenerationOperationError>,
+    ) -> Result<T, GenerationOperationError> {
+        let disposition = match &result {
+            Ok(_) => ExitDisposition::HelperReturned,
+            Err(GenerationOperationError::Rejected(_)) => ExitDisposition::Rejected,
+            Err(_) => ExitDisposition::Failed,
+        };
+        self.retain_result(&result, disposition)?;
+        result
+    }
+    pub(super) fn finish_drain(
+        self,
+        result: Result<DrainFinishResult, GenerationOperationError>,
+    ) -> Result<(), GenerationOperationError> {
+        let disposition = match &result {
+            Ok(DrainFinishResult::Finished(_)) => ExitDisposition::Finished,
+            Ok(DrainFinishResult::AlreadyExited(_)) => ExitDisposition::AlreadyExited,
+            Ok(DrainFinishResult::NotDraining(_) | DrainFinishResult::Rejected(_)) => {
+                ExitDisposition::Rejected
+            }
+            Err(_) => ExitDisposition::Failed,
+        };
+        self.retain_result(&result, disposition)?;
+        match result? {
+            DrainFinishResult::Finished(_) | DrainFinishResult::AlreadyExited(_) => Ok(()),
+            DrainFinishResult::NotDraining(actual) => Err(GenerationOperationError::Rejected(
+                GenerationRejection::IllegalPredecessor {
+                    expected: RuntimeLifecycleState::Draining,
+                    actual,
+                },
+            )),
+            DrainFinishResult::Rejected(rejection) => {
+                Err(GenerationOperationError::Rejected(rejection))
+            }
+        }
+    }
+    pub(super) fn finish_non_orderly(
+        self,
+        result: Result<GenerationMutation<RuntimeGenerationRow>, GenerationOperationError>,
+    ) -> Result<GenerationOperationOutcome, GenerationOperationError> {
+        let disposition = match &result {
+            Ok(GenerationMutation::Applied(_)) => ExitDisposition::Applied,
+            Ok(GenerationMutation::AlreadyApplied(_)) => ExitDisposition::AlreadyApplied,
+            Ok(GenerationMutation::Rejected(_)) => ExitDisposition::Rejected,
+            Err(_) => ExitDisposition::Failed,
+        };
+        self.retain_result(&result, disposition)?;
+        match result? {
+            GenerationMutation::Applied(_) => Ok(GenerationOperationOutcome::Applied),
+            GenerationMutation::AlreadyApplied(_) => Ok(GenerationOperationOutcome::AlreadyApplied),
+            GenerationMutation::Rejected(reason) => Err(GenerationOperationError::Rejected(reason)),
+        }
+    }
+    fn retain_result(
+        &self,
+        result: &impl std::fmt::Debug,
+        disposition: ExitDisposition,
+    ) -> Result<(), GenerationOperationError> {
+        if let Some(path) = &self.0 {
+            let observed = ExitResult {
+                rejected: disposition == ExitDisposition::Rejected,
+                disposition,
+                returned: format!("{result:?}"),
+            };
+            #[cfg(feature = "age360-fault-fixtures")]
+            oulipoly_state::completion_continuation::age360_fault_barrier(
+                "native-exit-result-retention",
+            );
+            durable::write_json(&path.join("result.json"), &observed).map_err(|_| {
+                #[cfg(feature = "age360-fault-fixtures")]
+                oulipoly_state::completion_continuation::age360_fault_barrier(
+                    "native-exit-result-retention-failed",
+                );
+                GenerationOperationError::StorageFailure
+            })?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn read(
+    root: &Path,
+    generation: &str,
+    invocation: &str,
+) -> Result<Vec<ExitObservation>, String> {
+    if !root.try_exists().map_err(|e| e.to_string())? {
+        return Ok(vec![]);
+    }
+    let mut paths = std::fs::read_dir(root)
+        .map_err(|e| e.to_string())?
+        .map(|e| e.map(|e| e.path()).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort(); // stable transport only; order never selects an outcome
+    let mut observations = Vec::new();
+    for path in paths {
+        let intent_path = path.join("intent.json");
+        // A failed intent write can leave only a temporary file. No operation
+        // followed that write, and its unretained facts cannot be reconstructed.
+        if !intent_path.try_exists().map_err(|e| e.to_string())? {
+            continue;
+        }
+        let intent: ExitIntent = durable::read_json(&intent_path)?;
+        if intent.generation != generation || intent.invocation != invocation {
+            return Err("native_exit_journal_identity_conflict".into());
+        }
+        observations.push(ExitObservation {
+            intent,
+            before: optional(&path.join("before.json"))?,
+            result: optional(&path.join("result.json"))?,
+        });
+    }
+    Ok(observations)
+}
+fn optional<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
+    if path.try_exists().map_err(|e| e.to_string())? {
+        durable::read_json(path).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn returned_retention_failure_is_not_success_and_does_not_erase_intent() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("operation");
+        let intent = ExitIntent {
+            generation: "g".into(),
+            invocation: "i".into(),
+            operation: ExitOperation::NonOrderly,
+            reason: "abnormal_termination".into(),
+            exit_code: None,
+            drain_request: None,
+        };
+        durable::write_json(&path.join("intent.json"), &intent).unwrap();
+        std::fs::create_dir(path.join("result.json")).unwrap();
+        assert_eq!(
+            PendingExit(Some(path.clone())).finish(Ok(())),
+            Err(GenerationOperationError::StorageFailure)
+        );
+        assert!(read(root.path(), "g", "i").is_err()); // unreadable result isn't absence
+        std::fs::remove_dir(path.join("result.json")).unwrap();
+        let retained = read(root.path(), "g", "i").unwrap();
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].result.is_none());
+        assert!(read(root.path(), "other-generation", "i").is_err());
+    }
+}

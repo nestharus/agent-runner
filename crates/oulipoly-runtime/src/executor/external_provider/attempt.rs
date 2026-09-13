@@ -129,6 +129,8 @@ struct RetainedAttemptCustody {
     retention_failure: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     runtime_exit_attempts: Vec<OriginalRuntimeExitAttempt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    runtime_exit_operations: Vec<super::super::cli::runtime_exit_journal::ExitObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_evidence: Option<serde_json::Value>,
 }
@@ -214,7 +216,10 @@ pub fn settle_retained_native_cancellation(
                     false,
                 )?;
             } else {
-                let (reason, code) = original_runtime_exit_outcome(&retained)?;
+                let (reason, code, drain_request) = original_runtime_exit_outcome(
+                    &retained,
+                    runtime.row.as_ref().ok_or("native_runtime_absent")?,
+                )?;
                 mailbox.exit_native_launched_after_original_drain(
                     &generation.to_string(),
                     &invocation.to_string(),
@@ -225,6 +230,7 @@ pub fn settle_retained_native_cancellation(
                     },
                     reason,
                     code,
+                    drain_request.as_deref(),
                 )?;
             }
         } else {
@@ -314,7 +320,7 @@ fn retain_recovered_dead_cancellation(
             if drain["receipt"]["accepted_cancellation"].is_string() {
                 RuntimeTerminalReason::Cancelled
             } else {
-                original_runtime_exit_outcome(retained)?.0
+                original_runtime_exit_outcome(retained, row)?.0
             },
         )
     } else {
@@ -346,25 +352,95 @@ fn retain_recovered_dead_cancellation(
         evidence["original_runtime_exit_attempts"] =
             serde_json::to_value(&retained.runtime_exit_attempts).map_err(|e| e.to_string())?;
     }
+    if launch.spawned && !retained.runtime_exit_operations.is_empty() {
+        evidence["original_runtime_exit_operations"] =
+            serde_json::to_value(&retained.runtime_exit_operations).map_err(|e| e.to_string())?;
+    }
     state.retain_native_runtime_cancellation(&retained.lease.owner, &evidence)?;
     Ok(Some(evidence))
 }
 
-/// Retry what the original executor actually attempted, not a new interpretation
-/// of raw actor status. Classification can supersede a provider's exit code.
+/// Select compatible actual operations, never the last outer helper label.
+/// Contradictory eligible requests stay unresolved; rejected requests remain in
+/// the retained history but cannot authorize a transition.
 fn original_runtime_exit_outcome(
     retained: &RetainedAttemptCustody,
-) -> Result<(RuntimeTerminalReason, Option<i32>), String> {
-    let original = retained
-        .runtime_exit_attempts
-        .last()
-        .ok_or("native_original_runtime_exit_attempt_absent")?;
-    let reason = match original.terminal_code.as_str() {
-        "orderly_completion" => RuntimeTerminalReason::OrderlyCompletion,
-        "abnormal_termination" => RuntimeTerminalReason::AbnormalTermination,
-        _ => return Err("native_original_launched_runtime_exit_conflict".into()),
-    };
-    Ok((reason, original.exit_code))
+    row: &RuntimeGenerationRow,
+) -> Result<(RuntimeTerminalReason, Option<i32>, Option<String>), String> {
+    use super::super::cli::runtime_exit_journal::{ExitDisposition, ExitOperation};
+    let mut selected = None;
+    for observation in &retained.runtime_exit_operations {
+        let intent = &observation.intent;
+        if intent.generation != retained.lease.runtime_generation_uuid.to_string()
+            || intent.invocation != retained.lease.owner.invocation_uuid.to_string()
+        {
+            return Err("native_exit_journal_identity_conflict".into());
+        }
+        if observation
+            .result
+            .as_ref()
+            .is_some_and(|r| r.rejected || r.disposition == ExitDisposition::AlreadyExited)
+        {
+            continue;
+        }
+        if row.terminal_reason == Some(RuntimeTerminalReason::RecoveredDead)
+            && observation.result.as_ref().is_some_and(|r| {
+                matches!(
+                    r.disposition,
+                    ExitDisposition::Applied
+                        | ExitDisposition::AlreadyApplied
+                        | ExitDisposition::Finished
+                )
+            })
+        {
+            return Err("native_original_durable_runtime_outcome_conflict".into());
+        }
+        let Some(before) = &observation.before else {
+            continue;
+        };
+        if before["spawn_invocation_uuid"] != intent.invocation
+            || before["generation_id"] != intent.generation
+            || before["exact_process_evidence"]
+                != serde_json::to_value(&row.exact_process_evidence).map_err(|e| e.to_string())?
+        {
+            return Err("native_exit_predecessor_identity_conflict".into());
+        }
+        let recovered = row.terminal_reason == Some(RuntimeTerminalReason::RecoveredDead);
+        let reason = match intent.operation {
+            ExitOperation::FinalizeDrain => continue, // helper may branch; NOT an SQL outcome
+            ExitOperation::FinishDrain
+                if intent.reason == "orderly_completion"
+                    && before["lifecycle_state"] == "draining"
+                    && intent.drain_request.is_some()
+                    && before["drain_request_id"].as_str() == intent.drain_request.as_deref()
+                    && row.drain_request_id.as_ref().map(ToString::to_string)
+                        == intent.drain_request
+                    && (row.lifecycle_state == RuntimeLifecycleState::Draining || recovered) =>
+            {
+                RuntimeTerminalReason::OrderlyCompletion
+            }
+            ExitOperation::NonOrderly
+                if intent.reason == "abnormal_termination"
+                    && matches!(
+                        before["lifecycle_state"].as_str(),
+                        Some("starting" | "running")
+                    )
+                    && (matches!(
+                        row.lifecycle_state,
+                        RuntimeLifecycleState::Starting | RuntimeLifecycleState::Running
+                    ) || recovered) =>
+            {
+                RuntimeTerminalReason::AbnormalTermination
+            }
+            _ => continue,
+        };
+        let candidate = (reason, intent.exit_code, intent.drain_request.clone());
+        if selected.as_ref().is_some_and(|prior| prior != &candidate) {
+            return Err("native_original_runtime_operations_conflict".into());
+        }
+        selected = Some(candidate);
+    }
+    selected.ok_or("native_original_applicable_runtime_operation_absent".into())
 }
 
 /// The request's persisted timestamp/token is separate from the original drain
@@ -789,6 +865,11 @@ impl AttemptExecution {
                 .ok_or("channel_settlement_absent")?,
             retention_failure: evidence.retention_failure.clone(),
             runtime_exit_attempts: evidence.runtime_exit_attempts.clone(),
+            runtime_exit_operations: super::super::cli::runtime_exit_journal::read(
+                &native_journal(&self.allocation).join("runtime-exit"),
+                &self.allocation.lease.runtime_generation_uuid.to_string(),
+                &self.allocation.lease.owner.invocation_uuid.to_string(),
+            )?,
             recovery_evidence: None,
         };
         self.state
@@ -886,7 +967,7 @@ fn execute_allocated_attempt(
         state.retain_launch_owner(&allocation.lease.owner)?;
         state
             .validate_active_launch_attempt(&allocation.lease, &allocation.completion_authority)?;
-        let spawn = SpawnIdentityContext::for_allocated_attempt(
+        let mut spawn = SpawnIdentityContext::for_allocated_attempt(
             &allocation.lease,
             allocation.mailbox_db_path.clone(),
             context.model.name.clone(),
@@ -906,6 +987,7 @@ fn execute_allocated_attempt(
         context.parent_invocation_env = Some(identity.to_string());
         if original_tree {
             let journal = native_journal(&allocation);
+            spawn = spawn.with_native_exit_journal(journal.join("runtime-exit"));
             std::fs::create_dir_all(journal.join("actors")).map_err(|e| e.to_string())?;
             oulipoly_provider::custody::durable::initialize_admissions(
                 &journal.join("actors"),
@@ -985,7 +1067,7 @@ fn execute_allocated_attempt(
         }
     }
     attempt.refresh_promotions();
-    let outcome = match result {
+    let mut outcome = match result {
         Ok(mut result) => {
             // Missing-final is a mapped failed execution, not the Err arm below.
             // Persist its incomplete prefix before this attempt owner is dropped.
@@ -1066,6 +1148,23 @@ fn execute_allocated_attempt(
     }
     if let Err(error) = attempt.retain_custody() {
         tracing::error!(%error, "native attempt custody retention failed; settlement unavailable");
+        match &mut outcome {
+            ProviderLaunchAttemptOutcome::Completed(result) => {
+                result.exit_code = -1;
+                result.terminal_reason = Some("native_custody_retention_failed".into());
+                result
+                    .stderr
+                    .push_str(&format!("\nnative_custody_retention_failed: {error}"));
+            }
+            ProviderLaunchAttemptOutcome::Failed(failure) => {
+                failure.evidence_retention_failure = Some(error);
+                failure.observations.persistence_failed = true;
+            }
+        }
+        #[cfg(feature = "age360-fault-fixtures")]
+        oulipoly_state::completion_continuation::age360_fault_barrier(
+            "native-custody-retention-failed",
+        );
     }
     #[cfg(feature = "age360-fault-fixtures")]
     if original_tree {
@@ -1413,6 +1512,11 @@ fn recover_native_custody(
     let retained = RetainedAttemptCustody {
         lease,
         runtime_exit_attempts,
+        runtime_exit_operations: super::super::cli::runtime_exit_journal::read(
+            &journal.join("runtime-exit"),
+            &generation.to_string(),
+            &invocation.to_string(),
+        )?,
         actors,
         channel,
         retention_failure: None,
@@ -1680,57 +1784,103 @@ mod tests {
         );
     }
     #[test]
-    fn runtime_exit_replay_uses_original_classification_not_raw_process_status() {
+    fn runtime_exit_selection_preserves_rejections_pending_and_conflicts() {
+        use super::super::super::cli::runtime_exit_journal::{
+            ExitDisposition, ExitIntent, ExitObservation, ExitOperation, ExitResult,
+        };
         let (_dir, attempt, _) = fixture();
+        register_allocated_runtime_generation_starting(&attempt.spawn).unwrap();
+        let mut row = runtime_receipt(&attempt.allocation, &[]).row.unwrap();
+        row.lifecycle_state = RuntimeLifecycleState::Draining;
+        row.drain_request_id = Some(oulipoly_state::mailbox::DrainRequestId::new());
         let mut retained = RetainedAttemptCustody {
             lease: attempt.allocation.lease.clone(),
             actors: vec![],
             channel: ReturnChannelSettlement::NotCreated,
             retention_failure: None,
             runtime_exit_attempts: vec![],
+            runtime_exit_operations: vec![],
             recovery_evidence: None,
         };
-        assert!(original_runtime_exit_outcome(&retained).is_err());
-        attempt.record_runtime_exit_attempt(
-            RuntimeTerminalReason::OrderlyCompletion,
-            Some(7),
-            "classified_dispatch",
-            &Err::<(), _>("storage"),
-        );
-        retained.runtime_exit_attempts = attempt
-            .evidence
-            .lock()
-            .unwrap()
-            .runtime_exit_attempts
-            .clone();
+        assert!(original_runtime_exit_outcome(&retained, &row).is_err());
+        let finish = ExitObservation {
+            intent: ExitIntent {
+                generation: retained.lease.runtime_generation_uuid.to_string(),
+                invocation: retained.lease.owner.invocation_uuid.to_string(),
+                operation: ExitOperation::FinishDrain,
+                reason: "orderly_completion".into(),
+                exit_code: Some(7),
+                drain_request: row.drain_request_id.as_ref().map(ToString::to_string),
+            },
+            before: Some(serde_json::to_value(&row).unwrap()),
+            result: Some(ExitResult {
+                disposition: ExitDisposition::Failed,
+                rejected: false,
+                returned: "Err(StorageFailure)".into(),
+            }),
+        };
+        retained.runtime_exit_operations.push(finish.clone());
+        let mut rejected = finish.clone();
+        rejected.intent.operation = ExitOperation::NonOrderly;
+        rejected.intent.reason = "abnormal_termination".into();
+        rejected.intent.drain_request = None;
+        rejected.intent.exit_code = None;
+        rejected.result = Some(ExitResult {
+            disposition: ExitDisposition::Rejected,
+            rejected: true,
+            returned: "Err(Rejected(IllegalPredecessor))".into(),
+        });
+        retained.runtime_exit_operations.push(rejected);
         assert_eq!(
-            original_runtime_exit_outcome(&retained).unwrap(),
-            (RuntimeTerminalReason::OrderlyCompletion, Some(7))
+            original_runtime_exit_outcome(&retained, &row).unwrap().0,
+            RuntimeTerminalReason::OrderlyCompletion
         );
-        attempt.record_runtime_exit_attempt(
-            RuntimeTerminalReason::AbnormalTermination,
-            None,
-            "dispatch_cleanup",
-            &Err::<(), _>("storage"),
-        );
-        retained.runtime_exit_attempts = attempt
-            .evidence
-            .lock()
-            .unwrap()
-            .runtime_exit_attempts
-            .clone();
+        // Lost result is a pending operation, not rejection erasure or LWW. The
+        // abnormal predecessor still fails even without its returned result.
+        retained.runtime_exit_operations[1].result = None;
         assert_eq!(
-            original_runtime_exit_outcome(&retained).unwrap(),
-            (RuntimeTerminalReason::AbnormalTermination, None)
+            original_runtime_exit_outcome(&retained, &row).unwrap().1,
+            Some(7)
         );
-        assert_eq!(retained.runtime_exit_attempts.len(), 2);
+        retained.runtime_exit_operations[0].result = None;
+        assert_eq!(
+            original_runtime_exit_outcome(&retained, &row).unwrap().1,
+            Some(7)
+        );
+        let mut conflict = finish.clone();
+        conflict.intent.exit_code = Some(8);
+        retained.runtime_exit_operations.push(conflict);
+        assert_eq!(
+            original_runtime_exit_outcome(&retained, &row).unwrap_err(),
+            "native_original_runtime_operations_conflict"
+        );
+        retained.runtime_exit_operations = vec![finish];
+        row.drain_request_id = Some(oulipoly_state::mailbox::DrainRequestId::new());
+        assert!(original_runtime_exit_outcome(&retained, &row).is_err());
+        row.drain_request_id = retained.runtime_exit_operations[0]
+            .intent
+            .drain_request
+            .as_ref()
+            .map(|id| oulipoly_state::mailbox::DrainRequestId::parse(id).unwrap());
+        retained.runtime_exit_operations[0].result = Some(ExitResult {
+            disposition: ExitDisposition::AlreadyExited,
+            rejected: false,
+            returned: "Ok(AlreadyExited(original row))".into(),
+        });
+        assert!(original_runtime_exit_outcome(&retained, &row).is_err());
+        // Historical outer helper labels cannot replace absent actual operations.
+        retained.runtime_exit_operations.clear();
         retained
             .runtime_exit_attempts
-            .last_mut()
-            .unwrap()
-            .terminal_code = "cancelled".into();
-        assert!(original_runtime_exit_outcome(&retained).is_err());
+            .push(OriginalRuntimeExitAttempt {
+                terminal_code: "orderly_completion".into(),
+                exit_code: Some(0),
+                site: "classified_dispatch".into(),
+                projection_result: "Ok(())".into(),
+            });
+        assert!(original_runtime_exit_outcome(&retained, &row).is_err());
     }
+
     #[test]
     fn logical_cancellation_keeps_actual_acceptance_separate_and_exact() {
         let (_dir, attempt, _) = fixture();
@@ -1779,6 +1929,7 @@ mod tests {
             channel: ReturnChannelSettlement::NotCreated,
             retention_failure: None,
             runtime_exit_attempts: vec![],
+            runtime_exit_operations: vec![],
             recovery_evidence: None,
         };
         let mut runtime = runtime_receipt(&attempt.allocation, &retained.actors);
