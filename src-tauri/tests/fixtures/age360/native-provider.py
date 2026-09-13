@@ -144,7 +144,11 @@ def launch(request):
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
                 os.environ["AGE360_CANCEL_TEST"] = "1"
             child = subprocess.Popen(["/bin/sh", "-c", 'if [ "$AGE360_CANCEL_TEST" = 1 ]; then trap "" TERM; touch "$AGE360_ROOT/cancel-descendant-ready"; fi; while [ ! -f "$AGE360_DESCENDANT_GATE" ]; do sleep 0.02; done'], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("descendant.pid").write_text(str(child.pid))
+            # Publish only complete real PID bytes; existence is a readiness contract.
+            pid_path = pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("descendant.pid")
+            pending_pid = pid_path.with_suffix(".pending")
+            pending_pid.write_text(str(child.pid))
+            pending_pid.replace(pid_path)
             if cancelling:
                 deadline=time.monotonic()+45
                 while time.monotonic()<deadline: time.sleep(0.02)

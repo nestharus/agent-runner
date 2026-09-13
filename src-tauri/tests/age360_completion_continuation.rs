@@ -951,6 +951,9 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
         .unwrap()
         .parse()
         .unwrap();
+    let descendant_identity = read_live_process_identity(descendant)
+        .unwrap()
+        .expect("published real descendant incarnation");
     wait(|| {
         let rows = f.mailbox().list_mailbox(SESSION, true).ok()?;
         (!rows.is_empty() && rows.iter().all(|r| r.delivered_at.is_some())).then_some(())
@@ -1159,16 +1162,69 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
             serde_json::from_str(&launcher).unwrap();
         assert!(current_identity_matches(&launcher));
         if matches!(owner_loss, 9 | 10) {
+            if channel == Some("wait_storage_failure") {
+                // Select original-AC adoption rather than let an inner reaper
+                // consume this descendant first. Freeze its genuine ancestors
+                // below the launcher; only product cancellation kills them.
+                let mut child = descendant;
+                let mut seen = std::collections::HashSet::new();
+                loop {
+                    let stat = fs::read_to_string(format!("/proc/{child}/stat")).unwrap();
+                    let parent: i64 = stat
+                        .rsplit_once(") ")
+                        .unwrap()
+                        .1
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if parent == launcher.pid {
+                        break;
+                    }
+                    assert!(
+                        parent > 1 && seen.insert(parent),
+                        "must reach original launcher through real ancestry"
+                    );
+                    let ac: oulipoly_state::completion_continuation::SourceProcessIdentity =
+                        serde_json::from_str(&custodian).unwrap();
+                    assert_ne!(parent, ac.pid, "never freeze original AC");
+                    let identity = read_live_process_identity(parent).unwrap().unwrap();
+                    assert_eq!(unsafe { libc::kill(parent as i32, libc::SIGSTOP) }, 0);
+                    wait(|| {
+                        assert_eq!(
+                            read_live_process_identity(parent).unwrap(),
+                            Some(identity.clone())
+                        );
+                        let stat = fs::read_to_string(format!("/proc/{parent}/stat")).unwrap();
+                        (stat.rsplit_once(") ").unwrap().1.split_whitespace().next() == Some("T"))
+                            .then_some(())
+                    });
+                    println!("frozen exact inner ancestor, not a wait receipt: {identity:?}");
+                    child = parent;
+                }
+            }
             request_linked_cancel(&f, &attempt);
             if channel == Some("wait_storage_failure") {
-                wait(|| {
-                    read_live_process_identity(descendant)
-                        .ok()?
-                        .is_none()
-                        .then_some(())
-                });
                 let ac: oulipoly_state::completion_continuation::SourceProcessIdentity =
                     serde_json::from_str(&custodian).unwrap();
+                // Cessation is NOT reaping: with storage obstructed the original
+                // owner must retain this exact terminal, still-waitable incarnation.
+                wait(|| {
+                    let identity = read_live_process_identity(descendant).unwrap()?;
+                    assert_eq!(identity, descendant_identity);
+                    let stat = fs::read_to_string(format!("/proc/{descendant}/stat")).unwrap();
+                    let fields: Vec<_> = stat
+                        .rsplit_once(") ")
+                        .unwrap()
+                        .1
+                        .split_whitespace()
+                        .collect();
+                    (fields[0] == "Z" && fields[1].parse::<i64>().unwrap() == ac.pid).then(|| {
+                        assert_eq!(fields[49].parse::<i32>().unwrap(), libc::SIGKILL);
+                        println!("ceased but unreaped exact descendant={identity:?} stat={stat}");
+                    })
+                });
                 let adopter: oulipoly_state::completion_continuation::SourceProcessIdentity =
                     serde_json::from_str(&adopter).unwrap();
                 assert!(current_identity_matches(&ac) && current_identity_matches(&adopter));
@@ -1181,6 +1237,15 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
                 assert_eq!(
                     fs::read(&wait_obstruction).unwrap(),
                     b"fixture obstruction, not a receipt"
+                );
+                let pending: (i64, Option<String>, bool) = f.sidecar_connection().query_row(
+                    "SELECT integrated,drain_receipt,EXISTS(SELECT 1 FROM session_wake_claim WHERE session_id=?2 AND claim_token=?3) FROM completion_continuation_attempt WHERE attempt_id=?1",
+                    rusqlite::params![attempt.attempt_id, SESSION, claim.claim_token],
+                    |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                assert_eq!(pending, (0, None, true));
+                assert!(
+                    !std::path::Path::new(&attempt.result_path).exists(),
+                    "no false aggregate drain"
                 );
                 fs::remove_file(&wait_obstruction).unwrap();
                 println!(
@@ -1228,6 +1293,30 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
     assert_eq!(receipt.0, "drained");
     assert_eq!(receipt.1, 1);
     assert!(receipt.2.contains("ECHILD"));
+    if channel == Some("wait_storage_failure") {
+        let ac: oulipoly_state::completion_continuation::SourceProcessIdentity =
+            serde_json::from_str(&custodian).unwrap();
+        let journal = wait_obstruction.join(format!(
+            "{}-{}-{}.json",
+            descendant, descendant_identity.os_pid_starttime_ticks, ac.pid
+        ));
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(journal).unwrap()).unwrap();
+        assert_eq!(value["attempt_id"], attempt.attempt_id);
+        assert_eq!(value["owner"], serde_json::to_value(&ac).unwrap());
+        assert_eq!(value["process"]["pid"], descendant);
+        assert_eq!(value["process"]["boot_id"], descendant_identity.os_boot_id);
+        assert_eq!(
+            value["process"]["starttime_ticks"],
+            descendant_identity.os_pid_starttime_ticks
+        );
+        assert_eq!(value["status"], libc::SIGKILL);
+        assert_eq!(value["observation"], "waitid_wnowait");
+        let aggregate: serde_json::Value = serde_json::from_str(&receipt.2).unwrap();
+        assert_eq!(aggregate["custodian"], serde_json::to_value(&ac).unwrap());
+        assert_eq!(aggregate["attempt_id"], attempt.attempt_id);
+        assert!(read_live_process_identity(descendant).unwrap().is_none());
+        println!("restored original wait journal={value}; integrated original ECHILD={aggregate}");
+    }
 
     if matches!(owner_loss, 5 | 6 | 8 | 10) {
         let value: serde_json::Value = serde_json::from_str(&receipt.2).unwrap();
@@ -1246,6 +1335,12 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
             assert_eq!(receipt["accepted_cancellation"], expected);
             let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
             let launch = expected.split(':').next().unwrap();
+            if channel == Some("wait_storage_failure") {
+                wait(|| {
+                    let status: String = state.connection().query_row("SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1", [launch], |r| r.get(0)).unwrap();
+                    (status == "cancelled").then_some(())
+                });
+            }
             let status: String = state
                 .connection()
                 .query_row(

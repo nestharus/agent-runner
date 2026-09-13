@@ -349,6 +349,9 @@ fn native_original_ac_receipt_after_adopter_loss_before_relaying_grant() {
     }
     let f = Fixture::new("owner_only");
     f.gate("adopter-before-ac-release.hold");
+    f.gate("unreleased-before-commit.hold");
+    f.gate("unreleased-commit-returned-ok.hold");
+    f.gate("unreleased-commit-returned-error.hold");
     start_pre_attachment(&f);
     let adopter = process_identity(reached(&f, "adopter-before-ac-release"));
     let a = attempt(&f);
@@ -365,23 +368,77 @@ fn native_original_ac_receipt_after_adopter_loss_before_relaying_grant() {
         adopter
     );
     kill_exact(&adopter);
-    wait(|| {
-        f.mailbox()
+    let ac_pid = reached(&f, "unreleased-before-commit");
+    let ac = process_identity(ac_pid);
+    let observe_live = || -> Option<String> {
+        use rusqlite::OptionalExtension;
+        f.sidecar_connection().query_row(
+            "SELECT json_object('phase',phase,'revision',revision,'integrated',integrated,'receipt',drain_receipt,'claim',EXISTS(SELECT 1 FROM session_wake_claim c WHERE c.session_id=a.session_id AND c.claim_token=a.claim_token)) FROM completion_continuation_attempt a WHERE attempt_id=?1",
+            [&a.attempt_id], |r| r.get(0)).optional().unwrap()
+    };
+    let artifact_header = |name: &str, limit: u64| -> Option<(u64, Vec<u8>)> {
+        use std::io::Read;
+        let file = fs::File::open(f.data.join(name)).ok()?;
+        let len = file.metadata().ok()?.len();
+        let mut bytes = Vec::new();
+        file.take(limit).read_to_end(&mut bytes).ok()?;
+        Some((len, bytes))
+    };
+    let copied_before = f.mailbox().age360_observe_attempt(&a.attempt_id).unwrap();
+    println!("before original commit copied exact row={copied_before:?}");
+    let before: serde_json::Value = serde_json::from_str(&observe_live().unwrap()).unwrap();
+    assert_eq!(before["integrated"], 0);
+    assert!(before["receipt"].is_null());
+    assert_eq!(before["claim"], 1);
+    let bytes: serde_json::Value =
+        serde_json::from_slice(&fs::read(&a.result_path).unwrap()).unwrap();
+    assert_eq!(bytes["custodian"], serde_json::to_value(&ac).unwrap());
+    println!("actual original receipt persisted, commit not entered: row={before} receipt={bytes}");
+    remove_hold(&f, "unreleased-before-commit");
+    // Preserve distinct observations, never use copied activation absence as
+    // an integration oracle. Each live row/receipt/claim is one coherent SELECT.
+    let mut last = None;
+    let live: serde_json::Value = wait(|| {
+        let copied = f.mailbox();
+        let copied_row = copied.age360_observe_attempt(&a.attempt_id).unwrap();
+        let activation_absent = copied
             .continuation_activation(SESSION, a.claim_token.as_ref().unwrap())
-            .ok()?
-            .is_none()
-            .then_some(())
+            .unwrap()
+            .is_none();
+        let live_row = observe_live();
+        let pair = (copied_row, live_row);
+        if last.as_ref() != Some(&pair) {
+            println!(
+                "visibility attempt={} copied_absent_or_terminal={activation_absent} copied={:?} live={:?} wal_header={:?} shm_publication={:?}",
+                a.attempt_id,
+                pair.0,
+                pair.1,
+                artifact_header("pid-identity.db-wal", 32),
+                artifact_header("pid-identity.db-shm", 96)
+            );
+            last = Some(pair.clone());
+        }
+        assert!(
+            !f.root
+                .path()
+                .join("unreleased-commit-returned-error.reached")
+                .exists(),
+            "actual commit returned error"
+        );
+        let live: serde_json::Value =
+            serde_json::from_str(pair.1.as_ref().expect("live exact row must remain")).unwrap();
+        (live["phase"] == "never_started"
+            && live["integrated"] == 1
+            && live["receipt"].is_string()
+            && live["claim"] == 0)
+            .then_some(live)
     });
-    let (phase, receipt): (String, String) = f
-        .sidecar_connection()
-        .query_row(
-            "SELECT phase,drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",
-            [&a.attempt_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(phase, "never_started");
-    let value: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(reached(&f, "unreleased-commit-returned-ok"), ac.pid);
+    assert!(current_identity_matches(&ac));
+    let receipt = live["receipt"].as_str().unwrap();
+    println!("original AC commit returned Ok; live integrated row={live}");
+    remove_hold(&f, "unreleased-commit-returned-ok");
+    let value: serde_json::Value = serde_json::from_str(receipt).unwrap();
     assert_eq!(value["gate"], "unreleased_eof");
     assert_eq!(value["owned_children"], "ECHILD");
     assert_eq!(fs::read_to_string(&a.result_path).unwrap(), receipt);
@@ -769,6 +826,11 @@ fn complete_prelaunch_runtime_settlement(late_cancel: bool) {
     writable_sidecar
         .execute_batch("DROP TRIGGER fixture_fail_runtime_exit")
         .unwrap();
+    if !late_cancel {
+        // Select the direct-projection history by obstructing only generic
+        // recovery. Do not author terminal evidence or permit arbitrary reasons.
+        writable_sidecar.execute_batch("CREATE TRIGGER fixture_hold_generic_recovery BEFORE UPDATE ON runtime_generation WHEN NEW.terminal_reason='recovered_dead' BEGIN SELECT RAISE(FAIL, 'fixture direct-projection schedule'); END;").unwrap();
+    }
     let original_drain = if late_cancel {
         let launcher = f
             .mailbox()
@@ -780,6 +842,20 @@ fn complete_prelaunch_runtime_settlement(late_cancel: bool) {
         assert!(drain["accepted_cancellation"].is_null());
         assert_eq!(drain["root_wait_status"], libc::SIGKILL);
         println!("original uncancelled physical drain before cancellation API={drain}");
+        // Real lifecycle recovery, after actual launcher death and original drain,
+        // must commit BEFORE cancellation can interpret the retained aggregate.
+        let mut writer = MailboxDb::open(&f.data.join("pid-identity.db")).unwrap();
+        writer
+            .runtime_lifecycle()
+            .reconcile_session_liveness(SESSION)
+            .unwrap();
+        let before: (String, String) = f.sidecar_connection().query_row(
+            "SELECT terminal_reason,spawn_invocation_uuid FROM runtime_generation WHERE generation_uuid=?1 AND lifecycle_state='exited'",
+            [&generation], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(before, ("recovered_dead".into(), invocation.clone()));
+        println!(
+            "committed exact recovered-dead history before cancellation generation={generation} invocation={invocation}"
+        );
         Some(drain)
     } else {
         None
@@ -816,29 +892,43 @@ fn complete_prelaunch_runtime_settlement(late_cancel: bool) {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(
-        reason, "recovered_dead",
-        "generic observation must not be relabeled"
-    );
-    let supplement: String = state.connection().query_row("SELECT result_json FROM provider_launch_transition_replays WHERE logical_launch_id=?1 AND operation_key LIKE '%/native-runtime-cancellation-receipts'", [launch], |r|r.get(0)).unwrap();
-    let supplement: serde_json::Value = serde_json::from_str(&supplement).unwrap();
-    assert_eq!(
-        supplement["original_runtime_row"]["terminal_reason"],
-        "recovered_dead"
-    );
-    assert_eq!(supplement["cancellation_terminal_code"], "startup_failed");
-    if let Some(drain) = original_drain {
-        assert_eq!(wait_drained_attempt(&f, &a), drain);
+    let drain = wait_drained_attempt(&f, &a);
+    assert_eq!(drain["attempt_id"], a.attempt_id);
+    let exact: (String, i64) = f.sidecar_connection().query_row(
+        "SELECT spawn_invocation_uuid,(spawned_os_pid IS NOT NULL OR identity_os_pid IS NOT NULL) FROM runtime_generation WHERE generation_uuid=?1",
+        [&generation], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(exact, (invocation.clone(), 0));
+    if let Some(original_drain) = original_drain {
+        assert_eq!(
+            reason, "recovered_dead",
+            "committed history must not be relabeled"
+        );
+        let supplement: String = state.connection().query_row("SELECT result_json FROM provider_launch_transition_replays WHERE logical_launch_id=?1 AND operation_key LIKE '%/native-runtime-cancellation-receipts'", [launch], |r|r.get(0)).unwrap();
+        let supplement: serde_json::Value = serde_json::from_str(&supplement).unwrap();
+        assert_eq!(
+            supplement["original_runtime_row"]["terminal_reason"],
+            "recovered_dead"
+        );
+        assert_eq!(supplement["cancellation_terminal_code"], "startup_failed");
+        assert_eq!(drain, original_drain);
         assert_eq!(supplement["original_drain"]["receipt"], drain);
-        assert!(supplement["original_drain"]["receipt"]["accepted_cancellation"].is_null());
+        assert!(drain["accepted_cancellation"].is_null());
         assert_eq!(supplement["logical_cancellation"]["token"], token);
-        // Public API and native settlement replay must preserve both observations.
         state
             .request_cancel(uuid::Uuid::parse_str(launch).unwrap())
             .unwrap();
         oulipoly_runtime::executor::settle_retained_native_cancellation(&state, g, i).unwrap();
+        println!("preserved runtime observation and separate cancellation evidence={supplement}");
+    } else {
+        assert_eq!(reason, "startup_failed", "direct original-drain projection");
+        assert_eq!(drain["accepted_cancellation"], token);
+        writable_sidecar
+            .execute_batch("DROP TRIGGER fixture_hold_generic_recovery")
+            .unwrap();
+        println!(
+            "direct original-drain startup failure generation={generation} invocation={invocation} receipt={drain}"
+        );
     }
-    println!("preserved runtime observation and separate cancellation evidence={supplement}");
     assert!(!f.root.path().join("resume-prompts.jsonl").exists());
     println!(
         "complete aggregate + actual original cancellation drain settled without invented recovery evidence"
