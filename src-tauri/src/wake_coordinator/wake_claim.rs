@@ -125,6 +125,7 @@ mod tests {
     fn manual_resume_stops_when_a_replacement_claim_wins_release() {
         let directory = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        crate::completion_owner::test_support::install_owner(&mut db);
         db.enqueue_submitted_input(&SubmittedInputEnqueue {
             submission_token: "manual-release-input",
             target: InboxTarget {
@@ -151,6 +152,7 @@ mod tests {
             .wake_claim("session-a")
             .unwrap()
             .unwrap();
+        crate::completion_owner::test_support::revoke_unspent(&mut db, "session-a", "token-a");
         let replacement = db
             .wake_sessions()
             .try_acquire_or_renew_wake_claim(
@@ -185,6 +187,7 @@ mod tests {
     fn manual_resume_releases_a_dead_admitted_wake_claim() {
         let directory = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        crate::completion_owner::test_support::install_owner(&mut db);
         db.enqueue_submitted_input(&SubmittedInputEnqueue {
             submission_token: "manual-dead-release-input",
             target: InboxTarget {

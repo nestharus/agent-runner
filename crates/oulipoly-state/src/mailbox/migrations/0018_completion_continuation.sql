@@ -1,6 +1,7 @@
 -- Additive ordered upgrade for populated domains and fresh construction.
--- No legacy rows become v2 source/owner/attempt authority. Old v17 writers
--- reject user_version=18; deployment requires stopped writers.
+-- No legacy rows become v2 source/owner/attempt authority. The preceding
+-- writer already accepts version18: version alone does not fence old writers.
+-- Deployment requires observed writer quiescence.
 CREATE TABLE completion_continuation_domain (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
     domain_id TEXT NOT NULL UNIQUE,

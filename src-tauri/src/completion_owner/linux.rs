@@ -109,7 +109,7 @@ fn join(endpoint: &Path) -> Result<(), String> {
 
 pub(super) fn bootstrap() -> Result<(), String> {
     if std::env::var_os(ENDPOINT_ENV).is_some() {
-        // Admission checks availability; read/ACK do not bootstrap at all.
+        // Wake-producing entry joins existing authority; read/ACK never bootstrap.
         let mailbox = MailboxDb::open_existing_native_authority(&MailboxDb::default_path()?)?;
         let domain = mailbox
             .completion_continuation_domain()?
@@ -185,6 +185,7 @@ pub(super) fn bootstrap() -> Result<(), String> {
             }
             join(&endpoint)?;
             unsafe { std::env::set_var(ENDPOINT_ENV, &endpoint) };
+            require_owner(&domain)?;
             return Ok(());
         }
         Err(e) => return Err(e.to_string()),

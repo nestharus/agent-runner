@@ -761,6 +761,7 @@ mod tests {
         let log = log.to_string_lossy().into_owned();
         let rc = rc.to_string_lossy().into_owned();
         let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        crate::completion_owner::test_support::install_owner(&mut db);
         let row = match db
             .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
                 session_id: "state-unavailable-session",

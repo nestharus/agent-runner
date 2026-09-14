@@ -116,6 +116,7 @@ pub(crate) fn is_wake_reclaim_handoff_invocation() -> bool {
 pub(crate) fn run_wake_reclaim_handoff_invocation() -> Result<(), String> {
     let owner_token = required_handoff_env(WAKE_RECLAIM_HANDOFF_OWNER_ENV)?;
     let handoff_token = required_handoff_env(WAKE_RECLAIM_HANDOFF_TOKEN_ENV)?;
+    crate::completion_owner::bootstrap_service()?;
     if handoff_token == WAKE_SWEEP_BOOTSTRAP_HANDOFF_TOKEN {
         let expected_owner =
             (owner_token != WAKE_SWEEP_BOOTSTRAP_OWNER_TOKEN).then_some(owner_token.as_str());

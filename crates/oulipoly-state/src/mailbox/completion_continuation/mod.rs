@@ -218,7 +218,7 @@ impl MailboxDb {
     }
 }
 
-fn domain_on(conn: &Connection) -> Result<Option<String>, String> {
+pub(in crate::mailbox) fn domain_on(conn: &Connection) -> Result<Option<String>, String> {
     let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='completion_continuation_domain')", [], |r| r.get(0)).map_err(|e| e.to_string())?;
     if !exists {
         return Ok(None);

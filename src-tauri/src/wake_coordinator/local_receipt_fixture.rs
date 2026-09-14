@@ -118,6 +118,7 @@ fn seed_local_receipt_fixture_mailbox(paths: &LocalReceiptFixturePaths) {
         )
         .unwrap();
     let mut db = MailboxDb::open(&paths.db_path).unwrap();
+    crate::completion_owner::test_support::install_owner(&mut db);
     db.trigger_completion_event(CompletionEventTriggerInput {
         event_id: LocalReceiptFixture::EVENT_ID,
         payload_json: r#"{"schema_version":2,"handle":"ab_late_consumed_fixture"}"#,

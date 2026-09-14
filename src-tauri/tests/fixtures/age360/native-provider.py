@@ -61,7 +61,7 @@ def launch(request):
         seq += 1
         event(request, seq, "marker", name="oulipoly.produced_assistant_response", value=True)
         seq += 1
-        if os.environ.get("AGE360_DESCENDANT") == "1" or os.environ.get("AGE360_CASE") != "owner_only":
+        if os.environ.get("AGE365_LEGACY_WAKE") == "1" or os.environ.get("AGE360_DESCENDANT") == "1" or os.environ.get("AGE360_CASE") != "owner_only":
             # The actual recipient reads and ACKs an exact existing mailbox row.
             # This is not a producer byte receipt or a parent-test SQL ACK.
             runner = os.environ["AGENT_BASH_AGENT_RUNNER_BIN"]
@@ -69,7 +69,11 @@ def launch(request):
             rows = json.loads(listed.stdout)["rows"]
             assert len(rows) == 1
             received_output = None
-            if os.environ.get("AGE360_CASE") == "owner_only":
+            if os.environ.get("AGE365_LEGACY_WAKE") == "1":
+                assert rows[0]["handle"] == "age365-legacy-mailbox"
+                assert rows[0]["handle"] in prompt
+                assert json.loads(rows[0]["payload_json"])["fixture"] == "legacy-materialized"
+            elif os.environ.get("AGE360_CASE") == "owner_only":
                 assert "native-custody-input" in prompt
             else:
                 assert rows[0]["handle"] in prompt

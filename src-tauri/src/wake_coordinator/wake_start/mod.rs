@@ -292,6 +292,7 @@ mod tests {
         assert_eq!(pending[0].delivery_attempts, 0);
         db.acknowledge_range(session, pending[0].seq, pending[0].seq, "test-consumer")
             .unwrap();
+        crate::completion_owner::test_support::revoke_unspent(&mut db, session, &claim.claim_token);
         db.wake_sessions()
             .release_wake_claim(session, &claim.claim_token)
             .unwrap();
@@ -439,6 +440,7 @@ mod tests {
                 .release_wake_claim(session, "wrong-owner")
                 .unwrap()
         );
+        crate::completion_owner::test_support::revoke_unspent(&mut db, session, "existing-owner");
         assert!(
             db.wake_sessions()
                 .release_wake_claim(session, "existing-owner")
@@ -485,6 +487,11 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(seeded, WakeClaimAcquireResult::Acquired(_)));
+        crate::completion_owner::test_support::revoke_unspent(
+            &mut db,
+            LocalReceiptFixture::SESSION_ID,
+            "seed-count-token",
+        );
         db.wake_sessions()
             .release_wake_claim(LocalReceiptFixture::SESSION_ID, "seed-count-token")
             .unwrap();

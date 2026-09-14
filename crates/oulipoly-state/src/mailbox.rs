@@ -5902,6 +5902,13 @@ impl WakeSessionRepository<'_> {
                 .map_err(|err| format!("Failed to commit rejected wake-child admission: {err}"))?;
             return Ok(false);
         };
+        if claim.wake_invocation_uuid.is_some()
+            && !wake_claim_has_matching_live_process_identity(&tx, &claim, child_identity)?
+        {
+            tx.commit()
+                .map_err(|err| format!("Failed to commit foreign wake-child refusal: {err}"))?;
+            return Ok(false);
+        }
         completion_continuation::admit_launcher_on(&tx, session_id, claim_token, child_identity)?;
         if claim.wake_invocation_uuid.is_some() {
             let replay_matches =
@@ -5914,6 +5921,13 @@ impl WakeSessionRepository<'_> {
             || wake_claim_runtime_is_busy_tx(&tx, session_id)?
             || mailbox_observation_stopped_on(&tx, session_id)?
         {
+            // A native launcher may refuse a busy runtime, but its custodian
+            // still owns physical drain. Keep the token until that exact receipt.
+            if completion_continuation::domain_on(&tx)?.is_some() {
+                tx.commit()
+                    .map_err(|err| format!("Failed to commit busy native refusal: {err}"))?;
+                return Ok(false);
+            }
             tx.execute(
                 "DELETE FROM session_wake_claim
                  WHERE session_id = ?1
@@ -11834,6 +11848,77 @@ mod tests {
     use super::*;
     use crate::StateDb;
 
+    // Relational final-system fixtures: exact live driver, never a transport
+    // liveness claim. Native endpoint/custodian execution is tested separately.
+    fn install_wake_owner(db: &mut MailboxDb) {
+        use crate::completion_continuation::{PROTOCOL, SourceProcessIdentity};
+        let live = current_identity();
+        let identity = SourceProcessIdentity {
+            pid: live.os_pid,
+            boot_id: live.os_boot_id,
+            starttime_ticks: live.os_pid_starttime_ticks,
+        };
+        db.publish_completion_continuation_owner(&CompletionDomainOwner {
+            protocol: PROTOCOL.into(),
+            domain_id: db.completion_continuation_domain().unwrap().unwrap(),
+            owner_generation: Uuid::new_v4().to_string(),
+            guardian_identity: identity.clone(),
+            driver_identity: identity,
+            endpoint: "/fixture/not-a-native-endpoint".into(),
+        })
+        .unwrap();
+    }
+
+    fn revoke_unspent_wake(db: &mut MailboxDb, token: &str) {
+        let attempt = db
+            .continuation_activation("session-a", token)
+            .unwrap()
+            .unwrap();
+        db.revoke_unaccepted_continuation_attempt(&attempt).unwrap();
+    }
+
+    // A retained pre-protocol claim has no attempt. Only subsequent acquisition
+    // runs the native reservation API; no historical custody is manufactured.
+    fn retained_legacy_wake(
+        db: &mut MailboxDb,
+        input: WakeClaimRequest<'_>,
+    ) -> Result<WakeClaimAcquireResult, String> {
+        db.conn.execute("INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count,wake_invocation_uuid) VALUES(?1,?2,?3,?4,?5,?6)", params![input.session_id,input.claim_token,now_rfc3339(),input.reason,input.auto_wake_count,input.wake_invocation_uuid]).unwrap();
+        Ok(WakeClaimAcquireResult::Acquired(
+            wake_claim(&db.conn, input.session_id)?.unwrap(),
+        ))
+    }
+
+    fn prepare_wake_launcher(
+        db: &mut MailboxDb,
+    ) -> (
+        ContinuationAttempt,
+        crate::completion_continuation::SourceProcessIdentity,
+    ) {
+        #[cfg(target_os = "linux")]
+        let parent =
+            pid_identity::read_live_process_identity(i64::from(unsafe { libc::getppid() }))
+                .unwrap()
+                .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let parent = current_identity();
+        let custodian = crate::completion_continuation::SourceProcessIdentity {
+            pid: parent.os_pid,
+            boot_id: parent.os_boot_id,
+            starttime_ticks: parent.os_pid_starttime_ticks,
+        };
+        let attempt = db
+            .continuation_activation("session-a", "token-a")
+            .unwrap()
+            .unwrap();
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.attach_continuation_custodian(&attempt, &custodian)
+            .unwrap();
+        db.advance_continuation_attempt(&attempt, 3, "accepted", "starting", &custodian)
+            .unwrap();
+        (attempt, custodian)
+    }
+
     const STARTING_GENERATION_FIXTURE_PATH: &str = "OULIPOLY_TEST_STARTING_GENERATION_FIXTURE_PATH";
     const WAKE_CLAIM_FOREIGN_CHILD_FIXTURE: &str = "OULIPOLY_TEST_WAKE_CLAIM_FOREIGN_CHILD";
 
@@ -17385,6 +17470,7 @@ mod tests {
     fn auto_wake_keeps_owner_separate_from_running_invocation() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         let identity = current_identity();
 
         db.wake_sessions()
@@ -17883,6 +17969,7 @@ mod tests {
     fn wake_idle_pending_acquires_claim() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         db.enqueue_agent_bash_complete(&input("handle-b", "session-a"))
@@ -17993,6 +18080,7 @@ mod tests {
     fn wake_startable_claim_does_not_apply_a_retry_budget() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         let first = db
@@ -18010,6 +18098,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(first, WakeClaimAcquireResult::Acquired(_)));
+        revoke_unspent_wake(&mut db, "token-a");
         assert!(
             db.wake_sessions()
                 .release_wake_claim("session-a", "token-a")
@@ -18041,6 +18130,7 @@ mod tests {
     fn wake_claim_count_persists_on_session_runtime_after_claim_release() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.wake_sessions()
             .upsert_session_metadata(SessionMetadataUpsert {
                 session_id: "session-a",
@@ -18076,6 +18166,7 @@ mod tests {
                 .auto_wake_count,
             5
         );
+        revoke_unspent_wake(&mut db, "token-a");
         db.wake_sessions()
             .release_wake_claim("session-a", "token-a")
             .unwrap();
@@ -18088,6 +18179,7 @@ mod tests {
     fn wake_claim_release_requires_the_exact_current_token() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         db.wake_sessions()
@@ -18114,6 +18206,7 @@ mod tests {
                 .claim_token,
             "token-a"
         );
+        revoke_unspent_wake(&mut db, "token-a");
         assert!(
             db.wake_sessions()
                 .release_wake_claim("session-a", "token-a")
@@ -18131,6 +18224,7 @@ mod tests {
     fn admitted_wake_child_blocks_manual_claim_release() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         db.wake_sessions()
@@ -18143,6 +18237,7 @@ mod tests {
                 stale_after_seconds: 600,
             })
             .unwrap();
+        let (attempt, custodian) = prepare_wake_launcher(&mut db);
         let admitted_identity = current_identity();
 
         assert!(
@@ -18231,8 +18326,17 @@ mod tests {
         assert!(
             db.wake_sessions()
                 .release_admitted_wake_claim("session-a", "token-a")
-                .unwrap(),
-            "the admitted child must retain exact-token cleanup authority"
+                .is_err(),
+            "launcher exit alone cannot erase native physical custody"
+        );
+        // Relational original-custodian drain fixture, not native ECHILD evidence.
+        db.discharge_continuation_attempt(&attempt, &custodian, "fixture-original-drain")
+            .unwrap();
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -18240,18 +18344,21 @@ mod tests {
     fn manual_resume_releases_an_exact_dead_admitted_wake_claim() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
-        db.wake_sessions()
-            .try_acquire_wake_claim(WakeClaimRequest {
+        retained_legacy_wake(
+            &mut db,
+            WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-a",
                 reason: "notify_idle",
                 auto_wake_count: 1,
                 wake_invocation_uuid: Some("wake-a"),
                 stale_after_seconds: 600,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         db.wake_sessions()
             .record_wake_claim_pid("session-a", "token-a", i64::MAX)
             .unwrap();
@@ -18273,18 +18380,21 @@ mod tests {
     fn manual_resume_releases_an_exact_pid_reused_admitted_wake_claim() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
-        db.wake_sessions()
-            .try_acquire_wake_claim(WakeClaimRequest {
+        retained_legacy_wake(
+            &mut db,
+            WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-a",
                 reason: "notify_idle",
                 auto_wake_count: 1,
                 wake_invocation_uuid: Some("wake-a"),
                 stale_after_seconds: 600,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let identity = current_identity();
         db.wake_sessions()
             .record_wake_claim_pid_identity("session-a", "token-a", identity.os_pid)
@@ -18315,18 +18425,21 @@ mod tests {
     fn manual_resume_retains_an_admitted_claim_without_process_identity() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
-        db.wake_sessions()
-            .try_acquire_wake_claim(WakeClaimRequest {
+        retained_legacy_wake(
+            &mut db,
+            WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-a",
                 reason: "notify_idle",
                 auto_wake_count: 1,
                 wake_invocation_uuid: Some("wake-a"),
                 stale_after_seconds: 600,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert!(
             !db.wake_sessions()
@@ -18347,6 +18460,7 @@ mod tests {
     fn wake_child_validation_rejects_claim_when_runtime_authority_is_busy() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         db.wake_sessions()
@@ -18359,6 +18473,18 @@ mod tests {
                 stale_after_seconds: 600,
             })
             .unwrap();
+        let (attempt, custodian) = prepare_wake_launcher(&mut db);
+        // Bind this exact launcher without admitting the wake claim yet; runtime
+        // publication then races ahead of the final child busy recheck.
+        let tx = db.conn.transaction().unwrap();
+        completion_continuation::admit_launcher_on(
+            &tx,
+            "session-a",
+            "token-a",
+            &current_identity(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
         let generation_id =
             RuntimeGenerationId::parse("92222222-2222-4222-8222-222222222222").unwrap();
         db.runtime_lifecycle()
@@ -18384,6 +18510,15 @@ mod tests {
             db.wake_session_reader()
                 .wake_claim("session-a")
                 .unwrap()
+                .is_some(),
+            "busy refusal cannot discharge an accepted native attempt"
+        );
+        db.discharge_continuation_attempt(&attempt, &custodian, "fixture-busy-original-drain")
+            .unwrap();
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
                 .is_none()
         );
     }
@@ -18392,6 +18527,7 @@ mod tests {
     fn wake_claim_ignores_legacy_runtime_projection_after_v2() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         let identity = current_identity();
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
@@ -18435,6 +18571,7 @@ mod tests {
     fn wake_existing_claim_is_single_flight() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         let first = db
@@ -18473,6 +18610,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         drop(db);
@@ -18531,19 +18669,22 @@ mod tests {
     fn wake_stale_claim_can_be_stolen() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         assert!(matches!(
-            db.wake_sessions()
-                .try_acquire_wake_claim(WakeClaimRequest {
+            retained_legacy_wake(
+                &mut db,
+                WakeClaimRequest {
                     session_id: "session-a",
                     claim_token: "token-a",
                     reason: "notify_idle",
                     auto_wake_count: 1,
                     wake_invocation_uuid: None,
                     stale_after_seconds: 600,
-                })
-                .unwrap(),
+                }
+            )
+            .unwrap(),
             WakeClaimAcquireResult::Acquired(_)
         ));
         db.wake_sessions()
@@ -18574,19 +18715,22 @@ mod tests {
     fn wake_dead_pid_claim_can_be_stolen_before_ttl() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         assert!(matches!(
-            db.wake_sessions()
-                .try_acquire_wake_claim(WakeClaimRequest {
+            retained_legacy_wake(
+                &mut db,
+                WakeClaimRequest {
                     session_id: "session-a",
                     claim_token: "token-a",
                     reason: "notify_idle",
                     auto_wake_count: 1,
                     wake_invocation_uuid: None,
                     stale_after_seconds: 600,
-                })
-                .unwrap(),
+                }
+            )
+            .unwrap(),
             WakeClaimAcquireResult::Acquired(_)
         ));
         db.wake_sessions()
@@ -18615,19 +18759,22 @@ mod tests {
     fn wake_live_identity_matched_claim_is_not_stolen_after_ttl() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         assert!(matches!(
-            db.wake_sessions()
-                .try_acquire_wake_claim(WakeClaimRequest {
+            retained_legacy_wake(
+                &mut db,
+                WakeClaimRequest {
                     session_id: "session-a",
                     claim_token: "token-a",
                     reason: "notify_idle",
                     auto_wake_count: 1,
                     wake_invocation_uuid: None,
                     stale_after_seconds: 600,
-                })
-                .unwrap(),
+                }
+            )
+            .unwrap(),
             WakeClaimAcquireResult::Acquired(_)
         ));
         let identity = current_identity();

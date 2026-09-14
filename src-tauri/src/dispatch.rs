@@ -226,23 +226,7 @@ fn dispatch_inspection_only_session(command: &SessionSubcommands) -> Option<Resu
 }
 
 fn startup_wake_reclaim_sweep_enabled(cli: &Cli) -> bool {
-    if cli.resume.is_some() {
-        return false;
-    }
-    !matches!(
-        &cli.command,
-        // Export owns a single structured result/error channel. Incidental
-        // startup inspection must not launch helpers before that result. Other
-        // startup/maintenance triggers retain their recovery opportunities.
-        Some(Subcommands::Session {
-            command: SessionSubcommands::Export { .. },
-        }) | Some(Subcommands::Notify { .. })
-            | Some(Subcommands::Resume { .. })
-            | Some(Subcommands::Repl {
-                resume: Some(_),
-                ..
-            })
-    )
+    crate::completion_owner::startup_wake_reclaim_sweep_enabled(cli)
 }
 
 fn provider_launch_schedules_startup_wake_reclaim(cli: &Cli) -> bool {

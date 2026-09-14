@@ -410,6 +410,21 @@ fn native_dead_inherited_endpoint_rejects_admission_but_preserves_mailbox_read()
         "{}",
         String::from_utf8_lossy(&read.stderr)
     );
+    let wake = f
+        .command()
+        .env("OULIPOLY_COMPLETION_ENDPOINT", &invalid)
+        .args(["mailbox", "resume", "--session-id", SESSION, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !wake.status.success(),
+        "a persisted owner row cannot substitute for a working endpoint"
+    );
+    assert_eq!(
+        count(),
+        before,
+        "failed service join must not admit a recipient"
+    );
     assert_eq!(f.owner().owner_generation, owner.owner_generation);
     f.gate("release-initial-provider");
     f.wait_initial(&mut initial);
@@ -2000,4 +2015,152 @@ fn native_transient_artifact_commit_recovers_after_cached_cleanup_failure() {
     if !private_case(false) {
         native_activation_channel_custody(9, Some("commit_failure"));
     }
+}
+
+#[test]
+fn native_mailbox_resume_services_legacy_notification_without_owner() {
+    if !private_case(false) {
+        legacy_mailbox_service(false);
+    }
+}
+
+#[test]
+fn native_mailbox_resume_replaces_eligible_retained_legacy_claim() {
+    if !private_case(false) {
+        legacy_mailbox_service(true);
+    }
+}
+
+fn legacy_mailbox_service(retained_claim: bool) {
+    let f = Fixture::new("owner_only");
+    let mut initial = f.start();
+    let old_owner = f.owner();
+    f.wait_initial(&mut initial);
+    wait(|| {
+        f.mailbox()
+            .completion_continuation_owner()
+            .unwrap()
+            .is_none()
+            .then_some(())
+    });
+    // Final-system legacy-shaped materialized notification. This is deliberately
+    // not a source-recovery fixture or an inferred admission/accepted attempt.
+    let mut db = MailboxDb::open(&f.data.join("pid-identity.db")).unwrap();
+    db.set_notifications_paused(SESSION, true).unwrap();
+    db.enqueue_agent_bash_complete(&oulipoly_state::mailbox::AgentBashCompleteEnqueue {
+        session_id: SESSION,
+        handle: "age365-legacy-mailbox",
+        payload_json: r#"{"fixture":"legacy-materialized"}"#,
+        owner_invocation_uuid: None,
+        matched_os_pid: None,
+        matched_os_boot_id: None,
+        matched_os_pid_starttime_ticks: None,
+        matched_chain_index: None,
+        state_dir: "/synthetic",
+        meta_path: "/synthetic/meta",
+        log_path: "/synthetic/log",
+        rc_path: "/synthetic/rc",
+        rc: 0,
+    })
+    .unwrap();
+    drop(db);
+    if retained_claim {
+        let c = rusqlite::Connection::open(f.data.join("pid-identity.db")).unwrap();
+        c.execute("INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count,wake_pid) VALUES(?1,'legacy-retained','2026-09-13T00:00:00Z','fixture',1,999999999)", [SESSION]).unwrap();
+    }
+    // Read and ACK entrypoints are not owner election. A stale endpoint on a
+    // reader must not turn inspection into failed service admission.
+    let read = f
+        .command()
+        .env("OULIPOLY_COMPLETION_ENDPOINT", "/absent/owner.sock")
+        .args(["mailbox", "list", "--session-id", SESSION, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert!(
+        f.mailbox()
+            .completion_continuation_owner()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(f.mailbox().list_pending(SESSION).unwrap().len(), 1);
+    let output = f
+        .command()
+        .env("AGE365_LEGACY_WAKE", "1")
+        .args(["mailbox", "resume", "--session-id", SESSION, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let owner = f.owner();
+    assert_ne!(owner.owner_generation, old_owner.owner_generation);
+    wait(|| {
+        f.root
+            .path()
+            .join("resume-prompts.jsonl")
+            .exists()
+            .then_some(())
+    });
+    let claim = f
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
+    assert_ne!(claim.claim_token, "legacy-retained");
+    let attempt = f
+        .mailbox()
+        .continuation_activation(SESSION, &claim.claim_token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.owner_generation, owner.owner_generation);
+    assert!(attempt.source_registration_id.is_none());
+    f.gate("release-resume");
+    wait(|| {
+        f.root
+            .path()
+            .join("recipient-exact-ack.json")
+            .exists()
+            .then_some(())
+    });
+    wait(|| {
+        f.mailbox()
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .unwrap()
+            .is_none()
+            .then_some(())
+    });
+    assert!(f.mailbox().list_pending(SESSION).unwrap().is_empty());
+    let c = f.sidecar_connection();
+    let phase: String = c
+        .query_row(
+            "SELECT phase FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase, "drained");
+    let count: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM completion_continuation_attempt WHERE session_id=?1",
+            [SESSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "no fabricated legacy attempt or duplicate activation"
+    );
+    println!(
+        "legacy servicing: retained_claim={retained_claim} exact native attempt={} ACK and original physical drain",
+        attempt.attempt_id
+    );
 }
