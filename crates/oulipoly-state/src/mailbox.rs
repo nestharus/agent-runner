@@ -1112,7 +1112,7 @@ impl CompletionAuthorityFence<'_> {
             let event = completion_event_by_id_on(&self.tx, input.event_id)?
                 .ok_or("registered source disappeared")?;
             if event.state == "triggered" {
-                self.tx.execute("UPDATE completion_event_listener SET active=1 WHERE event_id=?1 AND acknowledged_at IS NULL",[input.event_id]).map_err(|e|e.to_string())?;
+                completion_continuation::activate_notification_listeners_on(&self.tx, binding)?;
                 materialize_completion_event_listeners(&self.tx, &event, &now_rfc3339())?;
             }
         }
@@ -2697,8 +2697,8 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to refresh replayed completion payload: {err}"))?;
             false
         };
-        if continuation.is_some() {
-            tx.execute("UPDATE completion_event_listener SET active=1 WHERE event_id=?1 AND acknowledged_at IS NULL", [input.event_id]).map_err(|e| e.to_string())?;
+        if let Some((binding, _)) = continuation {
+            completion_continuation::activate_notification_listeners_on(&tx, binding)?;
         }
         let event = completion_event_by_id_on(&tx, input.event_id)?
             .ok_or_else(|| format!("Completion event {} disappeared", input.event_id))?;

@@ -172,3 +172,27 @@ pub(in crate::mailbox) fn retained_payload(
     }
     conn.query_row("SELECT EXISTS(SELECT 1 FROM completion_continuation_source WHERE payload_sha256=?1 AND phase='accepted')",[digest],|r|r.get(0)).map_err(|e|e.to_string())
 }
+
+/// Presentation policy is not listener ACK or physical drain. The original
+/// synchronous caller uses its command response (manual recovery on host loss).
+/// Independent listeners still receive notifications. Never deactivate: an
+/// explicit activation/detach may already have selected asynchronous delivery.
+pub(in crate::mailbox) fn activate_notification_listeners_on(
+    tx: &Transaction<'_>,
+    binding: &AdmittedSourceBinding,
+) -> Result<(), String> {
+    let source = binding.registration()?;
+    tx.execute(
+        "UPDATE completion_event_listener SET active=1
+         WHERE event_id=?1 AND acknowledged_at IS NULL
+           AND (?2 != 'sync' OR owner_invocation_uuid != ?3 OR session_id != ?4)",
+        params![
+            source.handle,
+            source.delivery_mode,
+            source.owner_invocation_uuid,
+            source.owner_session_id
+        ],
+    )
+    .map_err(|e| format!("Failed to apply completion presentation policy: {e}"))?;
+    Ok(())
+}

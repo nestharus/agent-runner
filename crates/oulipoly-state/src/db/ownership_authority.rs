@@ -3494,21 +3494,42 @@ mod completion_continuation_tests {
     }
 
     #[test]
-    fn completion_continuation_sync_acceptance_materializes_without_ack_and_replay_is_exact() {
-        acceptance_materializes_without_ack_and_replay_is_exact(false);
+    fn completion_continuation_sync_acceptance_suppresses_without_ack_and_replay_is_exact() {
+        acceptance_presentation_and_replay(false, "sync", false);
     }
 
     #[test]
     fn completion_continuation_missing_output_retains_late_listener_and_exact_ack() {
-        acceptance_materializes_without_ack_and_replay_is_exact(true);
+        acceptance_presentation_and_replay(true, "sync", false);
     }
 
-    fn acceptance_materializes_without_ack_and_replay_is_exact(missing: bool) {
+    #[test]
+    fn completion_continuation_explicit_async_acceptance_and_repair_deliver() {
+        acceptance_presentation_and_replay(false, "async", false);
+    }
+
+    #[test]
+    fn completion_continuation_detach_before_acceptance_survives_repair() {
+        acceptance_presentation_and_replay(false, "sync", true);
+    }
+
+    fn acceptance_presentation_and_replay(missing: bool, mode: &str, detach_before: bool) {
         use crate::completion_continuation::VerifiedCompletion;
         use crate::mailbox::CompletionEventTriggerInput;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.db");
-        let binding = binding();
+        let binding = if mode == "sync" {
+            binding()
+        } else {
+            let mut registration = serde_json::to_value(binding().registration().unwrap()).unwrap();
+            registration["delivery_mode"] = mode.into();
+            AdmittedSourceBinding::new(
+                "fixture-admission",
+                &serde_json::to_vec(&registration).unwrap(),
+            )
+            .unwrap()
+        };
+        let initially_active = mode == "async" || detach_before;
         let mut state = seed(&path, &binding);
         admit(&mut state, &binding, false, false);
         // Final-system diagnostic distinguishes exact v2 admissions from legacy
@@ -3520,18 +3541,33 @@ mod completion_continuation_tests {
             "../../tests/fixtures/age360-missing-output-wire.json"
         ))
         .unwrap();
-        let evidence = VerifiedCompletion::from_bytes(
-            &binding,
-            f[if missing {
-                "missing_output_snapshot_bytes_utf8"
-            } else {
-                "snapshot_bytes_utf8"
-            }]
-            .as_str()
-            .unwrap()
-            .as_bytes(),
-            f["outcome_bytes_utf8"].as_str().unwrap().as_bytes(),
-        )
+        let snapshot_bytes = f[if missing {
+            "missing_output_snapshot_bytes_utf8"
+        } else {
+            "snapshot_bytes_utf8"
+        }]
+        .as_str()
+        .unwrap()
+        .as_bytes();
+        let outcome_bytes = f["outcome_bytes_utf8"].as_str().unwrap().as_bytes();
+        let evidence = if mode == "sync" {
+            VerifiedCompletion::from_bytes(&binding, snapshot_bytes, outcome_bytes)
+        } else {
+            // A mode variant has its own immutable registration digest. Keep
+            // original missing-output attribution bytes intact in sync cases.
+            let mut outcome: serde_json::Value = serde_json::from_slice(outcome_bytes).unwrap();
+            outcome["registration_digest"] = binding.registration_digest().into();
+            let outcome = serde_json::to_vec(&outcome).unwrap();
+            let mut snapshot: serde_json::Value = serde_json::from_slice(snapshot_bytes).unwrap();
+            snapshot["registration_digest"] = binding.registration_digest().into();
+            snapshot["outcome_sha256"] = crate::completion_continuation::sha256(&outcome).into();
+            snapshot["outcome_byte_len"] = outcome.len().into();
+            VerifiedCompletion::from_bytes(
+                &binding,
+                &serde_json::to_vec(&snapshot).unwrap(),
+                &outcome,
+            )
+        }
         .unwrap();
         assert_eq!(evidence.original_output_missing(), missing);
         let payload = serde_json::to_string(&serde_json::json!({
@@ -3586,18 +3622,59 @@ mod completion_continuation_tests {
                 "accepted"
             );
         }
+        if detach_before {
+            let detached = mailbox
+                .activate_completion_event_listeners(&source.handle)
+                .unwrap();
+            assert!(detached.mailbox_rows.is_empty());
+        }
         let first = mailbox
             .trigger_completion_continuation(input, &binding, &evidence)
             .unwrap();
         assert!(first.triggered);
-        assert_eq!(first.mailbox_rows.len(), 1);
-        assert!(first.listeners[0].active);
+        assert_eq!(first.mailbox_rows.len(), usize::from(initially_active));
+        assert_eq!(first.listeners[0].active, initially_active);
         assert!(first.listeners[0].acknowledged_at.is_none());
         let replay = mailbox
             .trigger_completion_continuation(input, &binding, &evidence)
             .unwrap();
         assert!(!replay.triggered);
-        assert_eq!(first.mailbox_rows[0].seq, replay.mailbox_rows[0].seq);
+        assert_eq!(
+            first.listeners[0].mailbox_seq,
+            replay.listeners[0].mailbox_seq
+        );
+        // Host loss has no ACK bridge: reopening and repairing without any
+        // in-call receipt must retain the selected presentation policy.
+        drop(mailbox);
+        let mut mailbox = MailboxDb::open(&MailboxDb::path_for_state_db(&path)).unwrap();
+        drop(state);
+        let mut state = StateDb::open(&path).unwrap();
+        // Repeated admission and driver repair must not undo sync suppression.
+        admit(&mut state, &binding, false, false);
+        state
+            .repair_admitted_completion_continuation(
+                crate::InvocationMutationAuthority::Standalone,
+                &binding,
+            )
+            .unwrap();
+        let listeners = mailbox.completion_event_listeners(&source.handle).unwrap();
+        assert_eq!(listeners[0].active, initially_active);
+        assert!(listeners[0].acknowledged_at.is_none());
+        assert!(listeners[0].acknowledgement_reason.is_none());
+        assert_eq!(
+            mailbox
+                .list_pending(&source.owner_session_id)
+                .unwrap()
+                .len(),
+            usize::from(initially_active)
+        );
+        assert_eq!(
+            mailbox
+                .completion_continuation_acceptance(&source.registration_id)
+                .unwrap()
+                .unwrap()["phase"],
+            "accepted"
+        );
         let changed = CompletionEventTriggerInput {
             payload_json: r#"{"kind":"agent_bash_complete","rc":70}"#,
             ..input
@@ -3606,21 +3683,6 @@ mod completion_continuation_tests {
             mailbox
                 .trigger_completion_continuation(changed, &binding, &evidence)
                 .is_err()
-        );
-        let seq = first.mailbox_rows[0].seq;
-        mailbox
-            .acknowledge_range(
-                &source.owner_session_id,
-                seq,
-                seq,
-                &source.owner_invocation_uuid,
-            )
-            .unwrap();
-        let ack = mailbox.completion_event_listeners(&source.handle).unwrap();
-        assert!(ack[0].acknowledged_at.is_some());
-        assert_ne!(
-            ack[0].acknowledgement_reason.as_deref(),
-            Some("consumed_in_call")
         );
         let late_owner = "99999999-9999-4999-8999-999999999999";
         state
@@ -3681,7 +3743,78 @@ mod completion_continuation_tests {
                 .find(|l| l.session_id == source.owner_session_id)
                 .unwrap()
                 .acknowledged_at
+                .is_none()
+        );
+        // Late-listener repair uses original source ownership, not the repairing caller.
+        admit(&mut state, &late, false, false);
+        let replay = mailbox
+            .trigger_completion_continuation(input, &late, &evidence)
+            .unwrap();
+        let owner = replay
+            .listeners
+            .iter()
+            .find(|l| l.session_id == source.owner_session_id)
+            .unwrap();
+        assert_eq!(owner.active, initially_active);
+        assert!(owner.acknowledged_at.is_none());
+        assert_eq!(mailbox.list_pending("late-session").unwrap().len(), 1);
+        // Explicit post-completion detach selects notification, not ACK.
+        let detached = mailbox
+            .activate_completion_event_listeners(&source.handle)
+            .unwrap();
+        assert_eq!(detached.mailbox_rows.len(), 2);
+        admit(&mut state, &binding, false, false);
+        let replay = mailbox
+            .trigger_completion_continuation(input, &binding, &evidence)
+            .unwrap();
+        assert_eq!(
+            detached
+                .listeners
+                .iter()
+                .find(|l| l.session_id == source.owner_session_id)
+                .unwrap()
+                .mailbox_seq,
+            replay
+                .listeners
+                .iter()
+                .find(|l| l.session_id == source.owner_session_id)
+                .unwrap()
+                .mailbox_seq
+        );
+        assert!(replay.listeners[0].acknowledged_at.is_none());
+        let seq = detached
+            .listeners
+            .iter()
+            .find(|l| l.session_id == source.owner_session_id)
+            .unwrap()
+            .mailbox_seq
+            .unwrap();
+        mailbox
+            .acknowledge_range(
+                &source.owner_session_id,
+                seq,
+                seq,
+                &source.owner_invocation_uuid,
+            )
+            .unwrap();
+        let ack = mailbox.completion_event_listeners(&source.handle).unwrap();
+        assert!(
+            ack.iter()
+                .find(|l| l.session_id == source.owner_session_id)
+                .unwrap()
+                .acknowledged_at
                 .is_some()
+        );
+        assert!(
+            ack.iter()
+                .find(|l| l.session_id == "late-session")
+                .unwrap()
+                .acknowledged_at
+                .is_none()
+        );
+        assert_ne!(
+            ack[0].acknowledgement_reason.as_deref(),
+            Some("consumed_in_call")
         );
     }
 

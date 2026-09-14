@@ -218,6 +218,23 @@ def launch(request):
                 cancelled = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "cancel", handle], env=env, capture_output=True, timeout=30)
                 (root / "source-cancel-result.json").write_text(json.dumps({"rc": cancelled.returncode, "stdout": cancelled.stdout.decode(), "stderr": cancelled.stderr.decode(), "owner_pid": os.getpid()}))
             if mode == "sync":
+                # Real in-call output protocol, not a mailbox recipient ACK.
+                handle = json.loads(result.stdout)["handle"]
+                binary = os.environ["AGE360_AGENT_BASH_BIN"]
+                deadline = time.monotonic() + 30
+                while True:
+                    status = subprocess.run([binary, "status", handle, "--observe-only"], env=env, capture_output=True, timeout=30, check=True)
+                    if status.stdout.startswith(b"DONE "): break
+                    if time.monotonic() > deadline: raise RuntimeError("sync source did not complete: " + status.stdout.decode())
+                    time.sleep(.02)
+                snapshot = subprocess.run([binary, "snapshot", handle], env=env, capture_output=True, timeout=30, check=True)
+                acquired = json.loads(snapshot.stdout)
+                body = bytes.fromhex(acquired["output"])
+                assert body == b"paired-source-output", acquired
+                assert hashlib.sha256(body).hexdigest() == acquired["snapshot"]["sha256"]
+                receipt = subprocess.run([binary, "accept-output", handle, "--snapshot", json.dumps(acquired["snapshot"])], env=env, capture_output=True, timeout=30, check=True)
+                subprocess.run([binary, "status", handle], env=env, capture_output=True, timeout=30, check=True)
+                (root / "sync-byte-response.json").write_text(json.dumps({"output": body.decode(), "receipt": json.loads(receipt.stdout)}))
                 deadline = time.monotonic() + 30
                 while not (root / "release-initial-provider").exists():
                     if time.monotonic() > deadline: raise RuntimeError("test did not release initial provider")

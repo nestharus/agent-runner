@@ -660,13 +660,56 @@ fn paired_case(mode: &'static str) {
             .completion_event_listeners(&source.handle)
             .unwrap();
         assert_eq!(listeners.len(), 1);
-        assert!(listeners[0].mailbox_seq.is_some());
+        assert!(!listeners[0].active);
+        assert!(listeners[0].mailbox_seq.is_none());
         assert!(
             listeners[0].acknowledged_at.is_none(),
             "local synchronous bytes are not mailbox ACK"
         );
+        let output: serde_json::Value = wait(|| {
+            serde_json::from_slice(&fs::read(f.root.path().join("sync-byte-response.json")).ok()?)
+                .ok()
+        });
+        assert_eq!(output["output"], "paired-source-output");
+        assert_eq!(output["receipt"]["remote_ack"], "unconfirmed");
+        assert_eq!(output["receipt"]["physical_drain"], "unconfirmed");
         f.gate("release-initial-provider");
         f.wait_initial(&mut initial);
+        wait(|| {
+            f.mailbox()
+                .pending_continuation_attempt_ids(&source.registration_id)
+                .ok()?
+                .is_empty()
+                .then_some(())
+        });
+        let listeners = f
+            .mailbox()
+            .completion_event_listeners(&source.handle)
+            .unwrap();
+        assert!(!listeners[0].active);
+        assert!(listeners[0].mailbox_seq.is_none());
+        assert!(listeners[0].acknowledged_at.is_none());
+        assert!(listeners[0].acknowledgement_reason.is_none());
+        assert!(f.mailbox().list_pending(SESSION).unwrap().is_empty());
+        assert!(!f.root.path().join("recipient-byte-receipt.json").exists());
+        assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+        let evidence =
+            oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
+                &binding,
+            )
+            .unwrap();
+        assert!(evidence.outcome.original_tree_drained);
+        assert_eq!(
+            fs::read_to_string(f.root.path().join("source-launches"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        println!(
+            "sync output returned; accepted source retained; no notification or ACK; original drain read from source evidence, not suppression"
+        );
+        return;
     }
     wait(|| {
         let listeners = f
@@ -750,7 +793,7 @@ fn normal_sleeping_recipient() {
     paired_case("async");
 }
 #[test]
-fn sync_receipt_without_ack() {
+fn sync_response_without_notification_or_ack() {
     if private_case(true) {
         return;
     }

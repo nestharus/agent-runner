@@ -49,6 +49,29 @@ unreleased gate; CD loss before attachment can also leave that genuine original
 AC receipt. AC exec failure or loss of both receipt producers is not covered by
 that counterexample. Retained accepted uncertainty is not completed recovery.
 
+## Synchronous presentation policy
+
+Synchronous completion is presented through the command/tool response, not a
+runner completion notification to the original synchronous caller. This remains
+true if the host is interrupted or loses that response: the user inspects retained
+logs/status and chooses recovery. There is no automatic notification fallback,
+host-result ACK bridge, lease, consumed flag, or grace period.
+
+Acceptance and repeated bound registration/repair both preserve the original
+sync listener's inactive state. Independently registered listeners still receive
+notifications; the original owner identity comes from the immutable source binding,
+not the caller performing repair. Async/headless sources retain notification delivery.
+Explicit activation/detach before or after completion enables delivery; subsequent
+acceptance or repair never deactivates that listener. Polling alone does not ACK it.
+
+Suppression is a presentation choice, **not remote ACK or physical drain**. Source
+acceptance, work tracking, retained output and physical custody continue unchanged.
+Inactive unacknowledged listeners remain retained (including the existing owner
+retirement/retention costs); no false settlement is introduced to reclaim them.
+Already active/materialized notifications from older code are not retroactively
+withdrawn: active state can also represent an authorized detach. This policy is
+not a production cleanup or migration procedure.
+
 ## Publication and output
 
 Canonical examples: `crates/oulipoly-state/tests/fixtures/age360-paired-wire.json`,

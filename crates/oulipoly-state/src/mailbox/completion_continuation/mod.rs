@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 mod attempts;
 pub(super) use attempts::native_original_drain_on;
 mod source;
-pub(super) use source::{accept_on, bound_event, reject_unbound_v2_trigger, retained_payload};
+pub(super) use source::{
+    accept_on, activate_notification_listeners_on, bound_event, reject_unbound_v2_trigger,
+    retained_payload,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionDomainOwner {
