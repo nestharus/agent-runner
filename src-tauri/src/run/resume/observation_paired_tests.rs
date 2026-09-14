@@ -1104,9 +1104,10 @@ fn correction3_resume_route_with(
 fn age355_paired_correction3_startup_terminal_paths_are_owned_and_exact() {
     let _lock = crate::mailbox_delivery::DATA_DIR_ENV_LOCK.lock().unwrap();
     for startup in [true, false] {
-        for mode in ["blocked", "locked", "exact"] {
+        for mode in ["blocked", "locked", "released", "exact"] {
             let blocked = mode == "blocked";
             let locked = mode == "locked";
+            let released = mode == "released";
             let mut p = Paired::new();
             p.anchor_and_submit();
             let root = p.f.root.path();
@@ -1151,24 +1152,51 @@ fn age355_paired_correction3_startup_terminal_paths_are_owned_and_exact() {
                 "{record}"
             )
             .unwrap();
-            let _admission = if locked {
+            let admission = if locked || released {
                 crate::native_receipt::helper::try_admit(p.f.db.path(), "receipt-scan").unwrap()
             } else {
                 None
             };
+            let (release, _admission) = if released {
+                (
+                    Some(std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(750));
+                        drop(admission);
+                    })),
+                    None,
+                )
+            } else {
+                (None, admission)
+            };
             let operations_before = fs::read_to_string(root.join("inspection-operations")).unwrap();
             let start = std::time::Instant::now();
             let result = correction3_resume_route(&p, &config_home, startup);
-            if blocked || locked {
-                assert!(
-                    start.elapsed() < Duration::from_secs(3),
-                    "startup={startup}: {result:?}"
-                );
-                if locked {
+            eprintln!(
+                "receipt opportunity startup={startup} mode={mode} elapsed={:?} result={result:?}",
+                start.elapsed()
+            );
+            if blocked || locked || (released && startup) {
+                if locked && !startup {
+                    assert!(start.elapsed() >= Duration::from_secs(5));
                     assert!(
-                        !result.unwrap(),
-                        "contention should complete without a watchdog error"
+                        start.elapsed() < Duration::from_secs(9),
+                        "admission must expire before the 10s watchdog"
                     );
+                } else {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(3),
+                        "startup={startup}: {result:?}"
+                    );
+                }
+                if locked && !startup {
+                    let error = result.unwrap_err();
+                    assert!(error.contains("receipt helper exited"), "{error}");
+                    assert!(
+                        !error.contains("stalled"),
+                        "admission expiry is not the watchdog"
+                    );
+                } else if locked {
+                    assert!(!result.unwrap(), "startup skips without a watchdog error");
                 } else {
                     assert!(!result.unwrap_or(false));
                 }
@@ -1192,8 +1220,15 @@ fn age355_paired_correction3_startup_terminal_paths_are_owned_and_exact() {
                         .is_none()
                 );
             } else {
+                if released {
+                    assert!(start.elapsed() >= Duration::from_millis(500));
+                    assert!(start.elapsed() < Duration::from_secs(5));
+                }
                 assert!(result.unwrap(), "startup={startup}");
                 assert!(p.f.db.list_pending(SESSION).unwrap().is_empty());
+            }
+            if let Some(release) = release {
+                release.join().unwrap();
             }
         }
     }
@@ -1437,7 +1472,7 @@ fn correction4_install_target(p: &Paired, config_home: &Path) -> ReceiptRouteTes
         }))
     });
     // Long enough to distinguish prompt skipping from watchdog expiry. Tests
-    // require the entire contended call to return in less than three seconds.
+    // require startup to skip; terminal gets its separate 5s admission opportunity.
     crate::native_receipt::helper::TEST_BOUND.set(Some(Duration::from_secs(10)));
     guard
 }
@@ -1549,8 +1584,8 @@ fn age355_paired_correction4_contended_terminal_retains_pending_then_settles_exa
     })
     .unwrap();
     assert!(
-        start.elapsed() < Duration::from_secs(3),
-        "terminal waited on scan admission"
+        start.elapsed() >= Duration::from_secs(5) && start.elapsed() < Duration::from_secs(9),
+        "terminal must get its admission opportunity, not immediate skip or 10s watchdog"
     );
     assert_eq!(
         fs::read_to_string(p.f.root.path().join("inspection-operations")).unwrap(),

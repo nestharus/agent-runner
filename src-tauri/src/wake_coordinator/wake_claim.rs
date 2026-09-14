@@ -65,12 +65,14 @@ pub(crate) fn reset_manual_resume_wake_claim(session_id: &str) -> Result<(), Str
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
-    let Some(claim) = db.wake_session_reader().wake_claim(session_id)? else {
-        return Ok(());
-    };
-    release_manual_wake_claim(&mut db, session_id, &claim.claim_token)
+    use oulipoly_state::mailbox::ManualWakeCoordination;
+    match db.wake_sessions().coordinate_manual_resume(session_id)? {
+        ManualWakeCoordination::Absent | ManualWakeCoordination::Released => Ok(()),
+        observation => Err(format!("Manual resume admission changed: {observation:?}")),
+    }
 }
 
+#[cfg(test)]
 fn release_manual_wake_claim(
     db: &mut MailboxDb,
     session_id: &str,

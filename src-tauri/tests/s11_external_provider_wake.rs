@@ -9,10 +9,9 @@
 
 mod provider_authority_fixture;
 
-use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow};
+use oulipoly_state::mailbox::{MailboxDb, MailboxRow};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -90,7 +89,47 @@ impl Fixture {
             .env_remove("OULIPOLY_AUTO_WAKE_COUNT")
             .env_remove("OULIPOLY_PARENT_INVOCATION")
             .current_dir(self.dir.path());
-        cmd.output().unwrap()
+        let command = format!("{cmd:?}");
+        let output = cmd.output().unwrap();
+        eprintln!(
+            "S11_COMMAND case={:?} fixture={} command={} status={:?} stdout_hex={} stderr_hex={}\nstdout={}\nstderr={}",
+            std::thread::current().name(),
+            self.dir.path().display(),
+            command,
+            output.status,
+            hex_bytes(&output.stdout),
+            hex_bytes(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Do not insert a diagnostic subprocess between seed return and enqueue:
+        // the independent owner may legitimately retire while no work exists.
+        if cmd.get_args().any(|arg| arg == "resume") {
+            self.capture_diagnostics("command-return");
+        }
+        output
+    }
+
+    fn capture_diagnostics(&self, phase: &str) {
+        let capture = Command::new("/usr/bin/python3")
+            .arg("-c")
+            .arg(include_str!("fixtures/s11_diagnostics.py"))
+            .arg(self.dir.path())
+            .output();
+        eprintln!(
+            "S11_SNAPSHOT case={:?} phase={phase} fixture={} capture_completed={}",
+            std::thread::current().name(),
+            self.dir.path().display(),
+            capture.is_ok()
+        );
+        if let Ok(capture) = capture {
+            eprintln!(
+                "S11_SNAPSHOT_ROWS status={:?} stderr={}\n{}",
+                capture.status,
+                String::from_utf8_lossy(&capture.stderr),
+                String::from_utf8_lossy(&capture.stdout)
+            );
+        }
     }
 
     fn run_agent_with_env(&self, prompt: &str, envs: &[(&str, &str)]) -> Output {
@@ -123,15 +162,22 @@ impl Fixture {
         self.run(cmd)
     }
 
-    fn run_trace(&self, invocation_uuid: &str) -> Output {
-        let mut cmd = Command::new(runner_bin());
-        cmd.arg("trace").arg(invocation_uuid).arg("--json");
-        self.run(cmd)
-    }
-
     fn write_external_provider(&self) {
         let provider = self.provider;
         let provider_path = self.write_script("external-provider.py", external_provider_script());
+        self.write_script(
+            "slow_control.py",
+            include_str!("fixtures/s11_slow_control.py"),
+        );
+        self.write_script("s11_ingress.py", include_str!("fixtures/s11_ingress.py"));
+        self.write_script(
+            "s11_diagnostics.py",
+            include_str!("fixtures/s11_diagnostics.py"),
+        );
+        self.write_script(
+            "s11_recipient_control.py",
+            include_str!("fixtures/s11_recipient_control.py"),
+        );
         let turn_script_path = self.write_script("s11-turns.py", turn_script());
         fs::write(
             self.models_dir.join(format!("{MODEL}.toml")),
@@ -191,67 +237,6 @@ turn_script = {}
         MailboxDb::open(&self.sidecar_path()).unwrap()
     }
 
-    fn seed_detached_child_completion(&self, owner_invocation_uuid: &str) -> MailboxRow {
-        let state_dir = self.dir.path().join("detached-child");
-        fs::create_dir_all(&state_dir).unwrap();
-        let artifact = state_dir.join("result.json");
-        let artifact_bytes = b"{\"status\":\"PASS\"}\n";
-        fs::write(&artifact, artifact_bytes).unwrap();
-        let artifact_sha256 = format!("{:x}", Sha256::digest(artifact_bytes));
-        let meta = state_dir.join("meta.json");
-        let log = state_dir.join("log");
-        let rc = state_dir.join("rc");
-        fs::write(
-            &meta,
-            serde_json::json!({
-                "owner_session_id": SESSION,
-                "owner_invocation_uuid": owner_invocation_uuid,
-                "caller_chain": [],
-            })
-            .to_string(),
-        )
-        .unwrap();
-        fs::write(&log, "detached child completed with PASS\n").unwrap();
-        fs::write(&rc, "0\n").unwrap();
-        let payload_json = serde_json::json!({
-            "schema_version": 1,
-            "kind": "agent_bash_complete",
-            "handle": "age291-detached-child",
-            "state_dir": path_string(&state_dir),
-            "meta_path": path_string(&meta),
-            "log_path": path_string(&log),
-            "rc_path": path_string(&rc),
-            "rc": 0,
-            "terminal_artifact": {
-                "path": path_string(&artifact),
-                "sha256": artifact_sha256,
-            },
-        })
-        .to_string();
-        let mut mailbox = self.mailbox();
-        match mailbox
-            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
-                session_id: SESSION,
-                handle: "age291-detached-child",
-                payload_json: &payload_json,
-                owner_invocation_uuid: Some(owner_invocation_uuid),
-                matched_os_pid: Some(9000),
-                matched_os_boot_id: Some("age291-fixture-boot"),
-                matched_os_pid_starttime_ticks: Some(1),
-                matched_chain_index: Some(0),
-                state_dir: &path_string(&state_dir),
-                meta_path: &path_string(&meta),
-                log_path: &path_string(&log),
-                rc_path: &path_string(&rc),
-                rc: 0,
-            })
-            .unwrap()
-        {
-            EnqueueResult::Inserted(row) => row,
-            other => panic!("expected inserted detached-child notification, got {other:?}"),
-        }
-    }
-
     fn finalized_invocation_count(&self) -> i64 {
         Connection::open(self.state_path())
             .unwrap()
@@ -280,21 +265,6 @@ turn_script = {}
             .expect("expected a resumed invocation row")
     }
 
-    fn latest_resumed_provider_identity(&self) -> (String, String) {
-        Connection::open(self.state_path())
-            .unwrap()
-            .query_row(
-                "SELECT provider_name, provider_session_id
-                 FROM invocations
-                 WHERE resume_input_id IS NOT NULL
-                 ORDER BY id DESC
-                 LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap()
-    }
-
     fn latest_invocation_uuid(&self) -> String {
         Connection::open(self.state_path())
             .unwrap()
@@ -302,20 +272,6 @@ turn_script = {}
                 "SELECT invocation_uuid FROM invocations ORDER BY id DESC LIMIT 1",
                 [],
                 |row| row.get(0),
-            )
-            .unwrap()
-    }
-
-    fn latest_terminal_outcome(&self) -> (String, i32, String) {
-        Connection::open(self.state_path())
-            .unwrap()
-            .query_row(
-                "SELECT status, exit_code, terminal_reason
-                 FROM invocations
-                 ORDER BY id DESC
-                 LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap()
     }
@@ -354,6 +310,18 @@ turn_script = {}
             "config must stay in isolated XDG_CONFIG_HOME"
         );
     }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.capture_diagnostics("assertion-failure");
+        }
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn assert_unconfirmed_resume(output: &Output) {
@@ -503,42 +471,318 @@ fn prompt_acceptance_marker_requires_declared_capability() {
     assert_eq!(fixture.latest_resume_acceptance(), (None, None));
 }
 
+// Linux /proc evidence identifies the real contained terminal helper, not the
+// CLI chosen by the test. Automatic ownership and supersession stay enabled.
+#[cfg(target_os = "linux")]
+#[test]
+fn hidden_nonterminal_page_after_append_preserves_terminal_checkpoint() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fs::write(
+        fixture.dir.path().join("slow-control.json"),
+        serde_json::json!({
+            "work_dir": fixture.work_dir, "wrong_digest": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut command = Command::new("/usr/bin/python3");
+    command
+        .arg("-c")
+        .arg(include_str!("fixtures/s11_visibility_regression.py"))
+        .arg(fixture.dir.path());
+    assert_success(&fixture.run(command));
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn bounded_post_anchor_user_observation_confirms_mailbox_without_attestation_or_turn_script() {
+    slow_page_control(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn slow_post_anchor_wrong_digest_cannot_confirm_receipt() {
+    slow_page_control(true);
+}
+
+#[cfg(target_os = "linux")]
+fn slow_page_control(wrong_digest: bool) {
     let fixture = Fixture::new();
     fixture.write_external_provider();
     fixture.remove_turn_script_fallback();
-    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
-    let owner_invocation_uuid = fixture.latest_invocation_uuid();
-    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
-
-    let resumed = fixture.run_resume_with_env(
-        "continue owning workflow",
-        &[
-            ("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY", "1"),
-            ("S11_NO_ASSISTANT_RESULT", "1"),
-            ("S11_READ_TURNS_DELAY_MS", "2500"),
-        ],
-    );
-
-    assert_eq!(resumed.status.code(), Some(1), "{resumed:?}");
-    let delivered = fixture.mailbox_row(notification.seq);
-    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
-    let evidence: (Option<String>, Option<String>, Option<String>) =
-        Connection::open(fixture.sidecar_path())
-            .unwrap()
-            .query_row(
-                "SELECT observation_anchor_token, observation_expected_sha256,
-                        observation_confirmed_turn_id
-                 FROM mailbox_delivery_attempts
-                 ORDER BY created_at DESC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+    // First observe normal retirement with no admitted source. The next real
+    // producer enters through the supported CLI, never a forced owner restart.
+    assert_success(&fixture.run_agent_with_env("idle predecessor before ingress", &[]));
+    let db = Connection::open(fixture.sidecar_path()).unwrap();
+    wait_until("idle predecessor closing before producer ingress", || {
+        db.query_row(
+            "SELECT phase='closing' FROM completion_continuation_owner",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    });
+    let predecessor: String = db
+        .query_row(
+            "SELECT generation FROM completion_continuation_owner WHERE phase='closing'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    eprintln!("SLOW_INGRESS observed_predecessor_closing={predecessor}");
+    let agent_bash = std::env::var("AGE360_AGENT_BASH_BIN")
+        .expect("explicit source-built agent-bash required; no installed fallback");
+    fs::write(
+        fixture.dir.path().join("slow-control.json"),
+        serde_json::json!({
+            "work_dir": fixture.work_dir, "sidecar": fixture.sidecar_path(),
+            "runner": runner_bin(), "agent_bash": agent_bash, "admit_source": true,
+            "wrong_digest": wrong_digest
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let seed = fixture.run_agent_with_env("owner admits actual detached completion", &[]);
+    assert_success(&seed);
+    let owner = result_envelope(&seed)["id"].as_str().unwrap().to_owned();
+    let ingress: Value =
+        serde_json::from_slice(&fs::read(fixture.work_dir.join("ingress-result.json")).unwrap())
             .unwrap();
-    assert!(evidence.0.is_some());
-    assert_eq!(evidence.1.as_deref().map(str::len), Some(64));
-    assert!(evidence.2.is_some());
+    let registration: Value = serde_json::from_slice(
+        &fs::read(fixture.work_dir.join("ingress-registration.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ingress["rc"], 0);
+    assert_eq!(ingress["owner"], owner);
+    assert_eq!(registration["owner_invocation_uuid"], owner);
+    let successor = fixture
+        .mailbox()
+        .completion_continuation_owner()
+        .unwrap()
+        .unwrap();
+    assert_ne!(successor.owner_generation, predecessor);
+    assert_eq!(registration["domain_id"], successor.domain_id);
+    let handle = registration["handle"].as_str().unwrap();
+    assert!(
+        fixture
+            .mailbox()
+            .completion_event(handle)
+            .unwrap()
+            .is_some(),
+        "actual producer registration must remain discoverable"
+    );
+    eprintln!("SLOW_INGRESS actual={ingress} registration={registration} successor={successor:?}");
+    // The source producer, not a low-level post-seed insertion, creates this
+    // notification. Seed/provider custody may legitimately await source drain.
+    let mut notification_seq = None;
+    wait_until("admitted source notification materialized", || {
+        notification_seq = db
+            .query_row("SELECT seq FROM mailbox WHERE handle=?1", [handle], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()
+            .unwrap();
+        notification_seq.is_some()
+    });
+    let notification = fixture.mailbox_row(notification_seq.unwrap());
+    assert_eq!(
+        notification.owner_invocation_uuid.as_deref(),
+        Some(owner.as_str())
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.work_dir.join("source-launches")).unwrap(),
+        "launch\n"
+    );
+    // No explicit resume competitor: the actual automatic owner submits.
+    wait_until("automatic submitted invocation finalized", || {
+        let db = Connection::open(fixture.sidecar_path()).unwrap();
+        let invocation: Option<String> = db
+            .query_row(
+                "SELECT a.delivery_invocation_uuid FROM mailbox_delivery_attempts a
+             JOIN mailbox_delivery_attempt_items i USING(attempt_id)
+             WHERE i.mailbox_seq=?1 AND a.submission_started_at IS NOT NULL",
+                [notification.seq],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        invocation.is_some_and(|id| {
+            Connection::open(fixture.state_path())
+                .unwrap()
+                .query_row(
+                    "SELECT finished_at IS NOT NULL FROM invocations WHERE invocation_uuid=?1",
+                    [id],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
+        })
+    });
+    let db = Connection::open(fixture.sidecar_path()).unwrap();
+    let attempts: Vec<Value> = db
+        .prepare(
+            "SELECT json_object('attempt_id',a.attempt_id,'invocation',delivery_invocation_uuid,
+         'anchor',observation_anchor_token,'digest',observation_expected_sha256,
+         'turn',observation_confirmed_turn_id,'confirmed',observation_confirmed_at,
+         'ack',acknowledged_at) FROM mailbox_delivery_attempts a
+         JOIN mailbox_delivery_attempt_items i USING(attempt_id)
+         WHERE i.mailbox_seq=?1 AND submission_started_at IS NOT NULL",
+        )
+        .unwrap()
+        .query_map([notification.seq], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+        .collect();
+    let events: Vec<Value> = fs::read_to_string(fixture.work_dir.join("slow-events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    eprintln!("SLOW_CONTROL attempts={attempts:?} events={events:?}");
+    assert_eq!(attempts.len(), 1, "one actual submission per notification");
+    let a = &attempts[0];
+    let invocation = a["invocation"].as_str().unwrap();
+    wait_until("submitted runtime physically exited", || {
+        db.query_row("SELECT COUNT(*) FROM runtime_generation WHERE spawn_invocation_uuid=?1 AND lifecycle_state='exited'",
+            [invocation], |r| r.get::<_, i64>(0)).unwrap() == 1
+    });
+    let generation: String = db.query_row("SELECT json_object('id',generation_uuid,'exit_code',exit_code,'reason',terminal_reason) FROM runtime_generation WHERE spawn_invocation_uuid=?1",
+        [invocation], |r| r.get(0)).unwrap();
+    eprintln!("SLOW_CONTROL generation={generation}");
+    let launches: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "launch_exit")
+        .collect();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0]["invocation"], invocation);
+    assert_eq!(launches[0]["assistant_result"], false);
+    assert_eq!(launches[0]["provider_exit"], 0);
+    let mut native_result = None;
+    wait_until("automatic launcher wait receipt", || {
+        let paths: Vec<String> = db.prepare("SELECT result_path FROM completion_continuation_attempt WHERE session_id=?1 AND operation='activation'")
+            .unwrap().query_map([SESSION], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        for path in paths {
+            let path = Path::new(&path);
+            let stderr =
+                fs::read_to_string(path.with_file_name("launcher.stderr")).unwrap_or_default();
+            let stdout =
+                fs::read_to_string(path.with_file_name("launcher.stdout")).unwrap_or_default();
+            let matched = stdout
+                .lines()
+                .chain(stderr.lines())
+                .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|result| {
+                    result["id"] == invocation
+                        && result["terminal_reason"] == "resume_completion_unconfirmed"
+                });
+            if matched && let Ok(bytes) = fs::read(path) {
+                let receipt: Value = serde_json::from_slice(&bytes).unwrap();
+                native_result = Some((receipt, stdout, stderr));
+                return true;
+            }
+        }
+        false
+    });
+    let (receipt, stdout, stderr) = native_result.unwrap();
+    eprintln!(
+        "SLOW_CONTROL actual_wait={receipt} launcher_stdout={stdout} launcher_stderr={stderr}"
+    );
+    let activation_json: String = db
+        .query_row(
+            "SELECT json_object('attempt_id',attempt_id,'owner_generation',owner_generation,
+         'custodian',json(custodian_identity),'result_path',result_path)
+         FROM completion_continuation_attempt WHERE attempt_id=?1 AND operation='activation'",
+            [receipt["attempt_id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let activation: Value = serde_json::from_str(&activation_json).unwrap();
+    assert_eq!(activation["owner_generation"], successor.owner_generation);
+    assert_eq!(activation["custodian"], receipt["custodian"]);
+    eprintln!("SLOW_CONTROL activation={activation}");
+    assert_eq!(receipt["root_exit_code"], 1);
+    assert_eq!(receipt["root_wait_status"], 256);
+    assert_eq!(receipt["owned_children"], "ECHILD");
+    assert_eq!(receipt["spawn_failed"], false);
+    let outcome: (String, i32, String) = Connection::open(fixture.state_path())
+        .unwrap()
+        .query_row(
+            "SELECT status,exit_code,terminal_reason FROM invocations WHERE invocation_uuid=?1",
+            [invocation],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    eprintln!("SLOW_CONTROL notification={notification:?} outcome={outcome:?}");
+    assert_eq!(
+        fixture.recorded_resume_prompts().len(),
+        1,
+        "no duplicate submission"
+    );
+    assert_eq!(a["anchor"], "s11-anchor:0");
+    assert!(a["ack"].is_null(), "native receipt must not fabricate ACK");
+    let pages: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "terminal_page")
+        .collect();
+    assert!(!pages.is_empty(), "must reach actual terminal reader");
+    for page in pages {
+        assert_eq!(page["target"]["attempt_id"], a["attempt_id"]);
+        assert_eq!(page["target"]["admission_purpose"], "TerminalBounded");
+        assert_eq!(page["before"]["invocation"], invocation);
+        assert!(page["before"]["confirmed"].is_null());
+        assert!(page["before"]["ack"].is_null());
+        assert!(page["before"]["submitted"].is_string());
+        assert_eq!(page["request"]["params"]["after_token"], a["anchor"]);
+        assert_eq!(
+            page["request"]["params"]["expected_delivery_nonce"],
+            a["attempt_id"]
+        );
+        assert_eq!(page["after"]["confirmed"], Value::Null);
+        assert_eq!(page["after"]["ack"], Value::Null);
+        assert!(page["elapsed_ms"].as_u64().unwrap() >= 2500);
+        assert_eq!(page["turn"], "s11-observed-user-1");
+        if !wrong_digest {
+            assert_eq!(page["digest"], a["digest"]);
+        }
+    }
+    let delivered = fixture.mailbox_row(notification.seq);
+    eprintln!("SLOW_CONTROL final_notification={delivered:?}");
+    assert_eq!(
+        fs::read(&notification.log_path).unwrap(),
+        b"s11-admitted-source-output"
+    );
+    assert_eq!(
+        fs::read_to_string(&notification.rc_path).unwrap().trim(),
+        "0"
+    );
+    for field in ["snapshot_relative", "outcome_relative"] {
+        let path = Path::new(registration["handle_dir"].as_str().unwrap())
+            .join(registration[field].as_str().unwrap());
+        let evidence: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        eprintln!("SLOW_INGRESS {field}={evidence}");
+    }
+    assert_eq!(delivered.delivery_attempts, 1);
+    assert_eq!(outcome.0, "failed");
+    if wrong_digest {
+        assert!(delivered.delivered_at.is_none());
+        assert!(a["confirmed"].is_null());
+        assert_eq!(outcome.2, "resume_completion_unconfirmed");
+        assert_eq!(
+            delivered.delivery_error.as_deref(),
+            Some("mailbox_delivery_unconfirmed")
+        );
+    } else {
+        assert!(delivered.delivered_at.is_some());
+        assert_eq!(
+            delivered.delivered_by_invocation_uuid.as_deref(),
+            Some(invocation)
+        );
+        assert_eq!(a["turn"], "s11-observed-user-1");
+        assert_eq!(outcome.2, "resume_completion_unconfirmed");
+        assert_eq!(outcome.1, 0, "provider clean exit, assistant result absent");
+    }
+    fixture.assert_xdg_isolated();
 }
 
 #[test]
@@ -576,550 +820,99 @@ fn accepted_manual_prompt_nonzero_has_one_typed_terminal_outcome() {
 }
 
 #[test]
-fn missing_final_exit_does_not_settle_mismatched_prompt_acceptance() {
+fn recipient_controls_preserve_hidden_prefix_and_select_nonce_bearing_launch() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
-    fixture.remove_turn_script_fallback();
-    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
-    let owner_invocation_uuid = fixture.latest_invocation_uuid();
-    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
-
-    let resumed = fixture.run_resume_with_env(
-        "continue owning workflow",
-        &[
-            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
-            ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
-            ("S11_NO_ASSISTANT_RESULT", "1"),
-            ("S11_OMIT_EXIT_EVENT", "1"),
-        ],
+    fixture.write_script(
+        "s11_recipient_case.py",
+        include_str!("fixtures/s11_recipient_case.py"),
     );
+    let script = fixture.write_script(
+        "s11_recipient_regression.py",
+        include_str!("fixtures/s11_recipient_regression.py"),
+    );
+    let mut command = Command::new("/usr/bin/python3");
+    command.arg(script).arg(fixture.dir.path());
+    assert_success(&fixture.run(command));
+}
 
-    assert_ne!(resumed.status.code(), Some(0), "{resumed:?}");
-    let pending = fixture.mailbox_row(notification.seq);
-    assert!(pending.delivered_at.is_none(), "{pending:?}");
-    assert_eq!(pending.delivery_attempts, 1);
+// These cases select the actual automatic recipient, not the later manual turn.
+// The Python driver retains exact source/attempt/provider/native-result joins.
+fn recipient_case(provider: &'static str, marker: &str, exit: &str, projection: bool) {
+    let fixture = Fixture::with_provider(provider);
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    let script = fixture.write_script(
+        "s11_recipient_case.py",
+        include_str!("fixtures/s11_recipient_case.py"),
+    );
+    let mut command = Command::new("/usr/bin/python3");
+    command
+        .arg(script)
+        .arg(runner_bin())
+        .arg(&fixture.models_dir)
+        .arg(provider)
+        .arg(marker)
+        .arg(exit)
+        .arg(if projection { "1" } else { "0" });
+    let output = fixture.run(command);
+    assert_success(&output);
     fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn missing_final_exit_does_not_settle_mismatched_prompt_acceptance() {
+    recipient_case(PROVIDER, "hash", "missing", false);
 }
 
 #[test]
 fn trusted_prompt_acceptance_settles_mailbox_delivery_after_provider_nonzero() {
-    let fixture = Fixture::new();
-    fixture.write_external_provider();
-    fixture.remove_turn_script_fallback();
-    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
-    let owner_invocation_uuid = fixture.latest_invocation_uuid();
-    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
-
-    let resumed = fixture.run_resume_with_env(
-        "continue owning workflow",
-        &[
-            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
-            ("S11_NO_ASSISTANT_RESULT", "1"),
-            ("S11_EXIT_NONZERO", "1"),
-        ],
-    );
-
-    assert_eq!(resumed.status.code(), Some(29), "{resumed:?}");
-    let result = result_envelope(&resumed);
-    let invocation_uuid = result["id"].as_str().unwrap();
-    assert_eq!(result["status"], "failed");
-    assert_eq!(result["exit_code"], 29);
-    assert_eq!(
-        result["terminal_reason"],
-        "resume_prompt_accepted_provider_failed"
-    );
-    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
-    let delivered = fixture.mailbox_row(notification.seq);
-    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
-    assert_eq!(delivered.delivery_attempts, 1);
-    assert_eq!(
-        delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(invocation_uuid)
-    );
-    fixture.assert_xdg_isolated();
+    recipient_case(PROVIDER, "trusted", "nonzero", false);
 }
 
 #[test]
 fn trusted_prompt_acceptance_settles_mailbox_delivery_when_final_exit_is_missing() {
-    let fixture = Fixture::new();
-    fixture.write_external_provider();
-    fixture.remove_turn_script_fallback();
-    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
-    let owner_invocation_uuid = fixture.latest_invocation_uuid();
-    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
-
-    let resumed = fixture.run_resume_with_env(
-        "continue owning workflow",
-        &[
-            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
-            ("S11_NO_ASSISTANT_RESULT", "1"),
-            ("S11_OMIT_EXIT_EVENT", "1"),
-        ],
-    );
-
-    assert_ne!(resumed.status.code(), Some(0), "{resumed:?}");
-    let result = result_envelope(&resumed);
-    let invocation_uuid = result["id"].as_str().unwrap();
-    assert_eq!(result["status"], "failed");
-    assert_ne!(result["exit_code"], 0);
-    assert_eq!(
-        result["terminal_reason"],
-        "resume_prompt_accepted_provider_failed"
-    );
-    let stderr = String::from_utf8_lossy(&resumed.stderr);
-    assert!(
-        stderr.contains("missing_final_exit;provider_process=exited:0"),
-        "{stderr}"
-    );
-    let delivered = fixture.mailbox_row(notification.seq);
-    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
-    assert_eq!(delivered.delivery_attempts, 1);
-    assert_eq!(
-        delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(invocation_uuid)
-    );
-
-    assert_success(&fixture.run_resume_with_env(
-        "continue after child completion",
-        &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
-    ));
-    assert_eq!(fixture.mailbox_row(notification.seq).delivery_attempts, 1);
-    fixture.assert_xdg_isolated();
+    recipient_case(PROVIDER, "trusted", "missing", false);
 }
 
 #[test]
 fn absent_prompt_acceptance_is_reconciled_before_nonzero_and_missing_exit_replay() {
-    for (label, failure_environment) in [
-        (
-            "provider-nonzero",
-            [("S11_NO_ASSISTANT_RESULT", "1"), ("S11_EXIT_NONZERO", "1")],
-        ),
-        (
-            "missing-final-exit",
-            [
-                ("S11_NO_ASSISTANT_RESULT", "1"),
-                ("S11_OMIT_EXIT_EVENT", "1"),
-            ],
-        ),
-    ] {
-        let fixture = Fixture::new();
-        fixture.write_external_provider();
-        fixture.remove_turn_script_fallback();
-        assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
-        let owner_invocation_uuid = fixture.latest_invocation_uuid();
-        let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
-
-        let failed = fixture.run_resume_with_env("continue owning workflow", &failure_environment);
-        assert_ne!(failed.status.code(), Some(0), "{label}: {failed:?}");
-        let (status, exit_code, terminal_reason) = fixture.latest_terminal_outcome();
-        assert_eq!(status, "failed", "{label}");
-        assert_ne!(exit_code, 0, "{label}");
-        assert_ne!(
-            terminal_reason, "resume_prompt_accepted_provider_failed",
-            "{label}: absent acceptance must not select the trusted terminal path"
-        );
-        let pending = fixture.mailbox_row(notification.seq);
-        assert!(pending.delivered_at.is_none(), "{label}: {pending:?}");
-        assert_eq!(pending.delivery_attempts, 1, "{label}: {pending:?}");
-
-        assert_success(&fixture.run_resume_with_env(
-            "retry pending detached child",
-            &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
-        ));
-        let delivered = fixture.mailbox_row(notification.seq);
-        assert!(delivered.delivered_at.is_some(), "{label}: {delivered:?}");
-        assert_eq!(delivered.delivery_attempts, 2, "{label}: {delivered:?}");
-        let prompts = fixture.recorded_resume_prompts();
-        assert_eq!(prompts.len(), 2, "{label}: {prompts:#?}");
-        assert_eq!(
-            prompts
-                .iter()
-                .filter(|prompt| prompt.contains("age291-detached-child"))
-                .count(),
-            1,
-            "{label}: bounded observation must suppress duplicate delivery: {prompts:#?}"
-        );
-        fixture.assert_xdg_isolated();
+    for exit in ["nonzero", "missing"] {
+        recipient_case(PROVIDER, "absent", exit, false);
     }
 }
 
 #[test]
 fn wrong_prompt_acceptance_session_and_nonce_are_reconciled_before_replay() {
-    for (label, mismatch_environment, failure_environment) in [
-        (
-            "wrong-session-provider-nonzero",
-            "S11_MARKER_SESSION_MISMATCH",
-            "S11_EXIT_NONZERO",
-        ),
-        (
-            "wrong-session-missing-final-exit",
-            "S11_MARKER_SESSION_MISMATCH",
-            "S11_OMIT_EXIT_EVENT",
-        ),
-        (
-            "wrong-nonce-provider-nonzero",
-            "S11_MARKER_DELIVERY_NONCE_MISMATCH",
-            "S11_EXIT_NONZERO",
-        ),
-        (
-            "wrong-nonce-missing-final-exit",
-            "S11_MARKER_DELIVERY_NONCE_MISMATCH",
-            "S11_OMIT_EXIT_EVENT",
-        ),
-    ] {
-        let fixture = Fixture::new();
-        fixture.write_external_provider();
-        fixture.remove_turn_script_fallback();
-        assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
-        let owner_invocation_uuid = fixture.latest_invocation_uuid();
-        let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
-
-        let failed = fixture.run_resume_with_env(
-            "continue owning workflow",
-            &[
-                ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
-                (mismatch_environment, "1"),
-                ("S11_NO_ASSISTANT_RESULT", "1"),
-                (failure_environment, "1"),
-            ],
-        );
-        assert_ne!(failed.status.code(), Some(0), "{label}: {failed:?}");
-        let result = result_envelope(&failed);
-        assert_eq!(result["status"], "failed", "{label}");
-        assert_ne!(
-            result["terminal_reason"], "resume_prompt_accepted_provider_failed",
-            "{label}: mismatched correlation must not select the trusted terminal path"
-        );
-        let pending = fixture.mailbox_row(notification.seq);
-        assert!(pending.delivered_at.is_none(), "{label}: {pending:?}");
-        assert_eq!(pending.delivery_attempts, 1, "{label}: {pending:?}");
-
-        assert_success(&fixture.run_resume_with_env(
-            "retry pending detached child",
-            &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
-        ));
-        let delivered = fixture.mailbox_row(notification.seq);
-        assert!(delivered.delivered_at.is_some(), "{label}: {delivered:?}");
-        assert_eq!(delivered.delivery_attempts, 2, "{label}: {delivered:?}");
-        let prompts = fixture.recorded_resume_prompts();
-        assert_eq!(prompts.len(), 2, "{label}: {prompts:#?}");
-        assert_eq!(
-            prompts
-                .iter()
-                .filter(|prompt| prompt.contains("age291-detached-child"))
-                .count(),
-            1,
-            "{label}: bounded observation must suppress duplicate delivery: {prompts:#?}"
-        );
-        fixture.assert_xdg_isolated();
+    let mut failures = Vec::new();
+    for marker in ["session", "nonce"] {
+        for exit in ["nonzero", "missing"] {
+            if std::panic::catch_unwind(|| recipient_case(PROVIDER, marker, exit, false)).is_err() {
+                failures.push((marker, exit));
+            }
+        }
     }
+    assert!(failures.is_empty(), "failed matrix cells: {failures:?}");
 }
 
 #[test]
 fn trusted_prompt_acceptance_survives_mailbox_projection_failure_without_replay() {
-    let fixture = Fixture::new();
-    fixture.write_external_provider();
-    fixture.remove_turn_script_fallback();
-    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
-    let owner_invocation_uuid = fixture.latest_invocation_uuid();
-    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
-
-    let connection = Connection::open(fixture.sidecar_path()).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_accepted_mailbox_projection
-             BEFORE UPDATE OF delivered_at ON mailbox
-             WHEN NEW.delivered_at IS NOT NULL
-             BEGIN
-                 SELECT RAISE(ABORT, 'forced accepted mailbox projection failure');
-             END;",
-        )
-        .unwrap();
-    drop(connection);
-
-    let first = fixture.run_resume_with_env(
-        "continue owning workflow",
-        &[
-            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
-            ("S11_NO_ASSISTANT_RESULT", "1"),
-            ("S11_EXIT_NONZERO", "1"),
-        ],
-    );
-    let first_result = result_envelope(&first);
-    let first_invocation_uuid = first_result["id"].as_str().unwrap();
-    assert_eq!(
-        first_result["terminal_reason"],
-        "resume_prompt_accepted_provider_failed"
-    );
-    let pending = fixture.mailbox_row(notification.seq);
-    assert!(pending.delivered_at.is_none(), "{pending:?}");
-    let durable = Connection::open(fixture.state_path())
-        .unwrap()
-        .query_row(
-            "SELECT status, exit_code, terminal_reason,
-                    EXISTS(
-                        SELECT 1 FROM session_delivery_acknowledgements
-                        WHERE turn_generation_id = invocations.invocation_uuid
-                          AND confirmed_at IS NOT NULL
-                    )
-             FROM invocations
-             WHERE invocation_uuid = ?1",
-            [first_invocation_uuid],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i32>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, bool>(3)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        durable,
-        (
-            "failed".to_string(),
-            29,
-            "resume_prompt_accepted_provider_failed".to_string(),
-            true,
-        )
-    );
-
-    Connection::open(fixture.sidecar_path())
-        .unwrap()
-        .execute_batch("DROP TRIGGER fail_accepted_mailbox_projection;")
-        .unwrap();
-    assert_success(&fixture.run_resume_with_env(
-        "continue after projection recovery",
-        &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
-    ));
-
-    let delivered = fixture.mailbox_row(notification.seq);
-    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
-    assert_eq!(
-        delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(first_invocation_uuid)
-    );
-    let prompts = fixture.recorded_resume_prompts();
-    assert_eq!(prompts.len(), 2, "{prompts:#?}");
-    assert!(prompts[0].contains("age291-detached-child"), "{prompts:#?}");
-    assert!(
-        !prompts[1].contains("age291-detached-child"),
-        "{prompts:#?}"
-    );
-    fixture.assert_xdg_isolated();
+    recipient_case(PROVIDER, "trusted", "nonzero", true);
 }
 
 #[test]
 fn ordinary_completion_survives_mailbox_projection_failure_without_replay() {
-    let fixture = Fixture::new();
-    fixture.write_external_provider();
-    fixture.remove_turn_script_fallback();
-    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
-    let owner_invocation_uuid = fixture.latest_invocation_uuid();
-    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
-
-    let connection = Connection::open(fixture.sidecar_path()).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_ordinary_mailbox_projection
-             BEFORE UPDATE OF delivered_at ON mailbox
-             WHEN NEW.delivered_at IS NOT NULL
-             BEGIN
-                 SELECT RAISE(ABORT, 'forced ordinary mailbox projection failure');
-             END;",
-        )
-        .unwrap();
-    drop(connection);
-
-    let first = fixture.run_resume_with_env(
-        "continue owning workflow",
-        &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
-    );
-    assert_eq!(first.status.code(), Some(1), "{first:?}");
-    assert_payload_then_success_envelope(
-        &first,
-        "owner consumed detached child result and continued\n",
-    );
-    let first_invocation_uuid = fixture.latest_invocation_uuid();
-    let pending = fixture.mailbox_row(notification.seq);
-    assert!(pending.delivered_at.is_none(), "{pending:?}");
-    let durable = Connection::open(fixture.state_path())
-        .unwrap()
-        .query_row(
-            "SELECT status, exit_code,
-                    EXISTS(
-                        SELECT 1 FROM session_delivery_acknowledgements
-                        WHERE turn_generation_id = invocations.invocation_uuid
-                          AND confirmed_at IS NOT NULL
-                    )
-             FROM invocations
-             WHERE invocation_uuid = ?1",
-            [first_invocation_uuid.as_str()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i32>(1)?,
-                    row.get::<_, bool>(2)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(durable, ("succeeded".to_string(), 0, true));
-
-    Connection::open(fixture.sidecar_path())
-        .unwrap()
-        .execute_batch("DROP TRIGGER fail_ordinary_mailbox_projection;")
-        .unwrap();
-    assert_success(&fixture.run_resume_with_env(
-        "continue after projection recovery",
-        &[("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1")],
-    ));
-
-    let delivered = fixture.mailbox_row(notification.seq);
-    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
-    assert_eq!(
-        delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(first_invocation_uuid.as_str())
-    );
-    let prompts = fixture.recorded_resume_prompts();
-    assert_eq!(prompts.len(), 2, "{prompts:#?}");
-    assert!(prompts[0].contains("age291-detached-child"), "{prompts:#?}");
-    assert!(
-        !prompts[1].contains("age291-detached-child"),
-        "{prompts:#?}"
-    );
-    fixture.assert_xdg_isolated();
+    recipient_case(PROVIDER, "absent", "success", true);
 }
 
 #[test]
 fn delivery_nonce_does_not_override_a_mismatched_prompt_hash() {
-    let fixture = Fixture::new();
-    fixture.write_external_provider();
-    fixture.remove_turn_script_fallback();
-    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
-    let owner_invocation_uuid = fixture.latest_invocation_uuid();
-    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
-
-    let resumed = fixture.run_resume_with_env(
-        "continue owning workflow",
-        &[
-            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
-            ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
-            ("S11_NO_ASSISTANT_RESULT", "1"),
-            ("S11_EXIT_NONZERO", "1"),
-        ],
-    );
-
-    assert_eq!(resumed.status.code(), Some(29), "{resumed:?}");
-    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
-    let pending = fixture.mailbox_row(notification.seq);
-    assert!(pending.delivered_at.is_none(), "{pending:?}");
+    recipient_case(PROVIDER, "hash", "nonzero", false);
 }
 
 fn assert_owner_session_consumes_detached_child_completion(provider: &'static str) {
-    let positive = Fixture::with_provider(provider);
-    positive.write_external_provider();
-    positive.remove_turn_script_fallback();
-    let owner = positive.run_agent_with_env("owner waits for detached child", &[]);
-    assert_success(&owner);
-    let owner_invocation_uuid = positive.latest_invocation_uuid();
-    let notification = positive.seed_detached_child_completion(&owner_invocation_uuid);
-
-    let resumed = positive.run_resume_with_env(
-        "continue owning workflow",
-        &[
-            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
-            ("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1"),
-        ],
-    );
-    assert_success(&resumed);
-    assert_payload_then_success_envelope(
-        &resumed,
-        "owner consumed detached child result and continued\n",
-    );
-    let resumed_invocation_uuid = positive.latest_invocation_uuid();
-    let resumed_stderr = String::from_utf8_lossy(&resumed.stderr);
-    assert_eq!(
-        positive.latest_resume_acceptance(),
-        (None, None),
-        "prompt acceptance and session-resume acceptance are distinct durable entities"
-    );
-    let (provider_name, provider_session_id) = positive.latest_resumed_provider_identity();
-    assert_eq!(provider_session_id, SESSION);
-    assert_eq!(provider_name, provider);
-    assert_eq!(
-        fs::read_to_string(positive.work_dir.join("affirmative-result")).unwrap(),
-        "owner consumed detached child result and continued\n"
-    );
-    let delivered = positive.mailbox_row(notification.seq);
-    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
-    assert_eq!(delivered.delivery_attempts, 1);
-    assert_eq!(
-        delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(resumed_invocation_uuid.as_str())
-    );
-    let trace = positive.run_trace(&resumed_invocation_uuid);
-    assert_success(&trace);
-    let trace: Value = serde_json::from_slice(&trace.stdout).unwrap();
-    assert_eq!(trace["root"]["session"]["transcript_state"], "no_locator");
-    assert_eq!(trace["root"]["session"]["turn_count"], 0);
-    assert_eq!(trace["root"]["session"]["assistant_turn_count"], 0);
-    positive.assert_xdg_isolated();
-
-    let no_assistant = Fixture::with_provider(provider);
-    no_assistant.write_external_provider();
-    no_assistant.remove_turn_script_fallback();
-    let owner = no_assistant.run_agent_with_env("owner waits for detached child", &[]);
-    assert_success(&owner);
-    let owner_invocation_uuid = no_assistant.latest_invocation_uuid();
-    let notification = no_assistant.seed_detached_child_completion(&owner_invocation_uuid);
-    let unconfirmed = no_assistant.run_resume_with_env(
-        "continue owning workflow",
-        &[
-            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
-            ("S11_NO_ASSISTANT_RESULT", "1"),
-        ],
-    );
-    let unconfirmed_result = result_envelope(&unconfirmed);
-    let unconfirmed_invocation_uuid = unconfirmed_result["id"].as_str().unwrap().to_owned();
-    assert_eq!(unconfirmed.status.code(), Some(1), "{unconfirmed:?}");
-    assert_eq!(unconfirmed_result["status"], "failed");
-    assert_eq!(
-        unconfirmed_result["error_category"],
-        "resume_completion_unconfirmed"
-    );
-    let delivered = no_assistant.mailbox_row(notification.seq);
-    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
-    assert_eq!(delivered.delivery_attempts, 1);
-    assert_eq!(
-        delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(unconfirmed_invocation_uuid.as_str())
-    );
-
-    let later_resume = no_assistant.run_resume_with_env(
-        "continue after child completion",
-        &[
-            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
-            ("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1"),
-        ],
-    );
-    assert_success(&later_resume);
-    let still_delivered = no_assistant.mailbox_row(notification.seq);
-    assert_eq!(still_delivered.delivery_attempts, 1);
-    assert_eq!(
-        still_delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(unconfirmed_invocation_uuid.as_str())
-    );
-    no_assistant.assert_xdg_isolated();
-
-    assert_eq!(
-        resumed.status.code(),
-        Some(0),
-        "AGE-291: the exact owner session accepted the detached-child delivery nonce and the provider emitted an affirmative assistant result, but the owning continuation did not consume it\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&resumed.stdout),
-        resumed_stderr,
-    );
+    recipient_case(provider, "trusted", "success", false);
+    recipient_case(provider, "trusted", "no-assistant", false);
 }
 
 #[test]
@@ -1156,6 +949,9 @@ import os
 import pathlib
 import sys
 import time
+import slow_control
+import s11_recipient_control as recipient_control
+slow_control.configure()
 
 CONTRACT = "oulipoly.provider/v1"
 PROMPT_ACCEPTANCE = "oulipoly.prompt_acceptance/v1"
@@ -1227,6 +1023,7 @@ def policy_evaluate(request):
     })
 
 def emit(event):
+    recipient_control.emitted(event)
     print(json.dumps(event, separators=(",", ":")), flush=True)
 
 def stdout_event(request, seq, payload):
@@ -1338,6 +1135,10 @@ def exit_event(request, seq, session_id):
     return event
 
 def launch(request):
+    # Actual provider entry, not a command intent or an inferred latest row.
+    evidence = pathlib.Path(os.environ["S11_WORK_DIR"]) / "provider-launches.jsonl"
+    with evidence.open("a") as stream:
+        stream.write(json.dumps(request) + "\n")
     params = request.get("params", {})
     known = params.get("session", {}).get("known_provider_session_id")
     prompt = params.get("model", {}).get("inputs", {}).get("prompt", "")
@@ -1368,6 +1169,7 @@ def launch(request):
         emit(launch_output_complete_event(request, seq, stdout_payloads))
         seq += 1
         if os.environ.get("S11_OMIT_EXIT_EVENT") != "1":
+            slow_control.launch_exit(request)
             emit(exit_event(request, seq, known))
         return
     session_id = None if os.environ.get("S11_OMIT_EXIT_SESSION") == "1" else SESSION
@@ -1375,6 +1177,8 @@ def launch(request):
     if session_id:
         emit(provider_session_marker_event(request, seq, session_id))
         seq += 1
+        slow_control.admit_source(request, session_id)
+        recipient_control.admit_source(request, session_id)
     initial = "initial\n"
     emit(stdout_event(request, seq, initial))
     seq += 1
@@ -1458,6 +1262,7 @@ def session_turn_page(request):
 def main():
     subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
     request = json.loads(sys.stdin.read() or "{}")
+    recipient_control.configure(request, subcommand)
     if os.environ.get("S11_CHECK_LIVE_BINDING_ISOLATION") == "1":
         params = request.get("params", {})
         environments = [os.environ, request.get("host", {}).get("env", {}),
@@ -1482,7 +1287,7 @@ def main():
         return 0
     if subcommand == "session.read_turns":
         time.sleep(int(os.environ.get("S11_READ_TURNS_DELAY_MS", "0")) / 1000)
-        print(json.dumps(session_turn_page(request)))
+        print(json.dumps(recipient_control.read_page(request, slow_control.read_page(request, session_turn_page))))
         return 0
     print(json.dumps({
         "contract": request.get("contract", CONTRACT),
@@ -1544,18 +1349,6 @@ fn result_envelope(output: &Output) -> Value {
         stderr
     );
     serde_json::from_str(lines[0]).unwrap()
-}
-
-fn assert_payload_then_success_envelope(output: &Output, payload: &str) {
-    assert!(
-        payload.ends_with('\n'),
-        "payload fixture must end with a newline"
-    );
-    assert_eq!(output.stdout, payload.as_bytes());
-    let envelope = result_envelope(output);
-    assert_eq!(envelope["status"], "succeeded");
-    assert_eq!(envelope["success"], true);
-    assert_eq!(envelope["exit_code"], 0);
 }
 
 fn terminal_signal_marker(stderr: &str) -> Value {

@@ -807,16 +807,24 @@ fn parse_proc_stat_starttime_ticks(stat: &str) -> Option<i64> {
 pub(crate) fn recorded_boot_has_ended(recorded: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
-        let Ok(Some(current)) = read_boot_id() else { return false; };
+        let Ok(Some(current)) = read_boot_id() else {
+            return false;
+        };
         distinct_kernel_boot_ids(recorded, &current)
     }
     #[cfg(not(target_os = "linux"))]
-    { let _ = recorded; false }
+    {
+        let _ = recorded;
+        false
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn distinct_kernel_boot_ids(recorded: &str, current: &str) -> bool {
-    let (Ok(recorded), Ok(current)) = (uuid::Uuid::parse_str(recorded), uuid::Uuid::parse_str(current)) else {
+    let (Ok(recorded), Ok(current)) = (
+        uuid::Uuid::parse_str(recorded),
+        uuid::Uuid::parse_str(current),
+    ) else {
         return false;
     };
     recorded.get_version_num() == 4 && current.get_version_num() == 4 && recorded != current
@@ -916,7 +924,12 @@ mod tests {
         let b = "22222222-2222-4222-8222-222222222222";
         assert!(distinct_kernel_boot_ids(a, b));
         assert!(!distinct_kernel_boot_ids(a, a));
-        for unknown in ["", "fixture", "macos-absolute-process-start-v1", "00000000-0000-0000-0000-000000000000"] {
+        for unknown in [
+            "",
+            "fixture",
+            "macos-absolute-process-start-v1",
+            "00000000-0000-0000-0000-000000000000",
+        ] {
             assert!(!distinct_kernel_boot_ids(unknown, a));
             assert!(!distinct_kernel_boot_ids(a, unknown));
         }

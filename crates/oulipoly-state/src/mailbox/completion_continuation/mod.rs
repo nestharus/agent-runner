@@ -8,15 +8,15 @@ mod attempts;
 pub(super) use attempts::native_original_drain_on;
 mod notification;
 mod source;
-pub(super) use notification::classify_on as classify_notification_on;
 pub use notification::{
     CompletionNotificationRequest, NotificationDeliveryEvidence, NotificationDisposition,
     NotificationPolicy,
 };
-pub(super) use source::{
-    accept_on, activate_notification_listeners_on, bound_event, reject_unbound_v2_trigger,
-    retained_payload,
+pub(super) use notification::{
+    reconcile_on as reconcile_notification_on,
+    register_listener_on as register_notification_listener_on,
 };
+pub(super) use source::{accept_on, bound_event, reject_unbound_v2_trigger, retained_payload};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionDomainOwner {
@@ -350,13 +350,27 @@ mod tests {
     fn completion_continuation_unknown_listener_is_not_a_response_only_waiver() {
         let (_dir, mut db, owner) = fixture();
         db.register_completion_event(CompletionEventRegistrationInput {
-            event_id: "legacy-unknown", delivery_mode: "sync", owner_session_id: Some("session"),
-            owner_invocation_uuid: Some("owner"), state_dir: "/offline", meta_path: "/offline/meta",
-            log_path: "/offline/log", rc_path: "/offline/rc",
-        }).unwrap();
-        assert_eq!(db.completion_notification_diagnostics("legacy-unknown").unwrap()[0]["disposition"], "unknown");
+            event_id: "legacy-unknown",
+            delivery_mode: "sync",
+            owner_session_id: Some("session"),
+            owner_invocation_uuid: Some("owner"),
+            state_dir: "/offline",
+            meta_path: "/offline/meta",
+            log_path: "/offline/log",
+            rc_path: "/offline/rc",
+        })
+        .unwrap();
+        assert_eq!(
+            db.completion_notification_diagnostics("legacy-unknown")
+                .unwrap()[0]["disposition"],
+            "unknown"
+        );
         assert!(!db.close_idle_continuation_generation(&owner, &[]).unwrap());
-        assert!(db.completion_event_listeners("legacy-unknown").unwrap()[0].acknowledged_at.is_none());
+        assert!(
+            db.completion_event_listeners("legacy-unknown").unwrap()[0]
+                .acknowledged_at
+                .is_none()
+        );
     }
 
     fn reservation(db: &mut MailboxDb, owner: &CompletionDomainOwner) -> ContinuationAttempt {
@@ -455,7 +469,10 @@ mod tests {
         let probe = MailboxDb::open_read_only(&path).unwrap();
         assert_eq!(probe.completion_continuation_domain().unwrap(), None);
         assert_eq!(
-            probe.conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(),
+            probe
+                .conn
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
             17
         );
         drop(probe);
@@ -483,13 +500,31 @@ mod tests {
             "SELECT claim_token,reason,auto_wake_count FROM session_wake_claim WHERE session_id='legacy-session'",
             [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).unwrap();
-        assert_eq!(claim, ("legacy-token".into(), "retained-before-upgrade".into(), 3));
-        assert_eq!(upgraded.conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 19);
+        assert_eq!(
+            claim,
+            ("legacy-token".into(), "retained-before-upgrade".into(), 3)
+        );
+        assert_eq!(
+            upgraded
+                .conn
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            19
+        );
         drop(upgraded);
 
         let reopened = MailboxDb::open_completion_continuation_domain(&path).unwrap();
-        assert_eq!(reopened.completion_continuation_domain().unwrap(), Some(domain));
-        assert!(reopened.wake_session_reader().wake_claim("legacy-session").unwrap().is_some());
+        assert_eq!(
+            reopened.completion_continuation_domain().unwrap(),
+            Some(domain)
+        );
+        assert!(
+            reopened
+                .wake_session_reader()
+                .wake_claim("legacy-session")
+                .unwrap()
+                .is_some()
+        );
     }
     #[test]
     fn source_recovery_population_and_exclusion_survive_repeated_owner_replacement() {
@@ -593,7 +628,10 @@ mod tests {
         tx.commit().unwrap();
         assert!(db.pending_continuation_attempts().unwrap().is_empty());
         assert!(
-            db.wake_session_reader().wake_claim("legacy-session").unwrap().is_some()
+            db.wake_session_reader()
+                .wake_claim("legacy-session")
+                .unwrap()
+                .is_some()
         );
     }
 

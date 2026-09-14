@@ -1476,8 +1476,14 @@ executable = "{}"
         )
         .unwrap_err();
         assert!(error.contains(LIVE_SESSION_IDENTITY_UNAVAILABLE), "{error}");
-        assert!(error.contains("does not establish effective native policy"), "{error}");
-        assert!(error.contains("do not bypass trust or adopt another store"), "{error}");
+        assert!(
+            error.contains("does not establish effective native policy"),
+            "{error}"
+        );
+        assert!(
+            error.contains("do not bypass trust or adopt another store"),
+            "{error}"
+        );
         let (_, _, status, session, capture) = invocation_row(&state_path);
         assert_eq!(status, "failed");
         assert_eq!(session, None);

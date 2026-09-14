@@ -37,7 +37,7 @@ use crate::executor::cli::spawn_identity::{
     SpawnIdentityContext, SpawnRuntimeMode, attach_captured_session_id, child_custody_test_fault,
     context_from_parent_invocation_env, exit_runtime_generation_outcome,
     mark_runtime_generation_orderly_completed, record_child_identity,
-    register_runtime_generation_starting,
+    register_runtime_generation_starting_diagnostic,
 };
 use crate::executor::cli::{prepare_return_channel, read_and_cleanup_return_channel};
 use crate::executor::{ExecutionOutputSpool, ExecutionResult, ExternalProviderSessionAuthority};
@@ -53,12 +53,18 @@ use oulipoly_provider::stream::{DecodedLaunchEvent, LaunchEventObserver, LaunchR
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
-struct LiveAttachmentFailure {
-    verified: VerifiedSessionAuthority,
-    cause: GenerationOperationError,
+enum LiveSessionFailure {
+    Attachment {
+        verified: VerifiedSessionAuthority,
+        cause: GenerationOperationError,
+    },
+    // Host-recorded rejection, never inferred from the provider transport string.
+    Publication {
+        cause: &'static str,
+    },
 }
 
-type RecordedAttachmentFailure = Arc<Mutex<Option<LiveAttachmentFailure>>>;
+type RecordedLiveSessionFailure = Arc<Mutex<Option<LiveSessionFailure>>>;
 
 type RecordedLaunchGeneration = Arc<Mutex<Option<Result<RunningRuntimeGeneration, String>>>>;
 
@@ -98,12 +104,16 @@ pub(super) fn attempt_account_dispatch(
     // Cover describe/policy as well as launch, including allocated attempts
     // whose Starting registration precedes registry preflight.
     let custody_identity = external_launch_spawn_identity_context(context);
+    if custody_identity.is_none()
+        && (context.mailbox_delivery_correlation.is_some()
+            || context.parent_invocation_env.is_some())
+    {
+        return Err(terminal_attempt_error(ServiceError::Dependency {
+            message: "headless execution requires valid runtime registration identity".into(),
+        }));
+    }
     if context.attempt.is_none() {
-        register_runtime_generation_starting(custody_identity.as_ref()).map_err(|_| {
-            terminal_attempt_error(protocol_service_error(
-                "runtime_generation_registration_failed",
-            ))
-        })?;
+        register_standalone_generation(custody_identity.as_ref())?;
     }
     let _custody_scope =
         crate::executor::cli::spawn_identity::launch_custody_scope(custody_identity.as_ref());
@@ -121,6 +131,31 @@ pub(super) fn attempt_account_dispatch(
     }
     result
 }
+
+fn register_standalone_generation(
+    context: Option<&SpawnIdentityContext>,
+) -> Result<(), AccountAttemptError> {
+    register_runtime_generation_starting_diagnostic(context).map_err(|error| {
+        let cause = error.cause;
+        let invocation = context
+            .and_then(|c| uuid::Uuid::parse_str(c.invocation_uuid()).ok())
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "unavailable".into());
+        terminal_attempt_error(ServiceError::Dependency {
+            message: format!(
+                "external provider protocol failed: runtime_generation_registration_failed; cause={cause:?}; invocation={invocation}"
+            ),
+        })
+    })
+}
+
+#[cfg(test)]
+#[path = "age360_registration_required_tests.rs"]
+mod age360_registration_required_tests;
+
+#[cfg(test)]
+#[path = "registration_tests.rs"]
+mod registration_tests;
 
 fn attempt_account_dispatch_with_custody(
     registry: &ProviderRegistry,
@@ -178,14 +213,17 @@ fn attempt_account_dispatch_with_custody(
     let recorded_generation = recorded_launch_generation();
     let spawn_observer =
         external_launch_spawn_observer(spawn_identity.as_ref(), Arc::clone(&recorded_generation));
-    let attachment_failure = Arc::new(Mutex::new(None));
+    let live_session_failure = Arc::new(Mutex::new(None));
     let launch_event_observer = external_launch_event_observer(
         output_spool.clone(),
-        Arc::clone(&attachment_failure),
+        Arc::clone(&live_session_failure),
         spawn_identity.clone(),
         Arc::clone(&recorded_generation),
         endpoint.account_name().to_string(),
         context.clone(),
+        endpoint.endpoint_identity().map_err(|_| {
+            terminal_attempt_error(protocol_service_error("endpoint_identity_unavailable"))
+        })?,
     );
     let client = registry
         .client_factory()
@@ -313,12 +351,12 @@ fn attempt_account_dispatch_with_custody(
                 &recorded_generation,
                 context.attempt.as_deref(),
             );
-            // The observer records verified typed custody before returning its transport error.
-            // Do not infer attachment failure from provider-controlled diagnostics.
-            let live_failure = attachment_failure
+            // Retain host-recorded publication/attachment failures independently of readiness.
+            // Never infer their classification from provider-controlled diagnostics.
+            let live_failure = live_session_failure
                 .lock()
-                .ok()
-                .and_then(|failure| failure.clone());
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             if let Some(failure) = live_failure {
                 output_spool.mark_incomplete();
                 let result = ExecutionResult {
@@ -341,13 +379,7 @@ fn attempt_account_dispatch_with_custody(
                     captured_child_invocations: Vec::new(),
                     returned_artifacts,
                 };
-                let mut result = failed_finalization_result(
-                    result,
-                    Some(&failure.verified),
-                    "runtime_generation_attach_failed",
-                    failure.cause,
-                    cleanup,
-                );
+                let mut result = failed_live_session_result(result, failure, cleanup);
                 let signal = result.terminal_signal.as_mut().expect("failure signal");
                 signal.provider_name = context.provider.name.clone();
                 signal.evidence.push_str(
@@ -518,33 +550,131 @@ fn external_launch_spawn_observer(
 
 fn external_launch_event_observer(
     output_spool: ExecutionOutputSpool,
-    attachment_failure: RecordedAttachmentFailure,
+    live_session_failure: RecordedLiveSessionFailure,
     spawn_identity: Option<SpawnIdentityContext>,
     recorded_generation: RecordedLaunchGeneration,
     observed_account_name: String,
     dispatch_context: ExternalProviderDispatchContext,
+    endpoint: oulipoly_state::ProviderLaunchEndpoint,
 ) -> Option<LaunchEventObserver> {
-    Some(LaunchEventObserver::new(move |event| {
+    Some(LaunchEventObserver::new(external_launch_event_callback(
+        output_spool,
+        live_session_failure,
+        spawn_identity,
+        recorded_generation,
+        observed_account_name,
+        dispatch_context,
+        endpoint,
+    )))
+}
+
+fn external_launch_event_callback(
+    output_spool: ExecutionOutputSpool,
+    live_session_failure: RecordedLiveSessionFailure,
+    spawn_identity: Option<SpawnIdentityContext>,
+    recorded_generation: RecordedLaunchGeneration,
+    observed_account_name: String,
+    dispatch_context: ExternalProviderDispatchContext,
+    endpoint: oulipoly_state::ProviderLaunchEndpoint,
+) -> impl Fn(&DecodedLaunchEvent) -> Result<(), String> + Send + Sync {
+    move |event| {
         if let Some(attempt) = &dispatch_context.attempt {
             attempt.observe(&dispatch_context, event)?;
         }
         observe_output(&output_spool, event)?;
+        // Allocated launches already publish through their lease owner above.
+        // Ordinary launches must commit State before advertising sidecar attachment.
+        if dispatch_context.attempt.is_none()
+            && spawn_identity.is_some()
+            && let Some(session) = provider_session_id_from_launch_event(event)
+        {
+            publish_or_record_live_session_failure(
+                &dispatch_context,
+                spawn_identity.as_ref().expect("ordinary launch identity"),
+                &endpoint,
+                &observed_account_name,
+                &session,
+                &live_session_failure,
+            )?;
+        }
         bind_external_launch_session_from_event(
             spawn_identity.as_ref(),
             &recorded_generation,
-            &attachment_failure,
+            &live_session_failure,
             &dispatch_context.provider.name,
             dispatch_context.start_known_provider_session_id.as_deref(),
             &observed_account_name,
             event,
         )
-    }))
+    }
+}
+
+fn publish_or_record_live_session_failure(
+    context: &ExternalProviderDispatchContext,
+    spawn: &SpawnIdentityContext,
+    endpoint: &oulipoly_state::ProviderLaunchEndpoint,
+    observed_account: &str,
+    session: &str,
+    failure: &RecordedLiveSessionFailure,
+) -> Result<(), String> {
+    let publication =
+        publish_live_session_authority(context, spawn, endpoint, observed_account, session);
+    if let Err(cause) = publication {
+        *failure.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(LiveSessionFailure::Publication { cause });
+    }
+    publication.map_err(str::to_string)
+}
+
+fn publish_live_session_authority(
+    context: &ExternalProviderDispatchContext,
+    spawn: &SpawnIdentityContext,
+    endpoint: &oulipoly_state::ProviderLaunchEndpoint,
+    observed_account: &str,
+    session: &str,
+) -> Result<(), &'static str> {
+    let Some(target) = &context.live_session_authority else {
+        // Unowned library dispatches cannot advertise authoritative live readiness.
+        return Err("live_session_authority_target_missing");
+    };
+    if target.invocation_uuid != spawn.invocation_uuid() {
+        return Err("live_session_authority_launch_identity_mismatch");
+    }
+    let state = oulipoly_state::StateDb::open(&target.state_path)
+        .map_err(|_| "live_session_authority_state_open_failed")?;
+    crate::session_authority::commit_session_authority(
+        crate::session_authority::SessionAuthorityCommitRequest {
+            state: &state,
+            invocation_row_id: target.invocation_row_id,
+            invocation_uuid: &target.invocation_uuid,
+            expectation: SessionAuthorityExpectation {
+                account_name: &context.provider.name,
+                provider_session_id: context.start_known_provider_session_id.as_deref(),
+            },
+            observation: Some(AuthoritativeSessionObservation {
+                account_name: observed_account,
+                provider_session_id: session,
+            }),
+            capture_method: "external_provider_launch",
+            provider_instance_id: &endpoint.provider_instance_id,
+            settings_id: &endpoint.settings_id,
+            resume_input_id: matches!(
+                context.start_known_provider_session_mode,
+                Some(crate::services::ProviderSessionStartMode::Resume)
+            )
+            .then(|| context.start_known_provider_session_id.clone())
+            .flatten(),
+            provider_session_resolved_account: None,
+        },
+    )
+    .map(|_| ())
+    .map_err(|e| e.protocol_kind())
 }
 
 fn bind_external_launch_session_from_event(
     context: Option<&SpawnIdentityContext>,
     recorded_generation: &RecordedLaunchGeneration,
-    attachment_failure: &RecordedAttachmentFailure,
+    live_session_failure: &RecordedLiveSessionFailure,
     account_name: &str,
     expected_provider_session_id: Option<&str>,
     observed_account_name: &str,
@@ -573,10 +703,10 @@ fn bind_external_launch_session_from_event(
     match attachment {
         Ok(_) => Ok(()),
         Err(cause) => {
-            *attachment_failure
+            *live_session_failure
                 .lock()
                 .map_err(|_| "attachment failure custody unavailable".to_string())? =
-                Some(LiveAttachmentFailure { verified, cause });
+                Some(LiveSessionFailure::Attachment { verified, cause });
             Err("runtime_generation_attach_failed".to_string())
         }
     }
@@ -653,6 +783,37 @@ fn backfill_external_launch_session_id(
     let generation = require_recorded_external_generation(recorded_generation)
         .map_err(|_| GenerationOperationError::MissingGeneration)?;
     attach_captured_session_id(context, Some(&generation), verified.provider_session_id())
+}
+
+fn failed_live_session_result(
+    mut result: ExecutionResult,
+    failure: LiveSessionFailure,
+    cleanup: Result<GenerationOperationOutcome, GenerationOperationError>,
+) -> ExecutionResult {
+    use crate::executor::terminal_signal::{TerminalSignal, TerminalSignalKind};
+    result.exit_code = -1;
+    match failure {
+        LiveSessionFailure::Attachment { verified, cause } => failed_finalization_result(
+            result,
+            Some(&verified),
+            "runtime_generation_attach_failed",
+            cause,
+            cleanup,
+        ),
+        LiveSessionFailure::Publication { cause } => {
+            let stage = "live_session_authority_publication_failed";
+            result.terminal_reason = Some(stage.into());
+            result.terminal_signal = Some(TerminalSignal {
+                kind: TerminalSignalKind::SpawnError,
+                provider_name: String::new(),
+                evidence: format!("{stage};cause={cause};cleanup={cleanup:?}"),
+                observed_at: std::time::SystemTime::now(),
+            });
+            // Evidence custody does not authenticate the rejected session or grant readiness.
+            result.session_capture.session_id = None;
+            result
+        }
+    }
 }
 
 fn failed_finalization_result(
@@ -951,8 +1112,16 @@ mod tests {
             )
             .is_err()
         );
-        let retained = failures.lock().unwrap().clone().unwrap();
-        assert_eq!(retained.cause, GenerationOperationError::MissingGeneration);
-        assert_eq!(retained.verified.provider_session_id(), "observed");
+        let LiveSessionFailure::Attachment { verified, cause } =
+            failures.lock().unwrap().clone().unwrap()
+        else {
+            panic!("verified attachment failure must retain its own classification");
+        };
+        assert_eq!(cause, GenerationOperationError::MissingGeneration);
+        assert_eq!(verified.provider_session_id(), "observed");
     }
 }
+
+#[cfg(test)]
+#[path = "live_binding_tests.rs"]
+mod live_binding_tests;

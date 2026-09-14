@@ -292,7 +292,8 @@ mod eof_tests {
     #[test]
     fn output_eof_does_not_spin_while_proxy_waits_for_descendant() {
         let root = tempfile::tempdir().unwrap();
-        let custody = oulipoly_core::launch_custody::LaunchCustody::start(root.path().join("proof")).unwrap();
+        let custody =
+            oulipoly_core::launch_custody::LaunchCustody::start(root.path().join("proof")).unwrap();
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "exec >/dev/null 2>&1; (n=0; while [ ! -f release ]; do n=$((n + 1)); [ $n -lt 500 ] || exit 75; /bin/sleep 0.01; done) & exit 7"])
             .current_dir(root.path()).env_clear()
@@ -302,16 +303,30 @@ mod eof_tests {
         let mut child = command.spawn().unwrap();
         drop(command);
         let drains = drain::start_child_drains(&mut child).unwrap();
-        assert!(matches!(drains.rx.recv_timeout(Duration::from_secs(2)), Err(mpsc::RecvTimeoutError::Disconnected)));
-        assert!(child.try_wait().unwrap().is_none(), "proxy must still own a live descendant");
+        assert!(matches!(
+            drains.rx.recv_timeout(Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "proxy must still own a live descendant"
+        );
         let start = Instant::now();
         for _ in 0..3 {
-            assert!(matches!(receive_with_poll_cadence(&drains.rx, SUPERVISOR_POLL_INTERVAL), Err(mpsc::RecvTimeoutError::Disconnected)));
+            assert!(matches!(
+                receive_with_poll_cadence(&drains.rx, SUPERVISOR_POLL_INTERVAL),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ));
         }
         assert!(start.elapsed() >= SUPERVISOR_POLL_INTERVAL * 3);
         std::fs::write(root.path().join("release"), b"").unwrap();
         assert_eq!(child.wait().unwrap().code(), Some(7));
-        drain::finish_child_drains(drains, &mut Vec::new(), &mut Vec::new(), &mut Instant::now());
+        drain::finish_child_drains(
+            drains,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Instant::now(),
+        );
         custody.seal();
     }
 
@@ -321,8 +336,10 @@ mod eof_tests {
         drop(tx);
         let start = Instant::now();
         for _ in 0..3 {
-            assert_eq!(receive_with_poll_cadence(&rx, SUPERVISOR_POLL_INTERVAL),
-                Err(mpsc::RecvTimeoutError::Disconnected));
+            assert_eq!(
+                receive_with_poll_cadence(&rx, SUPERVISOR_POLL_INTERVAL),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            );
         }
         assert!(start.elapsed() >= SUPERVISOR_POLL_INTERVAL * 3);
     }

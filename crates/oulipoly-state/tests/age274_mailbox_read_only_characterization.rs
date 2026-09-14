@@ -19,6 +19,8 @@ const SESSION: &str = "age274-read-only-session";
 const INVOCATION: &str = "11111111-1111-4111-8111-111111111111";
 const ATTEMPT: &str = "age274-historical-attempt";
 const CLAIM: &str = "age274-historical-claim";
+const GENERATION_SESSION: &str = "age274-generation-history";
+const GENERATION_INVOCATION: &str = "33333333-3333-4333-8333-333333333333";
 const GENERATION: &str = "22222222-2222-4222-8222-222222222222";
 
 struct Fixture {
@@ -68,6 +70,64 @@ impl Fixture {
                 .record_delivery_attempt_transport_ack(ATTEMPT)
                 .unwrap()
         );
+        // This test characterizes persisted read-only history, not execution.
+        // Keep the real no-owner refusal control before publishing relational
+        // owner facts through the production API. No physical drain is asserted.
+        let refused = mailbox
+            .wake_sessions()
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: SESSION,
+                claim_token: CLAIM,
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: Some(INVOCATION),
+                stale_after_seconds: 600,
+            })
+            .unwrap_err();
+        assert!(
+            refused.contains("completion_owner_unavailable"),
+            "{refused}"
+        );
+        let live =
+            oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+                .unwrap()
+                .unwrap();
+        let identity = oulipoly_state::completion_continuation::SourceProcessIdentity {
+            pid: live.os_pid,
+            boot_id: live.os_boot_id,
+            starttime_ticks: live.os_pid_starttime_ticks,
+        };
+        mailbox
+            .publish_completion_continuation_owner(
+                &oulipoly_state::mailbox::CompletionDomainOwner {
+                    protocol: oulipoly_state::completion_continuation::PROTOCOL.into(),
+                    domain_id: mailbox.completion_continuation_domain().unwrap().unwrap(),
+                    owner_generation: uuid::Uuid::new_v4().to_string(),
+                    guardian_identity: identity.clone(),
+                    driver_identity: identity,
+                    endpoint: "/fixture/no-native-service".into(),
+                },
+            )
+            .unwrap();
+        // Generation and wake history exercise independent reader surfaces.
+        // Use distinct actors/sessions: a Starting runtime correctly excludes a
+        // competing wake reservation for that same session. Neither is drained
+        // or falsely marked terminal just to make a read-only test pass.
+        let generation = RuntimeGenerationId::parse(GENERATION).unwrap();
+        mailbox
+            .runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation,
+                spawn_invocation_uuid: GENERATION_INVOCATION,
+                session_id: Some(GENERATION_SESSION),
+                runtime_mode: "headless",
+                provider_name: "provider-read-only",
+                model_name: Some("model-read-only"),
+                pty_control_path: None,
+                models_dir: Some("/models/read-only"),
+                effective_cwd: Some("/work/read-only"),
+            })
+            .unwrap();
         let claim = mailbox
             .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
@@ -80,21 +140,6 @@ impl Fixture {
             })
             .unwrap();
         assert!(matches!(claim, WakeClaimAcquireResult::Acquired(_)));
-        let generation = RuntimeGenerationId::parse(GENERATION).unwrap();
-        mailbox
-            .runtime_lifecycle()
-            .create_runtime_generation(CreateRuntimeGeneration {
-                generation_id: &generation,
-                spawn_invocation_uuid: INVOCATION,
-                session_id: Some(SESSION),
-                runtime_mode: "headless",
-                provider_name: "provider-read-only",
-                model_name: Some("model-read-only"),
-                pty_control_path: None,
-                models_dir: Some("/models/read-only"),
-                effective_cwd: Some("/work/read-only"),
-            })
-            .unwrap();
         mailbox
             .wake_sessions()
             .upsert_session_metadata(SessionMetadataUpsert {
@@ -163,8 +208,8 @@ fn mailbox_open_read_only_preserves_files_and_recovers_claim_and_attempt_history
         .runtime_generation(&RuntimeGenerationId::parse(GENERATION).unwrap())
         .unwrap()
         .unwrap();
-    assert_eq!(generation.spawn_invocation_uuid, INVOCATION);
-    assert_eq!(generation.session_id.as_deref(), Some(SESSION));
+    assert_eq!(generation.spawn_invocation_uuid, GENERATION_INVOCATION);
+    assert_eq!(generation.session_id.as_deref(), Some(GENERATION_SESSION));
     assert_eq!(generation.provider_name, "provider-read-only");
     let metadata = mailbox
         .wake_session_reader()

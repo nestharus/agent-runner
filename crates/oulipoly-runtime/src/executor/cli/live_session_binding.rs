@@ -160,9 +160,8 @@ impl LiveSessionBindingServer {
         self.worker = Some(thread::spawn(move || {
             // Thread-local provider custody must be explicitly transferred to
             // this generation-affiliated worker before session.capture spawns.
-            let _scope = crate::executor::cli::spawn_identity::launch_custody_scope(
-                Some(&spawn_context),
-            );
+            let _scope =
+                crate::executor::cli::spawn_identity::launch_custody_scope(Some(&spawn_context));
             serve_live_session_reports(
                 listener,
                 context,
@@ -613,9 +612,17 @@ mod tests {
             fixture.child.kill().unwrap();
             fixture.child.wait().unwrap();
             std::fs::write(fixture._temp.path().join("capture.block"), b"").unwrap();
-            std::fs::write(Path::new(&root).join("fixture"), fixture._temp.path().as_os_str().as_encoded_bytes()).unwrap();
-            let _ = report_live_session_binding(&fixture.server.socket_path, &fixture.server.token,
-                INVOCATION_UUID, SESSION_ID);
+            std::fs::write(
+                Path::new(&root).join("fixture"),
+                fixture._temp.path().as_os_str().as_encoded_bytes(),
+            )
+            .unwrap();
+            let _ = report_live_session_binding(
+                &fixture.server.socket_path,
+                &fixture.server.token,
+                INVOCATION_UUID,
+                SESSION_ID,
+            );
             panic!("capture creator was not crashed");
         }
         let root = tempfile::tempdir().unwrap();
@@ -627,7 +634,12 @@ mod tests {
         capture_eventually(|| fixture.join("capture.started").exists());
         let sidecar = MailboxDb::path_for_state_db(&fixture.join("state.db"));
         let proof_dir = sidecar.with_extension("starting-custody-v1");
-        let proof = std::fs::read_dir(proof_dir).unwrap().next().unwrap().unwrap().path();
+        let proof = std::fs::read_dir(proof_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         creator.kill().unwrap(); // Retain the creator zombie while checking proof.
         assert!(!oulipoly_core::launch_custody::is_quiescent(&proof));
         // Both the helper's execution marker and an unreaped dead creator are
@@ -644,7 +656,10 @@ mod tests {
     fn capture_eventually(mut predicate: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !predicate() {
-            assert!(std::time::Instant::now() < deadline, "capture fixture deadline");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "capture fixture deadline"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }

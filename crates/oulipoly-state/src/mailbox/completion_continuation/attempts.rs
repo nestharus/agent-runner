@@ -136,6 +136,15 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
         }
     }
     if request.operation == "activation" {
+        if super::super::session_admission_intent_on(
+            tx,
+            request
+                .session_id
+                .as_deref()
+                .ok_or("activation session missing")?,
+        )? {
+            return Err("activation deferred behind session admission intent".into());
+        }
         let claim: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2)", params![request.session_id,request.claim_token], |r| r.get(0)).map_err(|e| e.to_string())?;
         if !claim {
             return Err("activation requires exact current wake claim".into());
@@ -410,14 +419,19 @@ pub(in crate::mailbox) fn bind_generation_on(
     tx: &Transaction<'_>,
     request: CreateRuntimeGeneration<'_>,
     creator: &ProcessIdentity,
-) -> Result<(), String> {
-    if domain_on(tx)?.is_none() {
+) -> Result<(), super::super::GenerationStorageError> {
+    use super::super::{GenerationStorageDiagnostic, GenerationStorageError};
+    let storage = |message: String| {
+        GenerationStorageError::new(message)
+            .with_diagnostic(GenerationStorageDiagnostic::NativeActivationBinding)
+    };
+    if domain_on(tx).map_err(storage)?.is_none() {
         return Ok(());
     }
     let Some(session) = request.session_id else {
         return Ok(());
     };
-    let active:Option<(String,Option<String>,Option<String>)>=tx.query_row("SELECT attempt_id,launcher_identity,runtime_generation_uuid FROM completion_continuation_attempt WHERE session_id=?1 AND operation='activation' AND phase NOT IN ('drained','never_started')",[session],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
+    let active:Option<(String,Option<String>,Option<String>)>=tx.query_row("SELECT attempt_id,launcher_identity,runtime_generation_uuid FROM completion_continuation_attempt WHERE session_id=?1 AND operation='activation' AND phase NOT IN ('drained','never_started')",[session],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|storage(e.to_string()))?;
     let Some((attempt, launcher, generation)) = active else {
         return Ok(());
     };
@@ -426,17 +440,18 @@ pub(in crate::mailbox) fn bind_generation_on(
         boot_id: creator.os_boot_id.clone(),
         starttime_ticks: creator.os_pid_starttime_ticks,
     })
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| storage(e.to_string()))?;
     if launcher.as_deref() != Some(&identity)
         || generation
             .as_ref()
             .is_some_and(|id| *id != request.generation_id.to_string())
     {
-        return Err(
+        return Err(GenerationStorageError::new(
             "runtime creation conflicts with current session activation reservation".into(),
-        );
+        )
+        .with_diagnostic(GenerationStorageDiagnostic::NativeActivationConflict));
     }
-    tx.execute("UPDATE completion_continuation_attempt SET spawn_invocation_uuid=?2,runtime_generation_uuid=?3,revision=revision+1 WHERE attempt_id=?1",params![attempt,request.spawn_invocation_uuid,request.generation_id.to_string()]).map_err(|e|e.to_string())?;
+    tx.execute("UPDATE completion_continuation_attempt SET spawn_invocation_uuid=?2,runtime_generation_uuid=?3,revision=revision+1 WHERE attempt_id=?1",params![attempt,request.spawn_invocation_uuid,request.generation_id.to_string()]).map_err(|e|storage(e.to_string()))?;
     Ok(())
 }
 

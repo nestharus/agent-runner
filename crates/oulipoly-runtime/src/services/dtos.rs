@@ -320,6 +320,15 @@ pub struct MailboxDeliveryCorrelation {
     pub delivery_nonce: String,
 }
 
+/// Launch-owned identity, supplied by the invocation lifecycle, never decoded
+/// from provider environment or listener metadata.
+#[derive(Debug, Clone)]
+pub struct LiveSessionAuthorityTarget {
+    pub state_path: PathBuf,
+    pub invocation_row_id: i64,
+    pub invocation_uuid: String,
+}
+
 #[derive(Clone)]
 #[allow(
     clippy::large_enum_variant,

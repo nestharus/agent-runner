@@ -116,6 +116,8 @@ pub(super) fn reconcile_pending_headless_delivery_observations(
         if let Err(error) =
             crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
                 attempt_id: pending.attempt_id,
+                admission_purpose:
+                    crate::native_receipt::helper::AdmissionPurpose::StartupOpportunistic,
                 anchor_identity: crate::native_receipt::helper::anchor_identity(&pending.anchor),
                 model_name: resolved.model_name.clone().unwrap_or_default(),
                 cwd: effective_cwd.to_path_buf(),
@@ -203,26 +205,6 @@ pub(super) fn bind_headless_resume_delivery_attempt(
         )?;
     }
     persist_pre_delivery_observation_anchor(input, provider)
-}
-
-pub(super) fn begin_headless_delivery_submission(
-    input: &ResumeAttemptInput<'_>,
-    invocation_uuid: &str,
-) -> Result<(), String> {
-    if input.mailbox_delivery_seqs.is_empty() {
-        return Ok(());
-    }
-    let attempt_id = input
-        .mailbox_delivery_nonce
-        .ok_or_else(|| "headless delivery missing nonce".to_string())?;
-    let db = MailboxDb::open_default_if_exists()?
-        .ok_or_else(|| "headless delivery sidecar missing".to_string())?;
-    db.begin_headless_delivery_submission(
-        attempt_id,
-        input.mailbox_session_id,
-        invocation_uuid,
-        input.mailbox_delivery_requires_turn_confirmation,
-    )
 }
 
 fn persist_pre_delivery_observation_anchor(
@@ -494,13 +476,15 @@ fn confirm_mailbox_delivery_from_anchor(
         return Ok(false);
     }
     drop(db);
-    let observation = crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
-        attempt_id: attempt_id.to_string(),
-        anchor_identity: crate::native_receipt::helper::anchor_identity(&anchor),
-        model_name: input.resolved.model_name.clone().unwrap_or_default(),
-        cwd: input.effective_spawn_cwd.to_path_buf(),
-        config_root: input.env.config_root.clone(),
-    });
+    let observation =
+        crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
+            attempt_id: attempt_id.to_string(),
+            admission_purpose: crate::native_receipt::helper::AdmissionPurpose::TerminalBounded,
+            anchor_identity: crate::native_receipt::helper::anchor_identity(&anchor),
+            model_name: input.resolved.model_name.clone().unwrap_or_default(),
+            cwd: input.effective_spawn_cwd.to_path_buf(),
+            config_root: input.env.config_root.clone(),
+        });
     // Projection or helper teardown may fail after the exact native receipt
     // commits. Always read back that independent evidence before interpreting
     // the operational error; helper completion alone never confirms delivery.
@@ -512,7 +496,9 @@ fn confirm_mailbox_delivery_from_anchor(
         if !confirmed {
             return Err(error);
         }
-        formatter::emit_stderr(&format!("Warning: receipt confirmed with observation/projection error: {error}"));
+        formatter::emit_stderr(&format!(
+            "Warning: receipt confirmed with observation/projection error: {error}"
+        ));
     }
     Ok(confirmed)
 }
@@ -698,11 +684,16 @@ pub(super) fn settle_clean_exit_mailbox_delivery_outcome(
     // boundary (Unconfirmed). It has the same delivery/follow-up authority as
     // synchronous confirmation, never authority to turn a shell failure into
     // successful assistant completion. Keep the shell result unchanged.
-    if matches!(outcome, MailboxDeliveryOutcome::AlreadySettled | MailboxDeliveryOutcome::Unconfirmed)
-        && committed_native_receipt(input)?
+    if matches!(
+        outcome,
+        MailboxDeliveryOutcome::AlreadySettled | MailboxDeliveryOutcome::Unconfirmed
+    ) && committed_native_receipt(input)?
     {
         return settle_accepted_mailbox_delivery_and_recheck(
-            input, provider_session_id, invocation_uuid, physical_exit_code,
+            input,
+            provider_session_id,
+            invocation_uuid,
+            physical_exit_code,
         );
     }
     match outcome {

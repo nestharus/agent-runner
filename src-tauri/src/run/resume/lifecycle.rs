@@ -44,12 +44,23 @@ pub(super) struct BoundResumeAttempt<'state> {
     pub(super) invocation_env: String,
 }
 
+#[cfg(test)]
 pub(super) fn setup_bound_resume_attempt<'state>(
     input: &ResumeAttemptInput<'state>,
     provider: &oulipoly_config::ProviderConfig,
     provider_index: usize,
 ) -> Result<BoundResumeAttempt<'state>, String> {
-    let attempt = start_resume_invocation(input, provider, provider_index)?;
+    let id = super::composite_invocation_id(&provider.name, input.reservation);
+    setup_bound_resume_attempt_with_identity(input, provider, provider_index, &id.id)
+}
+
+pub(super) fn setup_bound_resume_attempt_with_identity<'state>(
+    input: &ResumeAttemptInput<'state>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_index: usize,
+    registration_identity: &str,
+) -> Result<BoundResumeAttempt<'state>, String> {
+    let attempt = start_resume_invocation(input, provider, provider_index, registration_identity)?;
     let provider_session_id = input.resolved.active_session_id.clone();
     bind_resume_attempt_session(
         input,
@@ -87,8 +98,12 @@ fn start_resume_invocation<'state>(
     input: &ResumeAttemptInput<'state>,
     provider: &oulipoly_config::ProviderConfig,
     provider_index: usize,
+    registration_identity: &str,
 ) -> Result<ResumeInvocationAttempt<'state>, String> {
-    let invocation = super::composite_invocation_id(&provider.name, input.reservation);
+    let invocation = oulipoly_state::CompositeInvocationId {
+        source: provider.name.clone(),
+        id: registration_identity.to_string(),
+    };
     if (input.reservation.is_some() || crate::wake_coordinator::is_auto_wake_invocation())
         && input
             .agent_runtime_services

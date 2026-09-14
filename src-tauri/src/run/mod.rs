@@ -16,6 +16,7 @@
 //!       - run_repl and run_resume public re-exports
 //! ```
 
+mod authority_rejection;
 pub(crate) mod balancing;
 pub(crate) mod continuation_artifact;
 pub(crate) mod continuation_command;

@@ -11,7 +11,15 @@ mod wake_coordinator;
 #[path = "../src/wiring.rs"]
 mod wiring;
 
-use agent_runner_lib::completion_owner;
+mod completion_owner {
+    pub(crate) use agent_runner_lib::completion_owner::*;
+    pub(crate) mod test_support {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/completion_owner/test_support.rs"
+        ));
+    }
+}
 
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, MailboxDb,
@@ -164,6 +172,7 @@ fn notify_wake_preserves_generation_and_live_claim_authority() {
     let _env_snapshot = EnvSnapshot::capture();
     let generation_fixture = Fixture::new();
     let mut generation_db = generation_fixture.mailbox();
+    completion_owner::test_support::install_owner(&mut generation_db);
     generation_fixture.seed_pending(&mut generation_db, "h-generation");
     let generation_id = RuntimeGenerationId::parse("22222222-2222-4222-8222-222222222222").unwrap();
     generation_db
@@ -205,6 +214,7 @@ fn notify_wake_preserves_generation_and_live_claim_authority() {
 
     let claim_fixture = Fixture::new();
     let mut claim_db = claim_fixture.mailbox();
+    completion_owner::test_support::install_owner(&mut claim_db);
     claim_fixture.seed_pending(&mut claim_db, "h-claim");
     claim_fixture.seed_runtime(&mut claim_db, 0);
     let claim_token = "acr329-live-claim";

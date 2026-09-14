@@ -11,6 +11,8 @@ mod live_census;
 #[path = "fixtures/age360/paired_faults.rs"]
 mod paired_faults;
 mod provider_authority_fixture;
+#[path = "fixtures/age360/rejection.rs"]
+mod rejection;
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::read_live_process_identity;
 use std::fs;
@@ -2206,4 +2208,160 @@ fn legacy_mailbox_service(retained_claim: bool) {
         "legacy servicing: retained_claim={retained_claim} exact native attempt={} ACK and original physical drain",
         attempt.attempt_id
     );
+}
+
+/// Hold a real retiring driver's physical lifetime, rather than delaying the
+/// caller or relying on a naturally occurring hello/close race.
+#[test]
+fn native_retiring_owner_admits_first_sequential_fresh_and_resume_after_drain() {
+    if private_case(false) {
+        return;
+    }
+    for resume in [false, true] {
+        let f = Fixture::new("owner_only");
+        // Instrument only this private generated provider, not product code.
+        let provider = f.root.path().join("provider.py");
+        let source = fs::read_to_string(&provider).unwrap();
+        fs::write(&provider, source.replace("def launch(request):", "def launch(request):\n    with pathlib.Path(__file__).parent.joinpath('boundary-provider-effects').open('a') as effects:\n        effects.write(request['request_id'] + '\\n')")).unwrap();
+        let effect_count = || {
+            fs::read_to_string(f.root.path().join("boundary-provider-effects"))
+                .unwrap()
+                .lines()
+                .count()
+        };
+        let mut initial = f.start_with_hold(true);
+        let owner = f.owner();
+        wait(|| {
+            f.root
+                .path()
+                .join("provider-initial-ready")
+                .exists()
+                .then_some(())
+        });
+        assert!(current_identity_matches(&owner.driver_identity));
+        assert_eq!(
+            unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGSTOP) },
+            0
+        );
+        // Observe the actual stopped driver before releasing the original
+        // context. It cannot disappear before we exercise closing admission.
+        wait(|| {
+            let stat =
+                fs::read_to_string(format!("/proc/{}/stat", owner.driver_identity.pid)).ok()?;
+            (stat.rsplit_once(')')?.1.split_whitespace().next()? == "T").then_some(())
+        });
+        f.gate("release-initial-provider");
+        f.wait_initial(&mut initial);
+        wait(|| {
+            let phase: String = f
+                .sidecar_connection()
+                .query_row(
+                    "SELECT phase FROM completion_continuation_owner WHERE generation=?1",
+                    [&owner.owner_generation],
+                    |r| r.get(0),
+                )
+                .ok()?;
+            (phase == "closing").then_some(())
+        });
+        f.gate("release-resume");
+        let mut command = f.command();
+        if resume {
+            command.args([
+                "resume",
+                "--session-id",
+                SESSION,
+                "--prompt",
+                "first sequential launch across retirement",
+            ]);
+        } else {
+            command.args(["-m", MODEL, "first sequential launch across retirement"]);
+        }
+        let mut incoming = command
+            .arg("--models-dir")
+            .arg(&f.models)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let gate_path = PathBuf::from(&owner.endpoint).with_file_name("admission.lock");
+        wait(|| {
+            assert!(
+                incoming.try_wait().unwrap().is_none(),
+                "first entry failed during retirement"
+            );
+            let syscall = fs::read_to_string(format!("/proc/{}/syscall", incoming.id())).ok()?;
+            let mut fields = syscall.split_whitespace();
+            if fields.next()?.parse::<i64>().ok()? != libc::SYS_flock {
+                return None;
+            }
+            let fd = i32::from_str_radix(fields.next()?.trim_start_matches("0x"), 16).ok()?;
+            (fs::read_link(format!("/proc/{}/fd/{fd}", incoming.id())).ok()? == gate_path)
+                .then_some(())
+        });
+        assert!(current_identity_matches(&owner.driver_identity));
+        // No new generation or provider effects while old physical custody is
+        // held. The resumed provider records every execution in this fixture.
+        assert!(
+            f.mailbox()
+                .completion_continuation_owner()
+                .unwrap()
+                .is_none()
+        );
+        assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+        assert_eq!(
+            effect_count(),
+            1,
+            "no provider effect before physical drain"
+        );
+        println!(
+            "resume={resume} closing generation={} entrant={} blocked_on=admission.lock driver=stopped",
+            owner.owner_generation,
+            incoming.id()
+        );
+        assert_eq!(
+            unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGCONT) },
+            0
+        );
+        let output = incoming.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            if resume {
+                b"native resumed\n".as_slice()
+            } else {
+                b"native initial\n".as_slice()
+            }
+        );
+        assert_eq!(
+            effect_count(),
+            2,
+            "accepted entry executes its provider exactly once"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|line| line.starts_with("OULIPOLY_RESULT="))
+                .count(),
+            1
+        );
+        if resume {
+            assert_eq!(
+                fs::read_to_string(f.root.path().join("resume-prompts.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            !current_identity_matches(&owner.driver_identity),
+            "old driver must actually be reaped before admission"
+        );
+        println!(
+            "resume={resume} first_entry=success old_driver=reaped output_bytes={}",
+            output.stdout.len()
+        );
+    }
 }

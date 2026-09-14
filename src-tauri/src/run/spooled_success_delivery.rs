@@ -53,12 +53,16 @@ pub(super) fn settle<F>(state: &StateDb, invocation_row_id: i64, spooled: bool, 
 where
     F: FnOnce() -> std::io::Result<()>,
 {
+    // Keep the live caller's retained owner for every output mutation. This is
+    // not inferred from persisted rows: standalone callers have no retained
+    // lease, and State revalidates allocated fences in each writer transaction.
+    let scope = state.invocation_mutation_scope(invocation_row_id);
     // Persist the conservative terminal state before any bytes escape. If the
     // post-control delivered write fails, retained output stays explicitly failed
     // without a settled/pending row contradicting the nonzero process exit.
     if spooled
         && let Err(error) = state.mark_invocation_output_delivery_failed(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            scope.authority(),
             invocation_row_id,
             "delivery_confirmation",
             "unconfirmed",
@@ -74,7 +78,7 @@ where
     let delivery = delivery();
     if let Err(error) = delivery {
         if let Err(state_error) = state.mark_invocation_output_delivery_failed(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            scope.authority(),
             invocation_row_id,
             "payload_or_control",
             &format!("{:?}", error.kind()),
@@ -89,10 +93,8 @@ where
     }
 
     if spooled
-        && let Err(error) = state.mark_invocation_output_delivered(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
-            invocation_row_id,
-        )
+        && let Err(error) =
+            state.mark_invocation_output_delivered(scope.authority(), invocation_row_id)
     {
         emit_diagnostic(&format!(
             "failed to record provider output delivery: {error}"
@@ -106,3 +108,7 @@ where
 fn emit_diagnostic(message: &str) {
     let _ = writeln!(std::io::stderr().lock(), "{message}");
 }
+
+#[cfg(test)]
+#[path = "spooled_success_delivery_tests.rs"]
+mod tests;

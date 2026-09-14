@@ -34,6 +34,7 @@ pub(crate) struct ExternalProviderDispatchContext {
     pub(crate) start_known_provider_session_mode: Option<ProviderSessionStartMode>,
     pub(crate) mailbox_delivery_correlation: Option<MailboxDeliveryCorrelation>,
     pub(crate) settings_id: String,
+    pub(crate) live_session_authority: Option<crate::services::LiveSessionAuthorityTarget>,
     pub(crate) attempt: Option<std::sync::Arc<super::attempt::AttemptExecution>>,
 }
 
@@ -70,6 +71,7 @@ impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
             mailbox_delivery_correlation: input.mailbox_delivery_correlation,
             settings_id: String::new(),
             attempt: None,
+            live_session_authority: None,
         }
     }
 }

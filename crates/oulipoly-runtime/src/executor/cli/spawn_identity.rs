@@ -8,15 +8,15 @@
 //!   payload threaded through executor launches.
 
 use oulipoly_state::CompositeInvocationId;
-#[cfg(test)]
-use oulipoly_state::mailbox::{ExactProcessEvidence, RuntimeLifecycleState};
 use oulipoly_state::mailbox::{
     AdvanceRuntimeGenerationDrain, AttachRuntimeGenerationSession, BindRuntimeGenerationRunning,
-    CreateRuntimeGeneration, DrainAdvanceResult, DrainHandoff, DrainRequestId,
-    DrainRequestResult, ExitRuntimeGenerationNonOrderly, FinishRuntimeGenerationDrain,
-    GenerationMutation, MailboxDb, RequestRuntimeGenerationDrain, RuntimeGenerationFence,
-    RuntimeGenerationId, RuntimeTerminalReason,
+    CreateRuntimeGeneration, DrainAdvanceResult, DrainHandoff, DrainRequestId, DrainRequestResult,
+    ExitRuntimeGenerationNonOrderly, FinishRuntimeGenerationDrain, GenerationMutation, MailboxDb,
+    RequestRuntimeGenerationDrain, RuntimeGenerationFence, RuntimeGenerationId,
+    RuntimeTerminalReason,
 };
+#[cfg(test)]
+use oulipoly_state::mailbox::{ExactProcessEvidence, RuntimeLifecycleState};
 use oulipoly_state::pid_identity::{self, ProcessIdentity};
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -44,7 +44,9 @@ impl SpawnRuntimeMode {
 pub(crate) struct SpawnIdentityContext {
     pub(super) generation_id: RuntimeGenerationId,
     pub(super) native_exit_journal: Option<PathBuf>,
-    launch_custody: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<oulipoly_core::launch_custody::LaunchCustody>>>,
+    launch_custody: std::sync::Arc<
+        std::sync::OnceLock<std::sync::Arc<oulipoly_core::launch_custody::LaunchCustody>>,
+    >,
     pub(super) invocation_uuid: String,
     provider_name: String,
     model_name: Option<String>,
@@ -91,7 +93,7 @@ impl SpawnIdentityContext {
         self
     }
 
-    pub(super) fn invocation_uuid(&self) -> &str {
+    pub(crate) fn invocation_uuid(&self) -> &str {
         &self.invocation_uuid
     }
 
@@ -218,7 +220,7 @@ fn spawn_identity_context_from_invocation(
 }
 
 impl SpawnIdentityContext {
-    pub(super) fn with_mailbox_db_path(mut self, path: PathBuf) -> Self {
+    pub(crate) fn with_mailbox_db_path(mut self, path: PathBuf) -> Self {
         self.mailbox_db_path = Some(path);
         self
     }
@@ -423,8 +425,16 @@ fn exact_generation_exit_pending(child: &Child) -> std::io::Result<bool> {
 // Private process-test barrier, following the existing custody fault convention.
 // No timeout constitutes proof: expiry is a launch error, never a release.
 fn starting_custody_test_barrier(site: &str) -> Result<(), String> {
-    if std::env::var("OULIPOLY_STARTING_CUSTODY_TEST_BARRIER").ok().as_deref() != Some(site) { return Ok(()); }
-    let Some(path) = std::env::var_os("OULIPOLY_STARTING_CUSTODY_TEST_READY") else { return Err("missing custody barrier path".into()); };
+    if std::env::var("OULIPOLY_STARTING_CUSTODY_TEST_BARRIER")
+        .ok()
+        .as_deref()
+        != Some(site)
+    {
+        return Ok(());
+    }
+    let Some(path) = std::env::var_os("OULIPOLY_STARTING_CUSTODY_TEST_READY") else {
+        return Err("missing custody barrier path".into());
+    };
     std::fs::write(path, site).map_err(|e| e.to_string())?;
     std::thread::sleep(Duration::from_secs(10));
     Err(format!("starting custody barrier expired: {site}"))
@@ -456,13 +466,54 @@ fn wait_for_child_custody_test_ready() -> Result<(), String> {
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RegistrationCause {
+    StorageOpen,
+    Recovery,
+    CustodyStart,
+    CustodyInitialization,
+    Creation(oulipoly_state::mailbox::GenerationStorageDiagnostic),
+    AlreadyExists,
+    Rejected(oulipoly_state::mailbox::GenerationRejection),
+    StartingBarrier,
+    SubmissionFence,
+}
+
+/// Retain legacy local error text for existing callers; only `cause` crosses
+/// the bounded external-provider diagnostic boundary.
+#[derive(Debug)]
+pub(crate) struct RegistrationError {
+    pub(crate) cause: RegistrationCause,
+    message: String,
+}
+
+impl RegistrationError {
+    fn new(cause: RegistrationCause, message: String) -> Self {
+        Self { cause, message }
+    }
+}
+
+impl std::fmt::Display for RegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+pub(crate) fn register_runtime_generation_starting_diagnostic(
+    context: Option<&SpawnIdentityContext>,
+) -> Result<(), RegistrationError> {
+    context.map_or(Ok(()), |context| {
+        register_generation_starting(context, false)
+    })
+}
+
 pub(crate) fn register_runtime_generation_starting(
     context: Option<&SpawnIdentityContext>,
 ) -> Result<(), String> {
     let Some(context) = context else {
         return Ok(());
     };
-    register_generation_starting(context, false)
+    register_generation_starting(context, false).map_err(|e| e.to_string())
 }
 
 /// Allocation is single-use execution authority. Existing rows are evidence for
@@ -470,53 +521,108 @@ pub(crate) fn register_runtime_generation_starting(
 pub(crate) fn register_allocated_runtime_generation_starting(
     context: &SpawnIdentityContext,
 ) -> Result<(), String> {
-    register_generation_starting(context, true)
+    register_generation_starting(context, true).map_err(|e| e.to_string())
 }
 
 fn register_generation_starting(
     context: &SpawnIdentityContext,
     fresh_only: bool,
-) -> Result<(), String> {
-    let mut db = context.open_mailbox()?;
-    recover_stale_session_generations(&mut db, context)?;
+) -> Result<(), RegistrationError> {
+    let mut db = context
+        .open_mailbox()
+        .map_err(|e| RegistrationError::new(RegistrationCause::StorageOpen, e))?;
+    recover_stale_session_generations(&mut db, context)
+        .map_err(|e| RegistrationError::new(RegistrationCause::Recovery, e))?;
     // The monitor is ready before Starting can grant any spawn authority.
     #[cfg(target_os = "linux")]
     if context.launch_custody.get().is_none() {
-        let path = oulipoly_core::launch_custody::proof_path(db.path(), &context.generation_id.to_string());
-        let custody = oulipoly_core::launch_custody::LaunchCustody::start(path)
-            .map_err(|e| format!("starting custody unavailable: {e}"))?;
-        context.launch_custody.set(std::sync::Arc::new(custody))
-            .map_err(|_| "concurrent starting custody initialization".to_string())?;
+        let path = oulipoly_core::launch_custody::proof_path(
+            db.path(),
+            &context.generation_id.to_string(),
+        );
+        let custody = oulipoly_core::launch_custody::LaunchCustody::start(path).map_err(|e| {
+            RegistrationError::new(
+                RegistrationCause::CustodyStart,
+                format!("starting custody unavailable: {e}"),
+            )
+        })?;
+        context
+            .launch_custody
+            .set(std::sync::Arc::new(custody))
+            .map_err(|_| {
+                RegistrationError::new(
+                    RegistrationCause::CustodyInitialization,
+                    "concurrent starting custody initialization".into(),
+                )
+            })?;
     }
     #[cfg(target_os = "linux")]
-    let proof_path = Some(oulipoly_core::launch_custody::proof_path(db.path(), &context.generation_id.to_string()));
+    let proof_path = Some(oulipoly_core::launch_custody::proof_path(
+        db.path(),
+        &context.generation_id.to_string(),
+    ));
     #[cfg(not(target_os = "linux"))]
     let proof_path: Option<PathBuf> = None;
     let mutation = db
         .runtime_lifecycle()
-        .create_runtime_generation_with_custody(CreateRuntimeGeneration {
-            generation_id: &context.generation_id,
-            spawn_invocation_uuid: &context.invocation_uuid,
-            session_id: context.session_id.as_deref(),
-            runtime_mode: context.mode.as_str(),
-            provider_name: &context.provider_name,
-            model_name: context.model_name.as_deref(),
-            pty_control_path: context.pty_control_path.as_deref(),
-            models_dir: context.models_dir.as_deref(),
-            effective_cwd: context.effective_cwd.as_deref(),
-        }, proof_path.as_deref())
-        .map_err(|err| err.to_string())?;
+        .create_runtime_generation_with_custody(
+            CreateRuntimeGeneration {
+                generation_id: &context.generation_id,
+                spawn_invocation_uuid: &context.invocation_uuid,
+                session_id: context.session_id.as_deref(),
+                runtime_mode: context.mode.as_str(),
+                provider_name: &context.provider_name,
+                model_name: context.model_name.as_deref(),
+                pty_control_path: context.pty_control_path.as_deref(),
+                models_dir: context.models_dir.as_deref(),
+                effective_cwd: context.effective_cwd.as_deref(),
+            },
+            proof_path.as_deref(),
+        )
+        .map_err(|err| {
+            RegistrationError::new(
+                RegistrationCause::Creation(err.diagnostic()),
+                err.to_string(),
+            )
+        })?;
+    if matches!(mutation, GenerationMutation::AlreadyApplied(_))
+        && db
+            .has_headless_submission_for_invocation(&context.invocation_uuid)
+            .map_err(|e| RegistrationError::new(RegistrationCause::SubmissionFence, e))?
+    {
+        // A competing/repeated call owns no right to finalize the earlier
+        // generation or to cross its submission boundary a second time.
+        return Err(RegistrationError::new(
+            RegistrationCause::AlreadyExists,
+            "headless_runtime_generation_already_exists".into(),
+        ));
+    }
+    let submission = if matches!(mutation, GenerationMutation::Applied(_)) {
+        db.begin_registered_headless_submission(
+            &context.generation_id,
+            &context.invocation_uuid,
+            context.session_id.as_deref(),
+        )
+    } else {
+        Ok(())
+    };
     // Release the sidecar authority fence before any error finalizer reopens it.
     drop(db);
+    finalize_starting_error(submission, Some(context))
+        .map_err(|e| RegistrationError::new(RegistrationCause::SubmissionFence, e))?;
     match mutation {
-        GenerationMutation::Applied(_) => finalize_starting_error(
-            starting_custody_test_barrier("before_spawn"), Some(context)),
-        GenerationMutation::AlreadyApplied(_) if !fresh_only => Ok(()),
-        GenerationMutation::AlreadyApplied(_) => {
-            Err("allocated_runtime_generation_already_exists".into())
+        GenerationMutation::Applied(_) => {
+            finalize_starting_error(starting_custody_test_barrier("before_spawn"), Some(context))
+                .map_err(|e| RegistrationError::new(RegistrationCause::StartingBarrier, e))
         }
-        GenerationMutation::Rejected(rejection) => Err(format!(
-            "Runtime generation starting registration rejected: {rejection:?}"
+        GenerationMutation::AlreadyApplied(_) if !fresh_only => Ok(()),
+        GenerationMutation::AlreadyApplied(_) => Err(RegistrationError::new(
+            RegistrationCause::AlreadyExists,
+            "allocated_runtime_generation_already_exists".into(),
+        )),
+        GenerationMutation::Rejected(rejection) => Err(RegistrationError::new(
+            RegistrationCause::Rejected(rejection.clone()),
+            format!("Runtime generation starting registration rejected: {rejection:?}"),
         )),
     }
 }
@@ -548,8 +654,12 @@ fn configure_registered_custody(
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     if let Some(context) = context {
-        context.launch_custody.get().ok_or("starting custody not registered")?
-            .configure(command).map_err(|e| e.to_string())?;
+        context
+            .launch_custody
+            .get()
+            .ok_or("starting custody not registered")?
+            .configure(command)
+            .map_err(|e| e.to_string())?;
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (command, context); // Preserve native launch behavior, without Linux custody.
@@ -564,7 +674,9 @@ fn finalize_starting_error(
         Ok(()) => Ok(()),
         Err(error) => match mark_runtime_generation_spawn_failed(context) {
             Ok(()) => Err(error),
-            Err(finalization) => Err(format!("{error}; Starting finalization failed: {finalization}")),
+            Err(finalization) => Err(format!(
+                "{error}; Starting finalization failed: {finalization}"
+            )),
         },
     }
 }
@@ -740,11 +852,15 @@ pub(crate) fn mark_runtime_generation_exited(
 }
 
 fn seal_launch_custody(context: &SpawnIdentityContext) -> Result<(), GenerationOperationError> {
-    let Some(custody) = context.launch_custody.get() else { return Ok(()); };
+    let Some(custody) = context.launch_custody.get() else {
+        return Ok(());
+    };
     custody.seal();
     let deadline = Instant::now() + Duration::from_secs(2);
     while !custody.quiescent() {
-        if Instant::now() >= deadline { return Err(GenerationOperationError::Unknown); }
+        if Instant::now() >= deadline {
+            return Err(GenerationOperationError::Unknown);
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
     Ok(())
@@ -909,12 +1025,25 @@ fn parse_invocation_env_silent(value: &str) -> Option<CompositeInvocationId> {
 }
 
 #[cfg(test)]
+pub(crate) fn live_binding_test_fixture(
+    path: &Path,
+) -> (SpawnIdentityContext, RunningRuntimeGeneration) {
+    tests::attachment_fixture(path)
+}
+
+#[cfg(test)]
+#[path = "age360_submission_boundary_tests.rs"]
+mod age360_submission_boundary_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     const CURRENT: &str = r#"{"source":"opencode3","id":"11111111-1111-4111-8111-111111111111"}"#;
 
-    fn attachment_fixture(path: &Path) -> (SpawnIdentityContext, RunningRuntimeGeneration) {
+    pub(super) fn attachment_fixture(
+        path: &Path,
+    ) -> (SpawnIdentityContext, RunningRuntimeGeneration) {
         let context = context_from_parent_invocation_env(
             Some(CURRENT),
             "fixture",
@@ -952,14 +1081,34 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pid-identity.db");
-        let context = context_from_parent_invocation_env(Some(CURRENT), "fixture", None,
-            None, SpawnRuntimeMode::Headless, None, None).unwrap()
-            .with_mailbox_db_path(path.clone());
+        let context = context_from_parent_invocation_env(
+            Some(CURRENT),
+            "fixture",
+            None,
+            None,
+            SpawnRuntimeMode::Headless,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_mailbox_db_path(path.clone());
         register_runtime_generation_starting(Some(&context)).unwrap();
-        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
-        let exhausted = libc::rlimit { rlim_cur: 0, rlim_max: limit.rlim_max };
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted) }, 0);
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let exhausted = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: limit.rlim_max,
+        };
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted) },
+            0
+        );
         let mut command = std::process::Command::new("/bin/true");
         let configured = configure_launch_custody(&mut command, Some(&context));
         let open_error = std::fs::File::open("/dev/null").unwrap_err();
@@ -969,16 +1118,27 @@ mod tests {
         drop(command);
         // Exercise the remaining configuration error and its fenced finalizer.
         context.launch_custody.get().unwrap().seal();
-        let error = configure_launch_custody(&mut std::process::Command::new("/bin/true"),
-            Some(&context)).unwrap_err();
+        let error =
+            configure_launch_custody(&mut std::process::Command::new("/bin/true"), Some(&context))
+                .unwrap_err();
         assert!(error.contains("sealed"), "{error}");
         assert!(!error.contains("finalization failed"), "{error}");
         let db = MailboxDb::open(&path).unwrap();
-        let row = db.runtime_lifecycle_reader().runtime_generation(&context.generation_id)
-            .unwrap().unwrap();
+        let row = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&context.generation_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.lifecycle_state, RuntimeLifecycleState::Exited);
-        assert_eq!(row.terminal_reason, Some(RuntimeTerminalReason::StartupFailed));
-        assert!(pid_identity::read_live_process_identity(std::process::id().into()).unwrap().is_some());
+        assert_eq!(
+            row.terminal_reason,
+            Some(RuntimeTerminalReason::StartupFailed)
+        );
+        assert!(
+            pid_identity::read_live_process_identity(std::process::id().into())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ use oulipoly_runtime::services::{
     InvocationLifecycleStartOutput, InvocationLifecycleStartRequest,
     ProductionInvocationLifecycleService,
 };
-use oulipoly_state::StateDb;
+use oulipoly_state::{ProviderLaunchOwnerFence, StateDb};
 
 pub(crate) fn finalize_retained_outcome_with_contention_retry(
     service: &dyn InvocationLifecycleServicePort,
@@ -30,11 +30,35 @@ pub(crate) struct FinalizerGuard<'a> {
     db: &'a StateDb,
     invocation_id: i64,
     finalized: bool,
+    failure: Option<RetainedFailure>,
+    rejected_launch: Option<ProviderLaunchOwnerFence>,
+}
+
+struct RetainedFailure {
+    exit_code: i32,
+    error_category: String,
+    terminal_reason: String,
 }
 
 impl<'a> FinalizerGuard<'a> {
     pub(crate) fn new(db: &'a StateDb, invocation_id: i64) -> Self {
         finalizer_guard(db, invocation_id, false)
+    }
+
+    /// An explicit rejected result replaces the generic guard-drop diagnosis,
+    /// including when a failed first storage attempt leaves Drop owing a retry.
+    pub(crate) fn retain_failure(&mut self, exit_code: i32, category: &str, reason: &str) {
+        self.failure = Some(RetainedFailure {
+            exit_code,
+            error_category: category.to_string(),
+            terminal_reason: reason.to_string(),
+        });
+    }
+
+    /// Retain only the caller-supplied exact fence for rejection's Drop fallback.
+    /// This does not load or reconstruct authority from the database.
+    pub(crate) fn retain_rejected_launch(&mut self, owner: Option<&ProviderLaunchOwnerFence>) {
+        self.rejected_launch = owner.cloned();
     }
 
     pub(crate) fn mark_finalized(&mut self) {
@@ -58,6 +82,8 @@ fn finalizer_guard<'a>(db: &'a StateDb, invocation_id: i64, finalized: bool) -> 
         db,
         invocation_id,
         finalized,
+        failure: None,
+        rejected_launch: None,
     }
 }
 
@@ -80,29 +106,60 @@ fn should_skip_guard_drop_finalize(finalized: bool) -> bool {
 
 fn finalize_unfinalized_guard_invocation(guard: &FinalizerGuard<'_>) {
     // Source guard marker: self.db.finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,
-    emit_guard_finalize_failure(finalize_invocation_from_guard(
-        guard.db,
-        guard.invocation_id,
-    ));
+    let result =
+        finalize_invocation_from_guard(guard.db, guard.invocation_id, guard.failure.as_ref());
+    if result.is_ok() {
+        settle_guard_rejected_launch(guard);
+    }
+    emit_guard_finalize_failure(result);
+}
+
+fn settle_guard_rejected_launch(guard: &FinalizerGuard<'_>) {
+    if let Err(error) = settle_rejected_launch(guard.db, guard.rejected_launch.as_ref()) {
+        eprintln!(
+            "Warning: Rejected invocation {} guard logical settlement failed: {error}",
+            guard.invocation_id
+        );
+    }
 }
 
 fn emit_guard_finalize_failure(result: Result<(), String>) {
     result.unwrap_or_else(|err| emit_finalizer_guard_warning(&err));
 }
 
-fn finalize_invocation_from_guard(db: &StateDb, invocation_id: i64) -> Result<(), String> {
+fn finalize_invocation_from_guard(
+    db: &StateDb,
+    invocation_id: i64,
+    failure: Option<&RetainedFailure>,
+) -> Result<(), String> {
     db.finalize_invocation(
         db.invocation_mutation_scope(invocation_id).authority(),
         invocation_id,
         false,
-        -1,
-        Some("guard_drop"),
-        Some("guard_drop"),
+        failure.map_or(-1, |failure| failure.exit_code),
+        Some(failure.map_or("guard_drop", |failure| failure.error_category.as_str())),
+        Some(failure.map_or("guard_drop", |failure| failure.terminal_reason.as_str())),
     )
 }
 
 fn emit_finalizer_guard_warning(err: &str) {
     eprintln!("Warning: Failed to finalize invocation in guard: {err}");
+}
+
+pub(crate) fn settle_rejected_launch(
+    state: &StateDb,
+    owner: Option<&ProviderLaunchOwnerFence>,
+) -> Result<&'static str, String> {
+    let Some(owner) = owner else {
+        return Ok("not allocated");
+    };
+    // Cancellation retains its original drain/custody owner. This is the same
+    // fenced non-cancelling transition as normal resume, not a recovery override.
+    if state.launch_cancellation_requested(owner)? {
+        return Ok("cancellation retains drain-owned settlement");
+    }
+    state.complete_native_launch(owner)?;
+    Ok("failed logical launch recorded")
 }
 
 #[cfg(test)]
@@ -523,5 +580,100 @@ mod tests {
         assert_eq!(row.exit_code, Some(-1));
         assert_eq!(row.error_category.as_deref(), Some("guard_drop"));
         assert_eq!(row.terminal_reason.as_deref(), Some("guard_drop"));
+    }
+
+    fn rejected_launch_fixture() -> (tempfile::TempDir, StateDb, ProviderLaunchOwnerFence) {
+        use oulipoly_state::{
+            BeginProviderLaunchRequest, ProviderLaunchAttemptAllocation, ProviderLaunchCandidate,
+            ProviderLaunchStartMode,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&root.path().join("state.db")).unwrap();
+        let request = BeginProviderLaunchRequest {
+            logical_launch_id: Uuid::new_v4(),
+            request_identity_sha256: "a".repeat(64),
+            model_name: "private-rejection".into(),
+            start_mode: ProviderLaunchStartMode::Resume,
+            expected_provider_session_id: Some("private-session".into()),
+            candidates: vec![ProviderLaunchCandidate {
+                provider_index: 0,
+                account_name: "private-account".into(),
+            }],
+            parent_invocation_id: None,
+            allocation: ProviderLaunchAttemptAllocation::allocate().unwrap(),
+        };
+        let lease = state.begin_launch(&request).unwrap();
+        state.retain_launch_owner(&lease.owner).unwrap();
+        state
+            .activate_attempt(&lease, &request.allocation.completion_authority)
+            .unwrap();
+        (root, state, lease.owner)
+    }
+
+    fn logical_status(state: &StateDb, owner: &ProviderLaunchOwnerFence) -> String {
+        state
+            .connection()
+            .query_row(
+                "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+                [owner.logical_launch_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn rejection_guard_retry_settles_with_retained_owner_and_original_failure() {
+        let (_root, state, owner) = rejected_launch_fixture();
+        let mut guard = FinalizerGuard::new(&state, owner.invocation_row_id);
+        guard.retain_failure(
+            37,
+            "session_authority_rejected",
+            "original_provider_failure",
+        );
+        guard.retain_rejected_launch(Some(&owner));
+        let faults = rusqlite::Connection::open(state.path()).unwrap();
+        faults.execute_batch("CREATE TRIGGER private_finalize_fault BEFORE UPDATE OF status ON invocations BEGIN SELECT RAISE(ABORT, 'private finalize fault'); END").unwrap();
+        let failed =
+            finalize_invocation_from_guard(&state, owner.invocation_row_id, guard.failure.as_ref());
+        assert!(failed.unwrap_err().contains("private finalize fault"));
+        assert_eq!(logical_status(&state, &owner), "active");
+        faults
+            .execute_batch("DROP TRIGGER private_finalize_fault")
+            .unwrap();
+        drop(guard);
+        assert_eq!(logical_status(&state, &owner), "failed");
+        let recorded: (i32, String) = state
+            .connection()
+            .query_row(
+                "SELECT exit_code,terminal_reason FROM invocations WHERE id=?1",
+                [owner.invocation_row_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(recorded, (37, "original_provider_failure".into()));
+    }
+
+    #[test]
+    fn rejection_settlement_preserves_cancellation_drain_owner() {
+        let (_root, state, owner) = rejected_launch_fixture();
+        state.request_cancel(owner.logical_launch_id).unwrap();
+        finalize_invocation_from_guard(&state, owner.invocation_row_id, None).unwrap();
+        assert_eq!(
+            settle_rejected_launch(&state, Some(&owner)).unwrap(),
+            "cancellation retains drain-owned settlement"
+        );
+        assert_eq!(logical_status(&state, &owner), "cancelling");
+    }
+
+    #[test]
+    fn rejection_settlement_cannot_replace_the_retained_fence() {
+        let (_root, state, owner) = rejected_launch_fixture();
+        finalize_invocation_from_guard(&state, owner.invocation_row_id, None).unwrap();
+        let mut stale = owner.clone();
+        stale.attempt_id = Uuid::new_v4();
+        assert!(settle_rejected_launch(&state, Some(&stale)).is_err());
+        assert_eq!(logical_status(&state, &owner), "active");
+        settle_rejected_launch(&state, Some(&owner)).unwrap();
+        assert_eq!(logical_status(&state, &owner), "failed");
     }
 }

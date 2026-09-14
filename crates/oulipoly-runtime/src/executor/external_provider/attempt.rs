@@ -614,6 +614,7 @@ pub(crate) struct AttemptEvidence {
     pub verified_session: Option<String>,
     pub stderr_pending: Vec<u8>,
     pub retention_failure: Option<String>,
+    acceptance_rejection: Option<&'static str>,
     runtime_exit_attempts: Vec<OriginalRuntimeExitAttempt>,
 }
 impl AttemptExecution {
@@ -727,12 +728,15 @@ impl AttemptExecution {
         let session = match event {
             DecodedLaunchEvent::Marker { name, value, .. } if name == PROMPT_ACCEPTED_MARKER_V1 => {
                 let observed =
-                    super::launch_result_mapper::parse_prompt_acceptance_attestation_marker(value)
-                        .ok_or("prompt_acceptance_invalid")?;
-                let evidence = self
+                    super::launch_result_mapper::parse_prompt_acceptance_attestation_marker(value);
+                let mut evidence = self
                     .evidence
                     .lock()
                     .map_err(|_| "prompt_evidence_unavailable")?;
+                let Some(observed) = observed else {
+                    evidence.acceptance_rejection = Some("prompt_acceptance_invalid");
+                    return Ok(());
+                };
                 let expected = evidence
                     .prompt
                     .as_ref()
@@ -745,7 +749,10 @@ impl AttemptExecution {
                     || expected.delivery_nonce != observed.delivery_nonce
                     || session != Some(observed.provider_session_id.as_str())
                 {
-                    return Err("prompt_acceptance_mismatch".into());
+                    // Reject only this semantic attestation. The transport remains
+                    // observable: later exit/session/custody events are independent.
+                    evidence.acceptance_rejection = Some("prompt_acceptance_mismatch");
+                    return Ok(());
                 }
                 Some(observed.provider_session_id)
             }
@@ -810,24 +817,6 @@ impl AttemptExecution {
                 self.promote(ProviderLaunchPromotion::AssistantResponseObserved)?;
             }
             if name == PROMPT_ACCEPTED_MARKER_V1 {
-                let observed =
-                    super::launch_result_mapper::parse_prompt_acceptance_attestation_marker(value)
-                        .ok_or("prompt_acceptance_invalid")?;
-                let evidence = self
-                    .evidence
-                    .lock()
-                    .map_err(|_| "prompt_evidence_unavailable")?;
-                let expected = evidence
-                    .prompt
-                    .as_ref()
-                    .ok_or("prompt_acceptance_not_negotiated")?;
-                if expected.prompt_sha256 != observed.prompt_sha256
-                    || expected.delivery_nonce != observed.delivery_nonce
-                    || evidence.verified_session.as_deref() != Some(&observed.provider_session_id)
-                {
-                    return Err("prompt_acceptance_mismatch".into());
-                }
-                drop(evidence);
                 self.promote(ProviderLaunchPromotion::PromptAccepted)?;
             }
         }
@@ -1118,6 +1107,19 @@ fn execute_allocated_attempt(
                 let _ = attempt.promote(ProviderLaunchPromotion::AssistantResponseObserved);
             }
             let evidence = attempt.evidence.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(rejection) = evidence.acceptance_rejection {
+                result.stderr.push_str(&format!("\n{rejection}"));
+            }
+            // The mapper retains raw provider attestations. Do not let a rejected
+            // marker reach another consumer with weaker optional-nonce semantics.
+            result.prompt_acceptance_attestation =
+                result.prompt_acceptance_attestation.filter(|observed| {
+                    evidence.prompt.as_ref().is_some_and(|expected| {
+                        expected.prompt_sha256 == observed.prompt_sha256
+                            && expected.delivery_nonce == observed.delivery_nonce
+                    }) && evidence.verified_session.as_deref()
+                        == Some(observed.provider_session_id.as_str())
+                });
             result.captured_child_invocations = evidence.children.clone();
             result.returned_artifacts = evidence
                 .channel_settlement
@@ -1659,6 +1661,87 @@ mod tests {
         (dir, attempt, context)
     }
     #[test]
+    fn malformed_acceptance_keeps_observer_open_without_promotion() {
+        for fault in ["hash", "session", "nonce", "shape"] {
+            let (_dir, attempt, mut context) = fixture();
+            context.start_known_provider_session_id = Some("actual".into());
+            attempt.evidence.lock().unwrap().prompt =
+                Some(oulipoly_provider::generated::PromptAcceptanceRequestV1 {
+                    protocol: oulipoly_provider::generated::PROMPT_ACCEPTANCE_V1.into(),
+                    prompt_sha256: "a".repeat(64),
+                    delivery_nonce: Some("nonce".into()),
+                });
+            let mut value = serde_json::json!({
+                "protocol": oulipoly_provider::generated::PROMPT_ACCEPTANCE_V1,
+                "provider_session_id": "actual",
+                "prompt_sha256": "a".repeat(64), "delivery_nonce": "nonce"
+            });
+            match fault {
+                "hash" => value["prompt_sha256"] = "b".repeat(64).into(),
+                "session" => value["provider_session_id"] = "wrong".into(),
+                "nonce" => value["delivery_nonce"] = "wrong".into(),
+                _ => value = serde_json::Value::Null,
+            }
+            attempt
+                .observe(
+                    &context,
+                    &DecodedLaunchEvent::Marker {
+                        seq: 1,
+                        name: oulipoly_provider::generated::PROMPT_ACCEPTED_MARKER_V1.into(),
+                        value,
+                    },
+                )
+                .unwrap();
+            {
+                let evidence = attempt.evidence.lock().unwrap();
+                assert!(evidence.acceptance_rejection.is_some());
+                assert!(!evidence.promotions.prompt_accepted);
+                assert!(!evidence.promotions.provider_session_observed);
+                assert!(evidence.verified_session.is_none());
+            }
+            // Independent session evidence still works after the rejected marker.
+            attempt
+                .observe(
+                    &context,
+                    &DecodedLaunchEvent::Marker {
+                        seq: 2,
+                        name: super::super::launch_result_mapper::PROVIDER_SESSION_MARKER.into(),
+                        value: serde_json::json!({"provider_session_id":"actual"}),
+                    },
+                )
+                .unwrap();
+            assert!(!attempt.evidence.lock().unwrap().promotions.prompt_accepted);
+            assert!(
+                attempt
+                    .evidence
+                    .lock()
+                    .unwrap()
+                    .promotions
+                    .provider_session_observed
+            );
+            // Structural/custody observation failures are not semantic rejection.
+            assert!(
+                attempt
+                    .observe(
+                        &context,
+                        &DecodedLaunchEvent::Stderr {
+                            seq: 3,
+                            data: vec![b'x'; 1024 * 1024 + 1],
+                        }
+                    )
+                    .is_err()
+            );
+            assert!(
+                attempt
+                    .evidence
+                    .lock()
+                    .unwrap()
+                    .promotions
+                    .persistence_failed
+            );
+        }
+    }
+    #[test]
     fn every_closed_source_independently_promotes_and_durable_mailbox_acceptance_is_read_back() {
         for promotion in [
             ProviderLaunchPromotion::ProviderSessionObserved,
@@ -1806,7 +1889,11 @@ mod tests {
             name: oulipoly_provider::generated::PROMPT_ACCEPTED_MARKER_V1.into(),
             value: serde_json::json!({"protocol":oulipoly_provider::generated::PROMPT_ACCEPTANCE_V1,"provider_session_id":"actual","prompt_sha256":hash,"delivery_nonce":"nonce"}),
         };
-        assert!(attempt.observe(&context, &marker(&"b".repeat(64))).is_err());
+        assert!(attempt.observe(&context, &marker(&"b".repeat(64))).is_ok());
+        assert_eq!(
+            attempt.evidence.lock().unwrap().acceptance_rejection,
+            Some("prompt_acceptance_mismatch")
+        );
         assert!(!attempt.evidence.lock().unwrap().promotions.prompt_accepted);
         attempt.observe(&context, &marker(&"a".repeat(64))).unwrap();
         assert!(attempt.evidence.lock().unwrap().promotions.prompt_accepted);

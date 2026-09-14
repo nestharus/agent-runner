@@ -9,7 +9,7 @@ The external TypeScript files are copied byte-for-byte into the fixture; vendore
 and shared Bash adapter hashes must agree. The tested runner and Bash executables
 are copied explicitly and hashed. The caller must establish their build/source
 correspondence; a hash alone does not do that. No product rebuild is performed.
-Only the small passive process-entry audit shared library is compiled.
+Only the small harness process-entry audit/fault shared library is compiled.
 
 A fake native provider launches the actual Codex MCP bridge, submits an ordinary
 controlled shell command through the actual shared adapter and receives JSON-RPC
@@ -127,3 +127,46 @@ The synthetic async MCP host stays open until original snapshot publication.
 Closing it immediately after the async handle reply can cancel still-running
 work; that is a different host-loss experiment, not the exact-output async
 control. Exact recipient bytes and genuine sequence ACK are still required.
+
+## Real paired handoff controls
+
+`--handoff-cases` adds candidate-only cases to the baseline sync/async pair:
+
+- `detach-before`: an outstanding real sync MCP call is detached by another
+  executor under the original fake provider. The helper must return while the
+  event remains pending, with an active listener but no item/ACK. Only then is
+  the workload gate released.
+- `detach-after`: exact synchronous bytes and source acceptance precede detach.
+  A subsequent notification is intentional under Contract A, not a duplicate red.
+- `detach-race`: workload gate release races the real detach command. The result
+  must retain one source, original immutable sync registration and recipient,
+  one mailbox obligation and one original launch. This is one concurrent schedule,
+  not exhaustive scheduling evidence.
+- `detach-lost-reply`: a fixture-only preload exits the first activation helper at its
+  stdout reply boundary, losing the reply and successful exit receipt without
+  changing its already committed operation. Readback proves acceptance.
+  A real Bash repeat is observed; a separate real Runner same-target retry must
+  preserve first request facts and the existing item. If Bash cannot reconcile,
+  the case reports `BASH_RECONCILIATION_RED` and exits 2 after the other controls;
+  the Runner retry does not turn that Bash outcome into a pass.
+- `sync-independent`: after the original native caller exits normally, a separately
+  resumed native actor obtains its own real session binding and registration capability and admits a same-session, different-invocation listener.
+  The successful oracle requires only that listener to receive and genuinely ACK
+  its item, with the original caller inactive/unACKed. If the real native actor
+  has a runtime session but lacks State's authoritative session binding, preserve
+  `INDEPENDENT_LISTENER_ADMISSION_RED` (exit 2), not a fabricated binding or pass.
+  Original-owner retirement is explicitly waited before resume, so this case
+  does not infer successful entry across an in-flight owner-closing race.
+- `async-projection-fault`: test-only SQL rejects event projection, with an external
+  fixture marker proving the attempted failure. Original outcome/snapshot and
+  State admission remain; source/event projection rolls back without an item or
+  false ACK. Removing only the test trigger lets the actual owner repair and
+  deliver the retained output, with one original launch.
+
+All paths still run inside the existing masked private namespace. No fault
+activation exists in production Rust. The preload now includes opt-in faults,
+so it is not described as exclusively passive when these cases are selected.
+`identities.json` identifies the actual staged fixture revision and binaries;
+changes after staging cannot be credited to an earlier run. Lost reply uses the
+existing unattributed Runner administrative activation route for its separate
+retry control, not an invented authenticated initiating identity.

@@ -1684,13 +1684,19 @@ fn sanitize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     fn remove_continuation_schema_for_legacy_fixture(connection: &rusqlite::Connection) {
-        connection.execute_batch("DROP TABLE completion_continuation_attempt;
+        connection
+            .execute_batch(
+                "DROP TRIGGER completion_continuation_notification_ack;
+            DROP TABLE completion_continuation_notification;
+            DROP TABLE completion_continuation_attempt;
             DROP TABLE completion_continuation_source;
             DROP TABLE completion_continuation_context;
             DROP TABLE completion_continuation_owner;
             DROP TABLE completion_continuation_domain;
             DROP TRIGGER completion_continuation_claim_delete;
-            DROP TRIGGER completion_continuation_claim_replace;").unwrap();
+            DROP TRIGGER completion_continuation_claim_replace;",
+            )
+            .unwrap();
     }
 
     use super::*;
@@ -2187,7 +2193,7 @@ mod tests {
                 ))
                 .unwrap();
         }
-        // Existing v4 fixture: remove later18 objects before lowering version.
+        // Existing v4 fixture: remove later continuation/notification objects before lowering version.
         // This is synthetic fixture construction, not a production downgrade.
         remove_continuation_schema_for_legacy_fixture(&connection);
         connection.pragma_update(None, "user_version", 4).unwrap();
@@ -2348,7 +2354,7 @@ mod tests {
                 ))
                 .unwrap();
         }
-        // Existing v4 fixture: remove later18 objects before lowering version.
+        // Existing v4 fixture: remove later continuation/notification objects before lowering version.
         // This is synthetic fixture construction, not a production downgrade.
         remove_continuation_schema_for_legacy_fixture(&connection);
         connection.pragma_update(None, "user_version", 4).unwrap();

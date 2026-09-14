@@ -60,7 +60,9 @@ pub(crate) fn startup_wake_reclaim_sweep_enabled(cli: &crate::usage::cli::Cli) -
     )
 }
 
-pub(crate) fn bootstrap_service() -> Result<(), String> {
+/// Acquire an independent service lease at a supported process-entry boundary.
+/// Inspection and ACK callers must not bootstrap a recovery service.
+pub fn bootstrap_service() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         linux::bootstrap()

@@ -46,6 +46,46 @@ pub struct CompletionNotificationRequest<'a> {
     pub listener_id: &'a str,
 }
 
+/// Admit initial listener delivery eligibility; exact bound-source policy is
+/// classified by this owner once registration has established its binding.
+pub(in crate::mailbox) fn register_listener_on(
+    tx: &Transaction<'_>,
+    input: &CompletionEventRegistrationInput<'_>,
+    listeners_frozen: bool,
+    now: &str,
+) -> Result<(), String> {
+    let (Some(session_id), Some(invocation_uuid)) =
+        (input.owner_session_id, input.owner_invocation_uuid)
+    else {
+        return Err("Completion event owner session and invocation are both required".to_string());
+    };
+    if let Some(listener) = completion_event_listener_on(tx, input.event_id, invocation_uuid)? {
+        return validate_completion_event_listener_replay(&listener, session_id, invocation_uuid);
+    }
+    if listeners_frozen {
+        return Err(format!(
+            "Completion event {} cannot register a listener after it was triggered",
+            input.event_id
+        ));
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO completion_event_listener (
+            event_id, listener_id, session_id, owner_invocation_uuid, active, created_at
+         ) VALUES (?1, ?2, ?3, ?2, ?4, ?5)",
+        params![
+            input.event_id,
+            invocation_uuid,
+            session_id,
+            input.delivery_mode == "async",
+            now,
+        ],
+    )
+    .map_err(|err| format!("Failed to register completion event listener: {err}"))?;
+    let listener = completion_event_listener_on(tx, input.event_id, invocation_uuid)?
+        .ok_or_else(|| "Registered completion listener disappeared".to_string())?;
+    validate_completion_event_listener_replay(&listener, session_id, invocation_uuid)
+}
+
 /// Only the exact immutable admitted binding can classify original sync.
 /// Existing active/materialized obligations are never retracted or called detach.
 pub(in crate::mailbox) fn classify_on(
@@ -82,7 +122,137 @@ pub(in crate::mailbox) fn classify_on(
     Ok(())
 }
 
+/// One completion-delivery owner applies policy and projects obligations for
+/// both verified acceptance and admitted-source repair, in their transaction.
+/// Producers provide source truth, not a second eligibility decision.
+pub(in crate::mailbox) fn reconcile_on(
+    tx: &Transaction<'_>,
+    event: &CompletionEventRow,
+    binding: Option<&AdmittedSourceBinding>,
+    now: &str,
+) -> Result<(), String> {
+    if let Some(binding) = binding {
+        classify_on(tx, binding)?;
+        if event.state == "triggered" {
+            tx.execute(
+                "UPDATE completion_event_listener SET active=1
+                 WHERE event_id=?1 AND acknowledged_at IS NULL AND EXISTS (
+                   SELECT 1 FROM completion_continuation_notification n
+                   WHERE n.event_id=completion_event_listener.event_id
+                     AND n.listener_id=completion_event_listener.listener_id
+                     AND n.policy='notify')",
+                [&event.event_id],
+            )
+            .map_err(|e| format!("Failed to apply completion presentation policy: {e}"))?;
+        }
+    }
+    materialize_on(tx, event, now)
+}
+
+fn materialize_on(
+    tx: &Transaction<'_>,
+    event: &CompletionEventRow,
+    now: &str,
+) -> Result<(), String> {
+    if event.state != "triggered" {
+        return Ok(());
+    }
+    let listeners = completion_event_listeners_on(tx, &event.event_id)?;
+    let listener_count = listeners.len();
+    for listener in listeners.into_iter().filter(|listener| {
+        listener.active && listener.acknowledged_at.is_none() && listener.mailbox_seq.is_none()
+    }) {
+        let handle = completion_listener_mailbox_handle(event, &listener, listener_count);
+        let changed = insert_completion_listener_mailbox_row(tx, event, &listener, &handle, now)?;
+        let row = query_mailbox_by_kind_handle_tx(tx, AGENT_BASH_COMPLETE_KIND, &handle)?
+            .ok_or_else(|| "Completion listener mailbox row disappeared".to_string())?;
+        if changed == 0
+            && (row.session_id != listener.session_id
+                || row.owner_invocation_uuid.as_deref()
+                    != Some(listener.owner_invocation_uuid.as_str())
+                || row.payload_sha256 != event.payload_sha256)
+        {
+            return Err(format!(
+                "Completion event {} mailbox identity conflicts with an existing row",
+                event.event_id
+            ));
+        }
+        tx.execute(
+            "UPDATE completion_event_listener
+             SET mailbox_seq = ?3
+             WHERE event_id = ?1 AND listener_id = ?2 AND mailbox_seq IS NULL",
+            params![event.event_id, listener.listener_id, row.seq],
+        )
+        .map_err(|err| format!("Failed to bind completion listener mailbox row: {err}"))?;
+    }
+    Ok(())
+}
+
 impl MailboxDb {
+    pub fn activate_completion_event_listeners(
+        &mut self,
+        event_id: &str,
+    ) -> Result<CompletionEventTriggerResult, String> {
+        self.request_completion_notification_on_scope(event_id, None)
+    }
+
+    /// Explicit request scoped to one listener; event-wide administrative
+    /// activation remains a separate API and is not an inferred detach.
+    pub fn request_completion_notification(
+        &mut self,
+        request: CompletionNotificationRequest<'_>,
+    ) -> Result<CompletionEventTriggerResult, String> {
+        self.request_completion_notification_on_scope(request.event_id, Some(request.listener_id))
+    }
+
+    fn request_completion_notification_on_scope(
+        &mut self,
+        event_id: &str,
+        listener_id: Option<&str>,
+    ) -> Result<CompletionEventTriggerResult, String> {
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| {
+                format!("Failed to start completion listener activation transaction: {err}")
+            })?;
+        if let Some(listener_id) = listener_id
+            && completion_event_listener_on(&tx, event_id, listener_id)?.is_none()
+        {
+            return Err("notification request listener is not registered".into());
+        }
+        let event = completion_event_by_id_on(&tx, event_id)?
+            .ok_or_else(|| format!("Completion event {event_id} is not registered"))?;
+        if completion_continuation::bound_event(&tx, event_id)? {
+            let running: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM completion_continuation_owner WHERE phase='running')", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+            if !running {
+                return Err("completion_owner_closed_retryable: notification request requires a running owner".into());
+            }
+        }
+        // Record first effective scoped request facts, not incoming retry packets.
+        // Neither scope grants an inferred detach actor or a receipt.
+        tx.execute("INSERT INTO completion_continuation_notification(event_id,listener_id,requested_at,request_basis)
+            SELECT event_id,listener_id,?2,CASE WHEN ?3 IS NULL THEN 'explicit_event_activation_unattributed' ELSE 'explicit_listener_activation_unattributed' END
+            FROM completion_event_listener WHERE event_id=?1 AND acknowledged_at IS NULL AND (?3 IS NULL OR listener_id=?3)
+            ON CONFLICT(event_id,listener_id) DO UPDATE SET requested_at=COALESCE(requested_at,excluded.requested_at),
+            request_basis=COALESCE(request_basis,excluded.request_basis)", params![event_id,&now,listener_id])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE completion_event_listener
+             SET active = 1
+             WHERE event_id = ?1 AND acknowledged_at IS NULL AND (?2 IS NULL OR listener_id=?2)",
+            params![event_id, listener_id],
+        )
+        .map_err(|err| format!("Failed to activate completion event listeners: {err}"))?;
+        if event.state == "triggered" {
+            materialize_on(&tx, &event, &now)?;
+        }
+        tx.commit()
+            .map_err(|err| format!("Failed to commit completion listener activation: {err}"))?;
+        self.completion_event_trigger_result(event_id, false)
+    }
+
     /// Existing detach CLI shape targets the immutable original caller for v2;
     /// legacy event activation retains its event-wide administrative meaning.
     pub fn request_original_completion_notification(

@@ -66,11 +66,23 @@ acceptance or repair never deactivates that listener. Polling alone does not ACK
 
 Suppression is a presentation choice, **not remote ACK or physical drain**. Source
 acceptance, work tracking, retained output and physical custody continue unchanged.
-Inactive unacknowledged listeners remain retained (including the existing owner
-retirement/retention costs); no false settlement is introduced to reclaim them.
+Inactive unacknowledged listeners and accepted output remain retained. Schema 19
+separately records notification policy, first explicit request and qualified ACK
+evidence. An exactly accepted response-only listener with no request, activation
+or mailbox item settles only automatic notification debt for normal owner
+retirement; it does not ACK the listener or discharge physical custody. Other
+retirement predicates and source/output retention are unchanged.
 Already active/materialized notifications from older code are not retroactively
 withdrawn: active state can also represent an authorized detach. This policy is
 not a production cleanup or migration procedure.
+
+The sidecar `completion_continuation/notification.rs` module owns initial listener
+eligibility, exact-binding classification, explicit requests and materialization.
+Acceptance and admitted-source repair call its shared reconciliation operation
+inside their existing transaction. Request retries keep the event/listener
+identity and first-effective request facts; they neither execute work again nor
+create authenticated initiating-actor provenance. Bash's local handoff mirror is
+not this authoritative commitment or recipient receipt.
 
 ## Publication and output
 

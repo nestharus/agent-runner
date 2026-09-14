@@ -166,16 +166,20 @@ fn resume_execution_input(
 ) -> Result<ResumeExecutionInput, String> {
     let session_id = resume.session_id.to_string();
     let provider_without_capture = provider_without_capture(provider);
+    let spawn_identity = resume_spawn_identity(
+        parent_invocation_env,
+        &provider_without_capture,
+        model_name,
+        &session_id,
+        working_dir,
+        models_dir,
+    );
+    if parent_invocation_env.is_some() && spawn_identity.is_none() {
+        return Err("headless resume requires valid runtime registration identity".into());
+    }
     Ok(ResumeExecutionInput {
         resume_args: compose_resume_args(resume.strategy, resume.session_id)?,
-        spawn_identity: resume_spawn_identity(
-            parent_invocation_env,
-            &provider_without_capture,
-            model_name,
-            &session_id,
-            working_dir,
-            models_dir,
-        ),
+        spawn_identity,
         provider_without_capture,
         session_id,
     })

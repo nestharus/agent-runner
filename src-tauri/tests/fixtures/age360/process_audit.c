@@ -95,11 +95,23 @@ static int sql_trace(unsigned kind, void *context, void *statement, void *extra)
     api->free(expanded);
     return 0;
 }
+/* Triggered only by the private controller's synthetic projection-fault SQL. */
+static void projection_fault(sqlite3_context *ctx, int n, sqlite3_value **values) {
+    (void)n; (void)values;
+    const char *path = getenv("AGE360_PROJECTION_FAULT");
+    if (!path) { api->result_error(ctx, "unconfigured fixture fault", -1); return; }
+    int fd = open(path, O_WRONLY|O_CREAT|O_EXCL, 0600);
+    if (fd >= 0) { dprintf(fd, "%d\n", getpid()); close(fd); }
+    api->result_error(ctx, "e2e_projection_fault", -1);
+}
 static int sql_extension(sqlite3 *db, char **error, const sqlite3_api_routines *routines) {
     (void)error;
     api = routines;
     int rc = api->create_function_v2(db, "e2e_writer_pid", 0, SQLITE_UTF8|SQLITE_INNOCUOUS,
                                     NULL, writer_pid, NULL, NULL, NULL);
+    if (rc) return rc;
+    rc = api->create_function_v2(db, "e2e_projection_fault", 0, SQLITE_UTF8|SQLITE_INNOCUOUS,
+                                 NULL, projection_fault, NULL, NULL, NULL);
     if (rc) return rc;
     return api->trace_v2(db, SQLITE_TRACE_PROFILE, sql_trace, db);
 }
@@ -121,4 +133,31 @@ __attribute__((constructor)) static void install_sql_audit(void) {
     }
     fclose(file);
     /* A non-runner (e.g. Python) may load a different SQLite, never hook it. */
+}
+
+/* Opt-in paired fault: lose only the activation helper's stdout reply and successful exit receipt, after
+ * the unmodified operation has run. No product-state mutation or fault knob.
+ * Acceptance is checked independently in SQLite by the namespace controller.
+ */
+#include <sys/syscall.h>
+static int drop_activation_stdout;
+__attribute__((constructor)) static void select_reply_fault(void) {
+    const char *path = getenv("AGE360_DROP_ACTIVATION_REPLY");
+    if (!path) return;
+    char argv[16384] = {0};
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return;
+    ssize_t n = read(fd, argv, sizeof(argv)-1);
+    close(fd);
+    for (ssize_t i=0; i<n; i++) if (!argv[i]) argv[i]=' ';
+    if (!strstr(argv, "notify agent-bash-activate ")) return;
+    fd = open(path, O_WRONLY|O_CREAT|O_EXCL, 0600);
+    if (fd < 0) return; /* only the first helper reply is lost */
+    dprintf(fd, "%d\n", getpid());
+    close(fd);
+    drop_activation_stdout = 1;
+}
+ssize_t write(int fd, const void *buffer, size_t count) {
+    if (drop_activation_stdout && fd == STDOUT_FILENO) _exit(86);
+    return syscall(SYS_write, fd, buffer, count);
 }

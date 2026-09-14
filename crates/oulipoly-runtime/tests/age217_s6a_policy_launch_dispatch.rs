@@ -534,6 +534,34 @@ fn execute_external_model_effective(
     )
 }
 
+// Explicit lifecycle authority only: ordinary helpers above must not infer it from JSON.
+fn execute_external_fixture_with_authority(
+    fixture: &ExternalFixture,
+    parent_invocation_env: String,
+    authority: Option<oulipoly_runtime::services::LiveSessionAuthorityTarget>,
+) -> Result<executor::ExecutionResult, ServiceError> {
+    let model = external_model(fixture);
+    let provider = model.providers[0].clone();
+    let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
+    let service = executor::RuntimeExecutorService::new(Arc::new(registry));
+    let request = ExecutorServiceRequest::Effective {
+        model,
+        provider,
+        provider_index: 0,
+        prompt_mode: PromptMode::Arg,
+        prompt: "prompt-value".into(),
+        working_dir: None,
+        models_dir: None,
+        extra_inputs: HashMap::new(),
+        parent_invocation_env: Some(parent_invocation_env),
+    };
+    match authority {
+        Some(authority) => service.execute_with_live_session_authority(request, authority),
+        None => service.execute(request),
+    }
+    .map(|output| output.result)
+}
+
 fn make_external_fixture(
     capabilities: Capabilities,
     policy_mode: PolicyMode,
@@ -3117,6 +3145,25 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
     if isolated_case() {
         return;
     }
+    live_session_failure_retains_evidence("attachment");
+}
+
+#[test]
+fn authority_publication_failure_dispatch_retains_partial_output_and_return_reference() {
+    if isolated_case() {
+        return;
+    }
+    for case in [
+        "state_commit",
+        "state_open",
+        "missing_target",
+        "wrong_actor",
+    ] {
+        live_session_failure_retains_evidence(case);
+    }
+}
+
+fn live_session_failure_retains_evidence(case: &str) {
     use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
     use sha2::{Digest, Sha256};
     let _lock = env_lock();
@@ -3184,18 +3231,75 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
         serde_json::to_vec(&artifact).unwrap(),
     )
     .unwrap();
+    let state = oulipoly_state::StateDb::open(&data_dir.join("state.db")).unwrap();
+    let id = state
+        .start_invocation(&oulipoly_state::InvocationStart {
+            invocation_uuid: uuid.into(),
+            model_name: "fixture".into(),
+            provider_name: external_model(&fixture).providers[0].name.clone(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    let mut authority = Some(oulipoly_runtime::services::LiveSessionAuthorityTarget {
+        state_path: state.path().to_path_buf(),
+        invocation_row_id: id,
+        invocation_uuid: uuid.into(),
+    });
+    if case != "attachment" {
+        // The publication experiment must not accidentally trigger the sidecar failure.
+        let body = fs::read_to_string(&fixture.provider_path).unwrap();
+        let trigger = "        db.execute(\"CREATE TRIGGER reject_fixture_attachment BEFORE UPDATE OF session_id ON runtime_generation BEGIN SELECT RAISE(ABORT, 'fixture storage fault'); END\")";
+        assert!(body.contains(trigger));
+        fs::write(
+            &fixture.provider_path,
+            body.replace(trigger, "        pass"),
+        )
+        .unwrap();
+    }
+    match case {
+        "state_commit" => Connection::open(state.path()).unwrap().execute_batch("CREATE TRIGGER fail_binding BEFORE UPDATE OF provider_session_id ON invocations BEGIN SELECT RAISE(ABORT, 'fixture persistence fault'); END;").unwrap(),
+        "state_open" => authority.as_mut().unwrap().state_path = data_dir.clone(),
+        "missing_target" => authority = None,
+        "wrong_actor" => authority.as_mut().unwrap().invocation_uuid = uuid::Uuid::new_v4().to_string(),
+        "attachment" => (),
+        _ => panic!("unknown fixture case"),
+    }
     let invocation = serde_json::json!({"source": "fixture", "id": uuid}).to_string();
-    let result =
-        execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(invocation))
-            .expect("typed failed result must survive observer transport failure");
+    let result = execute_external_fixture_with_authority(&fixture, invocation, authority)
+        .expect("typed failed result must survive observer transport failure");
+    eprintln!(
+        "live failure case={case} reason={:?} signal={:?}",
+        result.terminal_reason, result.terminal_signal
+    );
     assert_eq!(result.exit_code, -1);
     assert_eq!(
         result.terminal_reason.as_deref(),
-        Some("runtime_generation_attach_failed")
+        Some(if case == "attachment" {
+            "runtime_generation_attach_failed"
+        } else {
+            "live_session_authority_publication_failed"
+        })
     );
     assert_eq!(
         result.session_capture.session_id.as_deref(),
-        Some("example-session")
+        (case == "attachment").then_some("example-session")
+    );
+    assert_eq!(
+        state
+            .get_invocation_by_uuid(uuid)
+            .unwrap()
+            .unwrap()
+            .provider_session_id
+            .as_deref(),
+        (case == "attachment").then_some("example-session")
+    );
+    assert_eq!(
+        state
+            .invocation_provider_session_authority(id)
+            .unwrap()
+            .is_some(),
+        case == "attachment"
     );
     let launch = read_json(&fixture.launch_record_path);
     let oulipoly_runtime::executor::SessionCaptureMethod::ExternalProviderLaunch(authority) =
@@ -3214,11 +3318,23 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
     assert_eq!(authority.settings_id, launch["params"]["settings_id"]);
     let signal = result.terminal_signal.as_ref().unwrap();
     assert_eq!(signal.kind, TerminalSignalKind::SpawnError);
+    let expected_cause = match case {
+        "attachment" => "cause=StorageFailure",
+        "state_commit" => "cause=session_identity_commit_failed",
+        "state_open" => "cause=live_session_authority_state_open_failed",
+        "missing_target" => "cause=live_session_authority_target_missing",
+        "wrong_actor" => "cause=live_session_authority_launch_identity_mismatch",
+        _ => unreachable!(),
+    };
     assert!(
-        signal.evidence.contains("cause=StorageFailure"),
+        signal.evidence.contains(expected_cause),
         "{}",
         signal.evidence
     );
+    if case != "attachment" {
+        assert!(!signal.evidence.contains("runtime_generation_attach_failed"));
+        assert!(!signal.evidence.contains("fixture persistence fault"));
+    }
     assert!(
         signal.evidence.contains("cleanup=Ok(Applied)"),
         "{}",
@@ -3228,6 +3344,7 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
     assert!(!signal.evidence.contains("fixture storage fault"));
     assert!(!result.produced_assistant_response);
     assert!(result.prompt_acceptance_attestation.is_none());
+    assert!(result.resume_acceptance.is_none());
     let spool = result.output_spool.as_ref().unwrap();
     assert_eq!(
         spool.incomplete_output_bytes().unwrap(),
@@ -3250,16 +3367,6 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
     let reference = &result.returned_artifacts[0];
     assert_eq!(reference.sha256, format!("{:x}", Sha256::digest(&payload)));
     assert_eq!(reference.content_len, payload.len() as u64);
-    let state = oulipoly_state::StateDb::open(&data_dir.join("state.db")).unwrap();
-    let id = state
-        .start_invocation(&oulipoly_state::InvocationStart {
-            invocation_uuid: uuid.into(),
-            model_name: "fixture".into(),
-            provider_name: "provider-a".into(),
-            provider_index: 0,
-            parent_invocation_id: None,
-        })
-        .unwrap();
     assert!(state.list_returned_artifacts(id).unwrap().is_empty());
     result
         .retain_failed_finalization_evidence(&state, id, uuid)
@@ -3378,7 +3485,7 @@ fn standalone_verified_missing_final_retains_binary_prefix_and_reports_storage_f
             .start_invocation(&oulipoly_state::InvocationStart {
                 invocation_uuid: uuid.clone(),
                 model_name: "fixture".into(),
-                provider_name: "provider-a".into(),
+                provider_name: external_model(&fixture).providers[0].name.clone(),
                 provider_index: 0,
                 parent_invocation_id: None,
             })
@@ -3390,9 +3497,20 @@ fn standalone_verified_missing_final_retains_binary_prefix_and_reports_storage_f
         if blocked {
             fs::create_dir(&paths.stdout).unwrap();
         }
-        let result =
-            execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(parent))
-                .unwrap();
+        let result = execute_external_fixture_with_authority(
+            &fixture,
+            parent,
+            Some(oulipoly_runtime::services::LiveSessionAuthorityTarget {
+                state_path: state.path().to_path_buf(),
+                invocation_row_id: id,
+                invocation_uuid: uuid.clone(),
+            }),
+        )
+        .unwrap();
+        eprintln!(
+            "missing-final case blocked={blocked} reason={:?} signal={:?}",
+            result.terminal_reason, result.terminal_signal
+        );
         assert_eq!(
             result.terminal_reason.as_deref(),
             Some("external_provider_missing_final_exit")

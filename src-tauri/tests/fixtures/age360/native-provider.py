@@ -41,14 +41,17 @@ def launch(request):
         SESSION = "ses_age360_founder"
         os.environ.update(AGE360_CASE="owner_only", AGE360_HOLD_INITIAL="1", AGE360_FOUNDER="1")
     case = os.environ.get("AGE360_CASE")
+    if prompt == "synthetic independent listener":
+        case = "listener_only"
     seq = 1
-    if known:
+    if known and case != "listener_only":
         marker = pathlib.Path(os.environ["AGE360_NATIVE_WAKE_MARKER"])
         with marker.open("a") as stream:
             stream.write(json.dumps(prompt, separators=(",", ":")) + "\n")
         gate = pathlib.Path(os.environ["AGE360_NATIVE_WAKE_GATE"])
         deadline = time.monotonic() + 20
-        while not gate.exists() and time.monotonic() < deadline:
+        while not gate.exists():
+            assert time.monotonic() < deadline, "recipient gate deadline; no ACK inferred"
             time.sleep(0.02)
         stdout = b"native resumed\n"
         event(request, seq, "stdout", data_base64=base64.b64encode(stdout).decode("ascii"))
@@ -167,7 +170,54 @@ def launch(request):
         known = SESSION
         event(request, seq, "marker", name="oulipoly.provider_session", value={"provider_session_id": known})
         seq += 1
-        if case == "native_missing":
+        if case == "listener_only":
+            root = pathlib.Path(os.environ["AGE360_ROOT"])
+            parent = json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"]
+            registration = next((root / "spool/agent-bash").glob("*/source-registration-v2.json"))
+            deadline = time.monotonic() + 30
+            while True:
+                with sqlite3.connect("file:" + os.environ["OULIPOLY_DATA_DIR"] + "/pid-identity.db?mode=ro", uri=True) as db:
+                    bound = db.execute("SELECT session_id FROM runtime_generation WHERE spawn_invocation_uuid=?", (parent,)).fetchone()
+                # A requested-session Starting reservation is not marker
+                # publication. Wait for launch-owned State authority too, then
+                # assert it against this actual pinned launch request.
+                with sqlite3.connect("file:" + os.environ["OULIPOLY_DATA_DIR"] + "/state.db?mode=ro", uri=True) as db:
+                    db.row_factory = sqlite3.Row
+                    actor = dict(db.execute("SELECT invocation_uuid,provider_session_id,session_id,status FROM invocations WHERE invocation_uuid=?", (parent,)).fetchone())
+                    authority_row = db.execute("SELECT a.provider_instance_id,a.settings_id FROM invocation_provider_session_authority a JOIN invocations i ON i.id=a.invocation_id WHERE i.invocation_uuid=?", (parent,)).fetchone()
+                if bound and bound[0] == SESSION and authority_row is not None:
+                    authority = dict(authority_row)
+                    assert actor['provider_session_id'] == SESSION and actor['status'] == 'running', actor
+                    assert authority['provider_instance_id'] == request['provider_instance_id'], authority
+                    assert authority['settings_id'] == params['settings_id'], authority
+                    break
+                assert time.monotonic() < deadline, "independent native authority publication deadline"
+                time.sleep(.02)
+            (root / "independent-admission-before.json").write_text(json.dumps(dict(
+                actor=actor, endpoint_authority=authority, runtime_session=bound[0], caller_pid=os.getpid())))
+            result = subprocess.run([os.environ["AGENT_BASH_AGENT_RUNNER_BIN"], "notify", "agent-bash-listen",
+                "--registration-file", str(registration), "--session-id", SESSION,
+                "--owner-invocation-uuid", parent, "--json"], capture_output=True, timeout=30)
+            (root / "independent-listener-result.json").write_text(json.dumps(dict(
+                rc=result.returncode, stdout=result.stdout.decode(), stderr=result.stderr.decode(), invocation=parent)))
+            assert result.returncode == 0, result.stderr
+            # This resumed synthetic prompt has now actually subscribed. Fulfil
+            # the same affirmative resume contract as the recipient branch;
+            # clean process exit alone is deliberately insufficient in Runner.
+            acceptance_marker = {
+                "protocol": "oulipoly.prompt_acceptance/v1",
+                "provider_session_id": known,
+                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "source": "age360.native.fixture",
+                "message_id": "independent-listener-subscribed",
+            }
+            if params.get("prompt_acceptance", {}).get("delivery_nonce"):
+                acceptance_marker["delivery_nonce"] = params["prompt_acceptance"]["delivery_nonce"]
+            event(request, seq, "marker", name="oulipoly.prompt_accepted/v1", value=acceptance_marker)
+            seq += 1
+            event(request, seq, "marker", name="oulipoly.produced_assistant_response", value=True)
+            seq += 1
+        elif case == "native_missing":
             import runpy
             runpy.run_path(str(pathlib.Path(os.environ["AGE360_ROOT"]) / "native-missing-output.py"))["publish"]()
         elif os.environ.get("AGE360_CASE") != "owner_only":
@@ -188,10 +238,10 @@ def launch(request):
                 while (root / "hold-mcp-admission").exists():
                     if time.monotonic() > deadline: raise RuntimeError("MCP audit admission gate expired")
                     time.sleep(.02)
-            mode = "sync" if os.environ["AGE360_CASE"] == "sync" else "async"
+            mode = "sync" if case in ("sync", "sync-independent") or case.startswith("detach-") else "async"
             env = dict(os.environ, AGENT_BASH_OWNER_SESSION_ID=SESSION, AGENT_BASH_OWNER_INVOCATION_UUID=parent)
             workload = "printf paired-source-output"
-            if mode == "async": workload = 'while [ ! -f "$AGE360_WORKLOAD_GATE" ]; do sleep 0.02; done; printf paired-source-output'
+            if mode == "async" or case in ("detach-before", "detach-race"): workload = 'while [ ! -f "$AGE360_WORKLOAD_GATE" ]; do sleep 0.02; done; printf paired-source-output'
             extra = []
             if os.environ["AGE360_CASE"] == "early_exit":
                 workload = 'printf paired-source-output; exit 37'
@@ -254,7 +304,7 @@ def launch(request):
                 while not (root / "release-initial-provider").exists():
                     if time.monotonic() > deadline: raise RuntimeError("test did not release initial provider")
                     time.sleep(0.02)
-        if os.environ.get("AGE360_MCP_E2E") and case == "sync":
+        if os.environ.get("AGE360_MCP_E2E") and (case in ("sync", "sync-independent") or case.startswith("detach-")):
             deadline = time.monotonic() + 45
             while not pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("release-initial-provider").exists():
                 if time.monotonic() > deadline: raise RuntimeError("MCP initial hold expired")

@@ -79,6 +79,10 @@ fn retain_context(socket: UnixStream) -> Result<(), String> {
         .map_err(|_| "native completion context already joined".into())
 }
 fn join(endpoint: &Path) -> Result<(), String> {
+    retain_context(connect_context(endpoint)?)
+}
+
+fn connect_context(endpoint: &Path) -> Result<UnixStream, String> {
     let mut socket = UnixStream::connect(endpoint).map_err(|e| e.to_string())?;
     let peer = peer_pid(&socket)?;
     socket
@@ -104,7 +108,7 @@ fn join(endpoint: &Path) -> Result<(), String> {
     if owner.guardian_identity != identity(peer)? || owner.endpoint != endpoint.to_string_lossy() {
         return Err("completion join peer conflict".into());
     }
-    retain_context(socket)
+    Ok(socket)
 }
 
 pub(super) fn bootstrap() -> Result<(), String> {
@@ -144,7 +148,9 @@ pub(super) fn bootstrap() -> Result<(), String> {
         .completion_continuation_domain()?
         .ok_or("missing native domain")?;
     if state.has_legacy_completion_admissions()? {
-        eprintln!("unsupported_legacy_source_recovery: legacy admissions have no v2 recovery binding; retained legacy notify/repair and mailbox delivery remain available. This is not a pending-work count or permission to clear debt.");
+        eprintln!(
+            "unsupported_legacy_source_recovery: legacy admissions have no v2 recovery binding; retained legacy notify/repair and mailbox delivery remain available. This is not a pending-work count or permission to clear debt."
+        );
     }
     drop(state);
     drop(mailbox);
@@ -167,6 +173,10 @@ pub(super) fn bootstrap() -> Result<(), String> {
         return Err("completion election directory is not private".into());
     }
     let endpoint = directory.join("owner.sock");
+    // Admission and retirement share this gate. Hold it through startup or
+    // hello + join + authority validation, not through provider execution.
+    let admission = admission_gate(&endpoint)?;
+    <std::fs::File as fs4::FileExt>::lock(&admission).map_err(|e| e.to_string())?;
     let election = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -220,6 +230,41 @@ pub(super) fn bootstrap() -> Result<(), String> {
     Ok(())
 }
 
+/// Lock ordering: admission -> lifetime election -> State -> sidecar.
+/// Retirement takes admission nonblocking while holding election, so an entry
+/// joining the running owner cannot deadlock its guardian. Waiting entrants do
+/// not hold State/sidecar locks. Kernel lock release, not a DB row or a delay,
+/// signals that the retiring custodian has relinquished the election.
+fn admission_gate(endpoint: &Path) -> Result<std::fs::File, String> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(endpoint.with_file_name("admission.lock"))
+        .map_err(|e| e.to_string())
+}
+
+fn try_begin_retirement(
+    admission: &std::fs::File,
+    close_idle: impl FnOnce() -> bool,
+) -> Result<bool, String> {
+    match <std::fs::File as fs4::FileExt>::try_lock(admission) {
+        Ok(()) => {
+            let closing = close_idle();
+            if !closing {
+                <std::fs::File as fs4::FileExt>::unlock(admission).map_err(|e| e.to_string())?;
+            }
+            // A successful close retains the gate through physical drain.
+            Ok(closing)
+        }
+        Err(fs4::TryLockError::WouldBlock) => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn guardian(
     path: &Path,
     endpoint: &Path,
@@ -257,6 +302,9 @@ fn guardian(
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
         contexts.push((socket, context));
     }
+    // Open a distinct description after close_except: never reuse the
+    // bootstrap parent's inherited flock description.
+    let admission = admission_gate(endpoint)?;
     let mut closing = false;
     loop {
         super::custody::retry_unreleased();
@@ -283,6 +331,11 @@ fn guardian(
                     && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
                 {
                     let _ = std::fs::remove_file(endpoint);
+                    // Release the lifetime election only after actual ECHILD,
+                    // and before waking entrants blocked on the admission gate.
+                    drop(listener);
+                    drop(election);
+                    drop(admission);
                     return Ok(());
                 }
                 break;
@@ -340,11 +393,11 @@ fn guardian(
         });
         if !closing && contexts.is_empty() && !retained_native_context(path).unwrap_or(true) {
             // A missing/unreadable State DB is uncertainty, not no obligations.
-            if let Ok(state) = oulipoly_state::StateDb::open_default() {
-                closing = state
-                    .close_idle_completion_continuation_owner(&owner)
-                    .unwrap_or(false);
-            }
+            closing = try_begin_retirement(&admission, || {
+                oulipoly_state::StateDb::open_default()
+                    .and_then(|state| state.close_idle_completion_continuation_owner(&owner))
+                    .unwrap_or(false)
+            })?;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -543,3 +596,7 @@ fn redirect_stdio() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "linux_admission_tests.rs"]
+mod admission_tests;

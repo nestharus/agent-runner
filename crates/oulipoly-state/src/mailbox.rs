@@ -390,11 +390,34 @@ pub struct FailRuntimeGenerationDelivery<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationStorageError {
     message: String,
+    diagnostic: GenerationStorageDiagnostic,
+}
+
+/// Bounded host-owned registration evidence, independent of raw storage messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationStorageDiagnostic {
+    Storage,
+    NativeActivationConflict,
+    NativeActivationBinding,
+    CustodyProof,
+    AdmissionBinding,
 }
 
 impl GenerationStorageError {
+    pub fn diagnostic(&self) -> GenerationStorageDiagnostic {
+        self.diagnostic
+    }
+
+    fn with_diagnostic(mut self, diagnostic: GenerationStorageDiagnostic) -> Self {
+        self.diagnostic = diagnostic;
+        self
+    }
+
     fn new(message: String) -> Self {
-        Self { message }
+        Self {
+            message,
+            diagnostic: GenerationStorageDiagnostic::Storage,
+        }
     }
 }
 
@@ -1111,13 +1134,14 @@ impl CompletionAuthorityFence<'_> {
         let inserted = register_completion_event_on(&self.tx, &input, &now_rfc3339())?;
         if let Some(binding) = binding {
             self.materialize_continuation_binding(binding)?;
-            completion_continuation::classify_notification_on(&self.tx, binding)?;
             let event = completion_event_by_id_on(&self.tx, input.event_id)?
                 .ok_or("registered source disappeared")?;
-            if event.state == "triggered" {
-                completion_continuation::activate_notification_listeners_on(&self.tx, binding)?;
-                materialize_completion_event_listeners(&self.tx, &event, &now_rfc3339())?;
-            }
+            completion_continuation::reconcile_notification_on(
+                &self.tx,
+                &event,
+                Some(binding),
+                &now_rfc3339(),
+            )?;
         }
         append_completion_continuity_on(&self.tx, continuity)?;
         let result = completion_event_registration_on(&self.tx, input.event_id, inserted)?;
@@ -1562,8 +1586,7 @@ impl RuntimeLifecycleRepository<'_> {
             .map_err(generation_storage_error(
                 "start generation creation transaction",
             ))?;
-        completion_continuation::bind_generation_on(&tx, request, &creator_process_identity)
-            .map_err(GenerationStorageError::new)?;
+        completion_continuation::bind_generation_on(&tx, request, &creator_process_identity)?;
         let changed = tx
             .execute(
                 "INSERT OR IGNORE INTO runtime_generation (
@@ -1594,7 +1617,8 @@ impl RuntimeLifecycleRepository<'_> {
         if changed == 1
             && let Some(path) = custody_proof
         {
-            register_custody_proof_on(&tx, request.generation_id, path)?;
+            register_custody_proof_on(&tx, request.generation_id, path)
+                .map_err(|e| e.with_diagnostic(GenerationStorageDiagnostic::CustodyProof))?;
         }
         let row = runtime_generation_by_id_on(&tx, request.generation_id)?.ok_or_else(|| {
             GenerationStorageError::new("Runtime generation missing after create".to_string())
@@ -1606,7 +1630,8 @@ impl RuntimeLifecycleRepository<'_> {
             request.spawn_invocation_uuid,
             request.generation_id,
             &creator_process_identity,
-        )?;
+        )
+        .map_err(|e| e.with_diagnostic(GenerationStorageDiagnostic::AdmissionBinding))?;
         tx.commit().map_err(generation_storage_error(
             "commit generation creation transaction",
         ))?;
@@ -2607,64 +2632,6 @@ impl MailboxDb {
         Ok(result)
     }
 
-    pub fn activate_completion_event_listeners(
-        &mut self,
-        event_id: &str,
-    ) -> Result<CompletionEventTriggerResult, String> {
-        self.request_completion_notification_on_scope(event_id, None)
-    }
-
-    /// Explicit request scoped to one listener. None retains the legacy
-    /// administrative event-wide API; it is not an inferred detach.
-    pub fn request_completion_notification(
-        &mut self,
-        request: CompletionNotificationRequest<'_>,
-    ) -> Result<CompletionEventTriggerResult, String> {
-        self.request_completion_notification_on_scope(request.event_id, Some(request.listener_id))
-    }
-
-    fn request_completion_notification_on_scope(
-        &mut self,
-        event_id: &str,
-        listener_id: Option<&str>,
-    ) -> Result<CompletionEventTriggerResult, String> {
-        let now = now_rfc3339();
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|err| format!("Failed to start completion listener activation transaction: {err}"))?;
-        if let Some(listener_id) = listener_id {
-            if completion_event_listener_on(&tx, event_id, listener_id)?.is_none() {
-                return Err("notification request listener is not registered".into());
-            }
-        }
-        let event = completion_event_by_id_on(&tx, event_id)?
-            .ok_or_else(|| format!("Completion event {event_id} is not registered"))?;
-        if completion_continuation::bound_event(&tx, event_id)? {
-            let running: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM completion_continuation_owner WHERE phase='running')", [], |r| r.get(0)).map_err(|e| e.to_string())?;
-            if !running { return Err("completion_owner_closed_retryable: notification request requires a running owner".into()); }
-        }
-        // Existing CLI activation is an explicit event-wide administrative request.
-        // Record each affected listener, not an inferred detach or a receipt.
-        tx.execute("INSERT INTO completion_continuation_notification(event_id,listener_id,requested_at,request_basis)
-            SELECT event_id,listener_id,?2,CASE WHEN ?3 IS NULL THEN 'explicit_event_activation_unattributed' ELSE 'explicit_listener_activation_unattributed' END
-            FROM completion_event_listener WHERE event_id=?1 AND acknowledged_at IS NULL AND (?3 IS NULL OR listener_id=?3)
-            ON CONFLICT(event_id,listener_id) DO UPDATE SET requested_at=COALESCE(requested_at,excluded.requested_at),
-            request_basis=COALESCE(request_basis,excluded.request_basis)", params![event_id,&now,listener_id])
-            .map_err(|e| e.to_string())?;
-        tx.execute(
-            "UPDATE completion_event_listener
-             SET active = 1
-             WHERE event_id = ?1 AND acknowledged_at IS NULL AND (?2 IS NULL OR listener_id=?2)",
-            params![event_id,listener_id],
-        )
-        .map_err(|err| format!("Failed to activate completion event listeners: {err}"))?;
-        if event.state == "triggered" {
-            materialize_completion_event_listeners(&tx, &event, &now)?;
-        }
-        tx.commit()
-            .map_err(|err| format!("Failed to commit completion listener activation: {err}"))?;
-        self.completion_event_trigger_result(event_id, false)
-    }
-
     pub fn trigger_completion_event(
         &mut self,
         input: CompletionEventTriggerInput<'_>,
@@ -2730,12 +2697,14 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to refresh replayed completion payload: {err}"))?;
             false
         };
-        if let Some((binding, _)) = continuation {
-            completion_continuation::activate_notification_listeners_on(&tx, binding)?;
-        }
         let event = completion_event_by_id_on(&tx, input.event_id)?
             .ok_or_else(|| format!("Completion event {} disappeared", input.event_id))?;
-        materialize_completion_event_listeners(&tx, &event, &now)?;
+        completion_continuation::reconcile_notification_on(
+            &tx,
+            &event,
+            continuation.map(|(binding, _)| binding),
+            &now,
+        )?;
         tx.commit()
             .map_err(|err| format!("Failed to commit completion event trigger: {err}"))?;
         self.maintain_terminal_history();
@@ -3893,33 +3862,88 @@ impl MailboxDb {
         invocation_uuid: &str,
         require_anchor: bool,
     ) -> Result<(), String> {
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE mailbox_delivery_attempts
-             SET submission_started_at = ?4, headless_submission_state = 'possible'
-             WHERE attempt_id = ?1 AND session_id = ?2 AND delivery_invocation_uuid = ?3
-               AND resolved_at IS NULL AND submission_started_at IS NULL
-               AND headless_submission_state = 'prepared'
-               AND NOT EXISTS (SELECT 1 FROM mailbox_observation_stops
-                   WHERE session_id = ?2 AND rearmed_at IS NULL)
-               AND (?5 = 0 OR observation_anchor_token IS NOT NULL)",
-                params![
-                    attempt_id,
-                    session_id,
-                    invocation_uuid,
-                    now_rfc3339(),
-                    require_anchor
-                ],
+        begin_headless_submission_on(
+            &self.conn,
+            attempt_id,
+            session_id,
+            invocation_uuid,
+            require_anchor,
+        )
+    }
+
+    pub fn has_headless_submission_for_invocation(&self, invocation: &str) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mailbox_delivery_attempts
+            WHERE delivery_invocation_uuid=?1 AND headless_submission_state IS NOT NULL)",
+                [invocation],
+                |r| r.get(0),
             )
-            .map_err(|err| format!("Failed to fence headless submission: {err}"))?;
-        if changed != 1 {
-            return Err(
-                "headless delivery missing anchor, replaced, or possibly submitted; no launch"
-                    .into(),
-            );
+            .map_err(|e| e.to_string())
+    }
+
+    /// Runtime registration is the host-owned submission boundary. The durable
+    /// invocation binding is independent of provider prompt-policy transforms.
+    pub fn begin_registered_headless_submission(
+        &mut self,
+        generation: &RuntimeGenerationId,
+        invocation: &str,
+        session: Option<&str>,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let mut statement = tx
+            .prepare(
+                "SELECT attempt_id, session_id,
+            observation_provider_name IS NOT NULL FROM mailbox_delivery_attempts
+            WHERE delivery_invocation_uuid=?1 AND headless_submission_state IS NOT NULL",
+            )
+            .map_err(|e| e.to_string())?;
+        let attempts = statement
+            .query_map([invocation], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        if attempts.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        if attempts.len() != 1 {
+            return Err("ambiguous registered headless submission".into());
+        }
+        let (attempt, target, anchor) = &attempts[0];
+        let live = pid_identity::read_live_process_identity(i64::from(std::process::id()))?
+            .ok_or("headless submission launcher absent")?;
+        let registered: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runtime_generation
+            WHERE generation_uuid=?1 AND spawn_invocation_uuid=?2 AND session_id=?3
+              AND lifecycle_state='starting' AND creator_identity_os_pid=?4
+              AND creator_identity_os_boot_id=?5 AND creator_identity_os_pid_starttime_ticks=?6)",
+                params![
+                    generation.to_string(),
+                    invocation,
+                    target,
+                    live.os_pid,
+                    live.os_boot_id,
+                    live.os_pid_starttime_ticks
+                ],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if session != Some(target.as_str()) || !registered {
+            return Err("headless submission missing exact runtime registration".into());
+        }
+        begin_headless_submission_on(&tx, attempt, target, invocation, *anchor)?;
+        drop(statement);
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn record_delivery_observation_error(
@@ -4348,7 +4372,10 @@ impl MailboxDb {
     }
 
     /// Replay only retained native evidence, never infer receipt from terminal state.
-    pub fn project_confirmed_native_delivery_receipt(&self, attempt_id: &str) -> Result<(), String> {
+    pub fn project_confirmed_native_delivery_receipt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<(), String> {
         let (invocation, session, confirmed): (String,String,String) = self.conn.query_row(
             "SELECT delivery_invocation_uuid,session_id,observation_confirmed_at
             FROM mailbox_delivery_attempts WHERE attempt_id=?1 AND observation_confirmed_at IS NOT NULL",
@@ -5296,6 +5323,15 @@ impl MailboxDb {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualWakeCoordination {
+    Absent,
+    Released,
+    NativeBusy,
+    LegacyLiveBusy,
+    UnknownCustody,
+}
+
 impl WakeSessionRepository<'_> {
     pub fn upsert_session_metadata(
         &mut self,
@@ -5568,6 +5604,26 @@ impl SessionAdmissionRepository<'_> {
             .map_err(|err| format!("Failed to begin exact session admission launch: {err}"))
     }
 
+    pub fn requeue_unmaterialized(
+        &mut self,
+        registration: &str,
+        token: &str,
+        session: &str,
+    ) -> Result<(), String> {
+        validate_session_admission_identity(session, "session_id")?;
+        let changed = self.conn.execute("UPDATE session_admission_queue
+            SET session_id=?3, state='queued', queue_reason='target_changed',
+                claim_token=NULL, claimed_at_unix_ms=NULL,
+                queue_sequence=(SELECT COALESCE(MAX(queue_sequence),0)+1 FROM session_admission_queue)
+            WHERE registration_identity=?1 AND claim_token=?2 AND state='launching'
+                AND runtime_generation_uuid IS NULL", params![registration, token, session])
+            .map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("session retarget lost unmaterialized authority".into());
+        }
+        Ok(())
+    }
+
     pub fn bind_session(
         &mut self,
         registration_identity: &str,
@@ -5651,7 +5707,9 @@ impl WakeSessionRepository<'_> {
     ) -> Result<WakeClaimAcquireResult, String> {
         let now = now_rfc3339();
         let tx = begin_wake_claim_transaction(self.conn)?;
-        if wake_claim_runtime_is_busy_tx(&tx, input.session_id)? {
+        if session_admission_intent_on(&tx, input.session_id)?
+            || wake_claim_runtime_is_busy_tx(&tx, input.session_id)?
+        {
             commit_empty_wake_claim_transaction(tx)?;
             return Ok(WakeClaimAcquireResult::Busy);
         }
@@ -5694,6 +5752,42 @@ impl WakeSessionRepository<'_> {
             )
             .map_err(|err| format!("Failed to release wake claim: {err}"))?;
         Ok(changed > 0)
+    }
+
+    /// Observe and (only for exact releasable legacy claims) release under one
+    /// writer. Native custody is never cancelled by a synchronous command.
+    pub fn coordinate_manual_resume(
+        &mut self,
+        session: &str,
+    ) -> Result<ManualWakeCoordination, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        if let Some(observation) = manual_native_custody_on(&tx, session)? {
+            return Ok(observation);
+        }
+        let Some(claim) = wake_claim_tx(&tx, session)? else {
+            return Ok(ManualWakeCoordination::Absent);
+        };
+        if wake_claim_is_releasable_for_manual_resume(&tx, &claim)? {
+            let changed = tx
+                .execute(
+                    "DELETE FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
+                    params![session, claim.claim_token],
+                )
+                .map_err(|e| e.to_string())?;
+            if changed != 1 {
+                return Err("manual legacy release changed under writer".into());
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(ManualWakeCoordination::Released);
+        }
+        Ok(if wake_claim_has_persisted_process_identity(&tx, &claim)? {
+            ManualWakeCoordination::LegacyLiveBusy
+        } else {
+            ManualWakeCoordination::UnknownCustody
+        })
     }
 
     pub fn release_wake_claim_for_manual_resume(
@@ -9554,7 +9648,7 @@ fn register_completion_event_on(
         insert_completion_event(tx, input, now)?;
         true
     };
-    register_completion_event_listener(
+    completion_continuation::register_notification_listener_on(
         tx,
         input,
         existing.is_some_and(|event| event.state == "triggered")
@@ -9705,44 +9799,6 @@ fn validate_completion_event_registration_replay(
     }
 }
 
-fn register_completion_event_listener(
-    tx: &Transaction<'_>,
-    input: &CompletionEventRegistrationInput<'_>,
-    listeners_frozen: bool,
-    now: &str,
-) -> Result<(), String> {
-    let (Some(session_id), Some(invocation_uuid)) =
-        (input.owner_session_id, input.owner_invocation_uuid)
-    else {
-        return Err("Completion event owner session and invocation are both required".to_string());
-    };
-    if let Some(listener) = completion_event_listener_on(tx, input.event_id, invocation_uuid)? {
-        return validate_completion_event_listener_replay(&listener, session_id, invocation_uuid);
-    }
-    if listeners_frozen {
-        return Err(format!(
-            "Completion event {} cannot register a listener after it was triggered",
-            input.event_id
-        ));
-    }
-    tx.execute(
-        "INSERT OR IGNORE INTO completion_event_listener (
-            event_id, listener_id, session_id, owner_invocation_uuid, active, created_at
-         ) VALUES (?1, ?2, ?3, ?2, ?4, ?5)",
-        params![
-            input.event_id,
-            invocation_uuid,
-            session_id,
-            input.delivery_mode == "async",
-            now,
-        ],
-    )
-    .map_err(|err| format!("Failed to register completion event listener: {err}"))?;
-    let listener = completion_event_listener_on(tx, input.event_id, invocation_uuid)?
-        .ok_or_else(|| "Registered completion listener disappeared".to_string())?;
-    validate_completion_event_listener_replay(&listener, session_id, invocation_uuid)
-}
-
 fn completion_event_listener_on(
     conn: &Connection,
     event_id: &str,
@@ -9859,45 +9915,6 @@ fn validate_completion_event_trigger_replay(
             input.event_id
         ))
     }
-}
-
-fn materialize_completion_event_listeners(
-    tx: &Transaction<'_>,
-    event: &CompletionEventRow,
-    now: &str,
-) -> Result<(), String> {
-    if event.state != "triggered" {
-        return Ok(());
-    }
-    let listeners = completion_event_listeners_on(tx, &event.event_id)?;
-    let listener_count = listeners.len();
-    for listener in listeners.into_iter().filter(|listener| {
-        listener.active && listener.acknowledged_at.is_none() && listener.mailbox_seq.is_none()
-    }) {
-        let handle = completion_listener_mailbox_handle(event, &listener, listener_count);
-        let changed = insert_completion_listener_mailbox_row(tx, event, &listener, &handle, now)?;
-        let row = query_mailbox_by_kind_handle_tx(tx, AGENT_BASH_COMPLETE_KIND, &handle)?
-            .ok_or_else(|| "Completion listener mailbox row disappeared".to_string())?;
-        if changed == 0
-            && (row.session_id != listener.session_id
-                || row.owner_invocation_uuid.as_deref()
-                    != Some(listener.owner_invocation_uuid.as_str())
-                || row.payload_sha256 != event.payload_sha256)
-        {
-            return Err(format!(
-                "Completion event {} mailbox identity conflicts with an existing row",
-                event.event_id
-            ));
-        }
-        tx.execute(
-            "UPDATE completion_event_listener
-             SET mailbox_seq = ?3
-             WHERE event_id = ?1 AND listener_id = ?2 AND mailbox_seq IS NULL",
-            params![event.event_id, listener.listener_id, row.seq],
-        )
-        .map_err(|err| format!("Failed to bind completion listener mailbox row: {err}"))?;
-    }
-    Ok(())
 }
 
 fn completion_listener_mailbox_handle(
@@ -10789,6 +10806,131 @@ fn validate_optional_session_admission_identity(
     }
 }
 
+fn begin_headless_submission_on(
+    conn: &Connection,
+    attempt_id: &str,
+    session_id: &str,
+    invocation_uuid: &str,
+    require_anchor: bool,
+) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE mailbox_delivery_attempts
+             SET submission_started_at = ?4, headless_submission_state = 'possible'
+             WHERE attempt_id = ?1 AND session_id = ?2 AND delivery_invocation_uuid = ?3
+               AND resolved_at IS NULL AND submission_started_at IS NULL
+               AND headless_submission_state = 'prepared'
+               AND NOT EXISTS (SELECT 1 FROM mailbox_observation_stops
+                   WHERE session_id = ?2 AND rearmed_at IS NULL)
+               AND (?5 = 0 OR observation_anchor_token IS NOT NULL)",
+            params![
+                attempt_id,
+                session_id,
+                invocation_uuid,
+                now_rfc3339(),
+                require_anchor
+            ],
+        )
+        .map_err(|err| format!("Failed to fence headless submission: {err}"))?;
+    if changed != 1 {
+        return Err(
+            "headless delivery missing anchor, replaced, or possibly submitted; no launch".into(),
+        );
+    }
+    Ok(())
+}
+
+struct ManualNativeCustodyRow {
+    phase: String,
+    custodian: Option<String>,
+    adopter: Option<String>,
+    driver: Option<String>,
+}
+
+fn manual_native_custody_on(
+    conn: &Connection,
+    session: &str,
+) -> Result<Option<ManualWakeCoordination>, String> {
+    let row: Option<ManualNativeCustodyRow> = conn
+        .query_row(
+            "SELECT a.phase,a.custodian_identity,a.adopter_identity,
+            CASE WHEN o.phase='running' THEN o.driver_identity ELSE NULL END
+         FROM completion_continuation_attempt a LEFT JOIN completion_continuation_owner o
+            ON o.generation=a.owner_generation
+         WHERE a.session_id=?1 AND a.operation='activation'
+            AND (a.phase NOT IN ('drained','never_started') OR a.integrated != 1)",
+            [session],
+            |r| {
+                Ok(ManualNativeCustodyRow {
+                    phase: r.get(0)?,
+                    custodian: r.get(1)?,
+                    adopter: r.get(2)?,
+                    driver: r.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(ManualNativeCustodyRow {
+        phase,
+        custodian,
+        adopter,
+        driver,
+    }) = row
+    else {
+        return Ok(None);
+    };
+    // Owner succession never frees debt. A live original custodian/adopter can
+    // still discharge unknown-custody rows; the successor driver cannot.
+    let driver = if phase == "unknown_custody" {
+        None
+    } else {
+        driver
+    };
+    for encoded in [custodian, adopter, driver].into_iter().flatten() {
+        let Ok(identity) =
+            serde_json::from_str::<crate::completion_continuation::SourceProcessIdentity>(&encoded)
+        else {
+            continue;
+        };
+        if let Some(live) = pid_identity::read_live_process_identity(identity.pid)?
+            && live.os_boot_id == identity.boot_id
+            && live.os_pid_starttime_ticks == identity.starttime_ticks
+        {
+            return Ok(Some(ManualWakeCoordination::NativeBusy));
+        }
+    }
+    Ok(Some(ManualWakeCoordination::UnknownCustody))
+}
+
+/// Shared sidecar arbitration: an existing command precedes a new automatic turn.
+/// Exact process observation, never queue age, decides whether an intent is live.
+fn session_admission_intent_on(conn: &Connection, session: &str) -> Result<bool, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT launcher_os_pid, launcher_os_boot_id,
+        launcher_os_pid_starttime_ticks FROM session_admission_queue
+        WHERE session_id=?1 AND state IN ('queued','admitted','launching')",
+        )
+        .map_err(|e| e.to_string())?;
+    let identities = statement
+        .query_map([session], |row| {
+            Ok(ProcessIdentity {
+                os_pid: row.get(0)?,
+                os_boot_id: row.get(1)?,
+                os_pid_starttime_ticks: row.get(2)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for identity in identities {
+        let identity = identity.map_err(|e| e.to_string())?;
+        if pid_identity::read_live_process_identity(identity.os_pid)?.as_ref() == Some(&identity) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn next_session_admission_on(conn: &Connection) -> Result<Option<String>, String> {
     conn.query_row(
         "SELECT admission.registration_identity
@@ -10802,6 +10944,31 @@ fn next_session_admission_on(conn: &Connection) -> Result<Option<String>, String
                    WHERE generation.session_id = admission.session_id
                      AND generation.lifecycle_state != 'exited'
                )
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM completion_continuation_attempt native
+               WHERE native.session_id = admission.session_id
+                 AND native.operation = 'activation'
+                 AND (native.phase NOT IN ('drained', 'never_started') OR native.integrated != 1)
+                 AND NOT (
+                     native.phase IN ('accepted', 'starting', 'running')
+                     AND native.launcher_identity IS NOT NULL
+                     AND json_extract(native.launcher_identity, '$.pid') = admission.launcher_os_pid
+                     AND json_extract(native.launcher_identity, '$.boot_id') = admission.launcher_os_boot_id
+                     AND json_extract(native.launcher_identity, '$.starttime_ticks') = admission.launcher_os_pid_starttime_ticks
+                     AND EXISTS (SELECT 1 FROM session_wake_claim claim
+                         WHERE claim.session_id = native.session_id AND claim.claim_token = native.claim_token)
+                 )
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM session_wake_claim claim
+               WHERE claim.session_id = admission.session_id
+                 AND NOT (claim.wake_pid IS NOT NULL
+                     AND claim.wake_os_boot_id IS NOT NULL
+                     AND claim.wake_os_pid_starttime_ticks IS NOT NULL
+                     AND claim.wake_pid = admission.launcher_os_pid
+                     AND claim.wake_os_boot_id = admission.launcher_os_boot_id
+                     AND claim.wake_os_pid_starttime_ticks = admission.launcher_os_pid_starttime_ticks)
            )
          ORDER BY admission.queue_sequence ASC
          LIMIT 1",
@@ -12409,7 +12576,15 @@ mod tests {
                     MailboxDb::open(&sidecar_path).map(SidecarHandle::Mailbox)
                 };
                 result_tx
-                    .send(handle.as_ref().map(|_| ()).map_err(Clone::clone))
+                    .send(handle.as_ref().map_err(Clone::clone).and_then(|handle| {
+                        match handle {
+                            SidecarHandle::Mailbox(mailbox) => mailbox.conn.query_row(
+                                "SELECT generation_uuid, (SELECT user_version FROM pragma_user_version) FROM mailbox_sidecar_identity WHERE singleton=1",
+                                [], |row| Ok(Some((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))),
+                            ).map_err(|error| error.to_string()),
+                            SidecarHandle::Pid(_) => Ok(None),
+                        }
+                    }))
                     .unwrap();
                 release.wait();
                 match handle {
@@ -12429,11 +12604,31 @@ mod tests {
         }
 
         assert_eq!(results.len(), STARTUPS);
+        let identities = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok().and_then(|id| id.as_ref()))
+            .collect::<Vec<_>>();
+        if let Some(first) = identities.first() {
+            assert_eq!(first.1, schema::CURRENT_VERSION);
+            assert!(
+                identities.iter().all(|identity| *identity == *first),
+                "different committed schema/namespace identities: {identities:?}"
+            );
+        }
+        let identity_count = identities.len();
         let failures = results
             .into_iter()
             .filter_map(Result::err)
             .collect::<Vec<_>>();
         assert!(failures.is_empty(), "startup failures: {failures:#?}");
+        assert_eq!(
+            identity_count,
+            if mixed_pid_handles {
+                STARTUPS / 2
+            } else {
+                STARTUPS
+            }
+        );
     }
 
     #[test]
@@ -13839,7 +14034,7 @@ mod tests {
             ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
             )
             .unwrap();
-        schema::remove_continuation_schema_for_legacy_fixture(&mailbox.connection());
+        schema::remove_continuation_schema_for_legacy_fixture(mailbox.connection());
         mailbox
             .connection()
             .pragma_update(None, "user_version", 1)
@@ -13952,7 +14147,7 @@ mod tests {
             ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
             )
             .unwrap();
-        schema::remove_continuation_schema_for_legacy_fixture(&mailbox.connection());
+        schema::remove_continuation_schema_for_legacy_fixture(mailbox.connection());
         mailbox
             .connection()
             .pragma_update(None, "user_version", 1)

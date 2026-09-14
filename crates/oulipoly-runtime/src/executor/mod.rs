@@ -67,7 +67,7 @@ pub struct ExecutionResult {
     pub stdout: Vec<u8>,
     pub stderr: String,
     /// External-provider output custody: complete on normal launches, explicitly
-    /// incomplete after live attachment abort or missing final event. Complete-stream APIs reject partial
+    /// incomplete after live publication/attachment abort or missing final event. Complete-stream APIs reject partial
     /// custody; failed retention writes `<invocation_uuid>.partial.{stdout,stderr}`.
     /// `stdout` and `stderr` remain bounded diagnostics when a spool is present.
     pub output_spool: Option<ExecutionOutputSpool>,
@@ -102,10 +102,22 @@ impl ExecutionResult {
                 "runtime_generation_attach_failed"
                     | "runtime_generation_exit_failed"
                     | "external_provider_missing_final_exit"
+                    | "live_session_authority_publication_failed"
             )
         ) {
             return Ok(());
         }
+        self.retain_produced_evidence(state, invocation_id, invocation_uuid)
+    }
+
+    /// Retain output/reference custody independently of session authority or success.
+    /// Callers rejecting authority still owe both attempts; storage can fail.
+    pub fn retain_produced_evidence(
+        &self,
+        state: &oulipoly_state::StateDb,
+        invocation_id: i64,
+        invocation_uuid: &str,
+    ) -> Result<(), &'static str> {
         let artifacts = state.record_returned_artifacts(
             state.invocation_mutation_scope(invocation_id).authority(),
             invocation_id,
@@ -286,6 +298,21 @@ impl Default for RuntimeExecutorService {
 }
 
 impl ExecutorServicePort for RuntimeExecutorService {
+    fn execute_with_live_session_authority(
+        &self,
+        request: ExecutorServiceRequest,
+        authority: crate::services::LiveSessionAuthorityTarget,
+    ) -> Result<ExecutorServiceOutput, ServiceError> {
+        let registry = self.provider_registry.current();
+        if !request_has_account_endpoint(&registry, &request) {
+            return self.execute(request);
+        }
+        let mut context = external_provider_context_from_request(request)?;
+        context.live_session_authority = Some(authority);
+        external_provider::dispatch(&registry, context)
+            .map(|result| ExecutorServiceOutput { result })
+    }
+
     fn execute(
         &self,
         request: ExecutorServiceRequest,

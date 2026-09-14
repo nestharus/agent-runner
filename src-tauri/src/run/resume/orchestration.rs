@@ -174,31 +174,102 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
         }
         attempts += 1;
 
-        match run_resume_attempt(ResumeAttemptInput {
-            agent_runtime_services: input.agent_runtime_services,
-            env: &input.prepared.env,
-            resolved: &mut input.prepared.resolved,
-            answer: input.prepared.answer.as_deref(),
-            mailbox_session_id: &input.prepared.mailbox_session_id,
-            mailbox_delivery_seqs: &input.prepared.mailbox_delivery_seqs,
-            mailbox_delivery_nonce: input.prepared.mailbox_delivery_nonce.as_deref(),
-            mailbox_delivery_requires_turn_confirmation: input
-                .prepared
-                .mailbox_delivery_requires_turn_confirmation,
-            manual_migrate: input.manual_migrate,
-            reservation: input.reservation,
-            session_id: input.session_id,
-            working_dir: input.working_dir,
-            attempts,
-            max_attempts,
-            parent_invocation_id: super::parent_invocation_row_id(
-                input.prepared.parent_invocation_id,
-                input.reservation,
-            ),
-            effective_spawn_cwd: &input.prepared.effective_spawn_cwd,
-            zero_turn_confirmation: &mut zero_turn_confirmation,
-            provider_prompt_accepted: &mut input.prepared.provider_prompt_accepted,
-        })? {
+        let registration = super::composite_invocation_id(
+            &input.prepared.resolved.active_provider,
+            input.reservation,
+        )
+        .id;
+        let mut admitted_session = input.prepared.resolved.active_session_id.clone();
+        let mut admission =
+            crate::wake_coordinator::admit_session_launch(&registration, Some(&admitted_session))?;
+        // A chain can advance during the queued wait. Refresh before publishing
+        // tokenized input or selecting a notification batch, not afterward.
+        if attempts == 1 {
+            loop {
+                execution::refresh_admitted_resume(
+                    input.agent_runtime_services,
+                    input.prepared,
+                    input.session_id,
+                    input.working_dir,
+                )?;
+                if input.prepared.resolved.active_session_id == admitted_session {
+                    break;
+                }
+                admitted_session = input.prepared.resolved.active_session_id.clone();
+                admission = admission.retarget(&admitted_session)?;
+            }
+        }
+        wake::reset_manual_resume_wake_claim(&admitted_session)?;
+        let mut target = crate::resume_cli::renderable_resume_execution_target(
+            &input.prepared.resolved,
+            &input.prepared.env.providers_cfg,
+        )
+        .map_err(|code| format!("resume target unavailable: {code}"))?;
+        if super::migration_allowed(input.reservation) {
+            super::migration::migrate_resume_target(
+                input.agent_runtime_services,
+                &input.prepared.env,
+                &mut input.prepared.resolved,
+                &mut target,
+                input.manual_migrate,
+                attempts,
+                &input.prepared.effective_spawn_cwd,
+            )
+            .map_err(|code| format!("resume migration failed: {code}"))?;
+        }
+        while input.prepared.resolved.active_session_id != admitted_session {
+            admitted_session = input.prepared.resolved.active_session_id.clone();
+            admission = admission.retarget(&admitted_session)?;
+            execution::refresh_admitted_resume(
+                input.agent_runtime_services,
+                input.prepared,
+                input.session_id,
+                input.working_dir,
+            )?;
+            target = crate::resume_cli::renderable_resume_execution_target(
+                &input.prepared.resolved,
+                &input.prepared.env.providers_cfg,
+            )
+            .map_err(|code| format!("migrated resume target unavailable: {code}"))?;
+        }
+        execution::prepare_admitted_delivery(input.prepared)?;
+        if crate::wake_coordinator::is_auto_wake_invocation()
+            && input.prepared.mailbox_delivery_seqs.is_empty()
+            && input.prepared.answer.is_none()
+        {
+            wake::release_current_auto_wake_claim(input.session_id);
+            return Ok(0);
+        }
+        let _admission = admission;
+        match run_resume_attempt(
+            ResumeAttemptInput {
+                agent_runtime_services: input.agent_runtime_services,
+                env: &input.prepared.env,
+                resolved: &mut input.prepared.resolved,
+                answer: input.prepared.answer.as_deref(),
+                mailbox_session_id: &input.prepared.mailbox_session_id,
+                mailbox_delivery_seqs: &input.prepared.mailbox_delivery_seqs,
+                mailbox_delivery_nonce: input.prepared.mailbox_delivery_nonce.as_deref(),
+                mailbox_delivery_requires_turn_confirmation: input
+                    .prepared
+                    .mailbox_delivery_requires_turn_confirmation,
+                manual_migrate: input.manual_migrate,
+                reservation: input.reservation,
+                session_id: input.session_id,
+                working_dir: input.working_dir,
+                attempts,
+                max_attempts,
+                parent_invocation_id: super::parent_invocation_row_id(
+                    input.prepared.parent_invocation_id,
+                    input.reservation,
+                ),
+                effective_spawn_cwd: &input.prepared.effective_spawn_cwd,
+                zero_turn_confirmation: &mut zero_turn_confirmation,
+                provider_prompt_accepted: &mut input.prepared.provider_prompt_accepted,
+            },
+            target,
+            &registration,
+        )? {
             ResumeAttemptLoopControl::Continue(exit_code) => last_exit_code = exit_code,
             ResumeAttemptLoopControl::Return(exit_code) => return Ok(exit_code),
         }
@@ -233,11 +304,10 @@ pub(super) enum ResumeAttemptLoopControl {
 
 fn run_resume_attempt(
     mut input: ResumeAttemptInput<'_>,
+    target: crate::resume_cli::ResumeExecutionTarget,
+    registration_identity: &str,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    let target = match prepare_resume_attempt_target(&mut input)? {
-        Ok(target) => target,
-        Err(exit_code) => return Ok(ResumeAttemptLoopControl::Return(exit_code)),
-    };
+    execution::validate_reserved_resume_options(input.reservation, input.manual_migrate)?;
     let provider_index = target.provider_index;
     let provider = target.provider;
     let account_endpoint_configured = input
@@ -249,20 +319,17 @@ fn run_resume_attempt(
         Ok(strategy) => strategy,
         Err(exit_code) => return Ok(ResumeAttemptLoopControl::Return(exit_code)),
     };
-    let mut bound_attempt =
-        lifecycle::setup_bound_resume_attempt(&input, &provider, provider_index)?;
+    let mut bound_attempt = lifecycle::setup_bound_resume_attempt_with_identity(
+        &input,
+        &provider,
+        provider_index,
+        registration_identity,
+    )?;
     wake::bind_headless_resume_delivery_attempt(
         &input,
         &provider,
         &bound_attempt.attempt.invocation.id,
     )?;
-    let _admission = crate::wake_coordinator::admit_session_launch(
-        &bound_attempt.attempt.invocation.id,
-        Some(&bound_attempt.provider_session_id),
-    )?;
-
-    wake::begin_headless_delivery_submission(&input, &bound_attempt.attempt.invocation.id)?;
-
     let _receipt_observer = if input.mailbox_delivery_seqs.is_empty() {
         None
     } else {
@@ -279,6 +346,11 @@ fn run_resume_attempt(
         )
     } else {
         execution::execute_resume_attempt_command(
+            oulipoly_runtime::services::LiveSessionAuthorityTarget {
+                state_path: input.env.state.path().to_path_buf(),
+                invocation_row_id: bound_attempt.attempt.invocation_row_id,
+                invocation_uuid: bound_attempt.attempt.invocation.id.clone(),
+            },
             &input,
             &provider,
             provider_index,
@@ -297,13 +369,38 @@ fn run_resume_attempt(
         }
     };
 
-    lifecycle::commit_resume_session_authority(
+    if let Err(error) = lifecycle::commit_resume_session_authority(
         &input,
         &bound_attempt.attempt,
         &provider,
         &result,
         account_endpoint_configured,
-    )?;
+    ) {
+        let error = super::super::authority_rejection::retain_and_finalize(
+            super::super::authority_rejection::RejectedResult {
+                service: input
+                    .agent_runtime_services
+                    .invocation_lifecycle_service
+                    .as_ref(),
+                state: &input.env.state,
+                invocation_row_id: bound_attempt.attempt.invocation_row_id,
+                invocation_uuid: &bound_attempt.attempt.invocation.id,
+                guard: &mut bound_attempt.attempt.guard,
+                result: &result,
+                launch_owner: bound_attempt
+                    .attempt
+                    .allocation
+                    .as_ref()
+                    .map(|allocation| &allocation.lease.owner),
+            },
+            error,
+        );
+        // Failure bookkeeping must not preempt the already-produced evidence handoff.
+        if let Err(bookkeeping) = wake::record_failed_mailbox_delivery_attempt(&input, &error) {
+            formatter::emit_stderr(&bookkeeping);
+        }
+        return Err(error);
+    }
 
     let control = terminal::handle_resume_attempt_result(
         &mut input,
@@ -332,14 +429,8 @@ fn prepare_resume_wake(session_id: &str) -> Result<Option<i32>, String> {
     if let Some(exit_code) = wake::validate_auto_wake_child(session_id)? {
         return Ok(Some(exit_code));
     }
-    wake::reset_manual_resume_wake_claim(session_id)?;
-    Ok(None)
-}
 
-fn prepare_resume_attempt_target(
-    input: &mut ResumeAttemptInput<'_>,
-) -> Result<Result<crate::resume_cli::ResumeExecutionTarget, i32>, String> {
-    execution::prepare_resume_attempt_target(input)
+    Ok(None)
 }
 
 fn resolve_resume_attempt_strategy(

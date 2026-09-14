@@ -46,6 +46,23 @@ pub(crate) struct SessionAdmissionGuard {
     run_post_settlement_sweep: bool,
 }
 
+impl SessionAdmissionGuard {
+    pub(crate) fn retarget(mut self, session: &str) -> Result<Self, String> {
+        let mut db = MailboxDb::open(&self.mailbox_path)?;
+        db.session_admissions().requeue_unmaterialized(
+            &self.registration_identity,
+            &self.claim_token,
+            session,
+        )?;
+        // Drop must not settle or sweep the requeued command.
+        self.run_post_settlement_sweep = false;
+        let identity = self.registration_identity.clone();
+        drop(db);
+        drop(self);
+        enqueue_and_wait(&identity, Some(session))
+    }
+}
+
 impl Drop for SessionAdmissionGuard {
     fn drop(&mut self) {
         let settled = MailboxDb::open(&self.mailbox_path).and_then(|mut db| {
@@ -121,6 +138,27 @@ fn enqueue_and_wait_at_with_memory_observer(
                 row.state, row.queue_reason
             ));
         }
+        if !super::is_auto_wake_invocation()
+            && let Some(session) = session_id
+        {
+            use oulipoly_state::mailbox::ManualWakeCoordination;
+            let observation = db.wake_sessions().coordinate_manual_resume(session);
+            if matches!(
+                observation,
+                Ok(ManualWakeCoordination::UnknownCustody) | Err(_)
+            ) {
+                db.session_admissions().cancel_queued(
+                    registration_identity,
+                    &admission_id,
+                    "manual_custody_unavailable",
+                    unix_time_ms()?,
+                )?;
+                return Err(match observation {
+                    Err(error) => error,
+                    _ => "manual resume cannot establish retained wake custody".into(),
+                });
+            }
+        }
         if let Some(claim_token) = admitted_claim_token(&row)
             && db.session_admissions().begin_launch(
                 registration_identity,
@@ -173,18 +211,14 @@ fn enqueue_and_wait_at_with_memory_observer(
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    report_queued_status(
+                    let mut db = MailboxDb::open(mailbox_path)?;
+                    db.session_admissions().cancel_queued(
                         registration_identity,
-                        QueueStatus {
-                            reason: "coordination_unavailable".to_string(),
-                            sequence: row.queue_sequence,
-                        },
-                        &mut reported,
-                    );
-                    tracing::warn!(
-                        registration_identity,
-                        "Session admission retry retained: {error}"
-                    );
+                        &admission_id,
+                        "coordination_unavailable",
+                        unix_time_ms()?,
+                    )?;
+                    return Err(error);
                 }
             }
         }

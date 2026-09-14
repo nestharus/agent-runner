@@ -65,8 +65,15 @@ pub(crate) fn entry(once: bool) -> Result<(), String> {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) enum AdmissionPurpose {
+    StartupOpportunistic,
+    TerminalBounded,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Target {
     pub attempt_id: String,
+    pub admission_purpose: AdmissionPurpose,
     pub anchor_identity: String,
     pub model_name: String,
     pub cwd: std::path::PathBuf,
@@ -260,7 +267,19 @@ fn inspect_target(target: Target) -> Result<(), String> {
     // bounded opportunity after a contending scanner releases admission. Do not
     // equate a skipped scan with absence of native evidence at turn completion.
     // This wait is inside the contained helper, below its 30s stall watchdog.
-    let admission = wait_for_scan_admission(try_scan_admission, Duration::from_secs(5))?;
+    let admission = match target.admission_purpose {
+        AdmissionPurpose::StartupOpportunistic => {
+            let Some(admission) = try_scan_admission()? else {
+                // Completion of this opportunity is not evidence of receipt or
+                // non-submission. The caller retains pending state for recovery.
+                return Ok(());
+            };
+            admission
+        }
+        AdmissionPurpose::TerminalBounded => {
+            wait_for_scan_admission(try_scan_admission, Duration::from_secs(5))?
+        }
+    };
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };

@@ -84,6 +84,43 @@ def repair_barrier(root, driver, event, start):
     return None
 
 
+def activation_output_obligations(root, terminal, expected):
+    """Launcher output, provider outcome and physical wait are distinct from ACK."""
+    state_db = root / 'data/state.db'
+    attempts = [a for a in terminal['completion_continuation_attempt'] if a['operation'] == 'activation']
+    evidence = []
+    for attempt in attempts:
+        # Resolve only this case's retained synthetic attempt, not arbitrary DB paths.
+        directory = root / 'data/completion-continuation' / attempt['domain_id'] / 'attempts' / attempt['claim_token']
+        stdout = (directory / 'launcher.stdout').read_bytes()
+        stderr = (directory / 'launcher.stderr').read_bytes()
+        invocation = rows(state_db, 'SELECT * FROM invocations WHERE invocation_uuid=?', (attempt['spawn_invocation_uuid'],))
+        delivery = rows(state_db, 'SELECT * FROM invocation_output_deliveries WHERE invocation_uuid=?', (attempt['spawn_invocation_uuid'],))
+        controls = [json.loads(line.split(b'=', 1)[1]) for line in stderr.splitlines() if line.startswith(b'OULIPOLY_RESULT=')]
+        retained = root / 'data/invocations/output' / (attempt['spawn_invocation_uuid'] + '.stdout')
+        evidence.append(dict(attempt=attempt, native_result=json.loads((directory / 'result.json').read_text()),
+                             stdout_hex=stdout.hex(), stderr_hex=stderr.hex(), controls=controls,
+                             invocation=invocation, delivery=delivery, retained_stdout_hex=retained.read_bytes().hex()))
+    (root / 'activation-output-obligations.json').write_text(json.dumps(evidence, indent=2))
+    assert len(attempts) == int(expected), ('activation count/replay', len(attempts), expected)
+    for observed in evidence:
+        receipt = observed['native_result']
+        assert receipt['root_exit_code'] == 0 and receipt['root_wait_status'] == 0, ('activation terminal failure', receipt)
+        assert receipt['owned_children'] == 'ECHILD' and receipt['spawn_error'] is None and receipt['accepted_cancellation'] is None
+        assert observed['attempt']['phase'] == 'drained' and observed['attempt']['integrated'] == 1
+        assert observed['stdout_hex'] == b'native resumed\n'.hex() == observed['retained_stdout_hex'], 'activation output not delivered'
+        assert len(observed['invocation']) == 1 and len(observed['delivery']) == 1
+        invocation, delivery = observed['invocation'][0], observed['delivery'][0]
+        assert invocation['status'] == 'succeeded' and invocation['exit_code'] == 0
+        assert delivery['provider_outcome_state'] == 'settled' and delivery['delivery_state'] == 'delivered'
+        assert delivery['delivered_at'] and delivery['delivery_failure_stage'] is None and delivery['delivery_failure_kind'] is None
+        assert delivery['stdout_bytes'] == 15 and delivery['stdout_sha256'] == hashlib.sha256(b'native resumed\n').hexdigest()
+        assert len(observed['controls']) == 1, 'missing or repeated final control'
+        control = observed['controls'][0]
+        assert control['id'] == invocation['invocation_uuid'] and control['success'] and control['exit_code'] == 0
+        assert 'stale_or_missing_provider_launch_owner_fence' not in bytes.fromhex(observed['stderr_hex']).decode()
+
+
 def case(stage, mode, owner_kind=None):
     root = stage / (f'{owner_kind}-{mode}' if owner_kind else mode)
     root.mkdir()
@@ -119,6 +156,14 @@ executable="{wrapper}"
                AGE360_NATIVE_WAKE_MARKER=str(root / 'resume-prompts.jsonl'),
                AGE360_NATIVE_WAKE_GATE=str(root / 'release-resume'),
                AGE360_WORKLOAD_GATE=str(root / 'release-workload'))
+    if mode == 'detach-lost-reply':
+        env['AGE360_DROP_ACTIVATION_REPLY'] = str(root / 'activation-reply-lost')
+    detached = mode.startswith("detach-")
+    projection_fault = mode == 'async-projection-fault'
+    if projection_fault:
+        env.update(AGE360_SQLITE_SYMBOLS=str(stage / 'sqlite-symbols.txt'),
+                   AGE360_SQL_AUDIT=str(root / 'sql-audit.tsv'),
+                   AGE360_PROJECTION_FAULT=str(root / 'projection-fault-observed'))
     founder = None
     coordinated = (stage / "coordinated-idle-replacement").exists()
     if owner_kind:
@@ -181,6 +226,9 @@ CREATE TRIGGER e2e_listener_insert AFTER INSERT ON completion_event_listener BEG
 CREATE TRIGGER e2e_listener_update AFTER UPDATE OF active ON completion_event_listener BEGIN
  INSERT INTO e2e_listener_audit(operation,event_id,listener_id,old_active,new_active,at) VALUES('update',NEW.event_id,NEW.listener_id,OLD.active,NEW.active,strftime('%Y-%m-%dT%H:%M:%fZ','now')); END;
 ''')
+    if projection_fault:
+        with sqlite3.connect(db) as c:
+            c.executescript("CREATE TRIGGER e2e_reject_projection BEFORE UPDATE OF state ON completion_event WHEN NEW.state='triggered' BEGIN SELECT e2e_projection_fault(); END;")
     if owner_kind:
         with sqlite3.connect(db) as c:
             c.executescript('''
@@ -205,11 +253,72 @@ CREATE TRIGGER e2e_listener_writer AFTER INSERT ON e2e_listener_audit BEGIN
         wait(lambda: Path(f'/proc/{driver}/stat').read_text().rsplit(')', 1)[1].split()[0] == 'T', 'private driver stopped before admission')
     (root / 'hold-mcp-admission').unlink()
     source = wait(lambda: rows(db, 'SELECT * FROM completion_continuation_source'), 'source admission')[0]
-    (root / 'release-workload').touch()
-    (root / 'release-resume').touch()
+    if mode not in ('detach-before', 'detach-race'):
+        (root / 'release-workload').touch()
     wait(lambda: (root / 'mcp-response-received').exists(), 'actual MCP response')
+    if projection_fault:
+        wait(lambda: (root / 'projection-fault-observed').exists(), 'actual projection failure')
+        handle_dir = root / 'spool/agent-bash' / source['event_id']
+        assert (handle_dir / 'completion-snapshot-v2.json').exists()
+        assert (handle_dir / 'source-outcome-v2.json').exists()
+        failed_projection = dict(source=rows(db, 'SELECT * FROM completion_continuation_source'),
+                                 listeners=rows(db, 'SELECT * FROM completion_event_listener'),
+                                 events=rows(db, 'SELECT * FROM completion_event'), mailbox=rows(db, 'SELECT * FROM mailbox'))
+        assert failed_projection['source'][0]['phase'] == 'registered'
+        assert failed_projection['events'][0]['state'] == 'pending'
+        assert not failed_projection['mailbox']
+        assert failed_projection['listeners'][0]['acknowledged_at'] is None
+        (root / 'failed-projection.json').write_text(json.dumps(failed_projection, default=str, indent=2))
+        with sqlite3.connect(db) as c:
+            c.execute('DROP TRIGGER e2e_reject_projection')
     wait(lambda: rows(db, "SELECT * FROM completion_continuation_source WHERE phase='accepted'"), 'accepted source')
+    independent = mode == 'sync-independent'
+    if independent:
+        original_owner = owner_evidence(db, stage / 'runner')
+        (root / 'release-initial-provider').touch()
+        assert proc.wait(timeout=45) == 0
+        guardian = original_owner['actors']['guardian_identity']['identity']['pid']
+        waited = wait(lambda: (result if (result := os.waitpid(guardian, os.WNOHANG))[0] else None),
+                      'original owner retirement before independent resume')
+        assert waited == (guardian, 0)
+        (root / 'independent-retirement.json').write_text(json.dumps(dict(owner=original_owner, guardian_wait=waited), indent=2))
+        # A new native actor acquires its own live capability. The fixture does
+        # not forge a listener or impersonate the immutable source owner.
+        with open(root / 'listener.stdout', 'wb') as out, open(root / 'listener.stderr', 'wb') as err:
+            listener_proc = subprocess.Popen([stage / 'runner', '--resume', SESSION, '--models-dir', models,
+                'synthetic independent listener'], env=env, cwd=root, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+            listener_rc = listener_proc.wait(timeout=45)
+        if listener_rc != 0:
+            rejected = json.loads((root / 'independent-listener-result.json').read_text())
+            reply = json.loads(rejected['stdout'])
+            assert rejected['rc'] == 1 and reply['status'] == 'unavailable'
+            assert 'has no authoritative session binding for completion registration' in reply['message'], reply
+            actor = json.loads((root / 'independent-admission-before.json').read_text())
+            assert actor['runtime_session'] == SESSION
+            assert actor['actor']['provider_session_id'] is None and actor['actor']['session_id'] is None
+            assert actor['actor']['invocation_uuid'] == rejected['invocation']
+            retained = rows(db, 'SELECT * FROM completion_event_listener')
+            assert len(retained) == 1 and retained[0]['active'] == 0
+            assert retained[0]['acknowledged_at'] is None and retained[0]['mailbox_seq'] is None
+            assert len(rows(db, 'SELECT * FROM completion_continuation_source')) == 1
+            assert (root / 'source-launches').read_bytes() == b'launch\n'
+            assert json.loads((root / 'sync-byte-response.json').read_text())['output'] == 'paired-source-output'
+            (root / 'independent-admission-red.json').write_text(json.dumps(dict(
+                reply=reply, before=actor, retained_listeners=retained), indent=2))
+            print(json.dumps(dict(mode=mode, result='INDEPENDENT_LISTENER_ADMISSION_RED',
+                                  reason=reply['message'])), flush=True)
+            return True
+        wait(lambda: len(rows(db, 'SELECT * FROM completion_event_listener')) == 2, 'independent listener admitted')
     before = rows(db, 'SELECT * FROM completion_event_listener')
+    if detached:
+        assert len(before) == 1 and before[0]['active'] == 1
+        assert before[0]['acknowledged_at'] is None, 'handoff must not fabricate ACK'
+        assert len(rows(db, 'SELECT * FROM completion_continuation_source')) == 1
+        assert len(rows(db, 'SELECT * FROM mailbox')) == 1
+        request = rows(db, 'SELECT * FROM completion_continuation_notification')[0]
+        assert request['requested_at'] and request['request_basis'] == 'explicit_listener_activation_unattributed'
+        (root / 'accepted-handoff.json').write_text(json.dumps(dict(listeners=before, request=request), indent=2))
+    (root / 'release-resume').touch()
     if owner_kind:
         # Require NEW observed post-response repair, not generation or silence.
         (root / 'fixed-acceptance-before-repair.json').write_text(json.dumps(dict(
@@ -230,7 +339,7 @@ CREATE TRIGGER e2e_listener_writer AFTER INSERT ON e2e_listener_audit BEGIN
         (root / 'owner-before.json').write_text(json.dumps(owner_before_release, indent=2))
     (root / 'release-initial-provider').touch()
     assert proc.wait(timeout=45) == 0, 'native initial failed'
-    if mode == 'async' or (owner_kind and rows(db, 'SELECT * FROM completion_event_listener WHERE active=1')):
+    if mode == 'async' or projection_fault or detached or independent or (owner_kind and rows(db, 'SELECT * FROM completion_event_listener WHERE active=1')):
         wait(lambda: (root / 'recipient-byte-receipt.json').exists(), 'actual same-session notification receipt')
         wait(lambda: rows(db, 'SELECT * FROM completion_event_listener WHERE acknowledged_at IS NOT NULL'), 'listener ACK')
     # Explicit private owner-generation replacement forces durable inventory repair.
@@ -276,14 +385,17 @@ CREATE TRIGGER e2e_listener_writer AFTER INSERT ON e2e_listener_audit BEGIN
         assert admission['operation'] == 'insert' and admission['writer']['sha256'] == digest(stage / 'runner')
     (root / 'terminal.json').write_text(json.dumps(terminal, default=str, indent=2))
     listeners = terminal['completion_event_listener']
-    assert len(listeners) == 1
-    listener = listeners[0]
+    assert len(listeners) == (2 if independent else 1)
+    listener = next(l for l in listeners if l['owner_invocation_uuid'] == json.loads(
+        (root / 'spool/agent-bash' / source['event_id'] / 'source-registration-v2.json').read_text())['owner_invocation_uuid'])
     assert listener['session_id'] == SESSION
     assert terminal['completion_continuation_source'][0]['phase'] == 'accepted'
     handle_dir = root / 'spool/agent-bash' / listener['event_id']
     registration = json.loads((handle_dir / 'source-registration-v2.json').read_text())
     outcome = json.loads((handle_dir / 'source-outcome-v2.json').read_text())
-    assert registration['delivery_mode'] == mode
+    assert registration['delivery_mode'] == ('sync' if detached or independent else 'async' if projection_fault else mode)
+    if detached:
+        assert registration == json.loads((root / 'registration-before-detach.json').read_text())
     assert registration['owner_session_id'] == listener['session_id']
     assert registration['owner_invocation_uuid'] == listener['owner_invocation_uuid']
     assert registration['helper']['sha256'] == digest(stage / 'runner'), 'wrong admitted helper executable'
@@ -295,11 +407,16 @@ CREATE TRIGGER e2e_listener_writer AFTER INSERT ON e2e_listener_audit BEGIN
     audit = (root / 'process-audit.tsv').read_text()
     assert 'notify agent-bash-capability --json' in audit
     assert 'notify agent-bash-register --handle ' + listener['event_id'] in audit
-    assert 'notify agent-bash-activate' not in audit, 'unexpected explicit activation entry'
+    if detached:
+        assert 'notify agent-bash-activate --handle ' + listener['event_id'] in audit
+        assert len(terminal['completion_continuation_source']) == 1, 'helper acquired a workload source'
+    else:
+        assert 'notify agent-bash-activate' not in audit, 'unexpected explicit activation entry'
     (root / 'source-proof.json').write_text(json.dumps({'registration': registration, 'outcome': outcome}, indent=2))
     assert (root / 'source-launches').read_bytes() == b'launch\n', 'original workload replayed'
     duplicate = False
-    if mode == 'sync':
+    handoff_red = mode == 'detach-lost-reply' and not json.loads((root / 'bash-reconciliation.json').read_text())['reconciled']
+    if mode == 'sync' or independent:
         assert json.loads((root / 'sync-byte-response.json').read_text())['output'].encode() == b'paired-source-output'
         receipt = json.loads((handle_dir / 'output-receipt.json').read_text())
         (root / 'local-output-receipt.json').write_text(json.dumps(receipt, indent=2))
@@ -316,6 +433,15 @@ CREATE TRIGGER e2e_listener_writer AFTER INSERT ON e2e_listener_audit BEGIN
             assert activation[0]['writer_pid'] == founded['actors']['driver_identity']['identity']['pid']
             assert activation[0]['owner_generation'] == founded['owner']['generation']
             (root / 'duplicate-proof.json').write_text(json.dumps(dict(listener=listener, activation=activation[0], recipient=received, owner=founded), indent=2))
+        elif independent:
+            assert listener['active'] == 0 and listener['mailbox_seq'] is None and listener['acknowledged_at'] is None
+            other = next(l for l in listeners if l['listener_id'] != listener['listener_id'])
+            assert other['session_id'] == listener['session_id'] and other['active'] == 1
+            assert other['acknowledged_at'] is not None
+            assert len(terminal['mailbox']['rows']) == 1
+            request = next(n for n in terminal['completion_continuation_notification'] if n['listener_id'] == other['listener_id'])
+            assert request['policy'] == 'notify' and request['requested_at'] is None
+            assert json.loads((root / 'recipient-byte-receipt.json').read_text())['output_checked']
         else:
             assert listener['active'] == 0, 'SYNC REGRESSION: same-caller listener activated'
             assert listener['mailbox_seq'] is None and listener['acknowledged_at'] is None
@@ -327,13 +453,14 @@ CREATE TRIGGER e2e_listener_writer AFTER INSERT ON e2e_listener_audit BEGIN
         assert receipt['output_checked'] and receipt['output']['byte_len'] == len(b'paired-source-output')
         assert listener['active'] == 1 and listener['acknowledged_at'] is not None
         assert listener['event_id'] in (root / 'resume-prompts.jsonl').read_text()
+    activation_output_obligations(root, terminal, bool(any(l['acknowledged_at'] for l in listeners)))
     if founder:
         assert founder.poll() is None, 'founding native context died during experiment'
         (root / 'owner-final.json').write_text(json.dumps(owner_evidence(db, owner_binary), indent=2))
         (root / 'release-founder').touch()
         assert founder.wait(timeout=30) == 0
-    print(json.dumps({'owner_kind': owner_kind, 'mode': mode, 'result': 'DUPLICATE_RED' if duplicate else 'PASS', 'listener': listener, 'audit_rows': len(terminal['e2e_listener_audit'])}), flush=True)
-    return duplicate
+    print(json.dumps({'owner_kind': owner_kind, 'mode': mode, 'result': 'BASH_RECONCILIATION_RED' if handoff_red else 'DUPLICATE_RED' if duplicate else 'PASS', 'listener': listener, 'audit_rows': len(terminal['e2e_listener_audit'])}), flush=True)
+    return duplicate or handoff_red
 
 
 def evidence_ignore(directory, names):
@@ -342,7 +469,9 @@ def evidence_ignore(directory, names):
     for name in names:
         path = Path(directory) / name
         mode = path.lstat().st_mode
-        if stat.S_ISSOCK(mode) or stat.S_ISFIFO(mode):
+        if name.endswith(('.db', '.db-wal', '.db-shm', '.db-journal')):
+            ignored.append(name)
+        elif stat.S_ISSOCK(mode) or stat.S_ISFIFO(mode):
             ignored.append(name)
         elif path.is_file() and (path.stat().st_size > 32 * 1024 * 1024 or 'capability' in name or 'environment' in name):
             ignored.append(name)
@@ -353,6 +482,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for arg in ('runner', 'agent-bash', 'bun', 'codex-source', 'bash-source', 'evidence'):
         parser.add_argument('--' + arg, required=True, type=Path)
+    parser.add_argument('--handoff-cases', action='store_true', help='real paired detach before/after/race controls')
     parser.add_argument('--prior-runner', type=Path, help='enables fixed/prior independent-owner contrast')
     parser.add_argument('--coordinated-idle-replacement', action='store_true', help='test normal sole-context release and exact guardian wait BEFORE new admissions; requires prior runner')
     parser.add_argument('--prior-sha256', help='required exact expected prior artifact hash')
@@ -365,6 +495,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='age360-mcp-e2e-') as directory:
         stage = Path(directory)
         identities = {}
+        if args.handoff_cases:
+            assert not args.prior_runner, 'handoff cases require candidate-only owners'
+            (stage / 'handoff-cases').touch()
         if args.coordinated_idle_replacement:
             (stage / 'coordinated-idle-replacement').touch()
         def copy(src, dest):
@@ -375,6 +508,10 @@ def main():
             identities[str(dest.relative_to(stage))] = {'source': str(src), 'sha256': digest(dest)}
         for name, path in [('runner', args.runner), ('agent-bash', args.agent_bash), ('bun', args.bun)]:
             copy(path, stage / name)
+        if args.handoff_cases:
+            nm = subprocess.run(['nm', str(stage / 'runner')], capture_output=True, text=True, check=True)
+            symbols = {parts[2]: parts[0] for line in nm.stdout.splitlines() if len(parts := line.split()) == 3}
+            (stage / 'sqlite-symbols.txt').write_text(symbols['sqlite3_open'] + ' ' + symbols['sqlite3_auto_extension'] + '\n')
         if args.prior_runner:
             copy(args.prior_runner, stage / 'prior-runner')
             assert digest(stage / 'prior-runner') == args.prior_sha256
@@ -435,6 +572,8 @@ if __name__ == '__main__':
         failed = False
         duplicate = False
         cases = [(owner, mode) for owner in ('fixed', 'prior') for mode in ('sync', 'async')] if (stage / 'owner-contrast').exists() else [(None, mode) for mode in ('sync', 'async')]
+        if (stage / 'handoff-cases').exists():
+            cases += [(None, mode) for mode in ('detach-before', 'detach-after', 'detach-race', 'detach-lost-reply', 'sync-independent', 'async-projection-fault')]
         for owner, mode in cases:
             try:
                 duplicate = case(stage, mode, owner) or duplicate

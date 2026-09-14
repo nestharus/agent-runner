@@ -1,4 +1,4 @@
-//! Relational fixtures only; these rows do not attest native endpoint servicing.
+// Relational fixtures only; these rows do not attest native endpoint servicing.
 use oulipoly_state::completion_continuation::{PROTOCOL, SourceProcessIdentity};
 use oulipoly_state::mailbox::{CompletionDomainOwner, MailboxDb};
 
