@@ -328,7 +328,7 @@ fn activate_completion_event(
     String,
 > {
     let mut mailbox = MailboxDb::open_default()?;
-    let result = mailbox.activate_completion_event_listeners(args.handle)?;
+    let result = mailbox.request_original_completion_notification(args.handle)?;
     let delivery = deliver_event_listeners(&mut mailbox, &result.mailbox_rows);
     Ok((result, delivery))
 }

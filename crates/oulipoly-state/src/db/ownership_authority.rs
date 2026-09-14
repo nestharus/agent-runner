@@ -3495,25 +3495,30 @@ mod completion_continuation_tests {
 
     #[test]
     fn completion_continuation_sync_acceptance_suppresses_without_ack_and_replay_is_exact() {
-        acceptance_presentation_and_replay(false, "sync", false);
+        acceptance_presentation_and_replay(false, "sync", false, false);
     }
 
     #[test]
     fn completion_continuation_missing_output_retains_late_listener_and_exact_ack() {
-        acceptance_presentation_and_replay(true, "sync", false);
+        acceptance_presentation_and_replay(true, "sync", false, false);
     }
 
     #[test]
     fn completion_continuation_explicit_async_acceptance_and_repair_deliver() {
-        acceptance_presentation_and_replay(false, "async", false);
+        acceptance_presentation_and_replay(false, "async", false, false);
     }
 
     #[test]
     fn completion_continuation_detach_before_acceptance_survives_repair() {
-        acceptance_presentation_and_replay(false, "sync", true);
+        acceptance_presentation_and_replay(false, "sync", true, false);
     }
 
-    fn acceptance_presentation_and_replay(missing: bool, mode: &str, detach_before: bool) {
+    #[test]
+    fn completion_continuation_response_only_cannot_settle_physical_custody() {
+        acceptance_presentation_and_replay(false, "sync", false, true);
+    }
+
+    fn acceptance_presentation_and_replay(missing: bool, mode: &str, detach_before: bool, physical_debt: bool) {
         use crate::completion_continuation::VerifiedCompletion;
         use crate::mailbox::CompletionEventTriggerInput;
         let directory = tempfile::tempdir().unwrap();
@@ -3624,7 +3629,7 @@ mod completion_continuation_tests {
         }
         if detach_before {
             let detached = mailbox
-                .activate_completion_event_listeners(&source.handle)
+                .request_original_completion_notification(&source.handle)
                 .unwrap();
             assert!(detached.mailbox_rows.is_empty());
         }
@@ -3675,6 +3680,60 @@ mod completion_continuation_tests {
                 .unwrap()["phase"],
             "accepted"
         );
+        if missing || initially_active {
+            // Reconstruct a synthetic pre-policy sidecar from this verified
+            // accepted fixture. No production data or old running writer.
+            mailbox.connection().execute_batch("DROP TRIGGER completion_continuation_notification_ack;
+                DROP TABLE completion_continuation_notification; PRAGMA user_version=18;").unwrap();
+            mailbox = MailboxDb::open(&MailboxDb::path_for_state_db(&path)).unwrap();
+            assert_eq!(mailbox.completion_notification_diagnostics(&source.handle).unwrap()[0]["policy"], "unknown");
+            state.repair_admitted_completion_continuation(crate::InvocationMutationAuthority::Standalone, &binding).unwrap();
+            let historical = mailbox.completion_notification_diagnostics(&source.handle).unwrap();
+            assert_eq!(historical[0]["policy"], if initially_active { "notify" } else { "response_only" });
+            assert!(historical[0]["requested_at"].is_null(), "historical active is not invented detach");
+            assert_eq!(mailbox.completion_event_listeners(&source.handle).unwrap(), listeners);
+        }
+        if mode == "sync" && !initially_active {
+            // Response-only is settled notification policy, never an ACK.
+            assert!(mailbox.pending_continuation_attempts().unwrap().is_empty());
+            let mut owner = mailbox.completion_continuation_owner().unwrap().unwrap();
+            let facts = mailbox.completion_notification_diagnostics(&source.handle).unwrap();
+            assert_eq!(facts[0]["disposition"], "no_notification_required");
+            assert_eq!(facts[0]["policy"], "response_only");
+            if physical_debt {
+                let attempt = crate::mailbox::ContinuationAttempt {
+                    attempt_id: uuid::Uuid::new_v4().to_string(),
+                    owner_generation: owner.owner_generation.clone(),
+                    operation: "transport".into(), request_sha256: "a".repeat(64),
+                    source_registration_id: None, source_listener_revision: None,
+                    session_id: None, claim_token: None,
+                    result_path: directory.path().join("unproduced-receipt.json").to_str().unwrap().into(),
+                };
+                mailbox.reserve_continuation_attempt(&attempt).unwrap();
+                mailbox.accept_continuation_attempt(&attempt).unwrap();
+                mailbox.attach_original_continuation_custody(&attempt, &owner.driver_identity,
+                    &owner.driver_identity, &owner.driver_identity).unwrap();
+                assert!(!state.close_idle_completion_continuation_owner(&owner).unwrap());
+                assert!(!state.close_idle_completion_continuation_owner(&owner).unwrap());
+                assert_eq!(mailbox.pending_continuation_attempts().unwrap(), vec![attempt]);
+                assert!(mailbox.completion_event_listeners(&source.handle).unwrap()[0].acknowledged_at.is_none());
+                return; // Never manufacture a physical receipt to finish this fixture.
+            }
+            assert!(state.close_idle_completion_continuation_owner(&owner).unwrap());
+            assert!(!state.close_idle_completion_continuation_owner(&owner).unwrap());
+            assert!(mailbox.request_original_completion_notification(&source.handle).unwrap_err().contains("completion_owner_closed_retryable"));
+            assert!(mailbox.completion_notification_diagnostics(&source.handle).unwrap()[0]["requested_at"].is_null());
+            let retained = mailbox.completion_event_listeners(&source.handle).unwrap();
+            assert!(!retained[0].active);
+            assert!(retained[0].mailbox_seq.is_none());
+            assert!(retained[0].acknowledged_at.is_none());
+            assert!(retained[0].acknowledgement_reason.is_none());
+            assert!(mailbox.completion_continuation_owner().unwrap().is_none());
+            // Synthetic successor for the remaining late-listener/detach checks.
+            // This is not an operational old-owner cutover test.
+            owner.owner_generation = uuid::Uuid::new_v4().to_string();
+            mailbox.publish_completion_continuation_owner(&owner).unwrap();
+        }
         let changed = CompletionEventTriggerInput {
             payload_json: r#"{"kind":"agent_bash_complete","rc":70}"#,
             ..input
@@ -3760,7 +3819,7 @@ mod completion_continuation_tests {
         assert_eq!(mailbox.list_pending("late-session").unwrap().len(), 1);
         // Explicit post-completion detach selects notification, not ACK.
         let detached = mailbox
-            .activate_completion_event_listeners(&source.handle)
+            .request_original_completion_notification(&source.handle)
             .unwrap();
         assert_eq!(detached.mailbox_rows.len(), 2);
         admit(&mut state, &binding, false, false);
@@ -3816,6 +3875,24 @@ mod completion_continuation_tests {
             ack[0].acknowledgement_reason.as_deref(),
             Some("consumed_in_call")
         );
+        let facts = mailbox.completion_notification_diagnostics(&source.handle).unwrap();
+        let original = facts.iter().find(|f| f["listener_id"] == source.owner_invocation_uuid).unwrap();
+        assert_eq!(original["disposition"], "handled");
+        assert_eq!(original["delivery_evidence"], "manual_assertion");
+        assert_eq!(original["ack_actor_label"], source.owner_invocation_uuid);
+        assert_eq!(original["ack_original_mailbox_seq"], seq);
+        assert!(original["native_receipt_evidence"].is_null());
+        let late = facts.iter().find(|f| f["listener_id"] == late_owner).unwrap();
+        assert_eq!(late["policy"], "notify");
+        assert!(late["requested_at"].is_null(), "original detach must not request independent listeners");
+        assert_eq!(late["disposition"], "pending");
+        let owner = mailbox.completion_continuation_owner().unwrap().unwrap();
+        assert!(!state.close_idle_completion_continuation_owner(&owner).unwrap(), "independent notification debt remains");
+        let before = original.clone();
+        mailbox.request_original_completion_notification(&source.handle).unwrap();
+        let after = mailbox.completion_notification_diagnostics(&source.handle).unwrap();
+        assert_eq!(&before, after.iter().find(|f| f["listener_id"] == source.owner_invocation_uuid).unwrap());
+
     }
 
     #[test]

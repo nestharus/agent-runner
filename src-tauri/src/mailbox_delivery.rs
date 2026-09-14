@@ -1329,6 +1329,10 @@ fn reconcile_confirmed_headless_deliveries_on(
         let observation_confirmed = db
             .delivery_observation_confirmation(&window.attempt_id)?
             .is_some();
+        if observation_confirmed {
+            db.project_confirmed_native_delivery_receipt(&window.attempt_id)?;
+            continue;
+        }
         if !observation_confirmed {
             let Some(acknowledgement) = state
                 .acknowledgement(&window.attempt_id)

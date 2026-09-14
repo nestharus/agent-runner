@@ -6,7 +6,13 @@ use crate::completion_continuation::{AdmittedSourceBinding, PROTOCOL, SourceProc
 use serde::{Deserialize, Serialize};
 mod attempts;
 pub(super) use attempts::native_original_drain_on;
+mod notification;
 mod source;
+pub(super) use notification::classify_on as classify_notification_on;
+pub use notification::{
+    CompletionNotificationRequest, NotificationDeliveryEvidence, NotificationDisposition,
+    NotificationPolicy,
+};
 pub(super) use source::{
     accept_on, activate_notification_listeners_on, bound_event, reject_unbound_v2_trigger,
     retained_payload,
@@ -174,7 +180,14 @@ impl MailboxDb {
                 return Ok(false);
             }
         }
-        let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM completion_event_listener WHERE acknowledged_at IS NULL) OR EXISTS(SELECT 1 FROM mailbox WHERE delivered_at IS NULL) OR EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE phase NOT IN ('drained','never_started'))",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+        for binding in admitted {
+            notification::classify_on(&tx, binding)?;
+        }
+        let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM completion_event_listener l WHERE l.acknowledged_at IS NULL AND NOT EXISTS (
+SELECT 1 FROM completion_continuation_notification n JOIN completion_event e ON e.event_id=n.event_id
+WHERE n.event_id=l.event_id AND n.listener_id=l.listener_id AND n.policy='response_only'
+AND n.requested_at IS NULL AND l.active=0 AND l.mailbox_seq IS NULL AND e.state='triggered'
+AND EXISTS(SELECT 1 FROM completion_continuation_source s WHERE s.event_id=l.event_id AND s.phase='accepted'))) OR EXISTS(SELECT 1 FROM mailbox WHERE delivered_at IS NULL) OR EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE phase NOT IN ('drained','never_started'))",[],|r|r.get(0)).map_err(|e|e.to_string())?;
         if pending {
             return Ok(false);
         }
@@ -271,12 +284,14 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
         .get_or_init(|| {
             let expected = Connection::open_in_memory().map_err(|e| e.to_string())?;
             expected
-                .execute_batch("CREATE TABLE session_wake_claim(session_id TEXT,claim_token TEXT);")
+                .execute_batch("CREATE TABLE session_wake_claim(session_id TEXT,claim_token TEXT); CREATE TABLE completion_event_listener(event_id TEXT,listener_id TEXT,acknowledged_at TEXT,acknowledgement_reason TEXT,mailbox_seq INTEGER,PRIMARY KEY(event_id,listener_id));")
                 .map_err(|e| e.to_string())?;
             expected
                 .execute_batch(include_str!(
                     "../migrations/0018_completion_continuation.sql"
                 ))
+                .map_err(|e| e.to_string())?;
+            expected.execute_batch(include_str!("../migrations/0019_notification_settlement.sql"))
                 .map_err(|e| e.to_string())?;
             definitions(&expected)
         })
@@ -285,7 +300,7 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    if version != 18 || definitions(conn)? != *expected {
+    if version != 19 || definitions(conn)? != *expected {
         return Err(
             "unsupported_transition_required: completion domain schema lineage differs".into(),
         );
@@ -331,6 +346,19 @@ mod tests {
         db.publish_completion_continuation_owner(&owner).unwrap();
         (dir, db, owner)
     }
+    #[test]
+    fn completion_continuation_unknown_listener_is_not_a_response_only_waiver() {
+        let (_dir, mut db, owner) = fixture();
+        db.register_completion_event(CompletionEventRegistrationInput {
+            event_id: "legacy-unknown", delivery_mode: "sync", owner_session_id: Some("session"),
+            owner_invocation_uuid: Some("owner"), state_dir: "/offline", meta_path: "/offline/meta",
+            log_path: "/offline/log", rc_path: "/offline/rc",
+        }).unwrap();
+        assert_eq!(db.completion_notification_diagnostics("legacy-unknown").unwrap()[0]["disposition"], "unknown");
+        assert!(!db.close_idle_continuation_generation(&owner, &[]).unwrap());
+        assert!(db.completion_event_listeners("legacy-unknown").unwrap()[0].acknowledged_at.is_none());
+    }
+
     fn reservation(db: &mut MailboxDb, owner: &CompletionDomainOwner) -> ContinuationAttempt {
         db.conn.execute("INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count) VALUES('session','token','2026-09-12T00:00:00Z','fixture',1)",[]).unwrap();
         let attempt = ContinuationAttempt {
@@ -456,7 +484,7 @@ mod tests {
             [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).unwrap();
         assert_eq!(claim, ("legacy-token".into(), "retained-before-upgrade".into(), 3));
-        assert_eq!(upgraded.conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 18);
+        assert_eq!(upgraded.conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 19);
         drop(upgraded);
 
         let reopened = MailboxDb::open_completion_continuation_domain(&path).unwrap();

@@ -30,7 +30,9 @@ pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
 mod schema;
 pub use completion_continuation::{
-    CompletionDomainOwner, ContinuationAttempt, activation_request_sha256,
+    CompletionDomainOwner, CompletionNotificationRequest, ContinuationAttempt,
+    NotificationDeliveryEvidence, NotificationDisposition, NotificationPolicy,
+    activation_request_sha256,
 };
 pub use finalization::DeliveryFinalizationGuard;
 
@@ -1109,6 +1111,7 @@ impl CompletionAuthorityFence<'_> {
         let inserted = register_completion_event_on(&self.tx, &input, &now_rfc3339())?;
         if let Some(binding) = binding {
             self.materialize_continuation_binding(binding)?;
+            completion_continuation::classify_notification_on(&self.tx, binding)?;
             let event = completion_event_by_id_on(&self.tx, input.event_id)?
                 .ok_or("registered source disappeared")?;
             if event.state == "triggered" {
@@ -2608,20 +2611,50 @@ impl MailboxDb {
         &mut self,
         event_id: &str,
     ) -> Result<CompletionEventTriggerResult, String> {
+        self.request_completion_notification_on_scope(event_id, None)
+    }
+
+    /// Explicit request scoped to one listener. None retains the legacy
+    /// administrative event-wide API; it is not an inferred detach.
+    pub fn request_completion_notification(
+        &mut self,
+        request: CompletionNotificationRequest<'_>,
+    ) -> Result<CompletionEventTriggerResult, String> {
+        self.request_completion_notification_on_scope(request.event_id, Some(request.listener_id))
+    }
+
+    fn request_completion_notification_on_scope(
+        &mut self,
+        event_id: &str,
+        listener_id: Option<&str>,
+    ) -> Result<CompletionEventTriggerResult, String> {
         let now = now_rfc3339();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|err| {
-                format!("Failed to start completion listener activation transaction: {err}")
-            })?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("Failed to start completion listener activation transaction: {err}"))?;
+        if let Some(listener_id) = listener_id {
+            if completion_event_listener_on(&tx, event_id, listener_id)?.is_none() {
+                return Err("notification request listener is not registered".into());
+            }
+        }
         let event = completion_event_by_id_on(&tx, event_id)?
             .ok_or_else(|| format!("Completion event {event_id} is not registered"))?;
+        if completion_continuation::bound_event(&tx, event_id)? {
+            let running: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM completion_continuation_owner WHERE phase='running')", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+            if !running { return Err("completion_owner_closed_retryable: notification request requires a running owner".into()); }
+        }
+        // Existing CLI activation is an explicit event-wide administrative request.
+        // Record each affected listener, not an inferred detach or a receipt.
+        tx.execute("INSERT INTO completion_continuation_notification(event_id,listener_id,requested_at,request_basis)
+            SELECT event_id,listener_id,?2,CASE WHEN ?3 IS NULL THEN 'explicit_event_activation_unattributed' ELSE 'explicit_listener_activation_unattributed' END
+            FROM completion_event_listener WHERE event_id=?1 AND acknowledged_at IS NULL AND (?3 IS NULL OR listener_id=?3)
+            ON CONFLICT(event_id,listener_id) DO UPDATE SET requested_at=COALESCE(requested_at,excluded.requested_at),
+            request_basis=COALESCE(request_basis,excluded.request_basis)", params![event_id,&now,listener_id])
+            .map_err(|e| e.to_string())?;
         tx.execute(
             "UPDATE completion_event_listener
              SET active = 1
-             WHERE event_id = ?1 AND acknowledged_at IS NULL",
-            params![event_id],
+             WHERE event_id = ?1 AND acknowledged_at IS NULL AND (?2 IS NULL OR listener_id=?2)",
+            params![event_id,listener_id],
         )
         .map_err(|err| format!("Failed to activate completion event listeners: {err}"))?;
         if event.state == "triggered" {
@@ -4314,6 +4347,15 @@ impl MailboxDb {
         Ok(true)
     }
 
+    /// Replay only retained native evidence, never infer receipt from terminal state.
+    pub fn project_confirmed_native_delivery_receipt(&self, attempt_id: &str) -> Result<(), String> {
+        let (invocation, session, confirmed): (String,String,String) = self.conn.query_row(
+            "SELECT delivery_invocation_uuid,session_id,observation_confirmed_at
+            FROM mailbox_delivery_attempts WHERE attempt_id=?1 AND observation_confirmed_at IS NOT NULL",
+            [attempt_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e| e.to_string())?;
+        self.project_native_delivery_receipt(attempt_id, &invocation, &session, &confirmed)
+    }
+
     fn project_native_delivery_receipt(
         &self,
         attempt_id: &str,
@@ -4337,6 +4379,18 @@ impl MailboxDb {
             acknowledgement_reason = COALESCE(acknowledgement_reason, 'native_receipt')
             WHERE mailbox_seq IN (SELECT mailbox_seq FROM mailbox_delivery_attempt_items WHERE attempt_id = ?1)",
             params![attempt_id, now]).map_err(|e| e.to_string())?;
+        // Retain exact native receipt attribution before attempt/sequence pruning.
+        // Receipt was committed independently before this projection transaction.
+        tx.execute("UPDATE completion_continuation_notification SET ack_native_evidence=(
+            SELECT json_object('attempt_id',attempt_id,'invocation_uuid',delivery_invocation_uuid,
+                'provider',observation_provider_name,'provider_instance',observation_provider_instance_id,
+                'settings_id',observation_settings_id,'session_id',observation_session_id,
+                'anchor_token',observation_anchor_token,'expected_sha256',observation_expected_sha256,
+                'turn_id',observation_confirmed_turn_id,'confirmed_at',observation_confirmed_at)
+            FROM mailbox_delivery_attempts WHERE attempt_id=?1 AND observation_confirmed_at IS NOT NULL)
+            WHERE ack_basis='native_receipt' AND ack_at=?2 AND ack_native_evidence IS NULL
+            AND ack_mailbox_seq IN (SELECT mailbox_seq FROM mailbox_delivery_attempt_items WHERE attempt_id=?1)",
+            params![attempt_id,now]).map_err(|e| e.to_string())?;
         resolve_completed_delivery_attempts(&tx, session_id, now, None)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
@@ -12590,11 +12644,11 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            // Schema 18 validates the continuation schema fingerprint on every
-            // current open (measured 1307 VM steps). Keep a tight fixed ceiling,
+            // Schema 19 includes three additional notification definitions in the
+            // fingerprint (measured 1390 VM steps). Keep a tight fixed ceiling,
             // the no-backfill assertion, and the separate retained-history
             // growth test; this does not grant a data-size-dependent budget.
-            current_open_steps < 1333,
+            current_open_steps < 1420,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
         );
     }

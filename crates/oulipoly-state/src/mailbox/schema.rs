@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 18;
+pub(super) const CURRENT_VERSION: i64 = 19;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -139,7 +139,17 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         owner: SidecarEntity::CompletionAuthority,
         apply: migrate_completion_continuation,
     },
+    MigrationStep {
+        target_version: 19,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_notification_settlement,
+    },
 ];
+
+fn migrate_notification_settlement(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0019_notification_settlement.sql"))
+        .map_err(|error| error.to_string())
+}
 
 fn migrate_completion_continuation(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("migrations/0018_completion_continuation.sql"))
@@ -603,7 +613,9 @@ fn migrate_receipt_scan(conn: &Connection) -> Result<(), String> {
 #[cfg(test)]
 pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
     conn.execute_batch(
-        "DROP TABLE completion_continuation_attempt;
+        "DROP TRIGGER completion_continuation_notification_ack;
+        DROP TABLE completion_continuation_notification;
+        DROP TABLE completion_continuation_attempt;
         DROP TABLE completion_continuation_source;
         DROP TABLE completion_continuation_context;
         DROP TABLE completion_continuation_owner;

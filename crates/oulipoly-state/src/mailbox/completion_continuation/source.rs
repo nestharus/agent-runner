@@ -181,6 +181,7 @@ pub(in crate::mailbox) fn activate_notification_listeners_on(
     tx: &Transaction<'_>,
     binding: &AdmittedSourceBinding,
 ) -> Result<(), String> {
+    notification::classify_on(tx, binding)?;
     let source = binding.registration()?;
     tx.execute(
         "UPDATE completion_event_listener SET active=1

@@ -28,12 +28,18 @@ def output_completion(request, seq, stdout):
     })
 
 def launch(request):
+    global SESSION
     params = request.get("params", {})
     # The provider launch contract carries workload environment in params.env,
     # not the adapter process environment. Apply the real runner-supplied values.
     os.environ.update(params.get("env") or {})
     known = params.get("session", {}).get("known_provider_session_id")
     prompt = params.get("model", {}).get("inputs", {}).get("prompt", "")
+    if os.environ.get("AGE360_MCP_E2E") and prompt == "synthetic independent owner founder" and not known:
+        # Founding context only; these flags never enter the guardian environment
+        # and therefore cannot contaminate another session's resumed recipient.
+        SESSION = "ses_age360_founder"
+        os.environ.update(AGE360_CASE="owner_only", AGE360_HOLD_INITIAL="1", AGE360_FOUNDER="1")
     case = os.environ.get("AGE360_CASE")
     seq = 1
     if known:
@@ -177,6 +183,11 @@ def launch(request):
                 if row and row[0] == SESSION: break
                 if time.monotonic() > deadline: raise RuntimeError("native session binding was not ingested")
                 time.sleep(0.02)
+            if os.environ.get("AGE360_MCP_E2E"):
+                deadline = time.monotonic() + 45
+                while (root / "hold-mcp-admission").exists():
+                    if time.monotonic() > deadline: raise RuntimeError("MCP audit admission gate expired")
+                    time.sleep(.02)
             mode = "sync" if os.environ["AGE360_CASE"] == "sync" else "async"
             env = dict(os.environ, AGENT_BASH_OWNER_SESSION_ID=SESSION, AGENT_BASH_OWNER_INVOCATION_UUID=parent)
             workload = "printf paired-source-output"
@@ -201,7 +212,11 @@ def launch(request):
             if case in ("missing_selection", "missing_pin", "missing_short"):
                 env["AGENT_BASH_LOG_MAX_BYTES"] = "65536"
             workload = 'printf "launch\\n" >> "$AGE360_ROOT/source-launches"; ' + workload
-            result = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "run", "--delivery", mode, "--completion-scope", scope, *extra, "--", "/bin/sh", "-c", workload], env=env, capture_output=True, timeout=30)
+            if os.environ.get("AGE360_MCP_E2E"):
+                from mcp_client import dispatch
+                result = dispatch(root, mode, workload, env)
+            else:
+                result = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "run", "--delivery", mode, "--completion-scope", scope, *extra, "--", "/bin/sh", "-c", workload], env=env, capture_output=True, timeout=30)
             (root / "bash-dispatch.stdout").write_bytes(result.stdout)
             (root / "bash-dispatch.stderr").write_bytes(result.stderr)
             allowed = (0, 37) if os.environ["AGE360_CASE"] == "early_exit" else (0,)
@@ -217,7 +232,7 @@ def launch(request):
                 handle = json.loads(result.stdout)["handle"]
                 cancelled = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "cancel", handle], env=env, capture_output=True, timeout=30)
                 (root / "source-cancel-result.json").write_text(json.dumps({"rc": cancelled.returncode, "stdout": cancelled.stdout.decode(), "stderr": cancelled.stderr.decode(), "owner_pid": os.getpid()}))
-            if mode == "sync":
+            if mode == "sync" and not os.environ.get("AGE360_MCP_E2E"):
                 # Real in-call output protocol, not a mailbox recipient ACK.
                 handle = json.loads(result.stdout)["handle"]
                 binary = os.environ["AGE360_AGENT_BASH_BIN"]
@@ -239,6 +254,11 @@ def launch(request):
                 while not (root / "release-initial-provider").exists():
                     if time.monotonic() > deadline: raise RuntimeError("test did not release initial provider")
                     time.sleep(0.02)
+        if os.environ.get("AGE360_MCP_E2E") and case == "sync":
+            deadline = time.monotonic() + 45
+            while not pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("release-initial-provider").exists():
+                if time.monotonic() > deadline: raise RuntimeError("MCP initial hold expired")
+                time.sleep(.02)
         stdout = b"native initial\n"
         event(request, seq, "stdout", data_base64=base64.b64encode(stdout).decode("ascii"))
         seq += 1
@@ -250,8 +270,8 @@ def launch(request):
     if not params.get("session", {}).get("known_provider_session_id"):
         pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("provider-initial-ready").touch()
     if not params.get("session", {}).get("known_provider_session_id") and os.environ.get("AGE360_HOLD_INITIAL") == "1":
-        gate = pathlib.Path(os.environ["AGE360_ROOT"]) / "release-initial-provider"
-        deadline = time.monotonic() + 45
+        gate = pathlib.Path(os.environ["AGE360_ROOT"]) / ("release-founder" if os.environ.get("AGE360_FOUNDER") else "release-initial-provider")
+        deadline = time.monotonic() + (240 if os.environ.get("AGE360_FOUNDER") else 45)
         while not gate.exists():
             if time.monotonic() > deadline: raise RuntimeError("fixture initial hold expired")
             time.sleep(0.02)

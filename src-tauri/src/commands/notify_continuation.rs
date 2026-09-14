@@ -157,6 +157,7 @@ fn add_completion_projection(
         value["phase"] = "awaiting_sidecar_repair".into();
     }
     let listeners = mailbox.completion_event_listeners(&source.handle)?;
+    value["notification_dispositions"] = json!(mailbox.completion_notification_diagnostics(&source.handle)?);
     value["listener_revision"] = json!(listeners.len());
     value["listeners"] = json!(
         listeners
