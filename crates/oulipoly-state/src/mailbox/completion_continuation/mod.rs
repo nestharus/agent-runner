@@ -430,6 +430,36 @@ mod tests {
         drop(probe);
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
+
+    #[test]
+    fn completion_continuation_populated_v17_upgrade_preserves_legacy_claim_and_domain_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let db = MailboxDb::open(&path).unwrap();
+        super::super::schema::remove_continuation_schema_for_legacy_fixture(&db.conn);
+        db.conn.pragma_update(None, "user_version", 17).unwrap();
+        db.conn.execute(
+            "INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count) VALUES('legacy-session','legacy-token','2026-09-12T00:00:00Z','retained-before-upgrade',3)",
+            [],
+        ).unwrap();
+        drop(db);
+
+        let upgraded = MailboxDb::open_completion_continuation_domain(&path).unwrap();
+        let domain = upgraded.completion_continuation_domain().unwrap().unwrap();
+        assert!(upgraded.completion_continuation_owner().unwrap().is_none());
+        assert!(upgraded.pending_continuation_attempts().unwrap().is_empty());
+        let claim: (String, String, i64) = upgraded.conn.query_row(
+            "SELECT claim_token,reason,auto_wake_count FROM session_wake_claim WHERE session_id='legacy-session'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(claim, ("legacy-token".into(), "retained-before-upgrade".into(), 3));
+        assert_eq!(upgraded.conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 18);
+        drop(upgraded);
+
+        let reopened = MailboxDb::open_completion_continuation_domain(&path).unwrap();
+        assert_eq!(reopened.completion_continuation_domain().unwrap(), Some(domain));
+        assert!(reopened.wake_session_reader().wake_claim("legacy-session").unwrap().is_some());
+    }
     #[test]
     fn source_recovery_population_and_exclusion_survive_repeated_owner_replacement() {
         let (_dir, mut db, mut owner) = fixture();

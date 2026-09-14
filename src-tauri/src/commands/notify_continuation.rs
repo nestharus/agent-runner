@@ -179,7 +179,10 @@ pub(crate) fn capability() -> Result<i32, String> {
     if !path.exists() {
         return emit(&json!({"protocol":PROTOCOL,"status":"unavailable"}));
     }
-    let mailbox = MailboxDb::open_read_only(&path)?;
+    // This is the native launch handshake, not detached recovery inspection.
+    // Copying the live sidecar makes every launch depend on a quiet database.
+    // Use the existing native lane without creating or migrating the database.
+    let mailbox = MailboxDb::open_existing_native_authority(&path)?;
     let Some(domain_id) = mailbox.completion_continuation_domain()? else {
         return emit(&json!({"protocol":PROTOCOL,"status":"unsupported_transition_required"}));
     };
