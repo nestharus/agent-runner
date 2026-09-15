@@ -168,3 +168,29 @@ query is implemented but has no native producer link in this candidate. Actual
 State-linked cancellation is therefore unverified and unfulfilled here, not
 covered by the passing terminal-signal cancellation tests. These red tests are
 retained requirements, not ignored tests or a completed cancellation matrix.
+
+### Paired test executable provisioning (Linux)
+
+The AGE360, proactive-wake and S11 paired fixtures use
+`tests/fixtures/bounded_runner_image.rs`. Each test process creates a separately
+owned ELF copy of its explicit candidate (or Cargo's exact built executable),
+runs `/usr/bin/strip --strip-debug`, and fails if the result exceeds the unchanged
+256 MiB helper-image bound. Missing strip, non-executable/non-ELF input and copy
+failure are errors, not skips. It prints both image hashes and sizes. Cargo's
+original executable is never stripped or hard-linked for transformation.
+
+This same provisioning runs under normal package/workspace tests, coverage and
+release-workflow tests; it is not a hosted-only profile override. Debug stripping
+must preserve executable and LLVM instrumentation/mapping sections. Coverage
+uses the original Cargo object for report discovery and the instrumented copy for
+execution; the native namespace re-exec forwards `LLVM_PROFILE_FILE`. Local
+instrumentation/report checks do not establish a hosted coverage run, full suite
+coverage, or signed production artifact equivalence. This fixture transform does
+not apply to release publication or installed executables.
+
+The three proactive async tests run their inner assertions as a synthetic provider
+of a real outer Runner entry. Registration uses that live entry's inherited
+invocation authority and owner endpoint, with a distinct outer session listener.
+Removing the inherited endpoint must still reject managed ancestry. The outer
+entry stays live through the inner initial/delivery relationship checks; fixture
+rows no longer impersonate the test process as an independently bootstrapped owner.

@@ -1,9 +1,9 @@
 # Coverage baseline for the Rust workspace.
 #
-# Consumed by ~/ai/agents/test-audit-gate.md § 6 "Fetch Coverage Artifacts".
-# The auditor queries this workflow's runs via `gh api .../workflow_runs`
-# with `head_sha` (PR baseline) and `branch=main&event=push` (main baseline)
-# to compute coverage deltas.
+# This manual-only workflow uploads rust-coverage artifacts for explicitly
+# selected runs; consumers must verify the selected run's identity.
+# ~/ai/agents/test-audit-gate.md § 6 generates coverage locally in pr-review
+# mode at exact head and merge base; it does not fetch remote artifacts.
 #
 # Scope:
 #   - Rust workspace (`--workspace`, all crates + src-tauri).

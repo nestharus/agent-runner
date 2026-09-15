@@ -7,6 +7,8 @@
 //! TEST: external-provider runtime fixtures for session ingestion, prompt
 //! acceptance, and policy diagnostics.
 
+#[path = "fixtures/bounded_runner_image.rs"]
+mod bounded_runner_image;
 mod provider_authority_fixture;
 
 use oulipoly_state::mailbox::{MailboxDb, MailboxRow};
@@ -1371,7 +1373,7 @@ fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
 }
 
 fn runner_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_oulipoly-agent-runner")
+    bounded_runner_image::runner_bin()
 }
 
 fn path_string(path: &Path) -> String {

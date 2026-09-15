@@ -6,8 +6,8 @@
 
 use crate::SESSION;
 use crate::fake_provider::{
-    delayed_agent_bash_provider_script, late_consumed_agent_bash_provider_script,
-    mixed_consumed_agent_bash_provider_script, provider_script,
+    delayed_agent_bash_provider_script, late_received_agent_bash_provider_script,
+    mixed_received_agent_bash_provider_script, provider_script,
 };
 use crate::fixtures::Fixture;
 use crate::liveness::{
@@ -17,25 +17,30 @@ use crate::liveness::{
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
     assert_age270_invocation, assert_exit_code_zero, assert_no_wake_claim,
-    assert_pending_mailbox_empty, assert_prompt_contains_handle, assert_prompt_excludes_handle,
-    assert_prompt_file_missing, assert_xdg_isolated,
+    assert_pending_mailbox_empty, assert_prompt_contains_handle, assert_prompt_file_missing,
+    assert_xdg_isolated,
 };
 use crate::wake_claim_setup::acquire_seed_wake_claim;
 use std::path::PathBuf;
 use std::process::Output;
 use std::time::{Duration, Instant};
 
-const OUTER_SESSION: &str = "6169694d-de0f-40d1-890c-6e28e55bab28";
-const OUTER_INVOCATION: &str = "22222222-2222-4222-8222-222222222222";
+pub(crate) const OUTER_SESSION: &str = "6169694d-de0f-40d1-890c-6e28e55bab28";
 const OUTER_EVENT: &str = "h-outer-listener";
 
 pub(crate) fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.seed_outer_caller(OUTER_SESSION, OUTER_INVOCATION, OUTER_EVENT);
+    if fixture
+        .run_under_outer_owner("delayed_agent_bash_completion_wakes_inactive_headless_parent_once")
+    {
+        return;
+    }
+    fixture.seed_outer_caller(OUTER_SESSION, OUTER_EVENT);
     let agent_bash = fixture.install_agent_bash(&agent_bash_bin());
     fixture.write_provider(&delayed_agent_bash_provider_script(&agent_bash));
 
+    fixture.assert_missing_owner_rejected();
     let initial = fixture.run_agent("dispatch delayed nested work");
     assert_delayed_dispatch_exit_code_zero(&fixture, &initial);
     // Wake registration may precede the initial caller's return. Count only
@@ -58,41 +63,56 @@ fn assert_delayed_dispatch_exit_code_zero(fixture: &Fixture, output: &Output) {
     );
 }
 
-pub(crate) fn polled_completion_after_enqueue_does_not_wake_parent() {
+pub(crate) fn local_receipt_after_enqueue_preserves_native_wake() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.seed_outer_caller(OUTER_SESSION, OUTER_INVOCATION, OUTER_EVENT);
+    if fixture.run_under_outer_owner("local_receipt_after_enqueue_preserves_native_wake") {
+        return;
+    }
+    fixture.seed_outer_caller(OUTER_SESSION, OUTER_EVENT);
     let agent_bash = fixture.install_agent_bash(&agent_bash_bin());
-    fixture.write_provider(&late_consumed_agent_bash_provider_script(&agent_bash));
+    fixture.write_provider(&late_received_agent_bash_provider_script(&agent_bash));
 
+    fixture.assert_missing_owner_rejected();
     let initial = fixture.run_agent("dispatch and poll fast nested work");
     assert_exit_code_zero(&initial);
-    let poll = wait_for_file(&fixture.prompt_file("late-consumed-poll.txt"));
+    let poll = wait_for_file(&fixture.prompt_file("late-received-poll.txt"));
     assert_terminal_poll(&poll);
     let session_id = wait_for_sidecar_session(&fixture, "mailbox");
-    wait_for_late_consumed_reconciliation(&fixture, &session_id);
-    assert_late_consumed_completion_outcome(&fixture, &session_id, &initial);
+    let handle = dispatch_handle(&fixture, "late-received-dispatch.json");
+    let prompt = wait_for_file(&fixture.prompt_file("late-received-resumed-input.txt"));
+    assert_prompt_contains_handle(&prompt, &handle);
+    wait_for_automatic_delivery(&fixture, &session_id, 1);
+    assert_locally_received_completion_outcome(&fixture, &session_id, &[&handle]);
 }
 
-pub(crate) fn consumed_completion_preserves_unpolled_completion_wake() {
+pub(crate) fn local_receipt_preserves_both_async_completion_wakes() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.seed_outer_caller(OUTER_SESSION, OUTER_INVOCATION, OUTER_EVENT);
+    if fixture.run_under_outer_owner("local_receipt_preserves_both_async_completion_wakes") {
+        return;
+    }
+    fixture.seed_outer_caller(OUTER_SESSION, OUTER_EVENT);
     let agent_bash = fixture.install_agent_bash(&agent_bash_bin());
-    fixture.write_provider(&mixed_consumed_agent_bash_provider_script(&agent_bash));
+    fixture.write_provider(&mixed_received_agent_bash_provider_script(&agent_bash));
 
-    let initial = fixture.run_agent("dispatch consumed and unpolled nested work");
+    fixture.assert_missing_owner_rejected();
+    let initial = fixture.run_agent("dispatch locally received and unpolled nested work");
     assert_exit_code_zero(&initial);
-    let poll = wait_for_file(&fixture.prompt_file("mixed-consumed-poll.txt"));
+    let poll = wait_for_file(&fixture.prompt_file("mixed-received-poll.txt"));
     assert_terminal_poll(&poll);
-    let consumed_handle = dispatch_handle(&fixture, "mixed-consumed-dispatch.json");
+    let received_handle = dispatch_handle(&fixture, "mixed-received-dispatch.json");
     let unpolled_handle = dispatch_handle(&fixture, "mixed-unpolled-dispatch.json");
     let prompt = wait_for_file(&fixture.prompt_file("mixed-resumed-input.txt"));
-    assert_prompt_excludes_handle(&prompt, &consumed_handle);
+    assert_prompt_contains_handle(&prompt, &received_handle);
     assert_prompt_contains_handle(&prompt, &unpolled_handle);
     let session_id = wait_for_sidecar_session(&fixture, "mailbox");
     wait_for_automatic_delivery(&fixture, &session_id, 2);
-    assert_mixed_completion_outcome(&fixture, &session_id, &consumed_handle, &unpolled_handle);
+    assert_locally_received_completion_outcome(
+        &fixture,
+        &session_id,
+        &[&received_handle, &unpolled_handle],
+    );
 }
 
 fn dispatch_handle(fixture: &Fixture, file_name: &str) -> String {
@@ -209,6 +229,20 @@ fn assert_delayed_assistant_turns(fixture: &Fixture, handle: &str) {
 }
 
 fn assert_outer_listener_preserved(fixture: &Fixture) {
+    let parent: serde_json::Value =
+        serde_json::from_str(&std::env::var("OULIPOLY_PARENT_INVOCATION").unwrap()).unwrap();
+    let children: i64 = fixture.state().connection().query_row(
+        "SELECT COUNT(*) FROM invocations child JOIN invocations parent ON child.parent_invocation_id=parent.id WHERE parent.invocation_uuid=?1",
+        [parent["id"].as_str().unwrap()], |row| row.get(0)).unwrap();
+    assert_eq!(
+        children, 1,
+        "initial entry is a child of the actual outer owner"
+    );
+    println!(
+        "outer ancestry: actual invocation={} initial children={children}",
+        parent["id"]
+    );
+
     assert!(
         fixture
             .mailbox()
@@ -230,79 +264,64 @@ fn assert_terminal_poll(poll: &str) {
     assert!(poll.starts_with("DONE rc=0"), "{poll}");
 }
 
-fn wait_for_late_consumed_reconciliation(fixture: &Fixture, session_id: &str) {
-    wait_until("late consumed completion reconciled", || {
-        late_consumed_completion_reconciled(fixture, session_id)
-    });
-}
-
-fn late_consumed_completion_reconciled(fixture: &Fixture, session_id: &str) -> bool {
-    pending_mailbox_rows(fixture, session_id).is_ok_and(pending_mailbox_rows_are_empty)
-}
-
-fn pending_mailbox_rows(
+// An async local byte receipt is neither listener ACK nor event-wide suppression.
+// Only the later native user-turn receipt settles these rows. This fixture writes
+// no assistant answer, so keep the independent AGE270 failure assertion intact.
+fn assert_locally_received_completion_outcome(
     fixture: &Fixture,
     session_id: &str,
-) -> Result<Vec<oulipoly_state::mailbox::MailboxRow>, String> {
-    fixture.mailbox().list_pending(session_id)
-}
-
-fn pending_mailbox_rows_are_empty(rows: Vec<oulipoly_state::mailbox::MailboxRow>) -> bool {
-    rows.is_empty()
-}
-
-fn assert_late_consumed_completion_outcome(fixture: &Fixture, session_id: &str, initial: &Output) {
-    let rows = fixture.mailbox().list_mailbox(session_id, true).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].delivery_attempts, 1);
-    assert_eq!(
-        rows[0].delivered_by_invocation_uuid,
-        rows[0].owner_invocation_uuid
-    );
-    let listeners = fixture
-        .mailbox()
-        .completion_event_listeners(&rows[0].handle)
-        .unwrap();
-    assert_eq!(listeners.len(), 1);
-    assert!(!listeners[0].active);
-    assert_eq!(
-        listeners[0].acknowledgement_reason.as_deref(),
-        Some("consumed_in_call")
-    );
-    let stderr = String::from_utf8_lossy(&initial.stderr);
-    assert!(
-        !stderr.contains("late_consumed_completion_acknowledged"),
-        "internal late-consumption acknowledgement leaked to stderr: {stderr}"
-    );
-    assert_eq!(invocation_count(fixture), 2);
-    assert_prompt_file_missing(fixture, "late-consumed-resumed-input.txt");
-    assert_no_wake_claim(fixture, session_id);
-    assert_xdg_isolated(fixture);
-}
-
-fn assert_mixed_completion_outcome(
-    fixture: &Fixture,
-    session_id: &str,
-    consumed_handle: &str,
-    unpolled_handle: &str,
+    handles: &[&str],
 ) {
     let rows = fixture.mailbox().list_mailbox(session_id, true).unwrap();
-    assert_eq!(rows.len(), 2);
-    let consumed_row = mailbox_row_with_handle(&rows, consumed_handle);
-    assert_eq!(
-        consumed_row.delivered_by_invocation_uuid,
-        consumed_row.owner_invocation_uuid
-    );
-    let unpolled_row = mailbox_row_with_handle(&rows, unpolled_handle);
-    assert_ne!(
-        unpolled_row.delivered_by_invocation_uuid,
-        unpolled_row.owner_invocation_uuid
-    );
-    let delivery_invocation = unpolled_row
-        .delivered_by_invocation_uuid
-        .as_deref()
-        .unwrap();
+    assert_eq!(rows.len(), handles.len());
+    let delivery_invocation = rows[0].delivered_by_invocation_uuid.as_deref().unwrap();
+    for handle in handles {
+        let row = mailbox_row_with_handle(&rows, handle);
+        assert_ne!(row.delivered_by_invocation_uuid, row.owner_invocation_uuid);
+        assert_eq!(
+            row.delivered_by_invocation_uuid.as_deref(),
+            Some(delivery_invocation)
+        );
+        assert_eq!(row.delivery_attempts, 1);
+        assert!(row.delivery_error.is_none());
+        let listeners = fixture
+            .mailbox()
+            .completion_event_listeners(handle)
+            .unwrap();
+        assert_eq!(listeners.len(), 1);
+        assert!(listeners[0].acknowledged_at.is_some());
+        assert_eq!(
+            listeners[0].acknowledgement_reason.as_deref(),
+            Some("native_receipt")
+        );
+    }
+    wait_until("receipt-only delivery invocation finalized", || {
+        fixture
+            .state()
+            .get_invocation_by_uuid(delivery_invocation)
+            .unwrap()
+            .is_some_and(|row| row.finished_at.is_some())
+    });
+    println!("actual native receipt rows: {rows:?}");
+    for entry in std::fs::read_dir(&fixture.work_dir).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if [
+            "-snapshot.json",
+            "-receipt.json",
+            "-pending-after-receipt.json",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+        {
+            println!(
+                "actual local receipt evidence {name}: {}",
+                std::fs::read_to_string(entry.path()).unwrap()
+            );
+        }
+    }
     assert_age270_invocation(fixture, delivery_invocation);
+    assert_pending_mailbox_empty(fixture, session_id);
+    assert_outer_listener_preserved(fixture);
     fixture.assert_delivery_invocation_is_child_of_owner(session_id);
     assert_eq!(invocation_count(fixture), 3);
     assert_no_wake_claim(fixture, session_id);

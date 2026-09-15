@@ -123,16 +123,16 @@ wait "$writer_pid"
     .replace("SUCCESSFUL_ASSISTANT = False", "SUCCESSFUL_ASSISTANT = True")
 }
 
-pub(crate) fn late_consumed_agent_bash_provider_script(agent_bash_bin: &Path) -> String {
+pub(crate) fn late_received_agent_bash_provider_script(agent_bash_bin: &Path) -> String {
+    let receipt_script = shell_single_quote(include_str!("local_receipt.py"));
     let agent_bash_bin = shell_single_quote(&agent_bash_bin.to_string_lossy());
     provider_script(
         &format!(
             r#"set -e
 runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
 owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
-dispatch="$work/late-consumed-dispatch.json"
+dispatch="$work/late-received-dispatch.json"
 AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
-AGENT_BASH_CONSUMER_GRACE_MS=0 \
 {agent_bash_bin} run --completion-scope root --delivery async -- \
   bash -lc 'printf nested-root-complete' > "$dispatch"
 handle="$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$dispatch")"
@@ -146,16 +146,17 @@ for _ in $(seq 1 200); do
   sleep 0.05
 done
 [ -n "$found" ]
-{agent_bash_bin} status "$handle" > "$work/late-consumed-poll.txt"
-grep -q '^DONE rc=0' "$work/late-consumed-poll.txt"
-{agent_bash_bin} consume "$handle" > "$work/late-consumed-consume.json""#,
+{agent_bash_bin} status "$handle" > "$work/late-received-poll.txt"
+grep -q '^DONE rc=0' "$work/late-received-poll.txt"
+python3 -c {receipt_script} {agent_bash_bin} "$handle" "$work/late-received" "$runner" "$session""#,
         ),
         "",
-        "late-consumed-resumed-input.txt",
+        "late-received-resumed-input.txt",
     )
 }
 
-pub(crate) fn mixed_consumed_agent_bash_provider_script(agent_bash_bin: &Path) -> String {
+pub(crate) fn mixed_received_agent_bash_provider_script(agent_bash_bin: &Path) -> String {
+    let receipt_script = shell_single_quote(include_str!("local_receipt.py"));
     let agent_bash_bin = shell_single_quote(&agent_bash_bin.to_string_lossy());
     provider_script(
         &format!(
@@ -165,20 +166,19 @@ owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OU
 run_job() {{
   local dispatch="$1"
   AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
-  AGENT_BASH_CONSUMER_GRACE_MS=0 \
-  {agent_bash_bin} run --completion-scope root --delivery async -- \
+    {agent_bash_bin} run --completion-scope root --delivery async -- \
     bash -lc 'printf nested-root-complete' > "$dispatch"
 }}
-consumed_dispatch="$work/mixed-consumed-dispatch.json"
+received_dispatch="$work/mixed-received-dispatch.json"
 unpolled_dispatch="$work/mixed-unpolled-dispatch.json"
-run_job "$consumed_dispatch"
-consumed_handle="$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$consumed_dispatch")"
+run_job "$received_dispatch"
+received_handle="$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$received_dispatch")"
 run_job "$unpolled_dispatch"
 unpolled_handle="$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"; print(h)' "$unpolled_dispatch")"
 found=""
 for _ in $(seq 1 200); do
   mailbox="$($runner mailbox list --session-id "$session" --json)"
-  if printf '%s' "$mailbox" | grep -Fq "$consumed_handle" && \
+  if printf '%s' "$mailbox" | grep -Fq "$received_handle" && \
      printf '%s' "$mailbox" | grep -Fq "$unpolled_handle"; then
     found=1
     break
@@ -186,9 +186,9 @@ for _ in $(seq 1 200); do
   sleep 0.05
 done
 [ -n "$found" ]
-{agent_bash_bin} status "$consumed_handle" > "$work/mixed-consumed-poll.txt"
-grep -q '^DONE rc=0' "$work/mixed-consumed-poll.txt"
-{agent_bash_bin} consume "$consumed_handle" > "$work/mixed-consumed-consume.json""#,
+{agent_bash_bin} status "$received_handle" > "$work/mixed-received-poll.txt"
+grep -q '^DONE rc=0' "$work/mixed-received-poll.txt"
+python3 -c {receipt_script} {agent_bash_bin} "$received_handle" "$work/mixed-received" "$runner" "$session""#,
         ),
         "",
         "mixed-resumed-input.txt",

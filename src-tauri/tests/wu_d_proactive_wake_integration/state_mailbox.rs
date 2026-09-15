@@ -11,11 +11,10 @@ use crate::parse::ts;
 use crate::{INVOCATION, MODEL, PROVIDER, SESSION};
 use chrono::Utc;
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, CompletionEventRegistrationInput, LegacyRuntimeProjection, MailboxDb,
-    MailboxRow, SessionMetadataUpsert,
+    AgentBashCompleteEnqueue, CompletionEventRegistrationInput, MailboxDb, MailboxRow,
+    SessionMetadataUpsert,
 };
-use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord};
-use oulipoly_state::{InvocationStart, ProviderSessionBinding, SessionTurnIngest, StateDb};
+use oulipoly_state::{CompletionRegistrationAuthority, SessionTurnIngest, StateDb};
 use rusqlite::Connection;
 use std::fs;
 use std::path::PathBuf;
@@ -75,86 +74,35 @@ impl Fixture {
             .unwrap()
     }
 
-    pub(crate) fn seed_outer_caller(
-        &self,
-        session_id: &str,
-        invocation_uuid: &str,
-        event_id: &str,
-    ) {
+    pub(crate) fn seed_outer_caller(&self, session_id: &str, event_id: &str) {
         let mut state = self.state();
-        let invocation_start = state
-            .start_invocation_with_completion_registration_authority(&InvocationStart {
-                invocation_uuid: invocation_uuid.to_string(),
-                model_name: MODEL.to_string(),
-                provider_name: PROVIDER.to_string(),
-                provider_index: 0,
-                parent_invocation_id: None,
-            })
-            .unwrap();
-        let invocation_id = invocation_start.invocation_row_id;
-        state
-            .bind_invocation_provider_session_start(
-                oulipoly_state::InvocationMutationAuthority::Standalone,
-                invocation_id,
-                &ProviderSessionBinding {
-                    provider_session_id: session_id.to_string(),
-                    capture_method: "fixture",
-                    resume_input_id: None,
-                    provider_session_resolved_account: None,
-                },
-            )
-            .unwrap();
-
-        let identity = crate::wake_claim_setup::current_process_identity();
-        PidIdentityDb::open(&self.sidecar_path())
+        let parent: serde_json::Value =
+            serde_json::from_str(&std::env::var("OULIPOLY_PARENT_INVOCATION").unwrap()).unwrap();
+        let invocation_uuid = parent["id"].as_str().unwrap();
+        let invocation = state
+            .get_invocation_by_uuid(invocation_uuid)
             .unwrap()
-            .record_identity(PidIdentityRecord {
-                identity: &identity,
-                os_pgid: None,
-                invocation_uuid,
-                session_id: Some(session_id),
-                provider_name: Some(PROVIDER),
-                model_name: Some(MODEL),
-                recorded_at: "2026-06-04T12:00:00Z",
-            })
             .unwrap();
-
-        let mut mailbox = self.mailbox();
-        let models_dir = path_string(&self.models_dir);
-        mailbox
-            .wake_sessions()
-            .upsert_session_metadata(SessionMetadataUpsert {
-                session_id,
-                mode: "pty_interactive",
-                invocation_uuid: Some(invocation_uuid),
-                provider_name: Some(PROVIDER),
-                model_name: Some(MODEL),
-                models_dir: Some(&models_dir),
-                effective_cwd: None,
-            })
-            .unwrap();
-        mailbox
-            .wake_sessions()
-            .project_legacy_runtime_running(LegacyRuntimeProjection {
-                session_id,
-                mode: "pty_interactive",
-                invocation_uuid,
-                provider_name: Some(PROVIDER),
-                model_name: Some(MODEL),
-                identity: &identity,
-                pty_control_path: None,
-                turn_start_max_mailbox_seq: None,
-                models_dir: Some(&models_dir),
-                effective_cwd: None,
-            })
-            .unwrap();
-
+        assert!(
+            invocation.finished_at.is_none(),
+            "outer native entry must remain live"
+        );
+        let authority = CompletionRegistrationAuthority::from_process_environment().unwrap();
+        crate::liveness::wait_until("actual outer runtime session binding", || {
+            self.mailbox()
+                .wake_session_reader()
+                .legacy_runtime_projection(session_id)
+                .unwrap()
+                .is_some_and(|runtime| {
+                    runtime.running_invocation_uuid.as_deref() == Some(invocation_uuid)
+                })
+        });
         let artifacts = self.seed_mailbox_artifacts(event_id);
         write_seed_mailbox_artifacts(&artifacts, event_id);
         state
             .register_completion_event_with_authority(
                 oulipoly_state::InvocationMutationAuthority::Standalone,
-                &invocation_start.completion_registration_authority,
+                &authority,
                 &format!("proactive-wake:{event_id}:owner:{invocation_uuid}"),
                 CompletionEventRegistrationInput {
                     event_id,

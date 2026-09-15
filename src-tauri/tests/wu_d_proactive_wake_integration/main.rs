@@ -28,6 +28,8 @@
 //!       - orchestration module declarations
 //! ```
 
+#[path = "../fixtures/bounded_runner_image.rs"]
+mod bounded_runner_image;
 mod cases_basic;
 mod cases_batch_sweep;
 mod cases_early_ack;
@@ -55,13 +57,13 @@ fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once() {
 }
 
 #[test]
-fn polled_completion_after_enqueue_does_not_wake_parent() {
-    cases_basic::polled_completion_after_enqueue_does_not_wake_parent();
+fn local_receipt_after_enqueue_preserves_native_wake() {
+    cases_basic::local_receipt_after_enqueue_preserves_native_wake();
 }
 
 #[test]
-fn consumed_completion_preserves_unpolled_completion_wake() {
-    cases_basic::consumed_completion_preserves_unpolled_completion_wake();
+fn local_receipt_preserves_both_async_completion_wakes() {
+    cases_basic::local_receipt_preserves_both_async_completion_wakes();
 }
 
 #[test]

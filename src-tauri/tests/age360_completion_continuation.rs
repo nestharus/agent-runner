@@ -2,6 +2,8 @@
 //! Each case re-execs in private user/network/PID/mount namespaces. PID namespace
 //! teardown contains failure descendants; product NoDeadline is not modified.
 #![cfg(target_os = "linux")]
+#[path = "fixtures/bounded_runner_image.rs"]
+mod bounded_runner_image;
 #[cfg(feature = "age360-fault-fixtures")]
 #[path = "fixtures/age360/custody_faults.rs"]
 mod custody_faults;
@@ -25,9 +27,7 @@ const MODEL: &str = "age360-native-model";
 const PROVIDER: &str = "age360-native-provider";
 
 fn runner() -> PathBuf {
-    std::env::var_os("AGE360_RUNNER_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_oulipoly-agent-runner")))
+    PathBuf::from(bounded_runner_image::runner_bin())
 }
 
 fn counterpart() -> PathBuf {
@@ -94,6 +94,9 @@ fn private_case(paired: bool) -> bool {
         .env("AGE360_PRIVATE_CASE", &name)
         .env("AGE360_PARENT_NET", &net)
         .env("AGE360_RUNNER_BIN", runner);
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
     if let Some(bash) = bash {
         command.env("AGE360_AGENT_BASH_BIN", bash);
     }
@@ -199,6 +202,9 @@ impl Fixture {
             )
             .env("AGENT_BASH_AGENT_RUNNER_BIN", runner())
             .current_dir(self.root.path());
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            cmd.env("LLVM_PROFILE_FILE", profile);
+        }
         #[cfg(feature = "age360-fault-fixtures")]
         cmd.env("AGE360_FAULT_ROOT", self.root.path()).env(
             "AGE360_FAULT_PARENT_NET",

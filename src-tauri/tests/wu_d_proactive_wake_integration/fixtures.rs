@@ -13,6 +13,7 @@ use std::process::{Command, Output};
 
 pub(crate) struct Fixture {
     pub(crate) dir: Option<tempfile::TempDir>,
+    root_dir: PathBuf,
     pub(crate) config_home: PathBuf,
     pub(crate) data_home: PathBuf,
     pub(crate) state_home: PathBuf,
@@ -24,20 +25,26 @@ pub(crate) struct Fixture {
 
 impl Fixture {
     pub(crate) fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let config_home = dir.path().join("xdg-config");
-        let data_home = dir.path().join("xdg-data");
-        let state_home = dir.path().join("xdg-state");
-        let home_dir = dir.path().join("home");
+        let dir = std::env::var_os("WU_D_OUTER_FIXTURE_ROOT")
+            .is_none()
+            .then(|| tempfile::tempdir().unwrap());
+        let root_dir = std::env::var_os("WU_D_OUTER_FIXTURE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dir.as_ref().unwrap().path().to_path_buf());
+        let config_home = root_dir.join("xdg-config");
+        let data_home = root_dir.join("xdg-data");
+        let state_home = root_dir.join("xdg-state");
+        let home_dir = root_dir.join("home");
         let app_config_dir = config_home.join("oulipoly-agent-runner");
         let models_dir = app_config_dir.join("models");
-        let work_dir = dir.path().join("work");
+        let work_dir = root_dir.join("work");
         fs::create_dir_all(&models_dir).unwrap();
         fs::create_dir_all(&state_home).unwrap();
         fs::create_dir_all(&home_dir).unwrap();
         fs::create_dir_all(&work_dir).unwrap();
         Self {
-            dir: Some(dir),
+            dir,
+            root_dir,
             config_home,
             data_home,
             state_home,
@@ -46,6 +53,51 @@ impl Fixture {
             models_dir,
             work_dir,
         }
+    }
+
+    // The outer native Runner owns the live admission lease. Its provider launches
+    // this same test; the endpoint and invocation authority come from that launch,
+    // never from a seeded owner row or a fabricated environment value.
+    pub(crate) fn run_under_outer_owner(&self, node: &str) -> bool {
+        if std::env::var_os("WU_D_OUTER_FIXTURE_ROOT").is_some() {
+            assert!(std::env::var_os("OULIPOLY_COMPLETION_ENDPOINT").is_some());
+            return false;
+        }
+        let hook = format!(
+            "exec {} --exact {} --nocapture",
+            shell_quote(&std::env::current_exe().unwrap().to_string_lossy()),
+            shell_quote(node)
+        );
+        let script = crate::fake_provider::provider_script(&hook, "", "outer-unused.txt")
+            .replace(crate::SESSION, crate::cases_basic::OUTER_SESSION);
+        self.write_provider(&script);
+        let mut cmd = self.agent_command("run admitted fixture provider");
+        self.prepare_command(&mut cmd);
+        cmd.env("WU_D_OUTER_FIXTURE_ROOT", self.root());
+        let output = cmd.output().unwrap();
+        println!(
+            "outer fixture stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(output.status.success(), "outer fixture failed: {output:?}");
+        true
+    }
+
+    pub(crate) fn assert_missing_owner_rejected(&self) {
+        let mut command = self.agent_command("must not launch without inherited owner");
+        self.prepare_command(&mut command);
+        command.env_remove("OULIPOLY_COMPLETION_ENDPOINT");
+        let output = command.output().unwrap();
+        assert!(
+            !output.status.success(),
+            "missing owner unexpectedly admitted"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("ancestor has no inherited completion owner"),
+            "{output:?}"
+        );
+        println!("missing inherited owner rejected: {stderr}");
     }
 
     pub(crate) fn sidecar_path(&self) -> PathBuf {
@@ -85,6 +137,12 @@ impl Fixture {
             .env_remove("AGENT_BASH_OWNER_SESSION_ID")
             .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
             .current_dir(self.root());
+        if std::env::var_os("WU_D_OUTER_FIXTURE_ROOT").is_some() {
+            cmd.env(
+                "OULIPOLY_PARENT_INVOCATION",
+                std::env::var("OULIPOLY_PARENT_INVOCATION").unwrap(),
+            );
+        }
         let helper = self.root().join("agent-bash/agent-bash");
         if helper.is_file() {
             cmd.env("AGENT_BASH_BIN", helper).env(
@@ -228,7 +286,7 @@ impl Fixture {
     }
 
     fn root(&self) -> &std::path::Path {
-        self.dir.as_ref().expect("fixture directory").path()
+        &self.root_dir
     }
 }
 
@@ -249,4 +307,8 @@ impl Drop for Fixture {
             );
         }
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
