@@ -1728,6 +1728,9 @@ impl Drop for Fixture {
             "bash-dispatch.stderr",
             "resume-prompts.jsonl",
             "provider-error.txt",
+            "resume-preflight.jsonl",
+            "native-describe.actor.json",
+            "native-policy.evaluate.actor.json",
             "descendant.pid",
             "recipient-exact-ack.json",
         ] {

@@ -37,6 +37,10 @@ impl LocalReceiptFixture {
         fs::write(self.state_dir.join("consumed"), []).unwrap();
     }
 
+    pub(super) fn state(&self) -> oulipoly_state::StateDb {
+        oulipoly_state::StateDb::open(&self.db_path.with_file_name("state.db")).unwrap()
+    }
+
     pub(super) fn mailbox(&self) -> MailboxDb {
         MailboxDb::open(&self.db_path).unwrap()
     }
@@ -119,6 +123,17 @@ fn seed_local_receipt_fixture_mailbox(paths: &LocalReceiptFixturePaths) {
         .unwrap();
     let mut db = MailboxDb::open(&paths.db_path).unwrap();
     crate::completion_owner::test_support::install_owner(&mut db);
+    db.wake_sessions()
+        .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+            session_id: LocalReceiptFixture::SESSION_ID,
+            mode: "headless",
+            invocation_uuid: Some(LocalReceiptFixture::INVOCATION_UUID),
+            provider_name: Some("fixture-provider"),
+            model_name: Some("consumed-completion-fixture"),
+            models_dir: None,
+            effective_cwd: None,
+        })
+        .unwrap();
     db.trigger_completion_event(CompletionEventTriggerInput {
         event_id: LocalReceiptFixture::EVENT_ID,
         payload_json: r#"{"schema_version":2,"handle":"ab_late_consumed_fixture"}"#,

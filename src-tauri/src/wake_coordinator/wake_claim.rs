@@ -15,9 +15,14 @@ pub(super) fn acquire_wake_claim(
     db: &mut MailboxDb,
     input: StartWakeInput<'_>,
     claim_token: &str,
+    runtime: Option<&oulipoly_state::mailbox::SessionMetadataRow>,
 ) -> Result<WakeClaimAcquireResult, String> {
     db.wake_sessions()
-        .try_acquire_startable_wake_claim(wake_claim_request(input, claim_token), input.renew_token)
+        .try_acquire_startable_wake_claim_for_runtime(
+            wake_claim_request(input, claim_token),
+            input.renew_token,
+            runtime,
+        )
 }
 
 fn wake_claim_request<'a>(input: StartWakeInput<'a>, claim_token: &'a str) -> WakeClaimRequest<'a> {
@@ -123,11 +128,49 @@ mod tests {
     use oulipoly_state::InboxTargetKind;
     use oulipoly_state::mailbox::{InboxTarget, SubmittedInputEnqueue};
 
+    fn publish_parent(db: &mut MailboxDb, directory: &std::path::Path) {
+        let state = oulipoly_state::StateDb::open(&directory.join("state.db")).unwrap();
+        let parent_uuid = uuid::Uuid::new_v4().to_string();
+        let parent = state
+            .start_invocation(&oulipoly_state::InvocationStart {
+                invocation_uuid: parent_uuid.clone(),
+                model_name: "model-a".into(),
+                provider_name: "provider-a".into(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .bind_invocation_provider_session_start(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                parent,
+                &oulipoly_state::ProviderSessionBinding {
+                    provider_session_id: "session-a".into(),
+                    capture_method: "fixture",
+                    resume_input_id: None,
+                    provider_session_resolved_account: None,
+                },
+            )
+            .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+                session_id: "session-a",
+                mode: "headless",
+                invocation_uuid: Some(&parent_uuid),
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+    }
+
     #[test]
     fn manual_resume_stops_when_a_replacement_claim_wins_release() {
         let directory = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
         crate::completion_owner::test_support::install_owner(&mut db);
+        publish_parent(&mut db, directory.path());
         db.enqueue_submitted_input(&SubmittedInputEnqueue {
             submission_token: "manual-release-input",
             target: InboxTarget {
@@ -190,6 +233,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
         crate::completion_owner::test_support::install_owner(&mut db);
+        publish_parent(&mut db, directory.path());
         db.enqueue_submitted_input(&SubmittedInputEnqueue {
             submission_token: "manual-dead-release-input",
             target: InboxTarget {

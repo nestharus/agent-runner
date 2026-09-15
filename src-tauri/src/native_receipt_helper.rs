@@ -434,7 +434,9 @@ impl OwnedHelper {
         Ok(status)
     }
     fn terminate(&mut self) {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        self.settle_group();
+        #[cfg(all(unix, not(target_os = "linux")))]
         unsafe {
             // Direct Child has not been reaped: group ID cannot be reused.
             libc::kill(-(self.child.id() as i32), libc::SIGKILL);
@@ -442,6 +444,28 @@ impl OwnedHelper {
         #[cfg(windows)]
         self.job.terminate();
         let _ = self.child.kill();
+    }
+    #[cfg(target_os = "linux")]
+    fn settle_group(&self) {
+        let mut reported_error = false;
+        loop {
+            match oulipoly_provider::client::settle_receipt_inspection_group(&self.child) {
+                Ok(true) => return,
+                Ok(false) => (),
+                Err(error) => report_cleanup_error(&mut reported_error, &error),
+            }
+            // Scheduling assistance only: no elapsed-time predicate can
+            // discharge custody. Retain the direct Child even on observation
+            // failure, rather than returning and silently abandoning its group.
+            std::thread::yield_now();
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+fn report_cleanup_error(reported: &mut bool, error: &std::io::Error) {
+    if !*reported {
+        tracing::error!("receipt group cleanup remains owned: {error}");
+        *reported = true;
     }
 }
 impl Drop for OwnedHelper {

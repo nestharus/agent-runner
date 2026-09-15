@@ -588,6 +588,10 @@ fn external_launch_event_callback(
             && spawn_identity.is_some()
             && let Some(session) = provider_session_id_from_launch_event(event)
         {
+            #[cfg(feature = "age360-fault-fixtures")]
+            oulipoly_state::completion_continuation::age360_fault_barrier(
+                "initial-session-publication",
+            );
             publish_or_record_live_session_failure(
                 &dispatch_context,
                 spawn_identity.as_ref().expect("ordinary launch identity"),

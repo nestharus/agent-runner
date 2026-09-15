@@ -80,6 +80,41 @@ pub fn enter_receipt_inspection_group() -> Result<(), String> {
     );
     Ok(())
 }
+/// Signal and observe only an exclusively owned, unreaped receipt-helper group.
+/// The caller must retain its Child until this returns true, then perform the
+/// direct wait. This is local observer cleanup, never an activation/drain ACK.
+/// Missing observation remains an error; signal failure can discharge custody
+/// only when independent group observation establishes it is already terminal.
+#[cfg(target_os = "linux")]
+pub fn settle_receipt_inspection_group(child: &std::process::Child) -> std::io::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    let wait = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if wait != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let group = child.id() as i32;
+    if unsafe { libc::getpgid(group) } != group {
+        return Err(std::io::Error::other("receipt helper lost its owned group"));
+    }
+    // The unreaped leader pins this PGID across signal and observation. No
+    // group discovered from /proc is ever signalled. Contained providers cannot
+    // change groups; SIGKILL prevents them from admitting further forks.
+    if unsafe { libc::kill(-group, libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return match crate::process_custody::group_dead(child.id())? {
+            true => Ok(true), // Already terminal; never infer this from errno.
+            false => Err(error),
+        };
+    }
+    crate::process_custody::group_dead(child.id())
+}
 #[cfg(unix)]
 fn receipt_group() -> i32 {
     RECEIPT_GROUP.load(std::sync::atomic::Ordering::SeqCst)

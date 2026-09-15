@@ -64,13 +64,15 @@ fn prepare_wake_start_context<'a>(
     claim_token: &str,
 ) -> Result<WakeStartContext<'a>, WakeDiagnostic> {
     let db = open_wake_mailbox().map_err(storage_error_diagnostic)?;
-    prepare_wake_start_context_with_db(input, claim_token, db)
+    let state = oulipoly_state::StateDb::open_default().map_err(storage_error_diagnostic)?;
+    prepare_wake_start_context_with_db(input, claim_token, db, &state)
 }
 
 fn prepare_wake_start_context_with_db<'a>(
     input: StartWakeInput<'a>,
     claim_token: &str,
     mut db: MailboxDb,
+    state: &oulipoly_state::StateDb,
 ) -> Result<WakeStartContext<'a>, WakeDiagnostic> {
     if let Some(stop) = db
         .mailbox_observation_stop(input.session_id)
@@ -82,14 +84,45 @@ fn prepare_wake_start_context_with_db<'a>(
     }
     let runtime =
         session_metadata_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
+    if db
+        .completion_continuation_domain()
+        .map_err(storage_error_diagnostic)?
+        .is_some()
+        && !native_parent_ready(state, input.session_id, runtime.as_ref())
+            .map_err(storage_error_diagnostic)?
+    {
+        return Err(WakeDiagnostic::status("runtime_unavailable"));
+    }
     let input = normalize_start_wake_input(input, runtime.as_ref());
     let liveness = wake_runtime_liveness(&mut db, input.session_id)?;
     cleanup_idle_runtime(&liveness);
     if wake_liveness_busy(&liveness) {
         return Err(busy_diagnostic());
     }
-    let claim = acquire_startable_wake_claim(&mut db, input, claim_token)?;
+    #[cfg(feature = "age360-fault-fixtures")]
+    oulipoly_state::completion_continuation::age360_fault_barrier("native-before-claim");
+    let claim = acquire_startable_wake_claim(&mut db, input, claim_token, runtime.as_ref())?;
     Ok(wake_start_context(input, db, runtime, claim))
+}
+
+fn native_parent_ready(
+    state: &oulipoly_state::StateDb,
+    session_id: &str,
+    runtime: Option<&SessionMetadataRow>,
+) -> Result<bool, String> {
+    if !oulipoly_state::mailbox::native_wake_runtime_ready(runtime) {
+        return Ok(false);
+    }
+    let parent = runtime
+        .and_then(|r| r.invocation_uuid.as_deref())
+        .expect("validated parent");
+    Ok(state.get_invocation_by_uuid(parent)?.is_some_and(|record| {
+        record
+            .provider_session_id
+            .as_deref()
+            .or(record.session_id.as_deref())
+            == Some(session_id)
+    }))
 }
 
 fn wake_start_context<'a>(
@@ -142,8 +175,9 @@ fn acquire_startable_wake_claim(
     db: &mut MailboxDb,
     input: StartWakeInput<'_>,
     claim_token: &str,
+    runtime: Option<&SessionMetadataRow>,
 ) -> Result<WakeClaimRow, WakeDiagnostic> {
-    let claim_result = super::wake_claim::acquire_wake_claim(db, input, claim_token)
+    let claim_result = super::wake_claim::acquire_wake_claim(db, input, claim_token, runtime)
         .map_err(storage_error_diagnostic)?;
     wake_claim_to_start(claim_result)
 }
@@ -151,6 +185,9 @@ fn acquire_startable_wake_claim(
 fn wake_claim_to_start(result: WakeClaimAcquireResult) -> Result<WakeClaimRow, WakeDiagnostic> {
     match result {
         WakeClaimAcquireResult::Acquired(claim) => Ok(claim),
+        WakeClaimAcquireResult::RuntimeUnavailable => {
+            Err(WakeDiagnostic::status("runtime_unavailable"))
+        }
         WakeClaimAcquireResult::NoPending => Err(WakeDiagnostic::status("no_pending")),
         WakeClaimAcquireResult::Busy => Err(WakeDiagnostic::status("busy")),
         WakeClaimAcquireResult::AlreadyInFlight(claim) => Err(already_in_flight_diagnostic(claim)),
@@ -227,6 +264,77 @@ mod tests {
     use oulipoly_state::mailbox::{SessionMetadataUpsert, WakeClaimRequest};
 
     #[test]
+    fn selected_runtime_change_does_not_commit_claim_or_activation() {
+        let fixture = LocalReceiptFixture::new();
+        let mut db = fixture.mailbox();
+        let runtime = db
+            .wake_session_reader()
+            .session_metadata(LocalReceiptFixture::SESSION_ID)
+            .unwrap()
+            .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: LocalReceiptFixture::SESSION_ID,
+                mode: "headless",
+                invocation_uuid: runtime.invocation_uuid.as_deref(),
+                provider_name: runtime.provider_name.as_deref(),
+                model_name: Some("changed-model"),
+                models_dir: Some("/changed-model-directory"),
+                effective_cwd: None,
+            })
+            .unwrap();
+        let result = db
+            .wake_sessions()
+            .try_acquire_startable_wake_claim_for_runtime(
+                WakeClaimRequest {
+                    session_id: LocalReceiptFixture::SESSION_ID,
+                    claim_token: "stale-selection",
+                    reason: "notify_idle",
+                    auto_wake_count: 1,
+                    wake_invocation_uuid: None,
+                    stale_after_seconds: 600,
+                },
+                None,
+                Some(&runtime),
+            )
+            .unwrap();
+        assert_eq!(result, WakeClaimAcquireResult::RuntimeUnavailable);
+        assert!(
+            db.wake_session_reader()
+                .wake_claim(LocalReceiptFixture::SESSION_ID)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.continuation_activation(LocalReceiptFixture::SESSION_ID, "stale-selection")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.list_pending(LocalReceiptFixture::SESSION_ID)
+                .unwrap()
+                .len(),
+            1
+        );
+        let context = prepare_wake_start_context_with_db(
+            StartWakeInput {
+                session_id: LocalReceiptFixture::SESSION_ID,
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                renew_token: None,
+            },
+            "fresh-selection",
+            db,
+            &fixture.state(),
+        )
+        .unwrap_or_else(|d| panic!("{}", d.status));
+        assert_eq!(
+            context.runtime.unwrap().model_name.as_deref(),
+            Some("changed-model")
+        );
+    }
+
+    #[test]
     fn unpause_concurrent_sleeping_requests_admit_only_one_owner_without_replay() {
         let fixture = LocalReceiptFixture::new();
         let session = LocalReceiptFixture::SESSION_ID;
@@ -253,6 +361,7 @@ mod tests {
                             },
                             &format!("unpause-owner-{index}"),
                             db,
+                            &fixture.state(),
                         ) {
                             Ok(_) => "acquired".to_string(),
                             Err(diagnostic) => diagnostic.status,
@@ -305,6 +414,7 @@ mod tests {
             },
             "after-settlement",
             db,
+            &fixture.state(),
         ) {
             Ok(_) => panic!("settled work must not launch"),
             Err(diagnostic) => diagnostic,
@@ -384,6 +494,7 @@ mod tests {
                 },
                 "replacement-owner",
                 fixture.mailbox(),
+                &fixture.state(),
             ) {
                 Err(diagnostic) => diagnostic,
                 Ok(_) => panic!("fixed failure must not reach spawn"),
@@ -455,6 +566,7 @@ mod tests {
             },
             "rearmed-owner",
             db,
+            &fixture.state(),
         )
         .unwrap_or_else(|d| panic!("rearm rejected: {}", d.status));
         assert_eq!(context.claim.claim_token, "rearmed-owner");
@@ -505,6 +617,7 @@ mod tests {
             },
             "exact-new-claim-token",
             db,
+            &fixture.state(),
         )
         .unwrap_or_else(|diagnostic| {
             panic!(
@@ -540,6 +653,7 @@ mod tests {
             },
             "claim-token",
             fixture.mailbox(),
+            &fixture.state(),
         );
         assert!(context.is_ok());
         let db = fixture.mailbox();

@@ -188,24 +188,99 @@ fn age355_scope_cancellation_terminates_contained_descendants() {
     let guard = helper::start_command(private_child(root.path(), "blocked-descendant")).unwrap();
     wait_for_file(&root.path().join("inspection-started"));
     let pid = std::fs::read_to_string(root.path().join("descendant-started")).unwrap();
+    let before = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let helper = std::fs::read_to_string(root.path().join("inspection-started")).unwrap();
+    let fields: Vec<_> = before
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        fields[2], helper,
+        "descendant not in the owned helper group"
+    );
+    eprintln!("receipt cancellation before: helper={helper} descendant={before}");
     drop(guard);
     assert_child_reaped(root.path());
     // Grandchildren are reparented to the OS reaper; a zombie is not a live IO
     // worker. The owned direct helper must already be reaped above.
-    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        let state = stat
-            .rsplit_once(')')
-            .unwrap()
-            .1
-            .split_whitespace()
-            .next()
-            .unwrap();
-        assert!(
-            state == "Z" || state == "X",
-            "descendant remains live: {stat}"
-        );
-    }
+    assert_descendant_terminal(
+        &std::path::PathBuf::from(format!("/proc/{pid}/stat")),
+        fields[19],
+    );
     assert!(!root.path().join("descendant-finished").exists());
+}
+
+// Oracle-only: a read failure is not a terminal-state observation. The caller
+// established the original descendant identity before cancellation.
+#[cfg(target_os = "linux")]
+fn assert_descendant_terminal(path: &std::path::Path, starttime: &str) {
+    match std::fs::read_to_string(path) {
+        Ok(stat) => {
+            let state = stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .next()
+                .unwrap();
+            assert_eq!(
+                stat.rsplit_once(')').unwrap().1.split_whitespace().nth(19),
+                Some(starttime),
+                "observation no longer describes the original descendant"
+            );
+            eprintln!("receipt cancellation after guard joined: {stat}");
+            assert!(
+                state == "Z" || state == "X",
+                "descendant remains live: {stat}"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "receipt descendant independently absent: {}: {error}",
+                path.display()
+            );
+        }
+        Err(error) => panic!(
+            "descendant observation unavailable: {}: {error}",
+            path.display()
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn receipt_descendant_oracle_rejects_unreadable_live_and_wrong_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("stat");
+    let record = |state| format!("1 (oracle fixture) {state} 0 7 {} 123", ["0"; 16].join(" "));
+    for state in ["R", "S", "D"] {
+        std::fs::write(&path, record(state)).unwrap();
+        assert!(std::panic::catch_unwind(|| assert_descendant_terminal(&path, "123")).is_err());
+    }
+    std::fs::write(&path, record("Z")).unwrap();
+    assert!(std::panic::catch_unwind(|| assert_descendant_terminal(&path, "456")).is_err());
+    assert_descendant_terminal(&path, "123");
+    std::fs::write(&path, b"invalid encoding \xff").unwrap();
+    assert!(std::panic::catch_unwind(|| assert_descendant_terminal(&path, "123")).is_err());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let read = std::fs::read_to_string(&path).unwrap_err();
+    assert_eq!(
+        read.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "negative requires real DAC denial"
+    );
+    assert!(std::panic::catch_unwind(|| assert_descendant_terminal(&path, "123")).is_err());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_descendant_terminal(&path, "123");
+    // Other I/O errors (a directory rather than a record) are not absence.
+    assert!(std::panic::catch_unwind(|| assert_descendant_terminal(root.path(), "123")).is_err());
+    eprintln!(
+        "strict oracle: live/wrong identity/InvalidData/PermissionDenied/other I/O rejected; terminal and NotFound accepted; synthetic records are oracle-only, not custody evidence"
+    );
 }
 
 #[cfg(unix)]
@@ -357,4 +432,55 @@ fn receipt_cwd_recovery_requires_exact_persisted_authority() {
             .unwrap_err()
             .contains("absolute")
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn receipt_cancellation_does_not_terminate_another_owned_group() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let guard = helper::start_command(private_child(first.path(), "blocked-descendant")).unwrap();
+    let other = helper::start_command(private_child(second.path(), "blocked-descendant")).unwrap();
+    wait_for_file(&first.path().join("inspection-started"));
+    wait_for_file(&second.path().join("inspection-started"));
+    let before = std::fs::read_to_string(second.path().join("descendant-started")).unwrap();
+    drop(guard);
+    assert_child_reaped(first.path());
+    let stat = std::fs::read_to_string(format!("/proc/{before}/stat")).unwrap();
+    let state = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .next()
+        .unwrap();
+    assert!(
+        !matches!(state, "Z" | "X"),
+        "unrelated owned group was killed: {stat}"
+    );
+    eprintln!("other exact group still live after first scope joined: {stat}");
+    drop(other);
+    assert_child_reaped(second.path());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn receipt_group_cleanup_rejects_an_unowned_group() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = private_child(root.path(), "descendant")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_file(&root.path().join("descendant-started"));
+    let result = oulipoly_provider::client::settle_receipt_inspection_group(&child);
+    let still_live = child.try_wait().unwrap().is_none();
+    // This test retains the direct child and cleans it even if the oracle fails.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(result.unwrap_err().to_string().contains("owned group"));
+    assert!(still_live, "observer signalled a group it did not own");
+    let lost_wait = oulipoly_provider::client::settle_receipt_inspection_group(&child).unwrap_err();
+    assert_eq!(lost_wait.raw_os_error(), Some(libc::ECHILD));
 }

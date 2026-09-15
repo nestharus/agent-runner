@@ -284,13 +284,20 @@ fn status_value(status: ExitStatus) -> ProcessStatus {
 }
 #[cfg(target_os = "linux")]
 fn proc_stat(pid: u32) -> std::io::Result<(char, i64, i64)> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let fields: Vec<_> = stat
-        .rsplit_once(')')
-        .ok_or_else(|| std::io::Error::other("invalid process stat"))?
-        .1
-        .split_whitespace()
-        .collect();
+    let stat = std::fs::read(format!("/proc/{pid}/stat"))?;
+    parse_proc_stat(&stat)
+}
+#[cfg(target_os = "linux")]
+fn parse_proc_stat(stat: &[u8]) -> std::io::Result<(char, i64, i64)> {
+    // Linux comm is an opaque byte string (and can contain ')'). Only the
+    // kernel-owned numeric/state suffix has a text contract.
+    let end = stat
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .ok_or_else(|| std::io::Error::other("invalid process stat"))?;
+    let suffix = std::str::from_utf8(&stat[end + 1..])
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let fields: Vec<_> = suffix.split_whitespace().collect();
     let invalid = || std::io::Error::other("invalid process identity");
     Ok((
         fields
@@ -323,7 +330,8 @@ fn identity(_: u32) -> std::io::Result<ProcessIdentity> {
     Err(std::io::Error::other("unsupported exact process custody"))
 }
 #[cfg(target_os = "linux")]
-fn group_dead(group: u32) -> std::io::Result<bool> {
+pub(crate) fn group_dead(group: u32) -> std::io::Result<bool> {
+    require_visible_proc_tasks()?;
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
         let Some(pid) = entry
@@ -333,16 +341,120 @@ fn group_dead(group: u32) -> std::io::Result<bool> {
         else {
             continue;
         };
-        match proc_stat(pid) {
-            Ok((state, pgid, _)) if pgid == i64::from(group) && state != 'Z' && state != 'X' => {
-                return Ok(false);
-            }
-            Ok(_) => (),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-            Err(e) => return Err(e),
+        if !process_group_tasks_dead(pid, group)? {
+            return Ok(false);
         }
     }
     Ok(true)
+}
+// Enumeration must expose task IDs even when stat access is denied. A procfs
+// view that hides owned entries cannot establish terminality by omission.
+#[cfg(target_os = "linux")]
+fn require_visible_proc_tasks() -> std::io::Result<()> {
+    let own = std::fs::read("/proc/self/stat")?;
+    let pid = own.split(|byte| *byte == b' ').next().unwrap_or_default();
+    if pid != std::process::id().to_string().as_bytes() {
+        return Err(std::io::Error::other(
+            "procfs PID namespace does not match custody",
+        ));
+    }
+    use std::os::fd::AsRawFd;
+    let proc = std::fs::File::open("/proc")?;
+    // fdinfo identifies the visible mount, even with namespace procfs mounts
+    // stacked on an older /proc. A lower mount's options are not its authority.
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", proc.as_raw_fd()))?;
+    let mount_id = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))
+        .ok_or_else(|| std::io::Error::other("procfs mount identity is unavailable"))?;
+    let mounts = std::fs::read("/proc/self/mountinfo")?;
+    if !proc_mount_exposes_task_ids(&mounts, mount_id.as_bytes()) {
+        return Err(std::io::Error::other(
+            "procfs task enumeration visibility is unavailable",
+        ));
+    }
+    Ok(())
+}
+#[cfg(target_os = "linux")]
+fn proc_mount_exposes_task_ids(mounts: &[u8], mount_id: &[u8]) -> bool {
+    // Paths in unrelated mount records can also contain non-UTF8 bytes. Select
+    // the literal /proc mount before decoding any of its kernel option tokens.
+    let Some(line) = mounts
+        .split(|byte| *byte == b'\n')
+        .find(|line| mount_fields(line).first() == Some(&mount_id))
+    else {
+        return false;
+    };
+    let fields = mount_fields(line);
+    let Some(separator) = fields.iter().position(|field| *field == b"-") else {
+        return false;
+    };
+    if fields.get(3) != Some(&b"/".as_slice())
+        || fields.get(4) != Some(&b"/proc".as_slice())
+        || fields.get(separator + 1) != Some(&b"proc".as_slice())
+    {
+        return false;
+    }
+    fields.get(separator + 3).is_some_and(|options| {
+        options.split(|byte| *byte == b',').all(|option| {
+            matches!(
+                option.strip_prefix(b"hidepid="),
+                None | Some(b"0" | b"off" | b"1" | b"noaccess")
+            )
+        })
+    })
+}
+#[cfg(target_os = "linux")]
+fn mount_fields(line: &[u8]) -> Vec<&[u8]> {
+    line.split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .collect()
+}
+// A zombie thread-group leader is not evidence that every sibling thread has
+// completed exit. Inspect tasks too; ENOENT means the exact observed task left.
+#[cfg(target_os = "linux")]
+fn process_group_tasks_dead(pid: u32, group: u32) -> std::io::Result<bool> {
+    // getpgid is a kernel membership query, independent of procfs stat access
+    // and comm encoding. Never discard an observation error to guess ownership.
+    // With the original leader retained and members confined, an excluded PID
+    // cannot be an owned task that escaped this group. ESRCH means that task
+    // has exited; PID reuse cannot replace the pinned group identity.
+    if !kernel_group_member(pid, group)? {
+        return Ok(true);
+    }
+    let tasks = match std::fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(tasks) => tasks,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    for task in tasks {
+        if !task_group_dead(&task?.path().join("stat"), group)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+#[cfg(target_os = "linux")]
+fn kernel_group_member(pid: u32, group: u32) -> std::io::Result<bool> {
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    if pgid >= 0 {
+        return Ok(pgid as u32 == group);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    Err(error)
+}
+#[cfg(target_os = "linux")]
+fn task_group_dead(path: &std::path::Path, group: u32) -> std::io::Result<bool> {
+    let stat = match std::fs::read(path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    let (state, pgid, _) = parse_proc_stat(&stat)?;
+    Ok(pgid != i64::from(group) || matches!(state, 'Z' | 'X'))
 }
 #[cfg(not(target_os = "linux"))]
 fn group_dead(_: u32) -> std::io::Result<bool> {
@@ -837,5 +949,243 @@ mod native_group_diagnostic_tests {
                 assert_eq!(status.signal(), Some(libc::SIGKILL));
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod receipt_group_observation_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn zombie_leader_with_live_sibling_is_not_a_terminal_group() {
+        let script = "import ctypes,os,sys,threading,time\nthreading.Thread(target=lambda: time.sleep(10)).start()\nctypes.CDLL(None).syscall(int(sys.argv[1]),0)\n";
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .args(["-c", script, &libc::SYS_exit.to_string()])
+            .env_clear()
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        while proc_stat(child.id()).unwrap().0 != 'Z' && started.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::yield_now();
+        }
+        let leader = proc_stat(child.id());
+        let before = group_dead(child.id());
+        // Retain the leader across the observer and actual signal; no namespace
+        // init/reaper observation is substituted for this owner's direct wait.
+        let signal = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        let status = child.wait().unwrap();
+        eprintln!(
+            "zombie leader/live sibling: leader={leader:?} terminal_before={before:?} signal={signal} waited={status:?}"
+        );
+        assert_eq!(leader.unwrap().0, 'Z');
+        assert!(!before.unwrap(), "live sibling hidden by zombie leader");
+        assert_eq!(signal, 0);
+    }
+
+    struct RetainedGroup(std::process::Child);
+    impl Drop for RetainedGroup {
+        fn drop(&mut self) {
+            // This exact unreaped direct leader pins the only signalled group.
+            unsafe {
+                libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+            }
+            self.0.wait().unwrap();
+        }
+    }
+
+    fn named_group() -> RetainedGroup {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .args(["-c", "import ctypes,time\nctypes.CDLL(None).prctl(15,b'opaque\\xff)comm',0,0,0)\nprint('ready',flush=True)\ntime.sleep(10)\n"])
+            .env_clear().process_group(0)
+            .stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        RetainedGroup(child)
+    }
+
+    #[test]
+    fn opaque_comm_does_not_obstruct_owned_or_unrelated_group_observation() {
+        let owned = named_group();
+        let unrelated = named_group();
+        assert!(std::fs::read_to_string(format!("/proc/{}/stat", unrelated.0.id())).is_err());
+        assert!(kernel_group_member(owned.0.id(), owned.0.id()).unwrap());
+        assert!(!kernel_group_member(unrelated.0.id(), owned.0.id()).unwrap());
+        assert!(
+            !group_dead(owned.0.id()).unwrap(),
+            "owned live task cannot discharge"
+        );
+        let started = Instant::now();
+        while !crate::process::settle_receipt_inspection_group(&owned.0).unwrap() {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "observation failed to progress"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            !group_dead(unrelated.0.id()).unwrap(),
+            "unrelated group was signalled"
+        );
+        eprintln!(
+            "opaque comm: owned live=false terminal; owned settled with unrelated opaque-comm task still live; both original waits retained"
+        );
+    }
+
+    struct StatMask(std::ffi::CString);
+    impl StatMask {
+        fn new(source: &std::path::Path, target: String) -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            let source = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+            let target = std::ffi::CString::new(target).unwrap();
+            assert_eq!(
+                unsafe {
+                    libc::mount(
+                        source.as_ptr(),
+                        target.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND,
+                        std::ptr::null(),
+                    )
+                },
+                0,
+                "private stat mask: {}",
+                std::io::Error::last_os_error()
+            );
+            Self(target)
+        }
+    }
+    impl Drop for StatMask {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { libc::umount(self.0.as_ptr()) }, 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires private user/mount/PID namespace and removed DAC override capabilities"]
+    fn private_denied_stat_excludes_unrelated_but_retains_owned_uncertainty() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::env::var("HOME").unwrap(), "/mnt/private/home");
+        let root = std::env::temp_dir().join(format!("receipt-denial-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let denied = root.join("denied");
+        std::fs::write(&denied, b"unreadable observation, not a custody fact").unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0)).unwrap();
+        let owned = named_group();
+        let unrelated = named_group();
+        let unrelated_path = format!("/proc/{}/stat", unrelated.0.id());
+        let unrelated_mask = StatMask::new(&denied, unrelated_path.clone());
+        assert_eq!(
+            std::fs::read(&unrelated_path).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(process_group_tasks_dead(unrelated.0.id(), owned.0.id()).unwrap());
+        let task_path = format!("/proc/{0}/task/{0}/stat", owned.0.id());
+        let owned_mask = StatMask::new(&denied, task_path.clone());
+        assert_eq!(
+            std::fs::read(&task_path).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            process_group_tasks_dead(owned.0.id(), owned.0.id())
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        // Real kernel membership is still owned. Denial is not replaced with
+        // absence, even after an actual kill while the direct child is pinned.
+        assert!(crate::process::settle_receipt_inspection_group(&owned.0).is_err());
+        eprintln!(
+            "real denied proc observation: unrelated excluded by getpgid; owned denial refuses settlement after actual signal"
+        );
+        drop(owned_mask);
+        let started = Instant::now();
+        while !crate::process::settle_receipt_inspection_group(&owned.0).unwrap() {
+            assert!(started.elapsed() < Duration::from_secs(2));
+            std::thread::yield_now();
+        }
+        assert!(!group_dead(unrelated.0.id()).unwrap());
+        assert_eq!(
+            std::fs::read(&unrelated_path).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        eprintln!(
+            "owned cleanup progressed while unrelated stat still actually PermissionDenied and unrelated task still live"
+        );
+        drop(unrelated_mask);
+        drop(owned);
+        drop(unrelated);
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hidden_proc_tasks_cannot_be_certified_by_omission() {
+        for option in ["rw", "rw,hidepid=0", "rw,hidepid=1", "rw,hidepid=noaccess"] {
+            assert!(proc_mount_exposes_task_ids(
+                format!("1 0 0:1 / /proc rw - proc proc {option}").as_bytes(),
+                b"1"
+            ));
+        }
+        for option in [
+            "rw,hidepid=2",
+            "rw,hidepid=invisible",
+            "rw,hidepid=4",
+            "rw,hidepid=ptraceable",
+            "rw,hidepid=unknown",
+        ] {
+            assert!(!proc_mount_exposes_task_ids(
+                format!("1 0 0:1 / /proc rw - proc proc {option}").as_bytes(),
+                b"1"
+            ));
+        }
+        assert!(!proc_mount_exposes_task_ids(b"", b"1"));
+        assert!(!proc_mount_exposes_task_ids(
+            b"1 0 0:1 / /proc rw - tmpfs tmpfs rw",
+            b"1"
+        ));
+        let stacked =
+            b"1 0 0:1 / /proc rw - proc proc rw\n2 1 0:2 / /proc rw - proc proc rw,hidepid=2";
+        assert!(proc_mount_exposes_task_ids(stacked, b"1"));
+        assert!(!proc_mount_exposes_task_ids(stacked, b"2"));
+        assert!(!proc_mount_exposes_task_ids(stacked, b"3"));
+        assert!(proc_mount_exposes_task_ids(
+            b"7 0 0:7 / /opaque\xff rw - tmpfs tmpfs rw\n1 0 0:1 / /proc rw - proc proc rw",
+            b"1"
+        ));
+    }
+
+    #[test]
+    fn terminal_task_parser_rejects_live_and_unknown_observations() {
+        let dir = std::env::temp_dir().join(format!("receipt-stat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("stat");
+        for (state, expected) in [
+            ("R", false),
+            ("S", false),
+            ("D", false),
+            ("Z", true),
+            ("X", true),
+        ] {
+            std::fs::write(
+                &path,
+                format!("1 (fixture) {state} 0 7 {} 123", ["0"; 16].join(" ")),
+            )
+            .unwrap();
+            assert_eq!(task_group_dead(&path, 7).unwrap(), expected);
+            assert!(task_group_dead(&path, 8).unwrap());
+        }
+        std::fs::write(&path, b"unavailable identity").unwrap();
+        assert!(task_group_dead(&path, 7).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(task_group_dead(&path, 7).unwrap());
+        std::fs::remove_dir(dir).unwrap();
     }
 }

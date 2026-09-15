@@ -17,6 +17,7 @@ fn enqueue(f: &Fixture) {
         })
         .unwrap();
 }
+#[track_caller]
 fn reached(f: &Fixture, name: &str) -> i64 {
     wait(|| {
         fs::read_to_string(f.root.path().join(format!("{name}.reached")))
@@ -86,6 +87,9 @@ fn start_pre_attachment(f: &Fixture) -> oulipoly_state::mailbox::CompletionDomai
             .exists()
             .then_some(())
     });
+    // This fixture studies custody after publication, not the admission race.
+    // The separate native_parent_publication_order tests deliberately enqueue early.
+    published_parent(f);
     enqueue(f);
     f.gate("release-initial-provider");
     f.wait_initial(&mut initial);
@@ -352,7 +356,7 @@ fn native_original_ac_receipt_after_adopter_loss_before_relaying_grant() {
     f.gate("unreleased-before-commit.hold");
     f.gate("unreleased-commit-returned-ok.hold");
     f.gate("unreleased-commit-returned-error.hold");
-    start_pre_attachment(&f);
+    let owner = start_pre_attachment(&f);
     let adopter = process_identity(reached(&f, "adopter-before-ac-release"));
     let a = attempt(&f);
     let attached: String = f
@@ -367,6 +371,12 @@ fn native_original_ac_receipt_after_adopter_loss_before_relaying_grant() {
         serde_json::from_str::<SourceProcessIdentity>(&attached).unwrap(),
         adopter
     );
+    // Both retained-result replay and the original AC use the commit barrier.
+    // Hold the actual CD before provoking EOF so the marker observes the AC,
+    // not an innocent replay consumer racing the producer's persisted receipt.
+    f.gate("driver-replay.hold");
+    assert_eq!(reached(&f, "driver-replay"), owner.driver_identity.pid);
+    assert!(current_identity_matches(&owner.driver_identity));
     kill_exact(&adopter);
     let ac_pid = reached(&f, "unreleased-before-commit");
     let ac = process_identity(ac_pid);
@@ -444,62 +454,19 @@ fn native_original_ac_receipt_after_adopter_loss_before_relaying_grant() {
     assert_eq!(fs::read_to_string(&a.result_path).unwrap(), receipt);
     assert!(!f.root.path().join("resume-prompts.jsonl").exists());
     println!("granted but not relayed: original AC receipt={receipt}");
+    remove_hold(&f, "driver-replay");
 }
 
-fn prelaunch_cancellation(operation: &str) {
-    if private_case(false) {
-        return;
-    }
-    let f = Fixture::new("owner_only");
-    let mut initial = f.start_with_hold(true);
-    f.owner();
-    wait(|| {
-        f.root
-            .path()
-            .join("provider-initial-ready")
-            .exists()
-            .then_some(())
-    });
-    f.gate(&format!("hold-native-{operation}"));
-    enqueue(&f);
-    f.gate("release-initial-provider");
-    f.wait_initial(&mut initial);
-    reached(&f, &format!("native-{operation}"));
-    let a = attempt(&f);
-    request_linked_cancel(&f, &a);
-    let token = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
-    let launch = token.split(':').next().unwrap();
-    wait(|| {
-        let state = oulipoly_state::StateDb::open_read_only(&f.data.join("state.db")).ok()?;
-        let status: String = state
-            .connection()
-            .query_row(
-                "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
-                [launch],
-                |r| r.get(0),
-            )
-            .ok()?;
-        (status == "cancelled").then_some(())
-    });
-    let (phase, integrated): (String, i64) = f
-        .sidecar_connection()
-        .query_row(
-            "SELECT phase,integrated FROM completion_continuation_attempt WHERE attempt_id=?1",
-            [&a.attempt_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!((phase.as_str(), integrated), ("drained", 1));
-    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
-    println!("actual {operation} cancellation settled before launch; no recipient invocation");
-}
+#[path = "custody_cancellation.rs"]
+mod cancellation;
+
 #[test]
 fn native_prelaunch_describe_cancellation_settles() {
-    prelaunch_cancellation("describe");
+    cancellation::prelaunch_cancellation("describe");
 }
 #[test]
 fn native_prelaunch_policy_cancellation_settles() {
-    prelaunch_cancellation("policy.evaluate");
+    cancellation::prelaunch_cancellation("policy.evaluate");
 }
 
 #[test]
@@ -2840,4 +2807,239 @@ fn native_channel_cancellation_after_ac_death_with_identity_obstructed() {
 #[test]
 fn native_channel_cancellation_after_ac_death_with_wait_journal_obstructed() {
     postlaunch_cancel_with_retained_ac_wait(false);
+}
+
+// Read real State binding and its sidecar projection, never a ready-file surrogate.
+fn published_parent(f: &Fixture) -> oulipoly_state::InvocationRecord {
+    wait(|| {
+        let runtime = f
+            .mailbox()
+            .wake_session_reader()
+            .session_metadata(SESSION)
+            .ok()??;
+        let state = oulipoly_state::StateDb::open_read_only(&f.data.join("state.db")).ok()?;
+        let parent = state
+            .get_invocation_by_uuid(runtime.invocation_uuid.as_deref()?)
+            .ok()??;
+        (parent.provider_session_id.as_deref() == Some(SESSION)
+            && runtime.model_name.as_deref() == Some(MODEL)
+            && runtime.provider_name.as_deref() == Some(PROVIDER))
+        .then_some(parent)
+    })
+}
+
+fn assert_no_activation(f: &Fixture) {
+    assert!(
+        f.mailbox()
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .unwrap()
+            .is_none()
+    );
+    let count: i64 = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT COUNT(*) FROM completion_continuation_attempt WHERE operation='activation'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "unbound pending address must not reserve or launch"
+    );
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+}
+
+fn native_parent_publication_order(early: bool) {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    if early {
+        f.gate("initial-session-publication.hold");
+        f.gate("native-runtime-unavailable.hold");
+    }
+    f.gate("hold-native-launch");
+    let mut initial = f.start_with_hold(true);
+    let owner = f.owner();
+    if early {
+        let publisher = reached(&f, "initial-session-publication");
+        assert_eq!(publisher, i64::from(initial.id()));
+        enqueue(&f);
+        assert_eq!(
+            reached(&f, "native-runtime-unavailable"),
+            owner.driver_identity.pid
+        );
+        assert_no_activation(&f);
+        assert!(
+            f.mailbox()
+                .wake_session_reader()
+                .session_metadata(SESSION)
+                .unwrap()
+                .is_none_or(|r| r.invocation_uuid.is_none())
+        );
+        let inputs = f.mailbox().list_pending(SESSION).unwrap().len();
+        assert_eq!(inputs, 1, "early work retained");
+        println!(
+            "ADMISSION early: actual driver declined; no claim/activation/recipient before binding; publisher={publisher}"
+        );
+        remove_hold(&f, "initial-session-publication");
+    }
+    let parent = published_parent(&f);
+    let selected_runtime = f
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
+    assert_no_activation(&f);
+    if !early {
+        enqueue(&f);
+    }
+    f.gate("release-initial-provider");
+    f.wait_initial(&mut initial);
+    if early {
+        remove_hold(&f, "native-runtime-unavailable");
+    }
+    let launcher = reached(&f, "native-launch");
+    let a = attempt(&f);
+    let claim = f
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        a.request_sha256,
+        oulipoly_state::mailbox::activation_request_sha256(
+            SESSION,
+            Some(&selected_runtime),
+            &claim.claim_token,
+            claim.auto_wake_count
+        )
+    );
+    let request: serde_json::Value = serde_json::from_slice(
+        &fs::read(PathBuf::from(&a.result_path).with_file_name("custodian-request.json")).unwrap(),
+    )
+    .unwrap();
+    let environment = request["recipe"]["Native"]["environment"]
+        .as_array()
+        .unwrap();
+    let encoded_parent = environment
+        .iter()
+        .find_map(|entry| {
+            let key: Vec<u8> = serde_json::from_value(entry[0].clone()).unwrap();
+            (key == b"OULIPOLY_PARENT_INVOCATION").then(|| {
+                serde_json::from_value::<Vec<u8>>(entry[1].clone())
+                    .expect("authentic parent must be set, not removed")
+            })
+        })
+        .unwrap();
+    let recipe_parent: oulipoly_state::CompositeInvocationId =
+        serde_json::from_slice(&encoded_parent).unwrap();
+    assert_eq!(recipe_parent.id, parent.invocation_uuid);
+    assert_eq!(recipe_parent.source, PROVIDER);
+    let state = oulipoly_state::StateDb::open_read_only(&f.data.join("state.db")).unwrap();
+    let sql = rusqlite::Connection::open_with_flags(
+        f.data.join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let resumed: (String, i64) = sql.query_row(
+        "SELECT invocation_uuid,parent_invocation_id FROM invocations WHERE parent_invocation_id=?1",
+        [parent.id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(resumed.1, parent.id);
+    assert!(state.get_invocation_by_uuid(&resumed.0).unwrap().is_some());
+    println!(
+        "ADMISSION early={early} bound parent={} id={} actual launcher={launcher} child={} claim={} request={}",
+        parent.invocation_uuid, parent.id, resumed.0, claim.claim_token, a.request_sha256
+    );
+    f.gate("release-resume");
+    fs::remove_file(f.root.path().join("hold-native-launch")).unwrap();
+    wait(|| {
+        // State read-only handles retain a snapshot. Reopen to observe the actual
+        // later terminal commit, rather than repeatedly reading pre-launch State.
+        let current = oulipoly_state::StateDb::open_read_only(&f.data.join("state.db")).ok()?;
+        let result = current.get_invocation_by_uuid(&resumed.0).ok()??;
+        (result.success == Some(true) && result.exit_code == Some(0)).then_some(())
+    });
+    println!("ADMISSION early={early}: authentic child completed successfully");
+}
+
+#[test]
+fn native_parent_publication_order_enqueue_before_binding() {
+    native_parent_publication_order(true);
+}
+
+#[test]
+fn native_parent_publication_order_binding_before_enqueue() {
+    native_parent_publication_order(false);
+}
+
+#[test]
+fn native_unknown_pending_target_retains_work_without_activation() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    // Keep the genuine founding invocation alive while using the low-level
+    // enqueue API; unlike CLI ingress that API does not elect a replacement owner.
+    let mut initial = f.start_with_hold(true);
+    let owner = f.owner();
+    published_parent(&f);
+    f.gate("native-runtime-unavailable.hold");
+    let mut db = MailboxDb::open(&f.data.join("pid-identity.db")).unwrap();
+    db.enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+        submission_token: "unknown-pending-input",
+        target: oulipoly_state::mailbox::InboxTarget {
+            kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+            id: "not-yet-bound",
+        },
+        input: b"retain until authentic binding",
+    })
+    .unwrap();
+    assert_eq!(
+        reached(&f, "native-runtime-unavailable"),
+        owner.driver_identity.pid
+    );
+    assert!(
+        db.wake_session_reader()
+            .wake_claim("not-yet-bound")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(db.list_pending("not-yet-bound").unwrap().len(), 1);
+    assert_no_activation(&f);
+    // The transaction API independently refuses missing runtime, even without
+    // going through the driver's preflight. This does not impersonate a parent.
+    let result = db
+        .wake_sessions()
+        .try_acquire_startable_wake_claim(
+            oulipoly_state::mailbox::WakeClaimRequest {
+                session_id: "not-yet-bound",
+                claim_token: "must-not-reserve",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        oulipoly_state::mailbox::WakeClaimAcquireResult::RuntimeUnavailable
+    );
+    assert!(
+        db.continuation_activation("not-yet-bound", "must-not-reserve")
+            .unwrap()
+            .is_none()
+    );
+    println!(
+        "ADMISSION unknown: actual driver and transaction retained one pending input, no activation"
+    );
+    remove_hold(&f, "native-runtime-unavailable");
+    f.gate("release-initial-provider");
+    f.wait_initial(&mut initial);
 }

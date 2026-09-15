@@ -1174,3 +1174,6 @@ fn provider_nonzero(status: &ProcessStatus) -> bool {
 
 #[cfg(unix)]
 pub use crate::process::enter_receipt_inspection_group;
+
+#[cfg(target_os = "linux")]
+pub use crate::process::settle_receipt_inspection_group;

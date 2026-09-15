@@ -734,6 +734,26 @@ pub struct SessionMetadataRow {
     pub auto_wake_count: i64,
 }
 
+/// Required selectors for native automatic resume. Metadata is published only
+/// after session binding; an address in pending input is not that publication.
+/// models_dir remains optional because the configured default is a valid selector.
+pub fn native_wake_runtime_ready(runtime: Option<&SessionMetadataRow>) -> bool {
+    runtime.is_some_and(|runtime| {
+        runtime
+            .invocation_uuid
+            .as_deref()
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+            && runtime
+                .provider_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+            && runtime
+                .model_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+    })
+}
+
 /// Compatibility columns retained in the installed `session_runtime` table.
 /// Generation lifecycle transactions maintain this projection atomically; no
 /// production liveness or wake decision treats it as runtime authority.
@@ -785,6 +805,8 @@ pub enum WakeClaimAcquireResult {
     NoPending,
     Busy,
     AlreadyInFlight(WakeClaimRow),
+    /// Pending work lacks launch selectors, or selection changed before claim.
+    RuntimeUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5705,6 +5727,27 @@ impl WakeSessionRepository<'_> {
         input: WakeClaimRequest<'_>,
         renew_token: Option<&str>,
     ) -> Result<WakeClaimAcquireResult, String> {
+        self.acquire_startable_wake_claim(input, renew_token, None)
+    }
+
+    /// Compare the caller's selected runtime inside the claim/reservation writer.
+    /// A concurrent publication must be selected again, not frozen into a different
+    /// request from the one the caller will launch.
+    pub fn try_acquire_startable_wake_claim_for_runtime(
+        &mut self,
+        input: WakeClaimRequest<'_>,
+        renew_token: Option<&str>,
+        runtime: Option<&SessionMetadataRow>,
+    ) -> Result<WakeClaimAcquireResult, String> {
+        self.acquire_startable_wake_claim(input, renew_token, Some(runtime))
+    }
+
+    fn acquire_startable_wake_claim(
+        &mut self,
+        input: WakeClaimRequest<'_>,
+        renew_token: Option<&str>,
+        selected: Option<Option<&SessionMetadataRow>>,
+    ) -> Result<WakeClaimAcquireResult, String> {
         let now = now_rfc3339();
         let tx = begin_wake_claim_transaction(self.conn)?;
         if session_admission_intent_on(&tx, input.session_id)?
@@ -5727,6 +5770,15 @@ impl WakeSessionRepository<'_> {
         if let Some(existing) = fresh_in_flight_wake_claim_for_input(&tx, input, renew_token)? {
             commit_existing_wake_claim_transaction(tx)?;
             return Ok(WakeClaimAcquireResult::AlreadyInFlight(existing));
+        }
+        let runtime = session_metadata_row(&tx, input.session_id)?;
+        let changed = selected.is_some_and(|selected| selected != runtime.as_ref());
+        if changed
+            || (completion_continuation::domain_on(&tx)?.is_some()
+                && !native_wake_runtime_ready(runtime.as_ref()))
+        {
+            commit_empty_wake_claim_transaction(tx)?;
+            return Ok(WakeClaimAcquireResult::RuntimeUnavailable);
         }
         let claim = acquire_wake_claim_tx(&tx, input, &now, min_seq, max_seq)?;
         completion_continuation::reserve_activation_on(&tx, input)?;
@@ -12073,6 +12125,41 @@ mod tests {
     // liveness claim. Native endpoint/custodian execution is tested separately.
     fn install_wake_owner(db: &mut MailboxDb) {
         use crate::completion_continuation::{PROTOCOL, SourceProcessIdentity};
+        let state_path = Path::new(db.conn.path().unwrap()).with_file_name("state.db");
+        let state = StateDb::open(&state_path).unwrap();
+        let parent_uuid = Uuid::new_v4().to_string();
+        let parent = state
+            .start_invocation(&crate::InvocationStart {
+                invocation_uuid: parent_uuid.clone(),
+                model_name: "model-a".into(),
+                provider_name: "provider-a".into(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .bind_invocation_provider_session_start(
+                crate::InvocationMutationAuthority::Standalone,
+                parent,
+                &crate::ProviderSessionBinding {
+                    provider_session_id: "session-a".into(),
+                    capture_method: "fixture",
+                    resume_input_id: None,
+                    provider_session_resolved_account: None,
+                },
+            )
+            .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: "session-a",
+                mode: "headless",
+                invocation_uuid: Some(&parent_uuid),
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
         let live = current_identity();
         let identity = SourceProcessIdentity {
             pid: live.os_pid,
@@ -17720,13 +17807,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);
+        let owner_uuid = db
+            .wake_session_reader()
+            .session_metadata("session-a")
+            .unwrap()
+            .unwrap()
+            .invocation_uuid
+            .unwrap();
         let identity = current_identity();
 
         db.wake_sessions()
             .project_legacy_runtime_running(LegacyRuntimeProjection {
                 session_id: "session-a",
                 mode: "headless",
-                invocation_uuid: "owner-invocation",
+                invocation_uuid: &owner_uuid,
                 provider_name: Some("provider-a"),
                 model_name: Some("model-a"),
                 identity: &identity,
@@ -17740,7 +17834,7 @@ mod tests {
             db.wake_sessions()
                 .settle_legacy_runtime_projection(LegacyRuntimeProjectionSettlement {
                     session_id: "session-a",
-                    invocation_uuid: "owner-invocation",
+                    invocation_uuid: &owner_uuid,
                     last_exit_code: Some(0),
                 })
                 .unwrap()
@@ -17800,7 +17894,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             metadata.invocation_uuid.as_deref(),
-            Some("owner-invocation")
+            Some(owner_uuid.as_str())
         );
         assert_eq!(
             projection.running_invocation_uuid.as_deref(),
@@ -18777,6 +18871,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);
+        let owner_uuid = db
+            .wake_session_reader()
+            .session_metadata("session-a")
+            .unwrap()
+            .unwrap()
+            .invocation_uuid
+            .unwrap();
         let identity = current_identity();
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
@@ -18784,9 +18885,9 @@ mod tests {
             .project_legacy_runtime_running(LegacyRuntimeProjection {
                 session_id: "session-a",
                 mode: "headless",
-                invocation_uuid: "invocation-a",
-                provider_name: None,
-                model_name: None,
+                invocation_uuid: &owner_uuid,
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
                 identity: &identity,
                 pty_control_path: None,
                 turn_start_max_mailbox_seq: None,

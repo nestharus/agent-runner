@@ -226,6 +226,9 @@ pub(in crate::mailbox) fn reserve_activation_on(
         return Err("completion activation must be admitted by independent driver".into());
     }
     let metadata = session_metadata_row(tx, input.session_id)?;
+    if !native_wake_runtime_ready(metadata.as_ref()) {
+        return Err("native activation runtime unavailable before reservation".into());
+    }
     let source:Option<String>=tx.query_row("SELECT s.registration_id FROM completion_continuation_source s JOIN completion_event_listener l ON l.event_id=s.event_id WHERE l.session_id=?1 AND l.acknowledged_at IS NULL ORDER BY s.registration_id LIMIT 1",[input.session_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
     let request = ContinuationAttempt {
         attempt_id: uuid::Uuid::new_v4().to_string(),

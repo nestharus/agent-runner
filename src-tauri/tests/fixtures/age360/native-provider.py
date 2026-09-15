@@ -389,17 +389,32 @@ hold = root / ("hold-native-" + method)
 if hold.exists():
     # Session-observer/preflight calls can share this provider. Hold only an
     # actually attributed native attempt actor, not whichever describe ran first.
-    ancestors = {os.getpid()}
-    pid = os.getppid()
+    ancestors = {}
+    pid = os.getpid()
     while pid > 0:
-        ancestors.add(pid)
-        pid = int(pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
-    attributed = False
+        raw = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        fields = raw.rsplit(")", 1)[1].split()
+        ancestors[pid] = {"pid": pid, "starttime": int(fields[19]), "stat": raw}
+        pid = int(fields[1])
+    matches = []
     for stat in root.glob("data/state.native-producer-custody/*/actors/*/proxy.stat"):
         raw = stat.read_text()
-        if raw and int(raw.split()[0]) in ancestors:
-            attributed = True
-    if attributed:
+        if not raw:
+            continue
+        pid = int(raw.split()[0])
+        starttime = int(raw.rsplit(")", 1)[1].split()[19])
+        if pid in ancestors and ancestors[pid]["starttime"] == starttime:
+            intent = json.loads(stat.with_name("intent.json").read_text())
+            assert intent["attempt_id"] == stat.parents[2].name
+            matches.append({"journal": str(stat), "attempt_id": intent["attempt_id"],
+                            "proxy": ancestors[pid], "operation": intent["operation"]})
+    if matches:
+        assert len(matches) == 1, matches
+        observation = {"provider": ancestors[os.getpid()], "actor": matches[0],
+                       "ancestors": list(ancestors.values()), "method": method,
+                       "request_id": request["request_id"],
+                       "boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+        (root / ("native-" + method + ".actor.json")).write_text(json.dumps(observation))
         (root / ("native-" + method + ".reached")).write_text(str(os.getpid()))
         while hold.exists(): time.sleep(0.02)
         if method == "launch" and root.joinpath("native-launch-exit-zero-without-output").exists():

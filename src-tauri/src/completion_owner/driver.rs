@@ -150,7 +150,18 @@ pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> 
                 "completion-independent-owner",
             );
             if !delivery.submitted && delivery.status != "paused" {
-                let _ = crate::wake_coordinator::trigger_notify_wake(&session);
+                let diagnostic = crate::wake_coordinator::trigger_notify_wake(&session);
+                tracing::debug!(
+                    session,
+                    status = diagnostic.status,
+                    "independent wake selection"
+                );
+                #[cfg(feature = "age360-fault-fixtures")]
+                if diagnostic.status == "runtime_unavailable" {
+                    oulipoly_state::completion_continuation::age360_fault_barrier(
+                        "native-runtime-unavailable",
+                    );
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(250));
