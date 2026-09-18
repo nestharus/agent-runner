@@ -890,8 +890,19 @@ fn usage_renders_error_row_for_any_failed_outcome_variant_with_exit_zero_and_no_
     make_quota_window_cache_unwritable(&cache_fail.db_path());
     let (code, stdout, stderr) = run_usage(&cache_fail);
     assert_success_with_stdout(code, &stdout, &stderr);
-    assert_contains_all(&stdout, &["cache-fail", "(error:", "cache write failed"]);
-    assert_not_contains_any(&stdout, &["weekly", "55%"]);
+    // Root storage decision 1 supersedes only the cache-suppression oracle.
+    // Preserve this historical ID and the genuine script/auth failure controls.
+    assert_contains_all(
+        &stdout,
+        &[
+            "cache-fail",
+            "(warning:",
+            "cache not committed",
+            "weekly",
+            "55%",
+        ],
+    );
+    assert_not_contains_any(&stdout, &["(error:"]);
 
     let auth_fail = Fixture::new();
     auth_fail.write_model("fixture", &["auth-fail"]);
@@ -1317,8 +1328,20 @@ fn usage_exits_zero_when_a_refresh_outcome_failed_due_to_cache_write_with_error_
     let (code, stdout, stderr) = run_usage(&fixture);
 
     assert_success_with_stdout(code, &stdout, &stderr);
-    assert_contains_all(&stdout, &["cache-fail", "(error:", "cache write failed"]);
-    assert_not_contains_any(&stdout, &["weekly", "66%"]);
+    // Storage Act1 decision 1 supersedes this ID's historical suppression
+    // oracle: valid provider observations survive an uncommitted cache write.
+    assert_contains_all(
+        &stdout,
+        &[
+            "cache-fail",
+            "(warning:",
+            "cache write failed",
+            "cache not committed",
+            "weekly",
+            "66%",
+        ],
+    );
+    assert_not_contains_any(&stdout, &["(error:"]);
 }
 
 fn wait_for_path(path: &Path) {

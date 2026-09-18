@@ -8,6 +8,12 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+#[path = "control.rs"]
+mod control;
+use control::{ControlService, JoinRefusal, JoinRequest, RefusalReason};
+#[path = "context_leases.rs"]
+mod context_leases;
+use context_leases::ContextLeases;
 
 pub(super) fn identity(pid: i64) -> Result<SourceProcessIdentity, String> {
     let identity = read_live_process_identity(pid)?.ok_or("process identity disappeared")?;
@@ -78,11 +84,14 @@ fn retain_context(socket: UnixStream) -> Result<(), String> {
         .set(socket)
         .map_err(|_| "native completion context already joined".into())
 }
-fn join(endpoint: &Path) -> Result<(), String> {
-    retain_context(connect_context(endpoint)?)
+fn join(endpoint: &Path, expected: &CompletionDomainOwner) -> Result<(), String> {
+    retain_context(connect_context(endpoint, expected)?)
 }
 
-fn connect_context(endpoint: &Path) -> Result<UnixStream, String> {
+fn connect_context(
+    endpoint: &Path,
+    expected: &CompletionDomainOwner,
+) -> Result<UnixStream, String> {
     let mut socket = UnixStream::connect(endpoint).map_err(|e| e.to_string())?;
     let peer = peer_pid(&socket)?;
     socket
@@ -104,14 +113,42 @@ fn connect_context(endpoint: &Path) -> Result<UnixStream, String> {
     if bytes.len() > 8192 {
         return Err("oversized completion join".into());
     }
-    let owner: CompletionDomainOwner = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    // Authenticate the peer before interpreting a negative. A refusal is not
+    // rollback/no-side-effect proof and never authorizes replay or fresh launch.
+    let peer_identity = identity(peer)?;
+    if peer_identity != expected.guardian_identity {
+        return Err("completion join peer conflict".into());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if value.get("completion_join_refusal").is_some() {
+        let refusal: JoinRefusal =
+            serde_json::from_value(value).map_err(|_| "invalid completion join refusal")?;
+        if refusal.guardian_identity != peer_identity
+            || refusal.protocol != PROTOCOL
+            || refusal.protocol != expected.protocol
+            || refusal.domain_id != expected.domain_id
+            || refusal.owner_generation != expected.owner_generation
+            || expected.endpoint != endpoint.to_string_lossy()
+        {
+            return Err("completion join refusal identity conflict".into());
+        }
+        let category = match refusal.completion_join_refusal {
+            RefusalReason::QueueFull => "queue full",
+            RefusalReason::Retiring => "retirement pause",
+            RefusalReason::Persistence => "persistence failure",
+        };
+        return Err(format!(
+            "completion join refused: {category}; admission outcome uncertain; no replay authorized"
+        ));
+    }
+    let owner: CompletionDomainOwner = serde_json::from_value(value).map_err(|e| e.to_string())?;
     if owner.guardian_identity != identity(peer)? || owner.endpoint != endpoint.to_string_lossy() {
         return Err("completion join peer conflict".into());
     }
     Ok(socket)
 }
 
-pub(super) fn bootstrap() -> Result<(), String> {
+pub(super) fn bootstrap() -> Result<(), super::BootstrapError> {
     if std::env::var_os(ENDPOINT_ENV).is_some() {
         // Wake-producing entry joins existing authority; read/ACK never bootstrap.
         let mailbox = MailboxDb::open_existing_native_authority(&MailboxDb::default_path()?)?;
@@ -119,7 +156,7 @@ pub(super) fn bootstrap() -> Result<(), String> {
             .completion_continuation_domain()?
             .ok_or("inherited endpoint has no native domain")?;
         let owner = require_owner(&domain)?;
-        join(Path::new(&owner.endpoint))?;
+        join(Path::new(&owner.endpoint), &owner)?;
         return Ok(());
     }
     validate_independent_entry()?;
@@ -130,8 +167,13 @@ pub(super) fn bootstrap() -> Result<(), String> {
     // The domain-keyed owner election cannot exist until the second database
     // has an identity. Serialize independent bootstrap at its stable path first;
     // this does not replace deployment's all-writers-stopped prerequisite.
-    std::fs::create_dir_all(path.parent().ok_or("sidecar parent absent")?)
-        .map_err(|e| e.to_string())?;
+    let directory = path.parent().ok_or("sidecar parent absent")?;
+    std::fs::create_dir_all(directory).map_err(|error| {
+        format!(
+            "Failed to create state directory {}: {error}",
+            directory.display()
+        )
+    })?;
     let transition = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -142,7 +184,8 @@ pub(super) fn bootstrap() -> Result<(), String> {
         .open(path.with_extension("completion-bootstrap.lock"))
         .map_err(|e| e.to_string())?;
     <std::fs::File as fs4::FileExt>::lock(&transition).map_err(|e| e.to_string())?;
-    let state = oulipoly_state::StateDb::open_default()?;
+    let state =
+        oulipoly_state::StateDb::open_default_with_error().map_err(super::BootstrapError::State)?;
     let mailbox = MailboxDb::open_completion_continuation_domain(&path)?;
     let domain = mailbox
         .completion_continuation_domain()?
@@ -162,7 +205,7 @@ pub(super) fn bootstrap() -> Result<(), String> {
     match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(e.to_string().into()),
     }
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::symlink_metadata(&directory).map_err(|e| e.to_string())?;
@@ -193,12 +236,12 @@ pub(super) fn bootstrap() -> Result<(), String> {
             if owner.domain_id != domain {
                 return Err("completion election domain conflict".into());
             }
-            join(&endpoint)?;
+            join(&endpoint, &owner)?;
             unsafe { std::env::set_var(ENDPOINT_ENV, &endpoint) };
             require_owner(&domain)?;
             return Ok(());
         }
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(e.to_string().into()),
     }
     let (mut ready, announce) = UnixStream::pair().map_err(|e| e.to_string())?;
     ready
@@ -206,7 +249,7 @@ pub(super) fn bootstrap() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(std::io::Error::last_os_error().to_string().into());
     }
     if pid == 0 {
         drop(ready);
@@ -294,19 +337,28 @@ fn guardian(
         election.as_raw_fd(),
         listener.as_raw_fd(),
     )?;
-    let mut contexts = Vec::new();
+    let mut contexts = ContextLeases::inherit(path)?;
     if let Some(mut socket) = announce.take() {
         let context = identity(peer_pid(&socket)?)?;
         MailboxDb::open(path)?.retain_completion_context(&context)?;
         socket.write_all(&[1]).map_err(|e| e.to_string())?;
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
-        contexts.push((socket, context));
+        contexts.retain_local(context, socket);
     }
     // Open a distinct description after close_except: never reuse the
     // bootstrap parent's inherited flock description.
     let admission = admission_gate(endpoint)?;
     let mut closing = false;
+    let mut control = ControlService::start(&listener, &owner)?;
+    let mut pending = Vec::new();
     loop {
+        if !closing {
+            append_pending(
+                &mut pending,
+                control.recover_finished(&listener, &owner)?,
+                &owner,
+            );
+        }
         super::custody::retry_unreleased();
         loop {
             let mut status = 0;
@@ -333,6 +385,7 @@ fn guardian(
                     let _ = std::fs::remove_file(endpoint);
                     // Release the lifetime election only after actual ECHILD,
                     // and before waking entrants blocked on the admission gate.
+                    control.stop()?;
                     drop(listener);
                     drop(election);
                     drop(admission);
@@ -343,6 +396,8 @@ fn guardian(
             // A waited descendant is not automatically attributable drain for
             // an activation whose custodian was lost. Its durable row remains.
             if !closing && i64::from(pid) == owner.driver_identity.pid {
+                // No control thread (or copied thread locks) may cross fork.
+                append_pending(&mut pending, control.stop()?, &owner);
                 owner = start_driver(
                     path,
                     endpoint,
@@ -350,57 +405,99 @@ fn guardian(
                     election.as_raw_fd(),
                     listener.as_raw_fd(),
                 )?;
+                control = ControlService::start(&listener, &owner)?;
             }
         }
-        for _ in 0..8 {
-            match listener.accept() {
-                Ok((mut socket, _)) => {
-                    if peer_pid(&socket).is_err() {
-                        continue;
-                    }
-                    let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
-                    let _ = socket.set_write_timeout(Some(Duration::from_millis(50)));
-                    let mut request = [0; 6];
-                    if socket.read_exact(&mut request).is_ok() && !closing {
-                        if request == *b"hello\n" {
-                            let _ = serde_json::to_writer(&mut socket, &owner);
-                        } else if request == *b"join!\n"
-                            && let Ok(context) = peer_pid(&socket).and_then(identity)
-                            && MailboxDb::open(path)
-                                .and_then(|db| db.retain_completion_context(&context))
-                                .is_ok()
-                            && serde_json::to_writer(&mut socket, &owner).is_ok()
-                            && socket.write_all(b"\n").is_ok()
-                            && socket.set_nonblocking(true).is_ok()
-                        {
-                            contexts.push((socket, context));
-                        }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.to_string()),
-            }
+        if pending.is_empty() {
+            append_pending(&mut pending, control.pending(), &owner);
         }
-        contexts.retain_mut(|(socket, context)| {
-            let mut byte = [0];
-            let retained = matches!(socket.read(&mut byte), Err(e) if matches!(e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted));
-            if !retained {
-                let _ = MailboxDb::open(path).and_then(|db| db.release_completion_context(context));
-            }
-            retained
-        });
-        if !closing && contexts.is_empty() && !retained_native_context(path).unwrap_or(true) {
-            // A missing/unreadable State DB is uncertainty, not no obligations.
+        retain_pending_contexts(path, &owner, &mut contexts, &mut pending);
+        // Errors leave the group owned for the next pass; never a release ACK.
+        let _ = contexts.release_disconnected(path);
+        if !closing
+            && contexts.is_empty()
+            && pending.is_empty()
+            && !retained_native_context(path).unwrap_or(true)
+        {
+            // Hold admission before pausing joins: an entrant already holding
+            // this gate must finish hello/join, not be rejected by retirement.
             closing = try_begin_retirement(&admission, || {
-                oulipoly_state::StateDb::open_default()
-                    .and_then(|state| state.close_idle_completion_continuation_owner(&owner))
-                    .unwrap_or(false)
+                close_idle_owner(&owner, &control, &mut pending)
             })?;
+            if closing {
+                control.close()?;
+            } else {
+                control.resume()?;
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn close_idle_owner(
+    owner: &CompletionDomainOwner,
+    control: &ControlService,
+    pending: &mut Vec<JoinRequest>,
+) -> bool {
+    // The barrier exposes every earlier join without obstructing hello during
+    // the State close. A failed reader cannot supply permission to retire.
+    if control.pause().is_err() {
+        return false;
+    }
+    append_pending(pending, control.pending(), owner);
+    if !pending.is_empty() {
+        return false;
+    }
+    oulipoly_state::StateDb::open_default()
+        .and_then(|state| state.close_idle_completion_continuation_owner(owner))
+        .unwrap_or(false)
+}
+
+// Both the channel and the writer backlog are bounded. A refused request has
+// not been persisted or acknowledged. Preserve earlier accepted ordering when
+// a driver replacement transfers the old reader's queued sockets.
+fn append_pending(
+    pending: &mut Vec<JoinRequest>,
+    requests: Vec<JoinRequest>,
+    owner: &CompletionDomainOwner,
+) {
+    for mut request in requests {
+        if pending.len() < control::PENDING_LIMIT {
+            pending.push(request);
+        } else {
+            JoinRefusal::new(owner, RefusalReason::QueueFull).send(&mut request.socket);
+        }
+    }
+}
+
+fn retain_pending_contexts(
+    path: &Path,
+    owner: &CompletionDomainOwner,
+    contexts: &mut ContextLeases,
+    pending: &mut Vec<JoinRequest>,
+) {
+    for request in pending.drain(..pending.len().min(8)) {
+        retain_pending_context(path, owner, contexts, request);
+    }
+}
+
+fn retain_pending_context(
+    path: &Path,
+    owner: &CompletionDomainOwner,
+    contexts: &mut ContextLeases,
+    mut request: JoinRequest,
+) {
+    if contexts.admit(path, &request.context).is_err() {
+        JoinRefusal::new(owner, RefusalReason::Persistence).send(&mut request.socket);
+        return;
+    }
+    // Persistence preceded the reply. Even a lost reply is owned locally;
+    // grouping sockets by incarnation prevents one release deleting another.
+    let _ = serde_json::to_writer(&mut request.socket, owner)
+        .map_err(|e| e.to_string())
+        .and_then(|()| request.socket.write_all(b"\n").map_err(|e| e.to_string()));
+    let _ = request.socket.set_nonblocking(true);
+    contexts.retain_local(request.context, request.socket);
 }
 
 /// A lost socket owner does not erase a live native entry's ability to admit
@@ -410,11 +507,9 @@ fn retained_native_context(path: &Path) -> Result<bool, String> {
     let db = MailboxDb::open(path)?;
     let mut live = false;
     for context in db.completion_contexts()? {
-        let current = read_live_process_identity(context.pid)?;
-        let matching = current.is_some_and(|id| {
-            id.os_boot_id == context.boot_id && id.os_pid_starttime_ticks == context.starttime_ticks
-        });
-        if matching {
+        // The residual sweep must use the same positive expiry evidence as
+        // inherited groups; optional absence is not permission to retire.
+        if !context_leases::incarnation_expired(&context) {
             live = true;
         } else {
             db.release_completion_context(&context)?;
@@ -600,3 +695,7 @@ fn redirect_stdio() -> Result<(), String> {
 #[cfg(test)]
 #[path = "linux_admission_tests.rs"]
 mod admission_tests;
+
+#[cfg(test)]
+#[path = "linux_identity_tests.rs"]
+mod identity_tests;

@@ -14,6 +14,7 @@ pub mod error_formatter;
 mod provider_access;
 mod provider_dispatch;
 mod request_mapper;
+mod source_ingest;
 
 use crate::provider_registry::ProviderRegistryHandle;
 use crate::services::{MigrationServiceOutput, MigrationServiceRequest};
@@ -40,6 +41,7 @@ pub fn assess_rotation(
         request,
         registry.host_options(),
         "rotation.assess",
+        registry.as_ref(),
     )?;
     provider_dispatch::invoke_provider_contract(endpoint.client(), "rotation.assess", payload)
 }
@@ -49,6 +51,7 @@ pub fn materialize_rotation(
     identity: ExternalRotationIdentity,
     request: &MigrationServiceRequest<'_>,
 ) -> Result<MigrationServiceOutput, ExternalRotationError> {
+    source_ingest::settle_source_ingestion(registry_handle, &identity, request)?;
     let result = invoke_rotation_materialize(registry_handle, &identity, request)?;
     if !result.changed {
         crate::rotation_host_apply::validate_no_change_host_state_plan(
@@ -137,6 +140,7 @@ fn invoke_rotation_materialize(
         request,
         registry.host_options(),
         "rotation.materialize",
+        registry.as_ref(),
     )?;
     provider_dispatch::invoke_provider_contract(endpoint.client(), "rotation.materialize", payload)
 }

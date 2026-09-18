@@ -81,6 +81,25 @@ impl CompletionAuthorityFence<'_> {
 }
 
 impl MailboxDb {
+    /// A coherent live observation of exact projection and reconciliation, not
+    /// acceptance or mutation authority. A missed/changed row still needs repair.
+    pub(crate) fn continuation_projection_matches(
+        &self,
+        binding: &AdmittedSourceBinding,
+        expected_head: &CompletionContinuityHead,
+    ) -> Result<bool, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        if completion_continuity_head_on(&tx)?.as_ref() != Some(expected_head)
+            || sidecar_generation_on(&tx)? != expected_head.sidecar_generation
+        {
+            return Ok(false);
+        }
+        projection_matches_on(&tx, binding)
+    }
+
     pub fn completion_continuation_acceptance(
         &self,
         registration_id: &str,
@@ -171,4 +190,68 @@ pub(in crate::mailbox) fn retained_payload(
         return Ok(false);
     }
     conn.query_row("SELECT EXISTS(SELECT 1 FROM completion_continuation_source WHERE payload_sha256=?1 AND phase='accepted')",[digest],|r|r.get(0)).map_err(|e|e.to_string())
+}
+
+fn projection_matches_on(
+    conn: &Connection,
+    binding: &AdmittedSourceBinding,
+) -> Result<bool, String> {
+    let source = binding.registration()?;
+    if domain_on(conn)?.as_deref() != Some(&source.domain_id) {
+        return Ok(false);
+    }
+    let retained: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT binding FROM completion_continuation_source WHERE registration_id=?1",
+            [&source.registration_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(retained) = retained else {
+        return Ok(false);
+    };
+    if !AdmittedSourceBinding::decode(&retained)?.same_source(binding) {
+        return Ok(false);
+    }
+    let Some(event) = completion_event_by_id_on(conn, &source.handle)? else {
+        return Ok(false);
+    };
+    let identity = binding.admission_listener()?;
+    let paths = source.paths();
+    validate_completion_event_registration_replay(
+        &event,
+        &CompletionEventRegistrationInput {
+            event_id: &source.handle,
+            delivery_mode: &source.delivery_mode,
+            owner_session_id: Some(&identity.session_id),
+            owner_invocation_uuid: Some(&identity.owner_invocation_uuid),
+            state_dir: &source.handle_dir,
+            meta_path: &paths[0],
+            log_path: &paths[1],
+            rc_path: &paths[2],
+        },
+    )?;
+    let Some(listener) = completion_event_listener_on(conn, &source.handle, &identity.listener_id)?
+    else {
+        return Ok(false);
+    };
+    validate_completion_event_listener_replay(
+        &listener,
+        &identity.session_id,
+        &identity.owner_invocation_uuid,
+    )?;
+    let policy: Option<String> = conn.query_row(
+        "SELECT policy FROM completion_continuation_notification WHERE event_id=?1 AND listener_id=?2",
+        params![source.handle, identity.listener_id], |r| r.get(0),
+    ).optional().map_err(|e| e.to_string())?;
+    match policy.as_deref() {
+        Some("response_only") => Ok(!listener.active
+            || listener.acknowledged_at.is_some()
+            || listener.mailbox_seq.is_some()),
+        Some("notify") if event.state == "triggered" => Ok(listener.acknowledged_at.is_some()
+            || (listener.active && listener.mailbox_seq.is_some())),
+        Some("notify") => Ok(true),
+        _ => Ok(false),
+    }
 }

@@ -670,7 +670,7 @@ impl StateDb {
             super::provider_launch_publication::needs_publication(&tx, predecessor, "successor")?;
         let authority = needs_publication
             .then(|| {
-                crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
+                crate::mailbox::MailboxAuthorityFence::try_acquire(&sidecar_path)
                     .map_err(|e| e.to_string())
             })
             .transpose()?;
@@ -1121,7 +1121,7 @@ impl StateDb {
             super::provider_launch_publication::needs_publication(&tx, owner, operation)?;
         let authority = needs_publication
             .then(|| {
-                crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
+                crate::mailbox::MailboxAuthorityFence::try_acquire(&sidecar_path)
                     .map_err(|e| e.to_string())
             })
             .transpose()?;

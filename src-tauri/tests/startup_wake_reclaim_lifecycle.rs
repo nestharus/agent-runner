@@ -19,8 +19,21 @@ const CONCURRENCY: usize = 8;
 
 #[test]
 fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
+    // Keep the historical ID and native custody obligations. A legitimate native
+    // claim can preempt snapshot selection; occurrence is independently tested below.
+    concurrent_startup(true);
+}
+
+#[test]
+fn incomplete_parent_concurrent_launches_exercise_snapshot_admission_and_cleanup() {
+    // Existing incomplete-history refusal is the independent admission oracle:
+    // the native driver stays enabled but cannot consume this pending candidate.
+    concurrent_startup(false);
+}
+
+fn concurrent_startup(complete_parent: bool) {
     let _guard = integration_test_guard();
-    let directory = tempfile::tempdir().unwrap();
+    let directory = FailureEvidenceDirectory(Some(tempfile::tempdir().unwrap()));
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
     let home = directory.path().join("home");
@@ -36,7 +49,7 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
     std::fs::write(
         &provider,
         format!(
-            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> {}\nprintf 'fixture-ok\\n'\n",
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> {}\nif [[ \"$*\" == *'establish recovery recipient'* ]]; then\n  printf '%s\\n' '{{\"type\":\"session\",\"session_id\":\"candidate-bearing-session\"}}'\nfi\nif [[ \"$*\" == *'--resume candidate-bearing-session'* ]]; then\n  printf 'fixture-resume-accepted\\n'\nfi\nprintf 'fixture-ok\\n'\n",
             starts.display()
         ),
     )
@@ -49,13 +62,15 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
     .unwrap();
     std::fs::write(
         app_config.join("providers.toml"),
-        provider_authority_fixture::with_explicit_provider_authority(&format!(
-            "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n\n[fixture-provider.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
+        provider_authority_fixture::with_explicit_provider_authority_for_prompt_acceptance(&format!(
+            "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n\n[fixture-provider.resume]\nkind = \"flag\"\nflag = \"--resume\"\n\n[fixture-provider.session_capture]\nkind = \"stdout_json_event\"\njson_args = [\"--fixture-json\"]\nevent_type = \"session\"\nevent_id_path = \"session_id\"\n\n[fixture-provider.resume_acceptance]\naccepted_output_patterns = [\"fixture-resume-accepted\"]\n",
             provider.display()
-        )),
+        ), &["fixture-provider"]),
     )
     .unwrap();
 
+    oulipoly_config::providers::ProvidersConfig::load(&app_config.join("providers.toml"))
+        .expect("valid startup fixture provider contract");
     let runner = Path::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
     let warmup = runner_command(
         runner,
@@ -74,6 +89,8 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
         String::from_utf8_lossy(&warmup.stderr)
     );
 
+    oulipoly_config::providers::ProvidersConfig::load(&app_config.join("providers.toml"))
+        .expect("valid startup fixture provider contract");
     let data_root = data_home.join("oulipoly-agent-runner");
     let state_path = data_root.join("state.db");
     let mailbox_path = data_root.join("pid-identity.db");
@@ -87,7 +104,13 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
         )
         .unwrap();
     drop(connection);
-    seed_recoverable_wake_candidate(directory.path(), &state_path, &mailbox_path, &models);
+    seed_recoverable_wake_candidate(
+        directory.path(),
+        &state_path,
+        &mailbox_path,
+        &models,
+        complete_parent,
+    );
     std::fs::write(&starts, []).unwrap();
     let baseline_temp_entries = directory_entries(&snapshot_temp);
 
@@ -138,6 +161,14 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
     stop_sampling.store(true, Ordering::SeqCst);
     sampler.join().unwrap();
 
+    for (index, (output, elapsed)) in outputs.iter().enumerate() {
+        println!(
+            "foreground index={index} elapsed={elapsed:?} status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     for (output, elapsed) in outputs {
         assert!(
             output.status.success(),
@@ -152,39 +183,23 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
         assert!(!stderr.contains("database is locked"));
         assert!(!stderr.contains("database is busy"));
     }
-    wait_until(Duration::from_secs(10), || {
-        std::fs::read_to_string(&starts).unwrap().lines().count() > CONCURRENCY
-            && sqlite_count(
-                &mailbox_path,
-                "SELECT auto_wake_count FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
-            ) >= 1
-            && sqlite_count(
-                &mailbox_path,
-                "SELECT COUNT(*) FROM runtime_generation WHERE lifecycle_state != 'exited'",
-            ) == 0
-            && sqlite_count(
-                &state_path,
-                "SELECT COUNT(*) FROM invocations WHERE status = 'running'",
-            ) == 0
-    });
-    let starts_content = std::fs::read_to_string(&starts).unwrap();
-    assert!(
-        starts_content.lines().count() > CONCURRENCY,
-        "the recoverable pending session was not automatically woken: {starts_content}"
-    );
-    assert_eq!(
-        sqlite_count(
-            &mailbox_path,
-            "SELECT auto_wake_count FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
-        ),
-        1,
-        "wake claim single-flight was not preserved; provider starts: {starts_content}"
-    );
+    if complete_parent {
+        assert_one_concurrent_wake(&starts, &state_path, &mailbox_path);
+    } else {
+        assert_incomplete_concurrent_parent(&starts, &state_path, &mailbox_path);
+    }
     let helper_peak = helper_peak.load(Ordering::SeqCst);
+    println!("complete_parent={complete_parent} snapshot_helper_peak={helper_peak}");
     assert!(
-        (1..=2).contains(&helper_peak),
+        helper_peak <= 2,
         "expected at most the expiring owner and its fenced successor, observed {helper_peak}"
     );
+    if !complete_parent {
+        assert!(
+            helper_peak >= 1,
+            "snapshot concurrency control must not be vacuous"
+        );
+    }
     wait_until(Duration::from_secs(5), || {
         snapshot_helper_count(directory.path()) == 0
             && directory_entries(&snapshot_temp) == baseline_temp_entries
@@ -223,12 +238,116 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
         1,
         "the exact recorded-dead incumbent was not reconciled before candidate planning"
     );
+    if complete_parent {
+        assert_settled_wake(&state_path, &mailbox_path);
+        println!("concurrent native original custody and end-state assertions reached");
+    }
+    println!("concurrent snapshot cleanup and exact dead-generation assertions reached");
+}
+
+fn assert_one_concurrent_wake(starts: &Path, state_path: &Path, mailbox_path: &Path) {
+    wait_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(starts).unwrap().lines().count() > CONCURRENCY
+            && sqlite_count(
+                mailbox_path,
+                "SELECT auto_wake_count FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
+            ) >= 1
+            && sqlite_count(
+                mailbox_path,
+                "SELECT COUNT(*) FROM runtime_generation WHERE lifecycle_state != 'exited'",
+            ) == 0
+            && sqlite_count(
+                state_path,
+                "SELECT COUNT(*) FROM invocations WHERE status = 'running'",
+            ) == 0
+    });
+    let starts_content = std::fs::read_to_string(starts).unwrap();
+    assert!(
+        starts_content.lines().count() > CONCURRENCY,
+        "the recoverable pending session was not automatically woken: {starts_content}"
+    );
+    assert_eq!(
+        sqlite_count(
+            mailbox_path,
+            "SELECT auto_wake_count FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
+        ),
+        1,
+        "wake claim single-flight was not preserved; provider starts: {starts_content}"
+    );
+    assert_eq!(
+        starts_content
+            .matches("handle: candidate-bearing-handle")
+            .count(),
+        1
+    );
+}
+
+fn assert_incomplete_concurrent_parent(starts: &Path, state_path: &Path, mailbox_path: &Path) {
+    wait_until(Duration::from_secs(10), || {
+        sqlite_count(
+            state_path,
+            "SELECT COUNT(*) FROM invocations WHERE status = 'running'",
+        ) == 0
+            && sqlite_count(
+                mailbox_path,
+                "SELECT COUNT(*) FROM runtime_generation WHERE lifecycle_state != 'exited'",
+            ) == 0
+    });
+    assert_eq!(
+        std::fs::read_to_string(starts).unwrap().lines().count(),
+        CONCURRENCY
+    );
+    let mailbox = MailboxDb::open(mailbox_path).unwrap();
+    assert!(
+        mailbox.completion_continuation_owner().unwrap().is_some(),
+        "native owner remains enabled"
+    );
+    let runtime = mailbox
+        .wake_session_reader()
+        .session_metadata("candidate-bearing-session")
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.auto_wake_count, 0);
+    assert!(runtime.invocation_uuid.as_deref().is_none_or(|id| {
+        StateDb::open(state_path)
+            .unwrap()
+            .get_invocation_by_uuid(id)
+            .unwrap()
+            .is_none()
+    }));
+    assert!(
+        mailbox
+            .wake_session_reader()
+            .wake_claim("candidate-bearing-session")
+            .unwrap()
+            .is_none()
+    );
+    let pending = mailbox.list_pending("candidate-bearing-session").unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].handle, "candidate-bearing-handle");
+    assert_eq!(
+        sqlite_count(
+            mailbox_path,
+            "SELECT COUNT(*) FROM completion_continuation_attempt WHERE session_id='candidate-bearing-session'"
+        ),
+        0
+    );
+    println!("incomplete parent: actual owner, pending retained, no claim/activation/wake");
 }
 
 #[test]
 fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
+    bootstrap_handoff(true);
+}
+
+#[test]
+fn incomplete_parent_handoff_does_not_admit_a_native_wake() {
+    bootstrap_handoff(false);
+}
+
+fn bootstrap_handoff(complete_parent: bool) {
     let _guard = integration_test_guard();
-    let directory = tempfile::tempdir().unwrap();
+    let directory = FailureEvidenceDirectory(Some(tempfile::tempdir().unwrap()));
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
     let home = directory.path().join("home");
@@ -244,7 +363,7 @@ fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
     std::fs::write(
         &provider,
         format!(
-            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> {}\nprintf 'fixture-ok\\n'\n",
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> {}\nif [[ \"$*\" == *'establish recovery recipient'* ]]; then\n  printf '%s\\n' '{{\"type\":\"session\",\"session_id\":\"candidate-bearing-session\"}}'\nfi\nif [[ \"$*\" == *'--resume candidate-bearing-session'* ]]; then\n  printf 'fixture-resume-accepted\\n'\nfi\nprintf 'fixture-ok\\n'\n",
             starts.display()
         ),
     )
@@ -257,25 +376,34 @@ fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
     .unwrap();
     std::fs::write(
         app_config.join("providers.toml"),
-        provider_authority_fixture::with_explicit_provider_authority(&format!(
-            "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n\n[fixture-provider.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
+        provider_authority_fixture::with_explicit_provider_authority_for_prompt_acceptance(&format!(
+            "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n\n[fixture-provider.resume]\nkind = \"flag\"\nflag = \"--resume\"\n\n[fixture-provider.session_capture]\nkind = \"stdout_json_event\"\njson_args = [\"--fixture-json\"]\nevent_type = \"session\"\nevent_id_path = \"session_id\"\n\n[fixture-provider.resume_acceptance]\naccepted_output_patterns = [\"fixture-resume-accepted\"]\n",
             provider.display()
-        )),
+        ), &["fixture-provider"]),
     )
     .unwrap();
 
+    oulipoly_config::providers::ProvidersConfig::load(&app_config.join("providers.toml"))
+        .expect("valid startup fixture provider contract");
     let data_root = data_home.join("oulipoly-agent-runner");
     std::fs::create_dir_all(&data_root).unwrap();
     let state_path = data_root.join("state.db");
     let mailbox_path = data_root.join("pid-identity.db");
     drop(StateDb::open(&state_path).unwrap());
-    seed_recoverable_wake_candidate(directory.path(), &state_path, &mailbox_path, &models);
+    seed_recoverable_wake_candidate(
+        directory.path(),
+        &state_path,
+        &mailbox_path,
+        &models,
+        complete_parent,
+    );
     std::fs::write(&starts, []).unwrap();
     let owner_token = "wake-reclaim-bootstrap";
     let handoff_token = "wake-reclaim-bootstrap";
     let lease_path = data_root.join("pid-identity.db.wake-reclaim-owner.json");
     assert!(!lease_path.exists());
 
+    let handoff_started = Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"))
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_DATA_HOME", &data_home)
@@ -292,6 +420,73 @@ fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
         "handoff helper failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    println!(
+        "handoff elapsed={:?} status={} stdout={} stderr={}",
+        handoff_started.elapsed(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        handoff_started.elapsed() < Duration::from_secs(5),
+        "handoff foreground exceeded five seconds"
+    );
+    if !complete_parent {
+        // Bootstrap is real; neither an owner row nor an invocation UUID is
+        // supplied by the test. Incomplete history must remain inadmissible.
+        wait_until(Duration::from_secs(5), || {
+            MailboxDb::open(&mailbox_path)
+                .unwrap()
+                .completion_continuation_owner()
+                .unwrap()
+                .is_some()
+        });
+        assert!(
+            MailboxDb::open(&mailbox_path)
+                .unwrap()
+                .completion_continuation_owner()
+                .unwrap()
+                .is_some()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(std::fs::read_to_string(&starts).unwrap().is_empty());
+        assert_eq!(
+            sqlite_count(&state_path, "SELECT COUNT(*) FROM invocations"),
+            0
+        );
+        assert_eq!(
+            sqlite_count(
+                &mailbox_path,
+                "SELECT auto_wake_count FROM session_runtime WHERE session_id='candidate-bearing-session'"
+            ),
+            0
+        );
+        assert_eq!(
+            sqlite_count(
+                &mailbox_path,
+                "SELECT COUNT(*) FROM completion_continuation_attempt WHERE session_id='candidate-bearing-session'"
+            ),
+            0
+        );
+        let selected = MailboxDb::open(&mailbox_path)
+            .unwrap()
+            .wake_session_reader()
+            .session_metadata("candidate-bearing-session")
+            .unwrap()
+            .unwrap()
+            .invocation_uuid;
+        assert!(selected.as_deref().is_none_or(|id| {
+            StateDb::open(&state_path)
+                .unwrap()
+                .get_invocation_by_uuid(id)
+                .unwrap()
+                .is_none()
+        }));
+        println!(
+            "incomplete parent: real owner, no parent invocation, no provider start/activation/count during bounded observation"
+        );
+        return;
+    }
     wait_until(Duration::from_secs(10), || {
         std::fs::read_to_string(&starts)
             .map(|content| !content.is_empty())
@@ -331,6 +526,7 @@ fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
         1
     );
     assert!(!lease_path.exists());
+    assert_settled_wake(&state_path, &mailbox_path);
 }
 
 fn runner_command(
@@ -370,16 +566,20 @@ fn seed_recoverable_wake_candidate(
     state_path: &Path,
     mailbox_path: &Path,
     models: &Path,
+    complete_parent: bool,
 ) {
-    let state = rusqlite::Connection::open(state_path).unwrap();
-    state
+    let parent =
+        complete_parent.then(|| establish_recovery_parent(root, state_path, mailbox_path, models));
+    if !complete_parent {
+        let state = rusqlite::Connection::open(state_path).unwrap();
+        state
         .execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
              VALUES ('11111111-1111-4111-8111-111111111111', '2026-08-19T00:00:00Z', '2026-08-19T00:00:00Z', 'fixture')",
             [],
         )
         .unwrap();
-    state
+        state
         .execute(
             "INSERT INTO session_chain_segments
                 (chain_id, provider_name, session_id, started_at, transition_reason)
@@ -387,13 +587,14 @@ fn seed_recoverable_wake_candidate(
             [],
         )
         .unwrap();
-    provider_authority_fixture::bind_session_authority_with_cwd(
-        &state,
-        "fixture-provider",
-        "candidate-bearing-session",
-        root,
-    );
-    drop(state);
+        provider_authority_fixture::bind_session_authority_with_cwd(
+            &state,
+            "fixture-provider",
+            "candidate-bearing-session",
+            root,
+        );
+        drop(state);
+    }
 
     let payload_root = root.join("pending-payload");
     std::fs::create_dir(&payload_root).unwrap();
@@ -410,7 +611,7 @@ fn seed_recoverable_wake_candidate(
         .upsert_session_metadata(SessionMetadataUpsert {
             session_id: "candidate-bearing-session",
             mode: "headless",
-            invocation_uuid: None,
+            invocation_uuid: parent.as_deref(),
             provider_name: Some("fixture-provider"),
             model_name: Some("fixture"),
             models_dir: Some(models),
@@ -503,6 +704,26 @@ fn seed_recoverable_wake_candidate(
         )
         .unwrap();
     assert_eq!(changed, 1);
+    if let Some(parent) = parent.as_deref() {
+        // The historical incumbent's compatibility projection selects its
+        // synthetic spawn UUID. Retain the separately proven real recipient,
+        // just as the recovery-parent fixtures retain their earlier metadata.
+        // This is history setup while no owner exists, not a native admission,
+        // activation, claim, binding or custody grant to this test process.
+        assert!(mailbox.completion_continuation_owner().unwrap().is_none());
+        mailbox
+            .wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: "candidate-bearing-session",
+                mode: "headless",
+                invocation_uuid: Some(parent),
+                provider_name: Some("fixture-provider"),
+                model_name: Some("fixture"),
+                models_dir: Some(models),
+                effective_cwd: root.to_str(),
+            })
+            .unwrap();
+    }
 }
 
 fn snapshot_helper_count(root: &Path) -> usize {
@@ -547,4 +768,132 @@ fn make_executable(path: &Path) {
     let mut permissions = std::fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(path, permissions).unwrap();
+}
+
+// The parent is published by the real Runner/provider binding path, following
+// the retry-parent fixture precedent, before historical dead-incumbent inputs.
+fn establish_recovery_parent(
+    root: &Path,
+    state_path: &Path,
+    mailbox_path: &Path,
+    models: &Path,
+) -> String {
+    let output = runner_command(
+        Path::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner")),
+        models,
+        &root.join("config"),
+        &root.join("data"),
+        &root.join("home"),
+        &root.join("snapshot-temp"),
+        "establish recovery recipient",
+    )
+    .current_dir(root)
+    .output()
+    .unwrap();
+    println!(
+        "genuine parent output status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "genuine parent launch: {output:?}");
+    let mailbox = MailboxDb::open(mailbox_path).unwrap();
+    let runtime = mailbox
+        .wake_session_reader()
+        .session_metadata("candidate-bearing-session")
+        .unwrap()
+        .expect("Runner-published session");
+    let id = runtime.invocation_uuid.expect("Runner-published parent");
+    let state = StateDb::open(state_path).unwrap();
+    let parent = state.get_invocation_by_uuid(&id).unwrap().unwrap();
+    assert_eq!(
+        parent.provider_session_id.as_deref(),
+        Some("candidate-bearing-session")
+    );
+    assert!(parent.finished_at.is_some());
+    let outcome: (String, bool, i64) = state
+        .connection()
+        .query_row(
+            "SELECT status, success, exit_code FROM invocations WHERE invocation_uuid=?1",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(outcome, ("succeeded".to_string(), true, 0));
+    wait_until(Duration::from_secs(5), || {
+        MailboxDb::open(mailbox_path)
+            .unwrap()
+            .completion_continuation_owner()
+            .unwrap()
+            .is_none()
+    });
+    assert!(
+        MailboxDb::open(mailbox_path)
+            .unwrap()
+            .completion_continuation_owner()
+            .unwrap()
+            .is_none(),
+        "founding owner must retire before startup recovery"
+    );
+    println!(
+        "genuine recovery parent={id} session=candidate-bearing-session finished={:?}",
+        parent.finished_at
+    );
+    id
+}
+
+fn assert_settled_wake(state_path: &Path, mailbox_path: &Path) {
+    // Source-custody and foreground success do not substitute for this original
+    // native activation's independently collected ECHILD receipt and result.
+    let settled = || {
+        sqlite_count(
+            mailbox_path,
+            "SELECT COUNT(*) FROM completion_continuation_attempt WHERE session_id='candidate-bearing-session' AND phase='drained' AND integrated=1 AND drain_receipt LIKE '%ECHILD%'",
+        ) == 1
+    };
+    wait_until(Duration::from_secs(5), settled);
+    assert!(settled(), "original native wake custody did not drain");
+    let mailbox = rusqlite::Connection::open(mailbox_path).unwrap();
+    let row: (String, String, String, String, String) = mailbox.query_row(
+        "SELECT runtime_generation_uuid,spawn_invocation_uuid,custodian_identity,launcher_identity,drain_receipt FROM completion_continuation_attempt WHERE session_id='candidate-bearing-session'",
+        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+    for identity in [&row.2, &row.3] {
+        let value: serde_json::Value = serde_json::from_str(identity).unwrap();
+        assert_ne!(value["pid"].as_u64(), Some(u64::from(std::process::id())));
+    }
+    let state = rusqlite::Connection::open(state_path).unwrap();
+    let result: (String, bool, i64, Option<i64>) = state.query_row(
+        "SELECT status,success,exit_code,parent_invocation_id FROM invocations WHERE invocation_uuid=?1",
+        [&row.1], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!((&result.0[..], result.1, result.2), ("succeeded", true, 0));
+    assert!(
+        result.3.is_some(),
+        "wake must descend from authentic bound parent"
+    );
+    assert_eq!(
+        sqlite_count(
+            mailbox_path,
+            "SELECT COUNT(*) FROM session_wake_claim WHERE session_id='candidate-bearing-session'"
+        ),
+        0
+    );
+    println!("settled original wake={row:?} result={result:?}");
+}
+
+// Preserve only this fixture's private files on failure for the collecting root.
+struct FailureEvidenceDirectory(Option<tempfile::TempDir>);
+impl FailureEvidenceDirectory {
+    fn path(&self) -> &Path {
+        self.0.as_ref().unwrap().path()
+    }
+}
+impl Drop for FailureEvidenceDirectory {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "startup failure evidence: {}",
+                self.0.take().unwrap().keep().display()
+            );
+        }
+    }
 }

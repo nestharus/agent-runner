@@ -12,25 +12,7 @@ pub(crate) fn render(rows: &[UsageRow], writer: &mut impl Write) -> io::Result<(
     ]);
 
     for row in rows {
-        match &row.row_state {
-            RowState::HasWindows => {
-                for window in &row.windows {
-                    table_rows.push([
-                        row.account_id.clone(),
-                        row.vendor.clone(),
-                        window_label(window),
-                        format_used_limit(window),
-                        format_remaining(window),
-                    ]);
-                }
-            }
-            RowState::NoUsageApi => table_rows.push(state_row(row, "(no usage api)")),
-            RowState::Error(message) => {
-                table_rows.push(state_row(row, &format!("(error: {message})")))
-            }
-            RowState::InFlight => table_rows.push(state_row(row, "(in flight)")),
-            RowState::NoWindows => table_rows.push(state_row(row, "(no windows)")),
-        }
+        append_account_rows(&mut table_rows, row);
     }
 
     let widths = column_widths(&table_rows);
@@ -50,6 +32,29 @@ pub(crate) fn render(rows: &[UsageRow], writer: &mut impl Write) -> io::Result<(
         )?;
     }
     Ok(())
+}
+
+fn append_account_rows(table: &mut Vec<[String; 5]>, row: &UsageRow) {
+    match &row.row_state {
+        RowState::HasWindows => table.extend(row.windows.iter().map(|w| window_row(row, w))),
+        RowState::NoUsageApi => table.push(state_row(row, "(no usage api)")),
+        RowState::Error(message) => table.push(state_row(row, &format!("(error: {message})"))),
+        RowState::InFlight => table.push(state_row(row, "(in flight)")),
+        RowState::NoWindows => table.push(state_row(row, "(no windows)")),
+    }
+    if let Some(warning) = &row.cache_warning {
+        table.push(state_row(row, &format!("(warning: {warning})")));
+    }
+}
+
+fn window_row(row: &UsageRow, window: &UsageWindow) -> [String; 5] {
+    [
+        row.account_id.clone(),
+        row.vendor.clone(),
+        window_label(window),
+        format_used_limit(window),
+        format_remaining(window),
+    ]
 }
 
 fn state_row(row: &UsageRow, label: &str) -> [String; 5] {

@@ -180,37 +180,6 @@ impl Fixture {
         self.run(cmd)
     }
 
-    pub(crate) fn run_auto_wake_resume(
-        &self,
-        claim_token: &str,
-        chronological_attempt_count: i64,
-        retry_base_milliseconds: u64,
-    ) -> Output {
-        let mut cmd = self.resume_command();
-        self.prepare_command(&mut cmd);
-        cmd.env(
-            oulipoly_core::AutoWakeEnvironmentVariable::MARKER.name(),
-            "1",
-        )
-        .env(
-            oulipoly_core::AutoWakeEnvironmentVariable::SESSION_ID.name(),
-            SESSION,
-        )
-        .env(
-            oulipoly_core::AutoWakeEnvironmentVariable::CLAIM_TOKEN.name(),
-            claim_token,
-        )
-        .env(
-            oulipoly_core::AutoWakeEnvironmentVariable::COUNT.name(),
-            chronological_attempt_count.to_string(),
-        )
-        .env(
-            oulipoly_core::AutoWakeEnvironmentVariable::RETRY_BASE_MILLISECONDS.name(),
-            retry_base_milliseconds.to_string(),
-        );
-        cmd.output().unwrap()
-    }
-
     fn resume_command(&self) -> Command {
         let mut cmd = Command::new(crate::parse::runner_bin());
         cmd.arg("resume")
@@ -221,6 +190,140 @@ impl Fixture {
             .arg("--models-dir")
             .arg(&self.models_dir);
         cmd
+    }
+
+    // Publish a real native parent before inserting historical recovery inputs.
+    // The completed invocation is history; the next operational entry elects
+    // its own owner/driver and obtains new custody through normal admission.
+    pub(crate) fn establish_recovery_parent(&self, session_id: &str) {
+        let path = self.root().join("provider.py");
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(&path, original.replace(crate::SESSION, session_id)).unwrap();
+        let output = self.run_agent("establish recovery recipient");
+        fs::write(&path, original).unwrap();
+        crate::validators::assert_success(&output);
+        crate::liveness::wait_until(
+            "initial native owner retired before historical setup",
+            || {
+                self.mailbox()
+                    .completion_continuation_owner()
+                    .unwrap()
+                    .is_none()
+            },
+        );
+        let runtime = self
+            .mailbox()
+            .wake_session_reader()
+            .session_metadata(session_id)
+            .unwrap()
+            .expect("actual native recipient metadata");
+        let id = runtime
+            .invocation_uuid
+            .as_deref()
+            .expect("actual parent invocation");
+        let parent = self.state().get_invocation_by_uuid(id).unwrap().unwrap();
+        assert_eq!(parent.provider_session_id.as_deref(), Some(session_id));
+        assert!(parent.finished_at.is_some());
+        println!("real recovery parent session={session_id} invocation={id}");
+    }
+
+    pub(crate) fn seed_recovery_control(&self) {
+        let session = "77777777-7777-4777-8777-777777777777";
+        self.seed_session_turn_for(crate::PROVIDER, session, "positive-control-turn");
+        self.seed_idle_runtime_for(session, crate::PROVIDER, crate::MODEL);
+        self.seed_mailbox_for(session, "h-positive-control", None);
+        crate::wake_claim_setup::seed_dead_wake_claim_for(
+            self,
+            session,
+            "historical-positive-control",
+            601,
+        );
+    }
+
+    pub(crate) fn assert_recovery_control(&self) {
+        let prompt =
+            crate::liveness::wait_for_file(&self.prompt_file("recovery-positive-control.txt"));
+        crate::validators::assert_prompt_contains_handle(&prompt, "h-positive-control");
+        crate::liveness::wait_until(
+            "positive control delivered under actual native owner",
+            || {
+                crate::liveness::delivered_rows_without_pending_or_claim(
+                    self,
+                    "77777777-7777-4777-8777-777777777777",
+                    1,
+                )
+            },
+        );
+        self.assert_recovery_drained("77777777-7777-4777-8777-777777777777");
+    }
+
+    pub(crate) fn assert_recovery_drained(&self, session_id: &str) {
+        // ACK/claim release is not physical custody discharge.
+        crate::liveness::wait_until("original native activation drain integrated", || {
+            self.sidecar_conn().query_row(
+                "SELECT COUNT(*) > 0 AND SUM(phase='drained' AND integrated=1 AND drain_receipt LIKE '%ECHILD%')=COUNT(*) FROM completion_continuation_attempt WHERE session_id=?1",
+                [session_id], |row| row.get::<_, bool>(0)).unwrap()
+        });
+        let conn = self.sidecar_conn();
+        let mut stmt = conn.prepare(
+            "SELECT attempt_id,custodian_identity,launcher_identity,runtime_generation_uuid,drain_receipt FROM completion_continuation_attempt WHERE session_id=?1").unwrap();
+        let rows = stmt
+            .query_map([session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .unwrap();
+        for row in rows {
+            let row = row.unwrap();
+            let custodian: serde_json::Value = serde_json::from_str(&row.1).unwrap();
+            let launcher: serde_json::Value = serde_json::from_str(&row.2).unwrap();
+            assert_ne!(
+                custodian["pid"].as_u64(),
+                Some(u64::from(std::process::id()))
+            );
+            assert_ne!(
+                launcher["pid"].as_u64(),
+                Some(u64::from(std::process::id()))
+            );
+            println!("actual native drain session={session_id} attempt={row:?}");
+        }
+    }
+
+    pub(crate) fn run_startup_recovery(&self, session_id: &str) -> Output {
+        // Inspection is not the producer. An actual zero-TTL advisory lease
+        // request enters the supported session-mutation startup-recovery lane;
+        // it cannot hold the recipient paused during native wake admission.
+        let owner_before = self.mailbox().completion_continuation_owner().unwrap();
+        let rows_before = self.mailbox().list_mailbox(session_id, true).unwrap();
+        crate::validators::assert_success(&self.run_mailbox_list(session_id));
+        if owner_before.is_none() {
+            assert!(
+                self.mailbox()
+                    .completion_continuation_owner()
+                    .unwrap()
+                    .is_none(),
+                "inspection must not elect an owner"
+            );
+            assert_eq!(
+                serde_json::to_value(self.mailbox().list_mailbox(session_id, true).unwrap())
+                    .unwrap(),
+                serde_json::to_value(rows_before).unwrap()
+            );
+        }
+        let mut cmd = Command::new(crate::parse::runner_bin());
+        cmd.args(["session", "pause-handshake", session_id, "--ttl-ms", "0"]);
+        let output = self.run(cmd);
+        println!(
+            "operational recovery receipt: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
     }
 
     pub(crate) fn run_mailbox_list(&self, session_id: &str) -> Output {

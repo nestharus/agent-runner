@@ -268,6 +268,67 @@ impl StateDb {
         self.register_bound_completion(mutation_authority, None, true, binding)
     }
 
+    /// A single authority scan per driver pass also supplies original-source
+    /// membership for late listeners. The full immutable ledger is still decoded
+    /// and validated; no accepted/terminal shortcut grants repair authority.
+    /// Each successful materialization retains its usual current writer fences.
+    pub fn repair_domain_completion_continuations(
+        &mut self,
+        domain: &str,
+    ) -> Result<Vec<AdmittedSourceBinding>, String> {
+        let bindings = self.admitted_completion_continuations()?;
+        let originals: std::collections::BTreeSet<Vec<u8>> = bindings
+            .iter()
+            .filter(|binding| !binding.is_late_listener())
+            .map(|binding| binding.registration_bytes().to_vec())
+            .collect();
+        // One live projection connection; no State writer is retained by these
+        // observations. Existing exact repair remains the fallback for any gap.
+        let projection = self.completion_authority_state_path().and_then(|path| {
+            MailboxDb::open_existing_native_authority(&MailboxDb::path_for_state_db(path)).ok()
+        });
+        // As in the driver, a failed exact repair stays owed on the next pass.
+        Ok(bindings
+            .into_iter()
+            .filter_map(|binding| {
+                self.repair_domain_binding(domain, &originals, projection.as_ref(), binding)
+                    .ok()
+                    .flatten()
+            })
+            .collect())
+    }
+
+    fn repair_domain_binding(
+        &mut self,
+        domain: &str,
+        originals: &std::collections::BTreeSet<Vec<u8>>,
+        projection: Option<&MailboxDb>,
+        binding: AdmittedSourceBinding,
+    ) -> Result<Option<AdmittedSourceBinding>, String> {
+        if binding.registration()?.domain_id != domain {
+            return Ok(None);
+        }
+        if binding.is_late_listener() && !originals.contains(binding.registration_bytes()) {
+            return Err("late listener requires original committed v2 source admission".into());
+        }
+        // Neither terminal nor accepted status suffices. Skip only when the
+        // exact current continuity, source, listener and policy projection agree.
+        if let (Some(projection), Some(head)) = (
+            projection,
+            completion_continuity_head_on(&self.conn).map_err(|e| e.to_string())?,
+        ) && projection.continuation_projection_matches(&binding, &head)?
+        {
+            return Ok(Some(binding));
+        }
+        self.materialize_bound_completion(
+            crate::InvocationMutationAuthority::Standalone,
+            None,
+            true,
+            &binding,
+        )?;
+        Ok(Some(binding))
+    }
+
     fn register_bound_completion(
         &mut self,
         mutation_authority: crate::InvocationMutationAuthority<'_>,
@@ -283,6 +344,16 @@ impl StateDb {
         {
             return Err("late listener requires original committed v2 source admission".into());
         }
+        self.materialize_bound_completion(mutation_authority, authority, repair, binding)
+    }
+
+    fn materialize_bound_completion(
+        &mut self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
+        authority: Option<&super::CompletionRegistrationAuthority>,
+        repair: bool,
+        binding: &AdmittedSourceBinding,
+    ) -> Result<CompletionEventRegistrationResult, String> {
         let source = binding.registration()?;
         let paths = source.paths();
         let listener = binding.admission_listener()?;
@@ -633,11 +704,11 @@ impl StateDb {
             registration.event_id,
             &admission_id,
         )?;
-        let sidecar_authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
+        let sidecar_authority = crate::mailbox::MailboxAuthorityFence::try_acquire(&sidecar_path)
             .map_err(|error| error.to_string())?;
         let state_head = completion_continuity_head_on(&tx).map_err(|error| error.to_string())?;
         let mut mailbox = if state_head.is_none() {
-            MailboxDb::open_with_authority(&sidecar_authority)?
+            MailboxDb::open_for_state_authority(&sidecar_authority)?
         } else {
             MailboxDb::open_existing_for_completion_authority(&sidecar_authority).map_err(|error| {
                 format!(
@@ -3495,27 +3566,32 @@ mod completion_continuation_tests {
 
     #[test]
     fn completion_continuation_sync_acceptance_suppresses_without_ack_and_replay_is_exact() {
-        acceptance_presentation_and_replay(false, "sync", false, false);
+        acceptance_presentation_and_replay(false, "sync", false, false, false);
     }
 
     #[test]
     fn completion_continuation_missing_output_retains_late_listener_and_exact_ack() {
-        acceptance_presentation_and_replay(true, "sync", false, false);
+        acceptance_presentation_and_replay(true, "sync", false, false, false);
     }
 
     #[test]
     fn completion_continuation_explicit_async_acceptance_and_repair_deliver() {
-        acceptance_presentation_and_replay(false, "async", false, false);
+        acceptance_presentation_and_replay(false, "async", false, false, false);
     }
 
     #[test]
     fn completion_continuation_detach_before_acceptance_survives_repair() {
-        acceptance_presentation_and_replay(false, "sync", true, false);
+        acceptance_presentation_and_replay(false, "sync", true, false, false);
     }
 
     #[test]
     fn completion_continuation_response_only_cannot_settle_physical_custody() {
-        acceptance_presentation_and_replay(false, "sync", false, true);
+        acceptance_presentation_and_replay(false, "sync", false, true, false);
+    }
+
+    #[test]
+    fn storage_batch_repair_retains_postcommit_late_listener_delivery_and_exact_ack() {
+        acceptance_presentation_and_replay(true, "sync", false, false, true);
     }
 
     fn acceptance_presentation_and_replay(
@@ -3523,6 +3599,7 @@ mod completion_continuation_tests {
         mode: &str,
         detach_before: bool,
         physical_debt: bool,
+        batch_repair: bool,
     ) {
         use crate::completion_continuation::VerifiedCompletion;
         use crate::mailbox::CompletionEventTriggerInput;
@@ -3864,12 +3941,47 @@ mod completion_continuation_tests {
                 .len(),
             1
         );
-        state
-            .repair_admitted_completion_continuation(
-                crate::InvocationMutationAuthority::Standalone,
-                &late,
-            )
-            .unwrap();
+        if batch_repair {
+            // Root Act2: with contexts absent and original accepted, the
+            // independent State-committed listener still forbids retirement.
+            let owner = mailbox.completion_continuation_owner().unwrap().unwrap();
+            assert!(
+                !state
+                    .close_idle_completion_continuation_owner(&owner)
+                    .unwrap()
+            );
+            assert!(mailbox.completion_contexts().unwrap().is_empty());
+            assert!(mailbox.completion_continuation_owner().unwrap().is_some());
+            assert_eq!(
+                state
+                    .repair_domain_completion_continuations(&source.domain_id)
+                    .unwrap(),
+                // The outstanding late State commit is the next continuity
+                // ordinal. Earlier repairs cannot jump that projection debt.
+                vec![late.clone()]
+            );
+            // Once the exact committed debt is materialized, the original is
+            // still owed: a later ordinary pass must retain both bindings.
+            assert_eq!(
+                state
+                    .repair_domain_completion_continuations(&source.domain_id)
+                    .unwrap(),
+                vec![binding.clone(), late.clone()]
+            );
+            assert!(
+                state
+                    .repair_domain_completion_continuations("not-this-domain")
+                    .unwrap()
+                    .is_empty()
+            );
+        } else {
+            state
+                .repair_admitted_completion_continuation(
+                    crate::InvocationMutationAuthority::Standalone,
+                    &late,
+                )
+                .unwrap();
+        }
         let listeners = mailbox.completion_event_listeners(&source.handle).unwrap();
         assert_eq!(listeners.len(), 2);
         let late_listener = listeners
@@ -4004,6 +4116,49 @@ mod completion_continuation_tests {
                 .find(|f| f["listener_id"] == source.owner_invocation_uuid)
                 .unwrap()
         );
+        if batch_repair {
+            let late_seq = mailbox.list_pending("late-session").unwrap()[0].seq;
+            mailbox
+                .acknowledge_range("late-session", late_seq, late_seq, late_owner)
+                .unwrap();
+            assert!(
+                state
+                    .close_idle_completion_continuation_owner(&owner)
+                    .unwrap()
+            );
+            assert!(mailbox.completion_continuation_owner().unwrap().is_none());
+            assert_eq!(state.admitted_completion_continuations().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn storage_projected_history_requires_no_state_or_sidecar_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let binding = binding();
+        let mut state = seed(&path, &binding);
+        admit(&mut state, &binding, false, false);
+        let source = binding.registration().unwrap();
+        let state_writer = sqlite::Connection::open(&path).unwrap();
+        let sidecar_writer = sqlite::Connection::open(MailboxDb::path_for_state_db(&path)).unwrap();
+        state_writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        sidecar_writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            state
+                .repair_domain_completion_continuations(&source.domain_id)
+                .unwrap(),
+            vec![binding.clone()]
+        );
+        // Same unaccepted source and no new useful demand: repeat, with both
+        // real writers still obstructing any attempted repair reservation.
+        assert_eq!(
+            state
+                .repair_domain_completion_continuations(&source.domain_id)
+                .unwrap(),
+            vec![binding]
+        );
+        sidecar_writer.execute_batch("ROLLBACK").unwrap();
+        state_writer.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]

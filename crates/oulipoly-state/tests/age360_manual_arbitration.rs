@@ -298,3 +298,38 @@ fn native_launcher_boot_mismatch_cannot_borrow_the_admission_exception() {
     };
     assert_eq!(next.registration_identity, "other");
 }
+
+// Act1 commitment 3: observation has no mutation duty when no claim exists.
+// The actual independent writer remains held until after the observation.
+#[test]
+fn absent_manual_observation_does_not_request_a_sidecar_writer() {
+    let mut f = Fixture::new();
+    f.sql.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(
+        f.db.wake_sessions()
+            .coordinate_manual_resume("session")
+            .unwrap(),
+        ManualWakeCoordination::Absent
+    );
+    f.sql.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn native_busy_observation_does_not_request_a_sidecar_writer_or_release_custody() {
+    let mut f = Fixture::new();
+    f.native("accepted", false);
+    f.sql.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(
+        f.db.wake_sessions()
+            .coordinate_manual_resume("session")
+            .unwrap(),
+        ManualWakeCoordination::NativeBusy
+    );
+    assert!(
+        f.db.wake_session_reader()
+            .wake_claim("session")
+            .unwrap()
+            .is_some()
+    );
+    f.sql.execute_batch("ROLLBACK").unwrap();
+}

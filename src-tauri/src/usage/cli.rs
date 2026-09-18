@@ -96,7 +96,7 @@ pub struct Cli {
     #[arg(
         long = "pin-provider",
         value_name = "TARGET",
-        conflicts_with_all = ["resume", "new", "rotate_provider"]
+        conflicts_with_all = ["resume", "rotate_provider"]
     )]
     pub(crate) pin_provider: Option<String>,
 

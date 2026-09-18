@@ -31,8 +31,8 @@ use crate::result_envelope::{ResultEnvelopeFailureIdentity, ResultEnvelopeInput}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvocationFinalizeError {
-    /// One independently bounded State, namespace, or sidecar writer wait expired.
-    /// This variant does not imply one aggregate end-to-end acquisition deadline.
+    /// State acquisition/commit or nonwaiting sidecar acquisition was contended.
+    /// No aggregate end-to-end wait or absence of committed earlier work is implied.
     Contention {
         message: String,
     },
@@ -404,6 +404,12 @@ impl StateDb {
             .flatten();
         let sidecar_path =
             crate::mailbox::MailboxDb::path_for_state_db(completion_authority_state_path);
+        #[cfg(test)]
+        tests::BEFORE_SIDECAR_ACQUISITION.with_borrow_mut(|hook| {
+            if let Some(hook) = hook.take() {
+                hook();
+            }
+        });
         let sidecar_authority = obligation
             .as_ref()
             .map(|obligation| {
@@ -491,7 +497,7 @@ impl StateDb {
         invocation_uuid: &str,
         obligation: &CompletionObligationExpectation,
     ) -> Result<crate::mailbox::MailboxAuthorityFence, String> {
-        match crate::mailbox::MailboxAuthorityFence::acquire(sidecar_path) {
+        match crate::mailbox::MailboxAuthorityFence::try_acquire(sidecar_path) {
             Ok(authority) => Ok(authority),
             Err(error @ crate::mailbox::MailboxAuthorityFenceError::Timeout { .. }) => Err(
                 Self::format_completion_sidecar_contention(invocation_uuid, obligation, error),
@@ -736,6 +742,41 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    thread_local! {
+        pub(super) static BEFORE_SIDECAR_ACQUISITION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    fn concurrent_state_probe(path: &std::path::Path) -> std::thread::JoinHandle<()> {
+        let path = path.to_owned();
+        let (start, receive_start) = mpsc::channel();
+        let (reserved, receive_reserved) = mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            let unrelated = sqlite::Connection::open(path).unwrap();
+            unrelated.busy_timeout(Duration::ZERO).unwrap();
+            receive_start.recv().unwrap();
+            let error = unrelated.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+            assert!(sqlite_error_is_contention(&error));
+            // Measure actual independent acquisition from the known-held cut.
+            // 250ms is below the old namespace test budget (500ms) and SQLite
+            // patience (seconds), not a new product timeout or suite cutoff.
+            unrelated.busy_timeout(Duration::from_millis(250)).unwrap();
+            let started = std::time::Instant::now();
+            reserved.send(()).unwrap();
+            unrelated
+                .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+                .unwrap();
+            assert!(started.elapsed() < Duration::from_millis(250));
+            eprintln!("concurrent State writer acquired before the old sidecar wait budget");
+        });
+        BEFORE_SIDECAR_ACQUISITION.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                start.send(()).unwrap();
+                receive_reserved.recv().unwrap();
+            }));
+        });
+        probe
+    }
+
     const INVOCATION_UUID: &str = "77777777-7777-4777-8777-777777777777";
     const EVENT_ID: &str = "age299-s2-finalize-fence-event";
     const SESSION_ID: &str = "age299-s2-finalize-fence-session";
@@ -779,11 +820,34 @@ mod tests {
             state_with_completion_obligation();
         let authority =
             crate::mailbox::MailboxAuthorityFence::acquire_exclusive(&sidecar_path).unwrap();
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            drop(authority);
-        });
-
+        // Root Act2 supersedes the historical waiting oracle, not finalization
+        // authority: contend without retaining State during the sidecar wait.
+        let probe = concurrent_state_probe(&state.db_path);
+        let error = state
+            .finalize_invocation(
+                crate::InvocationMutationAuthority::Standalone,
+                invocation_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
+            .unwrap_err();
+        probe.join().unwrap();
+        assert!(error.contains("completion_authority_contention"), "{error}");
+        assert_eq!(
+            state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Running
+        );
+        let unrelated = sqlite::Connection::open(&state.db_path).unwrap();
+        unrelated
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+            .unwrap();
+        drop(authority);
         state
             .finalize_invocation(
                 crate::InvocationMutationAuthority::Standalone,
@@ -794,7 +858,6 @@ mod tests {
                 None,
             )
             .unwrap();
-        releaser.join().unwrap();
         assert_eq!(
             state
                 .get_invocation_by_uuid(INVOCATION_UUID)
@@ -803,6 +866,41 @@ mod tests {
                 .status,
             InvocationStatus::Succeeded
         );
+    }
+
+    #[test]
+    fn storage_finalize_sidecar_sqlite_contention_unwinds_state_without_waiting() {
+        let (_directory, state, invocation_row_id, sidecar_path) =
+            state_with_completion_obligation();
+        let holder = sqlite::Connection::open(&sidecar_path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let probe = concurrent_state_probe(&state.db_path);
+        let error = state
+            .finalize_invocation(
+                crate::InvocationMutationAuthority::Standalone,
+                invocation_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
+            .unwrap_err();
+        probe.join().unwrap();
+        assert!(error.contains("without waiting"), "{error}");
+        assert_eq!(
+            state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Running
+        );
+        let unrelated = sqlite::Connection::open(&state.db_path).unwrap();
+        unrelated.busy_timeout(Duration::ZERO).unwrap();
+        unrelated
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+            .unwrap();
+        holder.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]

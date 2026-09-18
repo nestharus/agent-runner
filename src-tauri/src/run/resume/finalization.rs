@@ -87,6 +87,15 @@ pub(super) fn finalize_completed_attempt(
         )
     {
         formatter::emit_stderr(&format!("failed to persist provider output: {error}"));
+        // The confirmed-turn transaction below will not run on this failure.
+        // Preserve its owed references independently of raw output, using the
+        // producing invocation's retained authority (including native fences).
+        // This neither settles input delivery nor claims successful output.
+        if input.confirmed_delivery.is_some()
+            && let Err(error) = persist_returned_artifacts(&input)
+        {
+            formatter::emit_returned_artifacts_error(&error);
+        }
         let finalize_result = finalize_retained_outcome_with_contention_retry(
             input
                 .agent_runtime_services

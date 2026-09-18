@@ -28,7 +28,20 @@ impl MailboxDb {
             starttime_ticks: live.os_pid_starttime_ticks,
         };
         let encoded = serde_json::to_string(&identity).map_err(|e| e.to_string())?;
-        let changed = self.conn.execute(
+        let eligible: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt a JOIN completion_continuation_owner o ON o.generation=a.owner_generation WHERE a.attempt_id=?1 AND a.owner_generation=?2 AND a.phase='reserved' AND a.revision=1 AND a.custodian_identity IS NULL AND o.phase='running' AND o.driver_identity=?3)",
+            params![attempt.attempt_id, attempt.owner_generation, encoded], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !eligible {
+            return Err("reservation no longer unaccepted under this driver".into());
+        }
+        // Observation only: eligibility can change before acquisition. The
+        // exact current predicates below remain the sole mutation authority.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let changed = tx.execute(
             "UPDATE completion_continuation_attempt SET phase='never_started',revision=revision+1,integrated=1,drain_receipt=?3 WHERE attempt_id=?1 AND owner_generation=?2 AND phase='reserved' AND revision=1 AND custodian_identity IS NULL AND EXISTS(SELECT 1 FROM completion_continuation_owner WHERE generation=?2 AND phase='running' AND driver_identity=?4)",
             params![attempt.attempt_id, attempt.owner_generation,
                 serde_json::json!({"attempt_id":attempt.attempt_id,"driver":identity,"gate":"unaccepted_reservation_revoked"}).to_string(), encoded],
@@ -36,7 +49,14 @@ impl MailboxDb {
         if changed != 1 {
             return Err("reservation no longer unaccepted under this driver".into());
         }
-        Ok(())
+        if attempt.operation == "activation" {
+            tx.execute(
+                "DELETE FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
+                params![attempt.session_id, attempt.claim_token],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn advance_continuation_attempt(

@@ -24,7 +24,8 @@ pub(super) fn migrate(
     request: MigrationServiceRequest<'_>,
     provider_registry: Option<&ProviderRegistryHandle>,
 ) -> Result<MigrationServiceOutput, ServiceError> {
-    if external_branch_orchestration::model_declares_external_provider(&request) {
+    if external_branch_orchestration::model_declares_external_provider(&request, provider_registry)
+    {
         crate::rotation_journal::startup_recovery_before_provider_dispatch(&request)
             .map_err(error_formatter::construct_migration_service_error)?;
     }

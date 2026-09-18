@@ -13,6 +13,30 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+#[cfg(test)]
+mod birth_tests;
+mod independent_waits;
+mod never_forked;
+
+/// An outer driver failure must not destroy its unique live no-child witness.
+/// Keep this exact process until integration succeeds. No workload, reservation,
+/// or failed outer operation is replayed. Permanent media failure retains duty;
+/// uncatchable death remains outside the survival guarantee.
+pub(super) fn finish_original_testimony() {
+    #[cfg(test)]
+    BEFORE_TESTIMONY_FINISH.with_borrow_mut(|hook| {
+        if let Some(hook) = hook.take() {
+            hook();
+        }
+    });
+    while never_forked::has_pending() {
+        retry_unreleased();
+        if never_forked::has_pending() {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
 pub(super) const ADOPTER_ARG: &str = "__completion-continuation-adopter-v2";
 
 pub(super) const CUSTODIAN_ARG: &str = "__completion-continuation-custodian-v2";
@@ -118,6 +142,26 @@ fn launch_command(
     command.spawn().map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_ACCEPT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_TESTIMONY_FINISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+// An ignored SIGCHLD disposition survives exec. With automatic child reaping,
+// a successful fork is not a retained wait capability, so refuse BEFORE accepting
+// or forking this attempt. Do not mutate process-global signal policy here.
+fn require_retained_child_waits() -> Result<(), String> {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+        return Err("original adopter requires retained child waits, not automatic reaping".into());
+    }
+    Ok(())
+}
+
 fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Result<i64, String> {
     // This retained request is intent only. Database acceptance still precedes
     // fork and the launch gate; an unadmitted request cannot launch anything.
@@ -159,25 +203,35 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
         .and_then(|dir| dir.sync_all())
         .map_err(|e| e.to_string())?;
     drop(gate_file);
+    require_retained_child_waits()?;
     MailboxDb::open(path)?.accept_continuation_attempt(attempt)?;
-    let (mut release, gate) = match birth_channel() {
+    #[cfg(test)]
+    AFTER_ACCEPT.with_borrow_mut(|hook| {
+        if let Some(hook) = hook.take() {
+            hook();
+        }
+    });
+    let (release, gate) = match birth_channel() {
         Ok(pair) => pair,
         Err(e) => {
             let reason = format!("custodian gate creation failed: {e}");
-            MailboxDb::open(path)?.record_continuation_never_forked(attempt, &reason)?;
-            return Err(reason);
+            return Err(never_forked::retain(path, attempt, &driver, reason));
         }
     };
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let reason = format!("custodian fork failed: {}", std::io::Error::last_os_error());
-        MailboxDb::open(path)?.record_continuation_never_forked(attempt, &reason)?;
-        return Err(reason);
+        return Err(never_forked::retain(path, attempt, &driver, reason));
     }
     if pid == 0 {
         drop(release);
         let gate_fd = gate.as_raw_fd();
         let request_fd = request_file.as_raw_fd();
+        // These are fork copies, not this child's original obligations. Drop
+        // their Rust owners before close_except can make the numbers reusable.
+        let _ = pending_birth_fds();
+        #[cfg(feature = "age360-fault-fixtures")]
+        oulipoly_state::completion_continuation::age360_fault_barrier("adopter-before-exec");
         super::linux::close_except(&[gate_fd, request_fd]);
         for fd in [gate_fd, request_fd] {
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -197,38 +251,34 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
     }
     drop(gate);
     drop(request_file);
-    let adopter = super::linux::identity(i64::from(pid))?;
-    let mut worker = [0; BIRTH_PACKET_BYTES];
-    let mut custodian = None;
-    let mut announced = None;
-    let result = (|| {
-        read_ac_announcement(path, &driver, &mut release, &mut worker)
-            .map_err(|e| e.to_string())?;
-        announced = Some(decode_birth(&worker)?);
-        custodian = Some(birth_identity(announced.as_ref().unwrap())?);
-        #[cfg(feature = "age360-fault-fixtures")]
-        oulipoly_state::completion_continuation::age360_fault_barrier("attempt-before-attachment");
-        let identity = custodian.as_ref().ok_or("birth identity absent")?;
-        let mut mailbox = MailboxDb::open(path)?;
-        mailbox.attach_continuation_custodian_with_adopter(attempt, identity, Some(&adopter))?;
-        mailbox.advance_continuation_attempt(attempt, 3, "accepted", "starting", identity)?;
-        release.write_all(&[1]).map_err(|e| e.to_string())
-    })();
-    if let Err(error) = result {
-        // Preserve the original read/attachment/wait obligation on EVERY unwind,
-        // including guardian loss before EOF and an attachment precommit error.
-        // Retry can attach for custody only; it can never send an execution grant.
-        PENDING_UNRELEASED.with_borrow_mut(|pending| {
-            pending.push(PendingUnreleased {
-                path: path.into(),
-                attempt: attempt.clone(),
-                adopter,
-                driver,
-                socket: Some(release),
-                custodian,
-                announced,
-            })
+    // A successful fork is already an original obligation, even if /proc is
+    // temporarily unreadable. Enroll its socket and sole unreaped-child
+    // capability BEFORE any fallible identity/read/attachment operation.
+    let result = PENDING_UNRELEASED.with_borrow_mut(|pending| {
+        pending.push(PendingUnreleased {
+            path: path.into(),
+            attempt: attempt.clone(),
+            adopter: UnreapedAdopter {
+                pid,
+                identity: None,
+                ownership_lost: false,
+            },
+            driver,
+            socket: Some(release),
+            custodian: None,
+            announced: None,
+            grant: ExecutionGrant::NotSent,
         });
+        let result = pending.last_mut().unwrap().start();
+        if result.is_ok() {
+            // Normal custody now owns the released operation; ordinary reaping
+            // can consume the adopter only after this successful transfer.
+            independent_waits::retain(pending.last().unwrap().adopter.identity.as_ref().unwrap());
+            pending.pop();
+        }
+        result
+    });
+    if let Err(error) = result {
         retry_unreleased();
         return Err(error);
     }
@@ -419,10 +469,68 @@ fn birth_identity(
     Ok(current)
 }
 
+// The PID is not an incarnation. Only this original's exclusive, unconsumed
+// child wait keeps it from reuse while identity is unresolved. ECHILD revokes
+// that capability permanently; a later occupant can never repair it.
+struct UnreapedAdopter {
+    pid: i32,
+    identity: Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
+    ownership_lost: bool,
+}
+impl UnreapedAdopter {
+    fn resolve(
+        &mut self,
+    ) -> Result<&oulipoly_state::completion_continuation::SourceProcessIdentity, String> {
+        if self.ownership_lost {
+            return Err("original adopter wait ownership lost".into());
+        }
+        if self.identity.is_none() {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pid as u32,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            } != 0
+            {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    self.ownership_lost = true;
+                }
+                return Err(error.to_string());
+            }
+            #[cfg(feature = "age360-fault-fixtures")]
+            oulipoly_state::completion_continuation::age360_fault_barrier(
+                "original-adopter-before-identity",
+            );
+            self.identity = Some(super::linux::identity(i64::from(self.pid)).inspect_err(
+                |_| {
+                    #[cfg(feature = "age360-fault-fixtures")]
+                    oulipoly_state::completion_continuation::age360_fault_barrier(
+                        "original-adopter-identity-failed",
+                    );
+                },
+            )?);
+        }
+        Ok(self.identity.as_ref().unwrap())
+    }
+}
+
+#[derive(PartialEq)]
+enum ExecutionGrant {
+    NotSent,
+    // Set before the syscall. An error cannot be retried as a fresh grant or
+    // converted to unsent testimony/withdrawal without conclusive evidence.
+    Attempted,
+}
+
 struct PendingUnreleased {
     path: std::path::PathBuf,
     attempt: ContinuationAttempt,
-    adopter: oulipoly_state::completion_continuation::SourceProcessIdentity,
+    adopter: UnreapedAdopter,
+    grant: ExecutionGrant,
     driver: oulipoly_state::completion_continuation::SourceProcessIdentity,
     socket: Option<UnixStream>,
     announced: Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
@@ -435,6 +543,7 @@ thread_local! {
 // Only the original process owns these descriptors and kernel waits. Discard
 // fork copies BEFORE close_except or descriptor reuse, not on a later reap.
 pub(super) fn pending_birth_fds() -> Vec<i32> {
+    independent_waits::discard_fork_copies();
     let current = i64::from(std::process::id());
     PENDING_UNRELEASED.with_borrow_mut(|pending| {
         pending.retain(|p| p.driver.pid == current);
@@ -446,7 +555,41 @@ pub(super) fn pending_birth_fds() -> Vec<i32> {
 }
 
 impl PendingUnreleased {
+    fn start(&mut self) -> Result<(), String> {
+        let adopter = self.adopter.resolve()?;
+        let release = self.socket.as_mut().ok_or("original birth socket absent")?;
+        let mut worker = [0; BIRTH_PACKET_BYTES];
+        read_ac_announcement(&self.path, &self.driver, release, &mut worker)
+            .map_err(|e| e.to_string())?;
+        self.announced = Some(decode_birth(&worker)?);
+        self.custodian = Some(birth_identity(self.announced.as_ref().unwrap())?);
+        #[cfg(feature = "age360-fault-fixtures")]
+        oulipoly_state::completion_continuation::age360_fault_barrier("attempt-before-attachment");
+        let identity = self.custodian.as_ref().ok_or("birth identity absent")?;
+        let mut mailbox = MailboxDb::open(&self.path)?;
+        mailbox.attach_continuation_custodian_with_adopter(
+            &self.attempt,
+            identity,
+            Some(adopter),
+        )?;
+        mailbox.advance_continuation_attempt(&self.attempt, 3, "accepted", "starting", identity)?;
+        self.grant = ExecutionGrant::Attempted;
+        let result = release.write_all(&[1]);
+        // This is exactly one byte on SOCK_SEQPACKET: write_all cannot return
+        // Err after a partial successful grant (one byte is already complete).
+        // A returning error therefore establishes zero bytes, preserving the
+        // existing unsent recovery route. An unobserved outcome stays Attempted.
+        if result.is_err() {
+            self.grant = ExecutionGrant::NotSent;
+        }
+        result.map_err(|e| e.to_string())
+    }
+
     fn retry(&mut self) -> Result<(), String> {
+        if self.grant != ExecutionGrant::NotSent {
+            return Err("original execution grant outcome unresolved".into());
+        }
+        let adopter = self.adopter.resolve()?;
         if self.custodian.is_none()
             && self.announced.is_none()
             && let Some(socket) = &mut self.socket
@@ -474,28 +617,50 @@ impl PendingUnreleased {
                 &self.attempt,
                 &self.driver,
                 custodian,
-                &self.adopter,
+                adopter,
             )?;
             self.socket = None; // close unsent grant; original adopter owns drain
             return Ok(());
         }
-        retain_unreleased_adopter_loss(&self.path, &self.attempt, &self.adopter, &self.driver)
+        retain_unreleased_adopter_loss(&self.path, &self.attempt, adopter, &self.driver)
     }
 }
 
 /// One attempt per pending owner per OUTER reap pass, not per reaped child.
 /// Returning storage errors do not cause a retry-until-success loop.
 pub(super) fn retry_unreleased() {
+    never_forked::retry_pending();
     let _ = pending_birth_fds();
     PENDING_UNRELEASED.with_borrow_mut(|pending| {
-        pending.retain_mut(|p| p.retry().is_err());
+        pending.retain_mut(retain_unfinished_birth);
     });
+}
+
+fn retain_unfinished_birth(birth: &mut PendingUnreleased) -> bool {
+    if birth.retry().is_err() {
+        return true;
+    }
+    // The original obligation has actually transferred/integrated. Its known
+    // adopter wait is now independent of every remaining birth, even when an
+    // unrelated announcement is unavailable. This grants housekeeping only.
+    independent_waits::retain(birth.adopter.identity.as_ref().unwrap());
+    false
 }
 
 /// Shared by CD and its guardian succession: retry original evidence first,
 /// then reap unprotected exact child PIDs. Enumerating candidates is not drain
 /// evidence; only waitpid/waitid supply terminal/ECHILD observations.
 pub(super) fn reap_unprotected(status: &mut i32) -> i32 {
+    let independent = independent_waits::reap(status);
+    if independent > 0 {
+        return independent;
+    }
+    let waited = reap_generic_unprotected(status);
+    independent_waits::observe_wait(waited);
+    waited
+}
+
+fn reap_generic_unprotected(status: &mut i32) -> i32 {
     #[cfg(feature = "age360-fault-fixtures")]
     if PENDING_UNRELEASED.with_borrow(|pending| pending.iter().any(|p| p.announced.is_none())) {
         oulipoly_state::completion_continuation::age360_fault_barrier("birth-unread-before-reap");
@@ -510,7 +675,12 @@ pub(super) fn reap_unprotected(status: &mut i32) -> i32 {
     let protected = PENDING_UNRELEASED.with_borrow(|pending| {
         pending
             .iter()
-            .flat_map(|p| [Some(p.adopter.pid), p.announced.as_ref().map(|a| a.pid)])
+            .flat_map(|p| {
+                [
+                    Some(i64::from(p.adopter.pid)),
+                    p.announced.as_ref().map(|a| a.pid),
+                ]
+            })
             .flatten()
             .collect::<Vec<_>>()
     });
@@ -1297,6 +1467,9 @@ fn reap_adopted_child(
 /// Replay only retained wait/drain evidence joined by the DB to its original
 /// producer. A lost process with no receipt is not a replayable result.
 pub(super) fn replay_result(path: &Path, attempt: &ContinuationAttempt) -> Result<(), String> {
+    if never_forked::replay(path, attempt)? {
+        return Ok(());
+    }
     let result = Path::new(&attempt.result_path);
     let directory = result.parent().ok_or("result parent absent")?;
     if let Ok(bytes) = read_source_file(

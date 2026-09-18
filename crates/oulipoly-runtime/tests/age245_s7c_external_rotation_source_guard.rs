@@ -944,14 +944,57 @@ fn s7c_production_migration_service_runs_journal_recovery_before_provider_reques
 }
 
 #[test]
+fn s7c_account_rotation_recovers_journal_before_capability_preflight() {
+    let mut fixture = RuntimeFixture::new("s7c-rotation-materialize-success");
+    fixture.model.provider = None;
+    fixture.resolved.model = None;
+    let journal_path =
+        oulipoly_runtime::rotation_journal::rotation_journal_path(&fixture.workspace);
+    std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+    std::fs::write(&journal_path, b"{not-json").unwrap();
+    let service = ProductionMigrationService::with_registry_handle(fixture.registry.clone());
+    let error = service
+        .migrate(fixture.request_manual(&mut Vec::new(), TARGET_PROVIDER))
+        .unwrap_err();
+    assert!(matches!(error, ServiceError::Dependency { .. }));
+    fixture.assert_call_count(0);
+    assert!(journal_path.exists());
+}
+
+#[test]
 fn s7c_provider_ref_manual_rotation_service_applies_external_plan_without_builtin_stderr() {
-    let fixture = RuntimeFixture::new("s7c-rotation-materialize-success");
+    assert_service_rotation_applies(TARGET_PROVIDER, true);
+}
+
+#[test]
+fn s7c_bare_rotate_provider_selects_another_working_account() {
+    assert_service_rotation_applies("", true);
+}
+
+#[test]
+fn s7c_account_endpoint_rotation_without_model_provider_uses_external_plan() {
+    assert_service_rotation_applies(TARGET_PROVIDER, false);
+    assert_service_rotation_applies("", false);
+}
+
+fn assert_service_rotation_applies(target: &str, model_provider: bool) {
+    let mut fixture = RuntimeFixture::new("s7c-rotation-materialize-success");
+    if !model_provider {
+        fixture.model.provider = None;
+        fixture.resolved.model = None;
+        // Provider-default pools also contain unrelated storage accounts.
+        // Automatic rotation must skip those instead of dispatching Codex history to them.
+        fixture.model.providers.insert(
+            0,
+            ProviderConfig::model_provider("unrelated-provider", Vec::new()),
+        );
+    }
     let before = fixture.snapshot();
     let service = ProductionMigrationService::with_registry_handle(fixture.registry.clone());
     let mut stderr = Vec::new();
 
     let output = service
-        .migrate(fixture.request_manual(&mut stderr, TARGET_PROVIDER))
+        .migrate(fixture.request_manual(&mut stderr, target))
         .expect("external service migration");
 
     let MigrationServiceOutput::Migrated { segment } = output else {
@@ -974,7 +1017,7 @@ fn s7c_provider_ref_manual_rotation_service_applies_external_plan_without_builti
         String::from_utf8_lossy(&stderr).is_empty(),
         "external success must not emit built-in migration stderr"
     );
-    fixture.assert_call_count(2);
+    fixture.assert_call_count(if model_provider { 2 } else { 3 });
     fixture.assert_last_request("rotation.materialize");
 }
 
@@ -1271,6 +1314,22 @@ impl RuntimeFixture {
         )
         .expect("recorded provider request JSON");
         assert_eq!(request["params"]["settings_id"], TARGET_SETTINGS_ID);
+        assert_eq!(
+            request["params"]["source_settings_id"],
+            self.registry
+                .current()
+                .account_settings_id(SOURCE_PROVIDER)
+                .unwrap()
+        );
+        let snapshot = self
+            .state
+            .active_chain_segment_snapshot(&self.resolved.chain_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            request["params"]["source_ended_at"],
+            snapshot.latest_turn_at.unwrap()
+        );
         assert_eq!(request["params"]["transition_reason"], transition_reason);
         assert!(
             request["host"]["data_root"]

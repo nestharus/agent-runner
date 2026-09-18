@@ -188,7 +188,7 @@ pub use self::invocation_records::{
 pub use self::invocation_schema_legacy_migration::LegacyProviderNames;
 use self::invocation_schema_table::{LegacyInvocationInsert, LegacyInvocationRow};
 use self::lifecycle_invocation_row::LifecycleInvocationRow;
-pub use self::opening_write::StateReadConnection;
+pub use self::opening_write::{StateReadConnection, WritableOpenError};
 pub use self::owned_turn_event_write::{OwnedTurnEvent, OwnedTurnEventRow};
 use self::ownership_authority::{
     CompletionAuthoritySummary, CompletionMaterializationExpectation,

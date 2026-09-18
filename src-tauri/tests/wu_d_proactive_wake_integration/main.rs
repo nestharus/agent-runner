@@ -87,8 +87,8 @@ fn wake_sweep_reclaims_dead_claim_and_delivers_pending_mailbox() {
 }
 
 #[test]
-fn wake_sweep_does_not_resurrect_abandoned_transient_session() {
-    cases_batch_sweep::wake_sweep_does_not_resurrect_abandoned_transient_session();
+fn native_bound_session_automatically_delivers_after_historical_owner_death() {
+    cases_batch_sweep::native_bound_session_automatically_delivers_after_historical_owner_death();
 }
 
 #[test]

@@ -132,12 +132,12 @@ impl Fixture {
         assert!(matches!(result, EnqueueResult::Inserted(_)));
     }
 
-    fn seed_runtime(&self, db: &mut MailboxDb, wake_count: i64) {
+    fn seed_runtime(&self, db: &mut MailboxDb, wake_count: i64, parent: &str) {
         db.wake_sessions()
             .upsert_session_metadata(SessionMetadataUpsert {
                 session_id: SESSION,
                 mode: "headless",
-                invocation_uuid: Some(INVOCATION),
+                invocation_uuid: Some(parent),
                 provider_name: Some(PROVIDER),
                 model_name: Some(MODEL),
                 models_dir: None,
@@ -149,6 +149,34 @@ impl Fixture {
             .execute(
                 "UPDATE session_runtime SET auto_wake_count = ?2 WHERE session_id = ?1",
                 rusqlite::params![SESSION, wake_count],
+            )
+            .unwrap();
+    }
+
+    fn bind_parent(&self, invocation: &str, session: &str) {
+        let state = oulipoly_state::StateDb::open_default().unwrap();
+        let parent = match state.get_invocation_by_uuid(invocation).unwrap() {
+            Some(parent) => parent.id,
+            None => state
+                .start_invocation(&oulipoly_state::InvocationStart {
+                    invocation_uuid: invocation.into(),
+                    model_name: MODEL.into(),
+                    provider_name: PROVIDER.into(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                })
+                .unwrap(),
+        };
+        state
+            .bind_invocation_provider_session_start(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                parent,
+                &oulipoly_state::ProviderSessionBinding {
+                    provider_session_id: session.into(),
+                    capture_method: "fixture",
+                    resume_input_id: None,
+                    provider_session_resolved_account: None,
+                },
             )
             .unwrap();
     }
@@ -190,6 +218,20 @@ fn notify_wake_preserves_generation_and_live_claim_authority() {
         })
         .unwrap();
 
+    // A generation alone is not publication of a resumable State parent.
+    generation_fixture.seed_runtime(&mut generation_db, 0, INVOCATION);
+    let missing_parent = wake_coordinator::trigger_notify_wake(SESSION);
+    assert_eq!(missing_parent.status, "runtime_unavailable");
+    generation_fixture.assert_pending_without_spawn_attempt(&generation_db, &missing_parent);
+    let other_parent = "44444444-4444-4444-8444-444444444444";
+    generation_fixture.bind_parent(other_parent, "different-fixture-session");
+    generation_fixture.seed_runtime(&mut generation_db, 0, other_parent);
+    let wrong_parent = wake_coordinator::trigger_notify_wake(SESSION);
+    assert_eq!(wrong_parent.status, "runtime_unavailable");
+    generation_fixture.assert_pending_without_spawn_attempt(&generation_db, &wrong_parent);
+    generation_fixture.bind_parent(INVOCATION, SESSION);
+    generation_fixture.seed_runtime(&mut generation_db, 0, INVOCATION);
+
     let generation = wake_coordinator::trigger_notify_wake(SESSION);
 
     assert_eq!(generation.status, "busy");
@@ -216,7 +258,8 @@ fn notify_wake_preserves_generation_and_live_claim_authority() {
     let mut claim_db = claim_fixture.mailbox();
     completion_owner::test_support::install_owner(&mut claim_db);
     claim_fixture.seed_pending(&mut claim_db, "h-claim");
-    claim_fixture.seed_runtime(&mut claim_db, 0);
+    claim_fixture.seed_runtime(&mut claim_db, 0, INVOCATION);
+    claim_fixture.bind_parent(INVOCATION, SESSION);
     let claim_token = "acr329-live-claim";
     let acquired = claim_db
         .wake_sessions()

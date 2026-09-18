@@ -654,6 +654,26 @@ mod tests {
     }
 
     #[test]
+    fn executor_handoff_clears_pre_execution_logical_settlement_fallback() {
+        let (_root, state, owner) = rejected_launch_fixture();
+        let mut guard = FinalizerGuard::new(&state, owner.invocation_row_id);
+        guard.retain_rejected_launch(Some(&owner));
+        guard.retain_rejected_launch(None);
+        drop(guard);
+        // An arbitrary post-handoff drop still finalizes the invocation, but
+        // cannot classify or settle the allocation as a pre-execution rejection.
+        assert_eq!(logical_status(&state, &owner), "active");
+        assert_eq!(
+            state
+                .get_invocation_by_id(owner.invocation_row_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Failed
+        );
+    }
+
+    #[test]
     fn rejection_settlement_preserves_cancellation_drain_owner() {
         let (_root, state, owner) = rejected_launch_fixture();
         state.request_cancel(owner.logical_launch_id).unwrap();

@@ -36,6 +36,18 @@ fn wake_claim_request<'a>(input: StartWakeInput<'a>, claim_token: &'a str) -> Wa
     }
 }
 
+/// Static rejection only: native automatic children must inherit an owner.
+/// Presence permits attempting bootstrap, never election or child admission.
+/// No storage/path probe belongs here; bootstrap authenticates current ownership
+/// and the durable validator rechecks the claim/process/custodian afterwards.
+pub(crate) fn reject_auto_wake_entry(session_id: &str, endpoint_hint_present: bool) -> Option<i32> {
+    if !auto_wake_marker_present() {
+        return None;
+    }
+    let marker = current_auto_wake_child_marker();
+    (!marker.matches_session(session_id) || !endpoint_hint_present).then_some(0)
+}
+
 pub(crate) fn validate_auto_wake_child(session_id: &str) -> Result<Option<i32>, String> {
     if !auto_wake_marker_present() {
         return Ok(None);

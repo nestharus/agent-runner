@@ -186,10 +186,18 @@ fn observe_valid_current(conn: &Connection) -> Result<bool, String> {
 }
 
 pub(super) fn ensure(conn: &mut Connection) -> Result<(), String> {
+    ensure_with_timeout(conn, SCHEMA_LOCK_TIMEOUT)
+}
+
+pub(super) fn ensure_without_wait(conn: &mut Connection) -> Result<(), String> {
+    ensure_with_timeout(conn, Duration::ZERO)
+}
+
+fn ensure_with_timeout(conn: &mut Connection, timeout: Duration) -> Result<(), String> {
     if observe_valid_current(conn)? {
         return Ok(());
     }
-    let deadline = Instant::now() + SCHEMA_LOCK_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         // Reobserve on every retry, including after a busy handler used the
         // remaining deadline. Another opener's committed migration is enough.

@@ -7,6 +7,7 @@ use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, CompletionEventTriggerInput, CreateRuntimeGeneration, EnqueueResult,
     InboxTarget, InboxTargetKind, MailboxDb, MailboxRow, RuntimeGenerationId,
     RuntimeLifecycleState, RuntimeTerminalReason, SubmittedInputEnqueue,
+    TERMINAL_HISTORY_KEEP_ROWS,
 };
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
@@ -15,7 +16,7 @@ use oulipoly_state::{
     COMPLETION_REGISTRATION_AUTHORITY_ENV, CompletionRegistrationAuthority, CompositeInvocationId,
     InvocationStart, ProviderSessionBinding, SessionTurnIngest, StateDb,
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -34,7 +35,7 @@ const SESSION_B: &str = "6169694d-de0f-40d1-890c-6e28e55bab28";
 const CHAIN_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
 struct Fixture {
-    dir: tempfile::TempDir,
+    dir: FixtureDirectory,
     config_home: PathBuf,
     data_home: PathBuf,
     home_dir: PathBuf,
@@ -42,6 +43,19 @@ struct Fixture {
     models_dir: PathBuf,
     completion_authorities:
         Mutex<std::collections::HashMap<String, CompletionRegistrationAuthority>>,
+}
+
+// Only the three running-owner cases re-enter as a real Runner provider. The
+// outer process owns storage; the inner test borrows it while that entry is live.
+struct FixtureDirectory {
+    _owned: Option<tempfile::TempDir>,
+    path: PathBuf,
+}
+
+impl FixtureDirectory {
+    fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 struct NotifyArtifacts {
@@ -53,7 +67,13 @@ struct NotifyArtifacts {
 
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let inherited = std::env::var_os("WU_B_OUTER_FIXTURE_ROOT").map(PathBuf::from);
+        let owned = inherited.is_none().then(|| tempfile::tempdir().unwrap());
+        let path = inherited.unwrap_or_else(|| owned.as_ref().unwrap().path().to_path_buf());
+        let dir = FixtureDirectory {
+            _owned: owned,
+            path,
+        };
         let config_home = dir.path().join("xdg-config");
         let data_home = dir.path().join("xdg-data");
         let home_dir = dir.path().join("home");
@@ -69,6 +89,99 @@ impl Fixture {
             models_dir,
             completion_authorities: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    // Follow the proactive-wake fixture's genuine outer-entry precedent. Never
+    // synthesize a native owner row or an endpoint value to bypass admission.
+    fn run_under_outer_owner(&self, node: &str) -> bool {
+        // Native completion-owner admission is Linux-only; other Unix targets
+        // still execute the original registration assertions directly.
+        if !cfg!(target_os = "linux") {
+            return false;
+        }
+        if std::env::var_os("WU_B_OUTER_FIXTURE_ROOT").is_some() {
+            assert!(std::env::var_os("OULIPOLY_COMPLETION_ENDPOINT").is_some());
+            let mut missing = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+            missing.args(["-m", "mailbox-outer", "must not launch"]);
+            missing.env_remove("OULIPOLY_COMPLETION_ENDPOINT");
+            let refused = self.run(missing);
+            assert!(!refused.status.success(), "{refused:?}");
+            assert!(
+                String::from_utf8_lossy(&refused.stderr)
+                    .contains("ancestor has no inherited completion owner"),
+                "{refused:?}"
+            );
+            println!("managed ancestor without inherited endpoint rejected");
+            return false;
+        }
+        let script = self.write_script(
+            "outer-provider.sh",
+            &format!(
+                "{} --exact {} --nocapture",
+                shell_path(&std::env::current_exe().unwrap()),
+                node
+            ),
+        );
+        self.write_single_provider_model("mailbox-outer", "outer-provider", &script);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        command
+            .args(["-m", "mailbox-outer", "--models-dir"])
+            .arg(&self.models_dir)
+            .arg("run admitted registration fixture")
+            .env("WU_B_OUTER_FIXTURE_ROOT", self.dir.path())
+            .current_dir(self.dir.path());
+        let output = self.run(command);
+        println!(
+            "outer fixture stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(output.status.success(), "outer fixture failed: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "inner assertions did not complete: {output:?}"
+        );
+        true
+    }
+
+    fn assert_live_registration(&self, identity: &ProcessIdentity, handle: &str) {
+        let artifacts = self.write_notify_artifacts(
+            handle,
+            running_owner_metadata(SESSION_A, INVOCATION_A, identity),
+            0,
+        );
+        let registration = self.run_register_artifacts(handle, "async", &artifacts);
+        assert!(registration.status.success(), "{registration:?}");
+        let registered = stdout_json(&registration);
+        assert_eq!(registered["status"], "registered");
+        assert_eq!(registered["owner_session_id"], SESSION_A);
+        assert_eq!(registered["owner_invocation_uuid"], INVOCATION_A);
+        let state = self.open_state();
+        let record = state.get_invocation_by_uuid(INVOCATION_A).unwrap().unwrap();
+        assert_eq!(record.provider_session_id.as_deref(), Some(SESSION_A));
+        assert_eq!(
+            record.provider_session_capture_method.as_deref(),
+            Some("completion_registration_live_pid")
+        );
+        let obligations = state
+            .completion_obligations_for_invocation(INVOCATION_A)
+            .unwrap();
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(obligations[0].event_id, handle);
+        println!("exact live sidecar admitted and bound: {registered}");
+    }
+
+    fn assert_running_owner_unbound(&self) {
+        let state = self.open_state();
+        let record = state.get_invocation_by_uuid(INVOCATION_A).unwrap().unwrap();
+        assert!(record.provider_session_id.is_none());
+        assert!(record.session_id.is_none());
+        assert!(
+            state
+                .completion_obligations_for_invocation(INVOCATION_A)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn state_path(&self) -> PathBuf {
@@ -614,6 +727,20 @@ turn_script = {}
     }
 }
 
+// A callback delegates responsibility; it does not attest a spawn, busy
+// recipient, delivery, or ACK. The tests below observe delivery separately.
+fn assert_wake_response(completed: &Value, legacy_status: &str) {
+    if !cfg!(target_os = "linux") {
+        assert_eq!(completed["wake"]["status"], legacy_status);
+        return;
+    }
+    assert_eq!(completed["wake"]["status"], "independent_owner_pending");
+    assert_eq!(completed["wake"]["attempted"], false);
+    assert!(completed["wake"]["wake_pid"].is_null());
+    assert!(completed["wake"]["claim_token"].is_null());
+    println!("pending owner handoff: {}", completed["wake"]);
+}
+
 #[test]
 fn completion_registration_binds_the_explicit_owner_without_pid_lineage() {
     let fixture = Fixture::new();
@@ -709,19 +836,14 @@ fn completion_registration_rejects_foreign_cli_without_invocation_capability() {
 #[test]
 fn completion_registration_accepts_running_owner_from_exact_live_pid_sidecar() {
     let fixture = Fixture::new();
+    if fixture.run_under_outer_owner(
+        "completion_registration_accepts_running_owner_from_exact_live_pid_sidecar",
+    ) {
+        return;
+    }
     let identity = fixture.seed_running_invocation_with_live_session(INVOCATION_A, SESSION_A);
-    let artifacts = fixture.write_notify_artifacts(
-        "h-running-owner",
-        running_owner_metadata(SESSION_A, INVOCATION_A, &identity),
-        0,
-    );
-
-    let registration = fixture.run_register_artifacts("h-running-owner", "async", &artifacts);
-
-    assert!(registration.status.success(), "{registration:?}");
-    let registered = stdout_json(&registration);
-    assert_eq!(registered["owner_session_id"], SESSION_A);
-    assert_eq!(registered["owner_invocation_uuid"], INVOCATION_A);
+    fixture.assert_running_owner_unbound();
+    fixture.assert_live_registration(&identity, "h-running-owner");
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -844,6 +966,11 @@ fn completion_registration_waits_for_live_session_binding() {
 #[test]
 fn completion_registration_rejects_mismatched_running_owner_sidecar() {
     let fixture = Fixture::new();
+    if fixture
+        .run_under_outer_owner("completion_registration_rejects_mismatched_running_owner_sidecar")
+    {
+        return;
+    }
     let identity = fixture.seed_running_invocation_with_live_session(INVOCATION_A, SESSION_A);
     let artifacts = fixture.write_notify_artifacts(
         "h-running-wrong-session",
@@ -861,12 +988,24 @@ fn completion_registration_rejects_mismatched_running_owner_sidecar() {
             .unwrap()
             .contains("is not bound")
     );
+    fixture.assert_running_owner_unbound();
+    println!(
+        "mismatched session rejected: {}",
+        stdout_json(&registration)
+    );
+    // Repair only the submitted session; the same sidecar/process/capability
+    // must now pass. Run this after rejection so binding cannot mask the guard.
+    fixture.assert_live_registration(&identity, "h-running-session-control");
     fixture.assert_default_user_paths_untouched();
 }
 
 #[test]
 fn completion_registration_rejects_stale_running_owner_identity() {
     let fixture = Fixture::new();
+    if fixture.run_under_outer_owner("completion_registration_rejects_stale_running_owner_identity")
+    {
+        return;
+    }
     let mut identity = fixture.seed_running_invocation_with_live_session(INVOCATION_A, SESSION_A);
     identity.os_pid_starttime_ticks += 1;
     PidIdentityDb::open(&fixture.sidecar_path())
@@ -896,6 +1035,30 @@ fn completion_registration_rejects_stale_running_owner_identity() {
             .unwrap()
             .contains("is not bound")
     );
+    fixture.assert_running_owner_unbound();
+    println!("stale incarnation rejected: {}", stdout_json(&registration));
+    // Both metadata and sidecar matched the stale incarnation above. Restore
+    // the actual live incarnation, not a State session binding that bypasses it.
+    identity.os_pid_starttime_ticks -= 1;
+    assert_eq!(
+        read_live_process_identity(identity.os_pid)
+            .unwrap()
+            .as_ref(),
+        Some(&identity)
+    );
+    PidIdentityDb::open(&fixture.sidecar_path())
+        .unwrap()
+        .record_identity(PidIdentityRecord {
+            identity: &identity,
+            os_pgid: None,
+            invocation_uuid: INVOCATION_A,
+            session_id: Some(SESSION_A),
+            provider_name: Some("fixture-provider"),
+            model_name: Some("fixture-model"),
+            recorded_at: "2026-08-07T12:00:00Z",
+        })
+        .unwrap();
+    fixture.assert_live_registration(&identity, "h-running-incarnation-control");
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -924,7 +1087,7 @@ fn completion_response_reports_delivery_for_every_listener_session() {
     assert!(completion.status.success(), "{completion:?}");
     let completed = stdout_json(&completion);
     assert_eq!(completed["pty_deliveries"].as_array().unwrap().len(), 2);
-    assert_eq!(completed["wake"]["status"], "spawned");
+    assert_wake_response(&completed, "spawned");
     assert!(
         completed["pty_deliveries"]
             .as_array()
@@ -933,8 +1096,27 @@ fn completion_response_reports_delivery_for_every_listener_session() {
             .all(|diagnostic| diagnostic["status"] == "no_runtime"
                 && diagnostic["submitted"] == false)
     );
-    assert_eq!(fixture.mailbox_rows(SESSION_A, false).len(), 1);
-    assert_eq!(fixture.mailbox_rows(SESSION_B, false).len(), 1);
+    // Response diagnostics are not recipient acceptance. Check each listener's
+    // durable outcome independently; these fixtures have no resumable runtime.
+    for (session, owner) in [(SESSION_A, INVOCATION_A), (SESSION_B, INVOCATION_B)] {
+        let rows = fixture.mailbox_rows(session, true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, session);
+        let retained = MailboxDb::open(&fixture.sidecar_path())
+            .unwrap()
+            .payloads()
+            .hydrate_agent_bash_payload_json(&rows[0])
+            .unwrap();
+        let payload: Value = serde_json::from_str(&retained).unwrap();
+        assert_eq!(payload["handle"], "h-multi-listener");
+        assert_eq!(rows[0].owner_invocation_uuid.as_deref(), Some(owner));
+        assert!(rows[0].delivered_at.is_none());
+        assert_eq!(rows[0].delivery_attempts, 0);
+        println!(
+            "listener {session} retained pending sequence {}",
+            rows[0].seq
+        );
+    }
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -942,6 +1124,11 @@ fn completion_response_reports_delivery_for_every_listener_session() {
 fn completion_for_headless_runtime_is_not_submitted_to_pty() {
     let fixture = Fixture::new();
     fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    // A reachable trap makes exclusion observable independently of diagnostics.
+    // Headless mode must never submit even if a control-path hint is present.
+    let socket_path = fixture.dir.path().join("headless-trap.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
     let generation_id = RuntimeGenerationId::parse(INVOCATION_A).unwrap();
     MailboxDb::open(&fixture.sidecar_path())
         .unwrap()
@@ -953,7 +1140,7 @@ fn completion_for_headless_runtime_is_not_submitted_to_pty() {
             runtime_mode: "headless",
             provider_name: "fixture-provider",
             model_name: None,
-            pty_control_path: None,
+            pty_control_path: Some(socket_path.to_str().unwrap()),
             models_dir: None,
             effective_cwd: None,
         })
@@ -968,12 +1155,20 @@ fn completion_for_headless_runtime_is_not_submitted_to_pty() {
     let completed = stdout_json(&completion);
     assert_eq!(completed["pty_delivery"]["status"], "not_pty");
     assert_eq!(completed["pty_delivery"]["submitted"], false);
-    assert_eq!(completed["wake"]["status"], "busy");
+    assert_wake_response(&completed, "busy");
     let rows = fixture.mailbox_rows(SESSION_A, false);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].handle, "h-headless-not-pty");
     assert!(rows[0].delivered_at.is_none());
     assert_eq!(rows[0].delivery_attempts, 0);
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "headless notification connected to the PTY trap"
+    );
+    let probe = std::os::unix::net::UnixStream::connect(&socket_path).unwrap();
+    let (_accepted_probe, _) = listener.accept().unwrap();
+    drop(probe);
+    println!("headless completion retained pending without PTY connection; trap reachable");
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -1254,26 +1449,68 @@ fn completion_trigger_replay_accepts_bookkeeping_after_exact_ack_payload_reclama
     assert!(activated.listeners[0].acknowledged_at.is_none());
     db.acknowledge_range(SESSION_A, seq, seq, INVOCATION_A)
         .unwrap();
+    let retained = db.completion_event(handle).unwrap().unwrap();
+    let payload_path = Path::new(retained.payload_file_path.as_deref().unwrap());
+    let original_bytes = fs::read(payload_path).unwrap();
+    assert!(retained.payload_reclaimed_at.is_none());
+    let acknowledged = db.completion_event_listeners(handle).unwrap();
+    assert!(acknowledged[0].acknowledged_at.is_some());
+    assert_eq!(acknowledged[0].mailbox_seq, Some(seq));
+    assert_eq!(fixture.mailbox_rows(SESSION_A, true)[0].seq, seq);
+    // ACK does not release bytes referenced by retained history. Fill the real
+    // production window with newer terminal notifications, then use its normal
+    // maintenance API; never unlink a payload or delete its referencing rows.
+    let newer = (0..TERMINAL_HISTORY_KEEP_ROWS)
+        .map(|index| {
+            fixture
+                .seed_mailbox(SESSION_B, &format!("history-{index}"), 0)
+                .seq
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fs::read(payload_path).unwrap(), original_bytes);
+    db.acknowledge_range(SESSION_B, newer[0], *newer.last().unwrap(), INVOCATION_A)
+        .unwrap();
+    db.prune_terminal_history(TERMINAL_HISTORY_KEEP_ROWS)
+        .unwrap();
     let original = db.completion_event(handle).unwrap().unwrap();
-    let listeners = db.completion_event_listeners(handle).unwrap();
     assert!(original.payload_reclaimed_at.is_some());
-    assert!(!Path::new(original.payload_file_path.as_deref().unwrap()).exists());
+    assert!(!payload_path.exists());
+    assert!(fixture.mailbox_rows(SESSION_A, true).is_empty());
+    let newer_rows = fixture.mailbox_rows(SESSION_B, true);
+    assert_eq!(newer_rows.len(), TERMINAL_HISTORY_KEEP_ROWS);
+    assert!(newer_rows.iter().all(|row| row.delivered_at.is_some()));
+    let listeners = db.completion_event_listeners(handle).unwrap();
+    assert_eq!(listeners[0].mailbox_seq, None);
+    assert_eq!(
+        listeners[0].acknowledged_at,
+        acknowledged[0].acknowledged_at
+    );
+    assert_eq!(original.payload_sha256, retained.payload_sha256);
+    assert_eq!(original.payload_byte_len, retained.payload_byte_len);
+    assert_eq!(original.triggered_at, retained.triggered_at);
+    println!("exact ACK retained={retained:?}; genuine history reclamation={original:?}");
     metadata["delivery"] =
         json!({"attempted": true, "exit_code": 0, "error": null, "lifecycle": "admitted_outcome"});
     metadata["updated_at_unix_ms"] = json!(1788585398898_i64);
     fs::write(&artifacts.meta, notify_metadata_content(&metadata)).unwrap();
 
-    let replay = fixture.run_notify_artifacts(handle, &artifacts);
-    assert!(replay.status.success(), "{replay:?}");
-    assert_eq!(stdout_json(&replay)["status"], "already_triggered");
-    assert_eq!(stdout_json(&replay)["pty_deliveries"], json!([]));
-    assert_eq!(fixture.mailbox_rows(SESSION_A, true).len(), 1);
-    let replayed = db.completion_event(handle).unwrap().unwrap();
-    assert_eq!(replayed.payload_sha256, original.payload_sha256);
-    assert_eq!(replayed.payload_byte_len, original.payload_byte_len);
-    assert_eq!(replayed.payload_file_path, original.payload_file_path);
-    assert_eq!(replayed.triggered_at, original.triggered_at);
-    assert_eq!(db.completion_event_listeners(handle).unwrap(), listeners);
+    for _ in 0..2 {
+        let replay = fixture.run_notify_artifacts(handle, &artifacts);
+        assert!(replay.status.success(), "{replay:?}");
+        let response = stdout_json(&replay);
+        assert_eq!(response["status"], "already_triggered");
+        assert_eq!(response["pty_deliveries"], json!([]));
+        assert_eq!(response["wake"], Value::Null);
+        assert!(fixture.mailbox_rows(SESSION_A, true).is_empty());
+        assert_eq!(fixture.mailbox_rows(SESSION_B, true), newer_rows);
+        let replayed = db.completion_event(handle).unwrap().unwrap();
+        assert_eq!(replayed.payload_sha256, original.payload_sha256);
+        assert_eq!(replayed.payload_byte_len, original.payload_byte_len);
+        assert_eq!(replayed.payload_file_path, original.payload_file_path);
+        assert_eq!(replayed.triggered_at, original.triggered_at);
+        assert_eq!(db.completion_event_listeners(handle).unwrap(), listeners);
+        println!("post-prune CLI replay: {response}; event={replayed:?}");
+    }
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -2129,6 +2366,7 @@ fn resume_typed_physical_zero_failure_keeps_selected_mailbox_outside_age270_seam
     let fixture = Fixture::new();
     let prompt_dump = fixture.dir.path().join("prompt.txt");
     let turns = fixture.dir.path().join("turns.jsonl");
+    let launches = fixture.dir.path().join("provider-launches.txt");
     let turn_script = fixture.write_script(
         "turns-typed-zero.sh",
         &format!(
@@ -2139,12 +2377,16 @@ fn resume_typed_physical_zero_failure_keeps_selected_mailbox_outside_age270_seam
     );
     let script = fixture.write_script(
         "resume-typed-zero.sh",
-        &write_user_turn_script(
-            &prompt_dump,
-            &turns,
-            SESSION_A,
-            Some("different payload"),
-            0,
+        &format!(
+            "printf 'launch\\n' >> {}\n{}",
+            shell_path(&launches),
+            write_user_turn_script(
+                &prompt_dump,
+                &turns,
+                SESSION_A,
+                Some("different payload"),
+                0,
+            )
         ),
     );
     fixture.write_single_provider_model("fixture-model", "fixture-provider", &script);
@@ -2206,14 +2448,40 @@ fn resume_typed_physical_zero_failure_keeps_selected_mailbox_outside_age270_seam
     assert!(runtime.running_invocation_uuid.is_none());
     assert!(runtime.running_os_pid.is_none());
     assert_eq!(runtime.last_exit_code, Some(1));
-    assert!(
-        mailbox
-            .wake_session_reader()
-            .wake_claim(SESSION_A)
-            .unwrap()
-            .is_none()
-    );
+    // The compatibility idle projection above is not automatic-wake authority.
+    // A bound recipient may acquire a successor while submission is uncertain.
     assert_eq!(invocation_count(&fixture), 1);
+    assert_eq!(fs::read_to_string(&launches).unwrap(), "launch\n");
+    let windows = mailbox
+        .unresolved_delivery_attempt_windows(SESSION_A)
+        .unwrap();
+    assert_eq!(windows.len(), 1);
+    let window = &windows[0];
+    assert_eq!(window.delivery_invocation_uuid, invocation.id);
+    assert!(window.submission_started_at.is_some());
+    assert!(window.acknowledged_at.is_none());
+    assert!(window.resolved_at.is_none());
+    assert_eq!(
+        mailbox
+            .delivery_attempt_item_seqs(&window.attempt_id)
+            .unwrap(),
+        vec![selected.seq]
+    );
+    println!("typed physical-zero failure={result}; original possible submission={window:?}");
+    if cfg!(target_os = "linux") {
+        assert_uncertain_successor_refusal(&fixture, selected.seq, &launches);
+    }
+    assert_eq!(invocation_count(&fixture), 1);
+    assert_eq!(fs::read_to_string(&launches).unwrap(), "launch\n");
+    assert_eq!(fixture.mailbox_rows(SESSION_A, true), vec![row]);
+    assert_eq!(
+        mailbox
+            .unresolved_delivery_attempt_windows(SESSION_A)
+            .unwrap(),
+        windows
+    );
+    assert_failed_invocation(&fixture, &invocation.id, SESSION_A, "bounded_silence");
+    fixture.assert_default_user_paths_untouched();
 }
 
 #[test]
@@ -2628,4 +2896,84 @@ fn expected_payload_path(sidecar_path: &Path, bytes: &[u8]) -> PathBuf {
         .join("sha256")
         .join(&sha256[..2])
         .join(sha256)
+}
+
+// Read the first actual automatic activation's retained history, not whichever
+// claim happens to be current after its drain. Later activations are permitted;
+// this bounded observation is not quiescence or a forever-no-replay assertion.
+fn assert_uncertain_successor_refusal(fixture: &Fixture, seq: i64, launches: &Path) {
+    let conn = Connection::open_with_flags(
+        fixture.sidecar_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let activation: Value = loop {
+        assert_eq!(invocation_count(fixture), 1);
+        assert_eq!(fs::read_to_string(launches).unwrap(), "launch\n");
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT json_object('attempt_id', a.attempt_id, 'claim_token', a.claim_token,
+             'owner_generation', a.owner_generation, 'phase', a.phase,
+             'custodian', a.custodian_identity, 'adopter', a.adopter_identity,
+             'launcher', a.launcher_identity, 'spawn', a.spawn_invocation_uuid,
+             'runtime', a.runtime_generation_uuid, 'result_path', a.result_path,
+             'integrated', a.integrated, 'drain', a.drain_receipt)
+             FROM completion_continuation_attempt a
+             JOIN completion_continuation_owner o ON o.generation=a.owner_generation
+                 AND o.domain_id=a.domain_id
+             WHERE a.session_id=?1 AND a.operation='activation' ORDER BY a.rowid LIMIT 1",
+                [SESSION_A],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        let current: Value = text
+            .map(|text| serde_json::from_str(&text).unwrap())
+            .unwrap_or(Value::Null);
+        if current["phase"] == "drained" && current["integrated"] == 1 {
+            break current;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first successor did not physically drain: {current}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!activation["claim_token"].as_str().unwrap().is_empty());
+    assert!(!activation["owner_generation"].as_str().unwrap().is_empty());
+    for field in ["custodian", "adopter", "launcher"] {
+        let identity: Value = serde_json::from_str(activation[field].as_str().unwrap()).unwrap();
+        assert!(identity["pid"].as_i64().unwrap() > 0, "{identity}");
+    }
+    assert_eq!(activation["spawn"], Value::Null);
+    assert_eq!(activation["runtime"], Value::Null);
+    let receipt: Value = serde_json::from_str(activation["drain"].as_str().unwrap()).unwrap();
+    assert_eq!(receipt["attempt_id"], activation["attempt_id"]);
+    assert_eq!(receipt["owned_children"], "ECHILD");
+    assert_eq!(receipt["root_exit_code"], 1);
+    assert_eq!(receipt["spawn_failed"], false);
+    assert_eq!(receipt["accepted_cancellation"], Value::Null);
+    let custodian: Value = serde_json::from_str(activation["custodian"].as_str().unwrap()).unwrap();
+    assert_eq!(receipt["custodian"], custodian);
+    let result_path = Path::new(activation["result_path"].as_str().unwrap());
+    assert!(result_path.starts_with(fixture.dir.path()));
+    let result: Value = serde_json::from_slice(&fs::read(result_path).unwrap()).unwrap();
+    assert_eq!(result, receipt);
+    let stderr = fs::read_to_string(result_path.with_file_name("launcher.stderr")).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "mailbox delivery {seq} has unresolved possible submission; no launch"
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("OULIPOLY_SESSION_ADMISSION="), "{stderr}");
+    println!(
+        "first successor={activation}; physical receipt={receipt}; actual preflight stderr={stderr}"
+    );
+    let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+    println!(
+        "later claim snapshot (not quiescence): {:?}",
+        mailbox.wake_session_reader().wake_claim(SESSION_A).unwrap()
+    );
 }

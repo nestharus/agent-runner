@@ -133,6 +133,50 @@ fn sql_without_leading_trivia(mut sql: &str) -> Option<&str> {
     }
 }
 
+/// Writable-open failure provenance. Legacy callers retain their string API;
+/// entry callers can distinguish a migration refusal without inspecting paths.
+#[derive(Debug)]
+pub enum WritableOpenError {
+    Migration(crate::migrations::MigrationError),
+    Operational(String),
+}
+
+impl WritableOpenError {
+    pub fn is_schema_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Migration(
+                crate::migrations::MigrationError::Incompatible { .. }
+                    | crate::migrations::MigrationError::UnrecognizedShape { .. }
+            )
+        )
+    }
+}
+
+impl std::fmt::Display for WritableOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Migration(error) => std::fmt::Display::fmt(error, f),
+            Self::Operational(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for WritableOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Migration(error) => Some(error),
+            Self::Operational(_) => None,
+        }
+    }
+}
+
+impl From<String> for WritableOpenError {
+    fn from(message: String) -> Self {
+        Self::Operational(message)
+    }
+}
+
 impl StateDb {
     pub fn open(path: &Path) -> Result<Self, String> {
         Self::open_with_sink(path, Box::new(NoopLifecycleEventSink))
@@ -143,6 +187,7 @@ impl StateDb {
         sink: Box<dyn LifecycleEventSink + Send>,
     ) -> Result<Self, String> {
         Self::open_with_sink_and_legacy_provider_names(path, sink, &LegacyProviderNames::new())
+            .map_err(|error| error.to_string())
     }
 
     /// Open with a caller-pushed legacy provider-name lookup (PP-001 inversion).
@@ -159,15 +204,18 @@ impl StateDb {
             Box::new(NoopLifecycleEventSink),
             provider_names,
         )
+        .map_err(|error| error.to_string())
     }
 
     fn open_with_sink_and_legacy_provider_names(
         path: &Path,
         sink: Box<dyn LifecycleEventSink + Send>,
         provider_names: &LegacyProviderNames,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, WritableOpenError> {
         if Self::is_sqlite_uri_path(path) {
-            return Err("State DB writable open does not accept SQLite URI paths".to_string());
+            return Err("State DB writable open does not accept SQLite URI paths"
+                .to_string()
+                .into());
         }
         let nonlocal = Self::is_nonlocal_sqlite_path(path);
         if !nonlocal {
@@ -203,7 +251,7 @@ impl StateDb {
         sink: Box<dyn LifecycleEventSink + Send>,
         provider_names: &LegacyProviderNames,
         state_namespace_guard: Option<StateNamespaceGuard>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, WritableOpenError> {
         let mut conn = Self::open_state_connection(&db_path)?;
 
         let ran_open_migrations = Self::run_open_migrations(&db_path, &mut conn)?;
@@ -359,6 +407,15 @@ impl StateDb {
         })
     }
 
+    pub fn open_default_with_error() -> Result<Self, WritableOpenError> {
+        let db_path = Self::default_path()?;
+        Self::open_with_sink_and_legacy_provider_names(
+            &db_path,
+            Box::new(NoopLifecycleEventSink),
+            &LegacyProviderNames::new(),
+        )
+    }
+
     pub fn open_default() -> Result<Self, String> {
         let db_path = Self::default_path()?;
         Self::open(&db_path)
@@ -413,7 +470,8 @@ impl StateDb {
             Box::new(NoopLifecycleEventSink),
             &LegacyProviderNames::new(),
             None,
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         drop(db);
         Ok(())
     }
@@ -692,7 +750,7 @@ impl StateDb {
     pub(super) fn run_open_migrations(
         path: &Path,
         conn: &mut sqlite::Connection,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, WritableOpenError> {
         let compatibility = migrations::classify(conn)?;
         let ran_open_migrations = Self::compatibility_runs_open_migrations(&compatibility);
         Self::dispatch_open_migration_plan(path, conn, compatibility)?;
@@ -1281,5 +1339,50 @@ mod state_namespace_tests {
 
         assert!(error.contains("valid UTF-8"), "{error}");
         assert!(!target_path.exists());
+    }
+}
+
+#[cfg(test)]
+mod writable_open_error_tests {
+    use super::*;
+    use crate::schema::CURRENT_SCHEMA_VERSION;
+    use std::error::Error;
+
+    #[test]
+    fn migration_error_source_survives_transport_without_text_classification() {
+        let error = WritableOpenError::Migration(migrations::MigrationError::Incompatible {
+            db_path: PathBuf::from("/fixture/state.db"),
+            stored: CURRENT_SCHEMA_VERSION + 1,
+            current: CURRENT_SCHEMA_VERSION,
+        });
+        assert!(error.is_schema_refusal());
+        assert!(matches!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<migrations::MigrationError>(),
+            Some(migrations::MigrationError::Incompatible { .. })
+        ));
+        let same_text = WritableOpenError::Operational(error.to_string());
+        assert!(!same_text.is_schema_refusal());
+        assert_eq!(same_text.to_string(), error.to_string());
+        assert!(same_text.source().is_none());
+    }
+
+    #[test]
+    fn migration_step_failure_with_schema_looking_path_is_not_schema_refusal() {
+        let error = WritableOpenError::Migration(migrations::MigrationError::StepFailed {
+            db_path: PathBuf::from("/schema is incompatible/unrecognized schema shape/state.db"),
+            id: "fixture",
+            target_version: CURRENT_SCHEMA_VERSION,
+            source: sqlite::Error::InvalidQuery,
+        });
+        assert!(!error.is_schema_refusal());
+        assert!(error.source().unwrap().source().is_some());
+        assert!(
+            error
+                .to_string()
+                .contains("/schema is incompatible/unrecognized schema shape/state.db")
+        );
     }
 }

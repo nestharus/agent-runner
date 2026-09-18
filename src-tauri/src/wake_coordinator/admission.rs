@@ -147,16 +147,21 @@ fn enqueue_and_wait_at_with_memory_observer(
                 observation,
                 Ok(ManualWakeCoordination::UnknownCustody) | Err(_)
             ) {
-                db.session_admissions().cancel_queued(
+                let primary = match observation {
+                    Err(error) => error,
+                    _ => "manual resume cannot establish retained wake custody".into(),
+                };
+                let cleanup = cancel_failed_queue(
+                    &mut db,
                     registration_identity,
                     &admission_id,
                     "manual_custody_unavailable",
-                    unix_time_ms()?,
-                )?;
-                return Err(match observation {
-                    Err(error) => error,
-                    _ => "manual resume cannot establish retained wake custody".into(),
-                });
+                );
+                return Err(queue_failure(
+                    "manual custody observation (PID mailbox sidecar)",
+                    &primary,
+                    cleanup,
+                ));
             }
         }
         if let Some(claim_token) = admitted_claim_token(&row)
@@ -211,19 +216,48 @@ fn enqueue_and_wait_at_with_memory_observer(
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    let mut db = MailboxDb::open(mailbox_path)?;
-                    db.session_admissions().cancel_queued(
-                        registration_identity,
-                        &admission_id,
-                        "coordination_unavailable",
-                        unix_time_ms()?,
-                    )?;
-                    return Err(error);
+                    let cleanup = MailboxDb::open(mailbox_path).and_then(|mut db| {
+                        cancel_failed_queue(
+                            &mut db,
+                            registration_identity,
+                            &admission_id,
+                            "coordination_unavailable",
+                        )
+                    });
+                    return Err(queue_failure(
+                        "queue drain (sweep coordination / PID mailbox sidecar)",
+                        &error,
+                        cleanup,
+                    ));
                 }
             }
         }
         std::thread::sleep(WAIT_RETRY_INTERVAL);
     }
+}
+
+fn cancel_failed_queue(
+    db: &mut MailboxDb,
+    registration: &str,
+    admission: &str,
+    reason: &str,
+) -> Result<bool, String> {
+    let now = unix_time_ms()?;
+    db.session_admissions()
+        .cancel_queued(registration, admission, reason, now)
+}
+
+fn queue_failure(operation: &str, primary: &str, cleanup: Result<bool, String>) -> String {
+    let disposition = match cleanup {
+        Ok(true) => "changed: exact queued admission cancelled".to_string(),
+        Ok(false) => {
+            "no-op: no queued row changed; admission/launch outcome not established".to_string()
+        }
+        Err(error) => format!("error: {error}; admission/launch outcome unknown"),
+    };
+    format!(
+        "{operation} failed: {primary}; exact queued cleanup (PID mailbox sidecar): {disposition}"
+    )
 }
 
 fn queued_reason(outcome: DrainOutcome) -> &'static str {
@@ -624,6 +658,61 @@ mod tests {
         RuntimeLifecycleState, RuntimeTerminalReason,
     };
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn storage_queue_failure_preserves_primary_and_all_cleanup_dispositions() {
+        let changed = queue_failure("queue drain", "sweep lease open failed", Ok(true));
+        let noop = queue_failure("queue drain", "sweep lease open failed", Ok(false));
+        let failed = queue_failure(
+            "queue drain",
+            "sweep lease open failed",
+            Err("database is locked".into()),
+        );
+        for text in [&changed, &noop, &failed] {
+            assert!(text.contains("sweep lease open failed"));
+            assert!(text.contains("PID mailbox sidecar"));
+        }
+        assert!(changed.contains("changed: exact queued admission cancelled"));
+        assert!(noop.contains("no-op: no queued row changed"));
+        assert!(noop.contains("outcome not established"));
+        assert!(failed.contains("error: database is locked"));
+        assert!(failed.contains("outcome unknown"));
+    }
+
+    #[test]
+    fn storage_queue_real_sql_primary_and_cleanup_failures_both_survive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&path).unwrap());
+        let sql = rusqlite::Connection::open(&path).unwrap();
+        // The production enqueue/drain/cancel route, not queue_failure directly.
+        // Independent real SQLite statement faults distinguish the two phases.
+        sql.execute_batch("CREATE TRIGGER storage_primary BEFORE UPDATE ON session_admission_queue WHEN NEW.state='admitted' BEGIN SELECT RAISE(ABORT, 'selected admission primary'); END;
+            CREATE TRIGGER storage_cleanup BEFORE UPDATE ON session_admission_queue WHEN NEW.state='cancelled' BEGIN SELECT RAISE(ABORT, 'selected cancellation cleanup'); END;").unwrap();
+        let result = enqueue_and_wait_at_with_memory_observer(
+            &path,
+            "storage-dual-fault",
+            None,
+            roomy_default_memory,
+            false,
+        );
+        let error = match result {
+            Ok(_) => panic!("faulted admission unexpectedly launched"),
+            Err(error) => error,
+        };
+        assert!(error.contains("selected admission primary"), "{error}");
+        assert!(error.contains("selected cancellation cleanup"), "{error}");
+        assert!(error.contains("outcome unknown"), "{error}");
+        let mut db = MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            db.session_admissions()
+                .row("storage-dual-fault")
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
+        );
+    }
 
     fn config() -> AdmissionCapacityConfig {
         AdmissionCapacityConfig {

@@ -4,6 +4,9 @@
 //!
 //! TEST: physical read-only mailbox sidecar characterization for AGE-274.
 
+#[path = "support/fixture_process.rs"]
+mod fixture_process;
+
 use chrono::Utc;
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, MailboxDb,
@@ -70,6 +73,36 @@ impl Fixture {
                 .record_delivery_attempt_transport_ack(ATTEMPT)
                 .unwrap()
         );
+        // Readiness is an independent prerequisite, not owner authority. Prove
+        // its earlier refusal before exercising the missing-owner transaction.
+        let not_ready = mailbox
+            .wake_sessions()
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: SESSION,
+                claim_token: CLAIM,
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: Some(INVOCATION),
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+        assert!(matches!(
+            not_ready,
+            WakeClaimAcquireResult::RuntimeUnavailable
+        ));
+        mailbox
+            .wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: SESSION,
+                mode: "headless",
+                invocation_uuid: Some(INVOCATION),
+                provider_name: Some("provider-read-only"),
+                model_name: Some("model-read-only"),
+                models_dir: Some("/models/read-only"),
+                effective_cwd: Some("/work/read-only"),
+            })
+            .unwrap();
+        assert!(mailbox.completion_continuation_owner().unwrap().is_none());
         // This test characterizes persisted read-only history, not execution.
         // Keep the real no-owner refusal control before publishing relational
         // owner facts through the production API. No physical drain is asserted.
@@ -88,6 +121,20 @@ impl Fixture {
             refused.contains("completion_owner_unavailable"),
             "{refused}"
         );
+        assert!(
+            mailbox
+                .wake_session_reader()
+                .wake_claim(SESSION)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mailbox
+                .continuation_activation(SESSION, CLAIM)
+                .unwrap()
+                .is_none()
+        );
+        assert!(mailbox.completion_continuation_owner().unwrap().is_none());
         let live =
             oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
                 .unwrap()
@@ -140,18 +187,6 @@ impl Fixture {
             })
             .unwrap();
         assert!(matches!(claim, WakeClaimAcquireResult::Acquired(_)));
-        mailbox
-            .wake_sessions()
-            .upsert_session_metadata(SessionMetadataUpsert {
-                session_id: SESSION,
-                mode: "headless",
-                invocation_uuid: Some(INVOCATION),
-                provider_name: Some("provider-read-only"),
-                model_name: Some("model-read-only"),
-                models_dir: Some("/models/read-only"),
-                effective_cwd: Some("/work/read-only"),
-            })
-            .unwrap();
         drop(mailbox);
         Self {
             _dir: dir,
@@ -162,6 +197,9 @@ impl Fixture {
 
 #[test]
 fn mailbox_open_read_only_preserves_files_and_recovers_claim_and_attempt_history() {
+    if fixture_process::completed_in_fixture_process() {
+        return;
+    }
     let fixture = Fixture::seeded();
     let parent = fixture.sidecar_path.parent().unwrap();
     let wal = path_with_suffix(&fixture.sidecar_path, "-wal");
@@ -242,6 +280,9 @@ fn mailbox_open_read_only_preserves_files_and_recovers_claim_and_attempt_history
 
 #[test]
 fn mailbox_open_read_only_recovers_committed_wal_state_without_mutating_source() {
+    if fixture_process::completed_in_fixture_process() {
+        return;
+    }
     let fixture = Fixture::seeded();
     let parent = fixture.sidecar_path.parent().unwrap();
     let main_before = std::fs::read(&fixture.sidecar_path).unwrap();
@@ -284,6 +325,9 @@ fn mailbox_open_read_only_recovers_committed_wal_state_without_mutating_source()
 #[cfg(unix)]
 #[test]
 fn mailbox_open_read_only_through_leaf_symlink_recovers_canonical_wal_state() {
+    if fixture_process::completed_in_fixture_process() {
+        return;
+    }
     use std::os::unix::fs::symlink;
 
     let fixture = Fixture::seeded();
@@ -325,6 +369,9 @@ fn mailbox_open_read_only_through_leaf_symlink_recovers_canonical_wal_state() {
 
 #[test]
 fn mailbox_open_read_only_rejects_multi_link_database_identity() {
+    if fixture_process::completed_in_fixture_process() {
+        return;
+    }
     let fixture = Fixture::seeded();
     let alias_path = fixture
         .sidecar_path
@@ -341,6 +388,9 @@ fn mailbox_open_read_only_rejects_multi_link_database_identity() {
 
 #[test]
 fn mailbox_open_read_only_rejects_multi_link_wal_identity() {
+    if fixture_process::completed_in_fixture_process() {
+        return;
+    }
     let fixture = Fixture::seeded();
     let mut writer = MailboxDb::open(&fixture.sidecar_path).unwrap();
     writer

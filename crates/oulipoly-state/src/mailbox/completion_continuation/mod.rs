@@ -179,6 +179,14 @@ impl MailboxDb {
             if !AdmittedSourceBinding::decode(&retained)?.same_source(binding) {
                 return Ok(false);
             }
+            let listener = binding.admission_listener()?;
+            let projected: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM completion_event_listener WHERE event_id=?1 AND listener_id=?2 AND session_id=?3 AND owner_invocation_uuid=?4)",
+                params![source.handle, listener.listener_id, listener.session_id, listener.owner_invocation_uuid], |r| r.get(0),
+            ).map_err(|e| e.to_string())?;
+            if !projected {
+                return Ok(false); // accepted original is not this listener's projection
+            }
         }
         for binding in admitted {
             notification::classify_on(&tx, binding)?;
@@ -723,9 +731,14 @@ mod tests {
                 .iter()
                 .any(|a| a.attempt_id == attempt.attempt_id)
         );
-        let mut accepted = attempt.clone();
-        accepted.attempt_id = uuid::Uuid::new_v4().to_string();
-        db.reserve_continuation_attempt(&accepted).unwrap();
+        // Act1: reserved activation revocation must atomically retire its claim.
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+        let accepted = reservation(&mut db, &owner);
         db.accept_continuation_attempt(&accepted).unwrap();
         assert!(
             db.revoke_unaccepted_continuation_attempt(&accepted)
@@ -738,6 +751,29 @@ mod tests {
                 .any(|a| a.attempt_id == accepted.attempt_id)
         );
     }
+    #[test]
+    fn storage_accepted_revocation_rejects_without_requesting_a_writer() {
+        let (_dir, mut db, owner) = fixture();
+        let attempt = reservation(&mut db, &owner);
+        db.accept_continuation_attempt(&attempt).unwrap();
+        let blocker = Connection::open(db.path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for _ in 0..2 {
+            let error = db
+                .revoke_unaccepted_continuation_attempt(&attempt)
+                .unwrap_err();
+            assert_eq!(error, "reservation no longer unaccepted under this driver");
+            assert!(
+                db.wake_session_reader()
+                    .wake_claim("session")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(db.pending_continuation_attempts().unwrap(), vec![attempt]);
+    }
+
     #[test]
     fn completion_continuation_attempt_envelope_and_never_forked_receipt_are_exact() {
         let (_dir, mut db, owner) = fixture();

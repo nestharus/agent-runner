@@ -273,6 +273,8 @@ def launch(request):
         index = next_resume_index(work)
         env["WU_D_PROVIDER_RESUME_INDEX"] = str(index)
         target_name = PROMPT_FILE.replace("${WU_D_PROVIDER_RESUME_INDEX}", str(index))
+        if session == "77777777-7777-4777-8777-777777777777":
+            target_name = "recovery-positive-control.txt"
         target = work / target_name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(prompt)

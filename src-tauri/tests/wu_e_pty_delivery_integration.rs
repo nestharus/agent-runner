@@ -12,12 +12,10 @@ use oulipoly_state::mailbox::{
     MailboxDb, MailboxRow, RuntimeGenerationFence, RuntimeGenerationId, RuntimeLifecycleState,
     RuntimeTerminalReason, SessionGenerationProjection,
 };
-use oulipoly_state::pid_identity::{
-    PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
-};
+use oulipoly_state::pid_identity::{PidIdentityDb, ProcessIdentity, read_live_process_identity};
 use oulipoly_state::{
-    COMPLETION_REGISTRATION_AUTHORITY_ENV, CompletionRegistrationAuthority, InvocationStart,
-    ProviderSessionBinding, SessionTurnIngest, StateDb,
+    COMPLETION_REGISTRATION_AUTHORITY_ENV, CompletionRegistrationAuthority, SessionTurnIngest,
+    StateDb,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -29,7 +27,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,7 +38,7 @@ const OBSERVED_COMPLETION_AUTHORITY_FILE: &str = "observed-completion-registrati
 
 struct Fixture {
     _integration_test_guard: MutexGuard<'static, ()>,
-    dir: tempfile::TempDir,
+    dir: FixtureDirectory,
     config_home: PathBuf,
     data_home: PathBuf,
     runtime_dir: PathBuf,
@@ -50,6 +48,18 @@ struct Fixture {
     models_dir: PathBuf,
     completion_authorities:
         Mutex<std::collections::HashMap<String, CompletionRegistrationAuthority>>,
+}
+
+// Only actor-separated cases borrow an outer Runner provider's directory.
+// Its real native entry, not a fabricated endpoint/owner row, admits callbacks.
+struct FixtureDirectory {
+    _owned: Option<tempfile::TempDir>,
+    path: PathBuf,
+}
+impl FixtureDirectory {
+    fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 struct NotifyArtifacts {
@@ -64,7 +74,13 @@ impl Fixture {
         let integration_test_guard = integration_test_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let inherited = std::env::var_os("WU_E_OUTER_FIXTURE_ROOT").map(PathBuf::from);
+        let owned = inherited.is_none().then(|| tempfile::tempdir().unwrap());
+        let path = inherited.unwrap_or_else(|| owned.as_ref().unwrap().path().to_path_buf());
+        let dir = FixtureDirectory {
+            _owned: owned,
+            path,
+        };
         let config_home = dir.path().join("xdg-config");
         let data_home = dir.path().join("xdg-data");
         let runtime_dir = dir.path().join("xdg-runtime");
@@ -91,6 +107,66 @@ impl Fixture {
             models_dir,
             completion_authorities: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    fn run_under_outer_owner(&self, node: &str) -> bool {
+        if !cfg!(target_os = "linux") {
+            return false;
+        }
+        if std::env::var_os("WU_E_OUTER_FIXTURE_ROOT").is_some() {
+            assert!(std::env::var_os("OULIPOLY_COMPLETION_ENDPOINT").is_some());
+            let mut missing = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+            missing.args(["-m", "pty-outer", "must not launch"]);
+            missing.env_remove("OULIPOLY_COMPLETION_ENDPOINT");
+            let refused = self.run(missing);
+            assert!(!refused.status.success(), "{refused:?}");
+            assert!(
+                String::from_utf8_lossy(&refused.stderr)
+                    .contains("ancestor has no inherited completion owner"),
+                "{refused:?}"
+            );
+            println!("genuine outer entry: managed ancestor without inherited endpoint refused");
+            return false;
+        }
+        let script = self.dir.path().join("pty-outer.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n{} --exact {} --nocapture > {} 2>&1\nrc=$?\ncat {}\nexit $rc\n",
+                shell_single_quote(&path_string(&std::env::current_exe().unwrap())),
+                node,
+                shell_single_quote(&path_string(&self.dir.path().join("inner-result.log"))),
+                shell_single_quote(&path_string(&self.dir.path().join("inner-result.log")))
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        self.write_interactive_model("pty-outer", "pty-outer-provider", &script);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        command
+            .args(["-m", "pty-outer", "--models-dir"])
+            .arg(&self.models_dir)
+            .arg("run admitted PTY fixture")
+            .env("WU_E_OUTER_FIXTURE_ROOT", self.dir.path())
+            .current_dir(self.dir.path());
+        let output = self.run(command);
+        println!(
+            "outer fixture stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if !output.status.success() {
+            println!(
+                "failed inner fixture output: {}",
+                fs::read_to_string(self.dir.path().join("inner-result.log")).unwrap_or_default()
+            );
+        }
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "{output:?}"
+        );
+        true
     }
 
     fn sidecar_path(&self) -> PathBuf {
@@ -269,48 +345,6 @@ impl Fixture {
             log,
             rc: rc_path,
         }
-    }
-
-    fn record_owner_identity(&self, identity: &ProcessIdentity) {
-        let state = StateDb::open(&self.state_path()).unwrap();
-        let started = state
-            .start_invocation_with_completion_registration_authority(&InvocationStart {
-                invocation_uuid: INVOCATION_A.to_string(),
-                model_name: "fixture-model".to_string(),
-                provider_name: "fixture-provider".to_string(),
-                provider_index: 0,
-                parent_invocation_id: None,
-            })
-            .unwrap();
-        let invocation_id = started.invocation_row_id;
-        self.completion_authorities.lock().unwrap().insert(
-            INVOCATION_A.to_string(),
-            started.completion_registration_authority,
-        );
-        state
-            .bind_invocation_provider_session_start(
-                oulipoly_state::InvocationMutationAuthority::Standalone,
-                invocation_id,
-                &ProviderSessionBinding {
-                    provider_session_id: SESSION_A.to_string(),
-                    capture_method: "fixture",
-                    resume_input_id: None,
-                    provider_session_resolved_account: None,
-                },
-            )
-            .unwrap();
-        let sidecar = PidIdentityDb::open(&self.sidecar_path()).unwrap();
-        sidecar
-            .record_identity(PidIdentityRecord {
-                identity,
-                os_pgid: None,
-                invocation_uuid: INVOCATION_A,
-                session_id: Some(SESSION_A),
-                provider_name: Some("fixture-provider"),
-                model_name: Some("fixture-model"),
-                recorded_at: "2026-06-04T12:00:00Z",
-            })
-            .unwrap();
     }
 
     fn mark_live_pty_runtime(&self, identity: &ProcessIdentity, control_path: &Path) {
@@ -556,81 +590,109 @@ fn completion_registration_authority_requires_owner_association() {
     let _ = fixture.completion_authority_for_owner("unassociated-owner");
 }
 
+// Callback admission/materialization and automatic transport have separate
+// witnesses. Historical callback-owned busy/spawned diagnostics are not outcomes.
 #[test]
-fn notify_control_ack_immediately_delivers_without_provider_observation() {
+fn paused_callback_then_automatic_exact_ack_without_provider_observation() {
     let fixture = Fixture::new();
-    let identity = current_identity();
-    fixture.record_owner_identity(&identity);
-    let socket = fixture.socket_path("ack.sock");
-    let captured = Arc::new(Mutex::new(String::new()));
-    let server =
-        spawn_confirming_control_server(&socket, fixture.sidecar_path(), Arc::clone(&captured));
-    fixture.mark_live_pty_runtime(&identity, &socket);
-
-    let output = fixture.run_notify("h-live-ack", owner_metadata(SESSION_A, INVOCATION_A));
-    server.join().unwrap();
-
-    assert_success(&output);
-    let value = stdout_json(&output);
-    assert_eq!(value["status"], "triggered");
-    assert_eq!(value["pty_delivery"]["status"], "acked");
-    assert_eq!(value["pty_delivery"]["submitted"], true);
-    assert_eq!(value["pty_delivery"]["delivered_seqs"], json!([1]));
-    assert!(value["wake"].is_null());
-    let payload = captured.lock().unwrap().clone();
-    assert!(payload.contains("[OULIPOLY NOTIFICATIONS]"));
-    assert!(payload.contains("handle: h-live-ack"));
-    assert!(!payload.contains("log for h-live-ack"));
-    let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
-    assert!(
-        trace.contains("trigger=completion-event"),
-        "trace was {trace}"
-    );
-    assert!(trace.contains("decision=inject"), "trace was {trace}");
-    assert!(trace.contains("inject_status=acked"), "trace was {trace}");
-
-    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
+    if fixture.run_under_outer_owner(
+        "paused_callback_then_automatic_exact_ack_without_provider_observation",
+    ) {
+        return;
+    }
+    let mut live = AutomaticTransportFixture::start(&fixture);
+    live.register_paused(&fixture, "h-live-ack");
+    fixture
+        .mailbox()
+        .set_notifications_paused(SESSION_A, false)
+        .unwrap();
+    let trace = wait_for_automatic_transport(&fixture, "acked");
+    assert!(trace.contains("submitted=true"), "{trace}");
+    assert!(trace.contains("delivered_count=1"), "{trace}");
+    let received = live.received();
+    let attempt_id = delivery_attempt_id(&received);
+    let mailbox = fixture.mailbox();
+    let rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_some());
     assert_eq!(
         rows[0].delivered_by_invocation_uuid.as_deref(),
-        Some(INVOCATION_A)
+        Some(live.invocation.as_str())
     );
     assert_eq!(rows[0].delivery_attempts, 1);
-    assert!(
-        fixture
-            .mailbox()
-            .list_pending(SESSION_A)
-            .unwrap()
-            .is_empty()
-    );
-    let attempt_id = delivery_attempt_id(&payload);
-    let attempt = fixture
-        .mailbox()
+    assert!(mailbox.list_pending(SESSION_A).unwrap().is_empty());
+    let attempt = mailbox
         .delivery_attempt_window(&attempt_id)
         .unwrap()
         .unwrap();
+    assert!(attempt.submission_started_at.is_some());
     assert!(attempt.acknowledged_at.is_some());
-    let resolved_at: Option<String> = Connection::open(fixture.sidecar_path())
-        .unwrap()
-        .query_row(
-            "SELECT resolved_at FROM mailbox_delivery_attempts WHERE attempt_id = ?1",
-            params![attempt_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(resolved_at.is_some());
-    let listeners = fixture
-        .mailbox()
-        .completion_event_listeners("h-live-ack")
-        .unwrap();
+    assert!(attempt.resolved_at.is_some());
+    let listeners = mailbox.completion_event_listeners("h-live-ack").unwrap();
     assert_eq!(listeners.len(), 1);
+    assert_eq!(listeners[0].session_id, SESSION_A);
+    assert_eq!(listeners[0].owner_invocation_uuid, live.invocation);
     assert!(listeners[0].acknowledged_at.is_some());
     assert_eq!(
         listeners[0].acknowledgement_reason.as_deref(),
         Some("injected")
     );
     assert!(
+        mailbox
+            .pending_delivery_evidence_obligations(SESSION_A)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &attempt_id),
+        (1, 1)
+    );
+    assert!(received.contains("handle: h-live-ack"));
+    assert!(!received.contains("log for h-live-ack"));
+    // No ingest_turn/turn source supplies this transport receipt.
+    println!("exact ACK actual automatic actor: {trace}");
+    live.finish(&fixture, Some("h-live-ack"));
+}
+
+#[test]
+fn paused_callback_then_automatic_exact_ack_evidence_debt_reconciles_once() {
+    let fixture = Fixture::new();
+    if fixture.run_under_outer_owner(
+        "paused_callback_then_automatic_exact_ack_evidence_debt_reconciles_once",
+    ) {
+        return;
+    }
+    let mut live = AutomaticTransportFixture::start(&fixture);
+    let fault = fixture.conn();
+    fault.execute_batch("CREATE TRIGGER fail_pty_evidence_insert BEFORE INSERT ON session_delivery_evidence BEGIN SELECT RAISE(FAIL, 'injected evidence failure'); END;").unwrap();
+    live.register_paused(&fixture, "h-evidence-insert-fault");
+    fixture
+        .mailbox()
+        .set_notifications_paused(SESSION_A, false)
+        .unwrap();
+    let trace = wait_for_automatic_transport(&fixture, "evidence_pending");
+    assert!(trace.contains("submitted=true"), "{trace}");
+    assert!(trace.contains("delivered_count=1"), "{trace}");
+    let received = live.received();
+    let attempt_id = delivery_attempt_id(&received);
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &attempt_id),
+        (0, 0)
+    );
+    assert_delivered_with_pending_evidence(&fixture, "h-evidence-insert-fault", &attempt_id);
+    // Pause bounds new selection, not reconciliation. Fault keeps the debt real
+    // until this observation; removing it permits either real recovery actor.
+    fixture
+        .mailbox()
+        .set_notifications_paused(SESSION_A, true)
+        .unwrap();
+    fault
+        .execute_batch("DROP TRIGGER fail_pty_evidence_insert")
+        .unwrap();
+    let mut recovery = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+    recovery.args(["session", "pause-handshake", SESSION_A, "--ttl-ms", "0"]);
+    assert_success(&fixture.run(recovery));
+    assert!(
         fixture
             .mailbox()
             .pending_delivery_evidence_obligations(SESSION_A)
@@ -641,144 +703,115 @@ fn notify_control_ack_immediately_delivers_without_provider_observation() {
         state_delivery_evidence_counts(&fixture, &attempt_id),
         (1, 1)
     );
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn exact_ack_state_evidence_insert_fault_stays_submitted_and_reconciles_once() {
-    let fixture = Fixture::new();
-    let identity = current_identity();
-    fixture.record_owner_identity(&identity);
-    let socket = fixture.socket_path("evidence-insert-fault.sock");
-    let captured = Arc::new(Mutex::new(String::new()));
-    let server =
-        spawn_confirming_control_server(&socket, fixture.sidecar_path(), Arc::clone(&captured));
-    fixture.mark_live_pty_runtime(&identity, &socket);
-    let fault = fixture.conn();
-    fault
-        .execute_batch(
-            "CREATE TRIGGER fail_pty_evidence_insert
-             BEFORE INSERT ON session_delivery_evidence
-             BEGIN SELECT RAISE(FAIL, 'injected evidence failure'); END;",
-        )
-        .unwrap();
-
-    let output = fixture.run_notify(
-        "h-evidence-insert-fault",
-        owner_metadata(SESSION_A, INVOCATION_A),
-    );
-    server.join().unwrap();
-
-    assert_success(&output);
-    let value = stdout_json(&output);
-    assert_eq!(value["pty_delivery"]["status"], "evidence_pending");
-    assert_eq!(value["pty_delivery"]["submitted"], true);
-    assert_eq!(value["pty_delivery"]["delivered_seqs"], json!([1]));
-    let payload = captured.lock().unwrap().clone();
-    let attempt_id = delivery_attempt_id(&payload);
-    assert_eq!(
-        state_delivery_evidence_counts(&fixture, &attempt_id),
-        (0, 0)
-    );
-    assert_delivered_with_pending_evidence(&fixture, "h-evidence-insert-fault", &attempt_id);
-    fault
-        .execute_batch("DROP TRIGGER fail_pty_evidence_insert")
-        .unwrap();
-
     let replay = fixture.run_notify(
-        "h-evidence-reconcile-trigger",
-        owner_metadata(SESSION_A, INVOCATION_A),
+        "h-evidence-insert-fault",
+        owner_metadata(SESSION_A, &live.invocation),
     );
     assert_success(&replay);
-    assert_eq!(
-        fixture
-            .mailbox()
-            .pending_delivery_evidence_obligations(SESSION_A)
-            .unwrap(),
-        Vec::new()
-    );
     assert_eq!(
         state_delivery_evidence_counts(&fixture, &attempt_id),
         (1, 1)
     );
-    assert_eq!(payload.matches("[END OULIPOLY NOTIFICATIONS]").count(), 1);
+    assert_eq!(
+        fixture
+            .mailbox()
+            .list_mailbox(SESSION_A, true)
+            .unwrap()
+            .len(),
+        1
+    );
+    println!("actual automatic debt before real recovery: {trace}");
+    live.finish(&fixture, Some("h-evidence-insert-fault"));
 }
 
 #[test]
-fn notify_live_pty_generic_ack_is_not_delivery_evidence() {
+fn paused_callback_then_automatic_generic_ack_is_not_delivery_evidence() {
     let fixture = Fixture::new();
-    let identity = current_identity();
-    fixture.record_owner_identity(&identity);
-    let socket = fixture.socket_path("generic-ack.sock");
-    let captured = Arc::new(Mutex::new(String::new()));
-    let server = spawn_control_server(&socket, true, "ok", Arc::clone(&captured));
-    fixture.mark_live_pty_runtime(&identity, &socket);
-
-    let output = fixture.run_notify("h-generic-ack", owner_metadata(SESSION_A, INVOCATION_A));
-    server.join().unwrap();
-
-    assert_success(&output);
-    let value = stdout_json(&output);
-    assert_eq!(value["pty_delivery"]["status"], "unconfirmed_ack");
-    assert_eq!(value["pty_delivery"]["submitted"], false);
-    assert_eq!(value["pty_delivery"]["delivered_seqs"], json!([]));
-    assert_eq!(value["wake"]["status"], "busy");
+    if fixture.run_under_outer_owner(
+        "paused_callback_then_automatic_generic_ack_is_not_delivery_evidence",
+    ) {
+        return;
+    }
+    let mut live = AutomaticTransportFixture::start(&fixture);
+    let server = live.response_proxy(&fixture, TransportResponse::Generic);
+    live.register_paused(&fixture, "h-generic-ack");
+    fixture
+        .mailbox()
+        .set_notifications_paused(SESSION_A, false)
+        .unwrap();
+    let payload = server.join().unwrap();
+    let trace = wait_for_automatic_transport(&fixture, "unconfirmed_ack");
+    assert!(trace.contains("submitted=false"), "{trace}");
+    assert!(trace.contains("delivered_count=0"), "{trace}");
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_none());
     assert_eq!(rows[0].delivery_attempts, 1);
+    let attempt_id = delivery_attempt_id(&payload);
+    let attempt = fixture
+        .mailbox()
+        .delivery_attempt_window(&attempt_id)
+        .unwrap()
+        .unwrap();
+    assert!(attempt.submission_started_at.is_none());
+    assert!(attempt.acknowledged_at.is_none());
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &attempt_id),
+        (0, 0)
+    );
     let generation = fixture
         .mailbox()
         .runtime_lifecycle_reader()
-        .runtime_generation(&RuntimeGenerationId::parse(LIVE_INVOCATION).unwrap())
+        .runtime_generation(&running_generation_id(&fixture))
         .unwrap()
         .unwrap();
     assert!(generation.active_delivery_claim_id.is_none());
+    live.assert_listener_pending(&fixture, "h-generic-ack");
+    println!("generic response actual automatic actor (fixture re-pauses repeats): {trace}");
+    live.restore_control();
+    live.finish(&fixture, None);
 }
 
 #[test]
-fn unexpected_positive_ack_after_submission_start_remains_uncertain_without_wake() {
+fn paused_callback_then_automatic_unexpected_positive_retains_possible_submission() {
     let fixture = Fixture::new();
-    let identity = current_identity();
-    fixture.record_owner_identity(&identity);
-    let socket = fixture.socket_path("started-generic-ack.sock");
-    let captured = Arc::new(Mutex::new(String::new()));
-    let server = spawn_submission_started_control_server(
-        &socket,
-        fixture.sidecar_path(),
-        "ok",
-        Arc::clone(&captured),
-    );
-    fixture.mark_live_pty_runtime(&identity, &socket);
-
-    let output = fixture.run_notify(
-        "h-started-generic-ack",
-        owner_metadata(SESSION_A, INVOCATION_A),
-    );
-    server.join().unwrap();
-
-    assert_success(&output);
-    let value = stdout_json(&output);
-    assert_eq!(value["pty_delivery"]["status"], "submission_uncertain");
-    assert_eq!(value["pty_delivery"]["submitted"], true);
-    assert_eq!(value["pty_delivery"]["delivered_seqs"], json!([]));
-    assert!(value["wake"].is_null());
-    let payload = captured.lock().unwrap().clone();
+    if fixture.run_under_outer_owner(
+        "paused_callback_then_automatic_unexpected_positive_retains_possible_submission",
+    ) {
+        return;
+    }
+    let mut live = AutomaticTransportFixture::start(&fixture);
+    let fault = Connection::open(fixture.sidecar_path()).unwrap();
+    fault.execute_batch("CREATE TRIGGER fail_broker_confirmation BEFORE UPDATE OF acknowledged_at ON mailbox_delivery_attempts BEGIN SELECT RAISE(FAIL, 'injected confirmation failure'); END;").unwrap();
+    let server = live.response_proxy(&fixture, TransportResponse::GenericAfterRealSubmission);
+    live.register_paused(&fixture, "h-started-generic-ack");
+    fixture
+        .mailbox()
+        .set_notifications_paused(SESSION_A, false)
+        .unwrap();
+    let payload = server.join().unwrap();
+    let trace = wait_for_automatic_transport(&fixture, "submission_uncertain");
+    assert!(trace.contains("submitted=true"), "{trace}");
+    assert!(trace.contains("delivered_count=0"), "{trace}");
     let attempt_id = delivery_attempt_id(&payload);
-    let mailbox = fixture.mailbox();
-    let rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
+    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_none());
     assert_eq!(rows[0].delivery_attempts, 0);
-    let attempt = mailbox
+    let attempt = fixture
+        .mailbox()
         .delivery_attempt_window(&attempt_id)
         .unwrap()
         .unwrap();
     assert!(attempt.submission_started_at.is_some());
     assert!(attempt.acknowledged_at.is_none());
     assert!(attempt.resolved_at.is_none());
-    assert!({
-        drop(mailbox);
+    live.assert_listener_pending(&fixture, "h-started-generic-ack");
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &attempt_id),
+        (0, 0)
+    );
+    assert!(
         fixture
             .mailbox()
             .register_or_reuse_delivery_attempt(
@@ -787,76 +820,118 @@ fn unexpected_positive_ack_after_submission_start_remains_uncertain_without_wake
                 "replacement-invocation",
                 "replacement-generation",
                 &[rows[0].seq],
-                0,
+                0
             )
             .unwrap_err()
             .contains(&attempt_id)
-    });
+    );
+    fault
+        .execute_batch("DROP TRIGGER fail_broker_confirmation")
+        .unwrap();
+    live.restore_control();
+    // Unlike the response-shaping pause, this is genuine non-replay protection:
+    // permit selection again and execute a fresh callback against the retained
+    // possible submission, then fence provider input through the real broker.
+    fixture
+        .mailbox()
+        .set_notifications_paused(SESSION_A, false)
+        .unwrap();
+    let retry = fixture.run_notify(
+        "h-started-newer",
+        owner_metadata(SESSION_A, &live.invocation),
+    );
+    assert_success(&retry);
+    let diagnostic = stdout_json(&retry);
+    assert_eq!(diagnostic["pty_delivery"]["status"], "submission_uncertain");
+    assert_eq!(diagnostic["pty_delivery"]["submitted"], true);
+    assert!(diagnostic["wake"].is_null());
+    assert_eq!(unresolved_delivery_attempt_count(&fixture), 1);
+    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.delivered_at.is_none()));
+    println!("unexpected positive after real broker submission, actual automatic actor: {trace}");
+    live.finish(&fixture, Some("h-started-generic-ack"));
+    let received = fs::read_to_string(&live.received_log).unwrap();
+    assert!(!received.contains("handle: h-started-newer"));
 }
 
 #[test]
-fn notify_live_pty_nack_leaves_pending_and_reports_busy_wake() {
+fn paused_callback_then_automatic_nack_leaves_listener_pending() {
     let fixture = Fixture::new();
-    let identity = current_identity();
-    fixture.record_owner_identity(&identity);
-    let socket = fixture.socket_path("nack.sock");
-    let captured = Arc::new(Mutex::new(String::new()));
-    let server = spawn_control_server(&socket, false, "broker_rejected", Arc::clone(&captured));
-    fixture.mark_live_pty_runtime(&identity, &socket);
-
-    let output = fixture.run_notify("h-nack", owner_metadata(SESSION_A, INVOCATION_A));
-    server.join().unwrap();
-
-    assert_success(&output);
-    let value = stdout_json(&output);
-    assert_eq!(value["pty_delivery"]["status"], "protocol_error");
-    assert_eq!(value["pty_delivery"]["submitted"], false);
-    assert_eq!(value["wake"]["status"], "busy");
-    let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
-    assert!(
-        trace.contains("decision=skip-protocol_error"),
-        "trace was {trace}"
-    );
-    assert!(
-        trace.contains("inject_status=protocol_error"),
-        "trace was {trace}"
-    );
+    if fixture.run_under_outer_owner("paused_callback_then_automatic_nack_leaves_listener_pending")
+    {
+        return;
+    }
+    let mut live = AutomaticTransportFixture::start(&fixture);
+    let server = live.response_proxy(&fixture, TransportResponse::Nack);
+    live.register_paused(&fixture, "h-nack");
+    fixture
+        .mailbox()
+        .set_notifications_paused(SESSION_A, false)
+        .unwrap();
+    let payload = server.join().unwrap();
+    assert!(payload.contains("handle: h-nack"));
+    let trace = wait_for_automatic_transport(&fixture, "protocol_error");
+    assert!(trace.contains("submitted=false"), "{trace}");
+    assert!(trace.contains("decision=skip-protocol_error"), "{trace}");
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_none());
     assert_eq!(unresolved_delivery_attempt_count(&fixture), 0);
-    assert!(captured.lock().unwrap().contains("h-nack"));
-    let listeners = fixture
-        .mailbox()
-        .completion_event_listeners("h-nack")
-        .unwrap();
-    assert_eq!(listeners.len(), 1);
-    assert!(listeners[0].acknowledged_at.is_none());
-    fixture.assert_default_user_paths_untouched();
+    live.assert_listener_pending(&fixture, "h-nack");
+    println!("NACK actual automatic actor (fixture re-pauses repeats): {trace}");
+    live.restore_control();
+    live.finish(&fixture, None);
 }
 
 #[test]
-fn notify_stale_socket_cleans_runtime_and_does_not_report_busy() {
+fn paused_callback_then_automatic_stale_runtime_cleanup_preserves_pending() {
     let fixture = Fixture::new();
-    let owner_identity = current_identity();
-    fixture.record_owner_identity(&owner_identity);
-    let stale_identity = ProcessIdentity {
-        os_pid: 9_999_999,
-        os_boot_id: "stale-boot".to_string(),
-        os_pid_starttime_ticks: 1,
-    };
-    let stale_socket = fixture.socket_path("stale.sock");
-    fs::write(&stale_socket, "stale").unwrap();
-    fixture.mark_live_pty_runtime(&stale_identity, &stale_socket);
-    fixture.mark_generation_creator_stale();
-
-    let output = fixture.run_notify("h-stale", owner_metadata(SESSION_A, INVOCATION_A));
-
-    assert_success(&output);
-    let value = stdout_json(&output);
-    assert_eq!(value["pty_delivery"]["status"], "stale_generation");
-    assert_eq!(value["pty_delivery"]["submitted"], false);
-    assert_eq!(value["wake"]["status"], "spawned");
+    if fixture.run_under_outer_owner(
+        "paused_callback_then_automatic_stale_runtime_cleanup_preserves_pending",
+    ) {
+        return;
+    }
+    let mut live = AutomaticTransportFixture::start(&fixture);
+    live.register_paused(&fixture, "h-stale");
+    // Crash the actual private creator and exact provider, without manufacturing
+    // lifecycle rows or drain evidence. Pause only selection while this happens.
+    live.repl.child.kill().unwrap();
+    let crashed = live.repl.child.wait().unwrap();
+    assert!(!crashed.success());
+    let provider = live.repl.provider.as_ref().unwrap();
+    if read_live_process_identity(provider.os_pid)
+        .unwrap()
+        .as_ref()
+        == Some(provider)
+    {
+        assert_eq!(
+            unsafe { libc::kill(provider.os_pid as i32, libc::SIGKILL) },
+            0
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while read_live_process_identity(provider.os_pid)
+        .unwrap()
+        .as_ref()
+        == Some(provider)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "exact crashed provider still live"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        live.control.exists(),
+        "crash did not leave the intended stale socket"
+    );
+    fixture
+        .mailbox()
+        .set_notifications_paused(SESSION_A, false)
+        .unwrap();
+    let trace = wait_for_automatic_transport(&fixture, "connect_error");
+    assert!(trace.contains("submitted=false"), "{trace}");
     let projection = fixture
         .mailbox()
         .wake_session_reader()
@@ -865,20 +940,15 @@ fn notify_stale_socket_cleans_runtime_and_does_not_report_busy() {
         .unwrap();
     assert_eq!(projection.run_state, "idle");
     assert!(projection.pty_control_path.is_none());
-    assert!(!stale_socket.exists());
+    assert!(!live.control.exists());
     assert_eq!(unresolved_delivery_attempt_count(&fixture), 0);
     let rows = fixture.mailbox().list_pending(SESSION_A).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].handle, "h-stale");
     assert_eq!(rows[0].delivery_attempts, 0);
-    let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
-    assert!(
-        trace.contains("decision=skip-connect_error"),
-        "trace was {trace}"
-    );
-    assert!(
-        trace.contains("inject_status=connect_error"),
-        "trace was {trace}"
+    live.assert_listener_pending(&fixture, "h-stale");
+    println!(
+        "stale cleanup actual automatic actor after real private crash, no claimed spawn/drain: {trace}"
     );
     fixture.assert_default_user_paths_untouched();
 }
@@ -1344,8 +1414,25 @@ fn production_plain_and_tui_state_faults_reconcile_without_new_mailbox_rows() {
             .execute_batch("DROP TRIGGER fail_production_pty_evidence")
             .unwrap();
 
-        let recovery = fixture.run_mailbox_status(SESSION_A);
+        let inspection = fixture.run_mailbox_status(SESSION_A);
+        assert_success(&inspection);
+        let rows_before = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        command.args(["session", "pause-handshake", SESSION_A, "--ttl-ms", "0"]);
+        let recovery = fixture.run(command);
         assert_success(&recovery);
+        println!(
+            "actual PTY recovery entry: {}",
+            String::from_utf8_lossy(&recovery.stdout)
+        );
+        assert_eq!(
+            fixture
+                .mailbox()
+                .list_mailbox(SESSION_A, true)
+                .unwrap()
+                .len(),
+            rows_before.len()
+        );
         assert!(
             fixture
                 .mailbox()
@@ -1960,6 +2047,13 @@ fn live_broker_rejects_attempt_resolved_before_socket_acceptance() {
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
     let control_path = running_control_path(&fixture);
+    // Manual direct-broker protection: automatic notification selection is paused
+    // before pending work exists. The separate automatic-overlap test below
+    // exercises the independent delivery actors without this isolation.
+    fixture
+        .mailbox()
+        .set_notifications_paused(SESSION_A, true)
+        .unwrap();
     let row = fixture.seed_mailbox("h-resolved-request");
     let mut mailbox = fixture.mailbox();
     mailbox
@@ -2001,9 +2095,20 @@ fn live_broker_rejects_attempt_resolved_before_socket_acceptance() {
             0,
         )
         .unwrap();
+    let before_fresh = fixture
+        .mailbox()
+        .delivery_attempt_window("fresh-after-stale")
+        .unwrap()
+        .unwrap();
+    assert!(before_fresh.resolved_at.is_none());
+    assert!(before_fresh.submission_started_at.is_none());
+    assert_eq!(before_fresh.rows.len(), 1);
+    assert_eq!(before_fresh.rows[0].seq, row.seq);
+    assert_eq!(fs::read_to_string(&received_log).unwrap(), "");
     let fresh = render_mailbox_notification_envelope(&[row], 0, "fresh-after-stale");
     let fresh_response = inject_control_envelope(&control_path, &fresh).unwrap();
     assert!(fresh_response.ack, "{fresh_response:?}");
+    assert_eq!(fresh_response.message, "delivery_ack:fresh-after-stale");
     let fresh_output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
     assert!(fresh_output.contains("GOT_NOTIFY"), "{fresh_output:?}");
     fixture.ingest_turn(
@@ -2014,7 +2119,129 @@ fn live_broker_rejects_attempt_resolved_before_socket_acceptance() {
         "[OULIPOLY-DELIVERY fresh-after-stale]",
     );
     assert!(repl.wait().unwrap().success());
+    let received = fs::read_to_string(&received_log).unwrap();
+    assert_eq!(received.matches("handle: h-resolved-request").count(), 1);
+    assert_eq!(
+        received
+            .matches("[OULIPOLY-DELIVERY fresh-after-stale]")
+            .count(),
+        1
+    );
+    assert!(!received.contains("[OULIPOLY-DELIVERY resolved-before-accept]"));
+    println!(
+        "manual broker: paused automatic selection; original 250ms negative and exact fresh ACK/input reached"
+    );
     fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn automatic_broker_confirmation_resolves_overlap_without_duplicate_input() {
+    let fixture = Fixture::new();
+    let mut live = AutomaticTransportFixture::start(&fixture);
+    let row = fixture.seed_mailbox("h-automatic-overlap");
+    // A transport proxy observes the real automatic prepared request, registers
+    // overlaps before forwarding it, and relays the real broker's ACK. This
+    // establishes the actual automatic nonce without product driver barriers or
+    // assuming automatic preparation cannot reuse an earlier eligible window.
+    fs::rename(&live.control, &live.held_control).unwrap();
+    let listener = UnixListener::bind(&live.control).unwrap();
+    let sidecar = fixture.sidecar_path();
+    let invocation = live.invocation.clone();
+    let real = live.held_control.clone();
+    let seq = row.seq;
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let payload = read_inject_payload(&mut stream);
+        let attempt_id = delivery_attempt_id(&payload);
+        let mut mailbox = MailboxDb::open(&sidecar).unwrap();
+        let automatic = mailbox
+            .delivery_attempt_window(&attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(automatic.delivery_invocation_uuid, invocation);
+        assert!(automatic.submission_started_at.is_none());
+        for attempt in ["automatic-overlap-old", "automatic-overlap-fresh"] {
+            mailbox
+                .register_delivery_attempt(attempt, SESSION_A, &invocation, &[seq], 0)
+                .unwrap();
+        }
+        drop(mailbox);
+        let actual = inject_control_envelope(path_string(&real), &payload).unwrap();
+        assert!(actual.ack, "{actual:?}");
+        assert_eq!(actual.message, format!("delivery_ack:{attempt_id}"));
+        write_response(&mut stream, actual.ack, &actual.message);
+        attempt_id
+    });
+    fixture
+        .mailbox()
+        .set_notifications_paused(SESSION_A, false)
+        .unwrap();
+    let automatic_attempt = server.join().unwrap();
+    live.restore_control();
+    let trace = wait_for_automatic_transport(&fixture, "acked");
+    let received = live.received();
+    assert_eq!(delivery_attempt_id(&received), automatic_attempt);
+    assert!(
+        !["automatic-overlap-old", "automatic-overlap-fresh"].contains(&automatic_attempt.as_str())
+    );
+    println!("automatic overlap actual transport: {trace}");
+    let mailbox = fixture.mailbox();
+    let confirmation = mailbox
+        .delivery_attempt_window(&automatic_attempt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(confirmation.delivery_invocation_uuid, live.invocation);
+    assert!(confirmation.submission_started_at.is_some());
+    assert!(confirmation.acknowledged_at.is_some());
+    for attempt in ["automatic-overlap-old", "automatic-overlap-fresh"] {
+        let overlap = mailbox.delivery_attempt_window(attempt).unwrap().unwrap();
+        assert!(overlap.resolved_at.is_some());
+        assert!(overlap.submission_started_at.is_none());
+        assert!(overlap.acknowledged_at.is_none());
+        assert!(overlap.rows.is_empty());
+        let resolved_by: String = Connection::open(fixture.sidecar_path()).unwrap().query_row(
+            "SELECT resolved_by_attempt_id FROM mailbox_delivery_attempts WHERE attempt_id = ?1", [attempt], |row| row.get(0)).unwrap();
+        assert_eq!(resolved_by, automatic_attempt);
+        let stale = render_mailbox_notification_envelope(std::slice::from_ref(&row), 0, attempt);
+        let response = inject_control_envelope(path_string(&live.control), &stale).unwrap();
+        assert!(!response.ack, "{response:?}");
+        assert_eq!(response.message, "mailbox_delivery_stale");
+    }
+    let rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].delivered_at.is_some());
+    assert_eq!(
+        rows[0].delivered_by_invocation_uuid.as_deref(),
+        Some(live.invocation.as_str())
+    );
+    assert_eq!(rows[0].delivery_attempts, 1);
+    drop(mailbox);
+    live.finish(&fixture, Some("h-automatic-overlap"));
+    let received = fs::read_to_string(&live.received_log).unwrap();
+    assert!(!received.contains("[OULIPOLY-DELIVERY automatic-overlap-old]"));
+    assert!(!received.contains("[OULIPOLY-DELIVERY automatic-overlap-fresh]"));
+}
+
+// This observes the actual trace actor, never attributes automatic work to the
+// paused callback. Existing runtime retry and independent owner are distinct.
+fn wait_for_automatic_transport(fixture: &Fixture, status: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap_or_default();
+        if let Some(line) = trace.lines().find(|line| {
+            (line.contains("trigger=completion-independent-owner")
+                || line.contains("trigger=live_pty_retry_"))
+                && line.contains(&format!("session_id={SESSION_A} "))
+                && line.contains(&format!("inject_status={status} "))
+        }) {
+            return line.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "automatic {status} not observed: {trace}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[test]
@@ -3184,68 +3411,194 @@ fn wait_for_settlement_trace(
     }
 }
 
-fn spawn_control_server(
-    path: &Path,
-    ack: bool,
-    message: &'static str,
-    captured: Arc<Mutex<String>>,
-) -> thread::JoinHandle<()> {
-    let listener = UnixListener::bind(path).unwrap();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let payload = read_inject_payload(&mut stream);
-        let response_message = if message == "$delivery_nonce" {
-            format!("delivery_ack:{}", delivery_nonce_from_payload(&payload))
-        } else {
-            message.to_string()
-        };
-        *captured.lock().unwrap() = payload;
-        write_response(&mut stream, ack, &response_message);
-    })
+// Transport response shaping never writes submission/ACK/lifecycle rows.
+// Forwarded cases reach the real broker and provider; nonforwarded cases prove
+// absence of input with a later real input fence. Pause only bounds repeats.
+enum TransportResponse {
+    Generic,
+    Nack,
+    GenericAfterRealSubmission,
 }
 
-fn spawn_confirming_control_server(
-    path: &Path,
-    sidecar_path: PathBuf,
-    captured: Arc<Mutex<String>>,
-) -> thread::JoinHandle<()> {
-    let listener = UnixListener::bind(path).unwrap();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let payload = read_inject_payload(&mut stream);
-        let attempt_id = delivery_nonce_from_payload(&payload).to_string();
-        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
-        assert!(
-            mailbox
-                .begin_delivery_attempt_submission(&attempt_id)
-                .unwrap()
-        );
-        assert!(mailbox.confirm_delivery_attempt(&attempt_id).unwrap());
-        *captured.lock().unwrap() = payload;
-        write_response(&mut stream, true, &format!("delivery_ack:{attempt_id}"));
-    })
+struct AutomaticTransportFixture {
+    pty: OuterPty,
+    repl: SettlementChild,
+    lifetime: ProviderLifetime,
+    invocation: String,
+    received_log: PathBuf,
+    control: PathBuf,
+    held_control: PathBuf,
 }
 
-fn spawn_submission_started_control_server(
-    path: &Path,
-    sidecar_path: PathBuf,
-    message: &'static str,
-    captured: Arc<Mutex<String>>,
-) -> thread::JoinHandle<()> {
-    let listener = UnixListener::bind(path).unwrap();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let payload = read_inject_payload(&mut stream);
-        let attempt_id = delivery_nonce_from_payload(&payload).to_string();
-        assert!(
-            MailboxDb::open(&sidecar_path)
-                .unwrap()
-                .begin_delivery_attempt_submission(&attempt_id)
-                .unwrap()
+impl AutomaticTransportFixture {
+    fn start(fixture: &Fixture) -> Self {
+        fixture
+            .mailbox()
+            .set_notifications_paused(SESSION_A, true)
+            .unwrap();
+        let received_log = fixture.dir.path().join("automatic-transport-received.log");
+        let lifetime = ProviderLifetime::new(fixture.dir.path());
+        let script = fixture_provider_with_lifetime(fixture.dir.path(), &received_log, &lifetime);
+        fixture.write_interactive_model("automatic-transport", "fixture-provider", &script);
+        fixture.seed_active_chain(
+            "adadadad-adad-4dad-8dad-adadadadadad",
+            "fixture-provider",
+            SESSION_A,
+            "automatic-transport",
         );
-        *captured.lock().unwrap() = payload;
-        write_response(&mut stream, true, message);
-    })
+        // These response/receipt cases historically used fake control servers,
+        // not TUI rendering. Use the existing plain-PTY mode for real transport;
+        // independent plain/TUI controls retain rendering-path coverage. Keep
+        // the same startup/exit deadlines rather than stretching them.
+        let pty = OuterPty::open(30, 100);
+        let mut repl = SettlementChild::new(spawn_repl_under_pty_mode(
+            fixture,
+            &pty,
+            "automatic-transport",
+            SESSION_A,
+            false,
+        ));
+        let startup = read_until(
+            pty.master.as_raw_fd(),
+            "READY_FOR_NOTIFY",
+            Duration::from_secs(5),
+        );
+        assert!(startup.contains("READY_FOR_NOTIFY"), "{startup:?}");
+        let invocation = wait_for_running_invocation(fixture);
+        fixture.associate_observed_completion_authority(&invocation);
+        repl.provider = Some(wait_for_child_identity(fixture, &invocation));
+        let control = PathBuf::from(running_control_path(fixture));
+        let held_control = control.with_extension("real");
+        Self {
+            pty,
+            repl,
+            lifetime,
+            invocation,
+            received_log,
+            control,
+            held_control,
+        }
+    }
+
+    fn register_paused(&self, fixture: &Fixture, handle: &str) {
+        let output = fixture.run_notify(handle, owner_metadata(SESSION_A, &self.invocation));
+        assert_success(&output);
+        let callback = stdout_json(&output);
+        assert_eq!(callback["status"], "triggered");
+        assert_eq!(callback["pty_delivery"]["status"], "paused");
+        assert_eq!(callback["pty_delivery"]["submitted"], false);
+        assert_eq!(callback["pty_delivery"]["delivered_seqs"], json!([]));
+        assert!(callback["wake"].is_null());
+        self.assert_listener_pending(fixture, handle);
+        let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, SESSION_A);
+        assert_eq!(
+            rows[0].owner_invocation_uuid.as_deref(),
+            Some(self.invocation.as_str())
+        );
+        assert_eq!(rows[0].delivery_attempts, 0);
+        assert!(rows[0].delivered_at.is_none());
+        assert_eq!(fs::read_to_string(&self.received_log).unwrap(), "");
+        println!(
+            "callback actor: genuine registration, exact listener, paused/not-submitted/no wake"
+        );
+    }
+
+    fn assert_listener_pending(&self, fixture: &Fixture, handle: &str) {
+        let listeners = fixture
+            .mailbox()
+            .completion_event_listeners(handle)
+            .unwrap();
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].session_id, SESSION_A);
+        assert_eq!(listeners[0].owner_invocation_uuid, self.invocation);
+        assert_eq!(listeners[0].mailbox_seq, Some(1));
+        assert!(listeners[0].acknowledged_at.is_none());
+    }
+
+    fn received(&self) -> String {
+        read_pty_until_file_occurrences(
+            self.pty.master.as_raw_fd(),
+            &self.received_log,
+            "[END OULIPOLY NOTIFICATIONS]",
+            1,
+            Duration::from_secs(5),
+        )
+    }
+
+    fn response_proxy(
+        &self,
+        fixture: &Fixture,
+        response: TransportResponse,
+    ) -> thread::JoinHandle<String> {
+        fs::rename(&self.control, &self.held_control).unwrap();
+        let listener = UnixListener::bind(&self.control).unwrap();
+        let sidecar = fixture.sidecar_path();
+        let real = self.held_control.clone();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let payload = read_inject_payload(&mut stream);
+            MailboxDb::open(&sidecar)
+                .unwrap()
+                .set_notifications_paused(SESSION_A, true)
+                .unwrap();
+            match response {
+                TransportResponse::Nack => write_response(&mut stream, false, "broker_rejected"),
+                TransportResponse::Generic => write_response(&mut stream, true, "ok"),
+                TransportResponse::GenericAfterRealSubmission => {
+                    let actual = inject_control_envelope(path_string(&real), &payload).unwrap();
+                    assert!(actual.ack, "{actual:?}");
+                    assert_eq!(
+                        actual.message,
+                        format!(
+                            "delivery_submission_uncertain:{}",
+                            delivery_nonce_from_payload(&payload)
+                        )
+                    );
+                    write_response(&mut stream, true, "ok");
+                }
+            }
+            payload
+        })
+    }
+
+    fn restore_control(&self) {
+        fs::remove_file(&self.control).unwrap();
+        fs::rename(&self.held_control, &self.control).unwrap();
+    }
+
+    fn finish(&mut self, fixture: &Fixture, expected_handle: Option<&str>) {
+        let fence = inject_control_envelope(
+            path_string(&self.control),
+            "AUTOMATIC_TRANSPORT_INPUT_FENCE\n",
+        )
+        .unwrap();
+        assert!(fence.ack, "{fence:?}");
+        let received = read_pty_until_file_occurrences(
+            self.pty.master.as_raw_fd(),
+            &self.received_log,
+            "AUTOMATIC_TRANSPORT_INPUT_FENCE",
+            1,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            received.matches("[END OULIPOLY NOTIFICATIONS]").count(),
+            usize::from(expected_handle.is_some())
+        );
+        if let Some(handle) = expected_handle {
+            assert_eq!(received.matches(&format!("handle: {handle}")).count(), 1);
+        }
+        self.lifetime.probe(self.pty.master.as_raw_fd());
+        self.lifetime.release();
+        assert!(
+            self.repl
+                .wait_bounded(self.pty.master.as_raw_fd(), Duration::from_secs(5))
+                .unwrap()
+                .success()
+        );
+        fixture.assert_default_user_paths_untouched();
+    }
 }
 
 fn delivery_nonce_from_payload(payload: &str) -> &str {
@@ -3812,12 +4165,6 @@ fn owner_metadata(session_id: &str, invocation_uuid: &str) -> Value {
         "owner_session_id": session_id,
         "owner_invocation_uuid": invocation_uuid,
     })
-}
-
-fn current_identity() -> ProcessIdentity {
-    read_live_process_identity(i64::from(std::process::id()))
-        .unwrap()
-        .unwrap()
 }
 
 fn stdout_json(output: &Output) -> Value {

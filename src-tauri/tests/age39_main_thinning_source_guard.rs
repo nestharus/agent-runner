@@ -419,15 +419,10 @@ fn age_39_headless_resume_finalization_uses_lifecycle_service_port() {
         "invocation_lifecycle_service",
         "headless resume finalization cut-over",
     );
-    assert_contains(
-        &resume,
-        ".finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,",
-        "headless resume finalization cut-over",
-    );
-    assert_contains(
-        &resume,
-        "InvocationLifecycleFinalizeRequest",
-        "headless resume finalization cut-over",
+    assert_resume_finalization_authority(
+        include_str!("../src/run/resume/lifecycle.rs"),
+        include_str!("../src/run/resume/finalization.rs"),
+        include_str!("../../crates/oulipoly-runtime/src/services/invocation_lifecycle_finalize.rs"),
     );
 }
 
@@ -600,19 +595,178 @@ fn age_39_resume_acceptance_uses_shared_resume_service_record_acceptance() {
 
 #[test]
 fn age_39_returned_artifacts_are_persisted_before_lifecycle_finalization() {
-    for (name, body) in [
-        ("run_resume", compact(resume_slice())),
-        ("run_with_balancing", compact(one_shot_slice())),
+    // Keep the existing one-shot observation; resume now finalizes through a
+    // retained-outcome helper or an atomic confirmed-delivery transaction.
+    let one_shot = compact(one_shot_slice());
+    assert_artifacts_before_finalization(
+        "run_with_balancing",
+        artifact_finalization_positions(&one_shot),
+    );
+    assert_resume_artifact_order(include_str!("../src/run/resume/finalization.rs"));
+    let transaction = compact(source_function(
+        include_str!("../../crates/oulipoly-state/src/db/provider_turn_effects.rs"),
+        "fn apply_provider_turn_effects_transaction(",
+    ));
+    assert_order(
+        &transaction,
+        "Self::insert_returned_artifact_row(",
+        "Self::write_invocation_final_row(",
+        "confirmed delivery persists artifacts before terminal row in the same transaction",
+    );
+    assert_order(
+        &transaction,
+        "Self::write_invocation_final_row(",
+        "tx.commit()",
+        "atomic turn commit",
+    );
+}
+
+// Scope observations to actual functions rather than ordering concatenated files.
+fn source_function<'a>(source: &'a str, signature: &str) -> &'a str {
+    let source = &source[source.find(signature).expect("missing function")..];
+    let start = source.find('{').expect("missing body");
+    let mut depth = 0usize;
+    for (offset, ch) in source[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[..start + offset + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated function")
+}
+
+fn assert_resume_finalization_authority(lifecycle: &str, finalization: &str, retained: &str) {
+    for (source, signature, receiver, row) in [
+        (
+            lifecycle,
+            "fn finalize_resume_spawn_error(",
+            "input.env.state",
+            "attempt.invocation_row_id",
+        ),
+        (
+            finalization,
+            "fn handle_returned_artifacts_persist_failure(",
+            "input.env.state",
+            "input.invocation_row_id",
+        ),
+        (
+            retained,
+            "fn finalize_retained_outcome_with_contention_retry(",
+            "state",
+            "invocation_row_id",
+        ),
     ] {
-        assert_contains(&body, "record_returned_artifacts(", name);
-        assert_contains(&body, "invocation_lifecycle_service", name);
+        let body = compact(source_function(source, signature));
         assert_contains(
             &body,
-            ".finalize_invocation(oulipoly_state::InvocationMutationAuthority::Standalone,",
-            name,
+            &format!(
+                ".finalize_invocation({receiver}.invocation_mutation_scope({row}).authority(),"
+            ),
+            signature,
         );
-        assert_artifacts_before_finalization(name, artifact_finalization_positions(&body));
+        assert_not_contains(&body, "InvocationMutationAuthority::Standalone", signature);
+        assert_not_contains(&body, "state.finalize_invocation(", signature);
     }
+    let regular = compact(source_function(
+        finalization,
+        "fn finalize_regular_completed_attempt(",
+    ));
+    assert_contains(
+        &regular,
+        "finalize_retained_outcome_with_contention_retry(input.agent_runtime_services.invocation_lifecycle_service.as_ref(),",
+        "normal resume uses lifecycle port",
+    );
+    let confirmed = compact(source_function(
+        finalization,
+        "fn finalize_confirmed_delivery(",
+    ));
+    assert_contains(
+        &confirmed,
+        "state.apply_provider_turn_effects(state.invocation_mutation_scope(invocation_row_id).authority(),",
+        "confirmed delivery uses actual invocation authority",
+    );
+}
+
+fn assert_resume_artifact_order(source: &str) {
+    let completed = compact(source_function(source, "fn finalize_completed_attempt("));
+    assert_order(
+        &completed,
+        "persist_returned_artifacts(&input)",
+        "finalize_regular_completed_attempt(",
+        "resume artifact-before-normal-finalization",
+    );
+    assert_contains(
+        &completed,
+        "ifinput.confirmed_delivery.is_none()",
+        "atomic delivery branch selection",
+    );
+    let artifacts = compact(source_function(source, "fn persist_returned_artifacts("));
+    assert_contains(
+        &artifacts,
+        ".record_returned_artifacts(input.env.state.invocation_mutation_scope(input.invocation_row_id).authority(),input.invocation_row_id,&input.result.returned_artifacts,)",
+        "persist actual returned artifacts with actual authority",
+    );
+    let regular = compact(source_function(
+        source,
+        "fn finalize_regular_completed_attempt(",
+    ));
+    assert_contains(
+        &regular,
+        "ifletSome(settlement)=input.confirmed_delivery",
+        "confirmed delivery branch",
+    );
+    assert_contains(
+        &regular,
+        "finalize_confirmed_delivery(",
+        "confirmed delivery transaction route",
+    );
+    let confirmed = compact(source_function(source, "fn finalize_confirmed_delivery("));
+    assert_contains(
+        &confirmed,
+        "returned_artifacts:&result.returned_artifacts,",
+        "atomic returned artifacts",
+    );
+}
+
+#[test]
+fn resume_finalization_guards_reject_standalone_and_late_artifacts() {
+    let lifecycle = include_str!("../src/run/resume/lifecycle.rs");
+    let finalization = include_str!("../src/run/resume/finalization.rs");
+    let retained =
+        include_str!("../../crates/oulipoly-runtime/src/services/invocation_lifecycle_finalize.rs");
+    let wrong = compact(retained).replace(
+        "state.invocation_mutation_scope(invocation_row_id).authority()",
+        "oulipoly_state::InvocationMutationAuthority::Standalone",
+    );
+    // Keep the signature readable for the scoped reader.
+    let wrong = wrong.replace(
+        "pubfnfinalize_retained_outcome_with_contention_retry(",
+        "pub fn finalize_retained_outcome_with_contention_retry(",
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_resume_finalization_authority(
+            lifecycle,
+            finalization,
+            &wrong
+        ))
+        .is_err()
+    );
+    let missing = finalization.replace(
+        "persist_returned_artifacts(&input)",
+        "missing_artifact_persistence(&input)",
+    );
+    assert!(std::panic::catch_unwind(|| assert_resume_artifact_order(&missing)).is_err());
+    let late = missing.replace(
+        "if success {",
+        "persist_returned_artifacts(&input); if success {",
+    );
+    assert!(std::panic::catch_unwind(|| assert_resume_artifact_order(&late)).is_err());
 }
 
 fn artifact_finalization_positions(body: &str) -> (Option<usize>, Option<usize>) {

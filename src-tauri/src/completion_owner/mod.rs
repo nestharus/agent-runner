@@ -13,11 +13,54 @@ pub(crate) mod test_support;
 
 pub(crate) const ENDPOINT_ENV: &str = "OULIPOLY_COMPLETION_ENDPOINT";
 
-pub(crate) fn bootstrap(cli: &crate::usage::cli::Cli) -> Result<(), String> {
+/// Preserve the State open source at entry; unrelated owner/path text is operational.
+#[derive(Debug)]
+pub(crate) enum BootstrapError {
+    State(oulipoly_state::WritableOpenError),
+    Operational(String),
+}
+
+impl BootstrapError {
+    pub(crate) fn is_schema_refusal(&self) -> bool {
+        matches!(self, Self::State(error) if error.is_schema_refusal())
+    }
+}
+
+impl std::fmt::Display for BootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::State(error) => std::fmt::Display::fmt(error, f),
+            Self::Operational(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for BootstrapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::State(error) => Some(error),
+            Self::Operational(_) => None,
+        }
+    }
+}
+
+impl From<String> for BootstrapError {
+    fn from(message: String) -> Self {
+        Self::Operational(message)
+    }
+}
+
+impl From<&str> for BootstrapError {
+    fn from(message: &str) -> Self {
+        Self::Operational(message.to_owned())
+    }
+}
+
+pub(crate) fn bootstrap(cli: &crate::usage::cli::Cli) -> Result<(), BootstrapError> {
     if !requires_service(cli) {
         return Ok(());
     }
-    bootstrap_service()
+    bootstrap_entry_service()
 }
 
 // Process-entry boundary, before runtime threads or recovery. Database opens,
@@ -63,6 +106,10 @@ pub(crate) fn startup_wake_reclaim_sweep_enabled(cli: &crate::usage::cli::Cli) -
 /// Acquire an independent service lease at a supported process-entry boundary.
 /// Inspection and ACK callers must not bootstrap a recovery service.
 pub fn bootstrap_service() -> Result<(), String> {
+    bootstrap_entry_service().map_err(|error| error.to_string())
+}
+
+fn bootstrap_entry_service() -> Result<(), BootstrapError> {
     #[cfg(target_os = "linux")]
     {
         linux::bootstrap()

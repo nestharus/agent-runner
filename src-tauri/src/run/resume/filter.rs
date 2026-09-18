@@ -8,13 +8,10 @@ pub(super) fn first_attempt_manual_migrate(
 }
 
 pub(super) fn resumed_session_target<'a>(
-    manual_migrate: Option<&str>,
-    session_id: &'a str,
+    _manual_migrate: Option<&str>,
+    _session_id: &'a str,
     active_session_id: &'a str,
 ) -> &'a str {
-    if manual_migrate.is_some() {
-        session_id
-    } else {
-        active_session_id
-    }
+    // The original resume input can identify a closed segment after rotation.
+    active_session_id
 }

@@ -71,6 +71,7 @@ use crate::usage::cli::{
 use crate::{commands, run, usage, wiring};
 
 mod clock;
+mod entry;
 mod formatter;
 mod parent_invocation;
 mod parser;
@@ -79,6 +80,7 @@ mod predicate;
 mod usage_context;
 
 pub(crate) use clock::utc_now;
+pub(crate) use entry::{entry_bootstrap_error, preflight_entry, validate_owned_entry};
 pub(crate) use formatter::format_timestamp_rfc3339;
 pub(crate) use parent_invocation::resolve_parent_invocation_id;
 pub(crate) use parser::provider_session_marker_uuid;

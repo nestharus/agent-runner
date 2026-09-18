@@ -1544,7 +1544,7 @@ fn native_supplement_only_public_settlement_checks_action_time_not_retention_tim
         .unwrap();
     assert_eq!(
         db.settle_cancel(&lease.owner, &custody).unwrap_err(),
-        "completion_authority_contention: timed out acquiring PID mailbox SQLite writer: database is locked"
+        "completion_authority_contention: PID mailbox SQLite writer unavailable without waiting: database is locked"
     );
     assert_eq!(native_history(&db), history);
     sidecar.execute_batch("ROLLBACK").unwrap();
@@ -1695,7 +1695,7 @@ fn native_fresh_successor_revalidates_old_certification_but_allocated_replay_is_
         .unwrap();
     assert_eq!(
         allocate().unwrap_err(),
-        "completion_authority_contention: timed out acquiring PID mailbox SQLite writer: database is locked"
+        "completion_authority_contention: PID mailbox SQLite writer unavailable without waiting: database is locked"
     );
     assert_eq!(native_history(&db), history);
     sidecar.execute_batch("ROLLBACK").unwrap();

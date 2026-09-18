@@ -3043,3 +3043,167 @@ fn native_unknown_pending_target_retains_work_without_activation() {
     f.gate("release-initial-provider");
     f.wait_initial(&mut initial);
 }
+
+// Selected first-postfork outcome: no incarnation is known in the driver yet,
+// but its actual child, endpoint and unsent grant must survive a returning read
+// error. The preload selects one real /proc read; it supplies no receipt/history.
+#[test]
+fn native_first_parent_identity_failure_retains_preexec_original_birth() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    let shim = f.root.path().join("identity-read-fail.c");
+    fs::write(&shim, include_str!("identity-read-fail.c")).unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror", "-o"])
+            .arg(f.root.path().join("identity-read-fail.so"))
+            .arg(&shim)
+            .arg("-ldl")
+            .status()
+            .unwrap()
+            .success()
+    );
+    f.gate("adopter-before-exec.hold");
+    f.gate("original-adopter-before-identity.hold");
+    f.gate("original-adopter-identity-failed.hold");
+    let owner = start_pre_attachment(&f);
+    let adopter = process_identity(reached(&f, "adopter-before-exec"));
+    assert_eq!(parent(adopter.pid), owner.driver_identity.pid);
+    assert_eq!(
+        reached(&f, "original-adopter-before-identity"),
+        owner.driver_identity.pid
+    );
+    let a = attempt(&f);
+    let request_path = PathBuf::from(&a.result_path).with_file_name("custodian-request.json");
+    let request = fs::read(&request_path).unwrap();
+    let result =
+        PathBuf::from(&a.result_path).with_file_name("unreleased-announcement-result.json");
+    fs::create_dir(&result).unwrap(); // actual publication obstruction after identity restores
+    let arm = f.root.path().join("identity-read-target");
+    fs::write(
+        &arm,
+        format!("{} {}", owner.driver_identity.pid, adopter.pid),
+    )
+    .unwrap();
+    remove_hold(&f, "original-adopter-before-identity");
+    assert_eq!(
+        reached(&f, "original-adopter-identity-failed"),
+        owner.driver_identity.pid
+    );
+    let errors = fs::read_to_string(f.root.path().join("identity-read-errors")).unwrap();
+    assert_eq!(errors.lines().count(), 1);
+    println!("first original parent read failed before any AC: {errors}");
+    kill_exact(&adopter); // identified fixture-created preexec child only
+    wait_task_state(&adopter, "Z");
+    assert!(
+        fs::read_to_string(format!(
+            "/proc/{}/task/{}/children",
+            adopter.pid, adopter.pid
+        ))
+        .unwrap()
+        .trim()
+        .is_empty()
+    );
+    assert!(
+        !f.root
+            .path()
+            .join("adopter-before-ac-fork.reached")
+            .exists()
+    );
+    f.gate("driver-replay.hold");
+    remove_hold(&f, "original-adopter-identity-failed");
+    assert_eq!(reached(&f, "driver-replay"), owner.driver_identity.pid);
+    // An actual retry plus generic reaping pass occurred while lookup still
+    // fails. Neither wait consumption nor an inferred receipt is permitted.
+    let errors = fs::read_to_string(f.root.path().join("identity-read-errors")).unwrap();
+    assert!(errors.lines().count() >= 2);
+    wait_task_state(&adopter, "Z");
+    assert_eq!(process_identity(adopter.pid), adopter);
+    assert_unresolved(&f, &a);
+    assert!(
+        !PathBuf::from(&a.result_path)
+            .with_file_name("never-forked.json")
+            .exists()
+    );
+    assert_eq!(fs::read(&request_path).unwrap(), request);
+    fs::remove_file(&arm).unwrap();
+    remove_hold(&f, "driver-replay");
+    let unpublished = wait(|| {
+        fs::read_dir(result.parent()?)
+            .ok()?
+            .filter_map(Result::ok)
+            .find_map(|entry| {
+                if !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("unreleased-announcement-result.tmp-")
+                {
+                    return None;
+                }
+                serde_json::from_slice::<serde_json::Value>(&fs::read(entry.path()).ok()?).ok()
+            })
+    });
+    assert_eq!(
+        unpublished["adopter"],
+        serde_json::to_value(&adopter).unwrap()
+    );
+    assert_eq!(
+        unpublished["driver"],
+        serde_json::to_value(&owner.driver_identity).unwrap()
+    );
+    assert_eq!(unpublished["attempt_id"], a.attempt_id);
+    assert_eq!(unpublished["observation"], "waitid_wnowait");
+    assert_eq!(unpublished["si_code"], libc::CLD_KILLED);
+    assert_eq!(unpublished["si_status"], libc::SIGKILL);
+    assert_eq!(unpublished["original_ac_fork_gate"]["admitted"], false);
+    assert_eq!(unpublished["announcement"], "eof_before_identity");
+    assert_eq!(unpublished["execution_grant"], "not_sent");
+    // This different process possesses actual producer bytes, but not the
+    // original's authority. Readback is not permission to integrate its receipt.
+    assert!(
+        f.mailbox()
+            .record_continuation_unreleased_before_announcement(&a, &unpublished.to_string())
+            .is_err()
+    );
+    assert_unresolved(&f, &a);
+    wait_task_state(&adopter, "Z");
+    fs::remove_dir(&result).unwrap();
+    let receipt = wait_drained_attempt(&f, &a);
+    assert_eq!(receipt["gate"], "unreleased_announcement_eof");
+    assert_eq!(
+        receipt["driver"],
+        serde_json::to_value(&owner.driver_identity).unwrap()
+    );
+    let reason: serde_json::Value =
+        serde_json::from_str(receipt["reason"].as_str().unwrap()).unwrap();
+    assert_eq!(reason, unpublished);
+    let retained = f.sidecar_connection().query_row(
+        "SELECT attempt_id,owner_generation,operation,request_sha256,source_registration_id,source_listener_revision,session_id,claim_token,result_path FROM completion_continuation_attempt WHERE attempt_id=?1",
+        [&a.attempt_id], |row| Ok(ContinuationAttempt {
+            attempt_id: row.get(0)?, owner_generation: row.get(1)?, operation: row.get(2)?,
+            request_sha256: row.get(3)?, source_registration_id: row.get(4)?,
+            source_listener_revision: row.get(5)?, session_id: row.get(6)?,
+            claim_token: row.get(7)?, result_path: row.get(8)?,
+        }),
+    ).unwrap();
+    assert_eq!(retained, a);
+    assert_eq!(fs::read(&request_path).unwrap(), request);
+    assert!(current_identity_matches(&owner.driver_identity));
+    assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+    // Settlement removes this exact original claim, not all future session
+    // work. The continuing driver may already reserve a distinct activation.
+    let original_claims: i64 = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT COUNT(*) FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
+            rusqlite::params![a.session_id, a.claim_token],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(original_claims, 0);
+    println!(
+        "retained first-fork original after identity and storage restoration; exact private SIGKILL intervention, actual original-only EOF/WNOWAIT receipt={receipt}"
+    );
+}

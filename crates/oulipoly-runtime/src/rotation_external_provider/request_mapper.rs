@@ -2,7 +2,7 @@
 //! mapper, formatter
 
 use super::{ExternalRotationError, ExternalRotationIdentity, error_formatter};
-use crate::provider_registry::DescribeHostOptions;
+use crate::provider_registry::{DescribeHostOptions, ProviderRegistry};
 use crate::services::MigrationServiceRequest;
 use oulipoly_provider::generated::{
     CONTRACT_VERSION, HostContext, JsonObject, MigrationObject, RequestEnvelope, RotationObject,
@@ -15,15 +15,35 @@ pub(super) fn rotation_request(
     request: &MigrationServiceRequest<'_>,
     host_options: &DescribeHostOptions,
     operation: &str,
+    registry: &ProviderRegistry,
 ) -> Result<Value, ExternalRotationError> {
+    let mut fields = request_fields(identity, request, operation);
+    let source_settings_id = registry
+        .account_settings_id(&identity.source_provider)
+        .map_err(|error| error_formatter::malformed_external_identity(error.to_string()))?;
+    fields.insert(
+        "source_settings_id".into(),
+        Value::String(source_settings_id.into()),
+    );
+    let snapshot = request
+        .state
+        .active_chain_segment_snapshot(&request.resolved.chain_id)
+        .map_err(error_formatter::host_apply_conflict)?
+        .ok_or_else(|| error_formatter::host_apply_conflict("active source segment is missing"))?;
+    fields.insert(
+        "source_ended_at".into(),
+        Value::String(
+            snapshot
+                .latest_turn_at
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+        ),
+    );
     serialize_request(RequestEnvelope {
         contract: CONTRACT_VERSION.to_string(),
         request_id: format!("s7c-{operation}"),
         provider_instance_id: identity.provider_instance_id.clone(),
         host: host_context(request, host_options),
-        params: RotationObject {
-            fields: request_fields(identity, request, operation),
-        },
+        params: RotationObject { fields },
     })
 }
 

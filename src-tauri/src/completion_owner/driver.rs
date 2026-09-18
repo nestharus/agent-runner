@@ -1,12 +1,20 @@
 //! The driver scans committed State obligations even when no sidecar source row
 //! exists. Blocking recovery executes in separately retained/reaped custodians.
+use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{CompletionDomainOwner, ContinuationAttempt, MailboxDb};
-use oulipoly_state::{InvocationMutationAuthority, StateDb};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> Result<(), String> {
+    let result = run_owned(path, owner, election);
+    // Preserve the original failure, but not at the price of discarding its
+    // uniquely capable witness. Only evidence integration continues on this cut.
+    super::custody::finish_original_testimony();
+    result
+}
+
+fn run_owned(path: &Path, owner: &CompletionDomainOwner, election: i32) -> Result<(), String> {
     // Establish adoption before any attempt can fork. CG loss can promote this
     // exact driver while it retains its already-owned descendants.
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
@@ -29,13 +37,11 @@ pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> 
         oulipoly_state::completion_continuation::age360_fault_barrier("driver-replay");
         for attempt in MailboxDb::open(path)?.pending_continuation_attempts()? {
             let _ = super::custody::replay_result(path, &attempt);
-            // No concurrent source spawn runs in this driver. A still-reserved
-            // source request therefore failed before acceptance; retry its exact
-            // revocation if the first State write also failed. SQL rejects every
-            // accepted/possibly launched or predecessor-owned attempt.
-            if attempt.operation == "source_recovery" {
-                let _ = MailboxDb::open(path)?.revoke_unaccepted_continuation_attempt(&attempt);
-            }
+            // Source and activation preparation are synchronous in this driver.
+            // On the next outer pass, any still-reserved request failed before
+            // acceptance. Retry exact revocation, including its activation claim.
+            // SQL rejects accepted/possibly launched and predecessor-owned debt.
+            let _ = MailboxDb::open(path)?.revoke_unaccepted_continuation_attempt(&attempt);
         }
         let mut state = StateDb::open_default()?;
         // Runtime/channel receipts come from the original allocated executor;
@@ -58,23 +64,11 @@ pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> 
                 }
             }
         }
-        let obligations = state.admitted_completion_continuations()?;
+        // One validated ledger scan supplies original-source membership for
+        // all late-listener repairs, avoiding N additional decodes per listener.
+        let obligations = state.repair_domain_completion_continuations(&owner.domain_id)?;
         for binding in obligations {
             let source = binding.registration()?;
-            if source.domain_id != owner.domain_id {
-                continue;
-            }
-            // Exact-authority repair is deliberately before any source file read:
-            // losing the registration worker after State commit cannot hide it.
-            if state
-                .repair_admitted_completion_continuation(
-                    InvocationMutationAuthority::Standalone,
-                    &binding,
-                )
-                .is_err()
-            {
-                continue;
-            }
             let already_accepted = MailboxDb::open(path)?
                 .completion_continuation_acceptance(&source.registration_id)?
                 .is_some_and(|v| v["phase"] == "accepted");
@@ -82,8 +76,12 @@ pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> 
                 continue;
             }
             let snapshot = Path::new(&source.handle_dir).join(&source.snapshot_relative);
-            let accepted =
-                crate::commands::notify_continuation::accept(&binding, &snapshot).is_ok();
+            // The complete admitted ledger was decoded above, including hidden
+            // siblings. An absent snapshot cannot be accepted; avoid another
+            // full admission scan only on this already-validated driver lane.
+            // Presence is a hint, never acceptance or workload replay authority.
+            let accepted = snapshot.is_file()
+                && crate::commands::notify_continuation::accept(&binding, &snapshot).is_ok();
             if accepted {
                 continue;
             }

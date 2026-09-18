@@ -1176,14 +1176,25 @@ impl CompletionAuthorityFence<'_> {
 
 impl MailboxAuthorityFence {
     pub(crate) fn acquire(path: &Path) -> Result<Self, MailboxAuthorityFenceError> {
-        Self::acquire_with_mode(path, false)
+        Self::acquire_with_mode(path, false, None)
     }
 
     pub(crate) fn acquire_exclusive(path: &Path) -> Result<Self, MailboxAuthorityFenceError> {
-        Self::acquire_with_mode(path, true)
+        Self::acquire_with_mode(path, true, None)
     }
 
-    fn acquire_with_mode(path: &Path, exclusive: bool) -> Result<Self, MailboxAuthorityFenceError> {
+    /// State is already reserved by these callers. Never sleep on another
+    /// authority while excluding unrelated State writers; failure unwinds the
+    /// uncommitted transaction, not an already committed projection obligation.
+    pub(crate) fn try_acquire(path: &Path) -> Result<Self, MailboxAuthorityFenceError> {
+        Self::acquire_with_mode(path, false, Some(StdDuration::ZERO))
+    }
+
+    fn acquire_with_mode(
+        path: &Path,
+        exclusive: bool,
+        timeout: Option<StdDuration>,
+    ) -> Result<Self, MailboxAuthorityFenceError> {
         const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(10);
         #[cfg(not(test))]
         const ACQUISITION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
@@ -1250,7 +1261,8 @@ impl MailboxAuthorityFence {
                 ),
             });
         }
-        let deadline = Instant::now() + ACQUISITION_TIMEOUT;
+        let timeout = timeout.unwrap_or(ACQUISITION_TIMEOUT);
+        let deadline = Instant::now() + timeout;
         loop {
             let lock_result = if exclusive {
                 <std::fs::File as fs4::FileExt>::try_lock(&file)
@@ -1299,7 +1311,7 @@ impl MailboxAuthorityFence {
                 Err(fs4::TryLockError::WouldBlock) => {
                     return Err(MailboxAuthorityFenceError::Timeout {
                         path: authority_path,
-                        timeout: ACQUISITION_TIMEOUT,
+                        timeout,
                     });
                 }
                 Err(error) => return Err(MailboxAuthorityFenceError::Lock(error)),
@@ -1437,6 +1449,36 @@ impl MailboxDb {
         })
     }
 
+    /// Cross-store initialization has the same schema/identity checks as ordinary
+    /// open, but cannot wait on a sidecar writer while State is reserved.
+    pub(crate) fn open_for_state_authority(
+        authority: &MailboxAuthorityFence,
+    ) -> Result<Self, String> {
+        let path = authority.path();
+        let mut conn = Connection::open(path).map_err(|e| e.to_string())?;
+        authority.validate_opened_target()?;
+        configure_writable_sidecar_connection(&conn)?;
+        conn.busy_timeout(StdDuration::ZERO)
+            .map_err(|e| e.to_string())?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            .map_err(|e| {
+                if sqlite_error_is_contention(&e) {
+                    format!(
+                        "completion_authority_contention: sidecar initialization unavailable: {e}"
+                    )
+                } else {
+                    format!("Failed to initialize PID mailbox sidecar: {e}")
+                }
+            })?;
+        schema::ensure_without_wait(&mut conn)?;
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+            _read_only_snapshot: None,
+            _namespace_authority: None,
+        })
+    }
+
     /// Physically nonmutating detached recovery observation. Recoverable WAL
     /// bytes can precede live SQLite publication; this is not native authority.
     pub fn open_read_only(path: &Path) -> Result<Self, String> {
@@ -1507,15 +1549,18 @@ impl MailboxDb {
     pub(crate) fn begin_completion_authority_fence(
         &mut self,
     ) -> Result<CompletionAuthorityFence<'_>, String> {
-        // A write transaction excludes sidecar writers between authority validation and the
-        // state commit. This deliberately accepts writer contention to close that TOCTOU window.
+        // Preserve State -> sidecar authority through commit, without spending
+        // the sidecar's ordinary wait budget inside the State reservation.
+        self.conn
+            .busy_timeout(StdDuration::ZERO)
+            .map_err(|e| e.to_string())?;
         self.conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map(|tx| CompletionAuthorityFence { tx })
             .map_err(|err| {
                 if sqlite_error_is_contention(&err) {
                     format!(
-                        "completion_authority_contention: timed out acquiring PID mailbox SQLite writer: {err}"
+                        "completion_authority_contention: PID mailbox SQLite writer unavailable without waiting: {err}"
                     )
                 } else {
                     format!("Failed to fence PID mailbox sidecar authority: {err}")
@@ -5806,12 +5851,20 @@ impl WakeSessionRepository<'_> {
         Ok(changed > 0)
     }
 
-    /// Observe and (only for exact releasable legacy claims) release under one
-    /// writer. Native custody is never cancelled by a synchronous command.
+    /// Observe without a writer; recheck and release exact releasable legacy
+    /// claims under a writer. Native custody is never cancelled by this command.
     pub fn coordinate_manual_resume(
         &mut self,
         session: &str,
     ) -> Result<ManualWakeCoordination, String> {
+        // A live coherent read is only a wait/release hint, not launch authority.
+        // Drop it before acquiring a writer: never upgrade a read transaction.
+        let read = self.conn.transaction().map_err(|e| e.to_string())?;
+        let observation = manual_resume_observation_on(&read, session)?;
+        drop(read);
+        if let Some(observation) = observation {
+            return Ok(observation);
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -10899,6 +10952,29 @@ struct ManualNativeCustodyRow {
     driver: Option<String>,
 }
 
+/// None means a legacy release may be useful; it must be rechecked under
+/// Immediate. Some is observation only; admission/launch retain their fences.
+fn manual_resume_observation_on(
+    conn: &rusqlite::Transaction<'_>,
+    session: &str,
+) -> Result<Option<ManualWakeCoordination>, String> {
+    if let Some(observation) = manual_native_custody_on(conn, session)? {
+        return Ok(Some(observation));
+    }
+    let Some(claim) = wake_claim_tx(conn, session)? else {
+        return Ok(Some(ManualWakeCoordination::Absent));
+    };
+    if wake_claim_is_releasable_for_manual_resume(conn, &claim)? {
+        return Ok(None);
+    }
+    let observation = if wake_claim_has_persisted_process_identity(conn, &claim)? {
+        ManualWakeCoordination::LegacyLiveBusy
+    } else {
+        ManualWakeCoordination::UnknownCustody
+    };
+    Ok(Some(observation))
+}
+
 fn manual_native_custody_on(
     conn: &Connection,
     session: &str,
@@ -12115,6 +12191,10 @@ fn now_unix_millis() -> Result<i64, String> {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "mailbox/starting_recovery_tests.rs"]
 mod starting_recovery_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/fixture_process.rs"]
+mod fixture_process;
 
 #[cfg(test)]
 mod tests {
@@ -17804,6 +17884,9 @@ mod tests {
 
     #[test]
     fn auto_wake_keeps_owner_separate_from_running_invocation() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);
@@ -18310,6 +18393,9 @@ mod tests {
 
     #[test]
     fn wake_idle_pending_acquires_claim() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);
@@ -18421,6 +18507,9 @@ mod tests {
 
     #[test]
     fn wake_startable_claim_does_not_apply_a_retry_budget() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);
@@ -18471,6 +18560,9 @@ mod tests {
 
     #[test]
     fn wake_claim_count_persists_on_session_runtime_after_claim_release() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);
@@ -18520,6 +18612,9 @@ mod tests {
 
     #[test]
     fn wake_claim_release_requires_the_exact_current_token() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);
@@ -18565,6 +18660,9 @@ mod tests {
 
     #[test]
     fn admitted_wake_child_blocks_manual_claim_release() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);
@@ -18801,6 +18899,9 @@ mod tests {
 
     #[test]
     fn wake_child_validation_rejects_claim_when_runtime_authority_is_busy() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);
@@ -18868,6 +18969,9 @@ mod tests {
 
     #[test]
     fn wake_claim_ignores_legacy_runtime_projection_after_v2() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);
@@ -18919,6 +19023,9 @@ mod tests {
 
     #[test]
     fn wake_existing_claim_is_single_flight() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);
@@ -18957,6 +19064,9 @@ mod tests {
 
     #[test]
     fn concurrent_wake_claim_attempts_have_one_exact_token_winner() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
@@ -19017,6 +19127,9 @@ mod tests {
 
     #[test]
     fn wake_stale_claim_can_be_stolen() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);
@@ -19063,6 +19176,9 @@ mod tests {
 
     #[test]
     fn wake_dead_pid_claim_can_be_stolen_before_ttl() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         install_wake_owner(&mut db);

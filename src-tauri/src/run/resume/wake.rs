@@ -189,7 +189,18 @@ pub(super) fn bind_headless_resume_delivery_attempt(
         input.mailbox_delivery_seqs,
         invocation_uuid,
     )?;
-    if !input.mailbox_delivery_seqs.is_empty() {
+    // Native allocation is not a session binding. Its launch-event lifecycle
+    // publishes State authority before attaching the runtime/session metadata.
+    // Publishing this UUID here would replace the last valid parent even when
+    // the anchor fails before any provider launch. Legacy resumes are already
+    // bound by bind_resume_attempt_session and still need this projection.
+    if !input.mailbox_delivery_seqs.is_empty()
+        && !input
+            .agent_runtime_services
+            .provider_registry_handle
+            .current()
+            .has_account_endpoint(&provider.name)
+    {
         let mut db = MailboxDb::open_default_if_exists()?
             .ok_or("mailbox missing while retaining receipt route")?;
         db.wake_sessions().upsert_session_metadata(

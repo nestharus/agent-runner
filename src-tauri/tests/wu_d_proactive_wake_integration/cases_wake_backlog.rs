@@ -22,6 +22,7 @@ pub(crate) fn wake_sweep_retries_twice_unconfirmed_oldest_with_newer_mailbox() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script("", "", "oldest-after-unconfirmed.txt"));
+    fixture.establish_recovery_parent(SESSION);
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-unconfirmed-old");
@@ -29,7 +30,7 @@ pub(crate) fn wake_sweep_retries_twice_unconfirmed_oldest_with_newer_mailbox() {
     fixture.mark_mailbox_unconfirmed_twice(SESSION, "h-unconfirmed-old");
     seed_dead_wake_claim(&fixture, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", 601);
 
-    let output = fixture.run_mailbox_list(SESSION);
+    let output = fixture.run_startup_recovery(SESSION);
     assert_success(&output);
 
     let prompt = wait_for_file(&fixture.prompt_file("oldest-after-unconfirmed.txt"));
@@ -58,6 +59,7 @@ pub(crate) fn wake_sweep_retries_twice_unconfirmed_oldest_with_newer_mailbox() {
         &fixture,
         old.delivered_by_invocation_uuid.as_deref().unwrap(),
     );
+    fixture.assert_recovery_drained(SESSION);
     assert_xdg_isolated(&fixture);
 }
 
@@ -70,6 +72,8 @@ pub(crate) fn wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_deb
         "backlog-any.txt",
     ));
 
+    fixture.establish_recovery_parent("11111111-1111-4111-8111-000000000001");
+    fixture.establish_recovery_parent("11111111-1111-4111-8111-000000000002");
     let dead_sessions = fixture.seed_dead_owner_backlog();
 
     let idle_session = "11111111-1111-4111-8111-000000000001";
@@ -92,7 +96,7 @@ pub(crate) fn wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_deb
         None,
     );
 
-    let output = fixture.run_mailbox_list(recent_session);
+    let output = fixture.run_startup_recovery(recent_session);
     assert_success(&output);
 
     let idle_prompt = wait_for_file(&fixture.prompt_file(&format!("backlog-{idle_session}.txt")));
@@ -147,6 +151,8 @@ pub(crate) fn wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_deb
                 .is_some()
         );
     }
+    fixture.assert_recovery_drained(idle_session);
+    fixture.assert_recovery_drained(recent_session);
     assert_xdg_isolated(&fixture);
 }
 
@@ -155,6 +161,7 @@ pub(crate) fn wake_sweep_eventually_reaches_startable_session_between_paused_edg
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script("", "", "middle-session.txt"));
 
+    fixture.establish_recovery_parent("11111111-1111-4111-8111-000000000129");
     seed_paused_sessions(&fixture, "old", 0..128);
 
     let middle_session = "11111111-1111-4111-8111-000000000129";
@@ -170,7 +177,7 @@ pub(crate) fn wake_sweep_eventually_reaches_startable_session_between_paused_edg
     seed_paused_sessions(&fixture, "new", 130..258);
 
     for _ in 0..3 {
-        let output = fixture.run_mailbox_list(middle_session);
+        let output = fixture.run_startup_recovery(middle_session);
         assert_success(&output);
     }
 
@@ -179,6 +186,7 @@ pub(crate) fn wake_sweep_eventually_reaches_startable_session_between_paused_edg
     wait_until("middle backlog session delivered", || {
         delivered_rows_without_pending_or_claim(&fixture, middle_session, 1)
     });
+    fixture.assert_recovery_drained(middle_session);
     assert_xdg_isolated(&fixture);
 }
 

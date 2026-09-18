@@ -63,7 +63,7 @@ impl PreparedHeadlessResumeExecution {
     }
 }
 
-pub(super) fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
+pub(crate) fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
     match validator::validate_resume_input(session_id) {
         Ok(()) => None,
         Err(message) => {

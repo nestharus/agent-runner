@@ -13,6 +13,7 @@ pub(crate) struct UsageRow {
     pub vendor: String,
     pub windows: Vec<UsageWindow>,
     pub row_state: RowState,
+    pub cache_warning: Option<String>,
 }
 
 #[derive(Clone, Debug)]

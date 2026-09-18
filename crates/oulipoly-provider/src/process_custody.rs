@@ -1077,7 +1077,7 @@ mod receipt_group_observation_tests {
         std::fs::create_dir(&root).unwrap();
         let denied = root.join("denied");
         std::fs::write(&denied, b"unreadable observation, not a custody fact").unwrap();
-        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
         let owned = named_group();
         let unrelated = named_group();
         let unrelated_path = format!("/proc/{}/stat", unrelated.0.id());

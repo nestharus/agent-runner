@@ -335,6 +335,10 @@ fn run_resume_attempt(
     } else {
         Some(crate::native_receipt::start_headless_receipt_polling()?)
     };
+    // Crossing into execution ends the known-pre-execution fallback. Later
+    // errors must use their actual result/custody paths, not infer non-submission
+    // from a guard drop. Explicit authority rejection may retain its owner anew.
+    bound_attempt.attempt.guard.retain_rejected_launch(None);
     let execution = if let Some(allocation) = bound_attempt.attempt.allocation.clone() {
         execution::execute_allocated_resume_attempt(
             &input,

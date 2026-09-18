@@ -169,11 +169,15 @@ fn start_resume_invocation<'state>(
             .state
             .activate_attempt(&lease, &allocation.completion_authority)?;
         let row = lease.owner.invocation_row_id;
+        let mut guard = FinalizerGuard::new(&input.env.state, row);
+        // Until executor handoff, this launcher knows no provider work has begun
+        // and still owns this exact allocation's logical settlement obligation.
+        guard.retain_rejected_launch(Some(&lease.owner));
         return Ok(ResumeInvocationAttempt {
             invocation,
             invocation_row_id: row,
             completion_registration_authority: allocation.completion_authority.clone(),
-            guard: FinalizerGuard::new(&input.env.state, row),
+            guard,
             allocation: Some(oulipoly_runtime::executor::AllocatedProviderLaunchAttempt {
                 lease,
                 completion_authority: allocation.completion_authority,

@@ -39,15 +39,15 @@ impl StateDb {
         provider_name: &str,
         windows: &[QuotaWindowInput],
     ) -> Result<(), String> {
+        // Acquire the writer before reading any learning/cache baseline. All
+        // accessors below use this same connection and therefore this transaction.
+        // Provider execution remains outside this persistence-only operation.
+        let tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(Self::format_refresh_begin_error)?;
         let now = Self::quota_refresh_timestamp(Utc::now());
-
         let prior = self.get_quota(provider_name)?;
         let prior_windows = self.get_windows(provider_name)?;
-
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(Self::format_refresh_begin_error)?;
 
         if windows.is_empty() {
             return Self::record_empty_quota_refresh(tx, provider_name, &now, &prior_windows);
@@ -217,3 +217,7 @@ impl StateDb {
             .max(windows.len()) as i64
     }
 }
+
+#[cfg(test)]
+#[path = "provider_quota_refresh_tests.rs"]
+mod tests;

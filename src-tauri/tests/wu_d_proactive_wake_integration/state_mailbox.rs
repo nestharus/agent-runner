@@ -210,12 +210,16 @@ impl Fixture {
         model_name: &str,
     ) {
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
+        let previous = db
+            .wake_session_reader()
+            .session_metadata(session_id)
+            .unwrap();
         let models_dir = path_string(&self.models_dir);
         db.wake_sessions()
             .upsert_session_metadata(SessionMetadataUpsert {
                 session_id,
                 mode: "headless",
-                invocation_uuid: None,
+                invocation_uuid: previous.as_ref().and_then(|r| r.invocation_uuid.as_deref()),
                 provider_name: Some(provider_name),
                 model_name: Some(model_name),
                 models_dir: Some(&models_dir),
@@ -226,11 +230,15 @@ impl Fixture {
 
     pub(crate) fn seed_idle_runtime_without_models_dir(&self, session_id: &str) {
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
+        let previous = db
+            .wake_session_reader()
+            .session_metadata(session_id)
+            .unwrap();
         db.wake_sessions()
             .upsert_session_metadata(SessionMetadataUpsert {
                 session_id,
                 mode: "headless",
-                invocation_uuid: None,
+                invocation_uuid: previous.as_ref().and_then(|r| r.invocation_uuid.as_deref()),
                 provider_name: Some(PROVIDER),
                 model_name: Some(MODEL),
                 models_dir: None,
@@ -241,12 +249,19 @@ impl Fixture {
 
     pub(crate) fn seed_idle_runtime_with_wake_count(&self, session_id: &str, auto_wake_count: i64) {
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
+        let previous = db
+            .wake_session_reader()
+            .session_metadata(session_id)
+            .unwrap();
         let models_dir = path_string(&self.models_dir);
         db.wake_sessions()
             .upsert_session_metadata(SessionMetadataUpsert {
                 session_id,
                 mode: "headless",
-                invocation_uuid: Some(INVOCATION),
+                invocation_uuid: previous
+                    .as_ref()
+                    .and_then(|r| r.invocation_uuid.as_deref())
+                    .or(Some(INVOCATION)),
                 provider_name: Some(PROVIDER),
                 model_name: Some(MODEL),
                 models_dir: Some(&models_dir),
@@ -377,7 +392,14 @@ impl Fixture {
         claim_token: &str,
         mailbox_age_seconds: Option<i64>,
     ) {
-        self.seed_active_chain_for(chain_id, PROVIDER, session_id, MODEL);
+        // A genuine initial launch already created the recipient's lineage.
+        // Do not add a competing historical chain for that same native session.
+        let exists: bool = self.state().connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_chain_segments WHERE provider_name=?1 AND session_id=?2)",
+            rusqlite::params![PROVIDER, session_id], |row| row.get(0)).unwrap();
+        if !exists {
+            self.seed_active_chain_for(chain_id, PROVIDER, session_id, MODEL);
+        }
         self.seed_session_turn_for(PROVIDER, session_id, turn_id);
         self.seed_idle_runtime_for(session_id, PROVIDER, MODEL);
         self.seed_mailbox(session_id, handle);

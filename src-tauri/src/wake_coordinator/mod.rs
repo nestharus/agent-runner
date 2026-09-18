@@ -73,6 +73,10 @@ pub(crate) fn mark_terminal_attempt_idle_and_recheck(
     turn_recheck::mark_terminal_attempt_idle_and_recheck(session_id, invocation_uuid, exit_code)
 }
 
+pub(crate) fn reject_auto_wake_entry(session_id: &str, endpoint_hint_present: bool) -> Option<i32> {
+    wake_claim::reject_auto_wake_entry(session_id, endpoint_hint_present)
+}
+
 pub(crate) fn validate_auto_wake_child(session_id: &str) -> Result<Option<i32>, String> {
     wake_claim::validate_auto_wake_child(session_id)
 }

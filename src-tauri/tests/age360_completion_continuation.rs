@@ -1046,6 +1046,37 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
         .expect("actual retained activation");
     let (phase,custodian,launcher,generation):(String,String,String,String)=f.sidecar_connection().query_row("SELECT phase,custodian_identity,launcher_identity,runtime_generation_uuid FROM completion_continuation_attempt WHERE attempt_id=?1",[&attempt.attempt_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
     assert!(matches!(phase.as_str(), "starting" | "running"));
+    let binding_invocation = if owner_loss == 0 && channel.is_none() {
+        // AGE123 binding witness: the driver-created generation identifies the
+        // actual resumed invocation. A chain alias is not a provider session.
+        let invocation: String = f
+            .sidecar_connection()
+            .query_row(
+                "SELECT spawn_invocation_uuid FROM runtime_generation WHERE generation_uuid=?1",
+                [&generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let state = rusqlite::Connection::open_with_flags(
+            f.data.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let binding: (String, String, String) = state.query_row(
+            "SELECT provider_name, provider_session_id, resume_input_id FROM invocations WHERE invocation_uuid=?1",
+            [&invocation], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert_eq!(binding, (PROVIDER.into(), SESSION.into(), SESSION.into()));
+        assert_ne!(owner.driver_identity.pid, i64::from(std::process::id()));
+        assert_ne!(owner.guardian_identity.pid, i64::from(std::process::id()));
+        println!(
+            "native binding invocation={invocation} provider={} concrete_session={} resume_input={}",
+            binding.0, binding.1, binding.2
+        );
+        Some(invocation)
+    } else {
+        None
+    };
+
     assert!(read_live_process_identity(descendant).unwrap().is_some());
     println!(
         "ACK before drain owner={} attempt={} custodian={custodian} launcher={launcher} generation={generation} descendant={descendant}",
@@ -1369,6 +1400,30 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
     assert_eq!(receipt.0, "drained");
     assert_eq!(receipt.1, 1);
     assert!(receipt.2.contains("ECHILD"));
+    if let Some(invocation) = binding_invocation {
+        let state = rusqlite::Connection::open_with_flags(
+            f.data.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let outcome: (String, bool, i64) = state
+            .query_row(
+                "SELECT status, success, exit_code FROM invocations WHERE invocation_uuid=?1",
+                [&invocation],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            (
+                oulipoly_state::InvocationStatus::Succeeded.as_str().into(),
+                true,
+                0
+            )
+        );
+        println!("native bound invocation={invocation} final outcome={outcome:?}");
+    }
+
     if channel == Some("wait_storage_failure") {
         let ac: oulipoly_state::completion_continuation::SourceProcessIdentity =
             serde_json::from_str(&custodian).unwrap();
