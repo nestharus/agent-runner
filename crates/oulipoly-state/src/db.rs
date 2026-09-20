@@ -88,6 +88,8 @@ macro_rules! invocation_returned_artifacts_schema_sql {
     };
 }
 
+mod completed_turns;
+pub use completed_turns::*;
 mod accounts;
 mod chain_backfill;
 mod chain_segments_compaction;
@@ -123,6 +125,7 @@ mod owned_turn_event_read;
 mod owned_turn_event_write;
 mod ownership_authority;
 mod provider_launch_lifecycle;
+mod provider_launch_publication;
 mod provider_quota_reads;
 mod provider_quota_refresh;
 mod provider_quota_status;
@@ -187,7 +190,7 @@ pub use self::invocation_records::{
 pub use self::invocation_schema_legacy_migration::LegacyProviderNames;
 use self::invocation_schema_table::{LegacyInvocationInsert, LegacyInvocationRow};
 use self::lifecycle_invocation_row::LifecycleInvocationRow;
-pub use self::opening_write::StateReadConnection;
+pub use self::opening_write::{StateReadConnection, WritableOpenError};
 pub use self::owned_turn_event_write::{OwnedTurnEvent, OwnedTurnEventRow};
 use self::ownership_authority::{
     CompletionAuthoritySummary, CompletionMaterializationExpectation,
@@ -271,6 +274,8 @@ use std::sync::Mutex;
 use uuid::Uuid;
 
 pub struct StateDb {
+    retained_launch_owners:
+        std::cell::RefCell<std::collections::HashMap<i64, ProviderLaunchOwnerFence>>,
     conn: sqlite::Connection,
     db_path: PathBuf,
     // Completion authority rejoins the accepted source path to one canonical local file identity.

@@ -72,8 +72,13 @@ impl TempXdgHome {
     }
 
     fn run_new(&self) -> Output {
+        self.run_new_with_args(&[])
+    }
+
+    fn run_new_with_args(&self, args: &[&str]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("--new")
+            .args(args)
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
             .env(
@@ -121,6 +126,15 @@ fn marker_value(output: &str, prefix: &str) -> Value {
 
 #[test]
 fn new_flag_binds_exact_live_session_before_nested_registration_returns() {
+    assert_new_live_session_binding(&[], "live1");
+}
+
+#[test]
+fn new_flag_pins_account_and_binds_its_exact_live_session() {
+    assert_new_live_session_binding(&["--pin-provider", "live2"], "live2");
+}
+
+fn assert_new_live_session_binding(args: &[&str], expected_provider: &str) {
     const SESSION_ID: &str = "ses_age284_live_fixture";
 
     let fixture = TempXdgHome::new();
@@ -174,9 +188,16 @@ esac"#,
         ),
     );
     fixture.write_config(r#"default_provider = "live""#);
-    fixture.write_providers_at(&provider_entry("live1", &script, "interactive"), &script);
+    fixture.write_providers_at(
+        &[
+            provider_entry("live1", &script, "interactive"),
+            provider_entry("live2", &script, "interactive"),
+        ]
+        .join("\n"),
+        &script,
+    );
 
-    let output = fixture.run_new();
+    let output = fixture.run_new_with_args(args);
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -211,7 +232,7 @@ esac"#,
     assert_eq!(marker["agent_runner_invocation_id"], invocation_uuid);
     assert_eq!(marker["session_id"], SESSION_ID);
     assert_eq!(marker["provider_session_id"], SESSION_ID);
-    assert_eq!(marker["provider_name"], "live1");
+    assert_eq!(marker["provider_name"], expected_provider);
     assert!(marker["agent_runner_chain_id"].is_string());
     assert!(marker["resume_input_id"].is_null());
 

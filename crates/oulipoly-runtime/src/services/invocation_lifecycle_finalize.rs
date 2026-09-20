@@ -30,7 +30,9 @@ pub fn finalize_retained_outcome_with_contention_retry(
     };
     for attempt in 1..=attempts {
         let result = service.finalize_invocation(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            state
+                .invocation_mutation_scope(invocation_row_id)
+                .authority(),
             InvocationLifecycleFinalizeRequest {
                 state,
                 invocation_row_id,

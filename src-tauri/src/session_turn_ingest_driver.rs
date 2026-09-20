@@ -89,6 +89,8 @@ fn session_turn_ingest_loop(
                 continue;
             }
         };
+        #[cfg(feature = "age360-fault-fixtures")]
+        pause_private_resume_registry_acquisition();
         let current_registry = registry.current();
         let outcome = run_one_session_turn_ingest_quantum(SessionTurnIngestDriverRequest {
             state: &state,
@@ -150,4 +152,15 @@ fn open_current_state(path: &Path) -> Result<Option<StateDb>, String> {
         return Ok(None);
     }
     StateDb::open(path).map(Some)
+}
+
+// Control scheduling before taking a registry snapshot, not after pinning an old
+// instance. The existing barrier independently requires the private net namespace.
+#[cfg(feature = "age360-fault-fixtures")]
+fn pause_private_resume_registry_acquisition() {
+    if std::env::args().any(|arg| arg == "resume") {
+        oulipoly_state::completion_continuation::age360_fault_barrier(
+            "resume-ingest-before-registry",
+        );
+    }
 }

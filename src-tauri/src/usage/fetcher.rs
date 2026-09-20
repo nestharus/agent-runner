@@ -30,6 +30,7 @@ const USAGE_REFRESH_LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 pub(crate) enum QuotaScriptOutcome {
     Updated {
         script_windows: Vec<QuotaScriptWindow>,
+        cache_warning: Option<String>,
     },
     NoScript,
     AlreadyInFlight,
@@ -122,10 +123,14 @@ fn finish_updated(
         .iter()
         .map(QuotaScriptWindow::to_quota_window_input)
         .collect();
-    if let Err(err) = state.upsert_quota_refresh(account_id, &routing_windows) {
-        return QuotaScriptOutcome::Failed(format!("cache write failed: {err}"));
+    let cache_warning = state
+        .upsert_quota_refresh(account_id, &routing_windows)
+        .err()
+        .map(|err| format!("cache write failed; cache not committed: {err}"));
+    QuotaScriptOutcome::Updated {
+        script_windows,
+        cache_warning,
     }
-    QuotaScriptOutcome::Updated { script_windows }
 }
 
 struct RefreshFileLock {

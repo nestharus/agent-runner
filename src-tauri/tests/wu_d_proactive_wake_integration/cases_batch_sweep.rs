@@ -18,9 +18,7 @@ use crate::validators::{
     assert_pending_mailbox_count, assert_prompt_contains_handle, assert_prompt_file_missing,
     assert_success, assert_xdg_isolated,
 };
-use crate::wake_claim_setup::{
-    acquire_seed_wake_claim, seed_dead_wake_claim, seed_live_wake_claim,
-};
+use crate::wake_claim_setup::{seed_dead_wake_claim, seed_live_wake_claim};
 use crate::{MODEL, PROVIDER, SESSION};
 
 fn direct_unconfirmed_invocation(output: &std::process::Output) -> String {
@@ -144,12 +142,13 @@ pub(crate) fn wake_sweep_reclaims_dead_claim_and_delivers_pending_mailbox() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script("", "", "sweep-reclaimed.txt"));
+    fixture.establish_recovery_parent(SESSION);
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-sweep-reclaim");
     seed_dead_wake_claim(&fixture, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 601);
 
-    let output = fixture.run_mailbox_list(SESSION);
+    let output = fixture.run_startup_recovery(SESSION);
     assert_success(&output);
 
     let prompt = wait_for_file(&fixture.prompt_file("sweep-reclaimed.txt"));
@@ -158,24 +157,50 @@ pub(crate) fn wake_sweep_reclaims_dead_claim_and_delivers_pending_mailbox() {
         delivered_single_row_without_error_or_claim(&fixture, SESSION)
     });
     assert_one_failed_delivery(&fixture, SESSION);
+    fixture.assert_recovery_drained(SESSION);
     assert_xdg_isolated(&fixture);
 }
 
-pub(crate) fn wake_sweep_does_not_resurrect_abandoned_transient_session() {
+pub(crate) fn native_bound_session_automatically_delivers_after_historical_owner_death() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script("", "", "abandoned-transient-resumed.txt"));
+    fixture.establish_recovery_parent("77777777-7777-4777-8777-777777777777");
+    fixture.establish_recovery_parent(SESSION);
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-abandoned-transient");
 
-    let output = fixture.run_mailbox_list(SESSION);
+    fixture.seed_recovery_control();
+    let output = fixture.run_startup_recovery("77777777-7777-4777-8777-777777777777");
     assert_success(&output);
-    settle_wake_sweep();
+    fixture.assert_recovery_control();
 
-    assert_prompt_file_missing(&fixture, "abandoned-transient-resumed.txt");
-    assert_pending_handle_without_error(&fixture, SESSION, "h-abandoned-transient");
-    assert_no_wake_claim(&fixture, SESSION);
+    // AGE360 user decision supersedes the former abandoned-transient negative
+    // for genuinely bound native recipients only. A finished invocation and
+    // historical mailbox-owner death are not an explicit session stop.
+    let prompt = wait_for_file(&fixture.prompt_file("abandoned-transient-resumed.txt"));
+    assert_eq!(prompt.matches("handle: h-abandoned-transient").count(), 1);
+    assert!(!prompt.contains("h-positive-control"));
+    wait_until("native-bound historical notification delivered", || {
+        delivered_rows_without_pending_or_claim(&fixture, SESSION, 1)
+    });
+    assert_one_failed_delivery(&fixture, SESSION);
+    fixture.assert_recovery_drained(SESSION);
+    assert_exact_native_delivery(&fixture, SESSION, "h-abandoned-transient");
+    assert_exact_native_delivery(
+        &fixture,
+        "77777777-7777-4777-8777-777777777777",
+        "h-positive-control",
+    );
+    let before = invocation_count(&fixture);
+    assert_success(&fixture.run_startup_recovery(SESSION));
+    settle_wake_sweep();
+    assert_eq!(invocation_count(&fixture), before);
+    assert_eq!(
+        std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+        "2"
+    );
     assert_xdg_isolated(&fixture);
 }
 
@@ -187,6 +212,7 @@ pub(crate) fn wake_sweep_retains_non_resumable_abandoned_transient_session() {
         "",
         "non-resumable-transient-resumed.txt",
     ));
+    fixture.establish_recovery_parent("77777777-7777-4777-8777-777777777777");
     // Idle headless runtime with a dead-owner pending row, but NO session turn /
     // chain -> no durable resume evidence. The session is never auto-woken
     // (anti-resurrection), but automatic terminal reap is withheld because the
@@ -194,9 +220,10 @@ pub(crate) fn wake_sweep_retains_non_resumable_abandoned_transient_session() {
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-non-resumable-transient");
 
-    let output = fixture.run_mailbox_list(SESSION);
+    fixture.seed_recovery_control();
+    let output = fixture.run_startup_recovery("77777777-7777-4777-8777-777777777777");
     assert_success(&output);
-    settle_wake_sweep();
+    fixture.assert_recovery_control();
 
     assert_prompt_file_missing(&fixture, "non-resumable-transient-resumed.txt");
     assert_dead_owner_debris_retained(&fixture, SESSION);
@@ -208,6 +235,7 @@ pub(crate) fn wake_sweep_retains_dead_owner_session_with_chain_but_no_turns() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script("", "", "chain-no-turns-resumed.txt"));
+    fixture.establish_recovery_parent("77777777-7777-4777-8777-777777777777");
     // A registered chain segment with ZERO produced turns is an empty resume
     // target, not durable work. With a dead owner it is never auto-woken, but
     // remains pending for an explicitly fenced operator disposition.
@@ -220,9 +248,10 @@ pub(crate) fn wake_sweep_retains_dead_owner_session_with_chain_but_no_turns() {
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-chain-no-turns");
 
-    let output = fixture.run_mailbox_list(SESSION);
+    fixture.seed_recovery_control();
+    let output = fixture.run_startup_recovery("77777777-7777-4777-8777-777777777777");
     assert_success(&output);
-    settle_wake_sweep();
+    fixture.assert_recovery_control();
 
     assert_prompt_file_missing(&fixture, "chain-no-turns-resumed.txt");
     assert_dead_owner_debris_retained(&fixture, SESSION);
@@ -234,12 +263,13 @@ pub(crate) fn wake_sweep_delivers_resumable_session_missing_models_dir() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script("", "", "missing-models-dir-resumed.txt"));
+    fixture.establish_recovery_parent(SESSION);
     fixture.seed_session_turn();
     fixture.seed_idle_runtime_without_models_dir(SESSION);
     fixture.seed_mailbox_for(SESSION, "h-missing-models-dir", None);
     seed_dead_wake_claim(&fixture, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", 601);
 
-    let output = fixture.run_mailbox_list(SESSION);
+    let output = fixture.run_startup_recovery(SESSION);
     assert_success(&output);
 
     let prompt = wait_for_file(&fixture.prompt_file("missing-models-dir-resumed.txt"));
@@ -248,6 +278,7 @@ pub(crate) fn wake_sweep_delivers_resumable_session_missing_models_dir() {
         delivered_single_row_without_error_or_claim(&fixture, SESSION)
     });
     assert_one_failed_delivery(&fixture, SESSION);
+    fixture.assert_recovery_drained(SESSION);
     assert_xdg_isolated(&fixture);
 }
 
@@ -255,14 +286,17 @@ pub(crate) fn wake_sweep_does_not_disturb_live_identity_matched_claim() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script("", "", "live-claim-not-disturbed.txt"));
+    fixture.establish_recovery_parent("77777777-7777-4777-8777-777777777777");
+    fixture.establish_recovery_parent(SESSION);
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-live-claim");
     seed_live_wake_claim(&fixture, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
 
-    let output = fixture.run_mailbox_list(SESSION);
+    fixture.seed_recovery_control();
+    let output = fixture.run_startup_recovery("77777777-7777-4777-8777-777777777777");
     assert_success(&output);
-    settle_wake_sweep();
+    fixture.assert_recovery_control();
 
     assert_prompt_file_missing(&fixture, "live-claim-not-disturbed.txt");
     assert_live_claim_token(&fixture, SESSION, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
@@ -274,13 +308,14 @@ pub(crate) fn wake_sweep_does_not_treat_pre_anchor_prose_as_consumption() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script("", "", "pre-anchor-prose-retried.txt"));
+    fixture.establish_recovery_parent(SESSION);
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-consumed");
     fixture.seed_consumed_notification_turn("h-consumed");
     seed_dead_wake_claim(&fixture, "cccccccc-cccc-4ccc-8ccc-cccccccccccc", 601);
 
-    let output = fixture.run_mailbox_list(SESSION);
+    let output = fixture.run_startup_recovery(SESSION);
     assert_success(&output);
     // The stored prose predates the delivery anchor and has no exact nonce.
     // It cannot suppress this row; only the new provider-observed submission
@@ -298,6 +333,7 @@ pub(crate) fn wake_sweep_does_not_treat_pre_anchor_prose_as_consumption() {
     assert_eq!(row.delivery_attempts, 1);
     assert!(row.delivered_by_invocation_uuid.is_some());
     assert_pending_mailbox_count(&fixture, SESSION, 0);
+    fixture.assert_recovery_drained(SESSION);
     assert_xdg_isolated(&fixture);
 }
 
@@ -305,13 +341,14 @@ pub(crate) fn wake_sweep_retries_twice_unconfirmed_pending_mailbox() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script("", "", "twice-unconfirmed-retried.txt"));
+    fixture.establish_recovery_parent(SESSION);
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-unconfirmed");
     fixture.mark_mailbox_unconfirmed_twice(SESSION, "h-unconfirmed");
     seed_dead_wake_claim(&fixture, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", 601);
 
-    let output = fixture.run_mailbox_list(SESSION);
+    let output = fixture.run_startup_recovery(SESSION);
     assert_success(&output);
 
     let prompt = wait_for_file(&fixture.prompt_file("twice-unconfirmed-retried.txt"));
@@ -329,6 +366,7 @@ pub(crate) fn wake_sweep_retries_twice_unconfirmed_pending_mailbox() {
         &fixture,
         row.delivered_by_invocation_uuid.as_deref().unwrap(),
     );
+    fixture.assert_recovery_drained(SESSION);
     assert_xdg_isolated(&fixture);
 }
 
@@ -355,7 +393,7 @@ fi"#,
     }
 
     let manual_resume = fixture.run_resume_with_retry_base(2_000);
-    direct_unconfirmed_invocation(&manual_resume);
+    let original_parent = direct_unconfirmed_invocation(&manual_resume);
     wait_until("first automatic wake failed and entered backoff", || {
         first_failure.exists()
             && crate::liveness::runtime_is_idle(&fixture, SESSION)
@@ -372,13 +410,53 @@ fi"#,
     assert_eq!(claim.auto_wake_count, 1);
     assert!(claim.wake_pid.is_some());
 
+    // A rejected native allocation is diagnostic history, not a replacement
+    // parent. This samples the real failure while its retry owner still holds.
+    let metadata = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        metadata.invocation_uuid.as_deref(),
+        Some(original_parent.as_str())
+    );
+    let failed_uuid: String = fixture
+        .state()
+        .connection()
+        .query_row(
+            "SELECT invocation_uuid FROM invocations WHERE error_category='guard_drop'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let failed = fixture
+        .state()
+        .get_invocation_by_uuid(&failed_uuid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.status, oulipoly_state::InvocationStatus::Failed);
+    assert_eq!(failed.success, Some(false));
+    assert_eq!(failed.exit_code, Some(-1));
+    assert!(failed.session_id.is_none() && failed.provider_session_id.is_none());
+    let parent = fixture
+        .state()
+        .get_invocation_by_uuid(&original_parent)
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent.provider_session_id.as_deref(), Some(SESSION));
+    assert_eq!(failed.parent_invocation_id, Some(parent.id));
+    assert_rejected_anchor_attempts(&fixture, 1, 1);
+    println!("retry backoff metadata={metadata:?} failed={failed:?}");
+
     let overlapping_sweep = fixture.run_mailbox_list(SESSION);
     assert_success(&overlapping_sweep);
     std::thread::sleep(std::time::Duration::from_millis(250));
     assert_eq!(
         std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
         "1",
-        "a startup sweep must coalesce with the retry owner; rejected anchor never launched"
+        "inspection must not disturb the live retry owner; rejected anchor never launched"
     );
 
     wait_until("owned retry renewed and delivered pending mailbox", || {
@@ -389,6 +467,42 @@ fi"#,
         "2"
     );
     assert_rejected_anchor_attempts(&fixture, 1, 1);
+    let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert!(
+        rows[..20]
+            .iter()
+            .all(|row| row.delivered_by_invocation_uuid.as_deref()
+                == Some(original_parent.as_str())
+                && row.delivery_attempts == 1)
+    );
+    let retry_uuid = rows[20].delivered_by_invocation_uuid.as_deref().unwrap();
+    assert_ne!(retry_uuid, failed_uuid);
+    assert_ne!(retry_uuid, original_parent);
+    assert_age270_invocation(&fixture, retry_uuid);
+    let retry = fixture
+        .state()
+        .get_invocation_by_uuid(retry_uuid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.provider_session_id.as_deref(), Some(SESSION));
+    assert_eq!(retry.parent_invocation_id, Some(parent.id));
+    assert_eq!(invocation_count(&fixture), 3);
+    assert_retry_parent_custody_drained(&fixture, retry_uuid);
+    let metadata = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.auto_wake_count, 2);
+    let selected = fixture
+        .state()
+        .get_invocation_by_uuid(metadata.invocation_uuid.as_deref().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.provider_session_id.as_deref(), Some(SESSION));
+    assert_ne!(selected.invocation_uuid, failed_uuid);
+    println!("retry recovered metadata={metadata:?} bound={retry:?}");
     assert_xdg_isolated(&fixture);
 }
 
@@ -396,32 +510,40 @@ pub(crate) fn maximum_chronology_and_delivery_attempts_stay_eligible_across_rech
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     let first_failure = fixture.work_dir.join("maximum-chronology-first-failure");
+    let recovery_started = fixture.work_dir.join("maximum-recovery-started");
+    let release_recovery = fixture.work_dir.join("maximum-release-recovery");
     let hook = format!(
         r#"if [ "$WU_D_ANCHOR_INDEX" = 1 ]; then
-  : > {}
+  : > {first_failure}
   exit 17
+fi
+if [ "$WU_D_ANCHOR_INDEX" = 2 ]; then
+  : > {recovery_started}
+  while [ ! -e {release_recovery} ]; do sleep 0.01; done
 fi"#,
-        shell_path(&first_failure),
+        first_failure = shell_path(&first_failure),
+        recovery_started = shell_path(&recovery_started),
+        release_recovery = shell_path(&release_recovery),
     );
-    fixture.write_provider(&anchor_admission_provider_script(
-        &hook,
-        "",
-        "maximum-chronology-${WU_D_PROVIDER_RESUME_INDEX}.txt",
-    ));
+    // Recovery must answer, not merely receipt the notification. Anchor
+    // failures still happen before launch; other scenarios remain receipt-only.
+    fixture.write_provider(
+        &anchor_admission_provider_script(
+            &hook,
+            "",
+            "maximum-chronology-${WU_D_PROVIDER_RESUME_INDEX}.txt",
+        )
+        .replace(
+            "SUCCESSFUL_ASSISTANT = False",
+            "SUCCESSFUL_ASSISTANT = True",
+        ),
+    );
+    fixture.establish_recovery_parent(SESSION);
     fixture.seed_session_turn();
     fixture.seed_idle_runtime_with_wake_count(SESSION, i64::MAX);
     for index in 0..21 {
         fixture.seed_mailbox(SESSION, &format!("h-maximum-chronology-{index:02}"));
     }
-    let claim_token = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
-    acquire_seed_wake_claim(&fixture, claim_token);
-    fixture
-        .sidecar_conn()
-        .execute(
-            "UPDATE session_wake_claim SET auto_wake_count = ?2 WHERE session_id = ?1",
-            rusqlite::params![SESSION, i64::MAX],
-        )
-        .unwrap();
     fixture
         .sidecar_conn()
         .execute(
@@ -437,29 +559,53 @@ fi"#,
         )
         .unwrap();
 
-    let retry_started = std::time::Instant::now();
-    let first = fixture.run_auto_wake_resume(claim_token, i64::MAX, 30);
-    let retry_elapsed = retry_started.elapsed();
-    eprintln!("production maximum-chronology retry elapsed: {retry_elapsed:?}");
-    assert!(
-        first_failure.exists(),
-        "maximum-count failure path was not reached"
-    );
-    assert!(
-        retry_elapsed >= std::time::Duration::from_secs(29)
-            && retry_elapsed <= std::time::Duration::from_secs(45),
-        "the production maximum-chronology retry must select the 30-second cadence ceiling: \
-         {retry_elapsed:?}"
-    );
-    assert!(
-        !String::from_utf8_lossy(&first.stderr).contains("attempt to add with overflow"),
-        "maximum chronology overflowed before retry renewal: {first:?}"
-    );
-
+    // A real completed native parent is selected; startup admission elects the
+    // independent driver. Historical count is input, never launch authority.
+    assert_success(&fixture.run_startup_recovery(SESSION));
     wait_until(
+        "maximum-count failure reached real anchor admission",
+        || first_failure.exists(),
+    );
+    // Hold only the recovery anchor so failure/cadence evidence is checked
+    // before the first valid answer. Both waits share the original 45s budget.
+    let recovery_deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    wait_until_with_timeout(
+        "maximum chronology recovery held before submission",
+        recovery_deadline.saturating_duration_since(std::time::Instant::now()),
+        || recovery_started.exists(),
+    );
+    assert_rejected_anchor_attempts(&fixture, 1, 20);
+    let pending = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert_eq!(pending.len(), 21);
+    assert!(
+        pending
+            .iter()
+            .all(|row| row.delivered_at.is_none() && row.delivery_error.is_none())
+    );
+    assert!(
+        pending[..20]
+            .iter()
+            .all(|row| row.delivery_attempts == i64::MAX - 1)
+    );
+    assert_eq!(pending[20].delivery_attempts, 0);
+    assert!(
+        !fixture
+            .work_dir
+            .join("provider-resume-sequence.txt")
+            .exists()
+    );
+    let intervals = native_failed_retry_intervals_ms(&fixture, 1);
+    assert_eq!(intervals.len(), 1);
+    assert_retry_interval_ms(intervals[0], 30_000);
+    println!("maximum-chronology finished-to-created retry ms={intervals:?}");
+    std::fs::write(&release_recovery, "release\n").unwrap();
+    wait_until_with_timeout(
         "maximum chronology retry delivered all pending rows",
+        recovery_deadline.saturating_duration_since(std::time::Instant::now()),
         || delivered_rows_without_pending_or_claim(&fixture, SESSION, 21),
     );
+    assert_recovery_batch_prompts(&fixture, "maximum-chronology", "h-maximum-chronology");
+    assert_native_retry_custody(&fixture, 1, 2);
     let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
     assert_eq!(rows.len(), 21);
     assert!(
@@ -505,29 +651,26 @@ fi"#,
         seventh_started = shell_path(&seventh_started),
         release_seventh = shell_path(&release_seventh),
     );
-    fixture.write_provider(&anchor_admission_provider_script(
-        &hook,
-        "",
-        "persistent-failure-${WU_D_PROVIDER_RESUME_INDEX}.txt",
-    ));
+    // Recovery must answer, not merely receipt the notification. Anchor
+    // failures still happen before launch; other scenarios remain receipt-only.
+    fixture.write_provider(
+        &anchor_admission_provider_script(
+            &hook,
+            "",
+            "persistent-failure-${WU_D_PROVIDER_RESUME_INDEX}.txt",
+        )
+        .replace(
+            "SUCCESSFUL_ASSISTANT = False",
+            "SUCCESSFUL_ASSISTANT = True",
+        ),
+    );
+    fixture.establish_recovery_parent(SESSION);
     fixture.seed_session_turn();
-    fixture.seed_idle_runtime_with_wake_count(SESSION, 1);
+    fixture.seed_idle_runtime_with_wake_count(SESSION, 0);
     for index in 0..21 {
         fixture.seed_mailbox(SESSION, &format!("h-persistent-failure-{index:02}"));
     }
-    let claim_token = "ffffffff-ffff-4fff-8fff-ffffffffffff";
-    acquire_seed_wake_claim(&fixture, claim_token);
-    fixture
-        .sidecar_conn()
-        .execute(
-            "UPDATE session_wake_claim SET auto_wake_count = ?2 WHERE session_id = ?1",
-            rusqlite::params![SESSION, 1],
-        )
-        .unwrap();
-
-    let first = fixture.run_auto_wake_resume(claim_token, 1, 1_000);
-    assert_eq!(first.status.code(), Some(1), "{first:?}");
-    assert!(String::from_utf8_lossy(&first.stderr).contains("offline_anchor_unavailable"));
+    assert_success(&fixture.run_startup_recovery(SESSION));
     wait_until_with_timeout(
         "seventh production retry reached pre-submission anchor admission",
         std::time::Duration::from_secs(120),
@@ -540,7 +683,7 @@ fi"#,
         .wake_claim(SESSION)
         .unwrap()
         .expect("six consecutive failures must retain one claim for a seventh attempt");
-    assert_ne!(retained_claim.claim_token, claim_token);
+    assert!(!retained_claim.claim_token.is_empty());
     assert_eq!(retained_claim.auto_wake_count, 7);
     assert!(retained_claim.wake_pid.is_some());
     let pending = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
@@ -550,6 +693,23 @@ fi"#,
             .all(|row| row.delivery_attempts == 0 && row.delivery_error.is_none())
     );
     assert_rejected_anchor_attempts(&fixture, 6, 20);
+    let conn = fixture.sidecar_conn();
+    let newer_memberships: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM mailbox_delivery_attempt_items i JOIN mailbox m ON m.seq=i.mailbox_seq WHERE m.handle='h-persistent-failure-20'",
+        [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        newer_memberships, 0,
+        "newer work cannot displace the held oldest batch"
+    );
+    let claim_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_wake_claim WHERE session_id=?1",
+            [SESSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(claim_count, 1);
+
     assert!(
         !fixture
             .work_dir
@@ -561,11 +721,25 @@ fi"#,
     assert!(pending[20].delivery_error.is_none());
     assert!(pending.iter().all(|row| row.delivered_at.is_none()));
 
+    // Rejection unwinds the invocation guard before the failed-wake recheck
+    // sleeps. Anchor entry precedes that unwinding; timing from there charges
+    // observation/teardown to backoff. The next invocation starts after renewal.
+    // This bracket still includes recheck/spawn overhead, not just the sleep.
+    let retry_intervals_ms = native_failed_retry_intervals_ms(&fixture, 6);
+    eprintln!("production finished-to-created retry intervals (ms): {retry_intervals_ms:?}");
+    for (elapsed_ms, expected_ms) in retry_intervals_ms
+        .iter()
+        .zip([1_000_i64, 2_000, 4_000, 8_000, 16_000, 30_000])
+    {
+        assert_retry_interval_ms(*elapsed_ms, expected_ms);
+    }
+
     std::fs::write(&release_seventh, "release\n").unwrap();
     wait_until(
         "persistent failure lifecycle delivered oldest and newer work",
         || delivered_rows_without_pending_or_claim(&fixture, SESSION, 21),
     );
+    assert_recovery_batch_prompts(&fixture, "persistent-failure", "h-persistent-failure");
     let oldest = wait_for_file(&fixture.prompt_file("persistent-failure-1.txt"));
     assert_prompt_contains_handle(&oldest, "h-persistent-failure-00");
     assert_prompt_contains_handle(&oldest, "h-persistent-failure-19");
@@ -601,22 +775,11 @@ fi"#,
         .map(|pair| (pair[1].1 - pair[0].1) / 1_000_000)
         .collect::<Vec<_>>();
     eprintln!("anchor-entry intervals including active work (ms): {anchor_intervals_ms:?}");
-    // Rejection unwinds the invocation guard before the failed-wake recheck
-    // sleeps. Anchor entry precedes that unwinding; timing from there charges
-    // observation/teardown to backoff. The next invocation starts after renewal.
-    // This bracket still includes recheck/spawn overhead, not just the sleep.
-    let retry_intervals_ms = failed_invocation_retry_intervals_ms(&fixture);
-    eprintln!("production finished-to-created retry intervals (ms): {retry_intervals_ms:?}");
-    for (elapsed_ms, expected_ms) in retry_intervals_ms
-        .iter()
-        .zip([1_000_i64, 2_000, 4_000, 8_000, 16_000, 30_000])
-    {
-        assert_retry_interval_ms(*elapsed_ms, expected_ms);
-    }
+    assert_native_retry_custody(&fixture, 6, 2);
     assert_xdg_isolated(&fixture);
 }
 
-fn failed_invocation_retry_intervals_ms(fixture: &Fixture) -> Vec<i64> {
+fn native_failed_retry_intervals_ms(fixture: &Fixture, failures: usize) -> Vec<i64> {
     let state = fixture.state();
     let connection = state.connection();
     let mut statement = connection
@@ -633,8 +796,16 @@ fn failed_invocation_retry_intervals_ms(fixture: &Fixture) -> Vec<i64> {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(invocations.len(), 8);
-    invocations[..7]
+    assert_eq!(
+        invocations.len(),
+        failures + 2,
+        "recovery held before answer/newer launch"
+    );
+    assert_eq!(
+        invocations[0].2, "succeeded",
+        "genuine initial native parent"
+    );
+    invocations[1..failures + 2]
         .windows(2)
         .map(|pair| {
             assert_eq!(pair[0].2, "failed");
@@ -892,13 +1063,14 @@ pub(crate) fn maximum_persisted_count_allows_startup_sweep_delivery() {
         release = shell_path(&release),
     );
     fixture.write_provider(&provider_script("", &hook, "maximum-sweep-count.txt"));
+    fixture.establish_recovery_parent(SESSION);
     fixture.seed_session_turn();
     fixture.seed_idle_runtime_with_wake_count(SESSION, i64::MAX);
     fixture.seed_mailbox_for(SESSION, "h-sweep-count", None);
     let stale_token = "abababab-abab-4bab-8bab-abababababab";
     seed_dead_wake_claim(&fixture, stale_token, 601);
 
-    let output = fixture.run_mailbox_list(SESSION);
+    let output = fixture.run_startup_recovery(SESSION);
     assert_success(&output);
 
     wait_for_file(&started);
@@ -929,6 +1101,7 @@ pub(crate) fn maximum_persisted_count_allows_startup_sweep_delivery() {
         "1"
     );
     assert_one_failed_delivery(&fixture, SESSION);
+    fixture.assert_recovery_drained(SESSION);
     assert_xdg_isolated(&fixture);
 }
 
@@ -946,6 +1119,7 @@ fn assert_rejected_anchor_attempts(fixture: &Fixture, expected: i64, batch_size:
         rejected, expected,
         "only the prepared-before-CAS path proves non-submission"
     );
+    assert_rejected_logical_launches(fixture, expected);
 }
 
 #[test]
@@ -961,8 +1135,9 @@ fn failed_provider_exit_and_empty_observation_retain_uncertainty_across_rechecks
     let attempt: String = fixture.sidecar_conn().query_row(
         "SELECT attempt_id FROM mailbox_delivery_attempts WHERE submission_started_at IS NOT NULL AND resolved_at IS NULL",
         [], |row| row.get(0)).unwrap();
+    let invocations_before = invocation_count(&fixture);
     for _ in 0..3 {
-        assert_success(&fixture.run_mailbox_list(SESSION)); // fresh Runner process
+        assert_success(&fixture.run_startup_recovery(SESSION)); // fresh Runner process
         settle_wake_sweep();
         assert_eq!(
             std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
@@ -980,5 +1155,458 @@ fn failed_provider_exit_and_empty_observation_retain_uncertainty_across_rechecks
         assert!(rows[0].delivered_at.is_none());
         assert_eq!(rows[0].delivery_attempts, 1);
     }
+    assert_eq!(invocation_count(&fixture), invocations_before);
+    // Capture only already-observed native custody. Uncertainty permits no
+    // provider replay, but the independent owner can attempt a preflight and
+    // refuse it before publishing any invocation/runtime generation.
+    assert_observed_uncertainty_custody_drained(&fixture);
+    assert_eq!(invocation_count(&fixture), invocations_before);
+    assert_eq!(
+        std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+        "1"
+    );
+    let retained: i64 = fixture
+        .sidecar_conn()
+        .query_row(
+            "SELECT count(*) FROM mailbox_delivery_attempts WHERE attempt_id=?1
+         AND headless_submission_state='possible' AND submission_started_at IS NOT NULL
+         AND resolved_at IS NULL AND observation_confirmed_at IS NULL AND acknowledged_at IS NULL",
+            [&attempt],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, 1);
+    println!(
+        "uncertainty retained attempt={attempt} invocations={invocations_before}; no provider replay"
+    );
     assert_xdg_isolated(&fixture);
+}
+
+// Join the delivered row to the actual resumed invocation and native activation,
+// not merely to a fake-provider receipt or a prompt file that can be overwritten.
+fn assert_exact_native_delivery(fixture: &Fixture, session: &str, handle: &str) {
+    let rows = fixture.mailbox().list_mailbox(session, true).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].handle, handle);
+    let id = rows[0].delivered_by_invocation_uuid.as_deref().unwrap();
+    let invocation = fixture.state().get_invocation_by_uuid(id).unwrap().unwrap();
+    assert_eq!(invocation.provider_session_id.as_deref(), Some(session));
+    assert_eq!(invocation.provider_name.as_deref(), Some(PROVIDER));
+    assert_age270_invocation(fixture, id);
+    let count: i64 = fixture
+        .state()
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM invocations WHERE provider_session_id=?1",
+            [session],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2, "one genuine initial invocation and one resume");
+    let activations: i64 = fixture
+        .sidecar_conn()
+        .query_row(
+            "SELECT count(*) FROM completion_continuation_attempt WHERE session_id=?1",
+            [session],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(activations, 1, "no duplicate native execution");
+    let bound: String = fixture.sidecar_conn().query_row(
+        "SELECT spawn_invocation_uuid FROM completion_continuation_attempt WHERE session_id=?1 AND phase='drained' AND integrated=1",
+        [session], |row| row.get(0)).unwrap();
+    assert_eq!(
+        bound, id,
+        "delivery identity must match actual drained launcher"
+    );
+    println!("exact native delivery session={session} handle={handle} invocation={id}");
+}
+
+#[test]
+fn native_bound_pause_retains_legacy_notification_with_functioning_recipient() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "", "paused-native.txt"));
+    fixture.establish_recovery_parent("77777777-7777-4777-8777-777777777777");
+    fixture.establish_recovery_parent(SESSION);
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    fixture
+        .mailbox()
+        .set_notifications_paused(SESSION, true)
+        .unwrap();
+    fixture.seed_mailbox(SESSION, "h-paused-native");
+    fixture.seed_recovery_control();
+    assert_success(&fixture.run_startup_recovery("77777777-7777-4777-8777-777777777777"));
+    fixture.assert_recovery_control();
+    assert_prompt_file_missing(&fixture, "paused-native.txt");
+    assert_pending_handle_without_error(&fixture, SESSION, "h-paused-native");
+    assert_no_wake_claim(&fixture, SESSION);
+    assert!(fixture.mailbox().notifications_paused(SESSION).unwrap());
+    assert_eq!(invocation_count(&fixture), 3);
+    // Existing explicit mailbox resume, not TTL0 handshake, clears this pause.
+    let mut command = std::process::Command::new(crate::parse::runner_bin());
+    command.args(["mailbox", "resume", "--session-id", SESSION, "--json"]);
+    assert_success(&fixture.run(command));
+    wait_until("explicit unpause delivers native recipient", || {
+        delivered_rows_without_pending_or_claim(&fixture, SESSION, 1)
+    });
+    fixture.assert_recovery_drained(SESSION);
+    assert_exact_native_delivery(&fixture, SESSION, "h-paused-native");
+    assert_xdg_isolated(&fixture);
+}
+
+#[test]
+fn native_bound_observation_stop_retains_legacy_notification_with_functioning_recipient() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "", "stopped-native.txt"));
+    fixture.establish_recovery_parent("77777777-7777-4777-8777-777777777777");
+    fixture.establish_recovery_parent(SESSION);
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    fixture.seed_mailbox(SESSION, "h-stopped-native");
+    // Historical unresolved observation is input, never native custody authority.
+    let mut mailbox = fixture.mailbox();
+    let row = mailbox.list_pending(SESSION).unwrap().remove(0);
+    mailbox
+        .register_headless_delivery_attempt(
+            "historical-stop-attempt",
+            SESSION,
+            None,
+            "historical-stop-owner",
+            &[row.seq],
+            0,
+        )
+        .unwrap();
+    mailbox
+        .stop_mailbox_observation(
+            SESSION,
+            "historical-stop-attempt",
+            "capacity",
+            "explicit retained observation failure",
+        )
+        .unwrap();
+    let stop = mailbox.mailbox_observation_stop(SESSION).unwrap().unwrap();
+    fixture.seed_recovery_control();
+    assert_success(&fixture.run_startup_recovery("77777777-7777-4777-8777-777777777777"));
+    fixture.assert_recovery_control();
+    assert_prompt_file_missing(&fixture, "stopped-native.txt");
+    assert_pending_handle_without_error(&fixture, SESSION, "h-stopped-native");
+    assert_no_wake_claim(&fixture, SESSION);
+    let retained = mailbox.mailbox_observation_stop(SESSION).unwrap().unwrap();
+    assert_eq!(retained.stop_id, stop.stop_id);
+    assert_eq!(retained.error, stop.error);
+    assert_eq!(invocation_count(&fixture), 3);
+    // Pausing/resuming notifications must not silently clear an observation stop.
+    let mut command = std::process::Command::new(crate::parse::runner_bin());
+    command.args(["mailbox", "resume", "--session-id", SESSION, "--json"]);
+    assert_success(&fixture.run(command));
+    assert_eq!(
+        mailbox
+            .mailbox_observation_stop(SESSION)
+            .unwrap()
+            .unwrap()
+            .stop_id,
+        stop.stop_id
+    );
+    assert_prompt_file_missing(&fixture, "stopped-native.txt");
+    // Explicit resolution of this historical fixture stop is a separate action.
+    mailbox
+        .rearm_mailbox_observation(
+            SESSION,
+            &stop.stop_id,
+            "fixture observation capacity available; historical prepared attempt never submitted",
+        )
+        .unwrap();
+    assert_success(&fixture.run_startup_recovery(SESSION));
+    wait_until("explicitly rearmed native recipient delivers", || {
+        delivered_rows_without_pending_or_claim(&fixture, SESSION, 1)
+    });
+    fixture.assert_recovery_drained(SESSION);
+    assert_exact_native_delivery(&fixture, SESSION, "h-stopped-native");
+    assert_xdg_isolated(&fixture);
+}
+
+// Ongoing uncertainty is not domain quiescence. Snapshot actual custody IDs,
+// retain their physical results, and do not demand a launch or a runtime binding
+// merely to satisfy a test helper. Later owner attempts remain outside this
+// bounded drain witness; the test independently rechecks no provider replay.
+fn assert_observed_uncertainty_custody_drained(fixture: &Fixture) {
+    let conn = fixture.sidecar_conn();
+    let mut stmt = conn
+        .prepare("SELECT attempt_id FROM completion_continuation_attempt WHERE session_id=?1")
+        .unwrap();
+    let ids = stmt
+        .query_map([SESSION], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    println!("observed uncertainty custody IDs={ids:?}; empty is admissible");
+    for id in ids {
+        wait_until("observed preflight custody physically drained", || {
+            fixture.sidecar_conn().query_row(
+                "SELECT phase='drained' AND integrated=1 AND drain_receipt LIKE '%ECHILD%' FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&id], |row| row.get::<_, bool>(0)).unwrap()
+        });
+        let (custodian, launcher, generation, invocation, receipt): (String, String, Option<String>, Option<String>, String) =
+            fixture.sidecar_conn().query_row(
+                "SELECT custodian_identity,launcher_identity,runtime_generation_uuid,spawn_invocation_uuid,drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        for identity in [&custodian, &launcher] {
+            let actor: serde_json::Value = serde_json::from_str(identity).unwrap();
+            assert_ne!(actor["pid"].as_u64(), Some(u64::from(std::process::id())));
+        }
+        assert!(
+            generation.is_none(),
+            "possible submission must block before runtime launch"
+        );
+        assert!(
+            invocation.is_none(),
+            "possible submission must not create a replay invocation"
+        );
+        println!(
+            "observed preflight drain attempt={id} custodian={custodian} launcher={launcher} receipt={receipt}"
+        );
+    }
+}
+
+fn assert_retry_parent_custody_drained(fixture: &Fixture, retry_uuid: &str) {
+    assert_rejected_logical_launches(fixture, 1);
+    assert_terminal_logical_launch(fixture, retry_uuid, "failed");
+
+    wait_until("both original retry custodians drained", || {
+        fixture.sidecar_conn().query_row(
+            "SELECT COUNT(*)=2 AND SUM(phase='drained' AND integrated=1 AND drain_receipt LIKE '%ECHILD%')=2 FROM completion_continuation_attempt WHERE session_id=?1",
+            [SESSION], |row| row.get::<_, bool>(0)).unwrap()
+    });
+    let conn = fixture.sidecar_conn();
+    let mut statement = conn.prepare(
+        "SELECT attempt_id,custodian_identity,launcher_identity,runtime_generation_uuid,spawn_invocation_uuid,drain_receipt FROM completion_continuation_attempt WHERE session_id=?1").unwrap();
+    let rows = statement
+        .query_map([SESSION], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.3.is_none() && row.4.is_none())
+            .count(),
+        1
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.3.is_some() && row.4.as_deref() == Some(retry_uuid))
+            .count(),
+        1
+    );
+    for row in rows {
+        for identity in [&row.1, &row.2] {
+            let actor: serde_json::Value = serde_json::from_str(identity).unwrap();
+            assert_ne!(actor["pid"].as_u64(), Some(u64::from(std::process::id())));
+        }
+        println!("original retry custody drain={row:?}");
+    }
+}
+
+// Unlike successful-runtime-only helpers, pre-anchor rejection has no runtime.
+// Exact original activations must still be independently drained, not ACKed.
+fn assert_native_retry_custody(fixture: &Fixture, rejected: i64, launched: i64) {
+    wait_until("all exact retry activations physically drained", || {
+        fixture.sidecar_conn().query_row(
+            "SELECT COUNT(*)=?2 AND SUM(phase='drained' AND integrated=1 AND drain_receipt LIKE '%ECHILD%')=?2 FROM completion_continuation_attempt WHERE session_id=?1",
+            rusqlite::params![SESSION, rejected + launched], |r| r.get::<_, bool>(0)).unwrap()
+    });
+    let conn = fixture.sidecar_conn();
+    let counts: (i64, i64) = conn.query_row(
+        "SELECT SUM(runtime_generation_uuid IS NULL AND spawn_invocation_uuid IS NULL), SUM(runtime_generation_uuid IS NOT NULL AND spawn_invocation_uuid IS NOT NULL) FROM completion_continuation_attempt WHERE session_id=?1",
+        [SESSION], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(counts, (rejected, launched));
+    let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert_eq!(rows.len(), 21);
+    let oldest = rows[0].delivered_by_invocation_uuid.as_deref().unwrap();
+    let newer = rows[20].delivered_by_invocation_uuid.as_deref().unwrap();
+    assert_ne!(oldest, newer);
+    assert!(
+        rows[..20]
+            .iter()
+            .all(|row| row.delivered_by_invocation_uuid.as_deref() == Some(oldest))
+    );
+    let launched_ids = conn.prepare("SELECT spawn_invocation_uuid FROM completion_continuation_attempt WHERE session_id=?1 AND spawn_invocation_uuid IS NOT NULL ORDER BY spawn_invocation_uuid")
+        .unwrap().query_map([SESSION], |r| r.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    let mut delivery_ids = vec![oldest.to_owned(), newer.to_owned()];
+    delivery_ids.sort();
+    assert_eq!(launched_ids, delivery_ids);
+    assert_eq!(invocation_count(fixture), rejected + launched + 1);
+    assert_eq!(
+        std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+        "2"
+    );
+    let state = fixture.state();
+    let invocations = state.connection();
+    let parent: (i64, String) = invocations.query_row(
+        "SELECT id,invocation_uuid FROM invocations WHERE parent_invocation_id IS NULL AND status='succeeded' AND provider_session_id=?1",
+        [SESSION], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    let rejected_children: i64 = invocations.query_row(
+        "SELECT COUNT(*) FROM invocations WHERE parent_invocation_id=?1 AND session_id IS NULL AND provider_session_id IS NULL AND status='failed' AND error_category='guard_drop'",
+        [parent.0], |r| r.get(0)).unwrap();
+    assert_eq!(rejected_children, rejected);
+    assert_rejected_logical_launches(fixture, rejected);
+    for id in &delivery_ids {
+        assert_terminal_logical_launch(fixture, id, "succeeded");
+    }
+
+    for row in fixture.mailbox().list_mailbox(SESSION, true).unwrap() {
+        let id = row.delivered_by_invocation_uuid.as_deref().unwrap();
+        let child = state.get_invocation_by_uuid(id).unwrap().unwrap();
+        assert_eq!(child.status, oulipoly_state::InvocationStatus::Succeeded);
+        assert_eq!(child.success, Some(true));
+        assert_eq!(child.exit_code, Some(0));
+        assert!(child.error_category.is_none());
+        assert_ne!(
+            child.terminal_reason.as_deref(),
+            Some("resume_completion_unconfirmed")
+        );
+        assert!(child.finished_at.is_some());
+        assert_eq!(child.parent_invocation_id, Some(parent.0));
+        assert!(row.delivered_at.is_some() && row.delivery_error.is_none());
+        println!(
+            "genuine recovered delivery seq={} handle={} invocation={id} outcome={child:?}",
+            row.seq, row.handle
+        );
+        assert_eq!(child.provider_session_id.as_deref(), Some(SESSION));
+    }
+    println!(
+        "genuine retry parent={parent:?}; rejected={rejected}, successful answering launches={launched}"
+    );
+
+    let mut stmt = conn.prepare("SELECT attempt_id,custodian_identity,launcher_identity,drain_receipt FROM completion_continuation_attempt WHERE session_id=?1").unwrap();
+    for row in stmt
+        .query_map([SESSION], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+    {
+        let row = row.unwrap();
+        for identity in [&row.1, &row.2] {
+            let actor: serde_json::Value = serde_json::from_str(identity).unwrap();
+            assert_ne!(actor["pid"].as_u64(), Some(u64::from(std::process::id())));
+        }
+        println!("native retry original drain={row:?}");
+    }
+}
+
+// Exact batch membership at the provider boundary complements durable delivery IDs.
+fn assert_recovery_batch_prompts(fixture: &Fixture, file_prefix: &str, handle_prefix: &str) {
+    let oldest = wait_for_file(&fixture.prompt_file(&format!("{file_prefix}-1.txt")));
+    let newer = wait_for_file(&fixture.prompt_file(&format!("{file_prefix}-2.txt")));
+    for index in 0..21 {
+        let handle = format!("handle: {handle_prefix}-{index:02}");
+        assert_eq!(oldest.matches(&handle).count(), usize::from(index < 20));
+        assert_eq!(newer.matches(&handle).count(), usize::from(index == 20));
+    }
+    assert!(
+        !fixture
+            .prompt_file(&format!("{file_prefix}-3.txt"))
+            .exists()
+    );
+}
+
+// Root-selected truthful lifecycle: exact failed-anchor invocations settle their
+// own logical/attempt history; no synthetic runtime/endpoint or custody proof.
+fn assert_rejected_logical_launches(fixture: &Fixture, expected: i64) {
+    let ids = fixture
+        .sidecar_conn()
+        .prepare(
+            "SELECT delivery_invocation_uuid FROM mailbox_delivery_attempts
+         WHERE session_id=?1 AND observation_error LIKE '%offline_anchor_unavailable%'
+           AND headless_submission_state='prepared' AND submission_started_at IS NULL
+         ORDER BY created_at",
+        )
+        .unwrap()
+        .query_map([SESSION], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(ids.len() as i64, expected);
+    for id in ids {
+        assert_terminal_logical_launch(fixture, &id, "failed");
+        let state = fixture.state();
+        let truthful: bool = state.connection().query_row(
+            "SELECT i.status='failed' AND i.success=0 AND i.exit_code=-1
+               AND i.terminal_reason='guard_drop' AND i.finished_at IS NOT NULL
+               AND a.terminal_code='guard_drop' AND l.terminal_code='guard_drop'
+               AND a.actor_custody_state='not_started' AND a.return_channel_state='not_created'
+               AND a.endpoint_family IS NULL AND a.settings_id IS NULL
+               AND a.provider_instance_id IS NULL AND a.endpoint_identity_sha256 IS NULL
+               AND a.effect_incapable_at IS NULL AND a.actor_settlement_sha256 IS NULL
+               AND a.runtime_settlement_sha256 IS NULL AND a.return_channel_settlement_sha256 IS NULL
+               AND a.provider_session_observed+a.prompt_accepted+a.assistant_response_observed
+                   +a.captured_child_count+a.returned_artifact_count+a.mailbox_submission_accepted=0
+             FROM invocations i JOIN provider_launch_attempts a ON a.invocation_id=i.id
+             JOIN provider_logical_launches l ON l.logical_launch_id=a.logical_launch_id
+             WHERE i.invocation_uuid=?1", [&id], |r| r.get(0)).unwrap();
+        assert!(
+            truthful,
+            "failed anchor must not invent execution/custody: {id}"
+        );
+    }
+}
+
+fn assert_terminal_logical_launch(fixture: &Fixture, invocation_uuid: &str, status: &str) {
+    let state = fixture.state();
+    let row: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = state
+        .connection()
+        .query_row(
+            "SELECT l.logical_launch_id,a.attempt_id,l.status,a.status,l.finished_at,a.finished_at,
+                l.terminal_code,a.terminal_code
+         FROM provider_logical_launches l JOIN provider_launch_attempts a
+           ON a.logical_launch_id=l.logical_launch_id AND a.attempt_id=l.current_attempt_id
+           AND a.owner_epoch=l.owner_epoch
+         JOIN invocations i ON i.id=a.invocation_id AND i.invocation_uuid=a.invocation_uuid
+         WHERE i.invocation_uuid=?1 AND l.cancel_requested_at IS NULL
+           AND l.terminal_code=COALESCE(i.terminal_reason,'native_completed')",
+            [invocation_uuid],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row.2, status);
+    assert_eq!(row.3, status);
+    assert_eq!(row.4, row.5);
+    assert_eq!(row.6, row.7);
+    println!("terminal logical readback invocation={invocation_uuid} row={row:?}");
 }

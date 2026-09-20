@@ -5,7 +5,7 @@ use uuid::Uuid;
 pub(super) const DEFAULT_PAUSE_HANDSHAKE_TTL_MS: u64 = 60_000;
 pub(super) const MAX_PAUSE_HANDSHAKE_TTL_MS: u64 = 600_000;
 
-pub(super) fn validate_pause_handshake_args(session_id: &str, ttl_ms: Option<u64>) -> Option<u64> {
+pub(crate) fn validate_pause_handshake_args(session_id: &str, ttl_ms: Option<u64>) -> Option<u64> {
     if Uuid::parse_str(session_id).is_err() {
         super::formatter::emit_invalid_session_id(session_id);
         return None;
@@ -18,7 +18,7 @@ pub(super) fn validate_pause_handshake_args(session_id: &str, ttl_ms: Option<u64
     Some(ttl_ms)
 }
 
-pub(super) fn validate_resume_handshake_session_id(session_id: &str) -> Option<i32> {
+pub(crate) fn validate_resume_handshake_session_id(session_id: &str) -> Option<i32> {
     if Uuid::parse_str(session_id).is_err() {
         super::formatter::emit_invalid_session_id(session_id);
         Some(2)

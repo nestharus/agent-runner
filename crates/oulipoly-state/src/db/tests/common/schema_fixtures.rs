@@ -38,6 +38,22 @@ pub(in crate::db::tests) fn mark_current_schema_version(conn: &sqlite::Connectio
         ))
         .unwrap();
     }
+    // This helper stamps CURRENT, so include the current admission extension
+    // even when the fixture intentionally exercises an older unrelated shape.
+    let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='invocation_completion_obligations')",[],|r|r.get(0)).unwrap();
+    if !exists {
+        conn.execute_batch(include_str!(
+            "../../../../migrations/0014_invocation_completion_obligations.sql"
+        ))
+        .unwrap();
+    }
+    let bound:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('invocation_completion_obligations') WHERE name='completion_v2_binding')",[],|r|r.get(0)).unwrap();
+    if !bound {
+        conn.execute_batch(include_str!(
+            "../../../../migrations/0024_completion_continuation_binding.sql"
+        ))
+        .unwrap();
+    }
     conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
         .unwrap();
 }

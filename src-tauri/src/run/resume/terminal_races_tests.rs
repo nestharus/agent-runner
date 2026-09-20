@@ -8,8 +8,10 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Duration;
 
+type CheckpointCallback = Box<dyn FnMut(&str)>;
+
 thread_local! {
-    static CHECKPOINT: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = Default::default();
+    static CHECKPOINT: std::cell::RefCell<Option<CheckpointCallback>> = Default::default();
 }
 pub(in crate::run::resume) fn checkpoint(point: &str) {
     CHECKPOINT.with_borrow_mut(|hook| {
@@ -201,31 +203,30 @@ fn terminal_ack_race(point: &'static str, partial: bool, independent: &str, exit
     mailbox
         .begin_headless_delivery_submission(nonce, SESSION, &bound.attempt.invocation.id, false)
         .unwrap();
-    let acceptance = if independent == "acceptance" {
+    let attestation = (independent == "acceptance").then(|| {
+        oulipoly_provider::generated::PromptAcceptedMarkerValueV1 {
+            protocol: oulipoly_provider::generated::PROMPT_ACCEPTANCE_V1.into(),
+            provider_session_id: SESSION.into(),
+            prompt_sha256: wake::sha256_hex(delivery.answer.as_deref().unwrap().as_bytes()),
+            delivery_nonce: Some(nonce.into()),
+            source: None,
+            message_id: None,
+        }
+    });
+    let acceptance = attestation.as_ref().map(|marker| {
         use oulipoly_runtime::executor::prompt_acceptance::*;
-        let hash = wake::sha256_hex(delivery.answer.as_deref().unwrap().as_bytes());
-        Some(
-            promote_prompt_acceptance_attestation(
-                ExpectedPromptAcceptance {
-                    provider_session_id: SESSION,
-                    prompt_sha256: &hash,
-                    delivery_nonce: Some(nonce),
-                },
-                &oulipoly_provider::generated::PromptAcceptedMarkerValueV1 {
-                    protocol: oulipoly_provider::generated::PROMPT_ACCEPTANCE_V1.into(),
-                    provider_session_id: SESSION.into(),
-                    prompt_sha256: hash.clone(),
-                    delivery_nonce: Some(nonce.into()),
-                    source: None,
-                    message_id: None,
-                },
-            )
-            .unwrap(),
+        promote_prompt_acceptance_attestation(
+            ExpectedPromptAcceptance {
+                provider_session_id: SESSION,
+                prompt_sha256: &marker.prompt_sha256,
+                delivery_nonce: Some(nonce),
+            },
+            marker,
         )
-    } else {
-        None
-    };
+        .unwrap()
+    });
     let mut result = super::tests::clean_result();
+    result.prompt_acceptance_attestation = attestation;
     result.exit_code = exit_code;
     let (go_tx, go_rx) = mpsc::sync_channel(0);
     let (done_tx, done_rx) = mpsc::sync_channel(0);

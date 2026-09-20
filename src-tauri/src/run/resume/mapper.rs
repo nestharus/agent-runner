@@ -26,30 +26,6 @@ use crate::migration_providers::ResumeExecutionEnvironment;
 use crate::run::reservation::ReservedRun;
 use crate::terminal_outcome_adapter::TerminalSignalContext;
 
-pub(super) fn prepared_headless_resume_execution(
-    mailbox_delivery: crate::mailbox_delivery::PreparedMailboxDelivery,
-    env: ResumeExecutionEnvironment,
-    resolved: oulipoly_state::ResolvedResume,
-    effective_spawn_cwd: std::path::PathBuf,
-    parent_invocation_id: Option<i64>,
-    max_attempts: usize,
-) -> super::execution::PreparedHeadlessResumeExecution {
-    super::execution::PreparedHeadlessResumeExecution {
-        _mailbox_finalization_guard: mailbox_delivery.finalization_guard,
-        answer: mailbox_delivery.answer,
-        mailbox_session_id: mailbox_delivery.session_id,
-        mailbox_delivery_seqs: mailbox_delivery.seqs,
-        mailbox_delivery_nonce: mailbox_delivery.delivery_nonce,
-        mailbox_delivery_requires_turn_confirmation: mailbox_delivery.requires_turn_confirmation,
-        env,
-        resolved,
-        effective_spawn_cwd,
-        parent_invocation_id,
-        max_attempts,
-        provider_prompt_accepted: false,
-    }
-}
-
 pub(super) fn resume_provider_registry(
     models: &[oulipoly_config::ModelConfig],
     providers: &oulipoly_config::ProvidersConfig,
@@ -94,6 +70,8 @@ pub(super) fn resume_invocation_attempt<'state>(
     guard: crate::invocation::finalize::FinalizerGuard<'state>,
 ) -> super::lifecycle::ResumeInvocationAttempt<'state> {
     super::lifecycle::ResumeInvocationAttempt {
+        allocation: None,
+        original_wake_claim: None,
         invocation,
         invocation_row_id,
         completion_registration_authority,

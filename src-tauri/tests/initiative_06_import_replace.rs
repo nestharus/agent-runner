@@ -536,7 +536,7 @@ fn t9_concurrent_import_replace_allows_exactly_one_winner() {
         &prepared.jsonl_path,
         "winner-b",
     );
-    let first = prepared.fixture.spawn_import_replace(
+    let mut first = prepared.fixture.spawn_import_replace(
         &prepared.session_id,
         &input_a,
         &[],
@@ -548,7 +548,16 @@ fn t9_concurrent_import_replace_allows_exactly_one_winner() {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(prepared.fixture.lock_path(&prepared.session_id).exists());
+    if !prepared.fixture.lock_path(&prepared.session_id).exists() {
+        let status = first.try_wait().unwrap();
+        if status.is_none() {
+            first.kill().unwrap();
+        }
+        let output = first.wait_with_output().unwrap();
+        panic!(
+            "first import lock absent at original deadline; exited_before_cleanup={status:?}; output={output:?}"
+        );
+    }
     let second = prepared
         .fixture
         .spawn_import_replace(&prepared.session_id, &input_b, &[], &[]);

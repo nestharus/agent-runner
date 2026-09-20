@@ -1,6 +1,7 @@
-"""Real provider child: independently receive, read producer log, then ACK.
+"""Real provider child: independently receive, read immutable original payload, then ACK.
 No DB writes, PID prebinding, reconstructed prompts, or model workloads.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -72,7 +73,20 @@ if sys.argv[1] == 'initial':
                                  capture_output=True, text=True, timeout=15)
         assert unpause.returncode == 0, (unpause.stdout, unpause.stderr)
         response = json.loads(unpause.stdout)
-        assert not response['paused'] and response['wake']['status'] == 'busy', response
+        assert not response['paused'], response
+        assert response['wake'] == {
+            'attempted': False, 'status': 'independent_owner_pending',
+            'claim_token': None, 'wake_pid': None, 'auto_wake_count': None, 'message': None}, response
+        # Remain inside the genuine provider turn across multiple owner scans.
+        # A pending receipt is not proof that the owner inspected a busy target.
+        until = time.monotonic() + .75
+        while time.monotonic() < until:
+            assert rows('SELECT delivered_at,delivery_attempts FROM mailbox WHERE handle=?', (result['handle'],)) == [(None, 0)]
+            assert not (work / 'early-ack-verified.json').exists()
+            with sqlite3.connect(f'file:{data / "state.db"}?mode=ro', uri=True) as db:
+                assert db.execute('SELECT status FROM invocations WHERE invocation_uuid=?', (owner,)).fetchall() == [('running',)]
+            time.sleep(.02)
+        (work / 'busy-turn-release.json').write_text(json.dumps({'owner': owner, 'time_ns': time.monotonic_ns()}))
         assert rows('SELECT delivered_at,delivery_attempts FROM mailbox WHERE handle=?', (result['handle'],)) == [(None, 0)]
         assert not (work / 'early-ack-verified.json').exists()
         (work / 'busy-unpause.json').write_text(unpause.stdout)
@@ -80,11 +94,59 @@ else:
     handle = json.loads((work / 'early-ack-dispatch.json').read_text())['handle']
     prompt = os.environ['last']
     assert re.findall(r'^   handle: (.+)$', prompt, re.M) == [handle], prompt
-    advertised = re.findall(r'^   log: (.+)$', prompt, re.M)
+    advertised = re.findall(r'^   immutable_completion_payload: (.+)$', prompt, re.M)
     assert len(advertised) == 1, prompt
-    payload = Path(json.loads(advertised[0])).read_text()
-    assert payload == 'early-ack-payload\n', payload
-    (work / 'early-ack-payload.txt').write_text(payload)
+    path = Path(json.loads(advertised[0]))
+    # Read the advertised immutable object, joined to the supported hydrated
+    # mailbox reader, not to a live log that can grow after source completion.
+    shown = subprocess.run([runner, 'mailbox', 'show', '--session-id', os.environ['session'],
+                            '--handle', handle, '--json'], capture_output=True, text=True, timeout=15)
+    assert shown.returncode == 0, (shown.stdout, shown.stderr)
+    row = json.loads(shown.stdout)['row']
+    raw = path.read_bytes()
+    assert row['handle'] == handle and row['session_id'] == os.environ['session'], row
+    assert str(path) == row['payload_file_path']
+    assert len(raw) == row['payload_byte_len']
+    assert hashlib.sha256(raw).hexdigest() == row['payload_sha256']
+    payload = json.loads(raw)
+    assert payload == json.loads(row['payload_json'])
+    assert payload['schema_version'] == 2
+    assert payload['completion_protocol'] == 'completion-continuation-v2'
+    assert payload['kind'] == 'agent_bash_complete'
+    assert payload['handle'] == payload['event_id'] == handle
+    snapshot, outcome = payload['snapshot'], payload['outcome']
+    for key in ('source_id', 'registration_id', 'registration_digest', 'handle'):
+        assert snapshot[key] == outcome[key] == payload[key], (key, payload)
+    assert snapshot['protocol'] == outcome['protocol'] == payload['completion_protocol']
+    assert snapshot['completion_revision'] == outcome['completion_revision']
+    assert snapshot['rc'] == payload['rc'] == row['rc'] == 0
+    assert outcome['root_wait_status'] == 0 and outcome['original_tree_drained'] is True
+    assert outcome['output_closed'] is True
+    # This small printf fixture requires the supported inline representation;
+    # missing-output/artifact representations cannot silently become empty text.
+    assert payload['output_artifact'] is None
+    assert isinstance(snapshot['output'], str)
+    original = snapshot['output'].encode('utf-8')
+    assert original == b'early-ack-payload\n', original
+    diagnostic = re.findall(r'^   live_diagnostic_log_not_original_output: (.+)$', prompt, re.M)
+    assert len(diagnostic) == 1 and json.loads(diagnostic[0]) == row['log_path']
+    assert Path(row['log_path']) != path
+    # Deliberately diverge the fixture-only diagnostic after capture; the
+    # immutable bytes and supported readback above remain the original output.
+    with Path(row['log_path']).open('ab') as live:
+        live.write(b'fixture-late-diagnostic-not-original\n')
+    assert Path(row['log_path']).read_bytes() != original
+    assert path.read_bytes() == raw
+    (work / 'early-ack-payload.txt').write_bytes(original)
+    receipt = {'handle': handle, 'payload_sha256': row['payload_sha256'],
+               'payload_byte_len': len(raw), 'original_hex': original.hex(),
+               'original_sha256': hashlib.sha256(original).hexdigest(),
+               'diagnostic_distinct': True, 'snapshot': snapshot, 'outcome': outcome}
+    if UNPAUSE_MODE == 'busy':
+        boundary = json.loads((work / 'busy-turn-release.json').read_text())
+        assert time.monotonic_ns() > boundary['time_ns']
+        receipt['busy_turn_boundary'] = boundary
+    (work / 'early-ack-original-receipt.json').write_text(json.dumps(receipt))
     found = rows('SELECT seq,session_id FROM mailbox WHERE handle=?', (handle,))
     assert len(found) == 1 and found[0][1] == os.environ['session'], found
     seq = str(found[0][0])

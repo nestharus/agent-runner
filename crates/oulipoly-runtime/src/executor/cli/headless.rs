@@ -171,6 +171,7 @@ fn execute_effective_with_optional_supervisor_config(
             request.models_dir,
         ),
         supervisor_config,
+        None,
     )?;
     cleanup_temp_files(temp_files);
 

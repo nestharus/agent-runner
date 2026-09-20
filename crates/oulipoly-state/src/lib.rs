@@ -31,6 +31,7 @@
 //! ```
 
 mod chain_segments;
+pub mod completion_continuation;
 pub mod continuation;
 mod db;
 pub mod deployment;
@@ -66,6 +67,7 @@ pub use db::StateDb;
 pub use db::StateDbRebuildAuthority;
 pub use db::StateDbWriterAuthority;
 pub use db::StateReadConnection;
+pub use db::WritableOpenError;
 pub use db::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord, InvocationChildrenPage};
 pub use db::{
     AcknowledgementStage, AcknowledgementWrite, DeliveryAcknowledgement, DeliveryEvidence,
@@ -91,6 +93,10 @@ pub use db::{
 };
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};
+pub use db::{
+    CompletedTurnEffects, CompletedTurnMigrationFence, CompletedTurnMigrationScope,
+    CompletedTurnMigrationStage, CompletedTurnRecord, CompletedTurnRecoveryIdentity,
+};
 pub use db::{
     CompletionContinuityRecoveryState, CompletionObligationAdmission,
     CompletionObligationAdmissionResult, CompletionObligationAuthority,

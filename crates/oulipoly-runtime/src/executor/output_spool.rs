@@ -55,6 +55,30 @@ impl ExecutionOutputSpool {
         })
     }
 
+    /// Host-captured legacy output, sealed only after its process returned.
+    pub fn from_complete_bytes(stdout: &[u8], stderr: &[u8]) -> std::io::Result<Self> {
+        let spool = Self::new()?;
+        {
+            let mut state = spool
+                .inner
+                .lock()
+                .map_err(|_| std::io::Error::other("output lock poisoned"))?;
+            state.stdout.append(stdout)?;
+            state.stderr.append(stderr)?;
+            state.stdout.seal()?;
+            state.stderr.seal()?;
+            state.summary = Some(ExecutionOutputSummary {
+                stdout_bytes: state.stdout.len,
+                stdout_sha256: state.stdout.digest_hex(),
+                stderr_bytes: state.stderr.len,
+                stderr_sha256: state.stderr.digest_hex(),
+                data_event_count: 0,
+            });
+            state.exit_observed = true;
+        }
+        Ok(spool)
+    }
+
     pub(crate) fn observe(&self, event: &DecodedLaunchEvent) -> Result<(), String> {
         let mut state = self
             .inner
@@ -153,7 +177,7 @@ impl ExecutionOutputSpool {
                 .expect("sealed output spool has a summary")
         };
         state.record_invocation_output_pending(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            state.invocation_mutation_scope(invocation_id).authority(),
             invocation_id,
             invocation_uuid,
             &paths,
@@ -411,11 +435,14 @@ impl SpooledStream {
         ));
         let _ = std::fs::remove_file(&tmp_path);
         self.file.seek(SeekFrom::Start(0))?;
-        let mut destination = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&tmp_path)?;
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut destination = options.open(&tmp_path)?;
         let copy_result = std::io::copy(&mut (&mut self.file).take(self.len), &mut destination);
         if let Err(error) = copy_result {
             let _ = std::fs::remove_file(&tmp_path);

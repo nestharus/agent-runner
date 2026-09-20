@@ -46,6 +46,27 @@ pub(crate) struct SessionAdmissionGuard {
     run_post_settlement_sweep: bool,
 }
 
+impl SessionAdmissionGuard {
+    pub(crate) fn retarget(
+        mut self,
+        resolved: &oulipoly_state::ResolvedResume,
+    ) -> Result<Self, String> {
+        let session = &resolved.active_session_id;
+        let mut db = MailboxDb::open(&self.mailbox_path)?;
+        db.session_admissions().requeue_unmaterialized(
+            &self.registration_identity,
+            &self.claim_token,
+            session,
+        )?;
+        // Drop must not settle or sweep the requeued command.
+        self.run_post_settlement_sweep = false;
+        let identity = self.registration_identity.clone();
+        drop(db);
+        drop(self);
+        enqueue_resolved_and_wait(&identity, resolved)
+    }
+}
+
 impl Drop for SessionAdmissionGuard {
     fn drop(&mut self) {
         let settled = MailboxDb::open(&self.mailbox_path).and_then(|mut db| {
@@ -82,18 +103,17 @@ pub(super) fn enqueue_and_wait(
     )
 }
 
-#[cfg(test)]
-fn enqueue_and_wait_at(
-    mailbox_path: &Path,
+pub(super) fn enqueue_resolved_and_wait(
     registration_identity: &str,
-    session_id: Option<&str>,
+    resolved: &oulipoly_state::ResolvedResume,
 ) -> Result<SessionAdmissionGuard, String> {
-    enqueue_and_wait_at_with_memory_observer(
-        mailbox_path,
+    enqueue_target_and_wait_at(
+        &MailboxDb::default_path()?,
         registration_identity,
-        session_id,
+        Some(&resolved.active_session_id),
+        Some(resolved),
         observe_system_memory,
-        false,
+        true,
     )
 }
 
@@ -101,6 +121,24 @@ fn enqueue_and_wait_at_with_memory_observer(
     mailbox_path: &Path,
     registration_identity: &str,
     session_id: Option<&str>,
+    observe_memory: impl FnMut() -> Result<Option<MemoryObservation>, String>,
+    run_post_settlement_sweep: bool,
+) -> Result<SessionAdmissionGuard, String> {
+    enqueue_target_and_wait_at(
+        mailbox_path,
+        registration_identity,
+        session_id,
+        None,
+        observe_memory,
+        run_post_settlement_sweep,
+    )
+}
+
+fn enqueue_target_and_wait_at(
+    mailbox_path: &Path,
+    registration_identity: &str,
+    session_id: Option<&str>,
+    resolved: Option<&oulipoly_state::ResolvedResume>,
     mut observe_memory: impl FnMut() -> Result<Option<MemoryObservation>, String>,
     run_post_settlement_sweep: bool,
 ) -> Result<SessionAdmissionGuard, String> {
@@ -136,6 +174,37 @@ fn enqueue_and_wait_at_with_memory_observer(
                 row.state, row.queue_reason
             ));
         }
+        drop(db);
+        if !super::is_auto_wake_invocation()
+            && let Some(session) = session_id
+        {
+            use oulipoly_state::mailbox::ManualWakeCoordination;
+            let observation =
+                super::wake_claim::coordinate_manual_resume_at(mailbox_path, session, resolved);
+            if matches!(
+                observation,
+                Ok(ManualWakeCoordination::UnknownCustody) | Err(_)
+            ) {
+                let primary = match observation {
+                    Err(error) => error,
+                    _ => "manual resume cannot establish retained wake custody".into(),
+                };
+                let cleanup = MailboxDb::open(mailbox_path).and_then(|mut db| {
+                    cancel_failed_queue(
+                        &mut db,
+                        registration_identity,
+                        &admission_id,
+                        "manual_custody_unavailable",
+                    )
+                });
+                return Err(queue_failure(
+                    "manual custody observation (PID mailbox sidecar)",
+                    &primary,
+                    cleanup,
+                ));
+            }
+        }
+        let mut db = MailboxDb::open(mailbox_path)?;
         if let Some(claim_token) = admitted_claim_token(&row)
             && db.session_admissions().begin_launch(
                 registration_identity,
@@ -156,7 +225,7 @@ fn enqueue_and_wait_at_with_memory_observer(
             report_queued_status(
                 registration_identity,
                 QueueStatus {
-                    reason: row.queue_reason,
+                    reason: row.queue_reason.clone(),
                     sequence: row.queue_sequence,
                 },
                 &mut reported,
@@ -188,23 +257,57 @@ fn enqueue_and_wait_at_with_memory_observer(
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    report_queued_status(
-                        registration_identity,
-                        QueueStatus {
-                            reason: "coordination_unavailable".to_string(),
-                            sequence: row.queue_sequence,
-                        },
-                        &mut reported,
-                    );
-                    tracing::warn!(
-                        registration_identity,
-                        "Session admission retry retained: {error}"
-                    );
+                    let cleanup = MailboxDb::open(mailbox_path).and_then(|mut db| {
+                        cancel_failed_queue(
+                            &mut db,
+                            registration_identity,
+                            &admission_id,
+                            "coordination_unavailable",
+                        )
+                    });
+                    return Err(queue_failure(
+                        "queue drain (sweep coordination / PID mailbox sidecar)",
+                        &error,
+                        cleanup,
+                    ));
                 }
             }
         }
         std::thread::sleep(WAIT_RETRY_INTERVAL);
     }
+}
+
+fn cancel_failed_queue(
+    db: &mut MailboxDb,
+    registration: &str,
+    admission: &str,
+    reason: &str,
+) -> Result<bool, String> {
+    let now = unix_time_ms()?;
+    let current = db.session_admissions().row(registration)?;
+    let Some(current) = current.filter(|row| row.admission_id == admission) else {
+        return Ok(false);
+    };
+    db.session_admissions().cancel_exact_unmaterialized(
+        registration,
+        admission,
+        current.claim_token.as_deref(),
+        reason,
+        now,
+    )
+}
+
+fn queue_failure(operation: &str, primary: &str, cleanup: Result<bool, String>) -> String {
+    let disposition = match cleanup {
+        Ok(true) => "changed: exact queued/admitted unmaterialized reservation cancelled".to_string(),
+        Ok(false) => {
+            "no-op: exact unmaterialized ownership was not proven; launch/materialization custody preserved".to_string()
+        }
+        Err(error) => format!("error: {error}; admission/launch outcome unknown"),
+    };
+    format!(
+        "{operation} failed: {primary}; exact unmaterialized cleanup (PID mailbox sidecar): {disposition}"
+    )
 }
 
 fn queued_reason(outcome: DrainOutcome) -> &'static str {
@@ -605,6 +708,63 @@ mod tests {
         RuntimeLifecycleState, RuntimeTerminalReason,
     };
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn storage_queue_failure_preserves_primary_and_all_cleanup_dispositions() {
+        let changed = queue_failure("queue drain", "sweep lease open failed", Ok(true));
+        let noop = queue_failure("queue drain", "sweep lease open failed", Ok(false));
+        let failed = queue_failure(
+            "queue drain",
+            "sweep lease open failed",
+            Err("database is locked".into()),
+        );
+        for text in [&changed, &noop, &failed] {
+            assert!(text.contains("sweep lease open failed"));
+            assert!(text.contains("PID mailbox sidecar"));
+        }
+        assert!(
+            changed.contains("changed: exact queued/admitted unmaterialized reservation cancelled")
+        );
+        assert!(noop.contains("no-op: exact unmaterialized ownership was not proven"));
+        assert!(noop.contains("launch/materialization custody preserved"));
+        assert!(failed.contains("error: database is locked"));
+        assert!(failed.contains("outcome unknown"));
+    }
+
+    #[test]
+    fn storage_queue_real_sql_primary_and_cleanup_failures_both_survive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&path).unwrap());
+        let sql = rusqlite::Connection::open(&path).unwrap();
+        // The production enqueue/drain/cancel route, not queue_failure directly.
+        // Independent real SQLite statement faults distinguish the two phases.
+        sql.execute_batch("CREATE TRIGGER storage_primary BEFORE UPDATE ON session_admission_queue WHEN NEW.state='admitted' BEGIN SELECT RAISE(ABORT, 'selected admission primary'); END;
+            CREATE TRIGGER storage_cleanup BEFORE UPDATE ON session_admission_queue WHEN NEW.state='cancelled' BEGIN SELECT RAISE(ABORT, 'selected cancellation cleanup'); END;").unwrap();
+        let result = enqueue_and_wait_at_with_memory_observer(
+            &path,
+            "storage-dual-fault",
+            None,
+            roomy_default_memory,
+            false,
+        );
+        let error = match result {
+            Ok(_) => panic!("faulted admission unexpectedly launched"),
+            Err(error) => error,
+        };
+        assert!(error.contains("selected admission primary"), "{error}");
+        assert!(error.contains("selected cancellation cleanup"), "{error}");
+        assert!(error.contains("outcome unknown"), "{error}");
+        let mut db = MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            db.session_admissions()
+                .row("storage-dual-fault")
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
+        );
+    }
 
     fn config() -> AdmissionCapacityConfig {
         AdmissionCapacityConfig {
@@ -1255,6 +1415,85 @@ mod tests {
                 .unwrap()
                 .state,
             "admitted"
+        );
+    }
+
+    #[test]
+    fn bounded_refusal_cleans_exact_admitted_unmaterialized_reservation_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let first = enqueue(&mut db, "first", Some("session"), 1);
+        let SessionAdmissionAttempt::Admitted(first_admitted) = db
+            .session_admissions()
+            .try_admit_next("first-claim", 2, 0)
+            .unwrap()
+        else {
+            panic!("first reservation must be admitted")
+        };
+        assert!(
+            !db.session_admissions()
+                .cancel_exact_unmaterialized(
+                    "first",
+                    &first.admission_id,
+                    Some("wrong-claim"),
+                    "bounded_refusal",
+                    3,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            db.session_admissions().row("first").unwrap().unwrap().state,
+            "admitted"
+        );
+        assert!(
+            db.session_admissions()
+                .cancel_exact_unmaterialized(
+                    "first",
+                    &first.admission_id,
+                    first_admitted.claim_token.as_deref(),
+                    "bounded_refusal",
+                    4,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            db.session_admissions().row("first").unwrap().unwrap().state,
+            "cancelled"
+        );
+
+        let second = enqueue(&mut db, "second", Some("session"), 5);
+        let SessionAdmissionAttempt::Admitted(second_admitted) = db
+            .session_admissions()
+            .try_admit_next("second-claim", 6, 0)
+            .unwrap()
+        else {
+            panic!("second reservation must be admitted")
+        };
+        assert!(
+            db.session_admissions()
+                .begin_launch("second", "second-claim", 7)
+                .unwrap()
+        );
+        assert!(
+            !db.session_admissions()
+                .cancel_exact_unmaterialized(
+                    "second",
+                    &second.admission_id,
+                    second_admitted.claim_token.as_deref(),
+                    "bounded_refusal",
+                    8,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            db.session_admissions()
+                .row("second")
+                .unwrap()
+                .unwrap()
+                .state,
+            "launching",
+            "unknown/materializing launch custody must be preserved"
         );
     }
 

@@ -149,6 +149,69 @@ impl Drop for EnvScope {
     }
 }
 
+const ISOLATED_CASE_ENV: &str = "AGE360_DISPATCH_ISOLATED_CASE";
+
+fn isolated_case() -> bool {
+    if std::env::var_os(ISOLATED_CASE_ENV).is_some() {
+        return false;
+    }
+    let name = std::thread::current()
+        .name()
+        .expect("named test")
+        .to_owned();
+    let data = tempfile::tempdir().expect("private dispatch data");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+        .env(ISOLATED_CASE_ENV, "1")
+        .env(oulipoly_state::paths::DATA_DIR_ENV, data.path())
+        .env_remove(CHILD_CUSTODY_FAULT_ENV)
+        .env_remove(CHILD_CUSTODY_READY_FILE_ENV)
+        .output()
+        .expect("isolated dispatch test");
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "isolated node {name}: {}",
+        output.status
+    );
+    true
+}
+
+// A prospective controlled exposure, not attribution of the historical failure.
+#[test]
+fn dispatch_environment_exposure_control() {
+    if isolated_case() {
+        return;
+    }
+    let target =
+        "external_provider_launch_request_carries_selected_settings_id_and_effective_inputs";
+    let poisoned = tempfile::tempdir().unwrap();
+    let run = |bypass: bool| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", target, "--nocapture", "--test-threads=1"])
+            .env(oulipoly_state::paths::DATA_DIR_ENV, poisoned.path())
+            .env(CHILD_CUSTODY_FAULT_ENV, "external_spawn_observer")
+            .env_remove(CHILD_CUSTODY_READY_FILE_ENV);
+        if bypass {
+            cmd.env(ISOLATED_CASE_ENV, "1");
+        } else {
+            cmd.env_remove(ISOLATED_CASE_ENV);
+        }
+        cmd.output().unwrap()
+    };
+    let exposed = run(true);
+    assert!(!exposed.status.success());
+    assert!(String::from_utf8_lossy(&exposed.stderr).contains("spawn_observer_failed"));
+    let isolated = run(false);
+    assert!(isolated.status.success());
+    // Allowlisted causal fields only: no provider diagnostic descriptions.
+    println!(
+        "controlled_fault_site=external_spawn_observer exposed_status={} observer_failure=true isolated_status={}",
+        exposed.status, isolated.status
+    );
+}
+
 fn env_lock() -> MutexGuard<'static, ()> {
     env_mutex().lock().unwrap_or_else(|err| err.into_inner())
 }
@@ -469,6 +532,34 @@ fn execute_external_model_effective(
             parent_invocation_env,
         },
     )
+}
+
+// Explicit lifecycle authority only: ordinary helpers above must not infer it from JSON.
+fn execute_external_fixture_with_authority(
+    fixture: &ExternalFixture,
+    parent_invocation_env: String,
+    authority: Option<oulipoly_runtime::services::LiveSessionAuthorityTarget>,
+) -> Result<executor::ExecutionResult, ServiceError> {
+    let model = external_model(fixture);
+    let provider = model.providers[0].clone();
+    let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
+    let service = executor::RuntimeExecutorService::new(Arc::new(registry));
+    let request = ExecutorServiceRequest::Effective {
+        model,
+        provider,
+        provider_index: 0,
+        prompt_mode: PromptMode::Arg,
+        prompt: "prompt-value".into(),
+        working_dir: None,
+        models_dir: None,
+        extra_inputs: HashMap::new(),
+        parent_invocation_env: Some(parent_invocation_env),
+    };
+    match authority {
+        Some(authority) => service.execute_with_live_session_authority(request, authority),
+        None => service.execute(request),
+    }
+    .map(|output| output.result)
 }
 
 fn make_external_fixture(
@@ -1088,6 +1179,9 @@ fn assert_external_dispatch_failure(
 
 #[test]
 fn runtime_executor_dispatch_no_ref_preserves_legacy_bytes_with_unrelated_registry() {
+    if isolated_case() {
+        return;
+    }
     let legacy = fixture_script(
         r#"printf 'out:%b:%s\n' '\000\377' "$1"
 printf 'err:%b:%s\n' '\376' "$1" >&2"#,
@@ -1139,6 +1233,9 @@ printf 'err:%b:%s\n' '\376' "$1" >&2"#,
 
 #[test]
 fn runtime_executor_dispatch_no_ref_does_not_construct_or_invoke_provider_client() {
+    if isolated_case() {
+        return;
+    }
     let legacy = fixture_script("printf 'legacy:%s\\n' \"$1\"");
     let counter = tempfile::NamedTempFile::new().expect("counter");
     fs::write(counter.path(), "0").expect("initialize counter");
@@ -1185,6 +1282,9 @@ fn runtime_executor_dispatch_no_ref_does_not_construct_or_invoke_provider_client
 
 #[test]
 fn model_scoped_crate_reference_does_not_create_account_endpoint_authority() {
+    if isolated_case() {
+        return;
+    }
     let legacy = fixture_script("printf 'legacy fallback\\n'; exit 77");
     let model = crate_external_model(&legacy);
     let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
@@ -1209,6 +1309,9 @@ fn model_scoped_crate_reference_does_not_create_account_endpoint_authority() {
 
 #[test]
 fn external_provider_missing_policy_or_launch_capability_fails_without_builtin_fallback() {
+    if isolated_case() {
+        return;
+    }
     for capabilities in [
         Capabilities {
             policy: false,
@@ -1232,6 +1335,9 @@ fn external_provider_missing_policy_or_launch_capability_fails_without_builtin_f
 
 #[test]
 fn external_provider_missing_launch_output_capability_requires_provider_upgrade() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -1257,6 +1363,9 @@ fn external_provider_missing_launch_output_capability_requires_provider_upgrade(
 
 #[test]
 fn external_provider_policy_evaluate_runs_before_launch_and_uses_selected_provider_settings() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -1305,6 +1414,9 @@ fn external_provider_policy_evaluate_runs_before_launch_and_uses_selected_provid
 
 #[test]
 fn external_dispatch_keeps_the_capability_advertiser_after_path_replacement() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_describe_replacing_external_fixture();
 
     let result = execute_external_fixture(&fixture)
@@ -1323,6 +1435,9 @@ fn external_dispatch_keeps_the_capability_advertiser_after_path_replacement() {
 
 #[test]
 fn external_provider_policy_request_passes_hybrid_launch_shape() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -1361,6 +1476,9 @@ fn external_provider_policy_request_passes_hybrid_launch_shape() {
 
 #[test]
 fn external_provider_launch_request_carries_selected_settings_id_and_effective_inputs() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -1536,6 +1654,9 @@ fn assert_no_arg_mode_stdin(launch: &Value) {
 
 #[test]
 fn unrelated_fixture_cannot_publish_or_clear_custody_markers_from_ambient_env() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let dir = tempfile::tempdir().unwrap();
     let pid = dir.path().join("selected.pid");
@@ -1585,6 +1706,9 @@ fn unrelated_fixture_cannot_publish_or_clear_custody_markers_from_ambient_env() 
 
 #[test]
 fn external_provider_post_spawn_failures_reap_before_fenced_generation_exit() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     for (fault, invocation_uuid, terminal_reason, expect_bound_pid) in [
         (
@@ -1606,6 +1730,9 @@ fn external_provider_post_spawn_failures_reap_before_fenced_generation_exit() {
 
 #[test]
 fn external_provider_success_reaps_and_completes_the_exact_generation_orderly() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let dir = tempfile::tempdir().expect("custody tempdir");
     let data_dir = dir.path().join("data");
@@ -1645,7 +1772,10 @@ fn external_provider_success_reaps_and_completes_the_exact_generation_orderly() 
         .expect("numeric provider pid");
     assert_external_child_reaped(pid);
     let proxy: libc::pid_t = fs::read_to_string(format!("{}.proxy", pid_path.display()))
-        .expect("validated custody group leader recorded before host cleanup").trim().parse().unwrap();
+        .expect("validated custody group leader recorded before host cleanup")
+        .trim()
+        .parse()
+        .unwrap();
     assert_ne!(pid, proxy);
     assert_external_child_reaped(proxy);
     assert_external_terminal_generation(
@@ -1698,10 +1828,24 @@ fn run_external_child_custody_fault(
         .parse::<libc::pid_t>()
         .expect("numeric provider pid");
     let proxy: libc::pid_t = fs::read_to_string(format!("{}.proxy", pid_path.display()))
-        .expect("validated custody group leader recorded before host cleanup").trim().parse().unwrap();
+        .expect("validated custody group leader recorded before host cleanup")
+        .trim()
+        .parse()
+        .unwrap();
     let custodian: libc::pid_t = fs::read_to_string(format!("{}.custodian", pid_path.display()))
-        .unwrap().trim().parse().unwrap();
-    diagnose_external_custody_return(&data_dir, &pid_path, invocation_uuid, fault, pid, proxy, custodian);
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    diagnose_external_custody_return(
+        &data_dir,
+        &pid_path,
+        invocation_uuid,
+        fault,
+        pid,
+        proxy,
+        custodian,
+    );
     assert_external_child_reaped(pid);
     assert_ne!(pid, proxy);
     assert_external_child_reaped(proxy);
@@ -1727,7 +1871,12 @@ fn diagnose_external_custody_return(
     let start = std::time::Instant::now();
     let immediate = [workload, proxy].map(|pid| {
         let rc = unsafe { libc::kill(pid, 0) };
-        (rc, (rc == -1).then(|| io::Error::last_os_error().raw_os_error()).flatten())
+        (
+            rc,
+            (rc == -1)
+                .then(|| io::Error::last_os_error().raw_os_error())
+                .flatten(),
+        )
     });
     let identities = fs::read_to_string(format!("{}.identities", pid_path.display())).unwrap();
     eprintln!("custody fault={fault} invocation={invocation} captured identities={identities}");
@@ -1737,7 +1886,16 @@ fn diagnose_external_custody_return(
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
-        let row: (String, String, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>) = connection.query_row(
+        type NativeRuntimeObservation = (
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let row: NativeRuntimeObservation = connection.query_row(
             "SELECT generation_uuid,lifecycle_state,spawned_os_pid,running_at,draining_at,exited_at,terminal_reason FROM runtime_generation WHERE spawn_invocation_uuid=?1",
             [invocation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).unwrap();
         let q = oulipoly_core::launch_custody::is_quiescent(
@@ -1831,6 +1989,9 @@ fn assert_external_terminal_generation(
 
 #[test]
 fn external_provider_launch_env_inherits_parent_environment_with_runner_overrides() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let xdg_data = tempdir_path("xdg data tempdir");
     let expected_data_dir = runner_data_dir_from_xdg(&xdg_data.path);
@@ -1877,6 +2038,9 @@ fn external_provider_launch_env_inherits_parent_environment_with_runner_override
 
 #[test]
 fn external_provider_launch_env_separates_completion_authority_from_parent_identity() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let data_dir = tempdir_path("completion authority data tempdir");
     let _env = EnvScope::set_optional(&[
@@ -1940,6 +2104,9 @@ fn external_provider_launch_env_separates_completion_authority_from_parent_ident
 
 #[test]
 fn external_provider_launch_env_inherits_application_agnostic_parent_entries() {
+    if isolated_case() {
+        return;
+    }
     const JIRA_ENV: &str = "JIRA_API_KEY_REALLY";
     const JIRA_VALUE: &str = "synthetic-jira-api-key-really";
     const SENTINEL_ENV: &str = "UNRELATED_AMBIENT_SENTINEL";
@@ -1982,6 +2149,9 @@ fn external_provider_launch_env_inherits_application_agnostic_parent_entries() {
 
 #[test]
 fn external_provider_launch_env_removes_runner_private_entries() {
+    if isolated_case() {
+        return;
+    }
     assert_test_catalog_extension();
     let private_names = runner_private_environment_names();
     let _lock = env_lock();
@@ -2021,6 +2191,9 @@ fn external_provider_launch_env_removes_runner_private_entries() {
 
 #[test]
 fn external_provider_subcommands_do_not_inherit_runner_private_authority() {
+    if isolated_case() {
+        return;
+    }
     assert_test_catalog_extension();
     let private_names = runner_private_environment_names();
     let _lock = env_lock();
@@ -2084,6 +2257,9 @@ fn external_provider_subcommands_do_not_inherit_runner_private_authority() {
 
 #[test]
 fn external_provider_policy_cannot_reintroduce_runner_private_launch_authority() {
+    if isolated_case() {
+        return;
+    }
     assert_test_catalog_extension();
     let auto_wake_names = auto_wake_environment_names();
     let _lock = env_lock();
@@ -2147,6 +2323,9 @@ fn external_provider_policy_cannot_reintroduce_runner_private_launch_authority()
 
 #[test]
 fn external_provider_launch_env_applies_configured_removals_then_overlays() {
+    if isolated_case() {
+        return;
+    }
     const REMOVED_ENV: &str = "CONFIG_REMOVED_ENV";
     const OVERLAID_ENV: &str = "CONFIG_OVERLAID_ENV";
 
@@ -2244,6 +2423,9 @@ fn assert_host_linkage_envs(
 
 #[test]
 fn external_provider_launch_env_does_not_apply_opencode_account_policy() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let home = tempdir_path("home tempdir");
     let ambient_xdg = tempdir_path("ambient xdg tempdir");
@@ -2314,6 +2496,9 @@ fn assert_provider_neutral_parent_envs(
 
 #[test]
 fn external_provider_launch_env_preserves_ambient_xdg_for_provider_policy() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let ambient_xdg = tempdir_path("ambient xdg tempdir");
     let _env = EnvScope::set(&[
@@ -2396,6 +2581,9 @@ fn env_string<'a>(env: &'a serde_json::Map<String, Value>, key: &str) -> Option<
 
 #[test]
 fn external_provider_validates_schema_inputs_before_policy_or_launch() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2451,6 +2639,9 @@ fn external_provider_validates_schema_inputs_before_policy_or_launch() {
 
 #[test]
 fn external_provider_policy_rejection_skips_launch() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2484,6 +2675,9 @@ fn external_provider_policy_rejection_skips_launch() {
 
 #[test]
 fn external_provider_policy_request_preserves_provider_owned_settings_id() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2544,6 +2738,9 @@ fn external_provider_policy_request_preserves_provider_owned_settings_id() {
 
 #[test]
 fn external_provider_policy_transform_applies_once_and_no_legacy_double_policy() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2586,6 +2783,9 @@ fn external_provider_policy_transform_applies_once_and_no_legacy_double_policy()
 
 #[test]
 fn explicit_account_endpoint_dispatches_without_legacy_fallback() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2607,6 +2807,9 @@ fn explicit_account_endpoint_dispatches_without_legacy_fallback() {
 
 #[test]
 fn explicit_account_endpoint_receives_negotiated_prompt_acceptance() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2643,6 +2846,9 @@ fn explicit_account_endpoint_receives_negotiated_prompt_acceptance() {
 
 #[test]
 fn external_provider_launch_preserves_stdout_bytes_and_maps_stderr_boundary() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2670,6 +2876,9 @@ fn external_provider_launch_preserves_stdout_bytes_and_maps_stderr_boundary() {
 
 #[test]
 fn external_provider_launch_spools_output_beyond_diagnostic_retention() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2695,6 +2904,9 @@ fn external_provider_launch_spools_output_beyond_diagnostic_retention() {
 
 #[test]
 fn external_provider_launch_nonzero_final_exit_is_execution_result() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2713,6 +2925,9 @@ fn external_provider_launch_nonzero_final_exit_is_execution_result() {
 
 #[test]
 fn external_provider_launch_provider_nonzero_after_final_is_diagnostic_only() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2731,6 +2946,9 @@ fn external_provider_launch_provider_nonzero_after_final_is_diagnostic_only() {
 
 #[test]
 fn external_provider_launch_malformed_stream_is_protocol_failure_not_model_exit() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2749,6 +2967,9 @@ fn external_provider_launch_malformed_stream_is_protocol_failure_not_model_exit(
 
 #[test]
 fn external_provider_launch_missing_final_is_protocol_failure_not_model_exit() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2767,6 +2988,9 @@ fn external_provider_launch_missing_final_is_protocol_failure_not_model_exit() {
 
 #[test]
 fn external_provider_launch_invalid_base64_is_protocol_failure_not_model_exit() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2785,6 +3009,9 @@ fn external_provider_launch_invalid_base64_is_protocol_failure_not_model_exit() 
 
 #[test]
 fn external_provider_launch_timeout_or_host_transport_failure_is_not_model_exit() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2803,6 +3030,9 @@ fn external_provider_launch_timeout_or_host_transport_failure_is_not_model_exit(
 
 #[test]
 fn external_provider_launch_host_cancelled_before_final_uses_cancellation_fallback_message() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2844,6 +3074,9 @@ fn external_provider_launch_host_cancelled_before_final_uses_cancellation_fallba
 
 #[test]
 fn external_provider_launch_provider_nonzero_before_final_is_transport_failure_not_model_exit() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2862,6 +3095,9 @@ fn external_provider_launch_provider_nonzero_before_final_is_transport_failure_n
 
 #[test]
 fn external_provider_launch_provider_emitted_cancelled_final_event_maps_minimal_cancel_outcome() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2880,6 +3116,9 @@ fn external_provider_launch_provider_emitted_cancelled_final_event_maps_minimal_
 
 #[test]
 fn external_provider_launch_minimal_terminal_scope_uses_final_event_not_standalone_classify() {
+    if isolated_case() {
+        return;
+    }
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -2903,6 +3142,28 @@ fn external_provider_launch_minimal_terminal_scope_uses_final_event_not_standalo
 
 #[test]
 fn live_attachment_error_dispatch_retains_partial_output_and_new_return_reference() {
+    if isolated_case() {
+        return;
+    }
+    live_session_failure_retains_evidence("attachment");
+}
+
+#[test]
+fn authority_publication_failure_dispatch_retains_partial_output_and_return_reference() {
+    if isolated_case() {
+        return;
+    }
+    for case in [
+        "state_commit",
+        "state_open",
+        "missing_target",
+        "wrong_actor",
+    ] {
+        live_session_failure_retains_evidence(case);
+    }
+}
+
+fn live_session_failure_retains_evidence(case: &str) {
     use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
     use sha2::{Digest, Sha256};
     let _lock = env_lock();
@@ -2970,18 +3231,75 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
         serde_json::to_vec(&artifact).unwrap(),
     )
     .unwrap();
+    let state = oulipoly_state::StateDb::open(&data_dir.join("state.db")).unwrap();
+    let id = state
+        .start_invocation(&oulipoly_state::InvocationStart {
+            invocation_uuid: uuid.into(),
+            model_name: "fixture".into(),
+            provider_name: external_model(&fixture).providers[0].name.clone(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    let mut authority = Some(oulipoly_runtime::services::LiveSessionAuthorityTarget {
+        state_path: state.path().to_path_buf(),
+        invocation_row_id: id,
+        invocation_uuid: uuid.into(),
+    });
+    if case != "attachment" {
+        // The publication experiment must not accidentally trigger the sidecar failure.
+        let body = fs::read_to_string(&fixture.provider_path).unwrap();
+        let trigger = "        db.execute(\"CREATE TRIGGER reject_fixture_attachment BEFORE UPDATE OF session_id ON runtime_generation BEGIN SELECT RAISE(ABORT, 'fixture storage fault'); END\")";
+        assert!(body.contains(trigger));
+        fs::write(
+            &fixture.provider_path,
+            body.replace(trigger, "        pass"),
+        )
+        .unwrap();
+    }
+    match case {
+        "state_commit" => Connection::open(state.path()).unwrap().execute_batch("CREATE TRIGGER fail_binding BEFORE UPDATE OF provider_session_id ON invocations BEGIN SELECT RAISE(ABORT, 'fixture persistence fault'); END;").unwrap(),
+        "state_open" => authority.as_mut().unwrap().state_path = data_dir.clone(),
+        "missing_target" => authority = None,
+        "wrong_actor" => authority.as_mut().unwrap().invocation_uuid = uuid::Uuid::new_v4().to_string(),
+        "attachment" => (),
+        _ => panic!("unknown fixture case"),
+    }
     let invocation = serde_json::json!({"source": "fixture", "id": uuid}).to_string();
-    let result =
-        execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(invocation))
-            .expect("typed failed result must survive observer transport failure");
+    let result = execute_external_fixture_with_authority(&fixture, invocation, authority)
+        .expect("typed failed result must survive observer transport failure");
+    eprintln!(
+        "live failure case={case} reason={:?} signal={:?}",
+        result.terminal_reason, result.terminal_signal
+    );
     assert_eq!(result.exit_code, -1);
     assert_eq!(
         result.terminal_reason.as_deref(),
-        Some("runtime_generation_attach_failed")
+        Some(if case == "attachment" {
+            "runtime_generation_attach_failed"
+        } else {
+            "live_session_authority_publication_failed"
+        })
     );
     assert_eq!(
         result.session_capture.session_id.as_deref(),
-        Some("example-session")
+        (case == "attachment").then_some("example-session")
+    );
+    assert_eq!(
+        state
+            .get_invocation_by_uuid(uuid)
+            .unwrap()
+            .unwrap()
+            .provider_session_id
+            .as_deref(),
+        (case == "attachment").then_some("example-session")
+    );
+    assert_eq!(
+        state
+            .invocation_provider_session_authority(id)
+            .unwrap()
+            .is_some(),
+        case == "attachment"
     );
     let launch = read_json(&fixture.launch_record_path);
     let oulipoly_runtime::executor::SessionCaptureMethod::ExternalProviderLaunch(authority) =
@@ -3000,11 +3318,23 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
     assert_eq!(authority.settings_id, launch["params"]["settings_id"]);
     let signal = result.terminal_signal.as_ref().unwrap();
     assert_eq!(signal.kind, TerminalSignalKind::SpawnError);
+    let expected_cause = match case {
+        "attachment" => "cause=StorageFailure",
+        "state_commit" => "cause=session_identity_commit_failed",
+        "state_open" => "cause=live_session_authority_state_open_failed",
+        "missing_target" => "cause=live_session_authority_target_missing",
+        "wrong_actor" => "cause=live_session_authority_launch_identity_mismatch",
+        _ => unreachable!(),
+    };
     assert!(
-        signal.evidence.contains("cause=StorageFailure"),
+        signal.evidence.contains(expected_cause),
         "{}",
         signal.evidence
     );
+    if case != "attachment" {
+        assert!(!signal.evidence.contains("runtime_generation_attach_failed"));
+        assert!(!signal.evidence.contains("fixture persistence fault"));
+    }
     assert!(
         signal.evidence.contains("cleanup=Ok(Applied)"),
         "{}",
@@ -3014,6 +3344,7 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
     assert!(!signal.evidence.contains("fixture storage fault"));
     assert!(!result.produced_assistant_response);
     assert!(result.prompt_acceptance_attestation.is_none());
+    assert!(result.resume_acceptance.is_none());
     let spool = result.output_spool.as_ref().unwrap();
     assert_eq!(
         spool.incomplete_output_bytes().unwrap(),
@@ -3036,16 +3367,6 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
     let reference = &result.returned_artifacts[0];
     assert_eq!(reference.sha256, format!("{:x}", Sha256::digest(&payload)));
     assert_eq!(reference.content_len, payload.len() as u64);
-    let state = oulipoly_state::StateDb::open(&data_dir.join("state.db")).unwrap();
-    let id = state
-        .start_invocation(&oulipoly_state::InvocationStart {
-            invocation_uuid: uuid.into(),
-            model_name: "fixture".into(),
-            provider_name: "provider-a".into(),
-            provider_index: 0,
-            parent_invocation_id: None,
-        })
-        .unwrap();
     assert!(state.list_returned_artifacts(id).unwrap().is_empty());
     result
         .retain_failed_finalization_evidence(&state, id, uuid)
@@ -3084,7 +3405,10 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
         .unwrap();
     assert_external_child_reaped(pid);
     let proxy: libc::pid_t = fs::read_to_string(format!("{}.proxy", pid_path.display()))
-        .expect("published generation proxy").trim().parse().unwrap();
+        .expect("published generation proxy")
+        .trim()
+        .parse()
+        .unwrap();
     assert_ne!(pid, proxy);
     assert_external_child_reaped(proxy);
     assert_external_terminal_generation(
@@ -3119,6 +3443,9 @@ fn live_attachment_error_dispatch_retains_partial_output_and_new_return_referenc
 
 #[test]
 fn standalone_verified_missing_final_retains_binary_prefix_and_reports_storage_failure() {
+    if isolated_case() {
+        return;
+    }
     let _lock = env_lock();
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
@@ -3158,7 +3485,7 @@ fn standalone_verified_missing_final_retains_binary_prefix_and_reports_storage_f
             .start_invocation(&oulipoly_state::InvocationStart {
                 invocation_uuid: uuid.clone(),
                 model_name: "fixture".into(),
-                provider_name: "provider-a".into(),
+                provider_name: external_model(&fixture).providers[0].name.clone(),
                 provider_index: 0,
                 parent_invocation_id: None,
             })
@@ -3170,9 +3497,20 @@ fn standalone_verified_missing_final_retains_binary_prefix_and_reports_storage_f
         if blocked {
             fs::create_dir(&paths.stdout).unwrap();
         }
-        let result =
-            execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(parent))
-                .unwrap();
+        let result = execute_external_fixture_with_authority(
+            &fixture,
+            parent,
+            Some(oulipoly_runtime::services::LiveSessionAuthorityTarget {
+                state_path: state.path().to_path_buf(),
+                invocation_row_id: id,
+                invocation_uuid: uuid.clone(),
+            }),
+        )
+        .unwrap();
+        eprintln!(
+            "missing-final case blocked={blocked} reason={:?} signal={:?}",
+            result.terminal_reason, result.terminal_signal
+        );
         assert_eq!(
             result.terminal_reason.as_deref(),
             Some("external_provider_missing_final_exit")
@@ -3217,4 +3555,256 @@ fn standalone_verified_missing_final_retains_binary_prefix_and_reports_storage_f
         assert_eq!(count, 0);
         assert!(!fixture.legacy_record_path.exists());
     }
+}
+
+#[test]
+fn native_allocated_cancellation_retains_returned_artifact_custody() {
+    if isolated_case() {
+        return;
+    }
+    native_return_cancellation("committed");
+}
+#[test]
+fn native_allocated_cancellation_preserves_quarantine_ownership_gap() {
+    if isolated_case() {
+        return;
+    }
+    native_return_cancellation("quarantined");
+}
+#[test]
+fn native_allocated_cancellation_preserves_cleanup_ownership_gap() {
+    if isolated_case() {
+        return;
+    }
+    native_return_cancellation("cleanup_failed");
+}
+fn native_return_cancellation(channel_mode: &str) {
+    use oulipoly_state::{
+        BeginProviderLaunchRequest, ProviderLaunchAttemptAllocation, ProviderLaunchCandidate,
+        ProviderLaunchStartMode, StateDb,
+    };
+    if let Ok(channel) = std::env::var("AGE360_NATIVE_RETURN_HELPER_CHANNEL") {
+        native_return_helper(&channel);
+        return;
+    }
+    let _lock = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let _env = EnvScope::set_optional(&[("OULIPOLY_DATA_DIR", Some(data.to_str().unwrap()))]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let model = external_model(&fixture);
+    let registry = dispatch_registry_for_model(&model);
+    let state = StateDb::open(&data.join("state.db")).unwrap();
+    let allocation = ProviderLaunchAttemptAllocation::allocate().unwrap();
+    let lease = state
+        .begin_launch(&BeginProviderLaunchRequest {
+            logical_launch_id: uuid::Uuid::new_v4(),
+            request_identity_sha256: "d".repeat(64),
+            model_name: model.name.clone(),
+            start_mode: ProviderLaunchStartMode::Create,
+            expected_provider_session_id: None,
+            candidates: vec![ProviderLaunchCandidate {
+                provider_index: 0,
+                account_name: model.providers[0].name.clone(),
+            }],
+            parent_invocation_id: None,
+            allocation: allocation.clone(),
+        })
+        .unwrap();
+    state
+        .activate_attempt(&lease, &allocation.completion_authority)
+        .unwrap();
+    // The provider writes a producer-bound receipt on its actual supplied channel,
+    // then remains live. State cancellation is requested only after that write.
+    let script = fs::read_to_string(&fixture.provider_path).unwrap();
+    let insert = r#"    import signal, time, subprocess
+    producer = json.loads(_request['params']['env']['OULIPOLY_PARENT_INVOCATION'])['id']
+    helper_env = dict(os.environ)
+    helper_env['AGE360_NATIVE_RETURN_HELPER_CHANNEL'] = _request['params']['env']['OULIPOLY_RETURN_CHANNEL']
+    helper_env['AGE360_NATIVE_RETURN_HELPER_PRODUCER'] = producer
+    helper_env['AGE360_NATIVE_RETURN_HELPER_DB'] = str(LAUNCH_RECORD.parent / 'native-artifact-store.db')
+    subprocess.run([NATIVE_RETURN_HELPER, '--exact', 'native_allocated_cancellation_retains_returned_artifact_custody'], env=helper_env, check=True, stdout=subprocess.DEVNULL)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    (LAUNCH_RECORD.parent / 'native-return-ready').touch()
+    while True: time.sleep(.01)
+"#;
+    let insert = insert.replace(
+        "[NATIVE_RETURN_HELPER,",
+        &format!(
+            "[{},",
+            serde_json::to_string(&std::env::current_exe().unwrap()).unwrap()
+        ),
+    );
+    let channel_fault = match channel_mode {
+        "quarantined" => {
+            "    with open(_request['params']['env']['OULIPOLY_RETURN_CHANNEL'], 'a') as channel: channel.write('malformed\\n')\n"
+        }
+        "cleanup_failed" => {
+            "    (pathlib.Path(_request['params']['env']['OULIPOLY_RETURN_CHANNEL']).parent / 'retained-cleanup-obligation').touch()\n"
+        }
+        _ => "",
+    };
+    let insert = insert.replace(
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+        &format!("{channel_fault}    signal.signal(signal.SIGTERM, signal.SIG_IGN)"),
+    );
+    fs::write(
+        &fixture.provider_path,
+        script.replace(
+            "    reqid = request_id(_request)\n",
+            &format!("    reqid = request_id(_request)\n{insert}"),
+        ),
+    )
+    .unwrap();
+    let ready = fixture._dir.path().join("native-return-ready");
+    let path = state.path().to_path_buf();
+    let launch = lease.owner.logical_launch_id;
+    let cancel = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "test provider did not reach returned-artifact barrier"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        StateDb::open(&path)
+            .unwrap()
+            .request_cancel(launch)
+            .unwrap();
+    });
+    let outcome = executor::execute_native_allocated_provider_attempt(
+        &registry,
+        ExecutorServiceRequest::Facade {
+            model,
+            provider_index: 0,
+            prompt: "produce then cancel".into(),
+            working_dir: Some(fixture._dir.path().to_path_buf()),
+            models_dir: None,
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: None,
+        },
+        executor::AllocatedProviderLaunchAttempt {
+            lease: lease.clone(),
+            completion_authority: allocation.completion_authority,
+            state_db_path: state.path().to_path_buf(),
+            mailbox_db_path: data.join("pid-identity.db"),
+            channel_root: data.clone(),
+            parent_invocation_uuid: uuid::Uuid::new_v4(),
+        },
+    );
+    cancel.join().unwrap();
+    assert!(
+        matches!(outcome, executor::ProviderLaunchAttemptOutcome::Failed(_)),
+        "{outcome:?}"
+    );
+    let retained = state
+        .native_attempt_custody(lease.runtime_generation_uuid, lease.owner.invocation_uuid)
+        .unwrap()
+        .unwrap();
+    println!("actual retained actor/channel receipts={retained}");
+    let settlement = executor::settle_retained_native_cancellation(
+        &state,
+        lease.runtime_generation_uuid,
+        lease.owner.invocation_uuid,
+    );
+    match channel_mode {
+        "committed" => settlement.unwrap(),
+        "quarantined" => assert_eq!(
+            settlement.unwrap_err(),
+            "native_channel_continuing_domain_owner_absent"
+        ),
+        "cleanup_failed" => assert_eq!(
+            settlement.unwrap_err(),
+            "native_channel_continuing_domain_owner_absent"
+        ),
+        _ => unreachable!(),
+    }
+    let refs = state
+        .list_returned_artifacts(lease.owner.invocation_row_id)
+        .unwrap();
+    assert_eq!(refs.len(), 1);
+    use sha2::{Digest, Sha256};
+    let artifact = oulipoly_agent_messenger::show_returned(
+        oulipoly_agent_messenger::ShowReturnedRequest::VersionId {
+            db_path: fixture._dir.path().join("native-artifact-store.db"),
+            version_id: refs[0].version_id.clone(),
+        },
+    )
+    .unwrap();
+    let bytes = artifact.content;
+    assert_eq!(bytes, b"actual-native-return");
+    assert_eq!(refs[0].sha256, format!("{:x}", Sha256::digest(&bytes)));
+    assert_eq!(refs[0].content_len, bytes.len() as u64);
+    assert_eq!(
+        refs[0].producer_invocation_uuid,
+        lease.owner.invocation_uuid
+    );
+    let status: String = state
+        .connection()
+        .query_row(
+            "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+            [launch.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        status,
+        if channel_mode == "committed" {
+            "cancelled"
+        } else {
+            "cancelling"
+        }
+    );
+}
+
+// Executed inside the actual provider tree, with its allocated producer identity
+// and actual return channel. No fabricated store address or pre-linked State row.
+fn native_return_helper(channel: &str) {
+    let db = PathBuf::from(std::env::var("AGE360_NATIVE_RETURN_HELPER_DB").unwrap());
+    let source = include_str!("../../oulipoly-agent-store/src/lib.rs");
+    let schema = source
+        .split("fn install_schema(")
+        .nth(1)
+        .unwrap()
+        .split("r#\"")
+        .nth(1)
+        .unwrap()
+        .split("\"#")
+        .next()
+        .unwrap();
+    let version_sql = source
+        .split("fn initialize_schema_version(")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .nth(1)
+        .unwrap();
+    let connection = Connection::open(&db).unwrap();
+    connection.execute_batch(schema).unwrap();
+    connection.execute(version_sql, []).unwrap();
+    drop(connection);
+    oulipoly_agent_messenger::return_artifact(oulipoly_agent_messenger::ReturnRequest {
+        db_path: db,
+        invocation_uuid: std::env::var("AGE360_NATIVE_RETURN_HELPER_PRODUCER")
+            .unwrap()
+            .parse()
+            .unwrap(),
+        name: oulipoly_agent_messenger::ReturnName::new("result").unwrap(),
+        source: oulipoly_agent_messenger::ReturnSource::InlineBytes(
+            b"actual-native-return".to_vec(),
+        ),
+        format_hint: None,
+        verdict_line: None,
+        return_channel: Some(PathBuf::from(channel)),
+    })
+    .unwrap();
 }

@@ -36,7 +36,7 @@ fn run_ack_case(completed: bool, unpause_mode: &str) {
     );
     let completion = if completed {
         r#"    if code == 0:
-        stdout += b"Deterministic assistant completed real receipt, log read and exact ACK.\n"
+        stdout += b"Deterministic assistant completed real receipt, immutable output read and exact ACK.\n"
         event(request, seq, "marker", name="oulipoly.produced_assistant_response", value=True)
         seq += 1
 
@@ -71,8 +71,7 @@ fn run_ack_case(completed: bool, unpause_mode: &str) {
         let unpause = fixture.run(command);
         assert_eq!(unpause.status.code(), Some(0), "{unpause:?}");
         let response: serde_json::Value = serde_json::from_slice(&unpause.stdout).unwrap();
-        assert_eq!(response["paused"], false);
-        assert_eq!(response["wake"]["status"], "spawned");
+        assert_pending_owner_receipt(&response);
     }
     wait_until("immediate ACK and both terminal invocations", || {
         if !fixture.prompt_file("early-ack-verified.json").exists() {
@@ -87,6 +86,19 @@ fn run_ack_case(completed: bool, unpause_mode: &str) {
         .unwrap()
             == 2
     });
+    assert_eq!(
+        std::fs::read(fixture.prompt_file("early-ack-payload.txt")).unwrap(),
+        b"early-ack-payload\n"
+    );
+    let receipt =
+        std::fs::read_to_string(fixture.prompt_file("early-ack-original-receipt.json")).unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(receipt["diagnostic_distinct"], true);
+    assert_eq!(
+        receipt["original_hex"],
+        "6561726c792d61636b2d7061796c6f61640a"
+    );
+    println!("actual original-output consumer receipt={receipt}");
     let db = Connection::open(fixture.state_path()).unwrap();
     let mut query = db
         .prepare("SELECT status,success,exit_code,terminal_reason FROM invocations ORDER BY id")
@@ -118,13 +130,14 @@ fn run_ack_case(completed: bool, unpause_mode: &str) {
             "{invocations:?}"
         );
     } else {
-        assert!(
-            invocations
-                .iter()
-                .any(|row| row.0 == "failed" && !row.1 && row.2 == 23),
-            "{invocations:?}"
-        );
+        assert_eq!(invocations[0].0, "succeeded");
+        assert!(invocations[0].1 && invocations[0].2 == 0);
+        assert_eq!(invocations[1].0, "failed");
+        assert!(!invocations[1].1);
+        assert_eq!(invocations[1].2, 23);
+        assert_eq!(invocations[1].3.as_deref(), Some("exit_nonzero"));
     }
+    println!("actual initial/resumed terminal outcomes={invocations:?}");
     let mailbox = fixture.mailbox();
     let rows = mailbox.list_mailbox(SESSION, true).unwrap();
     assert_eq!(rows.len(), 1);
@@ -173,7 +186,19 @@ fn run_ack_case(completed: bool, unpause_mode: &str) {
         let settled = fixture.run(command);
         assert_eq!(settled.status.code(), Some(0), "{settled:?}");
         let response: serde_json::Value = serde_json::from_slice(&settled.stdout).unwrap();
-        assert_eq!(response["wake"]["status"], "no_pending");
+        assert_pending_owner_receipt(&response);
+        // Wait for the independent owner to finish its actual scan/retirement;
+        // receipt status says nothing about whether work was pending.
+        wait_until(
+            "settled unpause owner retires without another launch",
+            || {
+                fixture
+                    .mailbox()
+                    .completion_continuation_owner()
+                    .unwrap()
+                    .is_none()
+            },
+        );
         assert_eq!(
             db.query_row("SELECT COUNT(*) FROM invocations", [], |row| row
                 .get::<_, i64>(0))
@@ -181,4 +206,32 @@ fn run_ack_case(completed: bool, unpause_mode: &str) {
             2
         );
     }
+    fixture.assert_recovery_drained(SESSION);
+    assert_eq!(
+        sidecar
+            .query_row(
+                "SELECT COUNT(*) FROM completion_continuation_attempt WHERE session_id=?1",
+                [SESSION],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.work_dir.join("provider-resume-sequence.txt")).unwrap(),
+        "1"
+    );
+}
+
+fn assert_pending_owner_receipt(response: &serde_json::Value) {
+    assert_eq!(response["session_id"], SESSION);
+    assert_eq!(response["paused"], false);
+    assert_eq!(
+        response["wake"],
+        serde_json::json!({
+            "attempted": false, "status": "independent_owner_pending",
+            "claim_token": null, "wake_pid": null, "auto_wake_count": null, "message": null
+        })
+    );
+    println!("independent-owner handoff receipt={response}");
 }

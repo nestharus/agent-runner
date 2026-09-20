@@ -32,6 +32,29 @@ pub(crate) struct ObservationProgress {
     pub(crate) matching_turn_id: Option<String>,
     pub(crate) matching_turns: u64,
     pub(crate) complete: bool,
+    #[serde(default)]
+    pub(crate) stale_refresh_attempted: bool,
+}
+
+#[derive(Debug)]
+enum ObservationReadFailureKind {
+    StaleContinuation,
+    Other,
+}
+
+#[derive(Debug)]
+struct ObservationReadFailure {
+    kind: ObservationReadFailureKind,
+    diagnostic: String,
+}
+
+impl ObservationReadFailure {
+    fn other(diagnostic: String) -> Self {
+        Self {
+            kind: ObservationReadFailureKind::Other,
+            diagnostic,
+        }
+    }
 }
 
 impl ObservationProgress {
@@ -106,7 +129,7 @@ pub(crate) fn confirm_delivery_observation_bounded(
     // changed adapter cannot inherit weaker cached matches or later cursors.
     let reader_identity = endpoint.client().pinned_executable_identity_sha256()?;
     let cancellation = CancellationToken::new();
-    observe_delivery_for_revision_with(
+    observe_delivery_for_revision_typed_with(
         db,
         attempt_id,
         anchor,
@@ -135,7 +158,7 @@ pub(crate) fn confirm_delivery_observation_bounded(
                 timeout: remaining.min(OBSERVATION_TIMEOUT),
             })
             .map_err(|error| {
-                retain_observation_failure(db, &anchor.provider_session_id, attempt_id, error)
+                classify_observation_failure(db, &anchor.provider_session_id, attempt_id, error)
             })
         },
     )
@@ -197,6 +220,44 @@ pub(crate) fn observe_delivery_bounded_with(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn observe_delivery_stale_fixture_with(
+    db: &MailboxDb,
+    attempt_id: &str,
+    anchor: &MailboxDeliveryObservationAnchor,
+    mut read: impl FnMut(
+        SessionProviderPageCursor,
+        u64,
+        u64,
+        Duration,
+    ) -> Result<
+        oulipoly_runtime::session_provider::SessionProviderReadPageResult,
+        bool,
+    >,
+) -> Result<bool, String> {
+    observe_delivery_for_revision_typed_with(
+        db,
+        attempt_id,
+        anchor,
+        OBSERVATION_MAX_PAGES,
+        OBSERVATION_DEADLINE,
+        "offline-fixture-v1",
+        move |cursor, page_index, turn_sequence, remaining| {
+            read(cursor, page_index, turn_sequence, remaining).map_err(|stale| {
+                if stale {
+                    ObservationReadFailure {
+                        kind: ObservationReadFailureKind::StaleContinuation,
+                        diagnostic: "session_turn_page_token_stale".into(),
+                    }
+                } else {
+                    ObservationReadFailure::other("fixture observation error".into())
+                }
+            })
+        },
+    )
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn observe_delivery_for_revision_with(
     db: &MailboxDb,
@@ -213,6 +274,38 @@ pub(crate) fn observe_delivery_for_revision_with(
     ) -> Result<
         oulipoly_runtime::session_provider::SessionProviderReadPageResult,
         String,
+    >,
+) -> Result<bool, String> {
+    observe_delivery_for_revision_typed_with(
+        db,
+        attempt_id,
+        anchor,
+        max_pages,
+        budget,
+        reader_identity,
+        move |cursor, page_index, turn_sequence, remaining| {
+            read(cursor, page_index, turn_sequence, remaining)
+                .map_err(ObservationReadFailure::other)
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_delivery_for_revision_typed_with(
+    db: &MailboxDb,
+    attempt_id: &str,
+    anchor: &MailboxDeliveryObservationAnchor,
+    max_pages: usize,
+    budget: Duration,
+    reader_identity: &str,
+    mut read: impl FnMut(
+        SessionProviderPageCursor,
+        u64,
+        u64,
+        Duration,
+    ) -> Result<
+        oulipoly_runtime::session_provider::SessionProviderReadPageResult,
+        ObservationReadFailure,
     >,
 ) -> Result<bool, String> {
     ensure_observation_not_stopped(db, &anchor.provider_session_id)?;
@@ -248,7 +341,8 @@ pub(crate) fn observe_delivery_for_revision_with(
         db.advance_delivery_observation_progress(attempt_id, stored.as_deref(), &next)?;
         stored = Some(next);
     }
-    for _ in 0..max_pages {
+    let mut pages_read = 0usize;
+    while pages_read < max_pages {
         if progress.matching_turns > 1 {
             return Ok(false);
         }
@@ -286,10 +380,62 @@ pub(crate) fn observe_delivery_for_revision_with(
         ) {
             Ok(page) => page,
             Err(error) => {
-                db.record_delivery_observation_error(attempt_id, &error)?;
-                return Err(error);
+                if matches!(error.kind, ObservationReadFailureKind::StaleContinuation) {
+                    let derived_continuation = progress.snapshot_id.is_some()
+                        && progress.page_token.is_some()
+                        && stored.is_some();
+                    if derived_continuation
+                        && anchor.resume_token.is_some()
+                        && !progress.stale_refresh_attempted
+                    {
+                        let refreshed = ObservationProgress {
+                            receipt_policy: progress.receipt_policy,
+                            reader_identity: progress.reader_identity.clone(),
+                            stale_refresh_attempted: true,
+                            ..Default::default()
+                        };
+                        let next = serde_json::to_string(&refreshed)
+                            .map_err(|encode| encode.to_string())?;
+                        let previous = stored
+                            .as_deref()
+                            .ok_or("mailbox stale observation checkpoint missing")?;
+                        if let Err(reset_error) = db
+                            .reset_delivery_observation_progress_after_stale(
+                                attempt_id,
+                                previous,
+                                &next,
+                                "session_turn_page_token_stale: one anchor refresh selected",
+                            )
+                        {
+                            return stop_stale_observation(
+                                db,
+                                anchor,
+                                attempt_id,
+                                &format!("anchor_refresh_cas_lost: {reset_error}"),
+                            );
+                        }
+                        progress = refreshed;
+                        stored = Some(next);
+                        continue;
+                    }
+                    return stop_stale_observation(
+                        db,
+                        anchor,
+                        attempt_id,
+                        if progress.stale_refresh_attempted {
+                            "stale_after_anchor_refresh"
+                        } else if anchor.resume_token.is_none() {
+                            "immutable_anchor_unavailable"
+                        } else {
+                            "stale_cursor_was_not_a_derived_continuation"
+                        },
+                    );
+                }
+                db.record_delivery_observation_error(attempt_id, &error.diagnostic)?;
+                return Err(error.diagnostic);
             }
         };
+        pages_read += 1;
         if page.provider_instance_id != anchor.provider_instance_id
             || page.settings_id != anchor.settings_id
             || page.session_id != anchor.provider_session_id
@@ -369,6 +515,42 @@ pub(crate) fn ensure_observation_not_stopped(
     Ok(())
 }
 
+fn stop_stale_observation(
+    db: &MailboxDb,
+    anchor: &MailboxDeliveryObservationAnchor,
+    attempt_id: &str,
+    stage: &str,
+) -> Result<bool, String> {
+    let diagnostic = format!(
+        "session_turn_page_token_stale: observation stopped; stage={stage}; replay=forbidden; acknowledgement=absent"
+    );
+    db.record_delivery_observation_error(attempt_id, &diagnostic)?;
+    db.stop_mailbox_observation(
+        &anchor.provider_session_id,
+        attempt_id,
+        "session_turn_page_token_stale",
+        &diagnostic,
+    )?;
+    Err(diagnostic)
+}
+
+fn classify_observation_failure(
+    db: &MailboxDb,
+    session_id: &str,
+    attempt_id: &str,
+    error: oulipoly_runtime::session_provider::SessionProviderError,
+) -> ObservationReadFailure {
+    if error.is_stale_page_continuation() {
+        return ObservationReadFailure {
+            kind: ObservationReadFailureKind::StaleContinuation,
+            diagnostic: "session_turn_page_token_stale".into(),
+        };
+    }
+    ObservationReadFailure::other(retain_observation_failure(
+        db, session_id, attempt_id, error,
+    ))
+}
+
 pub(crate) fn retain_observation_failure(
     db: &MailboxDb,
     session_id: &str,
@@ -423,10 +605,9 @@ pub(crate) fn poll_headless_receipt_tick_with<
     let cwd = match runtime.effective_cwd {
         Some(cwd) => std::path::PathBuf::from(cwd),
         None => {
-            let state = oulipoly_state::StateDb::open_read_only(
-                &oulipoly_state::StateDb::default_path()?,
-            )
-            .map_err(|error| format!("receipt cwd recovery: {error:?}"))?;
+            let state =
+                oulipoly_state::StateDb::open_read_only(&oulipoly_state::StateDb::default_path()?)
+                    .map_err(|error| format!("receipt cwd recovery: {error:?}"))?;
             let Some(cwd) = recover_observation_cwd(&state, &anchor)? else {
                 return Ok(());
             };

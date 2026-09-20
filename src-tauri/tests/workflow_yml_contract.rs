@@ -1134,7 +1134,7 @@ fn agent_bash_integration_dependency_is_pinned_in_test_workflows() {
 }
 
 fn assert_agent_bash_action_is_pinned() {
-    const AGENT_BASH_REV: &str = "1e88d3e1d0af710d1476fdab1c105014406c28db";
+    const AGENT_BASH_REV: &str = "52975ab5449528ecc21dfce0dd31e4c6a8b9fbbf";
     let action = read_text("../../.github/actions/install-agent-bash/action.yml");
     let revision_argument = Regex::new(&format!(
         r"(?m)^\s*cargo\s+install\b[^\n]*\s--rev\s+{}(?:\s|$)",
@@ -1153,6 +1153,20 @@ fn assert_agent_bash_action_is_pinned() {
         github_env_export.is_match(&action),
         "install-agent-bash must export AGENT_BASH_BIN through GITHUB_ENV"
     );
+    for selector in ["AGENT_BASH_BIN", "AGE360_AGENT_BASH_BIN"] {
+        assert!(
+            action.contains(&format!(
+                "echo \"{selector}=$RUNNER_TEMP/agent-bash/bin/agent-bash\" >> \"$GITHUB_ENV\""
+            )),
+            "{selector} must select the same explicitly installed counterpart"
+        );
+    }
+    assert!(action.contains(
+        "/usr/bin/unshare --user --map-current-user --net --mount --pid --fork --mount-proc"
+    ));
+    assert!(action.contains("test \"$RUNNER_ENVIRONMENT\" = github-hosted"));
+    assert!(action.contains("test \"$ID:$VERSION_ID\" = ubuntu:24.04"));
+    assert!(action.contains("profile oulipoly-runner-ci-unshare /usr/bin/unshare"));
 }
 
 fn assert_agent_bash_test_workflow_ordering() {

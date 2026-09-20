@@ -7,6 +7,9 @@ rust-version.workspace = true
 [lib]
 name = "oulipoly_runtime"
 
+[features]
+age360-fault-fixtures = ["oulipoly-state/age360-fault-fixtures"]
+
 [dependencies]
 base64 = "0.22"
 ratatui = "0.30"

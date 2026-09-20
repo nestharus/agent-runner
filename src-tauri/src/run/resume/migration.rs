@@ -150,4 +150,141 @@ mod tests {
         assert!(resume_notification_must_stay_bound(true));
         assert!(!resume_notification_must_stay_bound(false));
     }
+
+    // Relocated AGE123 policy obligation. This calls the real migration entry
+    // through its existing service port; no claim or native authority is seeded.
+    // Environment is per-child so parallel tests never share auto-wake markers.
+    #[test]
+    fn notification_auto_wake_stays_bound_despite_explicit_rotation_target() {
+        const MODE: &str = "AGE123_POLICY_CHILD";
+        if let Ok(mode) = std::env::var(MODE) {
+            check_explicit_rotation_policy(mode == "auto");
+            return;
+        }
+        for mode in ["auto", "manual"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(MODE, mode);
+            for (key, sub) in [
+                ("HOME", "home"),
+                ("CODEX_HOME", "codex"),
+                ("XDG_CONFIG_HOME", "config"),
+                ("XDG_DATA_HOME", "xdg-data"),
+                ("XDG_STATE_HOME", "state"),
+                ("XDG_CACHE_HOME", "cache"),
+                ("XDG_RUNTIME_DIR", "runtime"),
+                ("OULIPOLY_DATA_DIR", "data"),
+                ("TMPDIR", "tmp"),
+            ] {
+                let path = root.path().join(sub);
+                std::fs::create_dir_all(&path).unwrap();
+                command.env(key, path);
+            }
+            if mode == "auto" {
+                command.env("OULIPOLY_AUTO_WAKE", "1");
+            }
+            let output = command.args([
+                "--exact",
+                "run::resume::migration::tests::notification_auto_wake_stays_bound_despite_explicit_rotation_target",
+                "--nocapture",
+            ]).output().unwrap();
+            assert!(output.status.success(), "{mode}: {output:?}");
+            println!(
+                "policy child mode={mode} status={} stdout={:?} stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                stdout.contains("test result: ok. 1 passed; 0 failed"),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains(&format!(
+                    "policy auto={} calls={}",
+                    mode == "auto",
+                    usize::from(mode == "manual")
+                )),
+                "{stdout}"
+            );
+            println!("isolated {mode}: real migration-entry service discrimination passed");
+        }
+    }
+
+    fn check_explicit_rotation_policy(auto: bool) {
+        use oulipoly_runtime::services::{
+            MigrationServiceOutput, MigrationServicePort, MigrationServiceRequest, ServiceError,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct MustNotMigrate(AtomicUsize);
+        impl MigrationServicePort for MustNotMigrate {
+            fn migrate(
+                &self,
+                request: MigrationServiceRequest<'_>,
+            ) -> Result<MigrationServiceOutput, ServiceError> {
+                assert_eq!(request.manual_target, Some("provider-b"));
+                assert_eq!(request.resolved.active_provider, "provider-a");
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(ServiceError::Dependency {
+                    message: "recording migration service reached".into(),
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let env = super::ResumeExecutionEnvironment {
+            state: oulipoly_state::StateDb::open(&root.path().join("state.db")).unwrap(),
+            providers_cfg: Default::default(),
+            models: Default::default(),
+            sessions_cfg: Default::default(),
+            config_root: root.path().join("config"),
+            models_dir: root.path().join("models"),
+        };
+        let mut services = crate::wiring::AgentRuntimeServices::cli_defaults().unwrap();
+        let recorder = Arc::new(MustNotMigrate(AtomicUsize::new(0)));
+        services.migration_service = recorder.clone();
+        let mut resolved = oulipoly_state::ResolvedResume {
+            chain_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+            model_name: None,
+            model: None,
+            active_provider: "provider-a".into(),
+            active_session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".into(),
+        };
+        let mut provider =
+            oulipoly_config::ProviderConfig::new("/never-executed-policy-fixture", vec![]);
+        provider.name = "provider-a".into();
+        let mut target = super::ResumeExecutionTarget {
+            model: None,
+            provider_index: 0,
+            provider,
+            prompt_mode: oulipoly_config::PromptMode::Arg,
+        };
+        let result = super::migrate_resume_target(
+            &services,
+            &env,
+            &mut resolved,
+            &mut target,
+            Some("provider-b"),
+            1,
+            root.path(),
+        );
+        assert_eq!(result, if auto { Ok(()) } else { Err(1) });
+        assert_eq!(recorder.0.load(Ordering::SeqCst), usize::from(!auto));
+        assert_eq!(resolved.active_provider, "provider-a");
+        assert_eq!(
+            resolved.active_session_id,
+            "5169694d-de0f-40d1-890c-6e28e55bab27"
+        );
+        assert_eq!(target.provider.name, "provider-a");
+        println!(
+            "policy auto={auto} calls={}",
+            recorder.0.load(Ordering::SeqCst)
+        );
+    }
 }

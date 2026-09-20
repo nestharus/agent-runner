@@ -1,0 +1,257 @@
+{
+  "protocol": "completion-continuation-v2",
+  "fixture_revision": 5,
+  "status": "coordination_contract_not_capability_claim",
+  "registration_bytes_utf8": "{\"completion_kind\":\"exit\",\"completion_scope\":\"tree\",\"delivery_mode\":\"sync\",\"domain_id\":\"11111111-1111-4111-8111-111111111111\",\"handle\":\"ab_fixture\",\"handle_dir\":\"/private/age360/spool/ab_fixture\",\"helper\":{\"environment_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"path\":\"/private/age360/spool/ab_fixture/runner\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"listener_revision\":1,\"listeners\":[{\"listener_id\":\"55555555-5555-4555-8555-555555555555\",\"owner_invocation_uuid\":\"55555555-5555-4555-8555-555555555555\",\"session_id\":\"fixture-session\"}],\"log_relative\":\"log\",\"meta_relative\":\"meta.json\",\"outcome_relative\":\"source-outcome-v2.json\",\"owner_invocation_uuid\":\"55555555-5555-4555-8555-555555555555\",\"owner_session_id\":\"fixture-session\",\"protocol\":\"completion-continuation-v2\",\"rc_relative\":\"rc\",\"recovery\":{\"environment_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"path\":\"/private/age360/spool/ab_fixture/agent-bash\",\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"registering_caller\":{\"boot_id\":\"44444444-4444-4444-8444-444444444444\",\"pid\":12345,\"starttime_ticks\":67890},\"registration_id\":\"33333333-3333-4333-8333-333333333333\",\"registration_relative\":\"source-registration-v2.json\",\"snapshot_relative\":\"completion-snapshot-v2.json\",\"source_evidence_protocol\":\"completion-continuation-v2\",\"source_id\":\"22222222-2222-4222-8222-222222222222\",\"spool_root\":\"/private/age360/spool\"}\n",
+  "registration": {
+    "protocol": "completion-continuation-v2",
+    "domain_id": "11111111-1111-4111-8111-111111111111",
+    "source_id": "22222222-2222-4222-8222-222222222222",
+    "handle": "ab_fixture",
+    "registration_id": "33333333-3333-4333-8333-333333333333",
+    "spool_root": "/private/age360/spool",
+    "handle_dir": "/private/age360/spool/ab_fixture",
+    "meta_relative": "meta.json",
+    "log_relative": "log",
+    "rc_relative": "rc",
+    "registration_relative": "source-registration-v2.json",
+    "snapshot_relative": "completion-snapshot-v2.json",
+    "outcome_relative": "source-outcome-v2.json",
+    "owner_session_id": "fixture-session",
+    "owner_invocation_uuid": "55555555-5555-4555-8555-555555555555",
+    "registering_caller": {
+      "pid": 12345,
+      "boot_id": "44444444-4444-4444-8444-444444444444",
+      "starttime_ticks": 67890
+    },
+    "delivery_mode": "sync",
+    "completion_kind": "exit",
+    "completion_scope": "tree",
+    "helper": {
+      "path": "/private/age360/spool/ab_fixture/runner",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "environment_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "recovery": {
+      "path": "/private/age360/spool/ab_fixture/agent-bash",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "environment_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "source_evidence_protocol": "completion-continuation-v2",
+    "listener_revision": 1,
+    "listeners": [
+      {
+        "listener_id": "55555555-5555-4555-8555-555555555555",
+        "session_id": "fixture-session",
+        "owner_invocation_uuid": "55555555-5555-4555-8555-555555555555"
+      }
+    ]
+  },
+  "common_identity": {
+    "protocol": "completion-continuation-v2",
+    "domain_id": "11111111-1111-4111-8111-111111111111",
+    "source_id": "22222222-2222-4222-8222-222222222222",
+    "handle": "ab_fixture",
+    "registration_id": "33333333-3333-4333-8333-333333333333",
+    "registration_digest": "40dbad53fa085eced8d4bf680ccb378aa4a75c44fde5daf6abe41973b3c2e520"
+  },
+  "outcome_bytes_utf8": "{\"cancellation_id\":null,\"completion_revision\":1,\"domain_id\":\"11111111-1111-4111-8111-111111111111\",\"handle\":\"ab_fixture\",\"kind\":\"exit_tree\",\"launch_fence_revision\":2,\"observer\":{\"boot_id\":\"44444444-4444-4444-8444-444444444444\",\"pid\":12345,\"starttime_ticks\":67890},\"original_tree_drained\":true,\"output_closed\":true,\"protocol\":\"completion-continuation-v2\",\"ready_sentinel\":null,\"registration_digest\":\"40dbad53fa085eced8d4bf680ccb378aa4a75c44fde5daf6abe41973b3c2e520\",\"registration_id\":\"33333333-3333-4333-8333-333333333333\",\"root_wait_status\":0,\"source_id\":\"22222222-2222-4222-8222-222222222222\"}\n",
+  "snapshot_bytes_utf8": "{\"completion_revision\":1,\"domain_id\":\"11111111-1111-4111-8111-111111111111\",\"handle\":\"ab_fixture\",\"outcome_byte_len\":595,\"outcome_sha256\":\"1dbedba70b516080c9442c2d6a84f306ecd1902d62630d5ea785c8203b1e6501\",\"output\":\"fixture output\\n\",\"protocol\":\"completion-continuation-v2\",\"rc\":0,\"registration_digest\":\"40dbad53fa085eced8d4bf680ccb378aa4a75c44fde5daf6abe41973b3c2e520\",\"registration_id\":\"33333333-3333-4333-8333-333333333333\",\"source_id\":\"22222222-2222-4222-8222-222222222222\",\"status\":\"completed\"}\n",
+  "register_response": {
+    "protocol": "completion-continuation-v2",
+    "domain_id": "11111111-1111-4111-8111-111111111111",
+    "source_id": "22222222-2222-4222-8222-222222222222",
+    "handle": "ab_fixture",
+    "registration_id": "33333333-3333-4333-8333-333333333333",
+    "registration_digest": "40dbad53fa085eced8d4bf680ccb378aa4a75c44fde5daf6abe41973b3c2e520",
+    "status": "registered",
+    "listeners": [
+      {
+        "listener_id": "55555555-5555-4555-8555-555555555555",
+        "session_id": "fixture-session",
+        "owner_invocation_uuid": "55555555-5555-4555-8555-555555555555"
+      }
+    ],
+    "listener_revision": 1,
+    "continuation_owner_domain": "11111111-1111-4111-8111-111111111111",
+    "registration_committed": true
+  },
+  "registration_readback": {
+    "protocol": "completion-continuation-v2",
+    "domain_id": "11111111-1111-4111-8111-111111111111",
+    "source_id": "22222222-2222-4222-8222-222222222222",
+    "handle": "ab_fixture",
+    "registration_id": "33333333-3333-4333-8333-333333333333",
+    "registration_digest": "40dbad53fa085eced8d4bf680ccb378aa4a75c44fde5daf6abe41973b3c2e520",
+    "status": "exact_committed",
+    "registration": {
+      "protocol": "completion-continuation-v2",
+      "domain_id": "11111111-1111-4111-8111-111111111111",
+      "source_id": "22222222-2222-4222-8222-222222222222",
+      "handle": "ab_fixture",
+      "registration_id": "33333333-3333-4333-8333-333333333333",
+      "spool_root": "/private/age360/spool",
+      "handle_dir": "/private/age360/spool/ab_fixture",
+      "meta_relative": "meta.json",
+      "log_relative": "log",
+      "rc_relative": "rc",
+      "registration_relative": "source-registration-v2.json",
+      "snapshot_relative": "completion-snapshot-v2.json",
+      "outcome_relative": "source-outcome-v2.json",
+      "owner_session_id": "fixture-session",
+      "owner_invocation_uuid": "55555555-5555-4555-8555-555555555555",
+      "registering_caller": {
+        "pid": 12345,
+        "boot_id": "44444444-4444-4444-8444-444444444444",
+        "starttime_ticks": 67890
+      },
+      "delivery_mode": "sync",
+      "completion_kind": "exit",
+      "completion_scope": "tree",
+      "helper": {
+        "path": "/private/age360/spool/ab_fixture/runner",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "environment_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "recovery": {
+        "path": "/private/age360/spool/ab_fixture/agent-bash",
+        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "environment_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "source_evidence_protocol": "completion-continuation-v2",
+      "listener_revision": 1,
+      "listeners": [
+        {
+          "listener_id": "55555555-5555-4555-8555-555555555555",
+          "session_id": "fixture-session",
+          "owner_invocation_uuid": "55555555-5555-4555-8555-555555555555"
+        }
+      ]
+    },
+    "registration_bytes_utf8": "{\"completion_kind\":\"exit\",\"completion_scope\":\"tree\",\"delivery_mode\":\"sync\",\"domain_id\":\"11111111-1111-4111-8111-111111111111\",\"handle\":\"ab_fixture\",\"handle_dir\":\"/private/age360/spool/ab_fixture\",\"helper\":{\"environment_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"path\":\"/private/age360/spool/ab_fixture/runner\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"listener_revision\":1,\"listeners\":[{\"listener_id\":\"55555555-5555-4555-8555-555555555555\",\"owner_invocation_uuid\":\"55555555-5555-4555-8555-555555555555\",\"session_id\":\"fixture-session\"}],\"log_relative\":\"log\",\"meta_relative\":\"meta.json\",\"outcome_relative\":\"source-outcome-v2.json\",\"owner_invocation_uuid\":\"55555555-5555-4555-8555-555555555555\",\"owner_session_id\":\"fixture-session\",\"protocol\":\"completion-continuation-v2\",\"rc_relative\":\"rc\",\"recovery\":{\"environment_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"path\":\"/private/age360/spool/ab_fixture/agent-bash\",\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"registering_caller\":{\"boot_id\":\"44444444-4444-4444-8444-444444444444\",\"pid\":12345,\"starttime_ticks\":67890},\"registration_id\":\"33333333-3333-4333-8333-333333333333\",\"registration_relative\":\"source-registration-v2.json\",\"snapshot_relative\":\"completion-snapshot-v2.json\",\"source_evidence_protocol\":\"completion-continuation-v2\",\"source_id\":\"22222222-2222-4222-8222-222222222222\",\"spool_root\":\"/private/age360/spool\"}\n",
+    "registration_committed": true
+  },
+  "completion_only_confirmation": {
+    "protocol": "completion-continuation-v2",
+    "domain_id": "11111111-1111-4111-8111-111111111111",
+    "source_id": "22222222-2222-4222-8222-222222222222",
+    "handle": "ab_fixture",
+    "registration_id": "33333333-3333-4333-8333-333333333333",
+    "registration_digest": "40dbad53fa085eced8d4bf680ccb378aa4a75c44fde5daf6abe41973b3c2e520",
+    "status": "exact_committed",
+    "authority": "completion_only",
+    "registration_committed": true
+  },
+  "accept_response": {
+    "protocol": "completion-continuation-v2",
+    "domain_id": "11111111-1111-4111-8111-111111111111",
+    "source_id": "22222222-2222-4222-8222-222222222222",
+    "handle": "ab_fixture",
+    "registration_id": "33333333-3333-4333-8333-333333333333",
+    "registration_digest": "40dbad53fa085eced8d4bf680ccb378aa4a75c44fde5daf6abe41973b3c2e520",
+    "status": "accepted",
+    "snapshot_sha256": "f01c065cd49a6d1c1ec6cf22db4ad1f1b868e2cbe14830e2cef1a6707d4e16a9",
+    "outcome_sha256": "1dbedba70b516080c9442c2d6a84f306ecd1902d62630d5ea785c8203b1e6501",
+    "payload_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "payload_byte_len": 123,
+    "listener_revision": 1
+  },
+  "completion_readback": {
+    "protocol": "completion-continuation-v2",
+    "domain_id": "11111111-1111-4111-8111-111111111111",
+    "source_id": "22222222-2222-4222-8222-222222222222",
+    "handle": "ab_fixture",
+    "registration_id": "33333333-3333-4333-8333-333333333333",
+    "registration_digest": "40dbad53fa085eced8d4bf680ccb378aa4a75c44fde5daf6abe41973b3c2e520",
+    "status": "exact_committed",
+    "snapshot_sha256": "f01c065cd49a6d1c1ec6cf22db4ad1f1b868e2cbe14830e2cef1a6707d4e16a9",
+    "outcome_sha256": "1dbedba70b516080c9442c2d6a84f306ecd1902d62630d5ea785c8203b1e6501",
+    "payload_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "payload_byte_len": 123,
+    "listener_revision": 1,
+    "listeners": [
+      {
+        "listener_id": "55555555-5555-4555-8555-555555555555",
+        "session_id": "fixture-session",
+        "owner_invocation_uuid": "55555555-5555-4555-8555-555555555555",
+        "mailbox_seq": 7,
+        "acknowledged_at": null,
+        "acknowledgement_basis": null
+      }
+    ],
+    "outstanding_attempt_ids": []
+  },
+  "error_statuses": [
+    "absent",
+    "conflict",
+    "unavailable",
+    "unsupported_transition_required"
+  ],
+  "hello": {
+    "protocol": "completion-continuation-v2",
+    "domain_id": "11111111-1111-4111-8111-111111111111",
+    "owner_generation": "66666666-6666-4666-8666-666666666666",
+    "guardian_identity": {
+      "pid": 12345,
+      "boot_id": "44444444-4444-4444-8444-444444444444",
+      "starttime_ticks": 67890
+    },
+    "driver_identity": {
+      "pid": 12346,
+      "boot_id": "44444444-4444-4444-8444-444444444444",
+      "starttime_ticks": 67890
+    },
+    "endpoint": "/tmp/oulipoly-completion-1000-11111111-1111-4111-8111-111111111111/owner.sock"
+  },
+  "outcome_kinds": [
+    "exit_root",
+    "exit_tree",
+    "cancelled",
+    "never_launched",
+    "ceased_status_unknown",
+    "ready"
+  ],
+  "recovery_response": {
+    "protocol": "completion-continuation-v2",
+    "domain_id": "11111111-1111-4111-8111-111111111111",
+    "source_id": "22222222-2222-4222-8222-222222222222",
+    "handle": "ab_fixture",
+    "registration_id": "33333333-3333-4333-8333-333333333333",
+    "registration_digest": "40dbad53fa085eced8d4bf680ccb378aa4a75c44fde5daf6abe41973b3c2e520",
+    "snapshot_sha256": "f01c065cd49a6d1c1ec6cf22db4ad1f1b868e2cbe14830e2cef1a6707d4e16a9",
+    "outcome_sha256": "1dbedba70b516080c9442c2d6a84f306ecd1902d62630d5ea785c8203b1e6501",
+    "status": "source_ready"
+  },
+  "early_exit_acceptance": {
+    "registration_completion_kind": "ready",
+    "outcome_kinds": [
+      "exit_root",
+      "exit_tree"
+    ],
+    "requires": "scope match, output closed, genuine raw terminal wait matching rc; tree additionally drained; ready_sentinel null",
+    "meaning": "exit before readiness, never sentinel success"
+  },
+  "output_artifact_example": {
+    "representation": "retained-output-v1",
+    "relative": "completion-output-v2.bin",
+    "sha256": "4d3ac42b53378ed2def23b3bf88787f9fffed17b22bd42ce971d7067dc591dab",
+    "byte_len": 15,
+    "encoding": "utf8-lossy"
+  },
+  "artifact_snapshot_bytes_utf8": "{\"completion_revision\":1,\"domain_id\":\"11111111-1111-4111-8111-111111111111\",\"handle\":\"ab_fixture\",\"outcome_byte_len\":595,\"outcome_sha256\":\"1dbedba70b516080c9442c2d6a84f306ecd1902d62630d5ea785c8203b1e6501\",\"output\":{\"byte_len\":15,\"encoding\":\"utf8-lossy\",\"relative\":\"completion-output-v2.bin\",\"representation\":\"retained-output-v1\",\"sha256\":\"4d3ac42b53378ed2def23b3bf88787f9fffed17b22bd42ce971d7067dc591dab\"},\"protocol\":\"completion-continuation-v2\",\"rc\":0,\"registration_digest\":\"40dbad53fa085eced8d4bf680ccb378aa4a75c44fde5daf6abe41973b3c2e520\",\"registration_id\":\"33333333-3333-4333-8333-333333333333\",\"source_id\":\"22222222-2222-4222-8222-222222222222\",\"status\":\"completed\"}\n",
+  "artifact_snapshot_sha256": "5259d112bb6edaf7729fe2440252b019d31d8f5d84ebd7e166ece51257fbc036",
+  "artifact_output_bytes_utf8": "fixture output\n",
+  "missing_output_snapshot_bytes_utf8": "{\"completion_revision\":1,\"domain_id\":\"11111111-1111-4111-8111-111111111111\",\"handle\":\"ab_fixture\",\"outcome_byte_len\":595,\"outcome_sha256\":\"1dbedba70b516080c9442c2d6a84f306ecd1902d62630d5ea785c8203b1e6501\",\"output\":{\"capture_state\":\"irrecoverable\",\"completion_revision\":1,\"detail\":\"Original event selection was not retained; producer established that the original boundary cannot be recovered. Later log bytes are not original evidence.\",\"observed_byte_len\":null,\"original_observer\":{\"boot_id\":\"44444444-4444-4444-8444-444444444444\",\"pid\":12345,\"starttime_ticks\":67890},\"outcome_sha256\":\"1dbedba70b516080c9442c2d6a84f306ecd1902d62630d5ea785c8203b1e6501\",\"producer\":{\"boot_id\":\"44444444-4444-4444-8444-444444444444\",\"pid\":12345,\"starttime_ticks\":67890},\"reason\":\"original_selection_not_retained\",\"representation\":\"missing-original-output-v1\",\"selection\":null},\"protocol\":\"completion-continuation-v2\",\"rc\":0,\"registration_digest\":\"40dbad53fa085eced8d4bf680ccb378aa4a75c44fde5daf6abe41973b3c2e520\",\"registration_id\":\"33333333-3333-4333-8333-333333333333\",\"source_id\":\"22222222-2222-4222-8222-222222222222\",\"status\":\"original_output_unavailable\"}\n",
+  "missing_output_snapshot_sha256": "d1a2c9ac0784581429f6e9cedd9fafe56000c47cb2f2606d302463734fc331bc",
+  "missing_output_recovery_response": {
+    "protocol": "completion-continuation-v2",
+    "domain_id": "11111111-1111-4111-8111-111111111111",
+    "source_id": "22222222-2222-4222-8222-222222222222",
+    "handle": "ab_fixture",
+    "registration_id": "33333333-3333-4333-8333-333333333333",
+    "registration_digest": "40dbad53fa085eced8d4bf680ccb378aa4a75c44fde5daf6abe41973b3c2e520",
+    "status": "source_output_missing",
+    "snapshot_sha256": "d1a2c9ac0784581429f6e9cedd9fafe56000c47cb2f2606d302463734fc331bc",
+    "outcome_sha256": "1dbedba70b516080c9442c2d6a84f306ecd1902d62630d5ea785c8203b1e6501"
+  }
+}

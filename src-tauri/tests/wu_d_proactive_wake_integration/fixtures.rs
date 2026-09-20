@@ -13,6 +13,7 @@ use std::process::{Command, Output};
 
 pub(crate) struct Fixture {
     pub(crate) dir: Option<tempfile::TempDir>,
+    root_dir: PathBuf,
     pub(crate) config_home: PathBuf,
     pub(crate) data_home: PathBuf,
     pub(crate) state_home: PathBuf,
@@ -24,20 +25,26 @@ pub(crate) struct Fixture {
 
 impl Fixture {
     pub(crate) fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let config_home = dir.path().join("xdg-config");
-        let data_home = dir.path().join("xdg-data");
-        let state_home = dir.path().join("xdg-state");
-        let home_dir = dir.path().join("home");
+        let dir = std::env::var_os("WU_D_OUTER_FIXTURE_ROOT")
+            .is_none()
+            .then(|| tempfile::tempdir().unwrap());
+        let root_dir = std::env::var_os("WU_D_OUTER_FIXTURE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dir.as_ref().unwrap().path().to_path_buf());
+        let config_home = root_dir.join("xdg-config");
+        let data_home = root_dir.join("xdg-data");
+        let state_home = root_dir.join("xdg-state");
+        let home_dir = root_dir.join("home");
         let app_config_dir = config_home.join("oulipoly-agent-runner");
         let models_dir = app_config_dir.join("models");
-        let work_dir = dir.path().join("work");
+        let work_dir = root_dir.join("work");
         fs::create_dir_all(&models_dir).unwrap();
         fs::create_dir_all(&state_home).unwrap();
         fs::create_dir_all(&home_dir).unwrap();
         fs::create_dir_all(&work_dir).unwrap();
         Self {
-            dir: Some(dir),
+            dir,
+            root_dir,
             config_home,
             data_home,
             state_home,
@@ -46,6 +53,51 @@ impl Fixture {
             models_dir,
             work_dir,
         }
+    }
+
+    // The outer native Runner owns the live admission lease. Its provider launches
+    // this same test; the endpoint and invocation authority come from that launch,
+    // never from a seeded owner row or a fabricated environment value.
+    pub(crate) fn run_under_outer_owner(&self, node: &str) -> bool {
+        if std::env::var_os("WU_D_OUTER_FIXTURE_ROOT").is_some() {
+            assert!(std::env::var_os("OULIPOLY_COMPLETION_ENDPOINT").is_some());
+            return false;
+        }
+        let hook = format!(
+            "exec {} --exact {} --nocapture",
+            shell_quote(&std::env::current_exe().unwrap().to_string_lossy()),
+            shell_quote(node)
+        );
+        let script = crate::fake_provider::provider_script(&hook, "", "outer-unused.txt")
+            .replace(crate::SESSION, crate::cases_basic::OUTER_SESSION);
+        self.write_provider(&script);
+        let mut cmd = self.agent_command("run admitted fixture provider");
+        self.prepare_command(&mut cmd);
+        cmd.env("WU_D_OUTER_FIXTURE_ROOT", self.root());
+        let output = cmd.output().unwrap();
+        println!(
+            "outer fixture stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(output.status.success(), "outer fixture failed: {output:?}");
+        true
+    }
+
+    pub(crate) fn assert_missing_owner_rejected(&self) {
+        let mut command = self.agent_command("must not launch without inherited owner");
+        self.prepare_command(&mut command);
+        command.env_remove("OULIPOLY_COMPLETION_ENDPOINT");
+        let output = command.output().unwrap();
+        assert!(
+            !output.status.success(),
+            "missing owner unexpectedly admitted"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("ancestor has no inherited completion owner"),
+            "{output:?}"
+        );
+        println!("missing inherited owner rejected: {stderr}");
     }
 
     pub(crate) fn sidecar_path(&self) -> PathBuf {
@@ -85,6 +137,12 @@ impl Fixture {
             .env_remove("AGENT_BASH_OWNER_SESSION_ID")
             .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
             .current_dir(self.root());
+        if std::env::var_os("WU_D_OUTER_FIXTURE_ROOT").is_some() {
+            cmd.env(
+                "OULIPOLY_PARENT_INVOCATION",
+                std::env::var("OULIPOLY_PARENT_INVOCATION").unwrap(),
+            );
+        }
         let helper = self.root().join("agent-bash/agent-bash");
         if helper.is_file() {
             cmd.env("AGENT_BASH_BIN", helper).env(
@@ -122,37 +180,6 @@ impl Fixture {
         self.run(cmd)
     }
 
-    pub(crate) fn run_auto_wake_resume(
-        &self,
-        claim_token: &str,
-        chronological_attempt_count: i64,
-        retry_base_milliseconds: u64,
-    ) -> Output {
-        let mut cmd = self.resume_command();
-        self.prepare_command(&mut cmd);
-        cmd.env(
-            oulipoly_core::AutoWakeEnvironmentVariable::MARKER.name(),
-            "1",
-        )
-        .env(
-            oulipoly_core::AutoWakeEnvironmentVariable::SESSION_ID.name(),
-            SESSION,
-        )
-        .env(
-            oulipoly_core::AutoWakeEnvironmentVariable::CLAIM_TOKEN.name(),
-            claim_token,
-        )
-        .env(
-            oulipoly_core::AutoWakeEnvironmentVariable::COUNT.name(),
-            chronological_attempt_count.to_string(),
-        )
-        .env(
-            oulipoly_core::AutoWakeEnvironmentVariable::RETRY_BASE_MILLISECONDS.name(),
-            retry_base_milliseconds.to_string(),
-        );
-        cmd.output().unwrap()
-    }
-
     fn resume_command(&self) -> Command {
         let mut cmd = Command::new(crate::parse::runner_bin());
         cmd.arg("resume")
@@ -163,6 +190,140 @@ impl Fixture {
             .arg("--models-dir")
             .arg(&self.models_dir);
         cmd
+    }
+
+    // Publish a real native parent before inserting historical recovery inputs.
+    // The completed invocation is history; the next operational entry elects
+    // its own owner/driver and obtains new custody through normal admission.
+    pub(crate) fn establish_recovery_parent(&self, session_id: &str) {
+        let path = self.root().join("provider.py");
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(&path, original.replace(crate::SESSION, session_id)).unwrap();
+        let output = self.run_agent("establish recovery recipient");
+        fs::write(&path, original).unwrap();
+        crate::validators::assert_success(&output);
+        crate::liveness::wait_until(
+            "initial native owner retired before historical setup",
+            || {
+                self.mailbox()
+                    .completion_continuation_owner()
+                    .unwrap()
+                    .is_none()
+            },
+        );
+        let runtime = self
+            .mailbox()
+            .wake_session_reader()
+            .session_metadata(session_id)
+            .unwrap()
+            .expect("actual native recipient metadata");
+        let id = runtime
+            .invocation_uuid
+            .as_deref()
+            .expect("actual parent invocation");
+        let parent = self.state().get_invocation_by_uuid(id).unwrap().unwrap();
+        assert_eq!(parent.provider_session_id.as_deref(), Some(session_id));
+        assert!(parent.finished_at.is_some());
+        println!("real recovery parent session={session_id} invocation={id}");
+    }
+
+    pub(crate) fn seed_recovery_control(&self) {
+        let session = "77777777-7777-4777-8777-777777777777";
+        self.seed_session_turn_for(crate::PROVIDER, session, "positive-control-turn");
+        self.seed_idle_runtime_for(session, crate::PROVIDER, crate::MODEL);
+        self.seed_mailbox_for(session, "h-positive-control", None);
+        crate::wake_claim_setup::seed_dead_wake_claim_for(
+            self,
+            session,
+            "historical-positive-control",
+            601,
+        );
+    }
+
+    pub(crate) fn assert_recovery_control(&self) {
+        let prompt =
+            crate::liveness::wait_for_file(&self.prompt_file("recovery-positive-control.txt"));
+        crate::validators::assert_prompt_contains_handle(&prompt, "h-positive-control");
+        crate::liveness::wait_until(
+            "positive control delivered under actual native owner",
+            || {
+                crate::liveness::delivered_rows_without_pending_or_claim(
+                    self,
+                    "77777777-7777-4777-8777-777777777777",
+                    1,
+                )
+            },
+        );
+        self.assert_recovery_drained("77777777-7777-4777-8777-777777777777");
+    }
+
+    pub(crate) fn assert_recovery_drained(&self, session_id: &str) {
+        // ACK/claim release is not physical custody discharge.
+        crate::liveness::wait_until("original native activation drain integrated", || {
+            self.sidecar_conn().query_row(
+                "SELECT COUNT(*) > 0 AND SUM(phase='drained' AND integrated=1 AND drain_receipt LIKE '%ECHILD%')=COUNT(*) FROM completion_continuation_attempt WHERE session_id=?1",
+                [session_id], |row| row.get::<_, bool>(0)).unwrap()
+        });
+        let conn = self.sidecar_conn();
+        let mut stmt = conn.prepare(
+            "SELECT attempt_id,custodian_identity,launcher_identity,runtime_generation_uuid,drain_receipt FROM completion_continuation_attempt WHERE session_id=?1").unwrap();
+        let rows = stmt
+            .query_map([session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .unwrap();
+        for row in rows {
+            let row = row.unwrap();
+            let custodian: serde_json::Value = serde_json::from_str(&row.1).unwrap();
+            let launcher: serde_json::Value = serde_json::from_str(&row.2).unwrap();
+            assert_ne!(
+                custodian["pid"].as_u64(),
+                Some(u64::from(std::process::id()))
+            );
+            assert_ne!(
+                launcher["pid"].as_u64(),
+                Some(u64::from(std::process::id()))
+            );
+            println!("actual native drain session={session_id} attempt={row:?}");
+        }
+    }
+
+    pub(crate) fn run_startup_recovery(&self, session_id: &str) -> Output {
+        // Inspection is not the producer. An actual zero-TTL advisory lease
+        // request enters the supported session-mutation startup-recovery lane;
+        // it cannot hold the recipient paused during native wake admission.
+        let owner_before = self.mailbox().completion_continuation_owner().unwrap();
+        let rows_before = self.mailbox().list_mailbox(session_id, true).unwrap();
+        crate::validators::assert_success(&self.run_mailbox_list(session_id));
+        if owner_before.is_none() {
+            assert!(
+                self.mailbox()
+                    .completion_continuation_owner()
+                    .unwrap()
+                    .is_none(),
+                "inspection must not elect an owner"
+            );
+            assert_eq!(
+                serde_json::to_value(self.mailbox().list_mailbox(session_id, true).unwrap())
+                    .unwrap(),
+                serde_json::to_value(rows_before).unwrap()
+            );
+        }
+        let mut cmd = Command::new(crate::parse::runner_bin());
+        cmd.args(["session", "pause-handshake", session_id, "--ttl-ms", "0"]);
+        let output = self.run(cmd);
+        println!(
+            "operational recovery receipt: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
     }
 
     pub(crate) fn run_mailbox_list(&self, session_id: &str) -> Output {
@@ -228,7 +389,7 @@ impl Fixture {
     }
 
     fn root(&self) -> &std::path::Path {
-        self.dir.as_ref().expect("fixture directory").path()
+        &self.root_dir
     }
 }
 
@@ -249,4 +410,8 @@ impl Drop for Fixture {
             );
         }
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }

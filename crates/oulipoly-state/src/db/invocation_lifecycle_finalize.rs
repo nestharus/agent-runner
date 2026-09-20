@@ -31,8 +31,8 @@ use crate::result_envelope::{ResultEnvelopeFailureIdentity, ResultEnvelopeInput}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvocationFinalizeError {
-    /// One independently bounded State, namespace, or sidecar writer wait expired.
-    /// This variant does not imply one aggregate end-to-end acquisition deadline.
+    /// State acquisition/commit or nonwaiting sidecar acquisition was contended.
+    /// No aggregate end-to-end wait or absence of committed earlier work is implied.
     Contention {
         message: String,
     },
@@ -340,6 +340,7 @@ impl StateDb {
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
                 .map_err(|error| Self::format_finalize_begin_transaction_error(id, error))?;
 
+        super::completed_turns::refuse_pending_turn(&tx, id)?;
         super::provider_launch_lifecycle::validate_invocation_mutation_authority(
             &tx,
             id,
@@ -347,39 +348,76 @@ impl StateDb {
         )?;
         let invocation = Self::load_invocation_for_finalize(&tx, id)?;
         Self::validate_invocation_is_running(id, &invocation.status)?;
+        self.with_finalization_completion_authority(
+            tx,
+            &invocation.invocation_uuid,
+            success,
+            |tx| {
+                Self::write_invocation_final_row(
+                    &tx,
+                    id,
+                    success,
+                    write.exit_code,
+                    write.error_category,
+                    write.terminal_reason,
+                    write.finished_at,
+                )?;
+                Self::upsert_provider_finalize_aggregate(
+                    &tx,
+                    &invocation.model_name,
+                    invocation.provider_name.as_deref(),
+                    success,
+                    write.terminal_reason,
+                    write.finished_at,
+                )?;
+
+                before_validation();
+                after_validation();
+
+                tx.commit()
+                    .map_err(|error| Self::format_finalize_commit_transaction_error(id, error))?;
+                Ok(())
+            },
+        )?;
+        Ok(invocation)
+    }
+
+    /// Both ordinary and confirmed-input success use this fence. The callback
+    /// owns the already-held State transaction so its entire write AND commit
+    /// occur before either sidecar fence is released. It must not replay effects.
+    pub(super) fn with_finalization_completion_authority<'tx, T>(
+        &self,
+        tx: sqlite::Transaction<'tx>,
+        invocation_uuid: &str,
+        success: bool,
+        write_and_commit: impl FnOnce(sqlite::Transaction<'tx>) -> Result<T, String>,
+    ) -> Result<T, String> {
         if success {
             require_completion_continuity_registration_ready(&tx)?;
         }
         let obligation = success
-            .then(|| {
-                Self::first_completion_obligation_for_invocation_on(
-                    &tx,
-                    &invocation.invocation_uuid,
-                )
-            })
+            .then(|| Self::first_completion_obligation_for_invocation_on(&tx, invocation_uuid))
             .transpose()
             .map_err(|error| {
-                Self::format_completion_authority_storage_error(&invocation.invocation_uuid, error)
+                Self::format_completion_authority_storage_error(invocation_uuid, error)
             })?
             .flatten();
         let authority_summary = success
-            .then(|| Self::completion_authority_summary_on(&tx, &invocation.invocation_uuid))
+            .then(|| Self::completion_authority_summary_on(&tx, invocation_uuid))
             .transpose()
             .map_err(|error| {
-                Self::format_completion_authority_storage_error(&invocation.invocation_uuid, error)
+                Self::format_completion_authority_storage_error(invocation_uuid, error)
             })?
             .flatten();
         let materialization_expectation = success
-            .then(|| {
-                Self::completion_materialization_expectation_on(&tx, &invocation.invocation_uuid)
-            })
+            .then(|| Self::completion_materialization_expectation_on(&tx, invocation_uuid))
             .transpose()
             .map_err(|error| {
-                Self::format_completion_authority_storage_error(&invocation.invocation_uuid, error)
+                Self::format_completion_authority_storage_error(invocation_uuid, error)
             })?
             .flatten();
         Self::validate_completion_authority_summary(
-            &invocation.invocation_uuid,
+            invocation_uuid,
             obligation.as_ref(),
             authority_summary.as_ref(),
             materialization_expectation.as_ref(),
@@ -390,7 +428,7 @@ impl StateDb {
             self.completion_authority_state_path().ok_or_else(|| {
                 format!(
                     "process_integrity: invocation {} has admitted completion authority but the state database no longer rejoins its retained canonical identity",
-                    invocation.invocation_uuid
+                    invocation_uuid
                 )
             })?
         };
@@ -399,24 +437,26 @@ impl StateDb {
             .map(|_| completion_continuity_head_on(&tx))
             .transpose()
             .map_err(|error| {
-                Self::format_completion_authority_storage_error(&invocation.invocation_uuid, error)
+                Self::format_completion_authority_storage_error(invocation_uuid, error)
             })?
             .flatten();
         let sidecar_path =
             crate::mailbox::MailboxDb::path_for_state_db(completion_authority_state_path);
+        #[cfg(test)]
+        tests::BEFORE_SIDECAR_ACQUISITION.with_borrow_mut(|hook| {
+            if let Some(hook) = hook.take() {
+                hook();
+            }
+        });
         let sidecar_authority = obligation
             .as_ref()
             .map(|obligation| {
-                Self::acquire_finalize_sidecar_authority(
-                    &sidecar_path,
-                    &invocation.invocation_uuid,
-                    obligation,
-                )
+                Self::acquire_finalize_sidecar_authority(&sidecar_path, invocation_uuid, obligation)
             })
             .transpose()?;
         let mut sidecar = self.open_completion_authority_sidecar(
             sidecar_authority.as_ref(),
-            &invocation.invocation_uuid,
+            invocation_uuid,
             obligation.as_ref(),
         )?;
         let sidecar_fence = sidecar
@@ -429,16 +469,12 @@ impl StateDb {
                     .expect("sidecar fence requires a completion obligation");
                 if error.starts_with("completion_authority_contention:") {
                     Self::format_completion_sidecar_sqlite_contention(
-                        &invocation.invocation_uuid,
+                        invocation_uuid,
                         obligation,
                         error,
                     )
                 } else {
-                    Self::format_unreadable_completion_sidecar(
-                        &invocation.invocation_uuid,
-                        obligation,
-                        error,
-                    )
+                    Self::format_unreadable_completion_sidecar(invocation_uuid, obligation, error)
                 }
             })?;
         if let (
@@ -454,36 +490,13 @@ impl StateDb {
         ) {
             self.validate_completion_sidecar_authority(
                 sidecar_fence,
-                &invocation.invocation_uuid,
+                invocation_uuid,
                 obligation,
                 materialization_expectation,
                 state_continuity_head,
             )?;
         }
-        Self::write_invocation_final_row(
-            &tx,
-            id,
-            success,
-            write.exit_code,
-            write.error_category,
-            write.terminal_reason,
-            write.finished_at,
-        )?;
-        Self::upsert_provider_finalize_aggregate(
-            &tx,
-            &invocation.model_name,
-            invocation.provider_name.as_deref(),
-            success,
-            write.terminal_reason,
-            write.finished_at,
-        )?;
-
-        before_validation();
-        after_validation();
-
-        tx.commit()
-            .map_err(|error| Self::format_finalize_commit_transaction_error(id, error))?;
-        Ok(invocation)
+        write_and_commit(tx)
     }
 
     fn acquire_finalize_sidecar_authority(
@@ -491,7 +504,7 @@ impl StateDb {
         invocation_uuid: &str,
         obligation: &CompletionObligationExpectation,
     ) -> Result<crate::mailbox::MailboxAuthorityFence, String> {
-        match crate::mailbox::MailboxAuthorityFence::acquire(sidecar_path) {
+        match crate::mailbox::MailboxAuthorityFence::try_acquire(sidecar_path) {
             Ok(authority) => Ok(authority),
             Err(error @ crate::mailbox::MailboxAuthorityFenceError::Timeout { .. }) => Err(
                 Self::format_completion_sidecar_contention(invocation_uuid, obligation, error),
@@ -675,7 +688,7 @@ impl StateDb {
         )
     }
 
-    fn format_finalize_begin_transaction_error(id: i64, err: sqlite::Error) -> String {
+    pub(super) fn format_finalize_begin_transaction_error(id: i64, err: sqlite::Error) -> String {
         if sqlite_error_is_contention(&err) {
             return format!(
                 "process_integrity: completion_authority_contention: invocation row {id} could not acquire the State writer: {err}"
@@ -684,20 +697,12 @@ impl StateDb {
         format!("Failed to begin invocation finalize tx: {err}")
     }
 
-    fn format_finalize_commit_transaction_error(id: i64, err: sqlite::Error) -> String {
+    pub(super) fn format_finalize_commit_transaction_error(id: i64, err: sqlite::Error) -> String {
         if sqlite_error_is_contention(&err) {
             return format!(
                 "process_integrity: completion_authority_contention: invocation row {id} could not commit while holding the State writer: {err}"
             );
         }
-        format!("Failed to commit invocation finalize tx: {err}")
-    }
-
-    pub(super) fn format_begin_transaction_error(err: sqlite::Error) -> String {
-        format!("Failed to begin invocation finalize tx: {err}")
-    }
-
-    pub(super) fn format_commit_transaction_error(err: sqlite::Error) -> String {
         format!("Failed to commit invocation finalize tx: {err}")
     }
 
@@ -735,6 +740,41 @@ mod tests {
     use crate::mailbox::{CompletionEventRegistrationInput, MailboxDb};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    thread_local! {
+        pub(super) static BEFORE_SIDECAR_ACQUISITION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    fn concurrent_state_probe(path: &std::path::Path) -> std::thread::JoinHandle<()> {
+        let path = path.to_owned();
+        let (start, receive_start) = mpsc::channel();
+        let (reserved, receive_reserved) = mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            let unrelated = sqlite::Connection::open(path).unwrap();
+            unrelated.busy_timeout(Duration::ZERO).unwrap();
+            receive_start.recv().unwrap();
+            let error = unrelated.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+            assert!(sqlite_error_is_contention(&error));
+            // Measure actual independent acquisition from the known-held cut.
+            // 250ms is below the old namespace test budget (500ms) and SQLite
+            // patience (seconds), not a new product timeout or suite cutoff.
+            unrelated.busy_timeout(Duration::from_millis(250)).unwrap();
+            let started = std::time::Instant::now();
+            reserved.send(()).unwrap();
+            unrelated
+                .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+                .unwrap();
+            assert!(started.elapsed() < Duration::from_millis(250));
+            eprintln!("concurrent State writer acquired before the old sidecar wait budget");
+        });
+        BEFORE_SIDECAR_ACQUISITION.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                start.send(()).unwrap();
+                receive_reserved.recv().unwrap();
+            }));
+        });
+        probe
+    }
 
     const INVOCATION_UUID: &str = "77777777-7777-4777-8777-777777777777";
     const EVENT_ID: &str = "age299-s2-finalize-fence-event";
@@ -779,11 +819,34 @@ mod tests {
             state_with_completion_obligation();
         let authority =
             crate::mailbox::MailboxAuthorityFence::acquire_exclusive(&sidecar_path).unwrap();
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            drop(authority);
-        });
-
+        // Root Act2 supersedes the historical waiting oracle, not finalization
+        // authority: contend without retaining State during the sidecar wait.
+        let probe = concurrent_state_probe(&state.db_path);
+        let error = state
+            .finalize_invocation(
+                crate::InvocationMutationAuthority::Standalone,
+                invocation_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
+            .unwrap_err();
+        probe.join().unwrap();
+        assert!(error.contains("completion_authority_contention"), "{error}");
+        assert_eq!(
+            state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Running
+        );
+        let unrelated = sqlite::Connection::open(&state.db_path).unwrap();
+        unrelated
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+            .unwrap();
+        drop(authority);
         state
             .finalize_invocation(
                 crate::InvocationMutationAuthority::Standalone,
@@ -794,7 +857,6 @@ mod tests {
                 None,
             )
             .unwrap();
-        releaser.join().unwrap();
         assert_eq!(
             state
                 .get_invocation_by_uuid(INVOCATION_UUID)
@@ -803,6 +865,41 @@ mod tests {
                 .status,
             InvocationStatus::Succeeded
         );
+    }
+
+    #[test]
+    fn storage_finalize_sidecar_sqlite_contention_unwinds_state_without_waiting() {
+        let (_directory, state, invocation_row_id, sidecar_path) =
+            state_with_completion_obligation();
+        let holder = sqlite::Connection::open(&sidecar_path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let probe = concurrent_state_probe(&state.db_path);
+        let error = state
+            .finalize_invocation(
+                crate::InvocationMutationAuthority::Standalone,
+                invocation_row_id,
+                true,
+                0,
+                None,
+                None,
+            )
+            .unwrap_err();
+        probe.join().unwrap();
+        assert!(error.contains("without waiting"), "{error}");
+        assert_eq!(
+            state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Running
+        );
+        let unrelated = sqlite::Connection::open(&state.db_path).unwrap();
+        unrelated.busy_timeout(Duration::ZERO).unwrap();
+        unrelated
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+            .unwrap();
+        holder.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
@@ -1014,5 +1111,348 @@ mod tests {
             small.2,
             mature.2
         );
+    }
+    fn combined_input<'a>(id: i64) -> crate::ProviderTurnEffectInput<'a> {
+        crate::ProviderTurnEffectInput {
+            invocation_row_id: id,
+            delivery_ids: &[],
+            accept_delivery_if_missing: true,
+            session_id: SESSION_ID,
+            turn_generation_id: INVOCATION_UUID,
+            submitted_evidence: Some("fixture exact submitted input"),
+            confirmed_evidence: Some("fixture independent confirmed input"),
+            observed_at: 17,
+            returned_artifacts: &[],
+            resume_acceptance_status: Some("accepted"),
+            resume_acceptance_evidence: Some("fixture independent confirmed input"),
+            success: true,
+            exit_code: 0,
+            error_category: None,
+            terminal_reason: None,
+        }
+    }
+
+    fn assert_combined_uncommitted(state: &StateDb, id: i64) {
+        let row = state.get_invocation_by_id(id).unwrap().unwrap();
+        assert_eq!(row.status, InvocationStatus::Running);
+        assert_eq!(row.success, None);
+        for table in [
+            "session_delivery_acknowledgements",
+            "invocation_returned_artifacts",
+        ] {
+            let count: i64 = state
+                .conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "partial combined write in {table}");
+        }
+        let completed: i64 = state
+            .conn
+            .query_row(
+                "SELECT coalesce(sum(invocation_count),0) FROM providers",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed, 0);
+    }
+
+    #[test]
+    fn combined_success_sidecar_contention_unwinds_state_without_waiting() {
+        let (_dir, state, id, sidecar) = state_with_completion_obligation();
+        let authority = crate::mailbox::MailboxAuthorityFence::acquire_exclusive(&sidecar).unwrap();
+        let probe = concurrent_state_probe(&state.db_path);
+        let error = state
+            .apply_provider_turn_effects(
+                crate::InvocationMutationAuthority::Standalone,
+                combined_input(id),
+            )
+            .err()
+            .unwrap();
+        probe.join().unwrap();
+        assert!(error.contains("completion_authority_contention"), "{error}");
+        assert_combined_uncommitted(&state, id);
+        drop(authority);
+        state
+            .apply_provider_turn_effects(
+                crate::InvocationMutationAuthority::Standalone,
+                combined_input(id),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn combined_success_sqlite_contention_unwinds_state_without_waiting() {
+        let (_dir, state, id, sidecar) = state_with_completion_obligation();
+        let holder = sqlite::Connection::open(sidecar).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let probe = concurrent_state_probe(&state.db_path);
+        let error = state
+            .apply_provider_turn_effects(
+                crate::InvocationMutationAuthority::Standalone,
+                combined_input(id),
+            )
+            .err()
+            .unwrap();
+        probe.join().unwrap();
+        assert!(error.contains("without waiting"), "{error}");
+        assert_combined_uncommitted(&state, id);
+        holder.execute_batch("ROLLBACK").unwrap();
+        state
+            .apply_provider_turn_effects(
+                crate::InvocationMutationAuthority::Standalone,
+                combined_input(id),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn combined_success_rejects_replaced_sidecar_generation() {
+        let (_dir, state, id, sidecar) = state_with_completion_obligation();
+        let held = sidecar.with_extension("held");
+        std::fs::rename(&sidecar, &held).unwrap();
+        drop(MailboxDb::open(&sidecar).unwrap());
+        let error = state
+            .apply_provider_turn_effects(
+                crate::InvocationMutationAuthority::Standalone,
+                combined_input(id),
+            )
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("expects mailbox sidecar generation"),
+            "{error}"
+        );
+        assert_combined_uncommitted(&state, id);
+    }
+
+    #[test]
+    fn combined_success_rejects_lost_retained_state_identity() {
+        let (_dir, state, id, _sidecar) = state_with_completion_obligation();
+        std::fs::rename(&state.db_path, state.db_path.with_extension("held")).unwrap();
+        let error = state
+            .apply_provider_turn_effects(
+                crate::InvocationMutationAuthority::Standalone,
+                combined_input(id),
+            )
+            .err()
+            .unwrap();
+        assert!(error.contains("retained canonical identity"), "{error}");
+        assert_combined_uncommitted(&state, id);
+    }
+
+    #[test]
+    fn combined_failure_does_not_require_outgoing_materialization() {
+        let (_dir, state, id, sidecar) = state_with_completion_obligation();
+        let _authority =
+            crate::mailbox::MailboxAuthorityFence::acquire_exclusive(&sidecar).unwrap();
+        let mut input = combined_input(id);
+        input.success = false;
+        input.exit_code = 23;
+        input.terminal_reason = Some("genuine-provider-failure");
+        state
+            .apply_provider_turn_effects(crate::InvocationMutationAuthority::Standalone, input)
+            .unwrap();
+        let row = state.get_invocation_by_id(id).unwrap().unwrap();
+        assert_eq!(row.status, InvocationStatus::Failed);
+        assert_eq!(row.exit_code, Some(23));
+        assert_eq!(
+            row.terminal_reason.as_deref(),
+            Some("genuine-provider-failure")
+        );
+    }
+
+    #[test]
+    fn combined_aggregate_fault_rolls_back_ack_artifacts_and_terminal_row() {
+        let (_dir, state, id, _sidecar) = state_with_completion_obligation();
+        // Valid caller-supplied artifact reference: these tests establish DB
+        // atomicity, not the upstream artifact producer or provider semantics.
+        let refs = [oulipoly_agent_messenger::ReturnedArtifactRef {
+            version_id: format!("store://return/{INVOCATION_UUID}/result/1"),
+            name: "result".into(),
+            store_address: oulipoly_agent_messenger::StoreAddress {
+                workflow_run_id: format!("return:{INVOCATION_UUID}"),
+                artifact_name: "result".into(),
+                version: 1,
+            },
+            sha256: "a".repeat(64),
+            content_len: 1,
+            format_hint: None,
+            verdict_line: None,
+            source: oulipoly_agent_messenger::ReturnedArtifactSource::InlineBytes,
+            producer_invocation_uuid: INVOCATION_UUID.parse().unwrap(),
+            returned_at: chrono::Utc::now(),
+        }];
+        let ids = ["distinct-incoming-delivery".to_string()];
+        state.conn.execute_batch("CREATE TRIGGER private_aggregate_fault BEFORE INSERT ON providers BEGIN SELECT RAISE(ABORT,'private aggregate fault'); END").unwrap();
+        let mut input = combined_input(id);
+        input.delivery_ids = &ids;
+        input.returned_artifacts = &refs;
+        let error = state
+            .apply_provider_turn_effects(crate::InvocationMutationAuthority::Standalone, input)
+            .err()
+            .unwrap();
+        assert!(error.contains("private aggregate fault"), "{error}");
+        assert_combined_uncommitted(&state, id);
+        state
+            .conn
+            .execute_batch("DROP TRIGGER private_aggregate_fault")
+            .unwrap();
+        let mut input = combined_input(id);
+        input.delivery_ids = &ids;
+        input.returned_artifacts = &refs;
+        state
+            .apply_provider_turn_effects(crate::InvocationMutationAuthority::Standalone, input)
+            .unwrap();
+        assert_eq!(
+            state.get_invocation_by_id(id).unwrap().unwrap().status,
+            InvocationStatus::Succeeded
+        );
+        assert_eq!(
+            state
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM invocation_returned_artifacts",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        let ack: (String,String,String) = state.conn.query_row("SELECT delivery_id,turn_generation_id,confirmed_evidence FROM session_delivery_acknowledgements", [], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(
+            ack,
+            (
+                ids[0].clone(),
+                INVOCATION_UUID.into(),
+                "fixture independent confirmed input".into()
+            )
+        );
+    }
+
+    #[test]
+    fn combined_success_without_outgoing_obligations_needs_no_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&directory.path().join("state.db")).unwrap();
+        let id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.into(),
+                model_name: "no-obligation".into(),
+                provider_name: "fixture".into(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let ids = ["distinct-incoming-delivery".into()];
+        let mut input = combined_input(id);
+        input.delivery_ids = &ids;
+        state
+            .apply_provider_turn_effects(crate::InvocationMutationAuthority::Standalone, input)
+            .unwrap();
+        assert_eq!(
+            state.get_invocation_by_id(id).unwrap().unwrap().status,
+            InvocationStatus::Succeeded
+        );
+        assert!(!MailboxDb::path_for_state_db(&state.db_path).exists());
+    }
+
+    #[test]
+    fn combined_success_requires_exact_materialization_not_only_continuity() {
+        let (_dir, state, id, sidecar) = state_with_completion_obligation();
+        let projection = sqlite::Connection::open(sidecar).unwrap();
+        // Fault only the materialized summary; generation and continuity remain.
+        projection
+            .execute(
+                "DELETE FROM completion_authority_materialization_summary WHERE invocation_uuid=?1",
+                [INVOCATION_UUID],
+            )
+            .unwrap();
+        let error = state
+            .apply_provider_turn_effects(
+                crate::InvocationMutationAuthority::Standalone,
+                combined_input(id),
+            )
+            .err()
+            .unwrap();
+        assert!(error.contains("exact agent_bash_complete"), "{error}");
+        assert_combined_uncommitted(&state, id);
+    }
+
+    #[test]
+    fn combined_refusal_preserves_exact_existing_incoming_evidence() {
+        use crate::SessionLifecycleRepository;
+        let (_dir, mut state, id, sidecar) = state_with_completion_obligation();
+        let delivery = "older-independent-input";
+        state
+            .accept_pending(delivery, SESSION_ID, INVOCATION_UUID, 1)
+            .unwrap();
+        state
+            .mark_submitted(
+                delivery,
+                SESSION_ID,
+                INVOCATION_UUID,
+                "fixture exact submitted input",
+                2,
+            )
+            .unwrap();
+        state
+            .mark_confirmed(
+                delivery,
+                SESSION_ID,
+                INVOCATION_UUID,
+                "fixture independent confirmed input",
+                3,
+            )
+            .unwrap();
+        let original = state.acknowledgement(delivery).unwrap().unwrap();
+        let ids = [delivery.to_string()];
+        for (session, turn, confirmation) in [
+            (
+                "wrong-session",
+                INVOCATION_UUID,
+                "fixture independent confirmed input",
+            ),
+            (
+                SESSION_ID,
+                "stale-turn",
+                "fixture independent confirmed input",
+            ),
+            (SESSION_ID, INVOCATION_UUID, "replacement-confirmation"),
+        ] {
+            let mut input = combined_input(id);
+            input.delivery_ids = &ids;
+            input.session_id = session;
+            input.turn_generation_id = turn;
+            input.confirmed_evidence = Some(confirmation);
+            assert!(
+                state
+                    .apply_provider_turn_effects(
+                        crate::InvocationMutationAuthority::Standalone,
+                        input
+                    )
+                    .is_err()
+            );
+            assert_eq!(state.acknowledgement(delivery).unwrap().unwrap(), original);
+            assert_eq!(
+                state.get_invocation_by_id(id).unwrap().unwrap().status,
+                InvocationStatus::Running
+            );
+        }
+        let authority = crate::mailbox::MailboxAuthorityFence::acquire_exclusive(&sidecar).unwrap();
+        let mut input = combined_input(id);
+        input.delivery_ids = &ids;
+        assert!(
+            state
+                .apply_provider_turn_effects(crate::InvocationMutationAuthority::Standalone, input)
+                .is_err()
+        );
+        assert_eq!(state.acknowledgement(delivery).unwrap().unwrap(), original);
+        drop(authority);
+        let mut input = combined_input(id);
+        input.delivery_ids = &ids;
+        state
+            .apply_provider_turn_effects(crate::InvocationMutationAuthority::Standalone, input)
+            .unwrap();
+        assert_eq!(state.acknowledgement(delivery).unwrap().unwrap(), original);
     }
 }

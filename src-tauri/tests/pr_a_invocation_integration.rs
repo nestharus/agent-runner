@@ -2,6 +2,9 @@
 
 mod provider_authority_fixture;
 
+#[path = "fixtures/bounded_runner_image.rs"]
+mod bounded_runner_image;
+
 use oulipoly_state::{
     CompositeInvocationId, InvocationStart, InvocationStatus, ProviderSessionBinding, StateDb,
 };
@@ -213,7 +216,10 @@ fn isolated_agent_bash_bin(fixture: &Fixture, source: &Path) -> PathBuf {
     fs::create_dir_all(&runner_dir).unwrap();
     let runner = runner_dir.join("oulipoly-agent-runner");
     let source_runner = env!("CARGO_BIN_EXE_oulipoly-agent-runner");
-    if fs::hard_link(source_runner, &runner).is_err() {
+    if cfg!(target_os = "linux") {
+        // Provision into this fixture's own file, never strip a Cargo hardlink.
+        fs::copy(bounded_runner_image::runner_bin(), &runner).unwrap();
+    } else {
         fs::copy(source_runner, &runner).unwrap();
     }
     fs::write(

@@ -23,9 +23,17 @@ use uuid::Uuid;
 
 use crate::pid_identity::{self, ProcessIdentity};
 
+mod completion_continuation;
 mod finalization;
+mod native_publication;
+pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
 mod schema;
+pub use completion_continuation::{
+    CompletionDomainOwner, CompletionNotificationRequest, ContinuationAttempt,
+    NotificationDeliveryEvidence, NotificationDisposition, NotificationPolicy,
+    activation_request_sha256,
+};
 pub use finalization::DeliveryFinalizationGuard;
 
 pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
@@ -342,6 +350,9 @@ pub enum GenerationRejection {
         actual: RuntimeLifecycleState,
     },
     InvariantViolation,
+    /// This exact custody proof was not observed quiescent. This is a refusal,
+    /// not an illegal predecessor and not evidence that Q will later exist.
+    CustodyNotQuiescent,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -379,11 +390,34 @@ pub struct FailRuntimeGenerationDelivery<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationStorageError {
     message: String,
+    diagnostic: GenerationStorageDiagnostic,
+}
+
+/// Bounded host-owned registration evidence, independent of raw storage messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationStorageDiagnostic {
+    Storage,
+    NativeActivationConflict,
+    NativeActivationBinding,
+    CustodyProof,
+    AdmissionBinding,
 }
 
 impl GenerationStorageError {
+    pub fn diagnostic(&self) -> GenerationStorageDiagnostic {
+        self.diagnostic
+    }
+
+    fn with_diagnostic(mut self, diagnostic: GenerationStorageDiagnostic) -> Self {
+        self.diagnostic = diagnostic;
+        self
+    }
+
     fn new(message: String) -> Self {
-        Self { message }
+        Self {
+            message,
+            diagnostic: GenerationStorageDiagnostic::Storage,
+        }
     }
 }
 
@@ -596,7 +630,6 @@ pub struct CompletionEventTriggerInput<'a> {
     pub log_path: &'a str,
     pub rc_path: &'a str,
     pub rc: i32,
-    pub consumed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -701,6 +734,26 @@ pub struct SessionMetadataRow {
     pub auto_wake_count: i64,
 }
 
+/// Required selectors for native automatic resume. Metadata is published only
+/// after session binding; an address in pending input is not that publication.
+/// models_dir remains optional because the configured default is a valid selector.
+pub fn native_wake_runtime_ready(runtime: Option<&SessionMetadataRow>) -> bool {
+    runtime.is_some_and(|runtime| {
+        runtime
+            .invocation_uuid
+            .as_deref()
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+            && runtime
+                .provider_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+            && runtime
+                .model_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+    })
+}
+
 /// Compatibility columns retained in the installed `session_runtime` table.
 /// Generation lifecycle transactions maintain this projection atomically; no
 /// production liveness or wake decision treats it as runtime authority.
@@ -752,6 +805,8 @@ pub enum WakeClaimAcquireResult {
     NoPending,
     Busy,
     AlreadyInFlight(WakeClaimRow),
+    /// Pending work lacks launch selectors, or selection changed before claim.
+    RuntimeUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -949,6 +1004,7 @@ pub struct PayloadRetentionRepository<'a> {
 /// Session metadata plus atomic wake-claim admission and lifecycle authority.
 pub struct WakeSessionRepository<'a> {
     conn: &'a mut Connection,
+    data_root: &'a Path,
 }
 
 /// Durable FIFO admission and in-flight launch reservation authority.
@@ -1096,8 +1152,20 @@ impl CompletionAuthorityFence<'_> {
         self,
         input: CompletionEventRegistrationInput<'_>,
         continuity: &CompletionContinuityHead,
+        binding: Option<&crate::completion_continuation::AdmittedSourceBinding>,
     ) -> Result<CompletionEventRegistrationResult, String> {
         let inserted = register_completion_event_on(&self.tx, &input, &now_rfc3339())?;
+        if let Some(binding) = binding {
+            self.materialize_continuation_binding(binding)?;
+            let event = completion_event_by_id_on(&self.tx, input.event_id)?
+                .ok_or("registered source disappeared")?;
+            completion_continuation::reconcile_notification_on(
+                &self.tx,
+                &event,
+                Some(binding),
+                &now_rfc3339(),
+            )?;
+        }
         append_completion_continuity_on(&self.tx, continuity)?;
         let result = completion_event_registration_on(&self.tx, input.event_id, inserted)?;
         self.tx
@@ -1109,14 +1177,25 @@ impl CompletionAuthorityFence<'_> {
 
 impl MailboxAuthorityFence {
     pub(crate) fn acquire(path: &Path) -> Result<Self, MailboxAuthorityFenceError> {
-        Self::acquire_with_mode(path, false)
+        Self::acquire_with_mode(path, false, None)
     }
 
     pub(crate) fn acquire_exclusive(path: &Path) -> Result<Self, MailboxAuthorityFenceError> {
-        Self::acquire_with_mode(path, true)
+        Self::acquire_with_mode(path, true, None)
     }
 
-    fn acquire_with_mode(path: &Path, exclusive: bool) -> Result<Self, MailboxAuthorityFenceError> {
+    /// State is already reserved by these callers. Never sleep on another
+    /// authority while excluding unrelated State writers; failure unwinds the
+    /// uncommitted transaction, not an already committed projection obligation.
+    pub(crate) fn try_acquire(path: &Path) -> Result<Self, MailboxAuthorityFenceError> {
+        Self::acquire_with_mode(path, false, Some(StdDuration::ZERO))
+    }
+
+    fn acquire_with_mode(
+        path: &Path,
+        exclusive: bool,
+        timeout: Option<StdDuration>,
+    ) -> Result<Self, MailboxAuthorityFenceError> {
         const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(10);
         #[cfg(not(test))]
         const ACQUISITION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
@@ -1183,7 +1262,8 @@ impl MailboxAuthorityFence {
                 ),
             });
         }
-        let deadline = Instant::now() + ACQUISITION_TIMEOUT;
+        let timeout = timeout.unwrap_or(ACQUISITION_TIMEOUT);
+        let deadline = Instant::now() + timeout;
         loop {
             let lock_result = if exclusive {
                 <std::fs::File as fs4::FileExt>::try_lock(&file)
@@ -1232,7 +1312,7 @@ impl MailboxAuthorityFence {
                 Err(fs4::TryLockError::WouldBlock) => {
                     return Err(MailboxAuthorityFenceError::Timeout {
                         path: authority_path,
-                        timeout: ACQUISITION_TIMEOUT,
+                        timeout,
                     });
                 }
                 Err(error) => return Err(MailboxAuthorityFenceError::Lock(error)),
@@ -1370,6 +1450,38 @@ impl MailboxDb {
         })
     }
 
+    /// Cross-store initialization has the same schema/identity checks as ordinary
+    /// open, but cannot wait on a sidecar writer while State is reserved.
+    pub(crate) fn open_for_state_authority(
+        authority: &MailboxAuthorityFence,
+    ) -> Result<Self, String> {
+        let path = authority.path();
+        let mut conn = Connection::open(path).map_err(|e| e.to_string())?;
+        authority.validate_opened_target()?;
+        configure_writable_sidecar_connection(&conn)?;
+        conn.busy_timeout(StdDuration::ZERO)
+            .map_err(|e| e.to_string())?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            .map_err(|e| {
+                if sqlite_error_is_contention(&e) {
+                    format!(
+                        "completion_authority_contention: sidecar initialization unavailable: {e}"
+                    )
+                } else {
+                    format!("Failed to initialize PID mailbox sidecar: {e}")
+                }
+            })?;
+        schema::ensure_without_wait(&mut conn)?;
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+            _read_only_snapshot: None,
+            _namespace_authority: None,
+        })
+    }
+
+    /// Physically nonmutating detached recovery observation. Recoverable WAL
+    /// bytes can precede live SQLite publication; this is not native authority.
     pub fn open_read_only(path: &Path) -> Result<Self, String> {
         Self::open_read_only_with_cancel(path, &|| false)
     }
@@ -1435,18 +1547,34 @@ impl MailboxDb {
         })
     }
 
+    /// Only called while State owns the completed-turn admission reservation.
+    pub(crate) fn coordinate_manual_resume_without_wait(
+        &mut self,
+        session: &str,
+        retained_claims: &[RetainedWakeClaim],
+    ) -> Result<ManualWakeCoordination, String> {
+        self.conn
+            .busy_timeout(StdDuration::ZERO)
+            .map_err(|e| e.to_string())?;
+        self.wake_sessions()
+            .coordinate_manual_resume(session, retained_claims)
+    }
+
     pub(crate) fn begin_completion_authority_fence(
         &mut self,
     ) -> Result<CompletionAuthorityFence<'_>, String> {
-        // A write transaction excludes sidecar writers between authority validation and the
-        // state commit. This deliberately accepts writer contention to close that TOCTOU window.
+        // Preserve State -> sidecar authority through commit, without spending
+        // the sidecar's ordinary wait budget inside the State reservation.
+        self.conn
+            .busy_timeout(StdDuration::ZERO)
+            .map_err(|e| e.to_string())?;
         self.conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map(|tx| CompletionAuthorityFence { tx })
             .map_err(|err| {
                 if sqlite_error_is_contention(&err) {
                     format!(
-                        "completion_authority_contention: timed out acquiring PID mailbox SQLite writer: {err}"
+                        "completion_authority_contention: PID mailbox SQLite writer unavailable without waiting: {err}"
                     )
                 } else {
                     format!("Failed to fence PID mailbox sidecar authority: {err}")
@@ -1501,6 +1629,7 @@ impl MailboxDb {
     pub fn wake_sessions(&mut self) -> WakeSessionRepository<'_> {
         WakeSessionRepository {
             conn: &mut self.conn,
+            data_root: self.path.parent().unwrap_or(Path::new(".")),
         }
     }
 
@@ -1539,6 +1668,7 @@ impl RuntimeLifecycleRepository<'_> {
             .map_err(generation_storage_error(
                 "start generation creation transaction",
             ))?;
+        completion_continuation::bind_generation_on(&tx, request, &creator_process_identity)?;
         let changed = tx
             .execute(
                 "INSERT OR IGNORE INTO runtime_generation (
@@ -1569,7 +1699,8 @@ impl RuntimeLifecycleRepository<'_> {
         if changed == 1
             && let Some(path) = custody_proof
         {
-            register_custody_proof_on(&tx, request.generation_id, path)?;
+            register_custody_proof_on(&tx, request.generation_id, path)
+                .map_err(|e| e.with_diagnostic(GenerationStorageDiagnostic::CustodyProof))?;
         }
         let row = runtime_generation_by_id_on(&tx, request.generation_id)?.ok_or_else(|| {
             GenerationStorageError::new("Runtime generation missing after create".to_string())
@@ -1581,7 +1712,8 @@ impl RuntimeLifecycleRepository<'_> {
             request.spawn_invocation_uuid,
             request.generation_id,
             &creator_process_identity,
-        )?;
+        )
+        .map_err(|e| e.with_diagnostic(GenerationStorageDiagnostic::AdmissionBinding))?;
         tx.commit().map_err(generation_storage_error(
             "commit generation creation transaction",
         ))?;
@@ -1667,6 +1799,8 @@ impl RuntimeLifecycleRepository<'_> {
             runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
                 GenerationStorageError::new("Runtime generation missing after binding".to_string())
             })?;
+        completion_continuation::mark_activation_running_on(&tx, request.fence.generation_id)
+            .map_err(GenerationStorageError::new)?;
         project_running_generation_on(&tx, &row)?;
         tx.commit().map_err(generation_storage_error(
             "commit generation binding transaction",
@@ -1811,7 +1945,10 @@ impl RuntimeLifecycleReader<'_> {
         let sql = format_runtime_generations_for_session_sql(true);
         let generations = runtime_generations_for_session_on(self.conn, session_id, &sql)
             .map_err(|error| error.to_string())?;
-        Ok(classify_generation_liveness_read_only(self.conn, &generations))
+        Ok(classify_generation_liveness_read_only(
+            self.conn,
+            &generations,
+        ))
     }
 }
 
@@ -2291,7 +2428,16 @@ impl RuntimeLifecycleRepository<'_> {
                 GenerationStorageError::new("Runtime generation missing after exit".to_string())
             })?;
         project_exited_generation_on(&tx, &row, &now, row.exit_code)?;
-        tx.commit().map_err(generation_storage_error(
+        #[cfg(feature = "age360-fault-fixtures")]
+        crate::completion_continuation::age360_fault_barrier("runtime-exit-before-commit");
+        let committed = tx.commit();
+        #[cfg(feature = "age360-fault-fixtures")]
+        crate::completion_continuation::age360_fault_barrier(if committed.is_ok() {
+            "runtime-exit-commit-returned-ok"
+        } else {
+            "runtime-exit-commit-returned-error"
+        });
+        committed.map_err(generation_storage_error(
             "commit non-orderly generation exit transaction",
         ))?;
         Ok(map_applied_generation(row))
@@ -2504,7 +2650,9 @@ impl RuntimeLifecycleRepository<'_> {
             Some(_) => unreachable!("only predecessor dispositions are mapped"),
         }
         if !custody_allows_terminal(&tx, &before) {
-            return Ok(DrainFinishResult::Rejected(GenerationRejection::InvariantViolation));
+            return Ok(DrainFinishResult::Rejected(
+                GenerationRejection::CustodyNotQuiescent,
+            ));
         }
         if let Err(rejection) = validate_drain_finish_claim(&before) {
             tx.commit().map_err(generation_storage_error(
@@ -2566,37 +2714,35 @@ impl MailboxDb {
         Ok(result)
     }
 
-    pub fn activate_completion_event_listeners(
-        &mut self,
-        event_id: &str,
-    ) -> Result<CompletionEventTriggerResult, String> {
-        let now = now_rfc3339();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|err| {
-                format!("Failed to start completion listener activation transaction: {err}")
-            })?;
-        let event = completion_event_by_id_on(&tx, event_id)?
-            .ok_or_else(|| format!("Completion event {event_id} is not registered"))?;
-        tx.execute(
-            "UPDATE completion_event_listener
-             SET active = 1
-             WHERE event_id = ?1 AND acknowledged_at IS NULL",
-            params![event_id],
-        )
-        .map_err(|err| format!("Failed to activate completion event listeners: {err}"))?;
-        if event.state == "triggered" {
-            materialize_completion_event_listeners(&tx, &event, &now)?;
-        }
-        tx.commit()
-            .map_err(|err| format!("Failed to commit completion listener activation: {err}"))?;
-        self.completion_event_trigger_result(event_id, false)
-    }
-
     pub fn trigger_completion_event(
         &mut self,
         input: CompletionEventTriggerInput<'_>,
+    ) -> Result<CompletionEventTriggerResult, String> {
+        self.trigger_completion_event_bound(input, None)
+    }
+
+    pub fn trigger_completion_continuation(
+        &mut self,
+        input: CompletionEventTriggerInput<'_>,
+        binding: &crate::completion_continuation::AdmittedSourceBinding,
+        evidence: &crate::completion_continuation::VerifiedCompletion,
+    ) -> Result<CompletionEventTriggerResult, String> {
+        if evidence.snapshot.identity != binding.identity()?
+            || input.event_id != evidence.snapshot.identity.handle
+        {
+            return Err("completion acceptance identity conflict".into());
+        }
+        evidence.validate_missing_payload(input.payload_json, input.rc)?;
+        self.trigger_completion_event_bound(input, Some((binding, evidence)))
+    }
+
+    fn trigger_completion_event_bound(
+        &mut self,
+        input: CompletionEventTriggerInput<'_>,
+        continuation: Option<(
+            &crate::completion_continuation::AdmittedSourceBinding,
+            &crate::completion_continuation::VerifiedCompletion,
+        )>,
     ) -> Result<CompletionEventTriggerResult, String> {
         validate_completion_event_trigger(&input)?;
         let published = self
@@ -2611,6 +2757,11 @@ impl MailboxDb {
                 format!("Failed to start completion event trigger transaction: {err}")
             })?;
         verify_published_payload(&published)?;
+        if let Some((binding, evidence)) = continuation {
+            completion_continuation::accept_on(&tx, binding, evidence, &published)?;
+        } else {
+            completion_continuation::reject_unbound_v2_trigger(&tx, input.event_id)?;
+        }
         let event = completion_event_by_id_on(&tx, input.event_id)?
             .ok_or_else(|| format!("Completion event {} is not registered", input.event_id))?;
         validate_completion_event_trigger_source(&event, &input)?;
@@ -2628,12 +2779,14 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to refresh replayed completion payload: {err}"))?;
             false
         };
-        if input.consumed {
-            acknowledge_consumed_completion_event_listeners(&tx, input.event_id, &now)?;
-        }
         let event = completion_event_by_id_on(&tx, input.event_id)?
             .ok_or_else(|| format!("Completion event {} disappeared", input.event_id))?;
-        materialize_completion_event_listeners(&tx, &event, &now)?;
+        completion_continuation::reconcile_notification_on(
+            &tx,
+            &event,
+            continuation.map(|(binding, _)| binding),
+            &now,
+        )?;
         tx.commit()
             .map_err(|err| format!("Failed to commit completion event trigger: {err}"))?;
         self.maintain_terminal_history();
@@ -2649,37 +2802,6 @@ impl MailboxDb {
         event_id: &str,
     ) -> Result<Vec<CompletionEventListenerRow>, String> {
         completion_event_listeners_on(&self.conn, event_id)
-    }
-
-    pub fn acknowledge_consumed_completion_event_for_mailbox_seq(
-        &mut self,
-        mailbox_seq: i64,
-        consumer_session_id: &str,
-        consumer_invocation_uuid: &str,
-    ) -> Result<Option<String>, String> {
-        let now = now_rfc3339();
-        let tx = begin_consumed_completion_acknowledgement(&mut self.conn)?;
-        let Some(binding) = consumed_completion_binding(&tx, mailbox_seq)? else {
-            commit_consumed_completion_acknowledgement(tx)?;
-            return Ok(None);
-        };
-        if !binding.owner_matches(consumer_session_id, consumer_invocation_uuid) {
-            commit_consumed_completion_acknowledgement(tx)?;
-            return Ok(None);
-        }
-        if binding.is_settled() || completion_consumption_claimed(&tx, &binding.event_id)? {
-            commit_consumed_completion_acknowledgement(tx)?;
-            return Ok(None);
-        }
-        let mailbox_changed =
-            consume_completion_mailbox_row(&tx, mailbox_seq, &now, &binding.owner_invocation_uuid)?;
-        validate_consumed_completion_change(mailbox_changed, "mailbox row", mailbox_seq)?;
-        let listener_changed = acknowledge_consumed_completion_listener(&tx, mailbox_seq, &now)?;
-        validate_consumed_completion_change(listener_changed, "listener", mailbox_seq)?;
-        resolve_completed_delivery_attempts_for_mailbox_seq(&tx, mailbox_seq, &now)?;
-        commit_consumed_completion_acknowledgement(tx)?;
-        self.maintain_terminal_history();
-        Ok(Some(binding.event_id))
     }
 
     fn completion_event_trigger_result(
@@ -2938,7 +3060,7 @@ impl MailboxDb {
                     "SELECT EXISTS (
                          SELECT 1 FROM mailbox_delivery_attempts
                          WHERE attempt_id = ?1
-                           AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                           AND NOT EXISTS (SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                                            WHERE finalizer.attempt_id = ?1)
                            AND resolved_at IS NOT NULL
                            AND (
@@ -2991,7 +3113,7 @@ impl MailboxDb {
                                  ON attempt.attempt_id = item.attempt_id
                                WHERE item.mailbox_seq = candidate.seq
                                  AND (attempt.resolved_at IS NULL OR EXISTS (
-                                     SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                                     SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                                      WHERE finalizer.attempt_id = attempt.attempt_id
                                  ))
                            )
@@ -3082,7 +3204,7 @@ impl MailboxDb {
                 |row| row.get(0),
             )
             .map_err(|err| format!("Failed to inspect mailbox payload references: {err}"))?;
-        if live {
+        if live || completion_continuation::retained_payload(&tx, &payload.sha256)? {
             tx.commit()
                 .map_err(|err| format!("Failed to finish mailbox payload inspection: {err}"))?;
             return Ok(PayloadReclaimResult::default());
@@ -3822,33 +3944,88 @@ impl MailboxDb {
         invocation_uuid: &str,
         require_anchor: bool,
     ) -> Result<(), String> {
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE mailbox_delivery_attempts
-             SET submission_started_at = ?4, headless_submission_state = 'possible'
-             WHERE attempt_id = ?1 AND session_id = ?2 AND delivery_invocation_uuid = ?3
-               AND resolved_at IS NULL AND submission_started_at IS NULL
-               AND headless_submission_state = 'prepared'
-               AND NOT EXISTS (SELECT 1 FROM mailbox_observation_stops
-                   WHERE session_id = ?2 AND rearmed_at IS NULL)
-               AND (?5 = 0 OR observation_anchor_token IS NOT NULL)",
-                params![
-                    attempt_id,
-                    session_id,
-                    invocation_uuid,
-                    now_rfc3339(),
-                    require_anchor
-                ],
+        begin_headless_submission_on(
+            &self.conn,
+            attempt_id,
+            session_id,
+            invocation_uuid,
+            require_anchor,
+        )
+    }
+
+    pub fn has_headless_submission_for_invocation(&self, invocation: &str) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mailbox_delivery_attempts
+            WHERE delivery_invocation_uuid=?1 AND headless_submission_state IS NOT NULL)",
+                [invocation],
+                |r| r.get(0),
             )
-            .map_err(|err| format!("Failed to fence headless submission: {err}"))?;
-        if changed != 1 {
-            return Err(
-                "headless delivery missing anchor, replaced, or possibly submitted; no launch"
-                    .into(),
-            );
+            .map_err(|e| e.to_string())
+    }
+
+    /// Runtime registration is the host-owned submission boundary. The durable
+    /// invocation binding is independent of provider prompt-policy transforms.
+    pub fn begin_registered_headless_submission(
+        &mut self,
+        generation: &RuntimeGenerationId,
+        invocation: &str,
+        session: Option<&str>,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let mut statement = tx
+            .prepare(
+                "SELECT attempt_id, session_id,
+            observation_provider_name IS NOT NULL FROM mailbox_delivery_attempts
+            WHERE delivery_invocation_uuid=?1 AND headless_submission_state IS NOT NULL",
+            )
+            .map_err(|e| e.to_string())?;
+        let attempts = statement
+            .query_map([invocation], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        if attempts.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        if attempts.len() != 1 {
+            return Err("ambiguous registered headless submission".into());
+        }
+        let (attempt, target, anchor) = &attempts[0];
+        let live = pid_identity::read_live_process_identity(i64::from(std::process::id()))?
+            .ok_or("headless submission launcher absent")?;
+        let registered: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runtime_generation
+            WHERE generation_uuid=?1 AND spawn_invocation_uuid=?2 AND session_id=?3
+              AND lifecycle_state='starting' AND creator_identity_os_pid=?4
+              AND creator_identity_os_boot_id=?5 AND creator_identity_os_pid_starttime_ticks=?6)",
+                params![
+                    generation.to_string(),
+                    invocation,
+                    target,
+                    live.os_pid,
+                    live.os_boot_id,
+                    live.os_pid_starttime_ticks
+                ],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if session != Some(target.as_str()) || !registered {
+            return Err("headless submission missing exact runtime registration".into());
+        }
+        begin_headless_submission_on(&tx, attempt, target, invocation, *anchor)?;
+        drop(statement);
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn record_delivery_observation_error(
@@ -3905,6 +4082,35 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to persist observation progress: {err}"))?;
         if changed != 1 {
             return Err("mailbox observation progress changed or resolved".into());
+        }
+        Ok(())
+    }
+
+    /// CAS a stale derived continuation back to its immutable anchor while
+    /// retaining a bounded structured diagnostic for the exact attempt.
+    pub fn reset_delivery_observation_progress_after_stale(
+        &self,
+        attempt_id: &str,
+        previous: &str,
+        next: &str,
+        diagnostic: &str,
+    ) -> Result<(), String> {
+        if next.len() > 128 * 1024 {
+            return Err("mailbox observation progress exceeds bound".into());
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts
+                 SET observation_progress=?3,observation_error=?4
+                 WHERE attempt_id=?1 AND observation_progress=?2
+                   AND resolved_at IS NULL AND observation_confirmed_at IS NULL
+                   AND observation_expected_sha256 IS NOT NULL",
+                params![attempt_id, previous, next, truncate_utf8(diagnostic, 1024)],
+            )
+            .map_err(|error| format!("Failed to reset stale observation progress: {error}"))?;
+        if changed != 1 {
+            return Err("mailbox stale observation reset changed or resolved".into());
         }
         Ok(())
     }
@@ -4258,17 +4464,34 @@ impl MailboxDb {
         // make admitted work eligible for retransmission.
         tx.commit().map_err(|e| e.to_string())?;
         if let Err(error) = self.project_native_delivery_receipt(
-            attempt_id, invocation_uuid, &anchor.provider_session_id, &now,
+            attempt_id,
+            invocation_uuid,
+            &anchor.provider_session_id,
+            &now,
         ) {
-            self.conn.execute(
-                "UPDATE mailbox_delivery_attempts SET observation_error = ?3
+            self.conn
+                .execute(
+                    "UPDATE mailbox_delivery_attempts SET observation_error = ?3
                  WHERE attempt_id = ?1 AND delivery_invocation_uuid = ?2
                    AND resolved_at IS NULL AND observation_confirmed_at IS NOT NULL",
-                params![attempt_id, invocation_uuid, truncate_utf8(&error, 1024)],
-            ).map_err(|storage| format!("{error}; receipt projection diagnostic: {storage}"))?;
+                    params![attempt_id, invocation_uuid, truncate_utf8(&error, 1024)],
+                )
+                .map_err(|storage| format!("{error}; receipt projection diagnostic: {storage}"))?;
             return Err(error);
         }
         Ok(true)
+    }
+
+    /// Replay only retained native evidence, never infer receipt from terminal state.
+    pub fn project_confirmed_native_delivery_receipt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<(), String> {
+        let (invocation, session, confirmed): (String,String,String) = self.conn.query_row(
+            "SELECT delivery_invocation_uuid,session_id,observation_confirmed_at
+            FROM mailbox_delivery_attempts WHERE attempt_id=?1 AND observation_confirmed_at IS NOT NULL",
+            [attempt_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e| e.to_string())?;
+        self.project_native_delivery_receipt(attempt_id, &invocation, &session, &confirmed)
     }
 
     fn project_native_delivery_receipt(
@@ -4278,7 +4501,10 @@ impl MailboxDb {
         session_id: &str,
         now: &str,
     ) -> Result<(), String> {
-        let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
         tx.execute(
             "UPDATE mailbox SET delivered_at = ?2, delivered_by_invocation_uuid = ?3,
                 delivery_attempts = delivery_attempts + 1, delivery_error = NULL
@@ -4291,6 +4517,18 @@ impl MailboxDb {
             acknowledgement_reason = COALESCE(acknowledgement_reason, 'native_receipt')
             WHERE mailbox_seq IN (SELECT mailbox_seq FROM mailbox_delivery_attempt_items WHERE attempt_id = ?1)",
             params![attempt_id, now]).map_err(|e| e.to_string())?;
+        // Retain exact native receipt attribution before attempt/sequence pruning.
+        // Receipt was committed independently before this projection transaction.
+        tx.execute("UPDATE completion_continuation_notification SET ack_native_evidence=(
+            SELECT json_object('attempt_id',attempt_id,'invocation_uuid',delivery_invocation_uuid,
+                'provider',observation_provider_name,'provider_instance',observation_provider_instance_id,
+                'settings_id',observation_settings_id,'session_id',observation_session_id,
+                'anchor_token',observation_anchor_token,'expected_sha256',observation_expected_sha256,
+                'turn_id',observation_confirmed_turn_id,'confirmed_at',observation_confirmed_at)
+            FROM mailbox_delivery_attempts WHERE attempt_id=?1 AND observation_confirmed_at IS NOT NULL)
+            WHERE ack_basis='native_receipt' AND ack_at=?2 AND ack_native_evidence IS NULL
+            AND ack_mailbox_seq IN (SELECT mailbox_seq FROM mailbox_delivery_attempt_items WHERE attempt_id=?1)",
+            params![attempt_id,now]).map_err(|e| e.to_string())?;
         resolve_completed_delivery_attempts(&tx, session_id, now, None)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
@@ -5196,6 +5434,26 @@ impl MailboxDb {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualWakeCoordination {
+    Absent,
+    Released,
+    NativeBusy,
+    LegacyLiveBusy,
+    UnknownCustody,
+}
+
+/// State-authenticated original claim identity whose completed-turn tail has
+/// not yet been proven complete. This grants no claim or settlement authority;
+/// it only prevents ordinary coordination from deleting that exact authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetainedWakeClaim {
+    pub(crate) invocation_uuid: String,
+    pub(crate) settlement_id: String,
+    pub(crate) claim_token: String,
+    pub(crate) phase: String,
+}
+
 impl WakeSessionRepository<'_> {
     pub fn upsert_session_metadata(
         &mut self,
@@ -5368,6 +5626,46 @@ impl SessionAdmissionRepository<'_> {
             .map_err(|err| format!("Failed to cancel exact queued session admission: {err}"))
     }
 
+    /// Cancel only the caller's exact reservation while custody is still
+    /// provably unmaterialized. An admitted row requires its exact claim token;
+    /// launching and generation-bound rows are never changed here.
+    pub fn cancel_exact_unmaterialized(
+        &mut self,
+        registration_identity: &str,
+        admission_id: &str,
+        observed_claim_token: Option<&str>,
+        reason: &str,
+        now_unix_ms: i64,
+    ) -> Result<bool, String> {
+        validate_session_admission_identity(registration_identity, "registration_identity")?;
+        validate_session_admission_identity(admission_id, "admission_id")?;
+        validate_optional_session_admission_identity(observed_claim_token, "claim_token")?;
+        validate_session_admission_identity(reason, "queue_reason")?;
+        self.conn
+            .execute(
+                "UPDATE session_admission_queue
+                 SET state = 'cancelled', queue_reason = ?4,
+                     claim_token = NULL, claimed_at_unix_ms = NULL,
+                     updated_at_unix_ms = ?5
+                 WHERE registration_identity = ?1
+                   AND admission_id = ?2
+                   AND runtime_generation_uuid IS NULL
+                   AND ((state = 'queued' AND claim_token IS NULL AND ?3 IS NULL)
+                        OR (state = 'admitted' AND claim_token = ?3))",
+                params![
+                    registration_identity,
+                    admission_id,
+                    observed_claim_token,
+                    reason,
+                    now_unix_ms
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|err| {
+                format!("Failed to cancel exact unmaterialized session admission: {err}")
+            })
+    }
+
     pub fn try_admit_next(
         &mut self,
         claim_token: &str,
@@ -5468,6 +5766,26 @@ impl SessionAdmissionRepository<'_> {
             .map_err(|err| format!("Failed to begin exact session admission launch: {err}"))
     }
 
+    pub fn requeue_unmaterialized(
+        &mut self,
+        registration: &str,
+        token: &str,
+        session: &str,
+    ) -> Result<(), String> {
+        validate_session_admission_identity(session, "session_id")?;
+        let changed = self.conn.execute("UPDATE session_admission_queue
+            SET session_id=?3, state='queued', queue_reason='target_changed',
+                claim_token=NULL, claimed_at_unix_ms=NULL,
+                queue_sequence=(SELECT COALESCE(MAX(queue_sequence),0)+1 FROM session_admission_queue)
+            WHERE registration_identity=?1 AND claim_token=?2 AND state='launching'
+                AND runtime_generation_uuid IS NULL", params![registration, token, session])
+            .map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("session retarget lost unmaterialized authority".into());
+        }
+        Ok(())
+    }
+
     pub fn bind_session(
         &mut self,
         registration_identity: &str,
@@ -5549,9 +5867,32 @@ impl WakeSessionRepository<'_> {
         input: WakeClaimRequest<'_>,
         renew_token: Option<&str>,
     ) -> Result<WakeClaimAcquireResult, String> {
+        self.acquire_startable_wake_claim(input, renew_token, None)
+    }
+
+    /// Compare the caller's selected runtime inside the claim/reservation writer.
+    /// A concurrent publication must be selected again, not frozen into a different
+    /// request from the one the caller will launch.
+    pub fn try_acquire_startable_wake_claim_for_runtime(
+        &mut self,
+        input: WakeClaimRequest<'_>,
+        renew_token: Option<&str>,
+        runtime: Option<&SessionMetadataRow>,
+    ) -> Result<WakeClaimAcquireResult, String> {
+        self.acquire_startable_wake_claim(input, renew_token, Some(runtime))
+    }
+
+    fn acquire_startable_wake_claim(
+        &mut self,
+        input: WakeClaimRequest<'_>,
+        renew_token: Option<&str>,
+        selected: Option<Option<&SessionMetadataRow>>,
+    ) -> Result<WakeClaimAcquireResult, String> {
         let now = now_rfc3339();
         let tx = begin_wake_claim_transaction(self.conn)?;
-        if wake_claim_runtime_is_busy_tx(&tx, input.session_id)? {
+        if session_admission_intent_on(&tx, input.session_id)?
+            || wake_claim_runtime_is_busy_tx(&tx, input.session_id)?
+        {
             commit_empty_wake_claim_transaction(tx)?;
             return Ok(WakeClaimAcquireResult::Busy);
         }
@@ -5570,7 +5911,17 @@ impl WakeSessionRepository<'_> {
             commit_existing_wake_claim_transaction(tx)?;
             return Ok(WakeClaimAcquireResult::AlreadyInFlight(existing));
         }
+        let runtime = session_metadata_row(&tx, input.session_id)?;
+        let changed = selected.is_some_and(|selected| selected != runtime.as_ref());
+        if changed
+            || (completion_continuation::domain_on(&tx)?.is_some()
+                && !native_wake_runtime_ready(runtime.as_ref()))
+        {
+            commit_empty_wake_claim_transaction(tx)?;
+            return Ok(WakeClaimAcquireResult::RuntimeUnavailable);
+        }
         let claim = acquire_wake_claim_tx(&tx, input, &now, min_seq, max_seq)?;
+        completion_continuation::reserve_activation_on(&tx, input, self.data_root)?;
         commit_wake_claim_transaction(tx)?;
         Ok(WakeClaimAcquireResult::Acquired(claim))
     }
@@ -5595,6 +5946,79 @@ impl WakeSessionRepository<'_> {
         Ok(changed > 0)
     }
 
+    /// Observe without a writer; recheck and release exact releasable legacy
+    /// claims under a writer. Native custody is never cancelled by this command.
+    fn coordinate_manual_resume(
+        &mut self,
+        session: &str,
+        retained_claims: &[RetainedWakeClaim],
+    ) -> Result<ManualWakeCoordination, String> {
+        // A live coherent read is only a wait/release hint, not launch authority.
+        // Drop it before acquiring a writer: never upgrade a read transaction.
+        let read = self.conn.transaction().map_err(|e| e.to_string())?;
+        let observation = manual_resume_observation_on(&read, session)?;
+        drop(read);
+        if let Some(observation) = observation {
+            return Ok(observation);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        if let Some(observation) = manual_native_custody_on(&tx, session)? {
+            return Ok(observation);
+        }
+        let Some(claim) = wake_claim_tx(&tx, session)? else {
+            return Ok(ManualWakeCoordination::Absent);
+        };
+        if wake_claim_is_releasable_for_manual_resume(&tx, &claim)? {
+            if let Some(retained) = retained_claims.iter().find(|retained| {
+                retained.claim_token == claim.claim_token
+                    && claim.wake_invocation_uuid.as_deref()
+                        == Some(retained.invocation_uuid.as_str())
+            }) {
+                let tail_finished: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM mailbox_completed_turn_tails
+                         WHERE invocation_uuid=?1 AND settlement_id=?2
+                           AND session_id=?3 AND claim_token=?4)",
+                        params![
+                            retained.invocation_uuid,
+                            retained.settlement_id,
+                            session,
+                            retained.claim_token
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        format!("Failed to inspect retained completed-turn claim tail: {error}")
+                    })?;
+                if !tail_finished {
+                    return Err(format!(
+                        "completed_turn_claim_pending: invocation={} phase={}; exact original claim remains required for non-provider recovery",
+                        retained.invocation_uuid, retained.phase
+                    ));
+                }
+            }
+            let changed = tx
+                .execute(
+                    "DELETE FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
+                    params![session, claim.claim_token],
+                )
+                .map_err(|e| e.to_string())?;
+            if changed != 1 {
+                return Err("manual legacy release changed under writer".into());
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(ManualWakeCoordination::Released);
+        }
+        Ok(if wake_claim_has_persisted_process_identity(&tx, &claim)? {
+            ManualWakeCoordination::LegacyLiveBusy
+        } else {
+            ManualWakeCoordination::UnknownCustody
+        })
+    }
+
     pub fn release_wake_claim_for_manual_resume(
         &mut self,
         session_id: &str,
@@ -5616,6 +6040,7 @@ impl WakeSessionRepository<'_> {
                 .map_err(|err| format!("Failed to commit retained manual wake claim: {err}"))?;
             return Ok(false);
         }
+        completion_continuation::cancel_unaccepted_activation_on(&tx, session_id, claim_token)?;
         let changed = tx
             .execute(
                 "DELETE FROM session_wake_claim
@@ -5854,6 +6279,14 @@ impl WakeSessionRepository<'_> {
                 .map_err(|err| format!("Failed to commit rejected wake-child admission: {err}"))?;
             return Ok(false);
         };
+        if claim.wake_invocation_uuid.is_some()
+            && !wake_claim_has_matching_live_process_identity(&tx, &claim, child_identity)?
+        {
+            tx.commit()
+                .map_err(|err| format!("Failed to commit foreign wake-child refusal: {err}"))?;
+            return Ok(false);
+        }
+        completion_continuation::admit_launcher_on(&tx, session_id, claim_token, child_identity)?;
         if claim.wake_invocation_uuid.is_some() {
             let replay_matches =
                 wake_claim_has_matching_live_process_identity(&tx, &claim, child_identity)?;
@@ -5865,6 +6298,13 @@ impl WakeSessionRepository<'_> {
             || wake_claim_runtime_is_busy_tx(&tx, session_id)?
             || mailbox_observation_stopped_on(&tx, session_id)?
         {
+            // A native launcher may refuse a busy runtime, but its custodian
+            // still owns physical drain. Keep the token until that exact receipt.
+            if completion_continuation::domain_on(&tx)?.is_some() {
+                tx.commit()
+                    .map_err(|err| format!("Failed to commit busy native refusal: {err}"))?;
+                return Ok(false);
+            }
             tx.execute(
                 "DELETE FROM session_wake_claim
                  WHERE session_id = ?1
@@ -6244,187 +6684,6 @@ fn resolve_completed_delivery_attempts(
     )
     .map(|_| ())
     .map_err(|err| format!("Failed to resolve completed mailbox delivery attempts: {err}"))
-}
-
-struct ConsumedCompletionBinding {
-    event_id: String,
-    owner_session_id: String,
-    owner_invocation_uuid: String,
-    acknowledged_at: Option<String>,
-    delivered_at: Option<String>,
-}
-
-impl ConsumedCompletionBinding {
-    fn owner_matches(&self, session_id: &str, invocation_uuid: &str) -> bool {
-        self.owner_session_id == session_id && self.owner_invocation_uuid == invocation_uuid
-    }
-
-    fn is_settled(&self) -> bool {
-        self.acknowledged_at.is_some() || self.delivered_at.is_some()
-    }
-}
-
-fn begin_consumed_completion_acknowledgement(
-    conn: &mut Connection,
-) -> Result<Transaction<'_>, String> {
-    conn.transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(format_consumed_completion_transaction_start_error)
-}
-
-fn format_consumed_completion_transaction_start_error(err: rusqlite::Error) -> String {
-    format!("Failed to start consumed completion acknowledgement transaction: {err}")
-}
-
-fn consumed_completion_binding(
-    tx: &Transaction<'_>,
-    mailbox_seq: i64,
-) -> Result<Option<ConsumedCompletionBinding>, String> {
-    tx.query_row(
-        "SELECT listener.event_id, listener.session_id,
-                listener.owner_invocation_uuid, listener.acknowledged_at,
-                mailbox.delivered_at
-         FROM completion_event_listener AS listener
-         JOIN mailbox ON mailbox.seq = listener.mailbox_seq
-         WHERE listener.mailbox_seq = ?1",
-        params![mailbox_seq],
-        map_consumed_completion_binding,
-    )
-    .optional()
-    .map_err(format_consumed_completion_binding_error)
-}
-
-fn map_consumed_completion_binding(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<ConsumedCompletionBinding> {
-    Ok(ConsumedCompletionBinding {
-        event_id: row.get(0)?,
-        owner_session_id: row.get(1)?,
-        owner_invocation_uuid: row.get(2)?,
-        acknowledged_at: row.get(3)?,
-        delivered_at: row.get(4)?,
-    })
-}
-
-fn format_consumed_completion_binding_error(err: rusqlite::Error) -> String {
-    format!("Failed to resolve mailbox completion event: {err}")
-}
-
-fn completion_consumption_claimed(tx: &Transaction<'_>, event_id: &str) -> Result<bool, String> {
-    tx.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM completion_event_listener
-            WHERE event_id = ?1
-              AND acknowledgement_reason = 'consumed_in_call'
-         )",
-        params![event_id],
-        |row| row.get(0),
-    )
-    .map_err(format_completion_consumption_claim_error)
-}
-
-fn format_completion_consumption_claim_error(err: rusqlite::Error) -> String {
-    format!("Failed to inspect completion consumption claim: {err}")
-}
-
-fn consume_completion_mailbox_row(
-    tx: &Transaction<'_>,
-    mailbox_seq: i64,
-    acknowledged_at: &str,
-    owner_invocation_uuid: &str,
-) -> Result<usize, String> {
-    tx.execute(
-        "UPDATE mailbox
-         SET delivered_at = ?2,
-             delivered_by_invocation_uuid = ?3,
-             delivery_attempts = delivery_attempts + 1,
-             delivery_error = NULL
-         WHERE seq = ?1 AND delivered_at IS NULL",
-        params![mailbox_seq, acknowledged_at, owner_invocation_uuid],
-    )
-    .map_err(format_consumed_completion_mailbox_error)
-}
-
-fn format_consumed_completion_mailbox_error(err: rusqlite::Error) -> String {
-    format!("Failed to consume completion event mailbox row: {err}")
-}
-
-fn acknowledge_consumed_completion_listener(
-    tx: &Transaction<'_>,
-    mailbox_seq: i64,
-    acknowledged_at: &str,
-) -> Result<usize, String> {
-    tx.execute(
-        "UPDATE completion_event_listener
-         SET active = 0,
-             acknowledged_at = ?2,
-             acknowledgement_reason = 'consumed_in_call'
-         WHERE mailbox_seq = ?1 AND acknowledged_at IS NULL",
-        params![mailbox_seq, acknowledged_at],
-    )
-    .map_err(format_consumed_completion_listener_error)
-}
-
-fn format_consumed_completion_listener_error(err: rusqlite::Error) -> String {
-    format!("Failed to acknowledge consumed completion listener: {err}")
-}
-
-fn validate_consumed_completion_change(
-    changed: usize,
-    target: &str,
-    mailbox_seq: i64,
-) -> Result<(), String> {
-    if changed == 1 {
-        return Ok(());
-    }
-    Err(format_consumed_completion_change_error(target, mailbox_seq))
-}
-
-fn format_consumed_completion_change_error(target: &str, mailbox_seq: i64) -> String {
-    format!(
-        "Completion event {target} for mailbox row {mailbox_seq} changed while it was being consumed"
-    )
-}
-
-fn commit_consumed_completion_acknowledgement(tx: Transaction<'_>) -> Result<(), String> {
-    tx.commit()
-        .map_err(format_consumed_completion_transaction_commit_error)
-}
-
-fn format_consumed_completion_transaction_commit_error(err: rusqlite::Error) -> String {
-    format!("Failed to commit consumed completion acknowledgement: {err}")
-}
-
-fn resolve_completed_delivery_attempts_for_mailbox_seq(
-    tx: &Transaction<'_>,
-    mailbox_seq: i64,
-    resolved_at: &str,
-) -> Result<(), String> {
-    tx.execute(
-        "UPDATE mailbox_delivery_attempts AS attempt
-         SET resolved_at = COALESCE(resolved_at, ?2)
-         WHERE resolved_at IS NULL
-           AND EXISTS (
-                 SELECT 1
-                 FROM mailbox_delivery_attempt_items AS consumed
-                 WHERE consumed.attempt_id = attempt.attempt_id
-                   AND consumed.mailbox_seq = ?1
-             )
-           AND NOT EXISTS (
-                 SELECT 1
-                 FROM mailbox_delivery_attempt_items AS unresolved
-                 JOIN mailbox ON mailbox.seq = unresolved.mailbox_seq
-                 WHERE unresolved.attempt_id = attempt.attempt_id
-                   AND mailbox.delivered_at IS NULL
-             )",
-        params![mailbox_seq, resolved_at],
-    )
-    .map(|_| ())
-    .map_err(format_exact_row_delivery_attempt_resolution_error)
-}
-
-fn format_exact_row_delivery_attempt_resolution_error(err: rusqlite::Error) -> String {
-    format!("Failed to resolve exact-row mailbox delivery attempts: {err}")
 }
 
 fn payload_address(sha256: &str) -> String {
@@ -7056,7 +7315,7 @@ fn terminal_history_retention_stats_on(
                  ON attempt.attempt_id = item.attempt_id
                WHERE item.mailbox_seq = candidate.seq
                  AND (attempt.resolved_at IS NULL OR EXISTS (
-                       SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                       SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                        WHERE finalizer.attempt_id = attempt.attempt_id
                    ))
            )",
@@ -7074,7 +7333,7 @@ fn terminal_history_retention_stats_on(
         "SELECT COUNT(*)
          FROM mailbox_delivery_attempts AS candidate
          WHERE candidate.resolved_at IS NOT NULL
-           AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+           AND NOT EXISTS (SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                            WHERE finalizer.attempt_id = candidate.attempt_id)
            AND (
                candidate.evidence_disposition IS NULL
@@ -7097,11 +7356,13 @@ fn terminal_history_retention_stats_on(
     )?;
     let reclaimable_payload_files = count_rows(
         conn,
-        "SELECT COUNT(*) FROM (
+        &format!(
+            "SELECT COUNT(*) FROM (
              SELECT DISTINCT event.payload_sha256
              FROM completion_event AS event
              WHERE event.state = 'triggered'
                AND event.payload_reclaimed_at IS NULL
+               {}
                AND event.payload_file_path IS NOT NULL
                AND event.payload_sha256 IS NOT NULL
                AND NOT EXISTS (
@@ -7117,6 +7378,8 @@ fn terminal_history_retention_stats_on(
                      AND listener.acknowledged_at IS NULL
                )
          )",
+            continuation_payload_retention_predicate(conn)?
+        ),
         [],
         "reclaimable terminal payload files",
     )?;
@@ -7151,7 +7414,7 @@ fn prunable_delivery_attempt_ids(
             "SELECT attempt_id
              FROM mailbox_delivery_attempts AS candidate
              WHERE candidate.resolved_at IS NOT NULL
-           AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+           AND NOT EXISTS (SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                            WHERE finalizer.attempt_id = candidate.attempt_id)
                AND (
                    candidate.evidence_disposition IS NULL
@@ -7209,7 +7472,7 @@ fn prunable_terminal_mailbox_rows(
                      ON attempt.attempt_id = item.attempt_id
                    WHERE item.mailbox_seq = candidate.seq
                      AND (attempt.resolved_at IS NULL OR EXISTS (
-                       SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                       SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                        WHERE finalizer.attempt_id = attempt.attempt_id
                    ))
                )
@@ -7236,16 +7499,29 @@ fn prunable_terminal_mailbox_rows(
         .map_err(|err| format!("Failed to read terminal mailbox row: {err}"))
 }
 
+fn continuation_payload_retention_predicate(conn: &Connection) -> Result<&'static str, String> {
+    let has_domain:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='completion_continuation_domain')",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if has_domain {
+        completion_continuation::validate_schema_on(conn)?;
+        Ok(
+            "AND NOT EXISTS (SELECT 1 FROM completion_continuation_source source WHERE source.payload_sha256=event.payload_sha256 AND source.phase='accepted')",
+        )
+    } else {
+        Ok("")
+    }
+}
+
 fn reclaimable_completion_payloads(
     conn: &Connection,
     limit: i64,
 ) -> Result<Vec<RetiredPayload>, String> {
     let mut statement = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT event.payload_file_path, event.payload_sha256
              FROM completion_event AS event
              WHERE event.state = 'triggered'
                AND event.payload_reclaimed_at IS NULL
+               {}
                AND event.payload_file_path IS NOT NULL
                AND event.payload_sha256 IS NOT NULL
                AND NOT EXISTS (
@@ -7263,7 +7539,8 @@ fn reclaimable_completion_payloads(
              GROUP BY event.payload_sha256
              ORDER BY MIN(event.triggered_at), event.payload_sha256
              LIMIT ?1",
-        )
+            continuation_payload_retention_predicate(conn)?
+        ))
         .map_err(|err| format!("Failed to prepare terminal payload reclamation: {err}"))?;
     let rows = statement
         .query_map(params![limit], |row| {
@@ -7958,7 +8235,7 @@ fn validate_recovered_dead_process(
         return Ok(());
     }
     if !custody_allows_terminal(conn, before) {
-        return Err(GenerationRejection::InvariantViolation);
+        return Err(GenerationRejection::CustodyNotQuiescent);
     }
     if request.reason != RuntimeTerminalReason::RecoveredDead {
         return Ok(());
@@ -8916,19 +9193,38 @@ fn register_custody_proof_on(
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
-            .open(path).map_err(|e| GenerationStorageError::new(e.to_string()))?;
-        let metadata = file.metadata().map_err(|e| GenerationStorageError::new(e.to_string()))?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| GenerationStorageError::new(e.to_string()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| GenerationStorageError::new(e.to_string()))?;
         if !metadata.is_file() || metadata.len() != 0 {
-            return Err(GenerationStorageError::new("custody proof is not fresh".into()));
+            return Err(GenerationStorageError::new(
+                "custody proof is not fresh".into(),
+            ));
         }
-        conn.execute("INSERT INTO runtime_generation_custody VALUES (?1, ?2, ?3, ?4)",
-            params![generation.to_string(), path.to_string_lossy(), metadata.dev() as i64, metadata.ino() as i64])
-            .map_err(generation_storage_error("register independent launch custody"))?;
+        conn.execute(
+            "INSERT INTO runtime_generation_custody VALUES (?1, ?2, ?3, ?4)",
+            params![
+                generation.to_string(),
+                path.to_string_lossy(),
+                metadata.dev() as i64,
+                metadata.ino() as i64
+            ],
+        )
+        .map_err(generation_storage_error(
+            "register independent launch custody",
+        ))?;
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
-    { let _ = (conn, generation, path); Err(GenerationStorageError::new("custody unsupported".into())) }
+    {
+        let _ = (conn, generation, path);
+        Err(GenerationStorageError::new("custody unsupported".into()))
+    }
 }
 
 // This sidecar's identity evidence is host-local. Cross-host copied state is
@@ -8946,10 +9242,12 @@ fn generation_boot_has_ended(generation: &RuntimeGenerationRow) -> bool {
 }
 
 fn custody_allows_recovery(conn: &Connection, generation: &RuntimeGenerationRow) -> bool {
-    if generation_boot_has_ended(generation) { return true; }
-    custody_proof_observation(conn, generation)
-        .unwrap_or(!cfg!(target_os = "linux")
-            || generation.lifecycle_state != RuntimeLifecycleState::Starting)
+    if generation_boot_has_ended(generation) {
+        return true;
+    }
+    custody_proof_observation(conn, generation).unwrap_or(
+        !cfg!(target_os = "linux") || generation.lifecycle_state != RuntimeLifecycleState::Starting,
+    )
 }
 
 fn custody_allows_terminal(conn: &Connection, generation: &RuntimeGenerationRow) -> bool {
@@ -8964,7 +9262,9 @@ fn custody_proof_observation(conn: &Connection, generation: &RuntimeGenerationRo
     ).optional();
     match proof {
         Ok(None) => None,
-        Ok(Some((path, device, inode))) => Some(exact_custody_proof_is_quiescent(&path, device, inode)),
+        Ok(Some((path, device, inode))) => {
+            Some(exact_custody_proof_is_quiescent(&path, device, inode))
+        }
         Err(_) => Some(false),
     }
 }
@@ -8974,14 +9274,32 @@ fn exact_custody_proof_is_quiescent(path: &str, device: i64, inode: i64) -> bool
     {
         use std::io::Read;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let Ok(mut file) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) else { return false; };
-        let Ok(metadata) = file.metadata() else { return false; };
-        if !metadata.is_file() || metadata.len() != 1 || metadata.dev() as i64 != device || metadata.ino() as i64 != inode { return false; }
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        else {
+            return false;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        if !metadata.is_file()
+            || metadata.len() != 1
+            || metadata.dev() as i64 != device
+            || metadata.ino() as i64 != inode
+        {
+            return false;
+        }
         let mut bytes = [0; 2];
-        file.read(&mut bytes).is_ok_and(|n| n == 1 && bytes[0] == b'Q')
+        file.read(&mut bytes)
+            .is_ok_and(|n| n == 1 && bytes[0] == b'Q')
     }
     #[cfg(not(target_os = "linux"))]
-    { let _ = (path, device, inode); false }
+    {
+        let _ = (path, device, inode);
+        false
+    }
 }
 
 fn generation_liveness_observation(
@@ -9537,7 +9855,7 @@ fn preflight_completion_event_registration_on(
             owner_invocation_uuid,
         );
     }
-    if event.state == "triggered" {
+    if event.state == "triggered" && !completion_continuation::bound_event(conn, input.event_id)? {
         return Err(format!(
             "Completion event {} cannot register a listener after it was triggered",
             input.event_id
@@ -9559,10 +9877,11 @@ fn register_completion_event_on(
         insert_completion_event(tx, input, now)?;
         true
     };
-    register_completion_event_listener(
+    completion_continuation::register_notification_listener_on(
         tx,
         input,
-        existing.is_some_and(|event| event.state == "triggered"),
+        existing.is_some_and(|event| event.state == "triggered")
+            && !completion_continuation::bound_event(tx, input.event_id)?,
         now,
     )?;
     Ok(inserted)
@@ -9709,44 +10028,6 @@ fn validate_completion_event_registration_replay(
     }
 }
 
-fn register_completion_event_listener(
-    tx: &Transaction<'_>,
-    input: &CompletionEventRegistrationInput<'_>,
-    listeners_frozen: bool,
-    now: &str,
-) -> Result<(), String> {
-    let (Some(session_id), Some(invocation_uuid)) =
-        (input.owner_session_id, input.owner_invocation_uuid)
-    else {
-        return Err("Completion event owner session and invocation are both required".to_string());
-    };
-    if let Some(listener) = completion_event_listener_on(tx, input.event_id, invocation_uuid)? {
-        return validate_completion_event_listener_replay(&listener, session_id, invocation_uuid);
-    }
-    if listeners_frozen {
-        return Err(format!(
-            "Completion event {} cannot register a listener after it was triggered",
-            input.event_id
-        ));
-    }
-    tx.execute(
-        "INSERT OR IGNORE INTO completion_event_listener (
-            event_id, listener_id, session_id, owner_invocation_uuid, active, created_at
-         ) VALUES (?1, ?2, ?3, ?2, ?4, ?5)",
-        params![
-            input.event_id,
-            invocation_uuid,
-            session_id,
-            input.delivery_mode == "async",
-            now,
-        ],
-    )
-    .map_err(|err| format!("Failed to register completion event listener: {err}"))?;
-    let listener = completion_event_listener_on(tx, input.event_id, invocation_uuid)?
-        .ok_or_else(|| "Registered completion listener disappeared".to_string())?;
-    validate_completion_event_listener_replay(&listener, session_id, invocation_uuid)
-}
-
 fn completion_event_listener_on(
     conn: &Connection,
     event_id: &str,
@@ -9863,103 +10144,6 @@ fn validate_completion_event_trigger_replay(
             input.event_id
         ))
     }
-}
-
-fn acknowledge_consumed_completion_event_listeners(
-    tx: &Transaction<'_>,
-    event_id: &str,
-    now: &str,
-) -> Result<(), String> {
-    let session_ids = completion_event_listener_session_ids(tx, event_id)?;
-    tx.execute(
-        "UPDATE mailbox
-         SET delivered_at = COALESCE(delivered_at, ?2),
-             delivered_by_invocation_uuid = COALESCE(
-                 delivered_by_invocation_uuid,
-                 (SELECT owner_invocation_uuid
-                  FROM completion_event_listener
-                  WHERE completion_event_listener.mailbox_seq = mailbox.seq)
-             ),
-             delivery_attempts = delivery_attempts + 1,
-             delivery_error = NULL
-         WHERE seq IN (
-             SELECT mailbox_seq
-             FROM completion_event_listener
-             WHERE event_id = ?1 AND mailbox_seq IS NOT NULL
-         ) AND delivered_at IS NULL",
-        params![event_id, now],
-    )
-    .map_err(|err| format!("Failed to consume completion event mailbox rows: {err}"))?;
-    tx.execute(
-        "UPDATE completion_event_listener
-         SET active = 0,
-             acknowledged_at = COALESCE(acknowledged_at, ?2),
-             acknowledgement_reason = COALESCE(acknowledgement_reason, 'consumed_in_call')
-         WHERE event_id = ?1",
-        params![event_id, now],
-    )
-    .map_err(|err| format!("Failed to acknowledge consumed completion listeners: {err}"))?;
-    for session_id in session_ids {
-        resolve_completed_delivery_attempts(tx, &session_id, now, None)?;
-    }
-    Ok(())
-}
-
-fn completion_event_listener_session_ids(
-    conn: &Connection,
-    event_id: &str,
-) -> Result<Vec<String>, String> {
-    let mut statement = conn
-        .prepare(
-            "SELECT DISTINCT session_id
-             FROM completion_event_listener
-             WHERE event_id = ?1 AND mailbox_seq IS NOT NULL",
-        )
-        .map_err(|err| format!("Failed to prepare completion listener session query: {err}"))?;
-    let rows = statement
-        .query_map(params![event_id], |row| row.get(0))
-        .map_err(|err| format!("Failed to query completion listener sessions: {err}"))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("Failed to read completion listener session: {err}"))
-}
-
-fn materialize_completion_event_listeners(
-    tx: &Transaction<'_>,
-    event: &CompletionEventRow,
-    now: &str,
-) -> Result<(), String> {
-    if event.state != "triggered" {
-        return Ok(());
-    }
-    let listeners = completion_event_listeners_on(tx, &event.event_id)?;
-    let listener_count = listeners.len();
-    for listener in listeners.into_iter().filter(|listener| {
-        listener.active && listener.acknowledged_at.is_none() && listener.mailbox_seq.is_none()
-    }) {
-        let handle = completion_listener_mailbox_handle(event, &listener, listener_count);
-        let changed = insert_completion_listener_mailbox_row(tx, event, &listener, &handle, now)?;
-        let row = query_mailbox_by_kind_handle_tx(tx, AGENT_BASH_COMPLETE_KIND, &handle)?
-            .ok_or_else(|| "Completion listener mailbox row disappeared".to_string())?;
-        if changed == 0
-            && (row.session_id != listener.session_id
-                || row.owner_invocation_uuid.as_deref()
-                    != Some(listener.owner_invocation_uuid.as_str())
-                || row.payload_sha256 != event.payload_sha256)
-        {
-            return Err(format!(
-                "Completion event {} mailbox identity conflicts with an existing row",
-                event.event_id
-            ));
-        }
-        tx.execute(
-            "UPDATE completion_event_listener
-             SET mailbox_seq = ?3
-             WHERE event_id = ?1 AND listener_id = ?2 AND mailbox_seq IS NULL",
-            params![event.event_id, listener.listener_id, row.seq],
-        )
-        .map_err(|err| format!("Failed to bind completion listener mailbox row: {err}"))?;
-    }
-    Ok(())
 }
 
 fn completion_listener_mailbox_handle(
@@ -10851,6 +11035,154 @@ fn validate_optional_session_admission_identity(
     }
 }
 
+fn begin_headless_submission_on(
+    conn: &Connection,
+    attempt_id: &str,
+    session_id: &str,
+    invocation_uuid: &str,
+    require_anchor: bool,
+) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE mailbox_delivery_attempts
+             SET submission_started_at = ?4, headless_submission_state = 'possible'
+             WHERE attempt_id = ?1 AND session_id = ?2 AND delivery_invocation_uuid = ?3
+               AND resolved_at IS NULL AND submission_started_at IS NULL
+               AND headless_submission_state = 'prepared'
+               AND NOT EXISTS (SELECT 1 FROM mailbox_observation_stops
+                   WHERE session_id = ?2 AND rearmed_at IS NULL)
+               AND (?5 = 0 OR observation_anchor_token IS NOT NULL)",
+            params![
+                attempt_id,
+                session_id,
+                invocation_uuid,
+                now_rfc3339(),
+                require_anchor
+            ],
+        )
+        .map_err(|err| format!("Failed to fence headless submission: {err}"))?;
+    if changed != 1 {
+        return Err(
+            "headless delivery missing anchor, replaced, or possibly submitted; no launch".into(),
+        );
+    }
+    Ok(())
+}
+
+struct ManualNativeCustodyRow {
+    phase: String,
+    custodian: Option<String>,
+    adopter: Option<String>,
+    driver: Option<String>,
+}
+
+/// None means a legacy release may be useful; it must be rechecked under
+/// Immediate. Some is observation only; admission/launch retain their fences.
+fn manual_resume_observation_on(
+    conn: &rusqlite::Transaction<'_>,
+    session: &str,
+) -> Result<Option<ManualWakeCoordination>, String> {
+    if let Some(observation) = manual_native_custody_on(conn, session)? {
+        return Ok(Some(observation));
+    }
+    let Some(claim) = wake_claim_tx(conn, session)? else {
+        return Ok(Some(ManualWakeCoordination::Absent));
+    };
+    if wake_claim_is_releasable_for_manual_resume(conn, &claim)? {
+        return Ok(None);
+    }
+    let observation = if wake_claim_has_persisted_process_identity(conn, &claim)? {
+        ManualWakeCoordination::LegacyLiveBusy
+    } else {
+        ManualWakeCoordination::UnknownCustody
+    };
+    Ok(Some(observation))
+}
+
+fn manual_native_custody_on(
+    conn: &Connection,
+    session: &str,
+) -> Result<Option<ManualWakeCoordination>, String> {
+    let row: Option<ManualNativeCustodyRow> = conn
+        .query_row(
+            "SELECT a.phase,a.custodian_identity,a.adopter_identity,
+            CASE WHEN o.phase='running' THEN o.driver_identity ELSE NULL END
+         FROM completion_continuation_attempt a LEFT JOIN completion_continuation_owner o
+            ON o.generation=a.owner_generation
+         WHERE a.session_id=?1 AND a.operation='activation'
+            AND (a.phase NOT IN ('drained','never_started') OR a.integrated != 1)",
+            [session],
+            |r| {
+                Ok(ManualNativeCustodyRow {
+                    phase: r.get(0)?,
+                    custodian: r.get(1)?,
+                    adopter: r.get(2)?,
+                    driver: r.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(ManualNativeCustodyRow {
+        phase,
+        custodian,
+        adopter,
+        driver,
+    }) = row
+    else {
+        return Ok(None);
+    };
+    // Owner succession never frees debt. A live original custodian/adopter can
+    // still discharge unknown-custody rows; the successor driver cannot.
+    let driver = if phase == "unknown_custody" {
+        None
+    } else {
+        driver
+    };
+    for encoded in [custodian, adopter, driver].into_iter().flatten() {
+        let Ok(identity) =
+            serde_json::from_str::<crate::completion_continuation::SourceProcessIdentity>(&encoded)
+        else {
+            continue;
+        };
+        if let Some(live) = pid_identity::read_live_process_identity(identity.pid)?
+            && live.os_boot_id == identity.boot_id
+            && live.os_pid_starttime_ticks == identity.starttime_ticks
+        {
+            return Ok(Some(ManualWakeCoordination::NativeBusy));
+        }
+    }
+    Ok(Some(ManualWakeCoordination::UnknownCustody))
+}
+
+/// Shared sidecar arbitration: an existing command precedes a new automatic turn.
+/// Exact process observation, never queue age, decides whether an intent is live.
+fn session_admission_intent_on(conn: &Connection, session: &str) -> Result<bool, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT launcher_os_pid, launcher_os_boot_id,
+        launcher_os_pid_starttime_ticks FROM session_admission_queue
+        WHERE session_id=?1 AND state IN ('queued','admitted','launching')",
+        )
+        .map_err(|e| e.to_string())?;
+    let identities = statement
+        .query_map([session], |row| {
+            Ok(ProcessIdentity {
+                os_pid: row.get(0)?,
+                os_boot_id: row.get(1)?,
+                os_pid_starttime_ticks: row.get(2)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for identity in identities {
+        let identity = identity.map_err(|e| e.to_string())?;
+        if pid_identity::read_live_process_identity(identity.os_pid)?.as_ref() == Some(&identity) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn next_session_admission_on(conn: &Connection) -> Result<Option<String>, String> {
     conn.query_row(
         "SELECT admission.registration_identity
@@ -10864,6 +11196,31 @@ fn next_session_admission_on(conn: &Connection) -> Result<Option<String>, String
                    WHERE generation.session_id = admission.session_id
                      AND generation.lifecycle_state != 'exited'
                )
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM completion_continuation_attempt native
+               WHERE native.session_id = admission.session_id
+                 AND native.operation = 'activation'
+                 AND (native.phase NOT IN ('drained', 'never_started') OR native.integrated != 1)
+                 AND NOT (
+                     native.phase IN ('accepted', 'starting', 'running')
+                     AND native.launcher_identity IS NOT NULL
+                     AND json_extract(native.launcher_identity, '$.pid') = admission.launcher_os_pid
+                     AND json_extract(native.launcher_identity, '$.boot_id') = admission.launcher_os_boot_id
+                     AND json_extract(native.launcher_identity, '$.starttime_ticks') = admission.launcher_os_pid_starttime_ticks
+                     AND EXISTS (SELECT 1 FROM session_wake_claim claim
+                         WHERE claim.session_id = native.session_id AND claim.claim_token = native.claim_token)
+                 )
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM session_wake_claim claim
+               WHERE claim.session_id = admission.session_id
+                 AND NOT (claim.wake_pid IS NOT NULL
+                     AND claim.wake_os_boot_id IS NOT NULL
+                     AND claim.wake_os_pid_starttime_ticks IS NOT NULL
+                     AND claim.wake_pid = admission.launcher_os_pid
+                     AND claim.wake_os_boot_id = admission.launcher_os_boot_id
+                     AND claim.wake_os_pid_starttime_ticks = admission.launcher_os_pid_starttime_ticks)
            )
          ORDER BY admission.queue_sequence ASC
          LIMIT 1",
@@ -11114,14 +11471,17 @@ fn reconcile_dead_starting_generations_on(
 }
 
 fn unpublished_starting_generation_ids_on(conn: &Connection) -> Result<Vec<String>, String> {
-    let mut statement = conn.prepare(
-        "SELECT generation_uuid FROM runtime_generation
+    let mut statement = conn
+        .prepare(
+            "SELECT generation_uuid FROM runtime_generation
          WHERE lifecycle_state = 'starting'
            AND identity_os_pid IS NULL
            AND creator_identity_os_pid IS NOT NULL
          ORDER BY created_at, generation_uuid",
-    ).map_err(|err| format!("Failed to prepare starting-generation scan: {err}"))?;
-    statement.query_map([], |row| row.get(0))
+        )
+        .map_err(|err| format!("Failed to prepare starting-generation scan: {err}"))?;
+    statement
+        .query_map([], |row| row.get(0))
         .map_err(|err| format!("Failed to scan starting generations: {err}"))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|err| format!("Failed to read starting-generation identity: {err}"))
@@ -11139,13 +11499,18 @@ fn reconcile_dead_starting_generation_on(
     let ExactProcessEvidence::Recorded(ref creator) = row.creator_process_evidence else {
         return Ok(());
     };
-    let recover = generation_boot_has_ended(&row) || (custody_allows_recovery(conn, &row)
-        && reservation_owner_has_exited(creator, observe_session_admission_owner(creator.os_pid)));
+    let recover = generation_boot_has_ended(&row)
+        || (custody_allows_recovery(conn, &row)
+            && reservation_owner_has_exited(
+                creator,
+                observe_session_admission_owner(creator.os_pid),
+            ));
     if !recover {
         return Ok(());
     }
-    let changed = conn.execute(
-        "UPDATE runtime_generation
+    let changed = conn
+        .execute(
+            "UPDATE runtime_generation
          SET lifecycle_state = 'exited', exited_at = ?2,
              terminal_reason = 'recovered_dead'
          WHERE generation_uuid = ?1
@@ -11154,15 +11519,15 @@ fn reconcile_dead_starting_generation_on(
            AND creator_identity_os_pid = ?3
            AND creator_identity_os_boot_id = ?4
            AND creator_identity_os_pid_starttime_ticks = ?5",
-        params![
-            &generation_uuid,
-            now_rfc3339(),
-            creator.os_pid,
-            &creator.os_boot_id,
-            creator.os_pid_starttime_ticks,
-        ],
-    )
-    .map_err(|err| format!("Failed to reconcile dead starting generation: {err}"))?;
+            params![
+                &generation_uuid,
+                now_rfc3339(),
+                creator.os_pid,
+                &creator.os_boot_id,
+                creator.os_pid_starttime_ticks,
+            ],
+        )
+        .map_err(|err| format!("Failed to reconcile dead starting generation: {err}"))?;
     if changed != 1 {
         return Ok(());
     }
@@ -11952,9 +12317,119 @@ fn now_unix_millis() -> Result<i64, String> {
 mod starting_recovery_tests;
 
 #[cfg(test)]
+#[path = "../tests/support/fixture_process.rs"]
+mod fixture_process;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::StateDb;
+
+    // Relational final-system fixtures: exact live driver, never a transport
+    // liveness claim. Native endpoint/custodian execution is tested separately.
+    fn install_wake_owner(db: &mut MailboxDb) {
+        use crate::completion_continuation::{PROTOCOL, SourceProcessIdentity};
+        let state_path = Path::new(db.conn.path().unwrap()).with_file_name("state.db");
+        let state = StateDb::open(&state_path).unwrap();
+        let parent_uuid = Uuid::new_v4().to_string();
+        let parent = state
+            .start_invocation(&crate::InvocationStart {
+                invocation_uuid: parent_uuid.clone(),
+                model_name: "model-a".into(),
+                provider_name: "provider-a".into(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .bind_invocation_provider_session_start(
+                crate::InvocationMutationAuthority::Standalone,
+                parent,
+                &crate::ProviderSessionBinding {
+                    provider_session_id: "session-a".into(),
+                    capture_method: "fixture",
+                    resume_input_id: None,
+                    provider_session_resolved_account: None,
+                },
+            )
+            .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: "session-a",
+                mode: "headless",
+                invocation_uuid: Some(&parent_uuid),
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        let live = current_identity();
+        let identity = SourceProcessIdentity {
+            pid: live.os_pid,
+            boot_id: live.os_boot_id,
+            starttime_ticks: live.os_pid_starttime_ticks,
+        };
+        db.publish_completion_continuation_owner(&CompletionDomainOwner {
+            protocol: PROTOCOL.into(),
+            domain_id: db.completion_continuation_domain().unwrap().unwrap(),
+            owner_generation: Uuid::new_v4().to_string(),
+            guardian_identity: identity.clone(),
+            driver_identity: identity,
+            endpoint: "/fixture/not-a-native-endpoint".into(),
+        })
+        .unwrap();
+    }
+
+    fn revoke_unspent_wake(db: &mut MailboxDb, token: &str) {
+        let attempt = db
+            .continuation_activation("session-a", token)
+            .unwrap()
+            .unwrap();
+        db.revoke_unaccepted_continuation_attempt(&attempt).unwrap();
+    }
+
+    // A retained pre-protocol claim has no attempt. Only subsequent acquisition
+    // runs the native reservation API; no historical custody is manufactured.
+    fn retained_legacy_wake(
+        db: &mut MailboxDb,
+        input: WakeClaimRequest<'_>,
+    ) -> Result<WakeClaimAcquireResult, String> {
+        db.conn.execute("INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count,wake_invocation_uuid) VALUES(?1,?2,?3,?4,?5,?6)", params![input.session_id,input.claim_token,now_rfc3339(),input.reason,input.auto_wake_count,input.wake_invocation_uuid]).unwrap();
+        Ok(WakeClaimAcquireResult::Acquired(
+            wake_claim(&db.conn, input.session_id)?.unwrap(),
+        ))
+    }
+
+    fn prepare_wake_launcher(
+        db: &mut MailboxDb,
+    ) -> (
+        ContinuationAttempt,
+        crate::completion_continuation::SourceProcessIdentity,
+    ) {
+        #[cfg(target_os = "linux")]
+        let parent =
+            pid_identity::read_live_process_identity(i64::from(unsafe { libc::getppid() }))
+                .unwrap()
+                .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let parent = current_identity();
+        let custodian = crate::completion_continuation::SourceProcessIdentity {
+            pid: parent.os_pid,
+            boot_id: parent.os_boot_id,
+            starttime_ticks: parent.os_pid_starttime_ticks,
+        };
+        let attempt = db
+            .continuation_activation("session-a", "token-a")
+            .unwrap()
+            .unwrap();
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.attach_continuation_custodian(&attempt, &custodian)
+            .unwrap();
+        db.advance_continuation_attempt(&attempt, 3, "accepted", "starting", &custodian)
+            .unwrap();
+        (attempt, custodian)
+    }
 
     const STARTING_GENERATION_FIXTURE_PATH: &str = "OULIPOLY_TEST_STARTING_GENERATION_FIXTURE_PATH";
     const WAKE_CLAIM_FOREIGN_CHILD_FIXTURE: &str = "OULIPOLY_TEST_WAKE_CLAIM_FOREIGN_CHILD";
@@ -11992,32 +12467,75 @@ mod tests {
         } else {
             "11111111-1111-4111-8111-111111111111"
         };
-        for (boot, previous_boot) in [(current, false), ("unverifiable".into(), false), (previous.into(), true)] {
+        for (boot, previous_boot) in [
+            (current, false),
+            ("unverifiable".into(), false),
+            (previous.into(), true),
+        ] {
             for route in ["session", "global"] {
                 let directory = tempfile::tempdir().unwrap();
                 let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
                 let id = RuntimeGenerationId::new();
                 let proof = directory.path().join("never-certified");
                 std::fs::write(&proof, b"").unwrap();
-                db.runtime_lifecycle().create_runtime_generation_with_custody(CreateRuntimeGeneration {
-                    generation_id: &id, spawn_invocation_uuid: "old-invocation", session_id: Some("old-session"),
-                    runtime_mode: "headless", provider_name: "fixture", model_name: None,
-                    pty_control_path: None, models_dir: None, effective_cwd: None,
-                }, Some(&proof)).unwrap();
+                db.runtime_lifecycle()
+                    .create_runtime_generation_with_custody(
+                        CreateRuntimeGeneration {
+                            generation_id: &id,
+                            spawn_invocation_uuid: "old-invocation",
+                            session_id: Some("old-session"),
+                            runtime_mode: "headless",
+                            provider_name: "fixture",
+                            model_name: None,
+                            pty_control_path: None,
+                            models_dir: None,
+                            effective_cwd: None,
+                        },
+                        Some(&proof),
+                    )
+                    .unwrap();
                 // Private persisted-epoch fixture, NOT a production rewrite or
                 // an executed reboot. Retain a current live PID deliberately.
                 db.conn.execute("UPDATE runtime_generation SET creator_identity_os_boot_id = ?1 WHERE generation_uuid = ?2",
                     params![boot, id.to_string()]).unwrap();
                 if route == "session" {
-                    assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("old-session").unwrap(),
-                        if previous_boot { SessionLiveness::Idle } else { SessionLiveness::Busy });
+                    assert_eq!(
+                        db.runtime_lifecycle()
+                            .reconcile_session_liveness("old-session")
+                            .unwrap(),
+                        if previous_boot {
+                            SessionLiveness::Idle
+                        } else {
+                            SessionLiveness::Busy
+                        }
+                    );
                 } else {
-                    db.session_admissions().enqueue("successor", "successor", None, &current_identity(), 1).unwrap();
-                    assert_eq!(matches!(db.session_admissions().try_admit_next("claim", 0, 2).unwrap(),
-                        SessionAdmissionAttempt::Admitted(_)), previous_boot);
+                    db.session_admissions()
+                        .enqueue("successor", "successor", None, &current_identity(), 1)
+                        .unwrap();
+                    assert_eq!(
+                        matches!(
+                            db.session_admissions()
+                                .try_admit_next("claim", 0, 2)
+                                .unwrap(),
+                            SessionAdmissionAttempt::Admitted(_)
+                        ),
+                        previous_boot
+                    );
                 }
-                let row = db.runtime_lifecycle_reader().runtime_generation(&id).unwrap().unwrap();
-                assert_eq!(row.lifecycle_state, if previous_boot { RuntimeLifecycleState::Exited } else { RuntimeLifecycleState::Starting });
+                let row = db
+                    .runtime_lifecycle_reader()
+                    .runtime_generation(&id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    row.lifecycle_state,
+                    if previous_boot {
+                        RuntimeLifecycleState::Exited
+                    } else {
+                        RuntimeLifecycleState::Starting
+                    }
+                );
                 assert_eq!(std::fs::read(&proof).unwrap(), b""); // Never fabricate Q.
             }
         }
@@ -12032,21 +12550,27 @@ mod tests {
             RuntimeGenerationId::parse("90111111-1111-4111-8111-111111111111").unwrap();
         let mut db = MailboxDb::open(Path::new(&path)).unwrap();
         let phase = std::env::var("OULIPOLY_TEST_CUSTODY_PHASE").ok();
-        let proof_path = oulipoly_core::launch_custody::proof_path(Path::new(&path), &generation_id.to_string());
-        let custody = phase.as_ref().map(|_| oulipoly_core::launch_custody::LaunchCustody::start(proof_path.clone()).unwrap());
+        let proof_path =
+            oulipoly_core::launch_custody::proof_path(Path::new(&path), &generation_id.to_string());
+        let custody = phase.as_ref().map(|_| {
+            oulipoly_core::launch_custody::LaunchCustody::start(proof_path.clone()).unwrap()
+        });
         let GenerationMutation::Applied(row) = db
             .runtime_lifecycle()
-            .create_runtime_generation_with_custody(CreateRuntimeGeneration {
-                generation_id: &generation_id,
-                spawn_invocation_uuid: "starting-fixture-invocation",
-                session_id: Some("starting-fixture-session"),
-                runtime_mode: "headless",
-                provider_name: "provider-a",
-                model_name: Some("model-a"),
-                pty_control_path: None,
-                models_dir: None,
-                effective_cwd: None,
-            }, custody.as_ref().map(|_| proof_path.as_path()))
+            .create_runtime_generation_with_custody(
+                CreateRuntimeGeneration {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: "starting-fixture-invocation",
+                    session_id: Some("starting-fixture-session"),
+                    runtime_mode: "headless",
+                    provider_name: "provider-a",
+                    model_name: Some("model-a"),
+                    pty_control_path: None,
+                    models_dir: None,
+                    effective_cwd: None,
+                },
+                custody.as_ref().map(|_| proof_path.as_path()),
+            )
             .unwrap()
         else {
             panic!("fixture generation was not created");
@@ -12064,11 +12588,16 @@ mod tests {
                 command.args(["-c", "/usr/bin/setsid /bin/sh -c 'echo ready > descendant; /bin/sleep 1' & exit 0"])
                     .env_clear().current_dir(root).process_group(0);
                 custody.as_ref().unwrap().configure(&mut command).unwrap();
+                // This fixture intentionally dies before local wait; its
+                // supervising test owns the crash and descendant-reap oracle.
+                #[allow(clippy::zombie_processes)]
                 let _child = command.spawn().unwrap();
                 drop(command);
                 custody_eventually(|| root.join("descendant").exists());
             }
-            if phase == "sealed_live" { custody.as_ref().unwrap().seal(); }
+            if phase == "sealed_live" {
+                custody.as_ref().unwrap().seal();
+            }
             std::fs::write(root.join("ready"), b"ready").unwrap();
             std::thread::sleep(StdDuration::from_secs(10));
             panic!("fixture creator not crashed");
@@ -12080,22 +12609,32 @@ mod tests {
     #[cfg(target_os = "linux")]
     impl std::ops::Deref for CustodyTestCreator {
         type Target = std::process::Child;
-        fn deref(&self) -> &Self::Target { &self.0 }
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
     }
     #[cfg(target_os = "linux")]
     impl std::ops::DerefMut for CustodyTestCreator {
-        fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
     }
     #[cfg(target_os = "linux")]
     impl Drop for CustodyTestCreator {
-        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     #[cfg(target_os = "linux")]
     fn custody_eventually(mut condition: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
         while !condition() {
-            assert!(std::time::Instant::now() < deadline, "private custody deadline");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "private custody deadline"
+            );
             std::thread::sleep(StdDuration::from_millis(5));
         }
     }
@@ -12107,23 +12646,62 @@ mod tests {
             for route in ["session", "global"] {
                 let directory = tempfile::tempdir().unwrap();
                 let sidecar = directory.path().join("pid-identity.db");
-                let mut creator = CustodyTestCreator(std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "mailbox::tests::starting_runtime_generation_fixture"])
-                    .env_clear().env("HOME", directory.path()).env("XDG_CONFIG_HOME", directory.path())
-                    .env("XDG_DATA_HOME", directory.path()).env(STARTING_GENERATION_FIXTURE_PATH, &sidecar)
-                    .env("OULIPOLY_TEST_CUSTODY_PHASE", phase)
-                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+                let mut creator = CustodyTestCreator(
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "mailbox::tests::starting_runtime_generation_fixture",
+                        ])
+                        .env_clear()
+                        .env("HOME", directory.path())
+                        .env("XDG_CONFIG_HOME", directory.path())
+                        .env("XDG_DATA_HOME", directory.path())
+                        .env(STARTING_GENERATION_FIXTURE_PATH, &sidecar)
+                        .env("OULIPOLY_TEST_CUSTODY_PHASE", phase)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                );
                 custody_eventually(|| directory.path().join("ready").exists());
-                let id = RuntimeGenerationId::parse("90111111-1111-4111-8111-111111111111").unwrap();
+                let id =
+                    RuntimeGenerationId::parse("90111111-1111-4111-8111-111111111111").unwrap();
                 let mut db = MailboxDb::open(&sidecar).unwrap();
-                db.session_admissions().enqueue("successor", "successor", None, &current_identity(), 1).unwrap();
-                assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("starting-fixture-session").unwrap(), SessionLiveness::Busy);
-                assert!(!matches!(db.session_admissions().try_admit_next("claim", 0, 2).unwrap(), SessionAdmissionAttempt::Admitted(_)));
+                db.session_admissions()
+                    .enqueue("successor", "successor", None, &current_identity(), 1)
+                    .unwrap();
+                assert_eq!(
+                    db.runtime_lifecycle()
+                        .reconcile_session_liveness("starting-fixture-session")
+                        .unwrap(),
+                    SessionLiveness::Busy
+                );
+                assert!(!matches!(
+                    db.session_admissions()
+                        .try_admit_next("claim", 0, 2)
+                        .unwrap(),
+                    SessionAdmissionAttempt::Admitted(_)
+                ));
                 creator.kill().unwrap();
-                custody_eventually(|| matches!(pid_identity::observe_finalizer_process_identity(creator.id().into()), pid_identity::FinalizerProcessIdentityObservation::ExactExited(_)));
+                custody_eventually(|| {
+                    matches!(
+                        pid_identity::observe_finalizer_process_identity(creator.id().into()),
+                        pid_identity::FinalizerProcessIdentityObservation::ExactExited(_)
+                    )
+                });
                 if phase == "unpublished" {
-                    assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("starting-fixture-session").unwrap(), SessionLiveness::Busy);
-                    assert!(!matches!(db.session_admissions().try_admit_next("claim", 0, 3).unwrap(), SessionAdmissionAttempt::Admitted(_)));
+                    assert_eq!(
+                        db.runtime_lifecycle()
+                            .reconcile_session_liveness("starting-fixture-session")
+                            .unwrap(),
+                        SessionLiveness::Busy
+                    );
+                    assert!(!matches!(
+                        db.session_admissions()
+                            .try_admit_next("claim", 0, 3)
+                            .unwrap(),
+                        SessionAdmissionAttempt::Admitted(_)
+                    ));
                 }
                 let proof = oulipoly_core::launch_custody::proof_path(&sidecar, &id.to_string());
                 custody_eventually(|| oulipoly_core::launch_custody::is_quiescent(&proof));
@@ -12131,21 +12709,53 @@ mod tests {
                 let retained = proof.with_extension("retained");
                 std::fs::rename(&proof, &retained).unwrap();
                 std::fs::write(&proof, b"Q").unwrap();
-                assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("starting-fixture-session").unwrap(), SessionLiveness::Busy);
+                assert_eq!(
+                    db.runtime_lifecycle()
+                        .reconcile_session_liveness("starting-fixture-session")
+                        .unwrap(),
+                    SessionLiveness::Busy
+                );
                 std::fs::remove_file(&proof).unwrap();
                 std::fs::rename(retained, &proof).unwrap();
                 if route == "session" {
-                    assert_eq!(db.runtime_lifecycle().reconcile_session_liveness("starting-fixture-session").unwrap(), SessionLiveness::Idle);
+                    assert_eq!(
+                        db.runtime_lifecycle()
+                            .reconcile_session_liveness("starting-fixture-session")
+                            .unwrap(),
+                        SessionLiveness::Idle
+                    );
                 }
-                assert!(matches!(db.session_admissions().try_admit_next("claim", 0, 4).unwrap(), SessionAdmissionAttempt::Admitted(_)));
-                let row = db.runtime_lifecycle_reader().runtime_generation(&id).unwrap().unwrap();
+                assert!(matches!(
+                    db.session_admissions()
+                        .try_admit_next("claim", 0, 4)
+                        .unwrap(),
+                    SessionAdmissionAttempt::Admitted(_)
+                ));
+                let row = db
+                    .runtime_lifecycle_reader()
+                    .runtime_generation(&id)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(row.lifecycle_state, RuntimeLifecycleState::Exited);
-                assert_eq!(row.terminal_reason, Some(RuntimeTerminalReason::RecoveredDead));
+                assert_eq!(
+                    row.terminal_reason,
+                    Some(RuntimeTerminalReason::RecoveredDead)
+                );
                 let identity = current_identity();
-                assert!(matches!(db.runtime_lifecycle().bind_runtime_generation_running(BindRuntimeGenerationRunning {
-                    fence: RuntimeGenerationFence { generation_id: &id, spawn_invocation_uuid: "starting-fixture-invocation" },
-                    spawned_os_pid: identity.os_pid, exact_process_identity: &identity, os_pgid: None,
-                }).unwrap(), GenerationMutation::Rejected(_)));
+                assert!(matches!(
+                    db.runtime_lifecycle()
+                        .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                            fence: RuntimeGenerationFence {
+                                generation_id: &id,
+                                spawn_invocation_uuid: "starting-fixture-invocation"
+                            },
+                            spawned_os_pid: identity.os_pid,
+                            exact_process_identity: &identity,
+                            os_pgid: None,
+                        })
+                        .unwrap(),
+                    GenerationMutation::Rejected(_)
+                ));
                 // Preserve the real creator zombie until successor admission and
                 // attempted late publication have both been checked.
                 creator.wait().unwrap();
@@ -12199,10 +12809,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after.lifecycle_state, RuntimeLifecycleState::Starting);
-        assert_eq!(
-            after.terminal_reason,
-            None
-        );
+        assert_eq!(after.terminal_reason, None);
     }
 
     #[cfg(unix)]
@@ -12260,7 +12867,15 @@ mod tests {
                     MailboxDb::open(&sidecar_path).map(SidecarHandle::Mailbox)
                 };
                 result_tx
-                    .send(handle.as_ref().map(|_| ()).map_err(Clone::clone))
+                    .send(handle.as_ref().map_err(Clone::clone).and_then(|handle| {
+                        match handle {
+                            SidecarHandle::Mailbox(mailbox) => mailbox.conn.query_row(
+                                "SELECT generation_uuid, (SELECT user_version FROM pragma_user_version) FROM mailbox_sidecar_identity WHERE singleton=1",
+                                [], |row| Ok(Some((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))),
+                            ).map_err(|error| error.to_string()),
+                            SidecarHandle::Pid(_) => Ok(None),
+                        }
+                    }))
                     .unwrap();
                 release.wait();
                 match handle {
@@ -12280,11 +12895,31 @@ mod tests {
         }
 
         assert_eq!(results.len(), STARTUPS);
+        let identities = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok().and_then(|id| id.as_ref()))
+            .collect::<Vec<_>>();
+        if let Some(first) = identities.first() {
+            assert_eq!(first.1, schema::CURRENT_VERSION);
+            assert!(
+                identities.iter().all(|identity| *identity == *first),
+                "different committed schema/namespace identities: {identities:?}"
+            );
+        }
+        let identity_count = identities.len();
         let failures = results
             .into_iter()
             .filter_map(Result::err)
             .collect::<Vec<_>>();
         assert!(failures.is_empty(), "startup failures: {failures:#?}");
+        assert_eq!(
+            identity_count,
+            if mixed_pid_handles {
+                STARTUPS / 2
+            } else {
+                STARTUPS
+            }
+        );
     }
 
     #[test]
@@ -12456,6 +13091,7 @@ mod tests {
             ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
             )
             .unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection.pragma_update(None, "user_version", 1).unwrap();
         drop(connection);
 
@@ -12494,10 +13130,11 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            // Schema 16 adds the fair cursor and its partial candidate index.
-            // The measured fixed schema-open overhead is 582 VM steps; retain a
-            // tight constant ceiling and the independent no-backfill assertion.
-            current_open_steps < 608,
+            // Schema 20 includes retained completed-turn definitions in the
+            // fingerprint (measured 1473 VM steps). Keep a tight fixed ceiling,
+            // the no-backfill assertion, and the separate retained-history
+            // growth test; this does not grant a data-size-dependent budget.
+            current_open_steps < 1510,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
         );
     }
@@ -12509,6 +13146,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP INDEX idx_session_admission_state_runtime;
@@ -12551,6 +13189,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP INDEX idx_mailbox_terminal_retention;
@@ -12609,6 +13248,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP INDEX idx_mailbox_payload_reference;
@@ -12651,6 +13291,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
@@ -12751,6 +13392,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TABLE session_wake_claim;
@@ -12804,6 +13446,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TABLE session_admission_queue;
@@ -12844,6 +13487,7 @@ mod tests {
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TABLE session_admission_queue;
@@ -13333,6 +13977,7 @@ mod tests {
         let sidecar_path = directory.path().join("pid-identity.db");
         drop(MailboxDb::open(&sidecar_path).unwrap());
         let connection = Connection::open(&sidecar_path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TABLE runtime_generation;
@@ -13557,6 +14202,7 @@ mod tests {
                 ))
                 .unwrap();
         }
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection.pragma_update(None, "user_version", 4).unwrap();
         drop(connection);
 
@@ -13679,6 +14325,7 @@ mod tests {
             ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
             )
             .unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(mailbox.connection());
         mailbox
             .connection()
             .pragma_update(None, "user_version", 1)
@@ -13791,6 +14438,7 @@ mod tests {
             ALTER TABLE mailbox_delivery_attempts DROP COLUMN observation_progress;",
             )
             .unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(mailbox.connection());
         mailbox
             .connection()
             .pragma_update(None, "user_version", 1)
@@ -14200,7 +14848,6 @@ mod tests {
     fn completion_trigger<'a>(
         event_id: &'a str,
         payload_json: &'a str,
-        consumed: bool,
     ) -> CompletionEventTriggerInput<'a> {
         CompletionEventTriggerInput {
             event_id,
@@ -14210,7 +14857,6 @@ mod tests {
             log_path: "/tmp/state/log",
             rc_path: "/tmp/state/rc",
             rc: 0,
-            consumed,
         }
     }
 
@@ -14324,7 +14970,6 @@ mod tests {
             .trigger_completion_event(completion_trigger(
                 event_id,
                 r#"{"schema_version":2,"handle":"ab_event"}"#,
-                false,
             ))
             .unwrap();
         assert!(triggered.triggered);
@@ -14339,7 +14984,6 @@ mod tests {
             .trigger_completion_event(completion_trigger(
                 event_id,
                 r#"{"schema_version":2,"handle":"ab_event"}"#,
-                false,
             ))
             .unwrap();
         assert!(!duplicate.triggered);
@@ -14358,8 +15002,7 @@ mod tests {
         assert!(
             db.trigger_completion_event(completion_trigger(
                 event_id,
-                r#"{"schema_version":2,"handle":"different"}"#,
-                false,
+                r#"{"schema_version":2,"handle":"different"}"#
             ))
             .is_err()
         );
@@ -14424,11 +15067,7 @@ mod tests {
         let trigger_error = db
             .trigger_completion_event(CompletionEventTriggerInput {
                 state_dir: "/tmp/different-state",
-                ..completion_trigger(
-                    event_id,
-                    r#"{"schema_version":2,"handle":"ab_identity"}"#,
-                    false,
-                )
+                ..completion_trigger(event_id, r#"{"schema_version":2,"handle":"ab_identity"}"#)
             })
             .unwrap_err();
         assert!(trigger_error.contains("does not match its registered source"));
@@ -14479,7 +15118,6 @@ mod tests {
             .trigger_completion_event(completion_trigger(
                 event_id,
                 r#"{"schema_version":2,"handle":"ab_sync"}"#,
-                false,
             ))
             .unwrap();
         assert!(triggered.triggered);
@@ -14492,366 +15130,45 @@ mod tests {
     }
 
     #[test]
-    fn consumed_completion_acknowledges_listener_without_mailbox_delivery() {
+    fn completion_replay_and_transport_receipt_do_not_acknowledge_listeners() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
-        let event_id = "ab_consumed";
+        let event_id = "ab_receipt_not_ack";
+        let owner = "11111111-1111-4111-8111-111111111111";
+        let payload = r#"{"schema_version":2,"handle":"ab_receipt_not_ack"}"#;
         db.register_completion_event(completion_registration(
             event_id,
             "async",
             "session-a",
-            "11111111-1111-4111-8111-111111111111",
+            owner,
         ))
         .unwrap();
-
-        let triggered = db
-            .trigger_completion_event(completion_trigger(
-                event_id,
-                r#"{"schema_version":2,"handle":"ab_consumed"}"#,
-                true,
-            ))
+        let first = db
+            .trigger_completion_event(completion_trigger(event_id, payload))
             .unwrap();
-        assert!(triggered.triggered);
-        assert!(triggered.mailbox_rows.is_empty());
-        assert!(!triggered.listeners[0].active);
-        assert!(triggered.listeners[0].acknowledged_at.is_some());
-        assert_eq!(
-            triggered.listeners[0].acknowledgement_reason.as_deref(),
-            Some("consumed_in_call")
-        );
-    }
-
-    #[test]
-    fn consumed_completion_resolves_an_existing_delivery_attempt() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
-        let event_id = "ab_consumed_replay";
-        let invocation_uuid = "11111111-1111-4111-8111-111111111111";
-        let payload = r#"{"schema_version":2,"handle":"ab_consumed_replay"}"#;
-        db.register_completion_event(completion_registration(
-            event_id,
-            "async",
-            "session-a",
-            invocation_uuid,
-        ))
-        .unwrap();
-        let triggered = db
-            .trigger_completion_event(completion_trigger(event_id, payload, false))
+        let seq = first.mailbox_rows[0].seq;
+        db.register_delivery_attempt("receipt-only", "session-a", owner, &[seq], 0)
             .unwrap();
-        let seq = triggered.mailbox_rows[0].seq;
-        db.register_delivery_attempt("attempt-consumed", "session-a", invocation_uuid, &[seq], 0)
+        db.record_delivery_attempt_transport_ack("receipt-only")
             .unwrap();
-        assert!(
-            db.record_delivery_attempt_transport_ack("attempt-consumed")
-                .unwrap()
-        );
-        db.conn
-            .execute(
-                "UPDATE mailbox SET delivery_attempts = 2, delivery_error = 'transport_error'
-                 WHERE seq = ?1",
-                params![seq],
-            )
+        let replay = db
+            .trigger_completion_event(completion_trigger(event_id, payload))
             .unwrap();
-
-        let consumed = db
-            .trigger_completion_event(completion_trigger(event_id, payload, true))
-            .unwrap();
-
-        let row = &consumed.mailbox_rows[0];
-        assert!(row.delivered_at.is_some());
-        assert_eq!(row.delivery_attempts, 3);
-        assert_eq!(row.delivery_error, None);
-        assert_eq!(
-            db.delivery_attempt_disposition("attempt-consumed").unwrap(),
+        assert!(!replay.triggered);
+        assert!(replay.listeners[0].acknowledged_at.is_none());
+        assert!(replay.listeners[0].active);
+        assert!(replay.mailbox_rows[0].delivered_at.is_none());
+        assert_ne!(
+            db.delivery_attempt_disposition("receipt-only").unwrap(),
             Some(MailboxDeliveryAttemptDisposition::Resolved)
         );
-        assert_eq!(
-            consumed.listeners[0].acknowledgement_reason.as_deref(),
-            Some("consumed_in_call")
-        );
-    }
-
-    struct LateConsumedCompletionFixture {
-        _dir: tempfile::TempDir,
-        db: MailboxDb,
-        event_id: &'static str,
-        unrelated_event_id: &'static str,
-        invocation_uuid: &'static str,
-        sibling_invocation_uuid: &'static str,
-        seq: i64,
-        sibling_seq: i64,
-    }
-
-    const LATE_CONSUMED_EVENT_ID: &str = "ab_late_consumed";
-    const UNRELATED_PENDING_EVENT_ID: &str = "ab_unrelated_pending";
-    const UNRELATED_COMPLETED_EVENT_ID: &str = "ab_unrelated_completed";
-    const LATE_CONSUMED_INVOCATION_UUID: &str = "11111111-1111-4111-8111-111111111111";
-    const LATE_CONSUMED_SIBLING_INVOCATION_UUID: &str = "22222222-2222-4222-8222-222222222222";
-
-    fn late_consumed_completion_fixture() -> LateConsumedCompletionFixture {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
-        let (seq, sibling_seq) = seed_late_consumed_listeners(&mut db);
-        seed_unrelated_pending_completion(&mut db, seq);
-        seed_unrelated_completed_attempt(&mut db);
-        map_late_consumed_completion_fixture(dir, db, seq, sibling_seq)
-    }
-
-    fn seed_late_consumed_listeners(db: &mut MailboxDb) -> (i64, i64) {
-        db.register_completion_event(completion_registration(
-            LATE_CONSUMED_EVENT_ID,
-            "async",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-        ))
-        .unwrap();
-        db.register_completion_event(completion_registration(
-            LATE_CONSUMED_EVENT_ID,
-            "async",
-            "session-b",
-            LATE_CONSUMED_SIBLING_INVOCATION_UUID,
-        ))
-        .unwrap();
-        let triggered = db
-            .trigger_completion_event(completion_trigger(
-                LATE_CONSUMED_EVENT_ID,
-                r#"{"schema_version":2,"handle":"ab_late_consumed"}"#,
-                false,
-            ))
-            .unwrap();
-        (
-            triggered_mailbox_seq(&triggered, "session-a"),
-            triggered_mailbox_seq(&triggered, "session-b"),
-        )
-    }
-
-    fn triggered_mailbox_seq(triggered: &CompletionEventTriggerResult, session_id: &str) -> i64 {
-        triggered
-            .mailbox_rows
-            .iter()
-            .find(|row| row.session_id == session_id)
-            .unwrap()
-            .seq
-    }
-
-    fn seed_unrelated_pending_completion(db: &mut MailboxDb, consumed_seq: i64) {
-        db.register_completion_event(completion_registration(
-            UNRELATED_PENDING_EVENT_ID,
-            "async",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-        ))
-        .unwrap();
-        let unrelated = db
-            .trigger_completion_event(completion_trigger(
-                UNRELATED_PENDING_EVENT_ID,
-                r#"{"schema_version":2,"handle":"ab_unrelated_pending"}"#,
-                false,
-            ))
-            .unwrap();
-        let unrelated_seq = unrelated.mailbox_rows[0].seq;
-        db.register_delivery_attempt(
-            "attempt-late-consumed",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-            &[consumed_seq],
-            0,
-        )
-        .unwrap();
-        db.register_delivery_attempt(
-            "attempt-unrelated",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-            &[unrelated_seq],
-            0,
-        )
-        .unwrap();
-    }
-
-    fn seed_unrelated_completed_attempt(db: &mut MailboxDb) {
-        db.register_completion_event(completion_registration(
-            UNRELATED_COMPLETED_EVENT_ID,
-            "async",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-        ))
-        .unwrap();
-        let unrelated_completed = db
-            .trigger_completion_event(completion_trigger(
-                UNRELATED_COMPLETED_EVENT_ID,
-                r#"{"schema_version":2,"handle":"ab_unrelated_completed"}"#,
-                false,
-            ))
-            .unwrap();
-        let unrelated_completed_seq = unrelated_completed.mailbox_rows[0].seq;
-        db.register_delivery_attempt(
-            "attempt-unrelated-completed",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-            &[unrelated_completed_seq],
-            0,
-        )
-        .unwrap();
-        db.conn
-            .execute(
-                "UPDATE mailbox SET delivered_at = '2026-08-10T00:00:00Z' WHERE seq = ?1",
-                params![unrelated_completed_seq],
-            )
-            .unwrap();
-    }
-
-    fn map_late_consumed_completion_fixture(
-        dir: tempfile::TempDir,
-        db: MailboxDb,
-        seq: i64,
-        sibling_seq: i64,
-    ) -> LateConsumedCompletionFixture {
-        LateConsumedCompletionFixture {
-            _dir: dir,
-            db,
-            event_id: LATE_CONSUMED_EVENT_ID,
-            unrelated_event_id: UNRELATED_PENDING_EVENT_ID,
-            invocation_uuid: LATE_CONSUMED_INVOCATION_UUID,
-            sibling_invocation_uuid: LATE_CONSUMED_SIBLING_INVOCATION_UUID,
-            seq,
-            sibling_seq,
-        }
-    }
-
-    #[test]
-    fn late_consumed_completion_acknowledges_materialized_mailbox_row_once() {
-        let fixture = late_consumed_completion_fixture();
-        let event_id = fixture.event_id;
-        let unrelated_event_id = fixture.unrelated_event_id;
-        let invocation_uuid = fixture.invocation_uuid;
-        let sibling_invocation_uuid = fixture.sibling_invocation_uuid;
-        let seq = fixture.seq;
-        let sibling_seq = fixture.sibling_seq;
-        let mut db = fixture.db;
-
-        assert_eq!(
-            db.acknowledge_consumed_completion_event_for_mailbox_seq(
-                sibling_seq,
-                "session-a",
-                invocation_uuid,
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            db.acknowledge_consumed_completion_event_for_mailbox_seq(
-                seq,
-                "session-a",
-                invocation_uuid,
-            )
-            .unwrap()
-            .as_deref(),
-            Some(event_id)
-        );
-        let first_acknowledged_at = db
-            .completion_event_listeners(event_id)
-            .unwrap()
-            .into_iter()
-            .find(completion_listener_for_session_a)
-            .unwrap()
-            .acknowledged_at
-            .unwrap();
-        assert_eq!(
-            db.acknowledge_consumed_completion_event_for_mailbox_seq(
-                seq,
-                "session-a",
-                invocation_uuid,
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            db.acknowledge_consumed_completion_event_for_mailbox_seq(
-                sibling_seq,
-                "session-a",
-                invocation_uuid,
-            )
-            .unwrap(),
-            None
-        );
-
-        let rows = db.list_mailbox("session-a", true).unwrap();
-        assert_eq!(rows.len(), 3);
-        let consumed_row = mailbox_row_for_seq(&rows, seq);
-        assert!(consumed_row.delivered_at.is_some());
-        assert_eq!(consumed_row.delivery_attempts, 1);
-        assert_eq!(
-            consumed_row.delivered_by_invocation_uuid.as_deref(),
-            Some(invocation_uuid)
-        );
-        assert_eq!(
-            db.delivery_attempt_disposition("attempt-late-consumed")
-                .unwrap(),
-            Some(MailboxDeliveryAttemptDisposition::Resolved)
-        );
-        assert!(
-            db.delivery_attempt_window("attempt-late-consumed")
-                .unwrap()
-                .unwrap()
-                .resolved_at
-                .is_some()
-        );
-        assert_eq!(
-            db.delivery_attempt_disposition("attempt-unrelated")
-                .unwrap(),
-            Some(MailboxDeliveryAttemptDisposition::Pending)
-        );
-        assert!(
-            db.delivery_attempt_window("attempt-unrelated-completed")
-                .unwrap()
-                .unwrap()
-                .resolved_at
-                .is_none()
-        );
-        let pending = db.list_pending("session-a").unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].handle, unrelated_event_id);
+        db.acknowledge_range("session-a", seq, seq, owner).unwrap();
         let listeners = db.completion_event_listeners(event_id).unwrap();
-        let consumed_listener = completion_listener_for_session(&listeners, "session-a");
-        assert_eq!(
-            consumed_listener.acknowledgement_reason.as_deref(),
+        assert!(listeners[0].acknowledged_at.is_some());
+        assert_ne!(
+            listeners[0].acknowledgement_reason.as_deref(),
             Some("consumed_in_call")
         );
-        assert!(!consumed_listener.active);
-        assert_eq!(
-            consumed_listener.acknowledged_at.as_deref(),
-            Some(first_acknowledged_at.as_str())
-        );
-        let sibling_listener = completion_listener_for_session(&listeners, "session-b");
-        assert!(sibling_listener.active);
-        assert!(sibling_listener.acknowledged_at.is_none());
-        let sibling_pending = db.list_pending("session-b").unwrap();
-        assert_eq!(sibling_pending.len(), 1);
-        assert_eq!(
-            sibling_pending[0].owner_invocation_uuid.as_deref(),
-            Some(sibling_invocation_uuid)
-        );
-        let unrelated = db.completion_event_listeners(unrelated_event_id).unwrap();
-        assert!(unrelated[0].active);
-        assert!(unrelated[0].acknowledged_at.is_none());
-    }
-
-    fn completion_listener_for_session_a(listener: &CompletionEventListenerRow) -> bool {
-        listener.session_id == "session-a"
-    }
-
-    fn completion_listener_for_session<'a>(
-        listeners: &'a [CompletionEventListenerRow],
-        session_id: &str,
-    ) -> &'a CompletionEventListenerRow {
-        listeners
-            .iter()
-            .find(|listener| listener.session_id == session_id)
-            .unwrap()
-    }
-
-    fn mailbox_row_for_seq(rows: &[MailboxRow], seq: i64) -> &MailboxRow {
-        rows.iter().find(|row| row.seq == seq).unwrap()
     }
 
     #[test]
@@ -15359,7 +15676,7 @@ mod tests {
             "11111111-1111-4111-8111-111111111111",
         ))
         .unwrap();
-        db.trigger_completion_event(completion_trigger(event_id, "{}", false))
+        db.trigger_completion_event(completion_trigger(event_id, "{}"))
             .unwrap();
         let row = db.list_pending("session-a").unwrap().remove(0);
         db.register_headless_delivery_attempt(
@@ -15529,6 +15846,7 @@ mod tests {
         let row = inserted_row(db.enqueue_agent_bash_complete(&input("legacy", "session-a")));
         db.register_delivery_attempt("legacy", "session-a", "native", &[row.seq], 0)
             .unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&db.conn);
         db.conn
             .execute_batch(
                 "DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;
@@ -16509,7 +16827,6 @@ mod tests {
             .trigger_completion_event(completion_trigger(
                 "terminal-event",
                 r#"{"terminal":"payload"}"#,
-                false,
             ))
             .unwrap();
         let event_row = event_result.mailbox_rows.into_iter().next().unwrap();
@@ -16598,7 +16915,6 @@ mod tests {
             .trigger_completion_event(completion_trigger(
                 "terminal-event",
                 r#"{"terminal":"payload"}"#,
-                false,
             ))
             .unwrap();
         assert!(!replay.triggered);
@@ -17309,6 +17625,7 @@ mod tests {
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
         let row = inserted_row(db.enqueue_agent_bash_complete(&input("pending", "session-a")));
+        schema::remove_continuation_schema_for_legacy_fixture(&db.conn);
         db.conn
             .execute_batch("DROP TABLE mailbox_delivery_finalizers; PRAGMA user_version = 14;")
             .unwrap();
@@ -17691,15 +18008,26 @@ mod tests {
 
     #[test]
     fn auto_wake_keeps_owner_separate_from_running_invocation() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
+        let owner_uuid = db
+            .wake_session_reader()
+            .session_metadata("session-a")
+            .unwrap()
+            .unwrap()
+            .invocation_uuid
+            .unwrap();
         let identity = current_identity();
 
         db.wake_sessions()
             .project_legacy_runtime_running(LegacyRuntimeProjection {
                 session_id: "session-a",
                 mode: "headless",
-                invocation_uuid: "owner-invocation",
+                invocation_uuid: &owner_uuid,
                 provider_name: Some("provider-a"),
                 model_name: Some("model-a"),
                 identity: &identity,
@@ -17713,7 +18041,7 @@ mod tests {
             db.wake_sessions()
                 .settle_legacy_runtime_projection(LegacyRuntimeProjectionSettlement {
                     session_id: "session-a",
-                    invocation_uuid: "owner-invocation",
+                    invocation_uuid: &owner_uuid,
                     last_exit_code: Some(0),
                 })
                 .unwrap()
@@ -17773,7 +18101,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             metadata.invocation_uuid.as_deref(),
-            Some("owner-invocation")
+            Some(owner_uuid.as_str())
         );
         assert_eq!(
             projection.running_invocation_uuid.as_deref(),
@@ -18189,8 +18517,12 @@ mod tests {
 
     #[test]
     fn wake_idle_pending_acquires_claim() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         db.enqueue_agent_bash_complete(&input("handle-b", "session-a"))
@@ -18299,8 +18631,12 @@ mod tests {
 
     #[test]
     fn wake_startable_claim_does_not_apply_a_retry_budget() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         let first = db
@@ -18318,8 +18654,15 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(first, WakeClaimAcquireResult::Acquired(_)));
+        revoke_unspent_wake(&mut db, "token-a");
         assert!(
-            db.wake_sessions()
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !db.wake_sessions()
                 .release_wake_claim("session-a", "token-a")
                 .unwrap()
         );
@@ -18347,8 +18690,12 @@ mod tests {
 
     #[test]
     fn wake_claim_count_persists_on_session_runtime_after_claim_release() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.wake_sessions()
             .upsert_session_metadata(SessionMetadataUpsert {
                 session_id: "session-a",
@@ -18384,9 +18731,12 @@ mod tests {
                 .auto_wake_count,
             5
         );
-        db.wake_sessions()
-            .release_wake_claim("session-a", "token-a")
-            .unwrap();
+        revoke_unspent_wake(&mut db, "token-a");
+        assert!(
+            !db.wake_sessions()
+                .release_wake_claim("session-a", "token-a")
+                .unwrap()
+        );
         let candidates = db.wake_sessions().wake_sweep_candidates(600, 10).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].auto_wake_count, 6);
@@ -18394,8 +18744,12 @@ mod tests {
 
     #[test]
     fn wake_claim_release_requires_the_exact_current_token() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         db.wake_sessions()
@@ -18422,8 +18776,15 @@ mod tests {
                 .claim_token,
             "token-a"
         );
+        revoke_unspent_wake(&mut db, "token-a");
         assert!(
-            db.wake_sessions()
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !db.wake_sessions()
                 .release_wake_claim("session-a", "token-a")
                 .unwrap()
         );
@@ -18437,8 +18798,12 @@ mod tests {
 
     #[test]
     fn admitted_wake_child_blocks_manual_claim_release() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         db.wake_sessions()
@@ -18451,6 +18816,7 @@ mod tests {
                 stale_after_seconds: 600,
             })
             .unwrap();
+        let (attempt, custodian) = prepare_wake_launcher(&mut db);
         let admitted_identity = current_identity();
 
         assert!(
@@ -18539,8 +18905,17 @@ mod tests {
         assert!(
             db.wake_sessions()
                 .release_admitted_wake_claim("session-a", "token-a")
-                .unwrap(),
-            "the admitted child must retain exact-token cleanup authority"
+                .is_err(),
+            "launcher exit alone cannot erase native physical custody"
+        );
+        // Relational original-custodian drain fixture, not native ECHILD evidence.
+        db.discharge_continuation_attempt(&attempt, &custodian, "fixture-original-drain")
+            .unwrap();
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -18548,18 +18923,21 @@ mod tests {
     fn manual_resume_releases_an_exact_dead_admitted_wake_claim() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
-        db.wake_sessions()
-            .try_acquire_wake_claim(WakeClaimRequest {
+        retained_legacy_wake(
+            &mut db,
+            WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-a",
                 reason: "notify_idle",
                 auto_wake_count: 1,
                 wake_invocation_uuid: Some("wake-a"),
                 stale_after_seconds: 600,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         db.wake_sessions()
             .record_wake_claim_pid("session-a", "token-a", i64::MAX)
             .unwrap();
@@ -18581,18 +18959,21 @@ mod tests {
     fn manual_resume_releases_an_exact_pid_reused_admitted_wake_claim() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
-        db.wake_sessions()
-            .try_acquire_wake_claim(WakeClaimRequest {
+        retained_legacy_wake(
+            &mut db,
+            WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-a",
                 reason: "notify_idle",
                 auto_wake_count: 1,
                 wake_invocation_uuid: Some("wake-a"),
                 stale_after_seconds: 600,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let identity = current_identity();
         db.wake_sessions()
             .record_wake_claim_pid_identity("session-a", "token-a", identity.os_pid)
@@ -18623,18 +19004,21 @@ mod tests {
     fn manual_resume_retains_an_admitted_claim_without_process_identity() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
-        db.wake_sessions()
-            .try_acquire_wake_claim(WakeClaimRequest {
+        retained_legacy_wake(
+            &mut db,
+            WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-a",
                 reason: "notify_idle",
                 auto_wake_count: 1,
                 wake_invocation_uuid: Some("wake-a"),
                 stale_after_seconds: 600,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert!(
             !db.wake_sessions()
@@ -18653,8 +19037,12 @@ mod tests {
 
     #[test]
     fn wake_child_validation_rejects_claim_when_runtime_authority_is_busy() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         db.wake_sessions()
@@ -18667,6 +19055,18 @@ mod tests {
                 stale_after_seconds: 600,
             })
             .unwrap();
+        let (attempt, custodian) = prepare_wake_launcher(&mut db);
+        // Bind this exact launcher without admitting the wake claim yet; runtime
+        // publication then races ahead of the final child busy recheck.
+        let tx = db.conn.transaction().unwrap();
+        completion_continuation::admit_launcher_on(
+            &tx,
+            "session-a",
+            "token-a",
+            &current_identity(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
         let generation_id =
             RuntimeGenerationId::parse("92222222-2222-4222-8222-222222222222").unwrap();
         db.runtime_lifecycle()
@@ -18692,14 +19092,34 @@ mod tests {
             db.wake_session_reader()
                 .wake_claim("session-a")
                 .unwrap()
+                .is_some(),
+            "busy refusal cannot discharge an accepted native attempt"
+        );
+        db.discharge_continuation_attempt(&attempt, &custodian, "fixture-busy-original-drain")
+            .unwrap();
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
                 .is_none()
         );
     }
 
     #[test]
     fn wake_claim_ignores_legacy_runtime_projection_after_v2() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
+        let owner_uuid = db
+            .wake_session_reader()
+            .session_metadata("session-a")
+            .unwrap()
+            .unwrap()
+            .invocation_uuid
+            .unwrap();
         let identity = current_identity();
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
@@ -18707,9 +19127,9 @@ mod tests {
             .project_legacy_runtime_running(LegacyRuntimeProjection {
                 session_id: "session-a",
                 mode: "headless",
-                invocation_uuid: "invocation-a",
-                provider_name: None,
-                model_name: None,
+                invocation_uuid: &owner_uuid,
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
                 identity: &identity,
                 pty_control_path: None,
                 turn_start_max_mailbox_seq: None,
@@ -18741,8 +19161,12 @@ mod tests {
 
     #[test]
     fn wake_existing_claim_is_single_flight() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         let first = db
@@ -18778,9 +19202,13 @@ mod tests {
 
     #[test]
     fn concurrent_wake_claim_attempts_have_one_exact_token_winner() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let mut db = MailboxDb::open(&path).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         drop(db);
@@ -18837,21 +19265,27 @@ mod tests {
 
     #[test]
     fn wake_stale_claim_can_be_stolen() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         assert!(matches!(
-            db.wake_sessions()
-                .try_acquire_wake_claim(WakeClaimRequest {
+            retained_legacy_wake(
+                &mut db,
+                WakeClaimRequest {
                     session_id: "session-a",
                     claim_token: "token-a",
                     reason: "notify_idle",
                     auto_wake_count: 1,
                     wake_invocation_uuid: None,
                     stale_after_seconds: 600,
-                })
-                .unwrap(),
+                }
+            )
+            .unwrap(),
             WakeClaimAcquireResult::Acquired(_)
         ));
         db.wake_sessions()
@@ -18880,21 +19314,27 @@ mod tests {
 
     #[test]
     fn wake_dead_pid_claim_can_be_stolen_before_ttl() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         assert!(matches!(
-            db.wake_sessions()
-                .try_acquire_wake_claim(WakeClaimRequest {
+            retained_legacy_wake(
+                &mut db,
+                WakeClaimRequest {
                     session_id: "session-a",
                     claim_token: "token-a",
                     reason: "notify_idle",
                     auto_wake_count: 1,
                     wake_invocation_uuid: None,
                     stale_after_seconds: 600,
-                })
-                .unwrap(),
+                }
+            )
+            .unwrap(),
             WakeClaimAcquireResult::Acquired(_)
         ));
         db.wake_sessions()
@@ -18923,19 +19363,22 @@ mod tests {
     fn wake_live_identity_matched_claim_is_not_stolen_after_ttl() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         assert!(matches!(
-            db.wake_sessions()
-                .try_acquire_wake_claim(WakeClaimRequest {
+            retained_legacy_wake(
+                &mut db,
+                WakeClaimRequest {
                     session_id: "session-a",
                     claim_token: "token-a",
                     reason: "notify_idle",
                     auto_wake_count: 1,
                     wake_invocation_uuid: None,
                     stale_after_seconds: 600,
-                })
-                .unwrap(),
+                }
+            )
+            .unwrap(),
             WakeClaimAcquireResult::Acquired(_)
         ));
         let identity = current_identity();
@@ -19636,6 +20079,7 @@ mod observation_stop_history_tests {
         {
             let db = MailboxDb::open(&path).unwrap();
             // Exact prior schema: v14 adds only the independent stop-history table.
+            schema::remove_continuation_schema_for_legacy_fixture(&db.conn);
             db.conn
                 .execute_batch("DROP TABLE mailbox_observation_stops; PRAGMA user_version = 13;")
                 .unwrap();
@@ -19705,6 +20149,7 @@ mod native_receipt_schema_tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("pid-identity.db");
         let db = MailboxDb::open(&path).unwrap();
+        schema::remove_continuation_schema_for_legacy_fixture(&db.conn);
         db.conn
             .execute_batch(
                 "DROP TABLE mailbox_receipt_scan;

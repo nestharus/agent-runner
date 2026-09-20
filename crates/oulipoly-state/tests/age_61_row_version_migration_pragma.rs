@@ -314,6 +314,7 @@ fn assert_schema5_current_plan(plan: &[&migrations::Migration]) {
             "0021_invocation_output_delivery",
             "0022_provider_session_authority",
             "0023_provider_launch_lifecycle",
+            "0024_completion_continuation_binding",
         ]
     );
 }

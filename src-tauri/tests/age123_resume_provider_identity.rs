@@ -25,9 +25,7 @@
 
 mod provider_authority_fixture;
 
-use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, WakeClaimAcquireResult, WakeClaimRequest,
-};
+use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult, MailboxDb};
 use oulipoly_state::{InvocationStatus, StateDb};
 use rusqlite::{Connection, params};
 use std::fs;
@@ -351,26 +349,37 @@ prompt_mode = "stdin"
             EnqueueResult::Inserted(row) | EnqueueResult::AlreadyEnqueued(row) => row,
             EnqueueResult::Conflict { existing } => existing,
         };
-        let result = db
-            .wake_sessions()
-            .try_acquire_wake_claim(WakeClaimRequest {
-                session_id,
-                claim_token,
-                reason: "notify_idle",
-                auto_wake_count: 1,
-                wake_invocation_uuid: None,
-                stale_after_seconds: 600,
-            })
-            .unwrap();
-        assert!(matches!(result, WakeClaimAcquireResult::Acquired(_)));
+        // Historical guard input only: no owner, activation, custodian or
+        // admission is fabricated. A matching token still grants no authority.
+        let conn = Connection::open(self.sidecar_path()).unwrap();
+        conn.execute(
+            "INSERT INTO session_wake_claim
+            (session_id, claim_token, claimed_at, reason, auto_wake_count)
+            VALUES (?1, ?2, '2026-01-01', 'historical-guard-fixture', 1)",
+            params![session_id, claim_token],
+        )
+        .unwrap();
+        assert!(db.completion_continuation_owner().unwrap().is_none());
+        assert!(
+            db.continuation_activation(session_id, claim_token)
+                .unwrap()
+                .is_none()
+        );
         row.seq
     }
 
-    fn seed_auto_wake_claim(&self, session_id: &str, claim_token: &str) {
-        let seq = self.seed_pending_auto_wake_claim(session_id, claim_token);
-        let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
-        db.mark_delivered(session_id, None, &[seq], "notification-boundary-test")
-            .unwrap();
+    fn sidecar_bytes(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = fs::read_dir(self.sidecar_path().parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file())
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
     }
 
     fn invocation_count(&self) -> i64 {
@@ -644,54 +653,13 @@ fn manual_migration_records_target_resolved_provider_identity() {
     );
 }
 
-#[test]
-fn notification_auto_wake_stays_bound_despite_explicit_rotation_target() {
-    const SOURCE: &str = "provider-a";
-    const TARGET: &str = "provider-b";
-    const CLAIM_TOKEN: &str = "notification-boundary-claim";
-
-    let fixture = Fixture::new();
-    fixture.write_resume_pool(
-        "age123-resume",
-        &[
-            ProviderFixture {
-                name: SOURCE,
-                body: "printf '%s\\n' 'bound notification resume accepted'\nexit 0",
-            },
-            ProviderFixture {
-                name: TARGET,
-                body: "printf '%s\\n' 'notification must not rotate' >&2\nexit 99",
-            },
-        ],
-    );
-    let source_dir = fixture.provider_projects_dir(SOURCE).join("source-project");
-    fs::create_dir_all(&source_dir).unwrap();
-    fs::write(
-        source_dir.join(format!("{SESSION_A}.jsonl")),
-        format!(
-            r#"{{"sessionId":"{SESSION_A}","turnId":"turn-1","timestamp":"2026-04-17T08:00:00Z","type":"assistant"}}"#
-        ),
-    )
-    .unwrap();
-    fixture.seed_active_chain(SOURCE, SESSION_A);
-    fixture.seed_auto_wake_claim(CHAIN_ID, CLAIM_TOKEN);
-
-    let output = fixture.run_resume_with_migration_env(
-        CHAIN_ID,
-        TARGET,
-        &[
-            ("OULIPOLY_AUTO_WAKE", "1"),
-            ("OULIPOLY_AUTO_WAKE_SESSION_ID", CHAIN_ID),
-            ("OULIPOLY_AUTO_WAKE_TOKEN", CLAIM_TOKEN),
-        ],
-    );
-
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
-    let row = fixture.latest_invocation();
-    assert_eq!(row.provider_name, SOURCE);
-    assert_eq!(row.provider_session_id.as_deref(), Some(SESSION_A));
-    assert_eq!(row.status, InvocationStatus::Succeeded.as_str());
-}
+// The former notification_auto_wake_stays_bound_despite_explicit_rotation_target
+// integration node fabricated a chain-addressed claim + child environment.
+// Its policy obligation now lives under the same name in run::resume::migration
+// tests (actual migration entry + recording service, not native admission).
+// manual_migration_records_target_resolved_provider_identity retains execution
+// coverage; age360_completion_continuation's native activation test independently
+// joins the real driver/custodian launch to its concrete provider session.
 
 #[test]
 fn notification_auto_wake_validation_rejects_invalid_child_markers_before_provider_execution() {
@@ -703,6 +671,7 @@ fn notification_auto_wake_validation_rejects_invalid_child_markers_before_provid
         ("wrong-session", "wrong-session", CLAIM_TOKEN),
         ("empty-token", CHAIN_ID, ""),
         ("wrong-token", CHAIN_ID, "wrong-token"),
+        ("matching-token-without-owner", CHAIN_ID, CLAIM_TOKEN),
     ];
     for (case, expected_session, child_token) in invalid_markers {
         let fixture = Fixture::new();
@@ -717,6 +686,7 @@ fn notification_auto_wake_validation_rejects_invalid_child_markers_before_provid
         fixture.seed_active_chain(PROVIDER, SESSION_A);
         let seq = fixture.seed_pending_auto_wake_claim(CHAIN_ID, CLAIM_TOKEN);
 
+        let before = fixture.sidecar_bytes();
         let output = fixture.run_resume_with_env(
             CHAIN_ID,
             &[
@@ -729,8 +699,9 @@ fn notification_auto_wake_validation_rejects_invalid_child_markers_before_provid
 
         assert_eq!(output.status.code(), Some(0), "{case}: {output:?}");
         assert!(!canary.exists(), "{case}: provider executed");
+        assert_eq!(fixture.sidecar_bytes(), before, "{case}: sidecar mutation");
         assert_eq!(fixture.invocation_count(), 0, "{case}");
-        let db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+        let db = MailboxDb::open_read_only(&fixture.sidecar_path()).unwrap();
         let pending = db.list_pending(CHAIN_ID).unwrap();
         assert_eq!(pending.len(), 1, "{case}");
         assert_eq!(pending[0].seq, seq, "{case}");

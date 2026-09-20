@@ -36,6 +36,14 @@ pub(crate) fn run_repl(
         resume,
         models_dir_override,
     )?;
+    // Selection may materialize built-in transcripts or external rotations.
+    // Refuse on the actual resolver identity before either effectful service.
+    if let Some(resolved) = prepared.resolved_resume.as_ref() {
+        prepared
+            .env
+            .state
+            .refuse_completed_turn_resolved_resume(resolved)?;
+    }
     let stderr_is_terminal = execution::repl_stderr_is_terminal();
     let mut resume_spawn_cwd: Option<PathBuf> = None;
     let Some((provider_index, provider, resume_session_id)) = select_prepared_repl_provider(
@@ -72,10 +80,16 @@ pub(crate) fn run_repl(
     )?;
     emit_repl_invocation(stderr_is_terminal, &attempt.invocation);
     let _live_pty_retry_driver = crate::wake_coordinator::start_live_pty_retry_driver_for_owner();
-    let _admission = crate::wake_coordinator::admit_session_launch(
-        &attempt.invocation.id,
-        resume_session_id.as_deref(),
-    )?;
+    let _admission = match prepared.resolved_resume.as_ref() {
+        Some(resolved) => crate::wake_coordinator::admit_resolved_session_launch(
+            &attempt.invocation.id,
+            resolved,
+        )?,
+        None => crate::wake_coordinator::admit_session_launch(
+            &attempt.invocation.id,
+            resume_session_id.as_deref(),
+        )?,
+    };
 
     execute_and_finalize_repl_attempt(ReplExecutionInput {
         agent_runtime_services,

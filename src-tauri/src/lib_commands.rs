@@ -18,3 +18,10 @@ pub mod quota_refresh;
 
 #[path = "commands/setup_flow/mod.rs"]
 pub mod setup_flow;
+
+#[allow(dead_code)]
+#[path = "commands/notify.rs"]
+pub(crate) mod notify;
+#[allow(dead_code)]
+#[path = "commands/notify_continuation.rs"]
+pub(crate) mod notify_continuation;

@@ -110,6 +110,7 @@ impl SourceSet {
         let mut selected = Self::load_input(root, receipt.as_deref(), invocation.as_deref());
         selected.historical = historical_outputs(&selected.root);
         selected.residues = exact_residue_policy();
+        selected.residues.extend(evidence_role_policy());
         eprintln!(
             "historical projection entries={}",
             selected.historical.len()
@@ -522,6 +523,50 @@ fn exact_residue_policy() -> BTreeMap<String, ExactResidue> {
             &[
                 291, 294, 301, 302, 437, 438, 439, 440, 509, 518, 808, 810, 893, 899, 911,
             ],
+        ),
+    ];
+    entries
+        .into_iter()
+        .map(|(path, sha256, lines)| {
+            (
+                path.to_owned(),
+                ExactResidue {
+                    sha256: sha256.to_owned(),
+                    lines: lines.iter().copied().collect(),
+                },
+            )
+        })
+        .collect()
+}
+
+// AGE360 root-authorized evidence roles, read at
+// 282442e009c52ec4a002d9931c4c9b2b3bea448a (not new production authority):
+// - the fixed-stop retryability test's authentic capacity-refusal input;
+// - the paired bridge launch asset identity;
+// - explicit paired source input, asset staging, and shared-source equality.
+// Five physical rows / seven occurrences. Reuse the exact-row delta mechanism,
+// NOT the wire projection: full counts and raw row sets retain these literals.
+// Whole-file fences preserve the reviewed test scope and meaningful assertions.
+// Any changed bytes (including role relocation or removal of assertions) revoke
+// the allowance. Same-role additions, copies, and untracked replacements are
+// not authorized. Future legitimate edits require renewed review/disposition,
+// not automatic pin refresh. Membership and historical comparison are unchanged.
+fn evidence_role_policy() -> BTreeMap<String, ExactResidue> {
+    let entries: [(&str, &str, &[usize]); 3] = [
+        (
+            "crates/oulipoly-runtime/src/session_provider/types.rs",
+            "4581346e94f21e2000f21936efc8a61e233e30c65662ae244b1290376978524b",
+            &[273],
+        ),
+        (
+            "src-tauri/tests/fixtures/age360/mcp_client.py",
+            "b4587ce5d6f132f5674c902bfc2b129103e28aa758b03b6e472e2c172aa03d05",
+            &[21],
+        ),
+        (
+            "src-tauri/tests/fixtures/age360/sync_mcp_e2e.py",
+            "bd74ba794a6ff0725558edcebb53b3ad711cbd3e27fc4763e7db677c2f0c8049",
+            &[483, 526, 528],
         ),
     ];
     entries
@@ -1279,5 +1324,188 @@ mod tests {
         }
         assert_eq!(physical, 22);
         assert_eq!(unique.len(), 18);
+    }
+    fn evidence_role_sources() -> BTreeMap<String, String> {
+        let location = git(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &["rev-parse", "--show-toplevel"],
+        );
+        let repository = PathBuf::from(String::from_utf8(location).unwrap().trim());
+        evidence_role_policy()
+            .into_iter()
+            .map(|(path, policy)| {
+                let bytes = git(
+                    &repository,
+                    &[
+                        "show",
+                        &format!("282442e009c52ec4a002d9931c4c9b2b3bea448a:{path}"),
+                    ],
+                );
+                assert_eq!(
+                    digest(&bytes),
+                    policy.sha256,
+                    "independent frozen role source"
+                );
+                (path, String::from_utf8(bytes).unwrap())
+            })
+            .collect()
+    }
+
+    fn evidence_fixture(root: &Path) -> SourceSet {
+        let mut sources = SourceSet::load_input(root, None, None);
+        sources.residues = evidence_role_policy();
+        sources
+    }
+
+    #[test]
+    fn evidence_roles_preserve_raw_metrics_and_reject_outside_scope_additions() {
+        let root = fixture();
+        let base = String::from_utf8(git(root.path(), &["rev-parse", "HEAD"])).unwrap();
+        let inputs = evidence_role_sources();
+        // Obtain the actual provider spelling from the independently pinned
+        // test input. Mutants use that exact spelling, never a synthetic alias.
+        let refusal = inputs["crates/oulipoly-runtime/src/session_provider/types.rs"]
+            .lines()
+            .nth(272)
+            .unwrap();
+        let denied = refusal
+            .split('"')
+            .nth(1)
+            .unwrap()
+            .split('_')
+            .next()
+            .unwrap();
+        for (path, text) in &inputs {
+            let file = root.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        let untracked = evidence_fixture(root.path());
+        assert_eq!(untracked.added_occurrences(None, denied), 7);
+        assert_eq!(untracked.approved_added_occurrences(None, denied), 0);
+        git(root.path(), &["add", "."]);
+        let sources = evidence_fixture(root.path());
+        assert_eq!(sources.full_occurrences(denied), 7);
+        assert_eq!(sources.line_set(None, denied).len(), 5);
+        assert_eq!(
+            sources.approved_added_occurrences(Some(base.trim()), denied),
+            7
+        );
+        assert_eq!(sources.added_occurrences(Some(base.trim()), denied), 0);
+        assert_eq!(sources.added_occurrences(None, denied), 0);
+        assert!(
+            sources
+                .unapproved_new_rows(&BTreeSet::new(), &sources.line_set(None, denied))
+                .is_empty()
+        );
+        // Keep every admitted row present: none can subsidize an unrelated
+        // addition or real provider-name routing in a different source file.
+        let routing =
+            format!("fn route(provider: &str) {{ if provider == {denied:?} {{ select(); }} }}\n");
+        std::fs::write(root.path().join("production.rs"), &routing).unwrap();
+        let sources = evidence_fixture(root.path());
+        assert_eq!(sources.full_occurrences(denied), 8);
+        assert_eq!(sources.added_occurrences(None, denied), 1);
+        assert_eq!(sources.added_occurrences(Some(base.trim()), denied), 1);
+        assert_eq!(
+            sources.unapproved_new_rows(&BTreeSet::new(), &sources.line_set(None, denied)),
+            [format!("production.rs:{}", routing.trim_end())]
+        );
+        git(root.path(), &["add", "production.rs"]);
+        assert_eq!(
+            evidence_fixture(root.path()).added_occurrences(Some(base.trim()), denied),
+            1
+        );
+    }
+
+    #[test]
+    fn evidence_roles_revoke_on_relocation_added_logic_and_lost_assertions() {
+        let inputs = evidence_role_sources();
+        let policy = evidence_role_policy();
+        for (path, text) in inputs {
+            let root = fixture();
+            let base = String::from_utf8(git(root.path(), &["rev-parse", "HEAD"])).unwrap();
+            let file = root.path().join(&path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, &text).unwrap();
+            git(root.path(), &["add", &path]);
+            let entry = &policy[&path];
+            let number = *entry.lines.first().unwrap();
+            let row = text.lines().nth(number - 1).unwrap();
+            let refusal =
+                evidence_role_sources()["crates/oulipoly-runtime/src/session_provider/types.rs"]
+                    .clone();
+            let denied = refusal
+                .lines()
+                .nth(272)
+                .unwrap()
+                .split('"')
+                .nth(1)
+                .unwrap()
+                .split('_')
+                .next()
+                .unwrap();
+            let mut moved: Vec<_> = text.lines().collect();
+            moved.remove(number - 1);
+            moved.insert(0, row);
+            let lost_role = if path.ends_with("types.rs") {
+                text.replace("#[cfg(test)]", "")
+            } else if path.ends_with("sync_mcp_e2e.py") {
+                text.split_inclusive('\n')
+                    .filter(|line| !line.contains("assert digest("))
+                    .collect::<String>()
+            } else {
+                text.replace("subprocess.Popen", "select_provider")
+            };
+            assert_ne!(lost_role, text);
+            for changed in [
+                format!("{text}{row}\n"),
+                format!("{text}\nif provider == {denied:?}: route()\n"),
+                format!("{}\n", moved.join("\n")),
+                lost_role,
+            ] {
+                std::fs::write(&file, &changed).unwrap();
+                let sources = evidence_fixture(root.path());
+                assert!(sources.exact_rows(&path, entry).is_empty());
+                assert_eq!(
+                    sources.approved_added_occurrences(Some(base.trim()), denied),
+                    0
+                );
+                assert_eq!(
+                    sources.added_occurrences(Some(base.trim()), denied),
+                    occurrences(&changed, denied)
+                );
+                let rows = sources.line_set(None, denied);
+                assert!(!rows.is_empty());
+                assert_eq!(
+                    sources.unapproved_new_rows(&BTreeSet::new(), &rows).len(),
+                    rows.len()
+                );
+            }
+            // A genuine pinned file does not grant a copied/relocated path
+            // authority, even with identical contents and original still present.
+            std::fs::write(&file, &text).unwrap();
+            std::fs::write(root.path().join("relocated-source.txt"), &text).unwrap();
+            let sources = evidence_fixture(root.path());
+            assert_eq!(
+                sources.added_occurrences(Some(base.trim()), denied),
+                occurrences(&text, denied)
+            );
+            assert_eq!(
+                sources.added_occurrences(None, denied),
+                occurrences(&text, denied)
+            );
+            git(root.path(), &["add", "relocated-source.txt"]);
+            assert_eq!(
+                evidence_fixture(root.path()).added_occurrences(Some(base.trim()), denied),
+                occurrences(&text, denied)
+            );
+            git(root.path(), &["rm", "--cached", &path]);
+            assert!(
+                evidence_fixture(root.path())
+                    .exact_rows(&path, entry)
+                    .is_empty()
+            );
+        }
     }
 }

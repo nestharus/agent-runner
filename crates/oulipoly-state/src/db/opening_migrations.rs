@@ -43,13 +43,13 @@ impl StateDb {
         path: &Path,
         conn: &mut sqlite::Connection,
         compatibility: SchemaCompatibility,
-    ) -> Result<(), String> {
+    ) -> Result<(), WritableOpenError> {
         match compatibility {
             SchemaCompatibility::Fresh => {
                 Self::set_wal_mode(conn)?;
                 Self::run_current_plan_from(path, conn, 0)
             }
-            SchemaCompatibility::Current { .. } => Self::set_wal_mode(conn),
+            SchemaCompatibility::Current { .. } => Self::set_wal_mode(conn).map_err(Into::into),
             SchemaCompatibility::Migratable { stored } => {
                 Self::set_wal_mode(conn)?;
                 let stored = Self::promote_existing_dual_id_schema5_if_present(conn, stored)?;
@@ -65,7 +65,7 @@ impl StateDb {
                 Err(Self::unrecognized_versionless_error(path))
             }
             SchemaCompatibility::Corrupt { reason } => {
-                Err(Self::corrupt_schema_error(path, reason))
+                Err(Self::corrupt_schema_error(path, reason).into())
             }
         }
     }
@@ -74,15 +74,16 @@ impl StateDb {
         path: &Path,
         conn: &mut sqlite::Connection,
         stored: i32,
-    ) -> Result<(), String> {
-        let plan = migrations::current_plan_from(stored).map_err(|e| e.to_string())?;
-        migrations::run_with_db_path(conn, &plan, path.to_path_buf()).map_err(|e| e.to_string())
+    ) -> Result<(), WritableOpenError> {
+        let plan = migrations::current_plan_from(stored).map_err(WritableOpenError::Migration)?;
+        migrations::run_with_db_path(conn, &plan, path.to_path_buf())
+            .map_err(WritableOpenError::Migration)
     }
 
     pub(super) fn validate_versionless_shape(
         path: &Path,
         conn: &sqlite::Connection,
-    ) -> Result<(), String> {
+    ) -> Result<(), WritableOpenError> {
         if migrations::classify_versionless(conn)?.is_some() {
             Ok(())
         } else {
@@ -90,20 +91,18 @@ impl StateDb {
         }
     }
 
-    pub(super) fn future_schema_error(path: &Path, stored: i32) -> String {
-        migrations::MigrationError::Incompatible {
+    pub(super) fn future_schema_error(path: &Path, stored: i32) -> WritableOpenError {
+        WritableOpenError::Migration(migrations::MigrationError::Incompatible {
             db_path: path.to_path_buf(),
             stored,
             current: CURRENT_SCHEMA_VERSION,
-        }
-        .to_string()
+        })
     }
 
-    pub(super) fn unrecognized_versionless_error(path: &Path) -> String {
-        migrations::MigrationError::UnrecognizedShape {
+    pub(super) fn unrecognized_versionless_error(path: &Path) -> WritableOpenError {
+        WritableOpenError::Migration(migrations::MigrationError::UnrecognizedShape {
             db_path: path.to_path_buf(),
-        }
-        .to_string()
+        })
     }
 
     pub(super) fn corrupt_schema_error(path: &Path, reason: String) -> String {

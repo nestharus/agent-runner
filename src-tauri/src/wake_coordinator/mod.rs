@@ -6,9 +6,10 @@
 mod admission;
 mod auto_wake_env;
 mod constants;
-mod consumed_completion;
 mod diagnostics;
 mod idle;
+#[cfg(test)]
+mod local_receipt_fixture;
 mod retry_cadence;
 mod spawn;
 mod sweep;
@@ -26,6 +27,13 @@ pub(crate) fn admit_session_launch(
     session_id: Option<&str>,
 ) -> Result<SessionAdmissionGuard, String> {
     admission::enqueue_and_wait(registration_identity, session_id)
+}
+
+pub(crate) fn admit_resolved_session_launch(
+    registration_identity: &str,
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<SessionAdmissionGuard, String> {
+    admission::enqueue_resolved_and_wait(registration_identity, resolved)
 }
 
 pub(crate) fn mark_session_idle_after_turn(
@@ -72,6 +80,10 @@ pub(crate) fn mark_terminal_attempt_idle_and_recheck(
     turn_recheck::mark_terminal_attempt_idle_and_recheck(session_id, invocation_uuid, exit_code)
 }
 
+pub(crate) fn reject_auto_wake_entry(session_id: &str, endpoint_hint_present: bool) -> Option<i32> {
+    wake_claim::reject_auto_wake_entry(session_id, endpoint_hint_present)
+}
+
 pub(crate) fn validate_auto_wake_child(session_id: &str) -> Result<Option<i32>, String> {
     wake_claim::validate_auto_wake_child(session_id)
 }
@@ -80,8 +92,10 @@ pub(crate) fn is_auto_wake_invocation() -> bool {
     auto_wake_env::is_auto_wake_invocation()
 }
 
-pub(crate) fn reset_manual_resume_wake_claim(session_id: &str) -> Result<(), String> {
-    wake_claim::reset_manual_resume_wake_claim(session_id)
+pub(crate) fn reset_manual_resume_wake_claim(
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<(), String> {
+    wake_claim::reset_manual_resume_wake_claim(resolved)
 }
 
 pub(crate) fn release_current_auto_wake_claim_for_session(session_id: &str) {

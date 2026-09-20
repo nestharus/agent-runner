@@ -30,6 +30,7 @@ const EXPECTED_EDGES: &[(&str, &str)] = &[
     ("src-tauri", "oulipoly-setup"),
     ("src-tauri", "oulipoly-state"),
     ("src-tauri", "oulipoly-agent-messenger"),
+    ("src-tauri", "oulipoly-agent-store"),
     ("src-tauri", "oulipoly-config"),
     ("src-tauri", "oulipoly-core"),
     ("src-tauri", "oulipoly-provider"),
@@ -426,6 +427,11 @@ fn dep_graph_exact_match() {
     let edges = workspace_edge_set(&repo_root(), true);
 
     assert_eq!(edges, expected_edges());
+    assert!(
+        !workspace_edge_set(&repo_root(), false)
+            .contains(&("src-tauri".to_string(), "oulipoly-agent-store".to_string())),
+        "Runner's agent-store edge is dev-only, not a production dependency"
+    );
 }
 
 #[test]

@@ -36,6 +36,18 @@ struct Fixture {
     provider_gate: PathBuf,
 }
 
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let root = std::mem::replace(&mut self.root, tempfile::tempdir().unwrap());
+            eprintln!(
+                "preserved failed native-wake fixture at {}",
+                root.keep().display()
+            );
+        }
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -119,13 +131,22 @@ impl Fixture {
     }
 
     fn start_startup_sweep(&self) -> Child {
+        let mut inspection = self.command();
+        inspection.args(["mailbox", "list", "--session-id", SESSION, "--json"]);
+        assert_success(&inspection.output().unwrap());
+        assert!(
+            MailboxDb::open(&self.sidecar_path())
+                .unwrap()
+                .completion_continuation_owner()
+                .unwrap()
+                .is_none()
+        );
         let mut command = self.command();
+        let chain: String = Connection::open(self.state_path()).unwrap().query_row(
+            "SELECT chain_id FROM session_chain_segments WHERE session_id = ?1 ORDER BY id LIMIT 1",
+            [SESSION], |row| row.get(0)).unwrap();
         command
-            .arg("mailbox")
-            .arg("list")
-            .arg("--session-id")
-            .arg(SESSION)
-            .arg("--json")
+            .args(["session", "pause-handshake", &chain, "--ttl-ms", "0"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command.spawn().unwrap()
@@ -219,7 +240,7 @@ impl Fixture {
         connection
             .execute(
                 "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
-                 VALUES ('age309-recovery-chain', '2026-08-30T12:00:00Z',
+                 VALUES ('30900000-0000-4000-8000-000000000001', '2026-08-30T12:00:00Z',
                          '2026-08-30T12:00:00Z', ?1)",
                 [MODEL],
             )
@@ -228,7 +249,7 @@ impl Fixture {
             .execute(
                 "INSERT INTO session_chain_segments
                     (chain_id, provider_name, session_id, started_at, transition_reason)
-                 VALUES ('age309-recovery-chain', ?1, ?2,
+                 VALUES ('30900000-0000-4000-8000-000000000001', ?1, ?2,
                          '2026-08-30T12:00:00Z', 'initial')",
                 [PROVIDER, SESSION],
             )
@@ -256,7 +277,7 @@ impl Fixture {
             .register_headless_delivery_attempt(
                 &attempt_id,
                 SESSION,
-                Some("age309-recovery-chain"),
+                Some("30900000-0000-4000-8000-000000000001"),
                 "age309-crashed-invocation",
                 &[row.seq],
                 0,
@@ -298,6 +319,11 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
     let stderr = String::from_utf8_lossy(&initial.stderr);
     assert_eq!(stderr.matches("OULIPOLY_RESULT=").count(), 1, "{stderr}");
     let owner_invocation_uuid = latest_invocation_uuid(&fixture.state_path());
+    assert!(wait_until(|| MailboxDb::open(&fixture.sidecar_path())
+        .unwrap()
+        .completion_continuation_owner()
+        .unwrap()
+        .is_none()));
     fixture.seed_pending_delivery(&owner_invocation_uuid);
 
     let sweep = fixture.start_startup_sweep();
@@ -398,11 +424,27 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
         )
         .unwrap();
     assert_eq!(runtime_count, 6);
+    assert!(wait_until(|| {
+        Connection::open(fixture.sidecar_path()).unwrap().query_row(
+        "SELECT COUNT(*)=1 AND SUM(phase='drained' AND integrated=1 AND drain_receipt LIKE '%ECHILD%')=1 FROM completion_continuation_attempt WHERE session_id=?1",
+        [SESSION], |row| row.get::<_, bool>(0)).unwrap()
+    }));
+    let receipt: String = Connection::open(fixture.sidecar_path())
+        .unwrap()
+        .query_row(
+            "SELECT drain_receipt FROM completion_continuation_attempt WHERE session_id=?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    println!("actual original native drain: {receipt}");
 }
 
 #[test]
 fn startup_recovery_settles_a_persisted_post_anchor_turn_without_relaunching() {
     let fixture = Fixture::new();
+    // Historical possible submission is observation input, never a live native
+    // parent/custodian. Only the supported session mutation starts recovery.
     fixture.seed_active_chain();
     fixture.seed_pending_delivery("age309-recovery-owner");
     fixture.seed_crashed_delivery_observation("persisted mailbox delivery");
@@ -423,7 +465,16 @@ fn startup_recovery_settles_a_persisted_post_anchor_turn_without_relaunching() {
                     .unwrap()
                     .is_none()
         }),
-        "persisted post-anchor delivery was not recovered"
+        "persisted post-anchor delivery was not recovered; output={sweep:?}; rows={:?}; confirmation={:?}; invocations={:?}",
+        MailboxDb::open(&fixture.sidecar_path())
+            .unwrap()
+            .list_mailbox(SESSION, true)
+            .unwrap(),
+        MailboxDb::open(&fixture.sidecar_path())
+            .unwrap()
+            .delivery_observation_confirmation(&"b".repeat(64))
+            .unwrap(),
+        invocation_diagnostics(&fixture.state_path())
     );
 
     let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();

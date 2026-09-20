@@ -22,6 +22,35 @@ pub enum InvocationMutationAuthority<'a> {
     ProviderLaunch(&'a ProviderLaunchOwnerFence),
 }
 
+/// A caller-retained fence, never authority inferred from a database row or a
+/// completion-registration capability. Copies remain subject to every State fence.
+#[derive(Debug, Clone, Default)]
+pub struct InvocationMutationScope(Option<ProviderLaunchOwnerFence>);
+impl InvocationMutationScope {
+    pub fn authority(&self) -> InvocationMutationAuthority<'_> {
+        self.0
+            .as_ref()
+            .map(InvocationMutationAuthority::ProviderLaunch)
+            .unwrap_or(InvocationMutationAuthority::Standalone)
+    }
+}
+impl StateDb {
+    pub fn retain_launch_owner(&self, owner: &ProviderLaunchOwnerFence) -> Result<(), String> {
+        validate_mutation_authority(
+            &self.conn,
+            owner.invocation_row_id,
+            InvocationMutationAuthority::ProviderLaunch(owner),
+        )?;
+        self.retained_launch_owners
+            .borrow_mut()
+            .insert(owner.invocation_row_id, owner.clone());
+        Ok(())
+    }
+    pub fn invocation_mutation_scope(&self, row: i64) -> InvocationMutationScope {
+        InvocationMutationScope(self.retained_launch_owners.borrow().get(&row).cloned())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderLaunchCandidate {
     pub provider_index: usize,
@@ -156,6 +185,32 @@ pub enum ProviderLaunchActorSettlement {
 pub enum ProviderLaunchChannelSettlement {
     NotCreated,
     EmptyRemoved,
+    /// Cancellation retains already committed effects; never a transfer receipt.
+    ArtifactsCommitted(Vec<oulipoly_agent_messenger::ReturnedArtifactRef>),
+    /// Logical cancellation is separate from retained, domain-owned cleanup.
+    ContinuingCustody {
+        domain_id: String,
+        original_owner: ProviderLaunchOwnerFence,
+        disposition: String,
+        path: String,
+        artifacts: Vec<oulipoly_agent_messenger::ReturnedArtifactRef>,
+    },
+}
+impl ProviderLaunchChannelSettlement {
+    fn transferable(&self) -> bool {
+        matches!(self, Self::NotCreated | Self::EmptyRemoved)
+    }
+    fn state(&self) -> &'static str {
+        match self {
+            Self::NotCreated => "not_created",
+            Self::EmptyRemoved => "empty_removed",
+            Self::ArtifactsCommitted(_) => "artifacts_committed",
+            Self::ContinuingCustody { disposition, .. } if disposition == "quarantined" => {
+                "quarantined"
+            }
+            Self::ContinuingCustody { .. } => "cleanup_failed",
+        }
+    }
 }
 
 /// Immutable receipts supplied by the custody owner, not observations reconstructed from PIDs.
@@ -568,8 +623,9 @@ impl StateDb {
     ) -> Result<(), String> {
         self.launch_transition(owner,"certify",proof,|tx| {
             validate_proof(tx,owner,proof)?;
+            if !proof.channel.transferable() { return Err(conflict()); }
             let actor_hash = digest(&proof.actors)?;
-            let channel = match proof.channel { ProviderLaunchChannelSettlement::NotCreated => "not_created", ProviderLaunchChannelSettlement::EmptyRemoved => "empty_removed" };
+            let channel = proof.channel.state();
             require_one(tx.execute(&format!("UPDATE provider_launch_attempts SET status='effect_incapable',actor_custody_state='effect_incapable',
                 actor_settlement_sha256=?1,runtime_settlement_sha256=?2,return_channel_state=?3,return_channel_settlement_sha256=?4,effect_incapable_at=?5
                 WHERE attempt_id=?6 AND status='transfer_requested' AND {ZERO_PROMOTION}
@@ -606,7 +662,39 @@ impl StateDb {
             predecessor.invocation_row_id,
             InvocationMutationAuthority::ProviderLaunch(predecessor),
         )?;
+        // Fresh allocation consumes old certification as new authority. Unlike
+        // the immutable replay above, it must revalidate native publication.
+        // Keep State -> namespace -> sidecar guards alive through State commit.
+        let sidecar_path = crate::mailbox::MailboxDb::path_for_state_db(&self.db_path);
+        let needs_publication =
+            super::provider_launch_publication::needs_publication(&tx, predecessor, "successor")?;
+        let authority = needs_publication
+            .then(|| {
+                crate::mailbox::MailboxAuthorityFence::try_acquire(&sidecar_path)
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()?;
+        let mut mailbox = authority
+            .as_ref()
+            .map(crate::mailbox::MailboxDb::open_existing_for_completion_authority)
+            .transpose()?;
+        let sidecar_fence = mailbox
+            .as_mut()
+            .map(crate::mailbox::MailboxDb::begin_completion_authority_fence)
+            .transpose()?;
+        if let Some(fence) = &sidecar_fence {
+            super::provider_launch_publication::validate(
+                &tx,
+                fence,
+                predecessor,
+                "successor",
+                &serde_json::to_value(proof).map_err(|e| e.to_string())?,
+            )?;
+        }
         validate_proof(&tx, predecessor, proof)?;
+        if !proof.channel.transferable() {
+            return Err(conflict());
+        }
         let (model,plan,parent,ordinal): (String,String,Option<i64>,i64) = tx.query_row(
             &format!("SELECT l.model_name,l.candidate_plan_json,i.parent_invocation_id,a.attempt_ordinal FROM provider_logical_launches l
              JOIN provider_launch_attempts a ON a.attempt_id=l.current_attempt_id JOIN invocations i ON i.id=a.invocation_id
@@ -684,6 +772,260 @@ impl StateDb {
         tx.commit().map_err(sql_error)
     }
 
+    /// Persist producer-emitted receipts before handing back to outer native custody.
+    /// This is evidence retention, not certification or logical settlement.
+    pub fn retain_native_attempt_recovery(
+        &self,
+        owner: &ProviderLaunchOwnerFence,
+        evidence: &serde_json::Value,
+    ) -> Result<(), String> {
+        if serde_json::to_vec(evidence)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 4 * 1024 * 1024
+        {
+            return Err("native_attempt_evidence_too_large".into());
+        }
+        self.launch_transition(owner, "native-recovery", evidence, |tx| {
+            remember(
+                tx,
+                owner.logical_launch_id,
+                &format!("{}/native-recovery-receipts", owner.attempt_id),
+                &digest(evidence)?,
+                evidence,
+            )
+        })
+    }
+
+    pub fn native_attempt_recovery(
+        &self,
+        generation: Uuid,
+        invocation: Uuid,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT r.result_json FROM provider_launch_attempts a
+            JOIN provider_launch_transition_replays r ON r.logical_launch_id=a.logical_launch_id
+            AND r.operation_key=a.attempt_id || '/native-recovery-receipts'
+            WHERE a.runtime_generation_uuid=?1 AND a.invocation_uuid=?2",
+                params![generation.to_string(), invocation.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        raw.map(|v| serde_json::from_str(&v).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    /// Persist producer-emitted receipts before handing back to outer native custody.
+    /// This is evidence retention, not certification or logical settlement.
+    pub fn retain_native_attempt_custody(
+        &self,
+        owner: &ProviderLaunchOwnerFence,
+        evidence: &serde_json::Value,
+    ) -> Result<(), String> {
+        if serde_json::to_vec(evidence)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 4 * 1024 * 1024
+        {
+            return Err("native_attempt_evidence_too_large".into());
+        }
+        self.launch_transition(owner, "native-custody", evidence, |tx| {
+            remember(
+                tx,
+                owner.logical_launch_id,
+                &format!("{}/native-custody-receipts", owner.attempt_id),
+                &digest(evidence)?,
+                evidence,
+            )
+        })
+    }
+
+    pub fn native_attempt_custody(
+        &self,
+        generation: Uuid,
+        invocation: Uuid,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT r.result_json FROM provider_launch_attempts a
+            JOIN provider_launch_transition_replays r ON r.logical_launch_id=a.logical_launch_id
+            AND r.operation_key=a.attempt_id || '/native-custody-receipts'
+            WHERE a.runtime_generation_uuid=?1 AND a.invocation_uuid=?2",
+                params![generation.to_string(), invocation.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        raw.map(|v| serde_json::from_str(&v).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    /// Retain supplemental original-owner recovery without rewriting prior observations.
+    /// The exact drain must be published under the State-then-sidecar fence,
+    /// including on replay. This does not certify the independent actor waits.
+    pub fn retain_native_recovered_attempt_custody(
+        &self,
+        owner: &ProviderLaunchOwnerFence,
+        evidence: &serde_json::Value,
+    ) -> Result<(), String> {
+        if serde_json::to_vec(evidence)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 4 * 1024 * 1024
+        {
+            return Err("native_attempt_evidence_too_large".into());
+        }
+        self.launch_transition(owner, "native-recovered-custody", evidence, |tx| {
+            remember(
+                tx,
+                owner.logical_launch_id,
+                &format!("{}/native-recovered-custody-receipts", owner.attempt_id),
+                &digest(evidence)?,
+                evidence,
+            )
+        })
+    }
+
+    pub fn native_recovered_attempt_custody(
+        &self,
+        generation: Uuid,
+        invocation: Uuid,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT r.result_json FROM provider_launch_attempts a
+            JOIN provider_launch_transition_replays r ON r.logical_launch_id=a.logical_launch_id
+            AND r.operation_key=a.attempt_id || '/native-recovered-custody-receipts'
+            WHERE a.runtime_generation_uuid=?1 AND a.invocation_uuid=?2",
+                params![generation.to_string(), invocation.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        raw.map(|v| serde_json::from_str(&v).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    /// Preserve the original generic runtime observation alongside stronger
+    /// cancellation-only evidence. This does not rewrite runtime history or
+    /// grant successor-transfer authority. Actual runtime/drain publication is
+    /// revalidated before retention, including immutable replay reuse.
+    pub fn retain_native_runtime_cancellation(
+        &self,
+        owner: &ProviderLaunchOwnerFence,
+        evidence: &serde_json::Value,
+    ) -> Result<(), String> {
+        if serde_json::to_vec(evidence)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 4 * 1024 * 1024
+        {
+            return Err("native_attempt_evidence_too_large".into());
+        }
+        self.launch_transition(owner, "native-runtime-cancellation", evidence, |tx| {
+            remember(
+                tx,
+                owner.logical_launch_id,
+                &format!("{}/native-runtime-cancellation-receipts", owner.attempt_id),
+                &digest(evidence)?,
+                evidence,
+            )
+        })
+    }
+
+    /// Continuing quarantine/cleanup custody survives logical terminalization.
+    /// No channel path, sidecar, or accepted artifact is released by this record.
+    pub fn retain_native_channel_duty(
+        &self,
+        owner: &ProviderLaunchOwnerFence,
+        duty: &ProviderLaunchChannelSettlement,
+    ) -> Result<(), String> {
+        self.launch_transition(owner, "native-channel-duty-owner", duty, |tx| {
+            remember(
+                tx,
+                owner.logical_launch_id,
+                &format!("{}/native-channel-duty", owner.attempt_id),
+                &digest(duty)?,
+                duty,
+            )
+        })
+    }
+    pub fn pending_native_channel_duties(
+        &self,
+    ) -> Result<Vec<ProviderLaunchChannelSettlement>, String> {
+        let mut statement = self.conn.prepare("SELECT result_json FROM provider_launch_transition_replays WHERE operation_key LIKE '%/native-channel-duty'").map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(sql_error)?;
+        rows.map(|r| serde_json::from_str(&r.map_err(sql_error)?).map_err(|e| e.to_string()))
+            .collect()
+    }
+    pub fn cancelling_native_attempts(&self) -> Result<Vec<(Uuid, Uuid)>, String> {
+        let mut statement = self.conn.prepare("SELECT a.runtime_generation_uuid,a.invocation_uuid
+            FROM provider_launch_attempts a JOIN provider_logical_launches l ON l.current_attempt_id=a.attempt_id
+            WHERE l.status='cancelling'").map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(sql_error)?;
+        rows.map(|r| {
+            let (generation, invocation) = r.map_err(sql_error)?;
+            Ok((
+                Uuid::parse_str(&generation).map_err(|e| e.to_string())?,
+                Uuid::parse_str(&invocation).map_err(|e| e.to_string())?,
+            ))
+        })
+        .collect()
+    }
+
+    pub fn validate_launch_start_session(
+        &self,
+        owner: &ProviderLaunchOwnerFence,
+        session: Option<&str>,
+    ) -> Result<(), String> {
+        validate_mutation_authority(
+            &self.conn,
+            owner.invocation_row_id,
+            InvocationMutationAuthority::ProviderLaunch(owner),
+        )?;
+        let valid: bool = self.conn.query_row("SELECT expected_provider_session_id IS ?2 FROM provider_logical_launches WHERE logical_launch_id=?1",
+            params![owner.logical_launch_id.to_string(), session], |r| r.get(0)).map_err(sql_error)?;
+        if valid {
+            Ok(())
+        } else {
+            Err("allocated_start_session_mismatch".into())
+        }
+    }
+
+    pub fn launch_cancellation_requested(
+        &self,
+        owner: &ProviderLaunchOwnerFence,
+    ) -> Result<bool, String> {
+        validate_mutation_authority(
+            &self.conn,
+            owner.invocation_row_id,
+            InvocationMutationAuthority::ProviderLaunch(owner),
+        )?;
+        self.conn.query_row("SELECT cancel_requested_at IS NOT NULL FROM provider_logical_launches WHERE logical_launch_id=?1",
+            [owner.logical_launch_id.to_string()], |r| r.get(0)).map_err(sql_error)
+    }
+
+    /// Complete from the finalized invocation without inventing a provider terminal reason.
+    pub fn complete_native_launch(&self, owner: &ProviderLaunchOwnerFence) -> Result<(), String> {
+        self.launch_transition(owner, "complete-native", &(), |tx| {
+            let (status, code): (String, Option<String>) = tx.query_row("SELECT i.status,i.terminal_reason
+                FROM invocations i JOIN provider_launch_attempts a ON a.invocation_id=i.id
+                JOIN provider_logical_launches l ON l.logical_launch_id=a.logical_launch_id
+                WHERE a.attempt_id=?1 AND a.status='active' AND l.status='active' AND l.cancel_requested_at IS NULL
+                AND i.status IN ('succeeded','failed')", [owner.attempt_id.to_string()], |r| Ok((r.get(0)?,r.get(1)?))).map_err(sql_error)?;
+            terminalize(tx, owner, &status, code.as_deref().unwrap_or("native_completed"))
+        })
+    }
+
     pub fn complete_launch(
         &self,
         owner: &ProviderLaunchOwnerFence,
@@ -711,6 +1053,7 @@ impl StateDb {
                 [owner.logical_launch_id.to_string()],|r|r.get(0)).map_err(sql_error)?;
             if !cancelling { return Err(conflict()); }
             validate_proof(tx,owner,proof)?;
+            retain_cancel_custody(tx, owner, proof)?;
             finish_recovery_invocation(tx,owner,"cancelled")?;
             terminalize(tx,owner,"cancelled","cancelled")
         })
@@ -741,7 +1084,9 @@ impl StateDb {
                 _ => return Err(conflict()),
             };
             if target != "recovery_blocked" {
-                validate_proof(tx,owner,proof.ok_or_else(conflict)?)?;
+                let proof = proof.ok_or_else(conflict)?;
+                validate_proof(tx,owner,proof)?;
+                retain_cancel_custody(tx,owner,proof)?;
                 finish_recovery_invocation(tx,owner,if cancel {"cancelled"} else {"recovered_before_transfer"})?;
             }
             terminalize(tx,owner,target,if target == "recovery_blocked" {"recovery_custody_uncertain"} else if cancel {"cancelled"} else {"recovered_before_transfer"})
@@ -768,6 +1113,34 @@ impl StateDb {
             if !executable {
                 return Err(conflict());
             }
+        }
+        // State first, sidecar second, held through State commit. No filesystem
+        // journal reconstruction runs here. Replays validate publication too.
+        let sidecar_path = crate::mailbox::MailboxDb::path_for_state_db(&self.db_path);
+        let needs_publication =
+            super::provider_launch_publication::needs_publication(&tx, owner, operation)?;
+        let authority = needs_publication
+            .then(|| {
+                crate::mailbox::MailboxAuthorityFence::try_acquire(&sidecar_path)
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()?;
+        let mut mailbox = authority
+            .as_ref()
+            .map(crate::mailbox::MailboxDb::open_existing_for_completion_authority)
+            .transpose()?;
+        let sidecar_fence = mailbox
+            .as_mut()
+            .map(crate::mailbox::MailboxDb::begin_completion_authority_fence)
+            .transpose()?;
+        if let Some(fence) = &sidecar_fence {
+            super::provider_launch_publication::validate(
+                &tx,
+                fence,
+                owner,
+                operation,
+                &serde_json::to_value(input).map_err(|e| e.to_string())?,
+            )?;
         }
         let key = format!("{}/{operation}", owner.attempt_id);
         let hash = digest(&(owner, input))?;
@@ -846,11 +1219,83 @@ fn finish_recovery_invocation(
     }
     Ok(())
 }
+fn retain_cancel_custody(
+    tx: &sqlite::Transaction<'_>,
+    owner: &ProviderLaunchOwnerFence,
+    proof: &ProviderLaunchCustodyProof,
+) -> Result<(), String> {
+    // Keep the receipts themselves, not just an unresolvable digest of effects.
+    remember(
+        tx,
+        owner.logical_launch_id,
+        &format!("{}/terminal-custody", owner.attempt_id),
+        &digest(proof)?,
+        proof,
+    )?;
+    require_one(
+        tx.execute(
+            "UPDATE provider_launch_attempts SET actor_custody_state='effect_incapable',
+        actor_settlement_sha256=?1,runtime_settlement_sha256=?2,return_channel_state=?3,
+        return_channel_settlement_sha256=?4 WHERE attempt_id=?5",
+            params![
+                digest(&proof.actors)?,
+                proof.runtime_settlement_sha256,
+                proof.channel.state(),
+                proof.return_channel_settlement_sha256,
+                owner.attempt_id.to_string()
+            ],
+        )
+        .map_err(sql_error)?,
+    )
+}
+
 fn validate_proof(
     conn: &sqlite::Connection,
     owner: &ProviderLaunchOwnerFence,
     proof: &ProviderLaunchCustodyProof,
 ) -> Result<(), String> {
+    if let ProviderLaunchChannelSettlement::ArtifactsCommitted(refs) = &proof.channel {
+        let retained = StateDb::parse_returned_artifact_rows(
+            StateDb::load_returned_artifact_rows(conn, owner.invocation_row_id)
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if refs.is_empty() || retained != *refs {
+            return Err("cancellation_artifact_custody_mismatch".into());
+        }
+    }
+    if let ProviderLaunchChannelSettlement::ContinuingCustody {
+        domain_id,
+        original_owner,
+        disposition,
+        path,
+        artifacts,
+    } = &proof.channel
+    {
+        bounded(domain_id)?;
+        if original_owner != owner
+            || path.is_empty()
+            || !matches!(disposition.as_str(), "quarantined" | "cleanup_failed")
+        {
+            return Err("continuing_native_channel_owner_conflict".into());
+        }
+        let retained = StateDb::parse_returned_artifact_rows(
+            StateDb::load_returned_artifact_rows(conn, owner.invocation_row_id)
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if retained != *artifacts {
+            return Err("continuing_native_channel_artifact_conflict".into());
+        }
+        let obligation: String = conn.query_row("SELECT result_json FROM provider_launch_transition_replays WHERE logical_launch_id=?1 AND operation_key=?2",
+            params![owner.logical_launch_id.to_string(),format!("{}/native-channel-duty", owner.attempt_id)], |r|r.get(0)).map_err(sql_error)?;
+        if serde_json::from_str::<ProviderLaunchChannelSettlement>(&obligation)
+            .map_err(|e| e.to_string())?
+            != proof.channel
+        {
+            return Err("continuing_native_channel_duty_conflict".into());
+        }
+    }
     valid_digest(&proof.runtime_settlement_sha256)?;
     valid_digest(&proof.return_channel_settlement_sha256)?;
     bounded(&proof.runtime_terminal_code)?;
@@ -888,7 +1333,13 @@ fn validate_proof(
             return Err(conflict());
         }
     }
-    if operations != std::collections::HashSet::from(["describe", "policy", "launch"]) {
+    if !["describe", "policy", "launch"]
+        .iter()
+        .all(|op| operations.contains(op))
+        || operations
+            .iter()
+            .any(|op| !["describe", "policy", "launch", "terminal_classify"].contains(op))
+    {
         return Err(conflict());
     }
     if proof.runtime_never_bound {

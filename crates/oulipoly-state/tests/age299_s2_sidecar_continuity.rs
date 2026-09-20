@@ -663,6 +663,7 @@ fn schema_17_upgrade_backfills_only_an_exact_proven_materialization_summary() {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
+             ALTER TABLE invocation_completion_obligations DROP COLUMN completion_v2_binding;
              DROP TABLE provider_launch_transition_replays;
              DROP TABLE provider_logical_launches;
              DROP TABLE provider_launch_attempts;

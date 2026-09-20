@@ -14,6 +14,7 @@ pub mod error_formatter;
 mod provider_access;
 mod provider_dispatch;
 mod request_mapper;
+mod source_ingest;
 
 use crate::provider_registry::ProviderRegistryHandle;
 use crate::services::{MigrationServiceOutput, MigrationServiceRequest};
@@ -40,6 +41,7 @@ pub fn assess_rotation(
         request,
         registry.host_options(),
         "rotation.assess",
+        registry.as_ref(),
     )?;
     provider_dispatch::invoke_provider_contract(endpoint.client(), "rotation.assess", payload)
 }
@@ -49,6 +51,26 @@ pub fn materialize_rotation(
     identity: ExternalRotationIdentity,
     request: &MigrationServiceRequest<'_>,
 ) -> Result<MigrationServiceOutput, ExternalRotationError> {
+    let migration_fence = request
+        .state
+        .begin_completed_turn_migration(
+            request.resolved,
+            &identity.target_provider,
+            None,
+            oulipoly_state::CompletedTurnMigrationScope::ExternalProviderWide,
+            oulipoly_state::CompletedTurnMigrationStage::ExternalBeforeProvider,
+        )
+        .map_err(crate::rotation_domain::host_apply_conflict)?;
+    materialize_rotation_with_fence(registry_handle, identity, request, &migration_fence)
+}
+
+pub(crate) fn materialize_rotation_with_fence(
+    registry_handle: &ProviderRegistryHandle,
+    identity: ExternalRotationIdentity,
+    request: &MigrationServiceRequest<'_>,
+    migration_fence: &oulipoly_state::CompletedTurnMigrationFence,
+) -> Result<MigrationServiceOutput, ExternalRotationError> {
+    source_ingest::settle_source_ingestion(registry_handle, &identity, request)?;
     let result = invoke_rotation_materialize(registry_handle, &identity, request)?;
     if !result.changed {
         crate::rotation_host_apply::validate_no_change_host_state_plan(
@@ -62,11 +84,12 @@ pub fn materialize_rotation(
     crate::rotation_journal::publish_after_artifact_record(request, &identity, &result)?;
     crate::rotation_host_apply::verify_rotation_artifacts(&result.artifacts)
         .map_err(error_formatter::artifact_verification_failure)?;
-    crate::rotation_host_apply::validate_host_state_plan(
+    crate::rotation_host_apply::validate_host_state_plan_with_fence(
         &result.host_state_plan,
         &result.artifacts,
         request,
         &identity,
+        migration_fence,
     )?;
     crate::rotation_journal::publish_during_apply_record(request, &identity, &result)?;
     let segment =
@@ -137,6 +160,7 @@ fn invoke_rotation_materialize(
         request,
         registry.host_options(),
         "rotation.materialize",
+        registry.as_ref(),
     )?;
     provider_dispatch::invoke_provider_contract(endpoint.client(), "rotation.materialize", payload)
 }

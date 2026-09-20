@@ -92,6 +92,14 @@ fn parsed_answer(args: &[&str]) -> Result<(Option<String>, Option<String>), Stri
 #[derive(Default)]
 struct RecordingExecutor(Mutex<Vec<ExecutorServiceRequest>>);
 impl ExecutorServicePort for RecordingExecutor {
+    fn execute_with_live_session_authority(
+        &self,
+        request: ExecutorServiceRequest,
+        _authority: oulipoly_runtime::services::LiveSessionAuthorityTarget,
+    ) -> Result<ExecutorServiceOutput, ServiceError> {
+        self.execute(request)
+    }
+
     fn execute(
         &self,
         request: ExecutorServiceRequest,
@@ -102,6 +110,7 @@ impl ExecutorServicePort for RecordingExecutor {
         })
     }
 }
+
 fn record_request(root: &Path, delivery: &PreparedMailboxDelivery) -> ExecutorServiceRequest {
     std::fs::create_dir_all(root.join("config")).unwrap();
     std::fs::write(
@@ -177,6 +186,11 @@ executable = "/nonexistent/age346-must-never-launch"
         provider_prompt_accepted: &mut accepted,
     };
     let error = execute_resume_attempt_command(
+        oulipoly_runtime::services::LiveSessionAuthorityTarget {
+            state_path: env.state.path().to_path_buf(),
+            invocation_row_id: 1,
+            invocation_uuid: "fixture-invocation".into(),
+        },
         &input,
         &provider,
         0,

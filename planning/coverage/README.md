@@ -76,7 +76,10 @@ Each spec contains, in order:
 
 ## Coverage workflow
 
-The CI coverage baseline lives in `.github/workflows/coverage.yml` and
-emits a `rust-coverage` artifact (lcov + cobertura + JSON summary) per
-PR and per `main` push. The test-audit gate consumes those artifacts
-via `gh api ... workflow_runs`.
+The manual-only `.github/workflows/coverage.yml` emits a `rust-coverage`
+artifact (lcov + cobertura + JSON summary) when explicitly dispatched and
+its generation/upload steps succeed; it does not run per PR or `main` push.
+Consumers of these artifacts must select an actual run and verify its identity.
+The current `~/ai/agents/test-audit-gate.md` § 6 instead generates coverage
+locally in `pr-review` mode at exact head and merge base, with no remote
+artifact fetches; it does not generate coverage in `implementation` mode.

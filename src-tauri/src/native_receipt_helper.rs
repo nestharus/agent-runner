@@ -65,8 +65,15 @@ pub(crate) fn entry(once: bool) -> Result<(), String> {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) enum AdmissionPurpose {
+    StartupOpportunistic,
+    TerminalBounded,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Target {
     pub attempt_id: String,
+    pub admission_purpose: AdmissionPurpose,
     pub anchor_identity: String,
     pub model_name: String,
     pub cwd: std::path::PathBuf,
@@ -133,9 +140,6 @@ pub(crate) fn entry_target(once: bool, target: Option<Target>) -> Result<(), Str
         })
         .map_err(|e| e.to_string())?;
     let result = inspect(once, target);
-    if let Err(error) = &result {
-        eprintln!("receipt helper: {error}");
-    }
     if result.is_ok() {
         // Process completion only, never receipt evidence. Unix cleanup kills
         // this helper too, so communicate completion before group teardown.
@@ -190,11 +194,10 @@ fn inspect(once: bool, target: Option<Target>) -> Result<(), String> {
         write!(owner, "{now}").map_err(|e| e.to_string())?;
         // Reopen under real shared custody every visit; rebuild may have
         // replaced the DB while idle. No stale connection/anchor survives it.
-        if let Some(mut db) = MailboxDb::open_default_if_exists()?
-            && let Err(error) =
-                super::poll_headless_receipt_tick_with(&mut db, |dir| registry.registry(dir))
-        {
-            eprintln!("receipt inspection: {error}");
+        if let Some(mut db) = MailboxDb::open_default_if_exists()? {
+            // The exact attempt retains bounded storage diagnostics. Provider
+            // observation failures never inherit the user's terminal stream.
+            let _ = super::poll_headless_receipt_tick_with(&mut db, |dir| registry.registry(dir));
         }
         std::io::stdout()
             .write_all(b".")
@@ -242,15 +245,15 @@ fn targeted_scan_waits_for_admission_and_bounds_persistent_contention() {
         std::thread::sleep(Duration::from_millis(50));
         drop(held);
     });
-    let admitted = wait_for_scan_admission(
-        || try_admit(&path, "receipt-scan"),
-        Duration::from_secs(2),
-    ).unwrap();
+    let admitted =
+        wait_for_scan_admission(|| try_admit(&path, "receipt-scan"), Duration::from_secs(2))
+            .unwrap();
     release.join().unwrap();
     let error = wait_for_scan_admission(
         || try_admit(&path, "receipt-scan"),
         Duration::from_millis(50),
-    ).unwrap_err();
+    )
+    .unwrap_err();
     assert!(error.contains("admission deadline"));
     drop(admitted);
 }
@@ -260,7 +263,19 @@ fn inspect_target(target: Target) -> Result<(), String> {
     // bounded opportunity after a contending scanner releases admission. Do not
     // equate a skipped scan with absence of native evidence at turn completion.
     // This wait is inside the contained helper, below its 30s stall watchdog.
-    let admission = wait_for_scan_admission(try_scan_admission, Duration::from_secs(5))?;
+    let admission = match target.admission_purpose {
+        AdmissionPurpose::StartupOpportunistic => {
+            let Some(admission) = try_scan_admission()? else {
+                // Completion of this opportunity is not evidence of receipt or
+                // non-submission. The caller retains pending state for recovery.
+                return Ok(());
+            };
+            admission
+        }
+        AdmissionPurpose::TerminalBounded => {
+            wait_for_scan_admission(try_scan_admission, Duration::from_secs(5))?
+        }
+    };
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
@@ -303,8 +318,11 @@ pub(crate) fn observe_target(target: Target) -> Result<(), String> {
 }
 
 #[cfg(test)]
+type TestCommandFactory = Box<dyn Fn(bool) -> Command>;
+
+#[cfg(test)]
 thread_local! {
-    pub(crate) static TEST_COMMAND: std::cell::RefCell<Option<Box<dyn Fn(bool) -> Command>>> = Default::default();
+    pub(crate) static TEST_COMMAND: std::cell::RefCell<Option<TestCommandFactory>> = Default::default();
     pub(crate) static TEST_BOUND: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
@@ -374,7 +392,7 @@ impl OwnedHelper {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::null());
         for key in [
             "OULIPOLY_PARENT_INVOCATION",
             "OULIPOLY_RETURN_CHANNEL",
@@ -412,7 +430,9 @@ impl OwnedHelper {
         Ok(status)
     }
     fn terminate(&mut self) {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        self.settle_group();
+        #[cfg(all(unix, not(target_os = "linux")))]
         unsafe {
             // Direct Child has not been reaped: group ID cannot be reused.
             libc::kill(-(self.child.id() as i32), libc::SIGKILL);
@@ -420,6 +440,28 @@ impl OwnedHelper {
         #[cfg(windows)]
         self.job.terminate();
         let _ = self.child.kill();
+    }
+    #[cfg(target_os = "linux")]
+    fn settle_group(&self) {
+        let mut reported_error = false;
+        loop {
+            match oulipoly_provider::client::settle_receipt_inspection_group(&self.child) {
+                Ok(true) => return,
+                Ok(false) => (),
+                Err(error) => report_cleanup_error(&mut reported_error, &error),
+            }
+            // Scheduling assistance only: no elapsed-time predicate can
+            // discharge custody. Retain the direct Child even on observation
+            // failure, rather than returning and silently abandoning its group.
+            std::thread::yield_now();
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+fn report_cleanup_error(reported: &mut bool, error: &std::io::Error) {
+    if !*reported {
+        tracing::error!("receipt group cleanup remains owned: {error}");
+        *reported = true;
     }
 }
 impl Drop for OwnedHelper {

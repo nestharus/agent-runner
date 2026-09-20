@@ -32,6 +32,7 @@ mod mapper;
 mod migration;
 mod orchestration;
 mod predicate;
+pub(crate) mod retention;
 #[cfg(test)]
 mod source_guard;
 mod terminal;
@@ -39,6 +40,7 @@ mod validator;
 mod wake;
 
 pub(in crate::run) use execution::PreparedHeadlessResumeExecution;
+pub(crate) use execution::reject_invalid_resume_input;
 pub(crate) use orchestration::run_resume;
 pub(in crate::run) use orchestration::{prepare_resume, run_prepared_resume};
 pub(crate) use validator::validate_resume_input;

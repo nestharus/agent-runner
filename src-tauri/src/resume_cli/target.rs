@@ -293,7 +293,7 @@ fn is_resume_migration_provider(
     name == active_provider
         || providers_cfg
             .get(name)
-            .is_some_and(|entry| entry.session_storage.is_some())
+            .is_some_and(|entry| entry.session_storage.is_some() || entry.implementation.is_some())
 }
 
 #[cfg(test)]
@@ -358,6 +358,32 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["fixture-a", "fixture-b", "fixture-c"]);
+    }
+
+    #[test]
+    fn migration_target_pool_includes_provider_owned_storage_without_legacy_storage() {
+        let resolved = oulipoly_state::ResolvedResume {
+            chain_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            model_name: None,
+            model: None,
+            active_provider: "fixture-a".to_string(),
+            active_session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+        };
+        let mut cfg = providers_cfg_with_storage(&["fixture-a", "fixture-b"]);
+        let target = cfg.entries.get_mut("fixture-b").unwrap();
+        target.session_storage = None;
+        target.implementation = Some(oulipoly_config::ProviderEndpointConfig {
+            family: "fixture".into(),
+            executable: "/fixture-provider".into(),
+        });
+        let pool = resume_migration_pool(&resolved, &cfg);
+        assert_eq!(
+            pool.providers
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fixture-a", "fixture-b"]
+        );
     }
 
     #[test]

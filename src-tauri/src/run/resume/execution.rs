@@ -27,7 +27,7 @@ use oulipoly_runtime::services::{
 };
 
 use super::orchestration::ResumeAttemptInput;
-use super::{formatter, mapper, migration, validator, wake};
+use super::{formatter, mapper, validator, wake};
 use crate::cli::inputs::resolve_resume_answer;
 use crate::migration_providers::{ResumeExecutionEnvironment, load_resume_execution_environment};
 use crate::resume_cli::{
@@ -40,6 +40,10 @@ use crate::wiring;
 pub(in crate::run) struct PreparedHeadlessResumeExecution {
     pub(super) _mailbox_finalization_guard:
         Option<oulipoly_state::mailbox::DeliveryFinalizationGuard>,
+    pub(super) original_answer: Option<String>,
+    pub(super) submission_token: Option<String>,
+    pub(super) target_kind: oulipoly_state::InboxTargetKind,
+    pub(super) target_id: String,
     pub(super) answer: Option<String>,
     pub(super) mailbox_session_id: String,
     pub(super) mailbox_delivery_seqs: Vec<i64>,
@@ -59,7 +63,7 @@ impl PreparedHeadlessResumeExecution {
     }
 }
 
-pub(super) fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
+pub(crate) fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
     match validator::validate_resume_input(session_id) {
         Ok(()) => None,
         Err(message) => {
@@ -82,8 +86,6 @@ pub(in crate::run) fn prepare_headless_resume_execution(
     models_dir_override: Option<&Path>,
 ) -> Result<Result<PreparedHeadlessResumeExecution, i32>, String> {
     let answer = resolve_resume_answer(prompt, file)?;
-    let (answer, submitted_seq) =
-        persist_tokenized_resume_input(answer, submission_token, target_kind, session_id)?;
     let env = load_resume_execution_environment(models_dir_override)?;
     refresh_resume_provider_registry(agent_runtime_services, &env)?;
     let resolved = match resolve_resume_for_headless_execution(
@@ -112,36 +114,81 @@ pub(in crate::run) fn prepare_headless_resume_execution(
     )?;
     let parent_invocation_id = crate::dispatch::resolve_parent_invocation_id(&env.state);
     let max_attempts = headless_resume_retry_budget(&resolved);
-    if let Err(error) = wake::reconcile_pending_headless_delivery_observations(
-        &resolved,
-        &effective_spawn_cwd,
-        &env.config_root,
-    ) {
-        formatter::emit_stderr(&format!(
-            "Warning: Pending mailbox delivery observation recovery failed: {error}"
-        ));
-    }
-    let mailbox_delivery = wake::prepare_headless_resume_delivery(
-        &resolved,
-        answer,
-        Some(&env.models_dir),
-        submitted_seq,
-    )?;
-    if crate::wake_coordinator::is_auto_wake_invocation()
-        && mailbox_delivery.seqs.is_empty()
-        && mailbox_delivery.answer.is_none()
-    {
-        wake::release_current_auto_wake_claim(session_id);
-        return Ok(Err(0));
-    }
-    Ok(Ok(mapper::prepared_headless_resume_execution(
-        mailbox_delivery,
+    Ok(Ok(PreparedHeadlessResumeExecution {
+        original_answer: answer,
+        submission_token: submission_token.map(str::to_string),
+        target_kind,
+        target_id: session_id.to_string(),
+        answer: None,
+        _mailbox_finalization_guard: None,
+        mailbox_session_id: resolved.active_session_id.clone(),
+        mailbox_delivery_seqs: Vec::new(),
+        mailbox_delivery_nonce: None,
+        mailbox_delivery_requires_turn_confirmation: false,
         env,
         resolved,
         effective_spawn_cwd,
         parent_invocation_id,
         max_attempts,
-    )))
+        provider_prompt_accepted: false,
+    }))
+}
+
+pub(super) fn prepare_admitted_delivery(
+    prepared: &mut PreparedHeadlessResumeExecution,
+) -> Result<(), String> {
+    let (answer, submitted_seq) = persist_tokenized_resume_input(
+        prepared.original_answer.clone(),
+        prepared.submission_token.as_deref(),
+        prepared.target_kind,
+        if prepared.target_kind == oulipoly_state::InboxTargetKind::Session {
+            &prepared.resolved.active_session_id
+        } else {
+            &prepared.target_id
+        },
+    )?;
+    wake::reconcile_pending_headless_delivery_observations(
+        &prepared.resolved,
+        &prepared.effective_spawn_cwd,
+        &prepared.env.config_root,
+    )?;
+    let delivery = wake::prepare_headless_resume_delivery(
+        &prepared.resolved,
+        answer,
+        Some(&prepared.env.models_dir),
+        submitted_seq,
+    )?;
+    prepared._mailbox_finalization_guard = delivery.finalization_guard;
+    prepared.answer = delivery.answer;
+    prepared.mailbox_session_id = delivery.session_id;
+    prepared.mailbox_delivery_seqs = delivery.seqs;
+    prepared.mailbox_delivery_nonce = delivery.delivery_nonce;
+    prepared.mailbox_delivery_requires_turn_confirmation = delivery.requires_turn_confirmation;
+    Ok(())
+}
+
+pub(super) fn refresh_admitted_resume(
+    services: &wiring::AgentRuntimeServices,
+    prepared: &mut PreparedHeadlessResumeExecution,
+    session_id: &str,
+    working_dir: Option<&Path>,
+) -> Result<(), String> {
+    prepared.resolved = resolve_resume_for_headless_execution(
+        services,
+        &prepared.env,
+        session_id,
+        prepared.resolved.model_name.as_deref(),
+    )
+    .map_err(|code| format!("resume target refresh failed: {code}"))?;
+    prepared.effective_spawn_cwd = effective_resume_spawn_cwd(
+        &prepared.env.state,
+        &prepared.env.providers_cfg,
+        &prepared.env.sessions_cfg,
+        &prepared.resolved,
+        session_id,
+        working_dir,
+    )?;
+    Ok(())
 }
 
 fn persist_tokenized_resume_input(
@@ -231,30 +278,6 @@ fn headless_resume_retry_budget(resolved: &oulipoly_state::ResolvedResume) -> us
         + 1
 }
 
-pub(super) fn prepare_resume_attempt_target(
-    input: &mut ResumeAttemptInput<'_>,
-) -> Result<Result<ResumeExecutionTarget, i32>, String> {
-    let mut target =
-        match renderable_resume_execution_target(input.resolved, &input.env.providers_cfg) {
-            Ok(target) => target,
-            Err(exit_code) => return Ok(Err(exit_code)),
-        };
-    if super::migration_allowed(input.reservation)
-        && let Err(exit_code) = migration::migrate_resume_target(
-            input.agent_runtime_services,
-            input.env,
-            input.resolved,
-            &mut target,
-            input.manual_migrate,
-            input.attempts,
-            input.effective_spawn_cwd,
-        )
-    {
-        return Ok(Err(exit_code));
-    }
-    Ok(Ok(target))
-}
-
 pub(super) fn resume_attempt_strategy_for_target(
     provider: &oulipoly_config::ProviderConfig,
     account_endpoint_configured: bool,
@@ -269,6 +292,7 @@ pub(super) fn resume_attempt_strategy_for_target(
 }
 
 pub(super) fn execute_resume_attempt_command(
+    authority: oulipoly_runtime::services::LiveSessionAuthorityTarget,
     input: &ResumeAttemptInput<'_>,
     provider: &oulipoly_config::ProviderConfig,
     provider_index: usize,
@@ -300,7 +324,7 @@ pub(super) fn execute_resume_attempt_command(
         return input
             .agent_runtime_services
             .executor_service
-            .execute(request)
+            .execute_with_live_session_authority(request, authority)
             .map(|output| output.result)
             .map_err(|err| err.to_string());
     }
@@ -308,7 +332,7 @@ pub(super) fn execute_resume_attempt_command(
         &input.resolved.active_session_id,
         strategy.expect("legacy resume target must have a resume strategy"),
     );
-    executor::cli::execute_resume_optional_prompt_with_model_identity(
+    executor::cli::execute_resume_with_completed_turn_owner(
         provider,
         provider_index,
         prompt_mode,
@@ -318,7 +342,47 @@ pub(super) fn execute_resume_attempt_command(
         resume_payload,
         input.resolved.model_name.as_deref().unwrap_or("<unknown>"),
         Some(&input.env.models_dir),
+        &authority,
     )
+}
+
+pub(super) fn execute_allocated_resume_attempt(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_index: usize,
+    prompt_mode: oulipoly_config::PromptMode,
+    invocation_env: &str,
+    allocation: executor::AllocatedProviderLaunchAttempt,
+) -> Result<executor::ExecutionResult, String> {
+    let fallback;
+    let model = if let Some(model) = input.resolved.model.as_ref() {
+        model
+    } else {
+        fallback = provider_only_resume_model(input, provider, prompt_mode);
+        &fallback
+    };
+    let request = provider_ref_resume_executor_request(
+        input,
+        model,
+        provider,
+        provider_index,
+        prompt_mode,
+        invocation_env,
+    );
+    match executor::execute_native_allocated_provider_attempt(
+        &input
+            .agent_runtime_services
+            .provider_registry_handle
+            .current(),
+        request,
+        allocation,
+    ) {
+        executor::ProviderLaunchAttemptOutcome::Completed(result) => Ok(result),
+        executor::ProviderLaunchAttemptOutcome::Failed(failure) => Err(format!(
+            "native allocated launch failed: {:?}",
+            failure.error
+        )),
+    }
 }
 
 fn provider_only_resume_model(

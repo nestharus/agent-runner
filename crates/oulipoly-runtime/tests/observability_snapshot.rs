@@ -16,7 +16,7 @@ use oulipoly_runtime::session_provider::SessionProviderIdentity;
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, BindRuntimeGenerationRunning, CreateRuntimeGeneration, EnqueueResult,
     MailboxDb, RuntimeGenerationFence, RuntimeGenerationId, SessionMetadataUpsert,
-    WAKE_SWEEP_ABANDONED_ERROR, WakeClaimAcquireResult, WakeClaimRequest,
+    WAKE_SWEEP_ABANDONED_ERROR, WakeClaimRequest,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{InvocationStart, StateDb};
@@ -1248,6 +1248,79 @@ fn stale_runtime_snapshot_emits_diagnostic_without_mutating_runtime_row() {
     );
 }
 
+// Storage-only relational history fixture through the existing SQLite test
+// facility. No owner, native endpoint, driver, attempt or custody is fabricated.
+// Native admission is exercised separately by age360_completion_continuation.
+fn seed_relational_wake_history(fixture: &Fixture, mailbox: &mut MailboxDb, token: &str) {
+    mailbox
+        .wake_sessions()
+        .upsert_session_metadata(SessionMetadataUpsert {
+            session_id: SESSION_ID,
+            mode: "headless",
+            invocation_uuid: Some(ROOT_UUID),
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            models_dir: Some("/models/observability-read-only"),
+            effective_cwd: Some("/work/observability-read-only"),
+        })
+        .unwrap();
+    let request = WakeClaimRequest {
+        session_id: SESSION_ID,
+        claim_token: "refused-without-owner",
+        reason: "notify_idle",
+        auto_wake_count: 1,
+        wake_invocation_uuid: Some(ROOT_UUID),
+        stale_after_seconds: 600,
+    };
+    let error = mailbox
+        .wake_sessions()
+        .try_acquire_wake_claim(request)
+        .unwrap_err();
+    assert!(error.contains("completion_owner_unavailable"), "{error}");
+    assert!(
+        mailbox
+            .wake_session_reader()
+            .wake_claim(SESSION_ID)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        mailbox
+            .continuation_activation(SESSION_ID, "refused-without-owner")
+            .unwrap()
+            .is_none()
+    );
+    assert!(mailbox.completion_continuation_owner().unwrap().is_none());
+    // Historical/legacy read input only. Seeding the existing SQLite table
+    // avoids impersonating a native driver or reserving a current activation.
+    let connection = rusqlite::Connection::open(fixture.sidecar_path()).unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "INSERT INTO session_wake_claim (session_id, claim_token, claimed_at,
+         reason, auto_wake_count, wake_invocation_uuid)
+         VALUES (?1, ?2, '2026-01-01T00:00:00Z', 'historical-read-fixture', 1, ?3)",
+                params![SESSION_ID, token, ROOT_UUID],
+            )
+            .unwrap(),
+        1
+    );
+    assert!(mailbox.completion_continuation_owner().unwrap().is_none());
+    assert!(
+        mailbox
+            .continuation_activation(SESSION_ID, token)
+            .unwrap()
+            .is_none()
+    );
+    let claim = mailbox
+        .wake_session_reader()
+        .wake_claim(SESSION_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.claim_token, token);
+    assert_eq!(claim.auto_wake_count, 1);
+}
+
 #[test]
 fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
     let fixture = Fixture::new();
@@ -1278,18 +1351,7 @@ fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
             .record_delivery_attempt_transport_ack("attempt-physical-read-only")
             .unwrap()
     );
-    let claim = mailbox
-        .wake_sessions()
-        .try_acquire_wake_claim(WakeClaimRequest {
-            session_id: SESSION_ID,
-            claim_token: "claim-physical-read-only",
-            reason: "notify_idle",
-            auto_wake_count: 1,
-            wake_invocation_uuid: Some(ROOT_UUID),
-            stale_after_seconds: 600,
-        })
-        .unwrap();
-    assert!(matches!(claim, WakeClaimAcquireResult::Acquired(_)));
+    seed_relational_wake_history(&fixture, &mut mailbox, "claim-physical-read-only");
     let generation = RuntimeGenerationId::parse("88888888-8888-4888-8888-888888888888").unwrap();
     mailbox
         .runtime_lifecycle()
@@ -1436,25 +1498,51 @@ fn wake_claim_with_dead_pid_is_reported_as_claim_dead() {
     mailbox
         .enqueue_agent_bash_complete(&mailbox_input("handle-pending", SESSION_ID))
         .unwrap();
-    let claim = mailbox
-        .wake_sessions()
-        .try_acquire_wake_claim(WakeClaimRequest {
-            session_id: SESSION_ID,
-            claim_token: "claim-a",
-            reason: "notify_idle",
-            auto_wake_count: 1,
-            wake_invocation_uuid: Some("wake-invocation"),
-            stale_after_seconds: 600,
-        })
+    seed_relational_wake_history(&fixture, &mut mailbox, "claim-a");
+    // Capture a real child while live, then reap that exact child. Neither a
+    // fabricated PID nor a different boot identity stands in for death.
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(matches!(claim, WakeClaimAcquireResult::Acquired(_)));
+    let pid = i64::from(child.id());
+    assert!(
+        oulipoly_state::pid_identity::read_live_process_identity(pid)
+            .unwrap()
+            .is_some()
+    );
     assert!(
         mailbox
             .wake_sessions()
-            .record_wake_claim_pid(SESSION_ID, "claim-a", 999_999_999)
+            .record_wake_claim_pid_identity(SESSION_ID, "claim-a", pid)
             .unwrap()
     );
+    let identity = oulipoly_state::pid_identity::read_live_process_identity(pid)
+        .unwrap()
+        .unwrap();
+    let pid_db = fixture.open_pid();
+    record_identity(&pid_db, "claim-a", Some(SESSION_ID), &identity);
+    drop(pid_db);
+    let live = fixture
+        .service()
+        .snapshot(&fixture.root(), full_snapshot_limits());
+    assert_eq!(
+        node(&live, "wake:session-observe:claim-a").liveness,
+        LivenessStatus::VerifiedLive
+    );
+    assert!(!has_diagnostic(&live, "stuck:claim-dead"));
+    drop(child.stdin.take());
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "read must see EOF");
+    assert!(
+        oulipoly_state::pid_identity::read_live_process_identity(pid)
+            .unwrap()
+            .is_none()
+    );
+    println!("real wake child pid={pid} waited={status}; live-to-dead contrast");
     drop(mailbox);
+    let before = physical_file_snapshot(&fixture.data_dir);
 
     let snapshot = fixture
         .service()
@@ -1464,6 +1552,7 @@ fn wake_claim_with_dead_pid_is_reported_as_claim_dead() {
     let wake = node(&snapshot, "wake:session-observe:claim-a");
     assert_eq!(wake.kind, MonitorNodeKind::WakeClaim);
     assert_eq!(wake.liveness, LivenessStatus::Dead);
+    assert_physical_files_unchanged(&before, &physical_file_snapshot(&fixture.data_dir));
 }
 
 #[test]

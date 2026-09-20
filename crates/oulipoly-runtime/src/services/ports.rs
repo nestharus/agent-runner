@@ -15,6 +15,16 @@ pub trait ConfigServicePort: Send + Sync {
 }
 
 pub trait ExecutorServicePort: Send + Sync {
+    fn execute_with_live_session_authority(
+        &self,
+        _request: ExecutorServiceRequest,
+        _authority: LiveSessionAuthorityTarget,
+    ) -> Result<ExecutorServiceOutput, ServiceError> {
+        Err(ServiceError::Dependency {
+            message: "executor does not support launch-owned live session authority".into(),
+        })
+    }
+
     fn execute(
         &self,
         request: ExecutorServiceRequest,

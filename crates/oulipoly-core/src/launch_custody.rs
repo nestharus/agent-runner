@@ -12,6 +12,17 @@ use std::{cell::RefCell, io};
 /// cancellation retains its own configured grace policy.
 pub const TERMINATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Signal only this thread's direct unreaped children. The caller must retain
+/// exclusive wait ownership and repeat after adoption to consume an escaped tree.
+#[cfg(target_os = "linux")]
+pub fn signal_owned_children(signal: i32) -> bool {
+    if !matches!(signal, libc::SIGTERM | libc::SIGKILL) {
+        return false;
+    }
+    // No PID lookup is used as authority: numeric identities are pinned by wait ownership.
+    unsafe { linux::signal_owned_children(signal) }
+}
+
 pub fn proof_path(database: &Path, generation: &str) -> PathBuf {
     database
         .with_extension("starting-custody-v1")
@@ -77,6 +88,146 @@ pub fn configure_current(command: &mut Command) -> io::Result<()> {
     CURRENT.with(|current| match current.borrow().as_ref() {
         Some(custody) => custody.configure(command),
         None => Ok(()),
+    })
+}
+
+/// Receipt issued only by the original published-command subreaper after its
+/// exact workload wait and ECHILD. A killed status proxy cannot forge this proof.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct PublishedTreeReceipt {
+    file: Arc<std::fs::File>,
+    completion: std::os::fd::OwnedFd,
+    settled_status: Mutex<Option<i32>>,
+}
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct PublishedReceiptWriter {
+    file: Arc<std::fs::File>,
+    completion: Arc<std::os::fd::OwnedFd>,
+    attribution: Option<Arc<std::fs::File>>,
+}
+#[cfg(target_os = "linux")]
+impl PublishedTreeReceipt {
+    /// Wait on the ORIGINAL C's private receipt endpoint. EOF is lost custody,
+    /// not a timeout, PID probe or an empty replacement's certificate.
+    pub fn wait(&self) -> io::Result<i32> {
+        use std::os::fd::AsRawFd;
+        let mut retained = self
+            .settled_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(status) = *retained {
+            return Ok(status);
+        }
+        let mut byte = 0u8;
+        loop {
+            let count = unsafe {
+                libc::recv(
+                    self.completion.as_raw_fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    0,
+                )
+            };
+            if count == 1 && byte == b'D' {
+                let status = self.read_receipt()?;
+                *retained = Some(status);
+                return Ok(status);
+            }
+            if count < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(io::Error::other(
+                "original published custodian lost before receipt",
+            ));
+        }
+    }
+    pub fn settled(&self) -> io::Result<i32> {
+        self.settled_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ok_or_else(|| io::Error::other("original receipt not consumed"))
+    }
+    fn read_receipt(&self) -> io::Result<i32> {
+        use std::os::unix::fs::FileExt;
+        let mut bytes = [0u8; 8];
+        if self.file.metadata()?.len() != 8
+            || self.file.read_at(&mut bytes, 0)? != 8
+            || &bytes[..4] != b"WCD1"
+        {
+            return Err(io::Error::other(
+                "original published tree receipt unavailable",
+            ));
+        }
+        Ok(i32::from_ne_bytes(bytes[4..].try_into().unwrap()))
+    }
+}
+
+/// Native actor mode requires the existing original launch owner. It never
+/// falls back to unconfined group signalling or a replacement's empty tree.
+#[cfg(target_os = "linux")]
+pub fn configure_current_receipted(command: &mut Command) -> io::Result<PublishedTreeReceipt> {
+    configure_current_receipted_attributed(command, None)
+}
+
+/// A pre-opened producer journal receives the published proxy's exact proc stat
+/// before any custodian/workload fork. Failed retention prevents effects.
+#[cfg(target_os = "linux")]
+pub fn configure_current_receipted_attributed(
+    command: &mut Command,
+    attribution: Option<Arc<std::fs::File>>,
+) -> io::Result<PublishedTreeReceipt> {
+    use std::os::unix::fs::OpenOptionsExt;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    CURRENT.with(|current| {
+        let current = current.borrow();
+        let custody = current
+            .as_ref()
+            .ok_or_else(|| io::Error::other("original launch custody required"))?;
+        let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = custody
+            .path
+            .with_extension(format!("published-{}-{ordinal}", std::process::id()));
+        let file = Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)?,
+        );
+        file.sync_all()?;
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut pair = [-1; 2];
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                pair.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let completion = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+        linux::configure_with_receipt(
+            custody,
+            command,
+            Some(PublishedReceiptWriter {
+                file: file.clone(),
+                completion: Arc::new(writer),
+                attribution,
+            }),
+        )?;
+        Ok(PublishedTreeReceipt {
+            file,
+            completion,
+            settled_status: Mutex::new(None),
+        })
     })
 }
 
@@ -351,6 +502,38 @@ mod linux {
         #[cfg(test)] startup_gate: Option<RawFd>,
         #[cfg(test)] transition: Option<TransitionGate>,
     ) -> io::Result<()> {
+        configure_receipt_impl(
+            custody,
+            command,
+            None,
+            #[cfg(test)]
+            startup_gate,
+            #[cfg(test)]
+            transition,
+        )
+    }
+    pub(super) fn configure_with_receipt(
+        custody: &LaunchCustody,
+        command: &mut Command,
+        receipt: Option<PublishedReceiptWriter>,
+    ) -> io::Result<()> {
+        configure_receipt_impl(
+            custody,
+            command,
+            receipt,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+        )
+    }
+    fn configure_receipt_impl(
+        custody: &LaunchCustody,
+        command: &mut Command,
+        receipt: Option<PublishedReceiptWriter>,
+        #[cfg(test)] startup_gate: Option<RawFd>,
+        #[cfg(test)] transition: Option<TransitionGate>,
+    ) -> io::Result<()> {
         let endpoint = custody.endpoint.lock().unwrap_or_else(|e| e.into_inner());
         let endpoint = endpoint
             .as_ref()
@@ -362,6 +545,12 @@ mod linux {
         unsafe {
             command.pre_exec(move || {
                 let fd = inherited.as_raw_fd();
+                let receipt_fd = receipt
+                    .as_ref()
+                    .map_or(-1, |writer| writer.file.as_raw_fd());
+                let receipt_done = receipt
+                    .as_ref()
+                    .map_or(-1, |writer| writer.completion.as_raw_fd());
                 // Disable the old creator-thread PDEATHSIG before any workload
                 // can exist. This child becomes an independently living reaper.
                 if libc::prctl(libc::PR_SET_PDEATHSIG, 0, 0, 0, 0) != 0
@@ -409,6 +598,35 @@ mod linux {
                     libc::close(status_pair[0]);
                     libc::close(status_pair[1]);
                     return Err(io::Error::last_os_error());
+                }
+                if let Some(attribution) = receipt.as_ref().and_then(|r| r.attribution.as_ref()) {
+                    // Syscall-only in the raw fork image. Keep the PID pinned;
+                    // this record precedes every process-capable descendant.
+                    let stat = libc::open(
+                        c"/proc/self/stat".as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    );
+                    let mut bytes = [0u8; 4096];
+                    let count = if stat < 0 {
+                        -1
+                    } else {
+                        libc::read(stat, bytes.as_mut_ptr().cast(), bytes.len())
+                    };
+                    if stat >= 0 {
+                        libc::close(stat);
+                    }
+                    if count <= 0
+                        || count == bytes.len() as isize
+                        || libc::pwrite(
+                            attribution.as_raw_fd(),
+                            bytes.as_ptr().cast(),
+                            count as usize,
+                            0,
+                        ) != count
+                        || libc::fsync(attribution.as_raw_fd()) != 0
+                    {
+                        return Err(io::Error::other("pre-effect proxy attribution failed"));
+                    }
                 }
                 let custodian = fork_process();
                 if custodian < 0 {
@@ -473,6 +691,10 @@ mod linux {
                 if workload == 0 {
                     libc::close(fd);
                     libc::close(status_pair[1]);
+                    if receipt_fd >= 0 {
+                        libc::close(receipt_fd);
+                        libc::close(receipt_done);
+                    }
                     // Recipient readiness precedes signal release: P may relay
                     // a startup notification while W still has it blocked.
                     // Standard-signal coalescing then covers simultaneous group
@@ -511,7 +733,7 @@ mod linux {
                 if libc::sigprocmask(libc::SIG_SETMASK, &workload_mask, std::ptr::null_mut()) != 0 {
                     libc::_exit(125);
                 }
-                reap_tree(fd, workload, status_pair[1]);
+                reap_tree(fd, workload, status_pair[1], receipt_fd, receipt_done);
             });
         }
         Ok(())
@@ -862,6 +1084,10 @@ mod linux {
     // descendants, including escaped groups; repeat until consuming ECHILD.
     // No global PID scan, allocation, status-carrier kill or stale group lookup.
     unsafe fn kill_owned_children() -> bool {
+        unsafe { signal_owned_children(libc::SIGKILL) }
+    }
+
+    pub(super) unsafe fn signal_owned_children(signal: i32) -> bool {
         unsafe {
             let fd = libc::open(
                 c"/proc/thread-self/children".as_ptr(),
@@ -870,42 +1096,67 @@ mod linux {
             if fd < 0 {
                 return false;
             }
-            let mut bytes = [0u8; 4096];
-            let count = libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len());
+            let result = signal_child_list(fd, signal);
             libc::close(fd);
-            if count < 0 {
-                return false;
-            }
-            let mut pid: i32 = 0;
-            for byte in &bytes[..count as usize] {
-                if byte.is_ascii_digit() {
-                    let Some(next) = pid
-                        .checked_mul(10)
-                        .and_then(|n| n.checked_add(i32::from(*byte - b'0')))
-                    else {
-                        return false;
-                    };
-                    pid = next;
-                } else if *byte == b' ' && pid > 0 {
-                    if libc::kill(pid, libc::SIGKILL) != 0
-                        && *libc::__errno_location() != libc::ESRCH
-                    {
-                        return false;
-                    }
-                    pid = 0;
-                } else {
-                    return false;
-                }
-            }
-            // The kernel list ends each PID with a space. A truncated last
-            // token is skipped; earlier children are killed and reaped first.
-            true
+            result
         }
     }
 
-    unsafe fn reap_tree(fd: RawFd, workload: libc::pid_t, status_fd: RawFd) -> ! {
+    // procfs children is a seq_file, not a one-read snapshot. Keep its cursor
+    // through EOF and carry partial PID tokens across read boundaries. No wait
+    // is consumed here: a retained zombie prefix must not prevent tail signals.
+    // Exclusive wait ownership keeps enumerated incarnations pinned even when
+    // signaling makes them zombies. Adoption can append children during this
+    // traversal; the caller repeats from a fresh open for later adoptions. EOF
+    // is only the end of this traversal, never ECHILD or proof of tree drain.
+    unsafe fn signal_child_list(fd: RawFd, signal: i32) -> bool {
         unsafe {
-            close_except(fd, status_fd);
+            let mut bytes = [0u8; 4096];
+            let mut pid: i32 = 0;
+            loop {
+                let count = libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len());
+                if count < 0 {
+                    if *libc::__errno_location() == libc::EINTR {
+                        continue;
+                    }
+                    return false;
+                }
+                if count == 0 {
+                    // Every kernel PID token ends with a space.
+                    return pid == 0;
+                }
+                for byte in &bytes[..count as usize] {
+                    if byte.is_ascii_digit() {
+                        let Some(next) = pid
+                            .checked_mul(10)
+                            .and_then(|n| n.checked_add(i32::from(*byte - b'0')))
+                        else {
+                            return false;
+                        };
+                        pid = next;
+                    } else if *byte == b' ' && pid > 0 {
+                        if libc::kill(pid, signal) != 0 && *libc::__errno_location() != libc::ESRCH
+                        {
+                            return false;
+                        }
+                        pid = 0;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe fn reap_tree(
+        fd: RawFd,
+        workload: libc::pid_t,
+        status_fd: RawFd,
+        receipt_fd: RawFd,
+        receipt_done: RawFd,
+    ) -> ! {
+        unsafe {
+            close_preserving(&[fd, status_fd, receipt_fd, receipt_done]);
             let mut children: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut children);
             libc::sigaddset(&mut children, libc::SIGCHLD);
@@ -974,6 +1225,21 @@ mod linux {
                 }
                 // ECHILD is proof only here: this dedicated subreaper was in
                 // place before fork and never transfers/adopts away descendants.
+                if let Some(status) = root_status
+                    && receipt_fd >= 0
+                {
+                    let mut bytes = [0u8; 8];
+                    bytes[..4].copy_from_slice(b"WCD1");
+                    bytes[4..].copy_from_slice(&i32::to_ne_bytes(status));
+                    if libc::pwrite(receipt_fd, bytes.as_ptr().cast(), bytes.len(), 0)
+                        != bytes.len() as isize
+                        || libc::fsync(receipt_fd) != 0
+                    {
+                        libc::_exit(125);
+                    }
+                    // A lost consumer must not prevent retained receipt or D.
+                    send(receipt_done, b'D');
+                }
                 if root_status.is_none() || !send(fd, b'D') {
                     libc::_exit(125);
                 }
@@ -1630,3 +1896,44 @@ os._exit(93)
 #[cfg(all(test, target_os = "linux"))]
 #[path = "launch_custody/published_shutdown_tests.rs"]
 mod published_shutdown_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod published_receipt_tests {
+    use super::*;
+    #[test]
+    fn original_receipt_requires_owner_and_waits_session_escaping_descendants() {
+        use std::os::unix::process::CommandExt;
+        let mut absent = Command::new("/bin/true");
+        assert!(configure_current_receipted(&mut absent).is_err());
+        let root = std::env::temp_dir().join(format!(
+            "published-receipt-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let custody = Arc::new(LaunchCustody::start(root.join("proof")).unwrap());
+        let scope = LaunchScope::enter(Some(custody.clone()));
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "setsid /bin/sh -c 'sleep .05' & wait; exit 7"])
+            .process_group(0);
+        let receipt = configure_current_receipted(&mut command).unwrap();
+        assert!(receipt.settled().is_err());
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        assert_eq!(child.wait().unwrap().code(), Some(7));
+        assert_eq!(receipt.wait().unwrap(), 7 << 8);
+        assert_eq!(receipt.wait().unwrap(), 7 << 8);
+        assert_eq!(receipt.settled().unwrap(), 7 << 8);
+        drop(scope);
+        custody.seal();
+        // This bounded observation is a test guard, never a workload deadline.
+        let start = std::time::Instant::now();
+        while !custody.quiescent() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(custody);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

@@ -6,7 +6,13 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 17;
+fn migrate_completed_turn_retention(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0020_completed_turn_retention.sql"))
+        .map_err(|error| error.to_string())
+}
+
+pub(super) const CURRENT_VERSION: i64 = 20;
+const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -133,27 +139,97 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         owner: SidecarEntity::RuntimeLifecycle,
         apply: migrate_starting_custody,
     },
+    MigrationStep {
+        target_version: 18,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_completion_continuation,
+    },
+    MigrationStep {
+        target_version: 19,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_notification_settlement,
+    },
+    MigrationStep {
+        target_version: 20,
+        owner: SidecarEntity::MailboxDelivery,
+        apply: migrate_completed_turn_retention,
+    },
 ];
+
+fn migrate_notification_settlement(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0019_notification_settlement.sql"))
+        .map_err(|error| error.to_string())
+}
+
+fn migrate_completion_continuation(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0018_completion_continuation.sql"))
+        .map_err(|error| error.to_string())?;
+    // Schema, identity and version commit together. Legacy namespace identity,
+    // admissions and pending work are not converted into v2 recovery authority.
+    conn.execute(
+        "INSERT INTO completion_continuation_domain VALUES(1,?1,'main-native-completion-v2')",
+        [Uuid::new_v4().to_string()],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
 
 fn migrate_starting_custody(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("migrations/0017_starting_custody.sql"))
         .map_err(|error| error.to_string())
 }
 
+// Version and fingerprint are one WAL read snapshot. The caller retains the
+// namespace fence throughout; a committed current schema needs no SQLite writer.
+fn observe_valid_current(conn: &Connection) -> Result<bool, String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("Failed to observe sidecar schema: {e}"))?;
+    let version = sidecar_version(&tx)?;
+    validate_supported_version(version)?;
+    if version == MAX_SUPPORTED_VERSION {
+        super::completion_continuation::validate_schema_on(&tx)?;
+    }
+    tx.commit()
+        .map_err(|e| format!("Failed to finish sidecar schema observation: {e}"))?;
+    Ok(version == MAX_SUPPORTED_VERSION)
+}
+
 pub(super) fn ensure(conn: &mut Connection) -> Result<(), String> {
-    let stored_version = sidecar_version(conn)?;
-    validate_supported_version(stored_version)?;
-    if stored_version == CURRENT_VERSION {
+    ensure_with_timeout(conn, SCHEMA_LOCK_TIMEOUT)
+}
+
+pub(super) fn ensure_without_wait(conn: &mut Connection) -> Result<(), String> {
+    ensure_with_timeout(conn, Duration::ZERO)
+}
+
+fn ensure_with_timeout(conn: &mut Connection, timeout: Duration) -> Result<(), String> {
+    if observe_valid_current(conn)? {
         return Ok(());
     }
-
-    let deadline = Instant::now() + SCHEMA_LOCK_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
-        let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+        // Reobserve on every retry, including after a busy handler used the
+        // remaining deadline. Another opener's committed migration is enough.
+        if observe_valid_current(conn)? {
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        after_stale_observation();
+        let tx = match rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
             Ok(tx) => tx,
-            Err(error)
-                if super::sqlite_error_is_contention(&error) && Instant::now() < deadline =>
-            {
+            Err(error) if super::sqlite_error_is_contention(&error) => {
+                // The failed BEGIN retained no transaction. Reobserve even at
+                // the deadline, without extending writer patience.
+                if observe_valid_current(conn)? {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "Failed to lock PID mailbox sidecar schema migration: {error}"
+                    ));
+                }
                 std::thread::sleep(SCHEMA_LOCK_RETRY_INTERVAL);
                 continue;
             }
@@ -165,12 +241,13 @@ pub(super) fn ensure(conn: &mut Connection) -> Result<(), String> {
         };
         let locked_version = sidecar_version(&tx)?;
         validate_supported_version(locked_version)?;
-        if locked_version == CURRENT_VERSION {
-            return tx.commit().map_err(|err| {
+        if locked_version >= CURRENT_VERSION {
+            // Do not serialize fingerprint work under a stale writer lease.
+            tx.commit().map_err(|err| {
                 format!("Failed to finish PID mailbox sidecar schema check: {err}")
-            });
+            })?;
+            continue;
         }
-
         if locked_version == 0 {
             create_fresh_schema(&tx)?;
         } else {
@@ -184,12 +261,25 @@ pub(super) fn ensure(conn: &mut Connection) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static STALE_OBSERVATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+}
+#[cfg(test)]
+fn after_stale_observation() {
+    STALE_OBSERVATION_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 fn validate_supported_version(version: i64) -> Result<(), String> {
-    if (0..=CURRENT_VERSION).contains(&version) {
+    if (0..=MAX_SUPPORTED_VERSION).contains(&version) {
         return Ok(());
     }
     Err(format!(
-        "Unsupported PID mailbox sidecar schema version {version}; expected 0..={CURRENT_VERSION}"
+        "Unsupported PID mailbox sidecar schema version {version}; expected 0..={MAX_SUPPORTED_VERSION}"
     ))
 }
 
@@ -574,4 +664,171 @@ fn ensure_delivery_finalization_schema(conn: &Connection) -> Result<(), String> 
 fn migrate_receipt_scan(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("0016_receipt_scan.sql"))
         .map_err(|err| format!("Failed to migrate receipt scan: {err}"))
+}
+
+/// Existing older-schema fixtures must remove newer objects as well as lower
+/// user_version; this helper is never available to production migration code.
+#[cfg(test)]
+pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
+    conn.execute_batch(
+        "DROP VIEW mailbox_retained_delivery_finalizers;
+        DROP INDEX mailbox_completed_turn_pins_attempt;
+        DROP TABLE mailbox_completed_turn_pins;
+        DROP TABLE mailbox_completed_turn_tails;
+        DROP TRIGGER completion_continuation_notification_ack;
+        DROP TABLE completion_continuation_notification;
+        DROP TABLE completion_continuation_attempt;
+        DROP TABLE completion_continuation_source;
+        DROP TABLE completion_continuation_context;
+        DROP TABLE completion_continuation_owner;
+        DROP TABLE completion_continuation_domain;
+        DROP TRIGGER completion_continuation_claim_delete;
+        DROP TRIGGER completion_continuation_claim_replace;",
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+mod contention_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn populated_v19_fixture_migrates_without_newer_schema_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut mailbox = super::super::MailboxDb::open(&path).unwrap();
+        mailbox
+            .enqueue_agent_bash_complete(&super::super::AgentBashCompleteEnqueue {
+                session_id: "historical-session",
+                handle: "historical-handle",
+                payload_json: "{}",
+                owner_invocation_uuid: Some("historical-owner"),
+                matched_os_pid: Some(1),
+                matched_os_boot_id: Some("boot"),
+                matched_os_pid_starttime_ticks: Some(1),
+                matched_chain_index: Some(0),
+                state_dir: "/private/state",
+                meta_path: "/private/meta",
+                log_path: "/private/log",
+                rc_path: "/private/rc",
+                rc: 0,
+            })
+            .unwrap();
+        drop(mailbox);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP VIEW mailbox_retained_delivery_finalizers;
+                 DROP INDEX mailbox_completed_turn_pins_attempt;
+                 DROP TABLE mailbox_completed_turn_pins;
+                 DROP TABLE mailbox_completed_turn_tails;",
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 19).unwrap();
+        drop(connection);
+        let migrated = super::super::MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .list_mailbox("historical-session", true)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            sidecar_version(migrated.connection()).unwrap(),
+            CURRENT_VERSION
+        );
+        for object in [
+            "mailbox_completed_turn_pins",
+            "mailbox_completed_turn_tails",
+        ] {
+            let present: bool = migrated
+                .connection()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                    [object],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing migrated object {object}");
+        }
+    }
+
+    #[test]
+    fn stale_reader_validates_committed_schema_with_unrelated_writer_held() {
+        stale_reader_case("current");
+    }
+
+    #[test]
+    fn stale_reader_rejects_uncommitted_corrupt_and_unsupported_schema() {
+        for case in ["uncommitted", "corrupt", "unsupported"] {
+            stale_reader_case(case);
+        }
+    }
+
+    fn stale_reader_case(case: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let reader_path = path.clone();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            STALE_OBSERVATION_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    observed_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }));
+            });
+            // Real opener retains its ordinary shared namespace fence.
+            let result = super::super::MailboxDb::open(&reader_path);
+            done_tx.send(result.map(|_| ())).unwrap();
+        });
+        observed_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        let mut writer = Connection::open(&path).unwrap();
+        if case != "uncommitted" {
+            let migrated = super::super::MailboxDb::open(&path).unwrap();
+            drop(migrated);
+            match case {
+                "corrupt" => writer
+                    .execute_batch("DROP TABLE completion_continuation_notification")
+                    .unwrap(),
+                "unsupported" => writer
+                    .pragma_update(None, "user_version", CURRENT_VERSION + 1)
+                    .unwrap(),
+                _ => (),
+            }
+        }
+        let tx = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        if case == "uncommitted" {
+            create_fresh_schema(&tx).unwrap();
+            tx.pragma_update(None, "user_version", CURRENT_VERSION)
+                .unwrap();
+        }
+        resume_tx.send(()).unwrap();
+        // Completion is required BEFORE releasing this writer, not inferred
+        // from elapsed sleep. The uncommitted migration must exhaust the
+        // existing bounded lock policy rather than observe dirty schema.
+        let result = done_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        match case {
+            "current" => result.unwrap(),
+            "uncommitted" => assert!(
+                result
+                    .unwrap_err()
+                    .contains("Failed to lock PID mailbox sidecar schema migration")
+            ),
+            "unsupported" => assert!(
+                result
+                    .unwrap_err()
+                    .contains("Unsupported PID mailbox sidecar schema version")
+            ),
+            "corrupt" => assert!(result.is_err(), "invalid fingerprint was accepted"),
+            _ => unreachable!(),
+        }
+        tx.rollback().unwrap();
+        reader.join().unwrap();
+    }
 }

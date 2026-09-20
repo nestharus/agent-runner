@@ -19,6 +19,9 @@ mod app_paths;
 mod app_state;
 #[path = "lib_commands.rs"]
 pub mod commands;
+#[doc(hidden)]
+#[allow(dead_code)]
+pub mod completion_owner;
 #[allow(dead_code)]
 mod mailbox_delivery;
 #[allow(dead_code)]

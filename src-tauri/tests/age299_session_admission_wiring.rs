@@ -18,11 +18,7 @@ fn initial_and_resume_production_paths_admit_before_provider_dispatch() {
         "admit_session_launch(",
         ".executor_service",
     );
-    assert_before(
-        function_body(RESUME, "fn run_resume_attempt("),
-        "admit_session_launch(",
-        "execute_resume_attempt_command(",
-    );
+    assert_resume_admission(RESUME);
     assert_before(
         function_body(REPL, "pub(crate) fn run_repl("),
         "admit_session_launch(",
@@ -87,4 +83,49 @@ fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
         }
     }
     panic!("unterminated production function")
+}
+
+// Admission belongs to the loop, and must cover refresh, delivery publication,
+// and both attempt execution branches. A moved call in the attempt is too late.
+fn assert_resume_admission(source: &str) {
+    let body = function_body(source, "fn run_resume_loop(");
+    let admission =
+        "crate::wake_coordinator::admit_session_launch(&registration, Some(&admitted_session))?";
+    for effect in [
+        "execution::refresh_admitted_resume(",
+        "wake::reset_manual_resume_wake_claim(",
+        "execution::prepare_admitted_delivery(",
+        "match run_resume_attempt(",
+    ] {
+        assert_before(body, admission, effect);
+    }
+    assert_before(
+        body,
+        "let _admission = admission;",
+        "match run_resume_attempt(",
+    );
+    let attempt = function_body(source, "fn run_resume_attempt(");
+    for dispatch in [
+        "execute_allocated_resume_attempt(",
+        "execute_resume_attempt_command(",
+    ] {
+        assert_before(
+            attempt,
+            "lifecycle::setup_bound_resume_attempt_with_identity(",
+            dispatch,
+        );
+    }
+}
+
+#[test]
+fn resume_admission_guard_rejects_missing_or_late_admission() {
+    let call =
+        "crate::wake_coordinator::admit_session_launch(&registration, Some(&admitted_session))?";
+    let missing = RESUME.replace(call, "unadmitted_fixture()");
+    assert!(std::panic::catch_unwind(|| assert_resume_admission(&missing)).is_err());
+    let late = missing.replace(
+        "match run_resume_attempt(",
+        &format!("{call}; match run_resume_attempt("),
+    );
+    assert!(std::panic::catch_unwind(|| assert_resume_admission(&late)).is_err());
 }

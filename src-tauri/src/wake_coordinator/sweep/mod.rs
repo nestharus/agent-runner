@@ -3,7 +3,6 @@
 //! `orchestration`
 
 mod candidate;
-mod consumed;
 mod handoff;
 mod lease;
 mod live_pty_retry;
@@ -762,6 +761,7 @@ mod tests {
         let log = log.to_string_lossy().into_owned();
         let rc = rc.to_string_lossy().into_owned();
         let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        crate::completion_owner::test_support::install_owner(&mut db);
         let row = match db
             .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
                 session_id: "state-unavailable-session",
@@ -783,6 +783,42 @@ mod tests {
             EnqueueResult::Inserted(row) => row,
             other => panic!("unexpected enqueue result: {other:?}"),
         };
+        // Establish genuine parent metadata before testing later State unavailability.
+        let parent_state =
+            oulipoly_state::StateDb::open(&directory.path().join("state.db")).unwrap();
+        let parent_uuid = uuid::Uuid::new_v4().to_string();
+        let parent = parent_state
+            .start_invocation(&oulipoly_state::InvocationStart {
+                invocation_uuid: parent_uuid.clone(),
+                model_name: "model-a".into(),
+                provider_name: "provider-a".into(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        parent_state
+            .bind_invocation_provider_session_start(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                parent,
+                &oulipoly_state::ProviderSessionBinding {
+                    provider_session_id: row.session_id.clone(),
+                    capture_method: "fixture",
+                    resume_input_id: None,
+                    provider_session_resolved_account: None,
+                },
+            )
+            .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+                session_id: &row.session_id,
+                mode: "headless",
+                invocation_uuid: Some(&parent_uuid),
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
         let claim_token = "state-unavailable-claim";
         let acquired = db
             .wake_sessions()

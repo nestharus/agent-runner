@@ -47,10 +47,6 @@ pub(crate) fn assert_prompt_contains_handle(prompt: &str, handle: &str) {
     assert!(prompt.contains(&format!("handle: {handle}")), "{prompt}");
 }
 
-pub(crate) fn assert_prompt_excludes_handle(prompt: &str, handle: &str) {
-    assert!(!prompt.contains(&format!("handle: {handle}")), "{prompt}");
-}
-
 pub(crate) fn assert_additional_notifications_remain_queued(prompt: &str) {
     assert!(
         prompt.contains("5 additional notification(s) remain queued"),

@@ -8,7 +8,7 @@
 use chrono::{DateTime, Utc};
 
 pub(crate) fn runner_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_oulipoly-agent-runner")
+    crate::bounded_runner_image::runner_bin()
 }
 
 pub(crate) fn ts(value: &str) -> DateTime<Utc> {

@@ -28,6 +28,8 @@ const RUNTIME_SERVICES_INIT_EXPECT_MESSAGE: &str = "failed to initialize runtime
 const TAURI_RUN_EXPECT_MESSAGE: &str = "error while running tauri application";
 
 pub fn run_tauri() {
+    // Before GUI/runtime threads: this process owns a wake maintenance service.
+    crate::completion_owner::bootstrap_service().expect("completion service startup failed");
     let models_dir = default_models_dir().expect(RUNTIME_SERVICES_INIT_EXPECT_MESSAGE);
     let config_root = app_paths::models_config_root(&models_dir);
     let runtime_paths =

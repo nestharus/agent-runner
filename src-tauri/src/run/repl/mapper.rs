@@ -170,16 +170,14 @@ pub(super) fn spawn_error_finalize_request(
 
 pub(super) fn repl_ingest_mode<'a>(
     resume: Option<&'a str>,
-    manual_migrate: Option<&str>,
+    _manual_migrate: Option<&str>,
     resume_session_id: Option<&'a str>,
 ) -> ResumeIngestMode<'a> {
     match resume {
         Some(session_id) => ResumeIngestMode::Pinned {
-            resume_target: if manual_migrate.is_some() {
-                session_id
-            } else {
-                resume_session_id.unwrap_or(session_id)
-            },
+            // Rotation may replace the native session UUID. Capture must agree
+            // with the session actually launched, not the caller's older ID.
+            resume_target: resume_session_id.unwrap_or(session_id),
         },
         None => ResumeIngestMode::Unpinned {
             capture_method: "turn_script",

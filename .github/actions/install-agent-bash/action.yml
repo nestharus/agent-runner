@@ -3,8 +3,41 @@ description: Install the agent-bash version required by wake integration tests
 runs:
   using: composite
   steps:
+    - name: Admit private test namespaces
+      shell: bash
+      run: |
+        # Paired fixtures provision private debug-only stripped ELF copies.
+        test -x /usr/bin/strip
+        /usr/bin/strip --version
+        # Probe first; only the disposable Ubuntu 24.04 hosted policy gets a
+        # path-specific userns allowance. No global AppArmor/sysctl disable.
+        probe() {
+          /usr/bin/unshare --user --map-current-user --net --mount --pid --fork --mount-proc -- /bin/true
+        }
+        if ! probe; then
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          . /etc/os-release
+          test "$ID:$VERSION_ID" = ubuntu:24.04
+          test "$(id -u)" -ne 0
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          profile=$(mktemp "$RUNNER_TEMP/runner-test-userns.XXXXXX")
+          trap 'rm -f "$profile"' EXIT
+          cat > "$profile" <<'PROFILE'
+        abi <abi/4.0>,
+        profile oulipoly-runner-ci-unshare /usr/bin/unshare flags=(unconfined) {
+          userns,
+        }
+        PROFILE
+          sudo apparmor_parser --add --skip-cache "$profile"
+          # The allowance remains for subsequent tests on this disposable job
+          # VM only. Unsupported environments or a failed retry stop the job.
+          probe
+        fi
     - shell: bash
       run: |
-        # Requires root/tree completion, explicit delivery, consume, and live owner attestation.
-        cargo install --git https://github.com/nestharus/agent-bash-tool --rev 1e88d3e1d0af710d1476fdab1c105014406c28db --locked --root "$RUNNER_TEMP/agent-bash" agent-bash-tool
+        # Requires root/tree completion, explicit delivery, retained-output snapshot/accept-output,
+        # original-request handoff reconciliation, and live owner attestation.
+        # Installs only the Rust binary; OpenCode/Codex adapters are delivered separately.
+        cargo install --git https://github.com/nestharus/agent-bash-tool --rev 52975ab5449528ecc21dfce0dd31e4c6a8b9fbbf --locked --root "$RUNNER_TEMP/agent-bash" agent-bash-tool
         echo "AGENT_BASH_BIN=$RUNNER_TEMP/agent-bash/bin/agent-bash" >> "$GITHUB_ENV"
+        echo "AGE360_AGENT_BASH_BIN=$RUNNER_TEMP/agent-bash/bin/agent-bash" >> "$GITHUB_ENV"

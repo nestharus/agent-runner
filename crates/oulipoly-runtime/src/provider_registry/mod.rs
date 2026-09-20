@@ -1,5 +1,7 @@
 mod artifact_key;
 mod cache;
+#[cfg(all(feature = "age360-fault-fixtures", target_os = "linux"))]
+mod cancellation_fixture;
 mod client_factory;
 mod conversion;
 mod describe;
@@ -51,6 +53,8 @@ pub use options::ProviderRegistryOptions;
 
 #[derive(Debug)]
 pub struct ProviderRegistry {
+    #[cfg(all(feature = "age360-fault-fixtures", target_os = "linux"))]
+    fixture_generation: u64,
     artifacts: BTreeMap<ArtifactKey, RuntimeProviderArtifact>,
     account_artifacts: HashMap<String, ArtifactKey>,
     account_families: HashMap<String, String>,
@@ -192,6 +196,8 @@ impl ProviderRegistry {
 
     fn from_inventory(inventory: ArtifactInventory, options: ProviderRegistryOptions) -> Self {
         Self {
+            #[cfg(all(feature = "age360-fault-fixtures", target_os = "linux"))]
+            fixture_generation: cancellation_fixture::next_generation(),
             artifacts: inventory.artifacts,
             account_artifacts: inventory.account_artifacts,
             account_families: inventory.account_families,
@@ -212,6 +218,8 @@ impl ProviderRegistry {
 
     pub fn empty(options: ProviderRegistryOptions) -> Self {
         Self {
+            #[cfg(all(feature = "age360-fault-fixtures", target_os = "linux"))]
+            fixture_generation: cancellation_fixture::next_generation(),
             artifacts: BTreeMap::new(),
             account_artifacts: HashMap::new(),
             account_families: HashMap::new(),
@@ -381,10 +389,23 @@ impl ProviderRegistry {
         account_name: &str,
         custody: Option<oulipoly_provider::custody::AttemptActorCustody>,
     ) -> Result<Arc<PinnedProviderEndpoint>, ProviderRegistryError> {
+        #[cfg(all(feature = "age360-fault-fixtures", target_os = "linux"))]
+        cancellation_fixture::before(self, account_name, custody.is_some());
         let mut endpoints = self
             .endpoint_cache
             .lock()
             .expect("provider endpoint cache mutex should not be poisoned");
+        #[cfg(all(feature = "age360-fault-fixtures", target_os = "linux"))]
+        cancellation_fixture::observe(
+            self,
+            account_name,
+            custody.is_some(),
+            if endpoints.contains_key(account_name) {
+                "hit"
+            } else {
+                "miss"
+            },
+        );
         if let Some(endpoint) = endpoints.get(account_name) {
             if let Some(custody) = &custody {
                 custody.record_not_invoked("describe");
@@ -401,6 +422,8 @@ impl ProviderRegistry {
                 });
             }
         };
+        #[cfg(all(feature = "age360-fault-fixtures", target_os = "linux"))]
+        let attributed = custody.is_some();
         let client = Arc::new(self.client_factory.client_for_attempt(artifact, custody));
         let capabilities = describe_provider_client(client.as_ref(), &self.host_options)?;
         self.store_describe(&key, capabilities.clone());
@@ -424,6 +447,8 @@ impl ProviderRegistry {
             capabilities,
         });
         endpoints.insert(account_name.to_string(), endpoint.clone());
+        #[cfg(all(feature = "age360-fault-fixtures", target_os = "linux"))]
+        cancellation_fixture::observe(self, account_name, attributed, "stored");
         Ok(endpoint)
     }
 

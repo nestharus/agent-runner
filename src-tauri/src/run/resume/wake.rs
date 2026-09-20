@@ -53,11 +53,13 @@ pub(super) fn validate_auto_wake_child(session_id: &str) -> Result<Option<i32>, 
     crate::wake_coordinator::validate_auto_wake_child(session_id)
 }
 
-pub(super) fn reset_manual_resume_wake_claim(session_id: &str) -> Result<(), String> {
+pub(super) fn reset_manual_resume_wake_claim(
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<(), String> {
     if crate::wake_coordinator::is_auto_wake_invocation() {
         return Ok(());
     }
-    crate::wake_coordinator::reset_manual_resume_wake_claim(session_id)
+    crate::wake_coordinator::reset_manual_resume_wake_claim(resolved)
 }
 
 pub(super) fn release_current_auto_wake_claim(session_id: &str) {
@@ -116,6 +118,8 @@ pub(super) fn reconcile_pending_headless_delivery_observations(
         if let Err(error) =
             crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
                 attempt_id: pending.attempt_id,
+                admission_purpose:
+                    crate::native_receipt::helper::AdmissionPurpose::StartupOpportunistic,
                 anchor_identity: crate::native_receipt::helper::anchor_identity(&pending.anchor),
                 model_name: resolved.model_name.clone().unwrap_or_default(),
                 cwd: effective_cwd.to_path_buf(),
@@ -187,7 +191,18 @@ pub(super) fn bind_headless_resume_delivery_attempt(
         input.mailbox_delivery_seqs,
         invocation_uuid,
     )?;
-    if !input.mailbox_delivery_seqs.is_empty() {
+    // Native allocation is not a session binding. Its launch-event lifecycle
+    // publishes State authority before attaching the runtime/session metadata.
+    // Publishing this UUID here would replace the last valid parent even when
+    // the anchor fails before any provider launch. Legacy resumes are already
+    // bound by bind_resume_attempt_session and still need this projection.
+    if !input.mailbox_delivery_seqs.is_empty()
+        && !input
+            .agent_runtime_services
+            .provider_registry_handle
+            .current()
+            .has_account_endpoint(&provider.name)
+    {
         let mut db = MailboxDb::open_default_if_exists()?
             .ok_or("mailbox missing while retaining receipt route")?;
         db.wake_sessions().upsert_session_metadata(
@@ -203,26 +218,6 @@ pub(super) fn bind_headless_resume_delivery_attempt(
         )?;
     }
     persist_pre_delivery_observation_anchor(input, provider)
-}
-
-pub(super) fn begin_headless_delivery_submission(
-    input: &ResumeAttemptInput<'_>,
-    invocation_uuid: &str,
-) -> Result<(), String> {
-    if input.mailbox_delivery_seqs.is_empty() {
-        return Ok(());
-    }
-    let attempt_id = input
-        .mailbox_delivery_nonce
-        .ok_or_else(|| "headless delivery missing nonce".to_string())?;
-    let db = MailboxDb::open_default_if_exists()?
-        .ok_or_else(|| "headless delivery sidecar missing".to_string())?;
-    db.begin_headless_delivery_submission(
-        attempt_id,
-        input.mailbox_session_id,
-        invocation_uuid,
-        input.mailbox_delivery_requires_turn_confirmation,
-    )
 }
 
 fn persist_pre_delivery_observation_anchor(
@@ -494,13 +489,15 @@ fn confirm_mailbox_delivery_from_anchor(
         return Ok(false);
     }
     drop(db);
-    let observation = crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
-        attempt_id: attempt_id.to_string(),
-        anchor_identity: crate::native_receipt::helper::anchor_identity(&anchor),
-        model_name: input.resolved.model_name.clone().unwrap_or_default(),
-        cwd: input.effective_spawn_cwd.to_path_buf(),
-        config_root: input.env.config_root.clone(),
-    });
+    let observation =
+        crate::native_receipt::helper::observe_target(crate::native_receipt::helper::Target {
+            attempt_id: attempt_id.to_string(),
+            admission_purpose: crate::native_receipt::helper::AdmissionPurpose::TerminalBounded,
+            anchor_identity: crate::native_receipt::helper::anchor_identity(&anchor),
+            model_name: input.resolved.model_name.clone().unwrap_or_default(),
+            cwd: input.effective_spawn_cwd.to_path_buf(),
+            config_root: input.env.config_root.clone(),
+        });
     // Projection or helper teardown may fail after the exact native receipt
     // commits. Always read back that independent evidence before interpreting
     // the operational error; helper completion alone never confirms delivery.
@@ -512,7 +509,9 @@ fn confirm_mailbox_delivery_from_anchor(
         if !confirmed {
             return Err(error);
         }
-        formatter::emit_stderr(&format!("Warning: receipt confirmed with observation/projection error: {error}"));
+        formatter::emit_stderr(&format!(
+            "Warning: receipt confirmed with observation/projection error: {error}"
+        ));
     }
     Ok(confirmed)
 }
@@ -559,7 +558,11 @@ fn finalize_unconfirmed_mailbox_delivery(
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
+            input
+                .env
+                .state
+                .invocation_mutation_scope(attempt.invocation_row_id)
+                .authority(),
             mapper::finalize_request(
                 &input.env.state,
                 attempt.invocation_row_id,
@@ -694,11 +697,16 @@ pub(super) fn settle_clean_exit_mailbox_delivery_outcome(
     // boundary (Unconfirmed). It has the same delivery/follow-up authority as
     // synchronous confirmation, never authority to turn a shell failure into
     // successful assistant completion. Keep the shell result unchanged.
-    if matches!(outcome, MailboxDeliveryOutcome::AlreadySettled | MailboxDeliveryOutcome::Unconfirmed)
-        && committed_native_receipt(input)?
+    if matches!(
+        outcome,
+        MailboxDeliveryOutcome::AlreadySettled | MailboxDeliveryOutcome::Unconfirmed
+    ) && committed_native_receipt(input)?
     {
         return settle_accepted_mailbox_delivery_and_recheck(
-            input, provider_session_id, invocation_uuid, physical_exit_code,
+            input,
+            provider_session_id,
+            invocation_uuid,
+            physical_exit_code,
         );
     }
     match outcome {

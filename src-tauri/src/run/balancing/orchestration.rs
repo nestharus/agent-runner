@@ -219,20 +219,36 @@ fn run_with_balancing_environment(
                 executor::SessionCaptureMethod::ExternalProviderLaunch(_)
             )
         {
-            let observed_provider_name = result_provider_name(model, &result)?;
-            commit_balanced_session_authority(BalancedSessionAuthorityCommitRequest {
-                state: &env.state,
-                invocation_row_id: attempt.invocation_row_id,
-                invocation_uuid: &attempt.invocation.id,
-                expectation: SessionAuthorityExpectation {
-                    account_name: provider_name,
-                    provider_session_id: attempt.start_known_provider_session_id.as_deref(),
-                },
-                observed_provider_name,
-                start_mode: attempt.start_known_provider_session_mode,
-                working_dir,
-                result: &result,
-            })?;
+            let authority_commit =
+                result_provider_name(model, &result).and_then(|observed_provider_name| {
+                    commit_balanced_session_authority(BalancedSessionAuthorityCommitRequest {
+                        state: &env.state,
+                        invocation_row_id: attempt.invocation_row_id,
+                        invocation_uuid: &attempt.invocation.id,
+                        expectation: SessionAuthorityExpectation {
+                            account_name: provider_name,
+                            provider_session_id: attempt.start_known_provider_session_id.as_deref(),
+                        },
+                        observed_provider_name,
+                        start_mode: attempt.start_known_provider_session_mode,
+                        working_dir,
+                        result: &result,
+                    })
+                });
+            if let Err(error) = authority_commit {
+                return Err(super::super::authority_rejection::retain_and_finalize(
+                    super::super::authority_rejection::RejectedResult {
+                        service: agent_runtime_services.invocation_lifecycle_service.as_ref(),
+                        state: &env.state,
+                        invocation_row_id: attempt.invocation_row_id,
+                        invocation_uuid: &attempt.invocation.id,
+                        guard: &mut attempt.guard,
+                        result: &result,
+                        launch_owner: None,
+                    },
+                    error,
+                ));
+            }
         }
         let zero_turn = classify_balanced_zero_turn_result(BalancedZeroTurnInput {
             env: &env,
@@ -566,8 +582,14 @@ fn execute_balanced_attempt(
     let _live_pty_retry_driver = start_live_pty_retry_driver_if_applicable(provider);
     match agent_runtime_services
         .executor_service
-        .execute(executor_request)
-    {
+        .execute_with_live_session_authority(
+            executor_request,
+            oulipoly_runtime::services::LiveSessionAuthorityTarget {
+                state_path: env.state.path().to_path_buf(),
+                invocation_row_id: attempt.invocation_row_id,
+                invocation_uuid: attempt.invocation.id.clone(),
+            },
+        ) {
         Ok(output) => Ok(output.result),
         Err(err) => {
             let error = executor_error_message(err);

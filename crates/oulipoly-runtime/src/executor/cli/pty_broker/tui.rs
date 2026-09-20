@@ -6724,13 +6724,22 @@ mod tests {
     fn routed_commands_apply_all_effects_after_refresh_in_order_once() {
         let mut pane = MonitorPane::new();
         assert!(!apply_routed_commands(&mut pane, &[]));
-        assert!(apply_routed_commands(&mut pane, &[
-            MonitorCommand::Refresh,
-            MonitorCommand::Collapse,
-            MonitorCommand::ToggleList,
-        ]));
-        assert!(!pane.collapsed, "collapse then exactly one toggle must expand");
-        assert!(!apply_routed_commands(&mut pane, &[MonitorCommand::ToggleList]));
+        assert!(apply_routed_commands(
+            &mut pane,
+            &[
+                MonitorCommand::Refresh,
+                MonitorCommand::Collapse,
+                MonitorCommand::ToggleList,
+            ]
+        ));
+        assert!(
+            !pane.collapsed,
+            "collapse then exactly one toggle must expand"
+        );
+        assert!(!apply_routed_commands(
+            &mut pane,
+            &[MonitorCommand::ToggleList]
+        ));
         assert!(pane.collapsed);
     }
 

@@ -6,7 +6,7 @@ on:
   # release and shipped an unverified binary to consumers. Releases
   # are now gated on an explicit human trigger (Actions tab ->
   # "Release" -> "Run workflow"), decoupled from merge cadence. CI
-  # (ci.yml) still runs on every PR for test/lint feedback.
+  # (ci.yml) is also manual-only; dispatch it for test/lint feedback.
   workflow_dispatch:
     inputs:
       reason:

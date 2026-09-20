@@ -6,6 +6,7 @@ pub(crate) mod handshake;
 pub(crate) mod mailbox;
 pub(crate) mod migrate;
 pub(crate) mod notify;
+pub(crate) mod notify_continuation;
 pub(crate) mod pid_session;
 pub(crate) mod resume_list;
 pub(crate) mod schema_probe;

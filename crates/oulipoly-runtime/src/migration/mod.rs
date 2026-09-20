@@ -5,7 +5,10 @@
 use crate::balancer::TransitionReason;
 use crate::sessions::locate_transcript;
 use oulipoly_config::{ModelConfig, ScriptSessionStorageType, SessionStorage, SessionsConfig};
-use oulipoly_state::{ChainSegmentRotationInput, ResolvedResume, StateDb};
+use oulipoly_state::{
+    ChainSegmentRotationInput, CompletedTurnMigrationScope, CompletedTurnMigrationStage,
+    ResolvedResume, StateDb,
+};
 use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -73,6 +76,9 @@ pub enum MigrationError {
     Db {
         message: String,
     },
+    RetainedTurnConflict {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +128,15 @@ pub fn migrate_chain_segment(
     require_provider_resume(source)?;
     require_provider_resume(target)?;
     ensure_migration_storage_supported(source, target)?;
+    let _migration_fence = state
+        .begin_completed_turn_migration(
+            resolved,
+            &target.name,
+            Some(&resolved.active_session_id),
+            CompletedTurnMigrationScope::BuiltInExact,
+            CompletedTurnMigrationStage::BuiltInBeforeEffects,
+        )
+        .map_err(|message| MigrationError::RetainedTurnConflict { message })?;
     let source_path = locate_migration_source_path(
         sessions_cfg,
         source,
@@ -242,6 +257,15 @@ pub fn bound_provider_ref_resume_segment(
         fresh_session_id,
         stderr,
     )?;
+    let _migration_fence = state
+        .begin_completed_turn_migration(
+            resolved,
+            &source.name,
+            Some(&target_session_id),
+            CompletedTurnMigrationScope::BuiltInExact,
+            CompletedTurnMigrationStage::BuiltInBeforeEffects,
+        )
+        .map_err(|message| MigrationError::RetainedTurnConflict { message })?;
     write_jsonl_atomic(&target_path, slice.as_ref())?;
     rotate_provider_ref_chain_segment(state, source, resolved, &target_session_id)?;
     preserve_provider_ref_boundary(

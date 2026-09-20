@@ -52,6 +52,7 @@ pub(super) fn execute_provider(
         start_known_provider_session_id,
         spawn_identity,
         None,
+        None,
     )
 }
 
@@ -71,6 +72,7 @@ pub(super) fn execute_provider_with_arg_parts_and_supervisor_config(
     start_known_provider_session_id: Option<&str>,
     spawn_identity: Option<SpawnIdentityContext>,
     supervisor_config: Option<SupervisorConfig>,
+    completed_turn_owner: Option<&crate::services::LiveSessionAuthorityTarget>,
 ) -> Result<(RawResult, Vec<PathBuf>), String> {
     let launch = assemble_provider_launch(
         ProviderLaunchRequest {
@@ -100,7 +102,8 @@ pub(super) fn execute_provider_with_arg_parts_and_supervisor_config(
         spawn_identity.as_ref(),
         &capture_plan,
     )?;
-    let returned_artifacts = ipc::read_and_cleanup_return_channel(return_channel)?;
+    let returned_artifacts =
+        ipc::read_and_retain_return_channel(return_channel, completed_turn_owner)?;
     let result = raw_result_from_supervised_output(&capture_plan, output, returned_artifacts);
 
     Ok((result, temp_files))
