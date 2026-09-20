@@ -11,7 +11,14 @@ fn migrate_completed_turn_retention(conn: &Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-pub(super) const CURRENT_VERSION: i64 = 20;
+fn migrate_completion_recovery_working_set(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!(
+        "migrations/0021_completion_recovery_working_set.sql"
+    ))
+    .map_err(|error| error.to_string())
+}
+
+pub(super) const CURRENT_VERSION: i64 = 21;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -153,6 +160,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 20,
         owner: SidecarEntity::MailboxDelivery,
         apply: migrate_completed_turn_retention,
+    },
+    MigrationStep {
+        target_version: 21,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_completion_recovery_working_set,
     },
 ];
 
@@ -681,9 +693,34 @@ pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
         DROP TABLE completion_continuation_source;
         DROP TABLE completion_continuation_context;
         DROP TABLE completion_continuation_owner;
+        DROP TABLE completion_supervisor_inheritance;
+        DROP TABLE completion_supervisor_authority;
         DROP TABLE completion_continuation_domain;
         DROP TRIGGER completion_continuation_claim_delete;
         DROP TRIGGER completion_continuation_claim_replace;",
+    )
+    .unwrap();
+}
+
+/// Downgrade-only test support for fixtures that preserve the v18 continuation
+/// tables while removing the additive v21 root-supervisor authority layer.
+#[cfg(test)]
+pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &Connection) {
+    conn.execute_batch(
+        "DROP TRIGGER completion_owner_supervisor_authority_insert;
+         DROP TRIGGER completion_owner_supervisor_authority_immutable;
+         DROP TRIGGER completion_source_supervisor_authority_insert;
+         DROP TRIGGER completion_source_supervisor_authority_immutable;
+         DROP TRIGGER completion_attempt_supervisor_authority_insert;
+         DROP TRIGGER completion_attempt_supervisor_authority_immutable;
+         DROP INDEX completion_continuation_attempt_unresolved;
+         DROP INDEX completion_continuation_source_unaccepted;
+         DROP INDEX completion_supervisor_inheritance_predecessor;
+         DROP TABLE completion_supervisor_inheritance;
+         DROP TABLE completion_supervisor_authority;
+         ALTER TABLE completion_continuation_owner DROP COLUMN supervisor_authority_id;
+         ALTER TABLE completion_continuation_source DROP COLUMN supervisor_authority_id;
+         ALTER TABLE completion_continuation_attempt DROP COLUMN supervisor_authority_id;",
     )
     .unwrap();
 }
@@ -725,6 +762,7 @@ mod contention_tests {
                  DROP TABLE mailbox_completed_turn_tails;",
             )
             .unwrap();
+        remove_completion_recovery_working_set_for_legacy_fixture(&connection);
         connection.pragma_update(None, "user_version", 19).unwrap();
         drop(connection);
         let migrated = super::super::MailboxDb::open(&path).unwrap();

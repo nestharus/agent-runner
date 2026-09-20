@@ -4,6 +4,7 @@ use oulipoly_state::mailbox::{CompletionDomainOwner, MailboxDb};
 use oulipoly_state::pid_identity::{PidIdentityDb, read_live_process_identity};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -38,6 +39,7 @@ pub(super) fn require_owner(domain_id: &str) -> Result<CompletionDomainOwner, St
     // Discovery/handshake only: source admission rechecks live ownership under
     // the State-then-sidecar fence; this result is not an admission capability.
     if current.domain_id != owner.domain_id
+        || current.supervisor_authority_id != owner.supervisor_authority_id
         || current.owner_generation != owner.owner_generation
         || current.endpoint != owner.endpoint
         || current.guardian_identity != owner.guardian_identity
@@ -244,9 +246,6 @@ pub(super) fn bootstrap() -> Result<(), super::BootstrapError> {
         Err(e) => return Err(e.to_string().into()),
     }
     let (mut ready, announce) = UnixStream::pair().map_err(|e| e.to_string())?;
-    ready
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error().to_string().into());
@@ -260,16 +259,31 @@ pub(super) fn bootstrap() -> Result<(), super::BootstrapError> {
     }
     drop(announce);
     drop(election); // close only; never LOCK_UN the child's open description.
-    let mut ready_byte = [0];
-    ready
-        .read_exact(&mut ready_byte)
-        .map_err(|e| e.to_string())?;
-    if ready_byte != [1] {
-        return Err("completion guardian startup failed".into());
-    }
+    // Readiness is a correctness barrier, not a latency policy. Migration and
+    // bounded recovery can legitimately exceed five seconds on a large retained
+    // store. A hard socket timeout previously surfaced Linux EAGAIN as apparent
+    // process exhaustion while the healthy guardian continued in the background.
+    // Wait for exact readiness or channel closure; individual database and IPC
+    // operations retain their own typed contention/failure bounds.
+    await_guardian_ready(&mut ready, pid)?;
     unsafe { std::env::set_var(ENDPOINT_ENV, &endpoint) };
     require_owner(&domain)?;
     retain_context(ready)?;
+    Ok(())
+}
+
+fn await_guardian_ready(ready: &mut UnixStream, pid: i32) -> Result<(), String> {
+    let mut ready_byte = [0];
+    ready.read_exact(&mut ready_byte).map_err(|error| {
+        format!(
+            "completion_guardian_startup_failed: guardian pid {pid} closed its ready channel before publishing owner/context readiness: {error}"
+        )
+    })?;
+    if ready_byte != [1] {
+        return Err(format!(
+            "completion_guardian_startup_failed: guardian pid {pid} published an invalid readiness marker"
+        ));
+    }
     Ok(())
 }
 
@@ -330,13 +344,8 @@ fn guardian(
     }
     retained.extend(super::custody::pending_birth_fds());
     close_except(&retained);
-    let mut owner = start_driver(
-        path,
-        endpoint,
-        domain,
-        election.as_raw_fd(),
-        listener.as_raw_fd(),
-    )?;
+    let (mut owner, driver_channel) = start_driver(path, endpoint, domain, listener.as_raw_fd())?;
+    let mut root_supervisor = super::root_supervisor::RootSupervisor::new(path, driver_channel)?;
     let mut contexts = ContextLeases::inherit(path)?;
     if let Some(mut socket) = announce.take() {
         let context = identity(peer_pid(&socket)?)?;
@@ -352,6 +361,11 @@ fn guardian(
     let mut control = ControlService::start(&listener, &owner)?;
     let mut pending = Vec::new();
     loop {
+        // This guardian is the only process-tree authority.  It accepts launch
+        // proposals, owns worker children, observes cancellation, reaps exact
+        // terminal identities, and integrates retained results before generic
+        // descendant cleanup can consume a wait status.
+        root_supervisor.tick(&owner)?;
         if !closing {
             append_pending(
                 &mut pending,
@@ -359,7 +373,6 @@ fn guardian(
                 &owner,
             );
         }
-        super::custody::retry_unreleased();
         loop {
             let mut status = 0;
             // This child has independent, exact custody from start_driver; an
@@ -398,13 +411,10 @@ fn guardian(
             if !closing && i64::from(pid) == owner.driver_identity.pid {
                 // No control thread (or copied thread locks) may cross fork.
                 append_pending(&mut pending, control.stop()?, &owner);
-                owner = start_driver(
-                    path,
-                    endpoint,
-                    domain,
-                    election.as_raw_fd(),
-                    listener.as_raw_fd(),
-                )?;
+                let (replacement, driver_channel) =
+                    start_driver(path, endpoint, domain, listener.as_raw_fd())?;
+                owner = replacement;
+                root_supervisor.replace_driver(driver_channel)?;
                 control = ControlService::start(&listener, &owner)?;
             }
         }
@@ -417,6 +427,7 @@ fn guardian(
         if !closing
             && contexts.is_empty()
             && pending.is_empty()
+            && root_supervisor.is_empty()
             && !retained_native_context(path).unwrap_or(true)
         {
             // Hold admission before pausing joins: an entrant already holding
@@ -518,33 +529,20 @@ fn retained_native_context(path: &Path) -> Result<bool, String> {
     Ok(live)
 }
 
-/// The original CD holds the same election open description. Parent loss
-/// transfers endpoint/election labor to that live successor, not to a new empty
-/// owner inferred from a stale row. Existing attempt custodians remain retained.
-pub(super) fn succeed_guardian(
-    path: &Path,
-    owner: &CompletionDomainOwner,
-    election: RawFd,
-) -> Result<(), String> {
-    use std::os::fd::FromRawFd;
-    let election = unsafe { std::fs::File::from_raw_fd(election) };
-    guardian(
-        path,
-        Path::new(&owner.endpoint),
-        &owner.domain_id,
-        election,
-        None,
-    )
-}
-
 fn start_driver(
     path: &Path,
     endpoint: &Path,
     domain: &str,
-    election: RawFd,
     listener: RawFd,
-) -> Result<CompletionDomainOwner, String> {
-    let (mut release, mut gate) = UnixStream::pair().map_err(|e| e.to_string())?;
+) -> Result<(CompletionDomainOwner, UnixStream), String> {
+    let (mut release, gate) = UnixStream::pair().map_err(|e| e.to_string())?;
+    let executable = std::ffi::CString::new("/proc/self/exe").expect("static path has no NUL");
+    let arg0 = std::ffi::CString::new("oulipoly-agent-runner").expect("static argv has no NUL");
+    let entry = std::ffi::CString::new(super::driver::DRIVER_ARG).expect("static argv has no NUL");
+    let path_arg = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "completion driver path contains NUL")?;
+    let fd_arg = std::ffi::CString::new(gate.as_raw_fd().to_string())
+        .expect("numeric descriptor has no NUL");
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error().to_string());
@@ -553,32 +551,67 @@ fn start_driver(
         drop(release);
         unsafe { libc::close(listener) };
         let _ = super::custody::pending_birth_fds();
-        close_except(&[election, gate.as_raw_fd()]);
-        let mut bytes = Vec::new();
-        let result = gate
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())
-            .and_then(|_| {
-                let owner: CompletionDomainOwner =
-                    serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-                unsafe { std::env::set_var(ENDPOINT_ENV, &owner.endpoint) };
-                super::driver::run(path, &owner, election)
-            });
-        unsafe { libc::_exit(if result.is_ok() { 0 } else { 70 }) }
+        close_except(&[gate.as_raw_fd()]);
+        let flags = unsafe { libc::fcntl(gate.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0
+            || unsafe { libc::fcntl(gate.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) }
+                < 0
+        {
+            unsafe { libc::_exit(70) }
+        }
+        let argv = [
+            arg0.as_ptr(),
+            entry.as_ptr(),
+            path_arg.as_ptr(),
+            fd_arg.as_ptr(),
+            std::ptr::null(),
+        ];
+        unsafe {
+            libc::execv(executable.as_ptr(), argv.as_ptr());
+            libc::_exit(70)
+        }
     }
     drop(gate);
+    let guardian_identity = identity(i64::from(std::process::id()))?;
+    // Driver replacement beneath the same living guardian stays in the same
+    // process-tree authority. A later independent guardian always mints a new
+    // root and publication explicitly adopts only unresolved predecessor debt.
+    let supervisor_authority_id = MailboxDb::open(path)?
+        .completion_continuation_owner()?
+        .filter(|current| current.guardian_identity == guardian_identity)
+        .map(|current| current.supervisor_authority_id)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let owner = CompletionDomainOwner {
         protocol: PROTOCOL.into(),
         domain_id: domain.into(),
+        supervisor_authority_id,
         owner_generation: uuid::Uuid::new_v4().to_string(),
-        guardian_identity: identity(i64::from(std::process::id()))?,
+        guardian_identity,
         driver_identity: identity(i64::from(pid))?,
         endpoint: endpoint.to_string_lossy().into_owned(),
     };
     MailboxDb::open(path)?.publish_completion_continuation_owner(&owner)?;
     serde_json::to_writer(&mut release, &owner).map_err(|e| e.to_string())?;
-    drop(release);
-    Ok(owner)
+    release.write_all(b"\n").map_err(|e| e.to_string())?;
+    Ok((owner, release))
+}
+
+pub(super) fn read_driver_owner(socket: &mut UnixStream) -> Result<CompletionDomainOwner, String> {
+    let mut bytes = Vec::new();
+    loop {
+        if bytes.len() >= 8192 {
+            return Err("oversized root supervisor driver owner frame".into());
+        }
+        let mut byte = [0];
+        socket
+            .read_exact(&mut byte)
+            .map_err(|error| error.to_string())?;
+        if byte == [b'\n'] {
+            break;
+        }
+        bytes.push(byte[0]);
+    }
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
 fn validate_independent_entry() -> Result<(), String> {

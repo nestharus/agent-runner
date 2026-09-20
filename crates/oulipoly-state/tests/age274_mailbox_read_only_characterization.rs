@@ -149,6 +149,7 @@ impl Fixture {
                 &oulipoly_state::mailbox::CompletionDomainOwner {
                     protocol: oulipoly_state::completion_continuation::PROTOCOL.into(),
                     domain_id: mailbox.completion_continuation_domain().unwrap().unwrap(),
+                    supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
                     owner_generation: uuid::Uuid::new_v4().to_string(),
                     guardian_identity: identity.clone(),
                     driver_identity: identity,

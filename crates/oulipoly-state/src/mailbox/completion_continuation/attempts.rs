@@ -19,6 +19,22 @@ impl MailboxDb {
         &mut self,
         attempt: &ContinuationAttempt,
     ) -> Result<(), String> {
+        if self.try_revoke_unaccepted_continuation_attempt(attempt)? {
+            Ok(())
+        } else {
+            Err("reservation no longer unaccepted under this driver".into())
+        }
+    }
+
+    /// Retry one exact proposal withdrawal without scanning the unresolved
+    /// ledger. `false` means the root already accepted it (or this driver no
+    /// longer owns the proposal), so the caller must stop retrying and leave
+    /// reconciliation to the root authority. Storage errors remain retryable by
+    /// the original live driver and never authorize a second launch.
+    pub fn try_revoke_unaccepted_continuation_attempt(
+        &mut self,
+        attempt: &ContinuationAttempt,
+    ) -> Result<bool, String> {
         require_exact_attempt(&self.conn, attempt)?;
         let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
             .ok_or("driver process disappeared")?;
@@ -28,15 +44,27 @@ impl MailboxDb {
             starttime_ticks: live.os_pid_starttime_ticks,
         };
         let encoded = serde_json::to_string(&identity).map_err(|e| e.to_string())?;
-        let eligible: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt a JOIN completion_continuation_owner o ON o.generation=a.owner_generation WHERE a.attempt_id=?1 AND a.owner_generation=?2 AND a.phase='reserved' AND a.revision=1 AND a.custodian_identity IS NULL AND o.phase='running' AND o.driver_identity=?3)",
-            params![attempt.attempt_id, attempt.owner_generation, encoded], |r| r.get(0),
-        ).map_err(|e| e.to_string())?;
+        // Reject a known accepted/root-owned attempt without requesting a
+        // SQLite writer. The exact UPDATE below rechecks every predicate after
+        // acquisition, so this read is only a contention-avoiding hint.
+        let eligible: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1
+                 FROM completion_continuation_attempt attempt
+                 JOIN completion_continuation_owner owner
+                   ON owner.generation=attempt.owner_generation
+                 WHERE attempt.attempt_id=?1 AND attempt.owner_generation=?2
+                   AND attempt.phase='reserved' AND attempt.revision=1
+                   AND attempt.custodian_identity IS NULL
+                   AND owner.phase='running' AND owner.driver_identity=?3)",
+                params![attempt.attempt_id, attempt.owner_generation, encoded],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
         if !eligible {
-            return Err("reservation no longer unaccepted under this driver".into());
+            return Ok(false);
         }
-        // Observation only: eligibility can change before acquisition. The
-        // exact current predicates below remain the sole mutation authority.
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -46,8 +74,9 @@ impl MailboxDb {
             params![attempt.attempt_id, attempt.owner_generation,
                 serde_json::json!({"attempt_id":attempt.attempt_id,"driver":identity,"gate":"unaccepted_reservation_revoked"}).to_string(), encoded],
         ).map_err(|e| e.to_string())?;
-        if changed != 1 {
-            return Err("reservation no longer unaccepted under this driver".into());
+        if changed == 0 {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(false);
         }
         if attempt.operation == "activation" {
             tx.execute(
@@ -56,7 +85,8 @@ impl MailboxDb {
             )
             .map_err(|e| e.to_string())?;
         }
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
     pub fn advance_continuation_attempt(
@@ -135,10 +165,119 @@ impl MailboxDb {
             .map(|r| r.map_err(|e| e.to_string()))
             .collect()
     }
+
+    /// Bounded unresolved custody for the current root and its explicitly
+    /// inherited predecessors. Terminal history stays out of this working set.
+    pub fn pending_continuation_attempts_for_supervisor(
+        &self,
+        supervisor_authority_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ContinuationAttempt>, String> {
+        let limit = i64::try_from(limit).map_err(|_| "continuation attempt limit overflow")?;
+        let mut statement = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE supervisor_scope(authority_id) AS (
+                    SELECT ?1
+                    UNION
+                    SELECT inheritance.predecessor_authority_id
+                    FROM completion_supervisor_inheritance inheritance
+                    JOIN supervisor_scope scope
+                      ON inheritance.authority_id=scope.authority_id)
+                 SELECT attempt_id,owner_generation,operation,request_sha256,
+                    source_registration_id,source_listener_revision,session_id,
+                    claim_token,result_path
+             FROM completion_continuation_attempt
+             WHERE supervisor_authority_id IN (
+                    SELECT authority_id FROM supervisor_scope)
+               AND phase NOT IN ('drained','never_started')
+             ORDER BY owner_generation,attempt_id LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(params![supervisor_authority_id, limit], |row| {
+                Ok(ContinuationAttempt {
+                    attempt_id: row.get(0)?,
+                    owner_generation: row.get(1)?,
+                    operation: row.get(2)?,
+                    request_sha256: row.get(3)?,
+                    source_registration_id: row.get(4)?,
+                    source_listener_revision: row.get(5)?,
+                    session_id: row.get(6)?,
+                    claim_token: row.get(7)?,
+                    result_path: row.get(8)?,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .map(|row| row.map_err(|error| error.to_string()))
+            .collect()
+    }
+
+    /// Continue a bounded unresolved walk after an exact lexical cursor. The
+    /// caller wraps to the beginning after a short page so retained unknowns at
+    /// the front cannot permanently starve later receipts or reservations.
+    pub fn pending_continuation_attempts_for_supervisor_after(
+        &self,
+        supervisor_authority_id: &str,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<ContinuationAttempt>, String> {
+        let limit = i64::try_from(limit).map_err(|_| "continuation attempt limit overflow")?;
+        let (after_generation, after_attempt) = after
+            .map(|(generation, attempt)| (Some(generation), Some(attempt)))
+            .unwrap_or((None, None));
+        let mut statement = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE supervisor_scope(authority_id) AS (
+                    SELECT ?1
+                    UNION
+                    SELECT inheritance.predecessor_authority_id
+                    FROM completion_supervisor_inheritance inheritance
+                    JOIN supervisor_scope scope
+                      ON inheritance.authority_id=scope.authority_id)
+                 SELECT attempt_id,owner_generation,operation,request_sha256,
+                    source_registration_id,source_listener_revision,session_id,
+                    claim_token,result_path
+             FROM completion_continuation_attempt
+             WHERE supervisor_authority_id IN (
+                    SELECT authority_id FROM supervisor_scope)
+               AND phase NOT IN ('drained','never_started')
+               AND (?2 IS NULL OR owner_generation>?2
+                    OR (owner_generation=?2 AND attempt_id>?3))
+             ORDER BY owner_generation,attempt_id LIMIT ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(
+                params![
+                    supervisor_authority_id,
+                    after_generation,
+                    after_attempt,
+                    limit
+                ],
+                |row| {
+                    Ok(ContinuationAttempt {
+                        attempt_id: row.get(0)?,
+                        owner_generation: row.get(1)?,
+                        operation: row.get(2)?,
+                        request_sha256: row.get(3)?,
+                        source_registration_id: row.get(4)?,
+                        source_listener_revision: row.get(5)?,
+                        session_id: row.get(6)?,
+                        claim_token: row.get(7)?,
+                        result_path: row.get(8)?,
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.map_err(|error| error.to_string()))
+            .collect()
+    }
 }
 
 fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(), String> {
-    let domain: String = tx.query_row("SELECT domain_id FROM completion_continuation_owner WHERE generation=?1 AND phase='running'", [&request.owner_generation], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let (domain, supervisor_authority_id): (String, String) = tx.query_row("SELECT domain_id,supervisor_authority_id FROM completion_continuation_owner WHERE generation=?1 AND phase='running'", [&request.owner_generation], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
     if !crate::completion_continuation::is_sha256(&request.request_sha256) {
         return Err("invalid continuation request digest".into());
     }
@@ -148,9 +287,24 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
             .as_deref()
             .filter(|s| !s.is_empty())
             .ok_or("source recovery requires registration")?;
-        let blocked: bool = tx.query_row(
-            "SELECT (SELECT COUNT(*) FROM completion_continuation_attempt WHERE domain_id=?1 AND operation='source_recovery' AND phase NOT IN ('drained','never_started')) >= 4 OR EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE domain_id=?1 AND operation='source_recovery' AND source_registration_id=?2 AND phase NOT IN ('drained','never_started'))",
-            params![domain, registration], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let blocked: bool = tx
+            .query_row(
+                "WITH RECURSIVE supervisor_scope(authority_id) AS (
+                SELECT ?1 UNION SELECT inheritance.predecessor_authority_id
+                FROM completion_supervisor_inheritance inheritance
+                JOIN supervisor_scope scope ON inheritance.authority_id=scope.authority_id)
+             SELECT (SELECT COUNT(*) FROM completion_continuation_attempt
+                 WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope)
+                   AND operation='source_recovery'
+                   AND phase NOT IN ('drained','never_started')) >= 4
+             OR EXISTS(SELECT 1 FROM completion_continuation_attempt
+                 WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope)
+                   AND operation='source_recovery' AND source_registration_id=?2
+                   AND phase NOT IN ('drained','never_started'))",
+                params![supervisor_authority_id, registration],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
         if blocked {
             return Err("source recovery retained custody bound".into());
         }
@@ -170,7 +324,7 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
             return Err("activation requires exact current wake claim".into());
         }
     }
-    tx.execute("INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,source_registration_id,source_listener_revision,session_id,claim_token,phase,result_path) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved',?10)", params![request.attempt_id,domain,request.owner_generation,request.operation,request.request_sha256,request.source_registration_id,request.source_listener_revision,request.session_id,request.claim_token,request.result_path]).map_err(|e| e.to_string())?;
+    tx.execute("INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,source_registration_id,source_listener_revision,session_id,claim_token,phase,result_path,supervisor_authority_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved',?10,?11)", params![request.attempt_id,domain,request.owner_generation,request.operation,request.request_sha256,request.source_registration_id,request.source_listener_revision,request.session_id,request.claim_token,request.result_path,supervisor_authority_id]).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -388,9 +542,19 @@ pub(in crate::mailbox) fn cancel_unaccepted_activation_on(
     if domain_on(tx)?.is_none() {
         return Ok(());
     }
+    let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
+        .ok_or("driver process disappeared")?;
+    let driver = serde_json::to_string(&SourceProcessIdentity {
+        pid: live.os_pid,
+        boot_id: live.os_boot_id,
+        starttime_ticks: live.os_pid_starttime_ticks,
+    })
+    .map_err(|error| error.to_string())?;
     // Accepted is persisted before any custodian fork. Thus a current reserved
     // row is conclusive unspent launch authority, unlike a dead accepted owner.
-    tx.execute("UPDATE completion_continuation_attempt SET phase='never_started',revision=revision+1,integrated=1,drain_receipt='cancelled_unaccepted_reservation' WHERE session_id=?1 AND claim_token=?2 AND operation='activation' AND phase='reserved' AND revision=1 AND custodian_identity IS NULL",params![session,token]).map_err(|e|e.to_string())?;
+    // Only the exact current driver may withdraw its proposal. A nested caller
+    // cannot erase the root's pending launch authority through claim cleanup.
+    tx.execute("UPDATE completion_continuation_attempt AS attempt SET phase='never_started',revision=revision+1,integrated=1,drain_receipt='cancelled_unaccepted_reservation' WHERE session_id=?1 AND claim_token=?2 AND operation='activation' AND phase='reserved' AND revision=1 AND custodian_identity IS NULL AND EXISTS(SELECT 1 FROM completion_continuation_owner owner WHERE owner.generation=attempt.owner_generation AND owner.phase='running' AND owner.driver_identity=?3)",params![session,token,driver]).map_err(|e|e.to_string())?;
     Ok(())
 }
 
@@ -488,6 +652,60 @@ fn require_exact_attempt(conn: &Connection, request: &ContinuationAttempt) -> Re
 }
 
 impl MailboxDb {
+    /// The root forked a worker but never sent its execution grant because the
+    /// worker's exact process identity could not be established. The guardian
+    /// retained the grant endpoint and waited the worker, so provider effects
+    /// are conclusively absent even though "never forked" would be false.
+    pub fn record_supervisor_unreleased_worker(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        guardian: &SourceProcessIdentity,
+        worker_pid: i64,
+        reason: &str,
+    ) -> Result<(), String> {
+        require_exact_attempt(&self.conn, attempt)?;
+        if worker_pid <= 0 || reason.is_empty() {
+            return Err("invalid unreleased root worker receipt".into());
+        }
+        require_exact_live_guardian(guardian)?;
+        let encoded = serde_json::to_string(guardian).map_err(|error| error.to_string())?;
+        let receipt = serde_json::json!({
+            "attempt_id": attempt.attempt_id,
+            "supervisor": guardian,
+            "worker_pid": worker_pid,
+            "gate": "root_worker_forked_execution_grant_not_sent",
+            "reason": reason,
+        })
+        .to_string();
+        settle_supervisor_unreleased_attempt(self, attempt, &encoded, &receipt)
+    }
+
+    /// The live root supervisor accepted the immutable request, but the worker
+    /// fork/exec syscall failed conclusively before a worker identity existed
+    /// or an execution grant could be sent.  Unlike the legacy driver helper,
+    /// this authority is the generation's recorded guardian.
+    pub fn record_supervisor_never_forked(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        guardian: &SourceProcessIdentity,
+        reason: &str,
+    ) -> Result<(), String> {
+        require_exact_attempt(&self.conn, attempt)?;
+        if reason.is_empty() {
+            return Err("missing root supervisor fork failure reason".into());
+        }
+        require_exact_live_guardian(guardian)?;
+        let encoded = serde_json::to_string(guardian).map_err(|error| error.to_string())?;
+        let receipt = serde_json::json!({
+            "attempt_id": attempt.attempt_id,
+            "supervisor": guardian,
+            "gate": "root_worker_not_forked",
+            "reason": reason,
+        })
+        .to_string();
+        settle_supervisor_unreleased_attempt(self, attempt, &encoded, &receipt)
+    }
+
     /// Called only by the actual recorded driver after a local gate/fork syscall
     /// conclusively failed before any custodian existed. Announcement EOF uses
     /// a separate no-effect classification, not a claim that no AC was forked.
@@ -557,6 +775,77 @@ impl MailboxDb {
         }
         tx.commit().map_err(|e| e.to_string())
     }
+}
+
+fn require_exact_live_guardian(guardian: &SourceProcessIdentity) -> Result<(), String> {
+    let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
+        .ok_or("root supervisor process disappeared")?;
+    let caller = SourceProcessIdentity {
+        pid: live.os_pid,
+        boot_id: live.os_boot_id,
+        starttime_ticks: live.os_pid_starttime_ticks,
+    };
+    if &caller != guardian {
+        return Err("root supervisor fork receipt caller mismatch".into());
+    }
+    Ok(())
+}
+
+fn settle_supervisor_unreleased_attempt(
+    db: &mut MailboxDb,
+    attempt: &ContinuationAttempt,
+    encoded_guardian: &str,
+    receipt: &str,
+) -> Result<(), String> {
+    let tx = db
+        .conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let changed = tx
+        .execute(
+            "UPDATE completion_continuation_attempt
+             SET phase='never_started',revision=revision+1,integrated=1,
+                 drain_receipt=?3
+             WHERE attempt_id=?1 AND owner_generation=?2
+               AND phase='accepted' AND custodian_identity IS NULL
+               AND EXISTS(
+                 SELECT 1 FROM completion_continuation_owner owner
+                 WHERE owner.phase='running'
+                   AND owner.supervisor_authority_id=(
+                     SELECT supervisor_authority_id
+                     FROM completion_continuation_attempt WHERE attempt_id=?1)
+                   AND owner.guardian_identity=?4)",
+            params![
+                attempt.attempt_id,
+                attempt.owner_generation,
+                receipt,
+                encoded_guardian
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed != 1 {
+        let retained: Option<String> = tx
+            .query_row(
+                "SELECT drain_receipt FROM completion_continuation_attempt
+                 WHERE attempt_id=?1 AND owner_generation=?2
+                   AND phase='never_started' AND custodian_identity IS NULL",
+                params![attempt.attempt_id, attempt.owner_generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if retained.as_deref() != Some(receipt) {
+            return Err("root supervisor fork receipt no longer matches attempt".into());
+        }
+    }
+    if attempt.operation == "activation" {
+        tx.execute(
+            "DELETE FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
+            params![attempt.session_id, attempt.claim_token],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|error| error.to_string())
 }
 
 impl MailboxDb {

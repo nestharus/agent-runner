@@ -7,6 +7,8 @@ mod custody;
 mod driver;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod root_supervisor;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -173,11 +175,16 @@ pub fn defer_wake_to_owner() -> Result<bool, String> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn custodian_entry() -> Option<Result<(), String>> {
-    matches!(
-        std::env::args().nth(1).as_deref(),
-        Some(custody::CUSTODIAN_ARG | custody::ADOPTER_ARG)
-    )
-    .then(custody::entry)
+    match std::env::args().nth(1).as_deref() {
+        Some(driver::DRIVER_ARG) => Some(driver::entry()),
+        Some(root_supervisor::ROOT_WORKER_ARG) => Some(custody::root_worker_entry()),
+        // The nested adopter/custodian executable path is retained only by
+        // unit fixtures. Production launches are admitted by the root
+        // supervisor and cannot select this former authority path.
+        #[cfg(test)]
+        Some(custody::CUSTODIAN_ARG | custody::ADOPTER_ARG) => Some(custody::entry()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

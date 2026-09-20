@@ -41,6 +41,8 @@ pub use completion_continuation::{
     activation_request_sha256,
 };
 pub use finalization::DeliveryFinalizationGuard;
+#[cfg(test)]
+pub(crate) use schema::remove_completion_recovery_working_set_for_legacy_fixture;
 
 pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
 pub const MAILBOX_DELIVERY_UNCONFIRMED_ERROR: &str = "mailbox_delivery_unconfirmed";
@@ -6156,8 +6158,16 @@ impl WakeSessionRepository<'_> {
         session_id: &str,
         claim_token: &str,
     ) -> Result<bool, String> {
-        let changed = self
+        let tx = self
             .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("Failed to start wake-claim release: {err}"))?;
+        // A failed spawn may leave an exact v2 activation proposal behind.
+        // Withdraw that still-unaccepted proposal in the same writer
+        // transaction before deleting its claim. Accepted/root-owned custody is
+        // untouched and the existing claim trigger continues to refuse release.
+        completion_continuation::cancel_unaccepted_activation_on(&tx, session_id, claim_token)?;
+        let changed = tx
             .execute(
                 "DELETE FROM session_wake_claim
                  WHERE session_id = ?1
@@ -6166,6 +6176,8 @@ impl WakeSessionRepository<'_> {
                 params![session_id, claim_token],
             )
             .map_err(|err| format!("Failed to release wake claim: {err}"))?;
+        tx.commit()
+            .map_err(|err| format!("Failed to commit wake-claim release: {err}"))?;
         Ok(changed > 0)
     }
 
@@ -12645,6 +12657,7 @@ mod tests {
         db.publish_completion_continuation_owner(&CompletionDomainOwner {
             protocol: PROTOCOL.into(),
             domain_id: db.completion_continuation_domain().unwrap().unwrap(),
+            supervisor_authority_id: Uuid::new_v4().to_string(),
             owner_generation: Uuid::new_v4().to_string(),
             guardian_identity: identity.clone(),
             driver_identity: identity,
@@ -13402,11 +13415,12 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            // Schema 20 includes retained completed-turn definitions in the
-            // fingerprint (measured 1473 VM steps). Keep a tight fixed ceiling,
+            // Schema 21 includes the root-supervisor tables, unresolved-work
+            // indexes, and authority-fence triggers in the fingerprint
+            // (measured 2703 VM steps). Keep a tight fixed ceiling,
             // the no-backfill assertion, and the separate retained-history
             // growth test; this does not grant a data-size-dependent budget.
-            current_open_steps < 1510,
+            current_open_steps < 2750,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
         );
     }
@@ -19066,6 +19080,50 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn failed_native_spawn_release_withdraws_only_its_unaccepted_proposal() {
+        if super::fixture_process::completed_in_fixture_process() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        install_wake_owner(&mut db);
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        db.wake_sessions()
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+
+        assert!(
+            db.wake_sessions()
+                .release_wake_claim("session-a", "token-a")
+                .unwrap()
+        );
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+        let phase: String = db
+            .conn
+            .query_row(
+                "SELECT phase FROM completion_continuation_attempt
+                 WHERE session_id='session-a' AND claim_token='token-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "never_started");
     }
 
     #[test]

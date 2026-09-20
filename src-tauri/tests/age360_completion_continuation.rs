@@ -894,13 +894,6 @@ fn native_accepted_cancellation_drains_resistant_activation_without_source_signa
     native_activation_custody(3);
 }
 #[test]
-fn native_guardian_only_loss_promotes_live_driver_and_preserves_custody() {
-    if private_case(false) {
-        return;
-    }
-    native_activation_custody(4);
-}
-#[test]
 fn native_ac_loss_original_adopter_integrates_actual_drain() {
     if private_case(false) {
         return;
@@ -915,7 +908,7 @@ fn native_ac_loss_adopter_cancels_resistant_descendants() {
     native_activation_custody(6);
 }
 #[test]
-fn native_guardian_loss_before_first_source_preserves_live_admission_context() {
+fn native_guardian_loss_before_first_source_requires_a_new_root() {
     if private_case(false) {
         return;
     }
@@ -940,21 +933,28 @@ fn native_guardian_loss_before_first_source_preserves_live_admission_context() {
         unsafe { libc::kill(owner.guardian_identity.pid as i32, libc::SIGKILL) },
         0
     );
+    // The driver no longer inherits the election or promotes itself. A fresh
+    // independent entry mints a distinct root authority. Do not wait for the
+    // dead driver's /proc identity to disappear: an unreaped zombie can retain
+    // the same PID/starttime while holding no election lock or live authority.
+    // The stale owner row is discovery only and cannot make that dead process
+    // tree live again.
+    let output = f
+        .command()
+        .args(["-m", "absent-pre-admission-model", "create successor root"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("absent-pre-admission-model"));
     let replacement = wait(|| {
         let current = f.mailbox().completion_continuation_owner().ok()??;
         (current.owner_generation != owner.owner_generation).then_some(current)
     });
-    assert_eq!(replacement.guardian_identity, owner.driver_identity);
-    // Force several request/retirement loop turns without creating a source.
-    for _ in 0..4 {
-        let output = f
-            .command()
-            .args(["-m", "absent-pre-admission-model", "join successor"])
-            .output()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&output.stderr).contains("absent-pre-admission-model"));
-        assert_eq!(f.owner().owner_generation, replacement.owner_generation);
-    }
+    assert_ne!(replacement.guardian_identity, owner.driver_identity);
+    assert_ne!(replacement.guardian_identity, owner.guardian_identity);
+    assert_ne!(
+        replacement.supervisor_authority_id,
+        owner.supervisor_authority_id
+    );
     f.gate("release-initial-provider");
     f.wait_initial(&mut initial);
 }
@@ -1110,19 +1110,12 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
             identity.pid
         );
     }
-    if matches!(owner_loss, 1 | 2 | 4) {
-        if owner_loss != 4 {
-            assert!(current_identity_matches(&owner.driver_identity));
-            assert_eq!(
-                unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
-                0
-            );
-        } else {
-            assert_eq!(
-                unsafe { libc::kill(owner.guardian_identity.pid as i32, libc::SIGKILL) },
-                0
-            );
-        }
+    if matches!(owner_loss, 1 | 2) {
+        assert!(current_identity_matches(&owner.driver_identity));
+        assert_eq!(
+            unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
+            0
+        );
         if owner_loss == 2 {
             assert!(current_identity_matches(&owner.guardian_identity));
             assert_eq!(
@@ -1157,24 +1150,16 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
             let (published_generation, phase): (String, String) = f.sidecar_connection().query_row(
                 "SELECT o.generation,a.phase FROM completion_continuation_owner o JOIN completion_continuation_attempt a ON a.domain_id=o.domain_id WHERE o.phase='running' AND a.attempt_id=?1",
                 [&attempt.attempt_id], |r| Ok((r.get(0)?,r.get(1)?))).ok()?;
+            let expected_phase = if owner_loss == 1 {
+                matches!(phase.as_str(), "starting" | "running")
+            } else {
+                phase == "unknown_custody"
+            };
             (current.owner_generation != owner.owner_generation
                 && published_generation == current.owner_generation
-                && phase == "unknown_custody")
+                && expected_phase)
                 .then_some(current)
         });
-        if owner_loss == 4 {
-            assert_eq!(replacement.guardian_identity, owner.driver_identity);
-            let output = f
-                .command()
-                .args(["-m", "absent-succession-model", "join successor"])
-                .output()
-                .unwrap();
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("absent-succession-model"),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
         if owner_loss == 1 {
             assert_eq!(replacement.guardian_identity, owner.guardian_identity);
         } else {
@@ -1188,7 +1173,11 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(phase, "unknown_custody");
+        if owner_loss == 1 {
+            assert!(matches!(phase.as_str(), "starting" | "running"));
+        } else {
+            assert_eq!(phase, "unknown_custody");
+        }
         assert!(read_live_process_identity(descendant).unwrap().is_some());
         assert_eq!(
             fs::read_to_string(f.root.path().join("resume-prompts.jsonl"))
@@ -1668,16 +1657,16 @@ fn native_interrupted_fresh_creation_never_publishes_legacy17() {
 
 #[cfg(feature = "age360-fault-fixtures")]
 #[test]
-fn native_retained_result_integrates_after_both_result_producers_die() {
+fn native_root_reconciles_retained_result_across_driver_replacement() {
     if private_case(false) {
         return;
     }
     let f = Fixture::new("owner_only");
     f.gate("test-descendant-enabled");
     f.gate("release-resume");
-    f.gate("ac-result-retained.hold");
+    f.gate("root-result-retained.hold");
     let mut initial = f.start_with_hold(true);
-    f.owner();
+    let owner = f.owner();
     wait(|| {
         f.root
             .path()
@@ -1699,19 +1688,11 @@ fn native_retained_result_integrates_after_both_result_producers_die() {
     f.gate("release-initial-provider");
     f.wait_initial(&mut initial);
     wait(|| f.root.path().join("descendant.pid").exists().then_some(()));
-    f.gate("driver-replay.hold");
-    wait(|| {
-        f.root
-            .path()
-            .join("driver-replay.reached")
-            .exists()
-            .then_some(())
-    });
     f.gate("release-descendant");
     wait(|| {
         f.root
             .path()
-            .join("ac-result-retained.reached")
+            .join("root-result-retained.reached")
             .exists()
             .then_some(())
     });
@@ -1727,19 +1708,31 @@ fn native_retained_result_integrates_after_both_result_producers_die() {
         .unwrap()
         .unwrap();
     let original = fs::read(&attempt.result_path).unwrap();
-    let (ac,adopter): (String,String) = f.sidecar_connection().query_row("SELECT custodian_identity,adopter_identity FROM completion_continuation_attempt WHERE attempt_id=?1",[&attempt.attempt_id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-    for encoded in [adopter, ac] {
-        let identity = serde_json::from_str(&encoded).unwrap();
-        assert!(current_identity_matches(&identity));
-        assert_eq!(unsafe { libc::kill(identity.pid as i32, libc::SIGKILL) }, 0);
-    }
+    let retained: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(retained["authority"], "root_supervisor");
+    assert_eq!(retained["result_retained"], true);
+    assert_eq!(retained["owned_children"], "ECHILD");
     assert!(
         f.mailbox()
             .continuation_activation(SESSION, &claim.claim_token)
             .unwrap()
             .is_some()
     );
-    fs::remove_file(f.root.path().join("driver-replay.hold")).unwrap();
+    assert!(current_identity_matches(&owner.driver_identity));
+    assert_eq!(
+        unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
+        0
+    );
+    fs::remove_file(f.root.path().join("root-result-retained.hold")).unwrap();
+    let replacement = wait(|| {
+        let current = f.mailbox().completion_continuation_owner().ok()??;
+        (current.owner_generation != owner.owner_generation).then_some(current)
+    });
+    assert_eq!(replacement.guardian_identity, owner.guardian_identity);
+    assert_eq!(
+        replacement.supervisor_authority_id,
+        owner.supervisor_authority_id
+    );
     wait(|| {
         f.mailbox()
             .continuation_activation(SESSION, &claim.claim_token)
@@ -1758,7 +1751,15 @@ fn native_retained_result_integrates_after_both_result_producers_die() {
     assert_eq!(
         integrated.as_bytes(),
         original,
-        "replay must preserve the exact original AC result"
+        "root reconciliation must preserve the exact retained result"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.path().join("resume-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "driver replacement must not replay the recipient"
     );
 }
 

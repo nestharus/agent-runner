@@ -2,6 +2,17 @@ use super::*;
 use fs4::FileExt;
 
 #[test]
+fn guardian_readiness_is_not_failed_by_the_retired_five_second_cap() {
+    let (mut parent, mut guardian) = UnixStream::pair().unwrap();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(5_100));
+        guardian.write_all(&[1]).unwrap();
+    });
+    await_guardian_ready(&mut parent, 42).unwrap();
+    writer.join().unwrap();
+}
+
+#[test]
 fn closing_admission_waits_for_election_release_before_first_hello() {
     let root = tempfile::tempdir().unwrap();
     let endpoint = root.path().join("owner.sock");
@@ -54,6 +65,7 @@ fn hello_to_join_gate_prevents_idle_close_and_releases_on_failed_close() {
     let owner = CompletionDomainOwner {
         protocol: PROTOCOL.into(),
         domain_id: "boundary".into(),
+        supervisor_authority_id: "11111111-1111-4111-8111-111111111111".into(),
         owner_generation: "generation".into(),
         guardian_identity: id.clone(),
         driver_identity: id,
@@ -116,6 +128,7 @@ fn hello_still_rejects_invalid_owner_and_empty_response() {
                 let owner = CompletionDomainOwner {
                     protocol: PROTOCOL.into(),
                     domain_id: "invalid".into(),
+                    supervisor_authority_id: "22222222-2222-4222-8222-222222222222".into(),
                     owner_generation: "invalid".into(),
                     guardian_identity: id.clone(),
                     driver_identity: id,
@@ -149,6 +162,7 @@ fn responsive_hello_does_not_ack_pending_join_and_pause_preserves_it() {
     let owner = CompletionDomainOwner {
         protocol: PROTOCOL.into(),
         domain_id: "control-only-not-admission".into(),
+        supervisor_authority_id: "33333333-3333-4333-8333-333333333333".into(),
         owner_generation: "control-only-generation".into(),
         guardian_identity: id.clone(),
         driver_identity: id.clone(),
@@ -203,6 +217,7 @@ pub(super) fn test_owner(endpoint: &Path) -> CompletionDomainOwner {
     CompletionDomainOwner {
         protocol: PROTOCOL.into(),
         domain_id: "control-test-domain".into(),
+        supervisor_authority_id: "44444444-4444-4444-8444-444444444444".into(),
         owner_generation: "control-test-generation".into(),
         guardian_identity: id.clone(),
         driver_identity: id,

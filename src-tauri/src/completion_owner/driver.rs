@@ -1,32 +1,63 @@
-//! The driver scans committed State obligations even when no sidecar source row
-//! exists. Blocking recovery executes in separately retained/reaped custodians.
+//! The driver schedules committed State obligations even when no sidecar source
+//! row exists.  It proposes immutable reservations to the root supervisor; it
+//! does not fork, reap, cancel, integrate terminal results, or succeed the root.
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{CompletionDomainOwner, ContinuationAttempt, MailboxDb};
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub(super) fn run(path: &Path, owner: &CompletionDomainOwner, election: i32) -> Result<(), String> {
-    let result = run_owned(path, owner, election);
+pub(super) const DRIVER_ARG: &str = "__completion-driver-v1";
+const STATE_REPAIR_SUFFIX_BATCH: usize = 64;
+const SOURCE_RECOVERY_BATCH: usize = 16;
+
+pub(super) fn entry() -> Result<(), String> {
+    let path = std::env::args_os()
+        .nth(2)
+        .map(PathBuf::from)
+        .ok_or("completion driver path missing")?;
+    let fd: RawFd = std::env::args()
+        .nth(3)
+        .ok_or("completion driver channel missing")?
+        .parse()
+        .map_err(|_| "completion driver channel is invalid")?;
+    if fd < 0 {
+        return Err("completion driver channel is invalid".into());
+    }
+    // The guardian deliberately execs the replacement driver so no mutex,
+    // allocator, recorder, control-thread, or SQLite state from its
+    // multi-threaded process can survive the fork boundary.
+    let mut channel = unsafe { UnixStream::from_raw_fd(fd) };
+    let owner = super::linux::read_driver_owner(&mut channel)?;
+    unsafe { std::env::set_var(super::ENDPOINT_ENV, &owner.endpoint) };
+    run(&path, &owner, channel)
+}
+
+pub(super) fn run(
+    path: &Path,
+    owner: &CompletionDomainOwner,
+    launch_channel: UnixStream,
+) -> Result<(), String> {
+    super::root_supervisor::install_driver_channel(launch_channel);
+    let result = run_owned(path, owner);
     // Preserve the original failure, but not at the price of discarding its
     // uniquely capable witness. Only evidence integration continues on this cut.
+    #[cfg(test)]
     super::custody::finish_original_testimony();
+    #[cfg(test)]
+    super::root_supervisor::clear_driver_channel();
     result
 }
 
-fn run_owned(path: &Path, owner: &CompletionDomainOwner, election: i32) -> Result<(), String> {
-    // Establish adoption before any attempt can fork. CG loss can promote this
-    // exact driver while it retains its already-owned descendants.
-    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    let mut live: HashMap<i64, String> = HashMap::new();
+fn run_owned(path: &Path, owner: &CompletionDomainOwner) -> Result<(), String> {
     let mut next_retry: HashMap<String, Instant> = HashMap::new();
+    let mut pending_proposal_withdrawals: Vec<ContinuationAttempt> = Vec::new();
     loop {
         if i64::from(unsafe { libc::getppid() }) != owner.guardian_identity.pid {
-            return super::linux::succeed_guardian(path, owner, election);
+            return Err("completion_root_supervisor_lost: driver parent changed".into());
         }
-        reap(&mut live);
         let current = MailboxDb::open(path)?
             .completion_continuation_owner()?
             .ok_or("driver authority disappeared")?;
@@ -35,14 +66,20 @@ fn run_owned(path: &Path, owner: &CompletionDomainOwner, election: i32) -> Resul
         }
         #[cfg(feature = "age360-fault-fixtures")]
         oulipoly_state::completion_continuation::age360_fault_barrier("driver-replay");
-        for attempt in MailboxDb::open(path)?.pending_continuation_attempts()? {
-            let _ = super::custody::replay_result(path, &attempt);
-            // Source and activation preparation are synchronous in this driver.
-            // On the next outer pass, any still-reserved request failed before
-            // acceptance. Retry exact revocation, including its activation claim.
-            // SQL rejects accepted/possibly launched and predecessor-owned debt.
-            let _ = MailboxDb::open(path)?.revoke_unaccepted_continuation_attempt(&attempt);
+        if !pending_proposal_withdrawals.is_empty() {
+            // Retry only proposals this exact driver observed failing before a
+            // launch response. Never rescan every unresolved root obligation:
+            // accepted/unknown custody belongs exclusively to the root
+            // supervisor's bounded reconciler.
+            let mut mailbox = MailboxDb::open(path)?;
+            pending_proposal_withdrawals.retain(|attempt| {
+                mailbox
+                    .try_revoke_unaccepted_continuation_attempt(attempt)
+                    .is_err()
+            });
         }
+        let now = Instant::now();
+        next_retry.retain(|_, retry_at| *retry_at > now);
         let mut state = StateDb::open_default()?;
         // Runtime/channel receipts come from the original allocated executor;
         // physical activation drain alone cannot settle a logical cancellation.
@@ -64,9 +101,16 @@ fn run_owned(path: &Path, owner: &CompletionDomainOwner, election: i32) -> Resul
                 }
             }
         }
-        // One validated ledger scan supplies original-source membership for
-        // all late-listener repairs, avoiding N additional decodes per listener.
-        let obligations = state.repair_domain_completion_continuations(&owner.domain_id)?;
+        // The sidecar continuity head is the durable cursor. Repair only its
+        // bounded append-only State suffix, then schedule only source rows that
+        // remain unaccepted. Accepted historical bindings never enter this hot
+        // pass; explicit audit/retirement retains the full-ledger validation.
+        let obligations = state.repair_pending_domain_completion_continuations(
+            &owner.domain_id,
+            &owner.supervisor_authority_id,
+            STATE_REPAIR_SUFFIX_BATCH,
+            SOURCE_RECOVERY_BATCH,
+        )?;
         for binding in obligations {
             let source = binding.registration()?;
             let already_accepted = MailboxDb::open(path)?
@@ -76,22 +120,17 @@ fn run_owned(path: &Path, owner: &CompletionDomainOwner, election: i32) -> Resul
                 continue;
             }
             let snapshot = Path::new(&source.handle_dir).join(&source.snapshot_relative);
-            // The complete admitted ledger was decoded above, including hidden
-            // siblings. An absent snapshot cannot be accepted; avoid another
-            // full admission scan only on this already-validated driver lane.
+            // This exact unaccepted source was selected from the current root's
+            // bounded durable scope. An absent snapshot cannot be accepted.
             // Presence is a hint, never acceptance or workload replay authority.
             let accepted = snapshot.is_file()
                 && crate::commands::notify_continuation::accept(&binding, &snapshot).is_ok();
             if accepted {
                 continue;
             }
-            if live
-                .values()
-                .any(|registration| registration == &source.registration_id)
-                || live.len() >= 4
-                || next_retry
-                    .get(&source.registration_id)
-                    .is_some_and(|when| *when > Instant::now())
+            if next_retry
+                .get(&source.registration_id)
+                .is_some_and(|when| *when > Instant::now())
             {
                 continue;
             }
@@ -120,11 +159,14 @@ fn run_owned(path: &Path, owner: &CompletionDomainOwner, election: i32) -> Resul
                 continue; // continuing authoritative attempts, including predecessors, own the bound
             }
             match super::custody::spawn_source(path, &attempt, &binding) {
-                Ok(pid) => {
-                    live.insert(pid, source.registration_id.clone());
-                }
+                Ok(_) => {}
                 Err(_) => {
-                    let _ = MailboxDb::open(path)?.revoke_unaccepted_continuation_attempt(&attempt);
+                    match MailboxDb::open(path).and_then(|mut mailbox| {
+                        mailbox.try_revoke_unaccepted_continuation_attempt(&attempt)
+                    }) {
+                        Ok(_) => {}
+                        Err(_) => pending_proposal_withdrawals.push(attempt.clone()),
+                    }
                 }
             }
             next_retry.insert(
@@ -163,25 +205,5 @@ fn run_owned(path: &Path, owner: &CompletionDomainOwner, election: i32) -> Resul
             }
         }
         std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
-fn reap(live: &mut HashMap<i64, String>) {
-    super::custody::retry_unreleased();
-    loop {
-        let pid = super::custody::reap_unprotected(&mut 0);
-        if pid <= 0 {
-            #[cfg(feature = "age360-fault-fixtures")]
-            if pid < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
-                // Test observation only, never an attempt-discharge certificate.
-                oulipoly_state::completion_continuation::age360_fault_barrier(
-                    "driver-reaped-echild",
-                );
-            }
-            break;
-        }
-        // Custodian exit is not converted to drain. Only its exact durable
-        // ECHILD/integration receipt can discharge its own attempt.
-        live.remove(&i64::from(pid));
     }
 }
