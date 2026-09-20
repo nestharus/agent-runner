@@ -303,6 +303,37 @@ impl StateDb {
             .collect())
     }
 
+    /// Repair only the append-only State suffix not yet projected to the
+    /// sidecar, then return only source registrations that still lack accepted
+    /// completion evidence. This is the owner driver's bounded hot path.
+    ///
+    /// The full ledger remains available to explicit audit paths; successful
+    /// history is not decoded on owner recovery or retirement passes.
+    pub fn repair_pending_domain_completion_continuations(
+        &mut self,
+        domain: &str,
+        supervisor_authority_id: &str,
+        suffix_limit: usize,
+        source_limit: usize,
+    ) -> Result<Vec<AdmittedSourceBinding>, String> {
+        let path = self
+            .completion_authority_state_path()
+            .ok_or("completion repair requires stable State identity")?;
+        let sidecar_path = MailboxDb::path_for_state_db(path);
+        let projection = MailboxDb::open_existing_native_authority(&sidecar_path)?;
+        let ordinal = projection.completion_continuity_repair_ordinal()?;
+        let suffix = self.admitted_completion_continuations_after(ordinal, suffix_limit)?;
+        let originals: std::collections::BTreeSet<Vec<u8>> = suffix
+            .iter()
+            .filter(|binding| !binding.is_late_listener())
+            .map(|binding| binding.registration_bytes().to_vec())
+            .collect();
+        for binding in suffix {
+            self.repair_domain_binding(domain, &originals, Some(&projection), binding)?;
+        }
+        projection.unaccepted_completion_continuations(supervisor_authority_id, source_limit)
+    }
+
     fn repair_domain_binding(
         &mut self,
         domain: &str,
@@ -313,7 +344,13 @@ impl StateDb {
         if binding.registration()?.domain_id != domain {
             return Ok(None);
         }
-        if binding.is_late_listener() && !originals.contains(binding.registration_bytes()) {
+        if binding.is_late_listener()
+            && !originals.contains(binding.registration_bytes())
+            && !projection
+                .map(|sidecar| sidecar.has_original_completion_source(&binding))
+                .transpose()?
+                .unwrap_or(false)
+        {
             return Err("late listener requires original committed v2 source admission".into());
         }
         // Neither terminal nor accepted status suffices. Skip only when the
@@ -413,36 +450,40 @@ impl StateDb {
                 ))
             })
             .map_err(|e| e.to_string())?;
-        rows.map(|row| {
-            let (bytes, admission_id, event_id, invocation, session) =
-                row.map_err(|e| e.to_string())?;
-            let binding = AdmittedSourceBinding::decode(&bytes)?;
-            let source = binding.registration()?;
-            let paths = source.paths();
-            let listener = binding.admission_listener()?;
-            let input = CompletionEventRegistrationInput {
-                event_id: &source.handle,
-                delivery_mode: &source.delivery_mode,
-                owner_session_id: Some(&listener.session_id),
-                owner_invocation_uuid: Some(&listener.owner_invocation_uuid),
-                state_dir: &source.handle_dir,
-                meta_path: &paths[0],
-                log_path: &paths[1],
-                rc_path: &paths[2],
-            };
-            if completion_bound_admission_id(binding.caller_admission_id(), &input, Some(&binding))
-                != admission_id
-                || event_id != source.handle
-                || invocation != listener.owner_invocation_uuid
-                || session != listener.session_id
-            {
-                return Err(
-                    "process_integrity: completion source does not match admitted authority".into(),
-                );
-            }
-            Ok(binding)
-        })
-        .collect()
+        rows.map(|row| decode_admitted_completion_row(row.map_err(|e| e.to_string())?))
+            .collect()
+    }
+
+    fn admitted_completion_continuations_after(
+        &self,
+        authority_ordinal: i64,
+        limit: usize,
+    ) -> Result<Vec<AdmittedSourceBinding>, String> {
+        let limit = i64::try_from(limit).map_err(|_| "completion repair limit overflow")?;
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT o.completion_v2_binding,o.admission_id,o.event_id,
+                    o.owner_invocation_uuid,o.owner_session_id
+             FROM invocation_completion_continuity c
+             JOIN invocation_completion_obligations o ON o.admission_id=c.admission_id
+             WHERE c.authority_ordinal>?1 AND o.completion_v2_binding IS NOT NULL
+             ORDER BY c.authority_ordinal LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(sqlite::params![authority_ordinal, limit], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .map(|row| decode_admitted_completion_row(row.map_err(|error| error.to_string())?))
+            .collect()
     }
 
     /// Atomically retire an idle notification generation against State admission.
@@ -464,7 +505,7 @@ impl StateDb {
         let tx =
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
                 .map_err(|e| e.to_string())?;
-        let admitted = self.admitted_completion_continuations()?;
+        let state_head = completion_continuity_head_on(&tx).map_err(|error| error.to_string())?;
         // Physical drain is not logical cancellation or retained-channel release.
         // Keep the domain steward while its native settlement/cleanup is owed.
         for (generation, invocation) in self.cancelling_native_attempts()? {
@@ -480,7 +521,7 @@ impl StateDb {
             crate::ProviderLaunchChannelSettlement::ContinuingCustody { domain_id, .. } if domain_id == &owner.domain_id)) {
             return Ok(false);
         }
-        let closed = mailbox.close_idle_continuation_generation(owner, &admitted)?;
+        let closed = mailbox.close_idle_continuation_generation(owner, state_head.as_ref())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(closed)
     }
@@ -1054,6 +1095,37 @@ impl StateDb {
             None => OwnerLineageRelationship::OutsideRecursiveLineage,
         })
     }
+}
+
+fn decode_admitted_completion_row(
+    row: (Vec<u8>, String, String, String, String),
+) -> Result<AdmittedSourceBinding, String> {
+    let (bytes, admission_id, event_id, invocation, session) = row;
+    let binding = AdmittedSourceBinding::decode(&bytes)?;
+    let source = binding.registration()?;
+    let paths = source.paths();
+    let listener = binding.admission_listener()?;
+    let input = CompletionEventRegistrationInput {
+        event_id: &source.handle,
+        delivery_mode: &source.delivery_mode,
+        owner_session_id: Some(&listener.session_id),
+        owner_invocation_uuid: Some(&listener.owner_invocation_uuid),
+        state_dir: &source.handle_dir,
+        meta_path: &paths[0],
+        log_path: &paths[1],
+        rc_path: &paths[2],
+    };
+    if completion_bound_admission_id(binding.caller_admission_id(), &input, Some(&binding))
+        != admission_id
+        || event_id != source.handle
+        || invocation != listener.owner_invocation_uuid
+        || session != listener.session_id
+    {
+        return Err(
+            "process_integrity: completion source does not match admitted authority".into(),
+        );
+    }
+    Ok(binding)
 }
 
 fn current_registration_effect_fence(
@@ -3860,6 +3932,7 @@ mod completion_continuation_tests {
             .publish_completion_continuation_owner(&crate::mailbox::CompletionDomainOwner {
                 protocol: source.protocol,
                 domain_id: source.domain_id,
+                supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
                 owner_generation: uuid::Uuid::new_v4().to_string(),
                 guardian_identity: identity.clone(),
                 driver_identity: identity,
@@ -4111,6 +4184,9 @@ mod completion_continuation_tests {
         if missing || initially_active {
             // Reconstruct a synthetic pre-policy sidecar from this verified
             // accepted fixture. No production data or old running writer.
+            crate::mailbox::remove_completion_recovery_working_set_for_legacy_fixture(
+                mailbox.connection(),
+            );
             mailbox
                 .connection()
                 .execute_batch(

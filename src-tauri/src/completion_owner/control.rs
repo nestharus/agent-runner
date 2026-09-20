@@ -268,6 +268,7 @@ mod tests {
         CompletionDomainOwner {
             protocol: oulipoly_state::completion_continuation::PROTOCOL.into(),
             domain_id: "reader-test".into(),
+            supervisor_authority_id: "11111111-1111-4111-8111-111111111111".into(),
             owner_generation: "reader-generation".into(),
             guardian_identity: id.clone(),
             driver_identity: id,

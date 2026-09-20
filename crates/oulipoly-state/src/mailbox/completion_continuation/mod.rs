@@ -18,10 +18,13 @@ pub(super) use notification::{
 };
 pub(super) use source::{accept_on, bound_event, reject_unbound_v2_trigger, retained_payload};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionDomainOwner {
     pub protocol: String,
     pub domain_id: String,
+    /// Stable process-tree authority. This survives driver succession but is
+    /// not reused by a later independent root after retirement.
+    pub supervisor_authority_id: String,
     pub owner_generation: String,
     pub guardian_identity: SourceProcessIdentity,
     pub driver_identity: SourceProcessIdentity,
@@ -137,18 +140,60 @@ impl MailboxDb {
         if domain_on(&self.conn)?.is_none() {
             return Ok(None);
         }
-        self.conn.query_row("SELECT domain_id,generation,guardian_identity,driver_identity,endpoint FROM completion_continuation_owner WHERE phase='running'", [], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))
-            .optional().map_err(|e| e.to_string())?.map(|(domain_id,owner_generation,guardian,driver,endpoint)| Ok(CompletionDomainOwner {
-                protocol: PROTOCOL.into(), domain_id, owner_generation,
+        self.conn.query_row("SELECT domain_id,supervisor_authority_id,generation,guardian_identity,driver_identity,endpoint FROM completion_continuation_owner WHERE phase='running'", [], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))
+            .optional().map_err(|e| e.to_string())?.map(|(domain_id,supervisor_authority_id,owner_generation,guardian,driver,endpoint)| Ok(CompletionDomainOwner {
+                protocol: PROTOCOL.into(), domain_id, supervisor_authority_id, owner_generation,
                 guardian_identity: serde_json::from_str(&guardian).map_err(|e| e.to_string())?,
                 driver_identity: serde_json::from_str(&driver).map_err(|e| e.to_string())?, endpoint,
             })).transpose()
     }
 
+    /// The sidecar continuity head is the exact durable cursor for State repair.
+    /// Recovery reads only the append-only suffix after this ordinal; accepted
+    /// historical bindings before it are not part of the hot working set.
+    pub fn completion_continuity_repair_ordinal(&self) -> Result<i64, String> {
+        Ok(completion_continuity_head_on(&self.conn)?.map_or(0, |head| head.authority_ordinal))
+    }
+
+    /// Return only source images that still lack an accepted completion.  The
+    /// partial index added with sidecar v21 keeps terminal source history out of
+    /// this bounded recovery selection.
+    pub fn unaccepted_completion_continuations(
+        &self,
+        supervisor_authority_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AdmittedSourceBinding>, String> {
+        let limit = i64::try_from(limit).map_err(|_| "completion recovery limit overflow")?;
+        let mut statement = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE supervisor_scope(authority_id) AS (
+                    SELECT ?1
+                    UNION
+                    SELECT inheritance.predecessor_authority_id
+                    FROM completion_supervisor_inheritance inheritance
+                    JOIN supervisor_scope scope
+                      ON inheritance.authority_id=scope.authority_id)
+                 SELECT binding FROM completion_continuation_source
+                 WHERE supervisor_authority_id IN (
+                    SELECT authority_id FROM supervisor_scope)
+                   AND phase='registered'
+                 ORDER BY registration_id LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(params![supervisor_authority_id, limit], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .map_err(|error| error.to_string())?
+            .map(|row| AdmittedSourceBinding::decode(&row.map_err(|error| error.to_string())?))
+            .collect()
+    }
+
     pub(crate) fn close_idle_continuation_generation(
         &mut self,
         owner: &CompletionDomainOwner,
-        admitted: &[AdmittedSourceBinding],
+        state_head: Option<&CompletionContinuityHead>,
     ) -> Result<bool, String> {
         // This connection belongs to this retirement attempt only. While State's
         // writer is held, sidecar contention is a refusal to retire, not a wait.
@@ -167,39 +212,39 @@ impl MailboxDb {
         if domain_on(&tx)?.as_deref() != Some(&owner.domain_id) {
             return Err("completion retirement domain conflict".into());
         }
-        for binding in admitted {
-            let source = binding.registration()?;
-            if source.domain_id != owner.domain_id {
-                continue;
-            }
-            let retained:Option<Vec<u8>>=tx.query_row("SELECT binding FROM completion_continuation_source WHERE registration_id=?1 AND phase='accepted'",[source.registration_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
-            let Some(retained) = retained else {
-                return Ok(false);
-            };
-            if !AdmittedSourceBinding::decode(&retained)?.same_source(binding) {
-                return Ok(false);
-            }
-            let listener = binding.admission_listener()?;
-            let projected: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM completion_event_listener WHERE event_id=?1 AND listener_id=?2 AND session_id=?3 AND owner_invocation_uuid=?4)",
-                params![source.handle, listener.listener_id, listener.session_id, listener.owner_invocation_uuid], |r| r.get(0),
-            ).map_err(|e| e.to_string())?;
-            if !projected {
-                return Ok(false); // accepted original is not this listener's projection
-            }
+        // The append-only heads are the exact durable statement that every
+        // State admission through this point was projected. Do not decode all
+        // successful historical bindings while both databases are writer-fenced.
+        if completion_continuity_head_on(&tx)?.as_ref() != state_head {
+            return Ok(false);
         }
-        for binding in admitted {
-            notification::classify_on(&tx, binding)?;
+        if let Some(head) = state_head
+            && sidecar_generation_on(&tx)? != head.sidecar_generation
+        {
+            return Ok(false);
         }
-        let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM completion_event_listener l WHERE l.acknowledged_at IS NULL AND NOT EXISTS (
+        let pending:bool=tx.query_row("WITH RECURSIVE supervisor_scope(authority_id) AS (
+SELECT ?1 UNION SELECT inheritance.predecessor_authority_id
+FROM completion_supervisor_inheritance inheritance JOIN supervisor_scope scope
+ON inheritance.authority_id=scope.authority_id)
+SELECT EXISTS(SELECT 1 FROM completion_continuation_source
+WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND phase='registered') OR EXISTS(SELECT 1 FROM completion_event_listener l WHERE l.acknowledged_at IS NULL AND NOT EXISTS (
 SELECT 1 FROM completion_continuation_notification n JOIN completion_event e ON e.event_id=n.event_id
 WHERE n.event_id=l.event_id AND n.listener_id=l.listener_id AND n.policy='response_only'
 AND n.requested_at IS NULL AND l.active=0 AND l.mailbox_seq IS NULL AND e.state='triggered'
-AND EXISTS(SELECT 1 FROM completion_continuation_source s WHERE s.event_id=l.event_id AND s.phase='accepted'))) OR EXISTS(SELECT 1 FROM mailbox WHERE delivered_at IS NULL) OR EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE phase NOT IN ('drained','never_started'))",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+AND EXISTS(SELECT 1 FROM completion_continuation_source s WHERE s.event_id=l.event_id AND s.phase='accepted'))) OR EXISTS(SELECT 1 FROM mailbox WHERE delivered_at IS NULL) OR EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND phase NOT IN ('drained','never_started'))",[&owner.supervisor_authority_id],|r|r.get(0)).map_err(|e|e.to_string())?;
         if pending {
             return Ok(false);
         }
         let changed=tx.execute("UPDATE completion_continuation_owner SET phase='closing' WHERE generation=?1 AND domain_id=?2 AND phase='running' AND guardian_identity=?3 AND driver_identity=?4",params![owner.owner_generation,owner.domain_id,serde_json::to_string(&owner.guardian_identity).map_err(|e|e.to_string())?,serde_json::to_string(&owner.driver_identity).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        if changed == 1 {
+            tx.execute(
+                "UPDATE completion_supervisor_authority SET phase='retired'
+                 WHERE authority_id=?1 AND domain_id=?2",
+                params![owner.supervisor_authority_id, owner.domain_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(changed == 1)
     }
@@ -217,24 +262,157 @@ AND EXISTS(SELECT 1 FROM completion_continuation_source s WHERE s.event_id=l.eve
         if owner.protocol != PROTOCOL || domain_on(&tx)?.as_deref() != Some(&owner.domain_id) {
             return Err("completion owner domain/protocol conflict".into());
         }
+        let authority = uuid::Uuid::parse_str(&owner.supervisor_authority_id)
+            .map_err(|_| "completion supervisor authority is not a UUID")?;
+        if authority.to_string() != owner.supervisor_authority_id {
+            return Err("completion supervisor authority is not canonical".into());
+        }
+        let encoded_guardian =
+            serde_json::to_string(&owner.guardian_identity).map_err(|e| e.to_string())?;
+        let current_root: Option<(String, String)> = tx
+            .query_row(
+                "SELECT supervisor_authority_id,guardian_identity
+                 FROM completion_continuation_owner WHERE phase='running'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if current_root.as_ref().is_some_and(|(authority, guardian)| {
+            authority == &owner.supervisor_authority_id && guardian != &encoded_guardian
+        }) {
+            return Err("completion supervisor authority cannot move to a different root".into());
+        }
+        let continues_root = current_root.as_ref().is_some_and(|(authority, guardian)| {
+            authority == &owner.supervisor_authority_id && guardian == &encoded_guardian
+        });
         tx.execute(
-            "UPDATE completion_continuation_owner SET phase='lost' WHERE phase='running'",
-            [],
+            "INSERT OR IGNORE INTO completion_supervisor_authority(
+                authority_id,domain_id,phase,created_by_generation,guardian_identity)
+             VALUES(?1,?2,'active',?3,?4)",
+            params![
+                owner.supervisor_authority_id,
+                owner.domain_id,
+                owner.owner_generation,
+                encoded_guardian
+            ],
         )
         .map_err(|e| e.to_string())?;
+        let (authority_domain, authority_guardian): (String, Option<String>) = tx
+            .query_row(
+                "SELECT domain_id,guardian_identity FROM completion_supervisor_authority
+                 WHERE authority_id=?1",
+                [&owner.supervisor_authority_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        if authority_domain != owner.domain_id {
+            return Err("completion supervisor authority domain conflict".into());
+        }
+        if authority_guardian.as_deref() != Some(encoded_guardian.as_str()) {
+            return Err("completion supervisor authority cannot move to a different root".into());
+        }
+        tx.execute(
+            "UPDATE completion_supervisor_authority SET phase='active'
+             WHERE authority_id=?1",
+            [&owner.supervisor_authority_id],
+        )
+        .map_err(|e| e.to_string())?;
+        // Adoption is explicit and durable. Only roots that still own unresolved
+        // attempts or unaccepted sources enter this tree; terminal predecessors
+        // never become part of its recovery scope.
+        if !continues_root {
+            tx.execute(
+                "WITH unresolved(authority_id) AS (
+                SELECT supervisor_authority_id
+                FROM completion_continuation_attempt
+                WHERE domain_id=?2 AND phase NOT IN ('drained','never_started')
+                UNION
+                SELECT supervisor_authority_id
+                FROM completion_continuation_source
+                WHERE domain_id=?2 AND phase='registered')
+             INSERT OR IGNORE INTO completion_supervisor_inheritance(
+                authority_id,predecessor_authority_id,inherited_by_generation)
+             SELECT ?1,authority_id,?3 FROM unresolved WHERE authority_id!=?1",
+                params![
+                    owner.supervisor_authority_id,
+                    owner.domain_id,
+                    owner.owner_generation
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute(
+            "UPDATE completion_continuation_owner SET phase='lost' WHERE domain_id=?1 AND phase='running'",
+            [&owner.domain_id],
+        )
+        .map_err(|e| e.to_string())?;
+        if !continues_root {
+            tx.execute(
+                "UPDATE completion_supervisor_authority SET phase='retired'
+             WHERE domain_id=?1 AND authority_id!=?2 AND phase='active'",
+                params![owner.domain_id, owner.supervisor_authority_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         // Reserved is committed before acceptance, and acceptance before any fork.
         // Replacement can revoke that unspent authority, but never accepted debt.
-        tx.execute("UPDATE completion_continuation_attempt SET phase='never_started',revision=revision+1,integrated=1,drain_receipt='replacement_revoked_unaccepted' WHERE phase='reserved' AND revision=1 AND custodian_identity IS NULL",[]).map_err(|e|e.to_string())?;
-        tx.execute("DELETE FROM session_wake_claim WHERE EXISTS(SELECT 1 FROM completion_continuation_attempt a WHERE a.operation='activation' AND a.session_id=session_wake_claim.session_id AND a.claim_token=session_wake_claim.claim_token AND a.phase='never_started')",[]).map_err(|e|e.to_string())?;
-        tx.execute("UPDATE completion_continuation_attempt SET phase='unknown_custody',revision=revision+1 WHERE phase IN ('accepted','starting','running')", []).map_err(|e| e.to_string())?;
+        // Capture only the exact claims in the unresolved working set. The
+        // v18 physical-custody trigger correctly forbids deleting a claim until
+        // its attempt is terminal, so revoke attempts first and delete these
+        // primary-key claims immediately afterward in the same transaction.
+        let revoked_claims: Vec<(String, String)> = {
+            let mut statement = tx
+                .prepare(
+                    "WITH RECURSIVE supervisor_scope(authority_id) AS (
+SELECT ?1 UNION SELECT inheritance.predecessor_authority_id
+FROM completion_supervisor_inheritance inheritance JOIN supervisor_scope scope
+ON inheritance.authority_id=scope.authority_id)
+SELECT session_id,claim_token FROM completion_continuation_attempt
+WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope)
+AND phase NOT IN ('drained','never_started') AND operation='activation'
+AND phase='reserved' AND revision=1 AND custodian_identity IS NULL",
+                )
+                .map_err(|e| e.to_string())?;
+            statement
+                .query_map([&owner.supervisor_authority_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|e| e.to_string())?
+                .map(|row| row.map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?
+        };
+        tx.execute("WITH RECURSIVE supervisor_scope(authority_id) AS (
+SELECT ?1 UNION SELECT inheritance.predecessor_authority_id
+FROM completion_supervisor_inheritance inheritance JOIN supervisor_scope scope
+ON inheritance.authority_id=scope.authority_id)
+UPDATE completion_continuation_attempt SET phase='never_started',revision=revision+1,integrated=1,drain_receipt='replacement_revoked_unaccepted' WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND phase NOT IN ('drained','never_started') AND phase='reserved' AND revision=1 AND custodian_identity IS NULL",[&owner.supervisor_authority_id]).map_err(|e|e.to_string())?;
+        for (session_id, claim_token) in revoked_claims {
+            tx.execute(
+                "DELETE FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
+                params![session_id, claim_token],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if !continues_root {
+            tx.execute("WITH RECURSIVE supervisor_scope(authority_id) AS (
+SELECT ?1 UNION SELECT inheritance.predecessor_authority_id
+FROM completion_supervisor_inheritance inheritance JOIN supervisor_scope scope
+ON inheritance.authority_id=scope.authority_id)
+UPDATE completion_continuation_attempt SET phase='unknown_custody',revision=revision+1 WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND phase NOT IN ('drained','never_started') AND phase IN ('accepted','starting','running')", [&owner.supervisor_authority_id]).map_err(|e| e.to_string())?;
+        }
         tx.execute(
-            "INSERT INTO completion_continuation_owner VALUES(?1,?2,'running',?3,?4,?5)",
+            "INSERT INTO completion_continuation_owner(
+                generation,domain_id,phase,guardian_identity,driver_identity,
+                endpoint,supervisor_authority_id)
+             VALUES(?1,?2,'running',?3,?4,?5,?6)",
             params![
                 owner.owner_generation,
                 owner.domain_id,
-                serde_json::to_string(&owner.guardian_identity).map_err(|e| e.to_string())?,
+                encoded_guardian,
                 serde_json::to_string(&owner.driver_identity).map_err(|e| e.to_string())?,
-                owner.endpoint
+                owner.endpoint,
+                owner.supervisor_authority_id
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -281,7 +459,18 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
     static EXPECTED: std::sync::OnceLock<Result<Vec<Definition>, String>> =
         std::sync::OnceLock::new();
     fn definitions(conn: &Connection) -> Result<Vec<Definition>, String> {
-        let mut statement=conn.prepare("SELECT type,name,sql FROM sqlite_master WHERE name LIKE 'completion_continuation_%' AND sql IS NOT NULL ORDER BY type,name").map_err(|e|e.to_string())?;
+        let mut statement = conn
+            .prepare(
+                "SELECT type,name,sql FROM sqlite_master
+                 WHERE sql IS NOT NULL AND (
+                    name LIKE 'completion_continuation_%'
+                    OR name LIKE 'completion_supervisor_%'
+                    OR name LIKE 'completion_owner_supervisor_%'
+                    OR name LIKE 'completion_source_supervisor_%'
+                    OR name LIKE 'completion_attempt_supervisor_%')
+                 ORDER BY type,name",
+            )
+            .map_err(|e| e.to_string())?;
         statement
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .map_err(|e| e.to_string())?
@@ -300,6 +489,11 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                 ))
                 .map_err(|e| e.to_string())?;
             expected.execute_batch(include_str!("../migrations/0019_notification_settlement.sql"))
+                .map_err(|e| e.to_string())?;
+            expected
+                .execute_batch(include_str!(
+                    "../migrations/0021_completion_recovery_working_set.sql"
+                ))
                 .map_err(|e| e.to_string())?;
             definitions(&expected)
         })
@@ -346,6 +540,7 @@ mod tests {
         let owner = CompletionDomainOwner {
             protocol: PROTOCOL.into(),
             domain_id: db.completion_continuation_domain().unwrap().unwrap(),
+            supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
             owner_generation: uuid::Uuid::new_v4().to_string(),
             guardian_identity: identity.clone(),
             driver_identity: identity,
@@ -353,6 +548,323 @@ mod tests {
         };
         db.publish_completion_continuation_owner(&owner).unwrap();
         (dir, db, owner)
+    }
+
+    fn explain(db: &MailboxDb, sql: &str, supervisor_authority_id: &str) -> Vec<String> {
+        let mut statement = db.conn.prepare(sql).unwrap();
+        if statement.parameter_count() == 1 {
+            statement
+                .query_map([supervisor_authority_id], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect()
+        } else {
+            statement
+                .query_map(params![supervisor_authority_id, 16_i64], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn completion_recovery_queries_exclude_terminal_history_by_construction() {
+        let (_dir, mut db, owner) = fixture();
+        let tx = db.conn.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO completion_continuation_attempt(
+                        attempt_id,domain_id,owner_generation,operation,request_sha256,
+                        phase,result_path,integrated,drain_receipt,supervisor_authority_id)
+                     VALUES(?1,?2,?3,'transport',?4,'never_started',?5,1,'fixture',?6)",
+                )
+                .unwrap();
+            for ordinal in 0..5_000 {
+                insert
+                    .execute(params![
+                        format!("terminal-{ordinal:05}"),
+                        owner.domain_id,
+                        owner.owner_generation,
+                        "a".repeat(64),
+                        format!("/fixture/terminal-{ordinal:05}.json"),
+                        owner.supervisor_authority_id
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let unresolved = reservation(&mut db, &owner);
+        assert_eq!(
+            db.pending_continuation_attempts_for_supervisor(&owner.supervisor_authority_id, 1,)
+                .unwrap(),
+            vec![unresolved]
+        );
+
+        let attempts = explain(
+            &db,
+            "EXPLAIN QUERY PLAN WITH RECURSIVE supervisor_scope(authority_id) AS (
+                SELECT ?1 UNION SELECT inheritance.predecessor_authority_id
+                FROM completion_supervisor_inheritance inheritance
+                JOIN supervisor_scope scope ON inheritance.authority_id=scope.authority_id)
+             SELECT attempt_id,owner_generation,operation,request_sha256,
+                source_registration_id,source_listener_revision,session_id,claim_token,result_path
+             FROM completion_continuation_attempt
+             WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope)
+               AND phase NOT IN ('drained','never_started')
+             ORDER BY owner_generation,attempt_id LIMIT ?2",
+            &owner.supervisor_authority_id,
+        );
+        assert!(
+            attempts
+                .iter()
+                .any(|detail| detail.contains("completion_continuation_attempt_unresolved")),
+            "unresolved recovery must not scan terminal history: {attempts:?}"
+        );
+
+        let sources = explain(
+            &db,
+            "EXPLAIN QUERY PLAN WITH RECURSIVE supervisor_scope(authority_id) AS (
+                SELECT ?1 UNION SELECT inheritance.predecessor_authority_id
+                FROM completion_supervisor_inheritance inheritance
+                JOIN supervisor_scope scope ON inheritance.authority_id=scope.authority_id)
+             SELECT binding FROM completion_continuation_source
+             WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope)
+               AND phase='registered'
+             ORDER BY registration_id LIMIT ?2",
+            &owner.supervisor_authority_id,
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|detail| detail.contains("completion_continuation_source_unaccepted")),
+            "source recovery must not scan accepted history: {sources:?}"
+        );
+
+        let unspent = explain(
+            &db,
+            "EXPLAIN QUERY PLAN WITH RECURSIVE supervisor_scope(authority_id) AS (
+                SELECT ?1 UNION SELECT inheritance.predecessor_authority_id
+                FROM completion_supervisor_inheritance inheritance
+                JOIN supervisor_scope scope ON inheritance.authority_id=scope.authority_id)
+             UPDATE completion_continuation_attempt
+             SET phase='never_started',revision=revision+1,integrated=1,
+                 drain_receipt='replacement_revoked_unaccepted'
+             WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope)
+               AND phase NOT IN ('drained','never_started')
+               AND phase='reserved' AND revision=1
+               AND custodian_identity IS NULL",
+            &owner.supervisor_authority_id,
+        );
+        assert!(
+            unspent
+                .iter()
+                .any(|detail| detail.contains("completion_continuation_attempt_unresolved")),
+            "owner replacement must not scan settled attempts: {unspent:?}"
+        );
+    }
+
+    #[test]
+    fn new_root_inherits_only_unresolved_predecessor_authority() {
+        let (_dir, mut db, first) = fixture();
+        let attempt = reservation(&mut db, &first);
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.attach_continuation_custodian(&attempt, &first.driver_identity)
+            .unwrap();
+
+        let second = CompletionDomainOwner {
+            supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            ..first.clone()
+        };
+        db.publish_completion_continuation_owner(&second).unwrap();
+        assert_eq!(
+            db.pending_continuation_attempts_for_supervisor(&second.supervisor_authority_id, 16,)
+                .unwrap(),
+            vec![attempt.clone()]
+        );
+        let inherited: bool = db
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM completion_supervisor_inheritance
+                 WHERE authority_id=?1 AND predecessor_authority_id=?2)",
+                params![
+                    second.supervisor_authority_id,
+                    first.supervisor_authority_id
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(inherited);
+
+        db.discharge_continuation_attempt(&attempt, &first.driver_identity, "fixture-drain")
+            .unwrap();
+        let third = CompletionDomainOwner {
+            supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            ..second.clone()
+        };
+        db.publish_completion_continuation_owner(&third).unwrap();
+        assert!(
+            db.pending_continuation_attempts_for_supervisor(&third.supervisor_authority_id, 16,)
+                .unwrap()
+                .is_empty()
+        );
+        let inherited_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM completion_supervisor_inheritance
+                 WHERE authority_id=?1",
+                [&third.supervisor_authority_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inherited_count, 0, "settled history is not adopted");
+    }
+
+    #[test]
+    fn driver_succession_keeps_one_root_authority_and_known_worker_custody() {
+        let (_dir, mut db, first) = fixture();
+        let attempt = reservation(&mut db, &first);
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.attach_continuation_custodian_with_adopter(
+            &attempt,
+            &first.driver_identity,
+            Some(&first.guardian_identity),
+        )
+        .unwrap();
+        db.advance_continuation_attempt(
+            &attempt,
+            3,
+            "accepted",
+            "starting",
+            &first.driver_identity,
+        )
+        .unwrap();
+
+        let successor = CompletionDomainOwner {
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            endpoint: "/fixture/replacement.sock".into(),
+            ..first.clone()
+        };
+        db.publish_completion_continuation_owner(&successor)
+            .unwrap();
+
+        let (phase, supervisor): (String, String) = db
+            .conn
+            .query_row(
+                "SELECT phase,supervisor_authority_id
+                 FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&attempt.attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "starting");
+        assert_eq!(supervisor, first.supervisor_authority_id);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM completion_supervisor_inheritance
+                     WHERE authority_id=?1",
+                    [&first.supervisor_authority_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "driver succession must not inherit or supersede its own root"
+        );
+        assert_eq!(
+            db.completion_continuation_owner().unwrap().unwrap(),
+            successor
+        );
+    }
+
+    #[test]
+    fn supervisor_authority_cannot_move_to_another_guardian_incarnation() {
+        let (_dir, mut db, first) = fixture();
+        let mut foreign = first.clone();
+        foreign.owner_generation = uuid::Uuid::new_v4().to_string();
+        foreign.guardian_identity.starttime_ticks += 1;
+        assert!(
+            db.publish_completion_continuation_owner(&foreign)
+                .unwrap_err()
+                .contains("cannot move to a different root")
+        );
+
+        db.conn
+            .execute(
+                "UPDATE completion_continuation_owner SET phase='lost'
+                 WHERE generation=?1",
+                [&first.owner_generation],
+            )
+            .unwrap();
+        assert!(
+            db.publish_completion_continuation_owner(&foreign)
+                .unwrap_err()
+                .contains("cannot move to a different root"),
+            "retiring the live owner must not make its durable authority reusable"
+        );
+    }
+
+    #[test]
+    fn unresolved_supervisor_walk_is_bounded_and_reaches_later_rows() {
+        let (_dir, db, owner) = fixture();
+        for ordinal in 0..5 {
+            db.conn
+                .execute(
+                    "INSERT INTO completion_continuation_attempt(
+                        attempt_id,domain_id,owner_generation,operation,request_sha256,
+                        phase,result_path,supervisor_authority_id)
+                     VALUES(?1,?2,?3,'transport',?4,'unknown_custody',?5,?6)",
+                    params![
+                        format!("page-{ordinal}"),
+                        owner.domain_id,
+                        owner.owner_generation,
+                        "a".repeat(64),
+                        format!("/fixture/page-{ordinal}.json"),
+                        owner.supervisor_authority_id
+                    ],
+                )
+                .unwrap();
+        }
+
+        let first = db
+            .pending_continuation_attempts_for_supervisor_after(
+                &owner.supervisor_authority_id,
+                None,
+                2,
+            )
+            .unwrap();
+        let second = db
+            .pending_continuation_attempts_for_supervisor_after(
+                &owner.supervisor_authority_id,
+                Some((
+                    &first.last().unwrap().owner_generation,
+                    &first.last().unwrap().attempt_id,
+                )),
+                2,
+            )
+            .unwrap();
+        let third = db
+            .pending_continuation_attempts_for_supervisor_after(
+                &owner.supervisor_authority_id,
+                Some((
+                    &second.last().unwrap().owner_generation,
+                    &second.last().unwrap().attempt_id,
+                )),
+                2,
+            )
+            .unwrap();
+        let observed = first
+            .into_iter()
+            .chain(second)
+            .chain(third)
+            .map(|attempt| attempt.attempt_id)
+            .collect::<Vec<_>>();
+        assert_eq!(observed, ["page-0", "page-1", "page-2", "page-3", "page-4"]);
     }
     #[test]
     fn completion_continuation_unknown_listener_is_not_a_response_only_waiver() {
@@ -373,7 +885,7 @@ mod tests {
                 .unwrap()[0]["disposition"],
             "unknown"
         );
-        assert!(!db.close_idle_continuation_generation(&owner, &[]).unwrap());
+        assert!(!db.close_idle_continuation_generation(&owner, None).unwrap());
         assert!(
             db.completion_event_listeners("legacy-unknown").unwrap()[0]
                 .acknowledged_at
@@ -461,7 +973,10 @@ mod tests {
         let (phase, revision, integrated): (String, i64, i64) = db.conn.query_row(
             "SELECT phase,revision,integrated FROM completion_continuation_attempt WHERE attempt_id=?1", [&attempt.attempt_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
         assert_eq!(phase, "unknown_custody");
-        assert_eq!(revision, 4);
+        // Same-root driver succession no longer fabricates a custody-loss
+        // revision. The original legacy attachment itself still closes grant
+        // authority and records the one unknown-custody transition.
+        assert_eq!(revision, 3);
         assert_eq!(integrated, 0);
     }
 
@@ -651,6 +1166,15 @@ mod tests {
             .unwrap();
         assert!(db.completion_continuation_domain().is_err());
     }
+
+    #[test]
+    fn completion_supervisor_schema_fingerprint_rejects_missing_authority_fence() {
+        let (_dir, db, _owner) = fixture();
+        db.conn
+            .execute_batch("DROP TRIGGER completion_attempt_supervisor_authority_insert")
+            .unwrap();
+        assert!(db.completion_continuation_domain().is_err());
+    }
     #[test]
     fn completion_continuation_accepted_and_unknown_attempts_fence_manual_release_and_new_owner() {
         let (_dir, mut db, owner) = fixture();
@@ -693,7 +1217,7 @@ mod tests {
             Ok(true)
         ));
         assert!(
-            !db.close_idle_continuation_generation(&replacement, &[])
+            !db.close_idle_continuation_generation(&replacement, None)
                 .unwrap()
         );
         let mut wrong = owner.driver_identity.clone();
@@ -713,7 +1237,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            db.close_idle_continuation_generation(&replacement, &[])
+            db.close_idle_continuation_generation(&replacement, None)
                 .unwrap()
         );
     }
@@ -801,6 +1325,111 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn root_supervisor_can_settle_only_its_exact_unforked_attempt() {
+        let (_dir, mut db, owner) = fixture();
+        let attempt = reservation(&mut db, &owner);
+        db.accept_continuation_attempt(&attempt).unwrap();
+        let mut wrong = owner.guardian_identity.clone();
+        wrong.starttime_ticks += 1;
+        assert!(
+            db.record_supervisor_never_forked(&attempt, &wrong, "worker spawn failed")
+                .is_err()
+        );
+        db.record_supervisor_never_forked(
+            &attempt,
+            &owner.guardian_identity,
+            "worker spawn failed",
+        )
+        .unwrap();
+        db.record_supervisor_never_forked(
+            &attempt,
+            &owner.guardian_identity,
+            "worker spawn failed",
+        )
+        .unwrap();
+        assert!(
+            db.record_supervisor_never_forked(
+                &attempt,
+                &owner.guardian_identity,
+                "different failure",
+            )
+            .is_err()
+        );
+        let receipt: String = db
+            .conn
+            .query_row(
+                "SELECT drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&attempt.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["gate"], "root_worker_not_forked");
+        assert_eq!(
+            receipt["supervisor"],
+            serde_json::json!(owner.guardian_identity)
+        );
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn root_supervisor_distinguishes_forked_but_unreleased_worker() {
+        let (_dir, mut db, owner) = fixture();
+        let attempt = reservation(&mut db, &owner);
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.record_supervisor_unreleased_worker(
+            &attempt,
+            &owner.guardian_identity,
+            4242,
+            "worker identity unavailable",
+        )
+        .unwrap();
+        db.record_supervisor_unreleased_worker(
+            &attempt,
+            &owner.guardian_identity,
+            4242,
+            "worker identity unavailable",
+        )
+        .unwrap();
+        assert!(
+            db.record_supervisor_unreleased_worker(
+                &attempt,
+                &owner.guardian_identity,
+                4243,
+                "worker identity unavailable",
+            )
+            .is_err()
+        );
+        let receipt: String = db
+            .conn
+            .query_row(
+                "SELECT drain_receipt FROM completion_continuation_attempt
+                 WHERE attempt_id=?1",
+                [&attempt.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(
+            receipt["gate"],
+            "root_worker_forked_execution_grant_not_sent"
+        );
+        assert_eq!(receipt["worker_pid"], 4242);
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn completion_continuation_unreleased_announcement_does_not_claim_no_fork() {
         let (_dir, mut db, owner) = fixture();

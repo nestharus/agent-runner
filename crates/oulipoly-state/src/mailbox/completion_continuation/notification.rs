@@ -452,6 +452,8 @@ mod tests {
             DROP TABLE completion_continuation_notification; PRAGMA user_version=18;",
             )
             .unwrap();
+        super::super::schema::remove_completion_recovery_working_set_for_legacy_fixture(&db.conn);
+        db.conn.pragma_update(None, "user_version", 18).unwrap();
         db = MailboxDb::open(&root.path().join("pid-identity.db")).unwrap();
         let historical = db
             .completion_notification_diagnostics("receipt-event")

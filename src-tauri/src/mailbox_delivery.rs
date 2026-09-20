@@ -1740,19 +1740,30 @@ mod tests {
     fn remove_continuation_schema_for_legacy_fixture(connection: &rusqlite::Connection) {
         connection
             .execute_batch(
-                "DROP VIEW mailbox_retained_delivery_finalizers;
+                "DROP TRIGGER completion_owner_supervisor_authority_insert;
+        DROP TRIGGER completion_owner_supervisor_authority_immutable;
+        DROP TRIGGER completion_source_supervisor_authority_insert;
+        DROP TRIGGER completion_source_supervisor_authority_immutable;
+        DROP TRIGGER completion_attempt_supervisor_authority_insert;
+        DROP TRIGGER completion_attempt_supervisor_authority_immutable;
+        DROP INDEX completion_continuation_attempt_unresolved;
+        DROP INDEX completion_continuation_source_unaccepted;
+        DROP INDEX completion_supervisor_inheritance_predecessor;
+        DROP TABLE completion_supervisor_inheritance;
+        DROP VIEW mailbox_retained_delivery_finalizers;
         DROP INDEX mailbox_completed_turn_pins_attempt;
         DROP TABLE mailbox_completed_turn_pins;
         DROP TABLE mailbox_completed_turn_tails;
         DROP TRIGGER completion_continuation_notification_ack;
-            DROP TABLE completion_continuation_notification;
-            DROP TABLE completion_continuation_attempt;
-            DROP TABLE completion_continuation_source;
-            DROP TABLE completion_continuation_context;
-            DROP TABLE completion_continuation_owner;
-            DROP TABLE completion_continuation_domain;
-            DROP TRIGGER completion_continuation_claim_delete;
-            DROP TRIGGER completion_continuation_claim_replace;",
+        DROP TABLE completion_continuation_notification;
+        DROP TABLE completion_continuation_attempt;
+        DROP TABLE completion_continuation_source;
+        DROP TABLE completion_continuation_context;
+        DROP TABLE completion_continuation_owner;
+        DROP TABLE completion_supervisor_authority;
+        DROP TABLE completion_continuation_domain;
+        DROP TRIGGER completion_continuation_claim_delete;
+        DROP TRIGGER completion_continuation_claim_replace;",
             )
             .unwrap();
     }

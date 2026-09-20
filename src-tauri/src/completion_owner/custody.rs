@@ -4,7 +4,9 @@ use oulipoly_state::completion_continuation::{
     AdmittedSourceBinding, MAX_REGISTRATION_BYTES, open_source_file, read_source_file, sha256,
 };
 use oulipoly_state::mailbox::{ContinuationAttempt, MailboxDb};
-use std::io::{Read, Seek, Write};
+#[cfg(test)]
+use std::io::Seek;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
@@ -15,6 +17,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 mod birth_tests;
+#[cfg(test)]
 mod independent_waits;
 mod never_forked;
 
@@ -22,6 +25,7 @@ mod never_forked;
 /// Keep this exact process until integration succeeds. No workload, reservation,
 /// or failed outer operation is replayed. Permanent media failure retains duty;
 /// uncatchable death remains outside the survival guarantee.
+#[cfg(test)]
 pub(super) fn finish_original_testimony() {
     #[cfg(test)]
     BEFORE_TESTIMONY_FINISH.with_borrow_mut(|hook| {
@@ -37,12 +41,14 @@ pub(super) fn finish_original_testimony() {
     }
 }
 
+#[cfg(test)]
 pub(super) const ADOPTER_ARG: &str = "__completion-continuation-adopter-v2";
 
+#[cfg(test)]
 pub(super) const CUSTODIAN_ARG: &str = "__completion-continuation-custodian-v2";
 
 #[derive(serde::Serialize, serde::Deserialize)]
-enum LaunchRecipe {
+pub(super) enum LaunchRecipe {
     Source(AdmittedSourceBinding),
     Native {
         args: Vec<Vec<u8>>,
@@ -51,10 +57,10 @@ enum LaunchRecipe {
     },
 }
 #[derive(serde::Serialize, serde::Deserialize)]
-struct CustodianRequest {
-    path: std::path::PathBuf,
-    attempt: ContinuationAttempt,
-    recipe: LaunchRecipe,
+pub(super) struct CustodianRequest {
+    pub(super) path: std::path::PathBuf,
+    pub(super) attempt: ContinuationAttempt,
+    pub(super) recipe: LaunchRecipe,
 }
 
 pub(super) fn spawn_source(
@@ -74,7 +80,22 @@ where
     F: FnOnce() -> Result<Command, String>,
 {
     use std::os::unix::ffi::OsStrExt;
-    let command = command()?;
+    let mut command = command()?;
+    // The launch request originates in the driver, but the root worker is a
+    // child of the guardian. The guardian was forked before the bootstrap
+    // caller published ENDPOINT_ENV, so ordinary inherited environment cannot
+    // carry the authenticated owner endpoint across this authority boundary.
+    // Pin it into the immutable native recipe. Without this binding the marked
+    // wake child correctly rejects entry before it can admit its exact launch.
+    #[cfg(test)]
+    let root_supervised = super::root_supervisor::driver_channel_installed();
+    #[cfg(not(test))]
+    let root_supervised = true;
+    if root_supervised {
+        let endpoint = std::env::var_os(super::ENDPOINT_ENV)
+            .ok_or("native activation has no inherited completion endpoint")?;
+        command.env(super::ENDPOINT_ENV, endpoint);
+    }
     let recipe = LaunchRecipe::Native {
         args: command.get_args().map(|v| v.as_bytes().to_vec()).collect(),
         environment: command
@@ -151,6 +172,7 @@ thread_local! {
 // An ignored SIGCHLD disposition survives exec. With automatic child reaping,
 // a successful fork is not a retained wait capability, so refuse BEFORE accepting
 // or forking this attempt. Do not mutate process-global signal policy here.
+#[cfg(test)]
 fn require_retained_child_waits() -> Result<(), String> {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) } != 0 {
@@ -163,6 +185,19 @@ fn require_retained_child_waits() -> Result<(), String> {
 }
 
 fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Result<i64, String> {
+    #[cfg(test)]
+    if !super::root_supervisor::driver_channel_installed() {
+        return legacy_spawn(path, attempt, recipe);
+    }
+    super::root_supervisor::request_launch(path, attempt, recipe)
+}
+
+#[cfg(test)]
+fn legacy_spawn(
+    path: &Path,
+    attempt: &ContinuationAttempt,
+    recipe: LaunchRecipe,
+) -> Result<i64, String> {
     // This retained request is intent only. Database acceptance still precedes
     // fork and the launch gate; an unadmitted request cannot launch anything.
     let request = CustodianRequest {
@@ -285,11 +320,30 @@ fn spawn(path: &Path, attempt: &ContinuationAttempt, recipe: LaunchRecipe) -> Re
     Ok(i64::from(pid))
 }
 
+pub(super) fn request_path(attempt: &ContinuationAttempt) -> Result<std::path::PathBuf, String> {
+    let directory = Path::new(&attempt.result_path)
+        .parent()
+        .ok_or("attempt result has no parent")?;
+    Ok(directory.join("custodian-request.json"))
+}
+
+pub(super) fn read_request(path: &Path) -> Result<CustodianRequest, String> {
+    let directory = path.parent().ok_or("request directory absent")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("request filename is not UTF-8")?;
+    let bytes = read_source_file(directory, name, 4 * 1024 * 1024)?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
 /// Birth and grant are small whole records. Packet boundaries prevent a child
 /// dying during an announcement from splicing a partial PID with the adopter's
 /// later terminal announcement. Each record carries the original incarnation,
 /// not a number that could be resolved against a later process.
+#[cfg(test)]
 const BIRTH_PACKET_BYTES: usize = 512;
+#[cfg(test)]
 fn encode_birth(
     identity: &oulipoly_state::completion_continuation::SourceProcessIdentity,
 ) -> Result<[u8; BIRTH_PACKET_BYTES], String> {
@@ -301,6 +355,7 @@ fn encode_birth(
     packet[..value.len()].copy_from_slice(&value);
     Ok(packet)
 }
+#[cfg(test)]
 fn decode_birth(
     packet: &[u8; BIRTH_PACKET_BYTES],
 ) -> Result<oulipoly_state::completion_continuation::SourceProcessIdentity, String> {
@@ -313,6 +368,7 @@ fn decode_birth(
     }
     serde_json::from_slice(&packet[..end]).map_err(|e| e.to_string())
 }
+#[cfg(test)]
 fn birth_channel() -> std::io::Result<(UnixStream, UnixStream)> {
     use std::os::fd::FromRawFd;
     let mut fds = [-1; 2];
@@ -335,6 +391,7 @@ fn birth_channel() -> std::io::Result<(UnixStream, UnixStream)> {
     })
 }
 
+#[cfg(test)]
 fn read_ac_announcement(
     path: &Path,
     driver: &oulipoly_state::completion_continuation::SourceProcessIdentity,
@@ -383,6 +440,7 @@ fn read_ac_announcement(
 /// itself. EOF before a complete identity, joined to the original adopter wait
 /// and this driver's unsent execution grant, proves no effects were released.
 /// It does NOT prove no process was forked (a gated AC might also have died).
+#[cfg(test)]
 fn retain_unreleased_adopter_loss(
     path: &Path,
     attempt: &ContinuationAttempt,
@@ -433,6 +491,7 @@ fn retain_unreleased_adopter_loss(
 
 // Keep the original announced incarnation across returning lookup errors. A
 // current numeric PID lookup can confirm it, never replace its provenance.
+#[cfg(test)]
 fn birth_identity(
     announced: &oulipoly_state::completion_continuation::SourceProcessIdentity,
 ) -> Result<oulipoly_state::completion_continuation::SourceProcessIdentity, String> {
@@ -472,11 +531,13 @@ fn birth_identity(
 // The PID is not an incarnation. Only this original's exclusive, unconsumed
 // child wait keeps it from reuse while identity is unresolved. ECHILD revokes
 // that capability permanently; a later occupant can never repair it.
+#[cfg(test)]
 struct UnreapedAdopter {
     pid: i32,
     identity: Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
     ownership_lost: bool,
 }
+#[cfg(test)]
 impl UnreapedAdopter {
     fn resolve(
         &mut self,
@@ -518,6 +579,7 @@ impl UnreapedAdopter {
     }
 }
 
+#[cfg(test)]
 #[derive(PartialEq)]
 enum ExecutionGrant {
     NotSent,
@@ -526,6 +588,7 @@ enum ExecutionGrant {
     Attempted,
 }
 
+#[cfg(test)]
 struct PendingUnreleased {
     path: std::path::PathBuf,
     attempt: ContinuationAttempt,
@@ -536,6 +599,7 @@ struct PendingUnreleased {
     announced: Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
     custodian: Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
 }
+#[cfg(test)]
 thread_local! {
     static PENDING_UNRELEASED: std::cell::RefCell<Vec<PendingUnreleased>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -543,17 +607,23 @@ thread_local! {
 // Only the original process owns these descriptors and kernel waits. Discard
 // fork copies BEFORE close_except or descriptor reuse, not on a later reap.
 pub(super) fn pending_birth_fds() -> Vec<i32> {
-    independent_waits::discard_fork_copies();
-    let current = i64::from(std::process::id());
-    PENDING_UNRELEASED.with_borrow_mut(|pending| {
-        pending.retain(|p| p.driver.pid == current);
-        pending
-            .iter()
-            .filter_map(|p| p.socket.as_ref().map(AsRawFd::as_raw_fd))
-            .collect()
-    })
+    #[cfg(not(test))]
+    return Vec::new();
+    #[cfg(test)]
+    {
+        independent_waits::discard_fork_copies();
+        let current = i64::from(std::process::id());
+        PENDING_UNRELEASED.with_borrow_mut(|pending| {
+            pending.retain(|p| p.driver.pid == current);
+            pending
+                .iter()
+                .filter_map(|p| p.socket.as_ref().map(AsRawFd::as_raw_fd))
+                .collect()
+        })
+    }
 }
 
+#[cfg(test)]
 impl PendingUnreleased {
     fn start(&mut self) -> Result<(), String> {
         let adopter = self.adopter.resolve()?;
@@ -628,6 +698,7 @@ impl PendingUnreleased {
 
 /// One attempt per pending owner per OUTER reap pass, not per reaped child.
 /// Returning storage errors do not cause a retry-until-success loop.
+#[cfg(test)]
 pub(super) fn retry_unreleased() {
     never_forked::retry_pending();
     let _ = pending_birth_fds();
@@ -636,6 +707,7 @@ pub(super) fn retry_unreleased() {
     });
 }
 
+#[cfg(test)]
 fn retain_unfinished_birth(birth: &mut PendingUnreleased) -> bool {
     if birth.retry().is_err() {
         return true;
@@ -651,15 +723,21 @@ fn retain_unfinished_birth(birth: &mut PendingUnreleased) -> bool {
 /// then reap unprotected exact child PIDs. Enumerating candidates is not drain
 /// evidence; only waitpid/waitid supply terminal/ECHILD observations.
 pub(super) fn reap_unprotected(status: &mut i32) -> i32 {
-    let independent = independent_waits::reap(status);
-    if independent > 0 {
-        return independent;
+    #[cfg(not(test))]
+    return unsafe { libc::waitpid(-1, status, libc::WNOHANG) };
+    #[cfg(test)]
+    {
+        let independent = independent_waits::reap(status);
+        if independent > 0 {
+            return independent;
+        }
+        let waited = reap_generic_unprotected(status);
+        independent_waits::observe_wait(waited);
+        waited
     }
-    let waited = reap_generic_unprotected(status);
-    independent_waits::observe_wait(waited);
-    waited
 }
 
+#[cfg(test)]
 fn reap_generic_unprotected(status: &mut i32) -> i32 {
     #[cfg(feature = "age360-fault-fixtures")]
     if PENDING_UNRELEASED.with_borrow(|pending| pending.iter().any(|p| p.announced.is_none())) {
@@ -709,6 +787,7 @@ fn reap_generic_unprotected(status: &mut i32) -> i32 {
     0
 }
 
+#[cfg(test)]
 pub(super) fn entry() -> Result<(), String> {
     use std::os::fd::FromRawFd;
     let fd = |index| -> Result<i32, String> {
@@ -868,6 +947,275 @@ pub(super) fn entry() -> Result<(), String> {
     Ok(())
 }
 
+/// Physical worker beneath the one root authority. It can isolate and drain
+/// one child tree and retain an immutable receipt, but it cannot open the
+/// PID-mailbox, mutate attempt authority, replay work, or classify a retry.
+pub(super) fn root_worker_entry() -> Result<(), String> {
+    use std::os::fd::FromRawFd;
+    let fd = |index| -> Result<i32, String> {
+        std::env::args()
+            .nth(index)
+            .ok_or("missing root worker descriptor")?
+            .parse()
+            .map_err(|_| "invalid root worker descriptor".into())
+    };
+    let gate_fd = fd(2)?;
+    let request_fd = fd(3)?;
+    let cancellation_fd = fd(4)?;
+    if [gate_fd, request_fd, cancellation_fd]
+        .iter()
+        .any(|fd| *fd < 3)
+        || gate_fd == request_fd
+        || gate_fd == cancellation_fd
+        || request_fd == cancellation_fd
+    {
+        return Err("invalid root worker descriptor identity".into());
+    }
+    let mut gate = unsafe { UnixStream::from_raw_fd(gate_fd) };
+    let mut file = unsafe { std::fs::File::from_raw_fd(request_fd) };
+    let mut cancellation = unsafe { UnixStream::from_raw_fd(cancellation_fd) };
+    set_close_on_exec(cancellation.as_raw_fd())?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err("root worker request too large".into());
+    }
+    let request: CustodianRequest =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    drop(file);
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let identity = super::linux::identity(i64::from(std::process::id()))?;
+    let mut byte = [0];
+    if gate.read_exact(&mut byte).is_err() || byte != [1] {
+        return Ok(());
+    }
+    drop(gate);
+    cancellation
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    let attempt = &request.attempt;
+    // The launched process must be the worker's direct child: native wake
+    // admission authenticates this exact parent/child custody edge before the
+    // provider can run. As a subreaper, the worker subsequently adopts every
+    // daemonized descendant when its nearer parent exits. Therefore ECHILD is
+    // an observation about the complete launched tree, not only the original
+    // launcher. An intermediate executor would break the authenticated edge
+    // and make a valid wake child look foreign.
+    let launch = launch_command(&request.recipe, attempt);
+    let (mut child, spawn_error) = match launch {
+        Ok(child) => (Some(child), None),
+        Err(error) => (None, Some(error)),
+    };
+    let spawn_failed = child.is_none();
+    let mut root_exit_code = None;
+    let mut root_wait_status = None;
+    let mut cancellation_started: Option<(String, std::time::Instant)> = None;
+    let mut cancellation_frame = Vec::new();
+    loop {
+        if cancellation_started.is_none() {
+            let mut frame_bytes = [0; 4096];
+            match cancellation.read(&mut frame_bytes) {
+                Ok(0) => {
+                    cancellation_started = Some((
+                        "root_supervisor_authority_lost".into(),
+                        std::time::Instant::now(),
+                    ));
+                }
+                Ok(count) => {
+                    cancellation_frame.extend_from_slice(&frame_bytes[..count]);
+                    if cancellation_frame.len() > 4096 {
+                        cancellation_started = Some((
+                            "root_supervisor_cancellation_frame_oversized".into(),
+                            std::time::Instant::now(),
+                        ));
+                    } else if let Some(end) =
+                        cancellation_frame.iter().position(|byte| *byte == b'\n')
+                    {
+                        let identity = std::str::from_utf8(&cancellation_frame[..end])
+                            .ok()
+                            .filter(|identity| !identity.is_empty())
+                            .unwrap_or("root_supervisor_cancellation_frame_invalid")
+                            .to_owned();
+                        cancellation_started = Some((identity, std::time::Instant::now()));
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => {
+                    cancellation_started = Some((
+                        "root_supervisor_cancellation_channel_failed".into(),
+                        std::time::Instant::now(),
+                    ));
+                }
+            }
+        }
+        if let Some((_, started)) = &cancellation_started {
+            let signal =
+                if started.elapsed() >= oulipoly_core::launch_custody::TERMINATION_GRACE_PERIOD {
+                    libc::SIGKILL
+                } else {
+                    libc::SIGTERM
+                };
+            let _ = oulipoly_core::launch_custody::signal_owned_children(signal);
+        }
+        let (waited, status, _) = reap_adopted_child(Some((attempt, &identity)))?;
+        if child
+            .as_ref()
+            .is_some_and(|process| process.id() as i32 == waited)
+        {
+            let exit = std::process::ExitStatus::from_raw(status);
+            root_exit_code = exit.code();
+            root_wait_status = Some(status);
+            child = None;
+            // An abnormal launcher death is itself a root-owned cancellation
+            // observation. Do not leave daemonized descendants running merely
+            // because the State cancellation writer never got a chance to
+            // publish. Orderly launcher exit may intentionally leave a child
+            // tree to drain and therefore is not synthesized as cancellation.
+            if cancellation_started.is_none()
+                && let Some(signal) = exit.signal()
+            {
+                cancellation_started = Some((
+                    format!("root_launcher_wait_signal:{signal}"),
+                    std::time::Instant::now(),
+                ));
+            }
+        }
+        if waited < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                if child.is_some() {
+                    return Err("root supervisor launcher wait missing".into());
+                }
+                break;
+            }
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.to_string());
+            }
+        }
+        if waited <= 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let classification = if attempt.operation == "source_recovery" && !spawn_failed {
+        classify_source_reply_from_request(attempt, &request.recipe).unwrap_or_else(
+            |error| serde_json::json!({"classification":"uncertain_response","error":error}),
+        )
+    } else {
+        serde_json::json!({"classification":"native_wait_result"})
+    };
+    persist_root_worker_result(
+        attempt,
+        &identity,
+        RootLaunchResult {
+            spawn_failed,
+            spawn_error,
+            root_exit_code,
+            root_wait_status,
+        },
+        cancellation_started.as_ref().map(|value| value.0.as_str()),
+        classification,
+    )?;
+    Ok(())
+}
+
+struct RootLaunchResult {
+    spawn_failed: bool,
+    spawn_error: Option<String>,
+    root_exit_code: Option<i32>,
+    root_wait_status: Option<i32>,
+}
+
+fn persist_root_worker_result(
+    attempt: &ContinuationAttempt,
+    identity: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+    launch: RootLaunchResult,
+    accepted_cancellation: Option<&str>,
+    response: serde_json::Value,
+) -> Result<(), String> {
+    use oulipoly_state::diagnostic_recorder::{
+        DiagnosticPhase, PhaseObservation, SpanStart, process_recorder,
+    };
+    let terminal_start = SpanStart::new("root_worker_terminal_result", "process_tree")
+        .with_lifecycle_phase("completion_terminal_authority")
+        .with_hashed_correlation("attempt_id", &attempt.attempt_id);
+    process_recorder().with_requested_span(terminal_start, |span| {
+        if launch.spawn_failed {
+            let mut observation =
+                PhaseObservation::not_started().with_cause("provider_spawn_failed");
+            if let Some(error) = launch.spawn_error.as_deref() {
+                observation = observation.with_cause(error);
+            }
+            let _ = span.record(DiagnosticPhase::Failed, observation);
+        } else {
+            let mut observation = PhaseObservation::terminal().with_cause("provider_tree_echild");
+            if let Some(status) = launch.root_wait_status {
+                let exit = std::process::ExitStatus::from_raw(status);
+                if let Some(code) = exit.code() {
+                    observation = observation.with_cause(format!("provider_exit_code:{code}"));
+                } else if let Some(signal) = exit.signal() {
+                    observation = observation.with_cause(format!("provider_exit_signal:{signal}"));
+                }
+            }
+            let _ = span.record(DiagnosticPhase::Committed, observation);
+        }
+    });
+    let receipt = serde_json::json!({
+        "attempt_id": attempt.attempt_id,
+        "custodian": identity,
+        "root_exit_code": launch.root_exit_code,
+        "root_wait_status": launch.root_wait_status,
+        "spawn_failed": launch.spawn_failed,
+        "spawn_error": launch.spawn_error,
+        "accepted_cancellation": accepted_cancellation,
+        "response": response,
+        "owned_children": "ECHILD",
+        "result_retained": true,
+        "authority": "root_supervisor",
+    });
+    let bytes = serde_json::to_vec(&receipt).map_err(|error| error.to_string())?;
+    let mut retained_error = None;
+    loop {
+        match durable_write(Path::new(&attempt.result_path), &bytes) {
+            Ok(()) => break,
+            Err(error) => {
+                if retained_error.as_deref() != Some(error.as_str()) {
+                    let start = SpanStart::new("root_worker_result_persistence", "filesystem")
+                        .with_lifecycle_phase("completion_terminal_authority")
+                        .with_hashed_correlation("attempt_id", &attempt.attempt_id);
+                    process_recorder().with_requested_span(start, |span| {
+                        let _ = span.record(
+                            DiagnosticPhase::Failed,
+                            PhaseObservation::started_unknown()
+                                .with_cause("terminal_result_persistence_deferred")
+                                .with_cause(&error),
+                        );
+                    });
+                }
+                retained_error = Some(error);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn set_close_on_exec(fd: i32) -> Result<(), String> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
 fn source_command(
     binding: &AdmittedSourceBinding,
     attempt: &ContinuationAttempt,
@@ -951,6 +1299,7 @@ fn source_command(
     Ok(command)
 }
 
+#[cfg(test)]
 pub(super) fn owned_tree_empty() -> Result<bool, String> {
     loop {
         let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
@@ -990,6 +1339,7 @@ pub(super) fn durable_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 fn classify_source_reply(attempt: &ContinuationAttempt) -> Result<serde_json::Value, String> {
     let directory = Path::new(&attempt.result_path)
         .parent()
@@ -1009,6 +1359,39 @@ fn classify_source_reply(attempt: &ContinuationAttempt) -> Result<serde_json::Va
             })
         })
         .ok_or("source reply has no retained admission")?;
+    classify_source_reply_with_binding(attempt, &binding, &bytes, &value)
+}
+
+fn classify_source_reply_from_request(
+    attempt: &ContinuationAttempt,
+    recipe: &LaunchRecipe,
+) -> Result<serde_json::Value, String> {
+    let LaunchRecipe::Source(binding) = recipe else {
+        return Err("source recovery request has no source binding".into());
+    };
+    let directory = Path::new(&attempt.result_path)
+        .parent()
+        .ok_or("attempt result directory absent")?;
+    let bytes = read_source_file(directory, "stdout.json", MAX_REGISTRATION_BYTES)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    classify_source_reply_with_binding(attempt, binding, &bytes, &value)
+}
+
+fn classify_source_reply_with_binding(
+    attempt: &ContinuationAttempt,
+    binding: &AdmittedSourceBinding,
+    bytes: &[u8],
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if binding.registration()?.registration_id.as_str()
+        != attempt
+            .source_registration_id
+            .as_deref()
+            .ok_or("source recovery attempt has no registration")?
+    {
+        return Err("source reply registration conflicts with launch request".into());
+    }
     let expected = serde_json::to_value(binding.identity()?).map_err(|e| e.to_string())?;
     for (key, expected) in expected.as_object().ok_or("invalid source identity")? {
         if value.get(key) != Some(expected) {
@@ -1019,24 +1402,26 @@ fn classify_source_reply(attempt: &ContinuationAttempt) -> Result<serde_json::Va
         Some("source_ready" | "source_output_missing") => {
             let evidence =
                 oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
-                    &binding,
+                    binding,
                 )?;
-            evidence.validate_source_reply(&value)?;
+            evidence.validate_source_reply(value)?;
         }
         Some("pending" | "conflict" | "unavailable") => {}
         _ => return Err("source reply missing/unsupported status".into()),
     }
     Ok(
-        serde_json::json!({"classification":"structured_source_response","stdout_sha256":sha256(&bytes),"stdout_byte_len":bytes.len(),"reply":value}),
+        serde_json::json!({"classification":"structured_source_response","stdout_sha256":sha256(bytes),"stdout_byte_len":bytes.len(),"reply":value}),
     )
 }
 
+#[cfg(test)]
 fn persist_result_until_retained(path: &Path, bytes: &[u8]) {
     while durable_write(path, bytes).is_err() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct ActivationObservation {
     launcher: Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
@@ -1047,6 +1432,7 @@ struct ActivationObservation {
 /// observer owns ordinary writer connections in a separate thread, not snapshot
 /// helper children intermingled with the custodian's wait set. One latest-value
 /// slot bounds transport memory; persisted cancellation is queried until read.
+#[cfg(test)]
 fn activation_observer(
     path: &Path,
     attempt: &ContinuationAttempt,
@@ -1061,6 +1447,7 @@ fn activation_observer(
     Some(receiver)
 }
 
+#[cfg(test)]
 fn observe_activation_database(
     path: std::path::PathBuf,
     attempt: ContinuationAttempt,
@@ -1080,6 +1467,7 @@ fn observe_activation_database(
     }
 }
 
+#[cfg(test)]
 fn read_activation_observation(
     path: &Path,
     attempt: &ContinuationAttempt,
@@ -1110,6 +1498,21 @@ fn read_activation_cancellation(
     state.connection().query_row("SELECT l.logical_launch_id || ':' || l.cancel_requested_at FROM provider_launch_attempts a JOIN provider_logical_launches l ON l.logical_launch_id=a.logical_launch_id WHERE a.runtime_generation_uuid=?1 AND a.invocation_uuid=?2 AND l.cancel_requested_at IS NOT NULL",rusqlite::params![generation,invocation],|r|r.get(0)).optional().map_err(|e|e.to_string())
 }
 
+pub(super) fn root_cancellation_identity(
+    path: &Path,
+    attempt: &ContinuationAttempt,
+) -> Result<Option<String>, String> {
+    if attempt.operation != "activation" {
+        return Ok(None);
+    }
+    let runtime = MailboxDb::open(path)?.continuation_runtime_identity(attempt)?;
+    let Some((generation, invocation)) = runtime else {
+        return Ok(None);
+    };
+    read_activation_cancellation(&generation, &invocation)
+}
+
+#[cfg(test)]
 fn latest_activation_observation(
     receiver: &Option<std::sync::mpsc::Receiver<ActivationObservation>>,
 ) -> Option<ActivationObservation> {
@@ -1119,6 +1522,7 @@ fn latest_activation_observation(
 /// An original per-attempt adopting boundary exists before AC starts. This is
 /// not a replacement's empty tree: every launched descendant stays beneath it
 /// on AC loss, independently of domain guardian/driver replacement.
+#[cfg(test)]
 fn adopt(
     request: CustodianRequest,
     mut gate: UnixStream,
@@ -1309,6 +1713,7 @@ fn adopt(
 /// A living unannounced AC retains birth authority. Only its original parent,
 /// observing that exact child with WNOWAIT, may relay its terminal identity.
 /// The wait stays unconsumed until the ordinary adopting journal retains it.
+#[cfg(test)]
 fn read_original_grant(
     gate: &mut UnixStream,
     pid: i32,
@@ -1339,6 +1744,7 @@ fn read_original_grant(
     }
 }
 
+#[cfg(test)]
 fn exact_child_terminal(
     pid: i32,
     expected: &oulipoly_state::completion_continuation::SourceProcessIdentity,
@@ -1366,6 +1772,7 @@ fn exact_child_terminal(
 
 /// Observe only the original, still-owned fork child. Errors/absence are not
 /// death evidence; WNOWAIT preserves the ordinary identity/journal/reap path.
+#[cfg(test)]
 fn original_child_is_waitable(pid: i32) -> bool {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let result = unsafe {
@@ -1514,4 +1921,33 @@ pub(super) fn replay_result(path: &Path, attempt: &ContinuationAttempt) -> Resul
         attempt,
         std::str::from_utf8(&bytes).map_err(|e| e.to_string())?,
     )
+}
+
+pub(super) fn replay_root_result(
+    path: &Path,
+    attempt: &ContinuationAttempt,
+    expected_worker: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+) -> Result<(), String> {
+    let result = Path::new(&attempt.result_path);
+    let directory = result.parent().ok_or("result parent absent")?;
+    let bytes = read_source_file(directory, "result.json", MAX_REGISTRATION_BYTES)?;
+    let receipt = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if value["attempt_id"] != attempt.attempt_id
+        || value["owned_children"] != "ECHILD"
+        || value["authority"] != "root_supervisor"
+        || value["custodian"]
+            != serde_json::to_value(expected_worker).map_err(|error| error.to_string())?
+    {
+        return Err("root supervisor retained result evidence conflict".into());
+    }
+    let mut mailbox = MailboxDb::open(path)?;
+    if value["spawn_failed"] == true {
+        mailbox.cancel_unreleased_continuation_gate(attempt, expected_worker, receipt)
+    } else if value["result_retained"] == true && value["root_wait_status"].as_i64().is_some() {
+        mailbox.discharge_continuation_attempt(attempt, expected_worker, receipt)
+    } else {
+        Err("root supervisor retained result lacks launch/wait evidence".into())
+    }
 }

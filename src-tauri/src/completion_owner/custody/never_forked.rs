@@ -21,6 +21,7 @@ thread_local! {
 
 /// Only the two conclusive pre-fork syscall error branches call this producer.
 /// Memory custody is installed before either filesystem or SQLite persistence.
+#[cfg(test)]
 pub(super) fn retain(
     path: &Path,
     attempt: &ContinuationAttempt,
@@ -40,6 +41,7 @@ pub(super) fn retain(
 
 /// One attempt per existing outer custody pass, with the same original owner.
 /// Fork copies cannot testify for the original process.
+#[cfg(test)]
 pub(super) fn retry_pending() {
     let pid = i64::from(std::process::id());
     PENDING.with_borrow_mut(|pending| {
@@ -50,6 +52,7 @@ pub(super) fn retry_pending() {
 /// A process may not voluntarily exit while it is the only authorized original
 /// witness. This is continuing evidence integration, never another launch or a
 /// replacement's inference from its empty child set.
+#[cfg(test)]
 pub(super) fn has_pending() -> bool {
     let pid = i64::from(std::process::id());
     PENDING.with_borrow(|pending| pending.iter().any(|e| e.driver.pid == pid))
@@ -241,7 +244,9 @@ mod tests {
             std::fs::set_permissions(&authority, permissions).unwrap();
             sql.execute_batch("DROP TRIGGER fail_receipt").unwrap();
         });
-        let outer = crate::completion_owner::driver::run(&path, &owner, -1).unwrap_err();
+        let (driver_channel, _root_channel) = std::os::unix::net::UnixStream::pair().unwrap();
+        let outer =
+            crate::completion_owner::driver::run(&path, &owner, driver_channel).unwrap_err();
         repair.join().unwrap();
         assert!(outer.contains("Permission denied"), "{outer}");
         assert!(!has_pending());

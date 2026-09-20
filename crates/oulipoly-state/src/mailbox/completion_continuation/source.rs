@@ -75,12 +75,45 @@ impl CompletionAuthorityFence<'_> {
                 Err("immutable completion binding conflict".into())
             };
         }
-        self.tx.execute("INSERT INTO completion_continuation_source(registration_id,domain_id,source_id,event_id,registration_digest,binding) VALUES(?1,?2,?3,?4,?5,?6)", params![source.registration_id,source.domain_id,source.source_id,source.handle,binding.registration_digest(),bytes]).map_err(|e| e.to_string())?;
+        let supervisor_authority_id: String = self
+            .tx
+            .query_row(
+                "SELECT supervisor_authority_id
+                 FROM completion_continuation_owner
+                 WHERE domain_id=?1 AND phase='running'",
+                [&source.domain_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        self.tx.execute("INSERT INTO completion_continuation_source(registration_id,domain_id,source_id,event_id,registration_digest,binding,supervisor_authority_id) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![source.registration_id,source.domain_id,source.source_id,source.handle,binding.registration_digest(),bytes,supervisor_authority_id]).map_err(|e| e.to_string())?;
         Ok(())
     }
 }
 
 impl MailboxDb {
+    pub(crate) fn has_original_completion_source(
+        &self,
+        binding: &AdmittedSourceBinding,
+    ) -> Result<bool, String> {
+        let source = binding.registration()?;
+        let retained: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT binding FROM completion_continuation_source
+                 WHERE registration_id=?1 AND domain_id=?2",
+                params![source.registration_id, source.domain_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        retained
+            .map(|bytes| {
+                AdmittedSourceBinding::decode(&bytes).map(|original| original.same_source(binding))
+            })
+            .transpose()
+            .map(|matched| matched.unwrap_or(false))
+    }
+
     /// A coherent live observation of exact projection and reconciliation, not
     /// acceptance or mutation authority. A missed/changed row still needs repair.
     pub(crate) fn continuation_projection_matches(

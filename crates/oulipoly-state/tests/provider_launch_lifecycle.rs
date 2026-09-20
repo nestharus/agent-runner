@@ -1368,6 +1368,7 @@ fn native_publication_fixture(
     let owner = CompletionDomainOwner {
         protocol: oulipoly_state::completion_continuation::PROTOCOL.into(),
         domain_id: mailbox.completion_continuation_domain().unwrap().unwrap(),
+        supervisor_authority_id: Uuid::new_v4().to_string(),
         owner_generation: Uuid::new_v4().to_string(),
         guardian_identity: identity.clone(),
         driver_identity: identity.clone(),
@@ -1380,8 +1381,8 @@ fn native_publication_fixture(
     let conn = Connection::open(&path).unwrap();
     conn.execute("INSERT INTO runtime_generation(generation_uuid,lifecycle_state,spawn_invocation_uuid,runtime_mode,provider_name,created_at,exited_at,terminal_reason) VALUES(?1,'exited',?2,'headless','fixture','now','now','recovered_dead')",
         params![lease.runtime_generation_uuid.to_string(), lease.owner.invocation_uuid.to_string()]).unwrap();
-    conn.execute("INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,session_id,claim_token,phase,revision,custodian_identity,adopter_identity,spawn_invocation_uuid,runtime_generation_uuid,result_path,integrated,drain_receipt) VALUES(?1,?2,?3,'activation',?4,'fixture','claim','drained',1,?5,?5,?6,?7,'fixture',1,?8)",
-        params![Uuid::new_v4().to_string(),owner.domain_id,owner.owner_generation,"a".repeat(64),serde_json::to_string(&identity).unwrap(),lease.owner.invocation_uuid.to_string(),lease.runtime_generation_uuid.to_string(),r#"{"accepted_cancellation":"fixture"}"#]).unwrap();
+    conn.execute("INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,session_id,claim_token,phase,revision,custodian_identity,adopter_identity,spawn_invocation_uuid,runtime_generation_uuid,result_path,integrated,drain_receipt,supervisor_authority_id) VALUES(?1,?2,?3,'activation',?4,'fixture','claim','drained',1,?5,?5,?6,?7,'fixture',1,?8,?9)",
+        params![Uuid::new_v4().to_string(),owner.domain_id,owner.owner_generation,"a".repeat(64),serde_json::to_string(&identity).unwrap(),lease.owner.invocation_uuid.to_string(),lease.runtime_generation_uuid.to_string(),r#"{"accepted_cancellation":"fixture"}"#,owner.supervisor_authority_id]).unwrap();
     let published = MailboxDb::read_native_publication(
         &path,
         &lease.runtime_generation_uuid.to_string(),
