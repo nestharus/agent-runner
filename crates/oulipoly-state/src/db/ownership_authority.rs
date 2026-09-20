@@ -6,6 +6,11 @@
 
 use super::{InvocationStatus, RusqliteOptionalExtension, StateDb, sqlite};
 use crate::completion_continuation::AdmittedSourceBinding;
+use crate::diagnostic_producer::{
+    TransactionAttempt, TransactionPhaseGuard, record_effects_possible_failure,
+    record_sqlite_failure, record_unacquired_release,
+};
+use crate::diagnostic_recorder::{DiagnosticPhase, PhaseObservation, SpanStart, process_recorder};
 use crate::mailbox::{
     COMPLETION_CONTINUITY_GENESIS_DIGEST, CompletionContinuityHead,
     CompletionEventRegistrationInput, CompletionEventRegistrationResult, MailboxDb,
@@ -620,13 +625,39 @@ impl StateDb {
         validate_nonempty(admission_id, "admission_id").map_err(|error| error.to_string())?;
         let admission_id = completion_bound_admission_id(admission_id, &registration, binding);
         let binding_bytes = binding.map(AdmittedSourceBinding::encoded).transpose()?;
+        let authority_basis = if admitted_replay_only {
+            "admitted_repair"
+        } else {
+            "live_registration"
+        };
         let sidecar_path = MailboxDb::path_for_state_db(completion_authority_state_path);
-        let tx = self
+        let state_start = SpanStart::new("completion_registration", "state_sqlite")
+            .with_lifecycle_phase("completion_registration")
+            .with_busy_timeout(super::opening_write::state_writer_busy_timeout())
+            .with_identifier("completion_event_id", registration.event_id)
+            .with_identifier("authority_basis", authority_basis)
+            .with_identifier("owner_invocation_uuid", owner_invocation_uuid)
+            .with_identifier("owner_session_id", owner_session_id)
+            .with_hashed_correlation("admission_id", &admission_id);
+        process_recorder().with_requested_span(state_start, |state_span| {
+        let state_attempt = TransactionAttempt::start();
+        let tx = match self
             .conn
             .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
-            .map_err(|error| {
-                format!("Failed to begin completion admission transaction: {error}")
-            })?;
+        {
+            Ok(tx) => tx,
+            Err(error) => {
+                record_sqlite_failure(state_span, &error, state_attempt);
+                record_unacquired_release(state_span);
+                return Err(format!(
+                    "Failed to begin completion admission transaction: {error}"
+                ));
+            }
+        };
+        let mut state_phases = TransactionPhaseGuard::acquired(state_span, state_attempt);
+        let state_committed = std::cell::Cell::new(false);
+        let sidecar_failure_recorded = std::cell::Cell::new(false);
+        let state_result = (|| {
         let invocation_row_id: i64 = tx
             .query_row(
                 "SELECT id FROM invocations WHERE invocation_uuid=?1",
@@ -704,21 +735,59 @@ impl StateDb {
             registration.event_id,
             &admission_id,
         )?;
-        let sidecar_authority = crate::mailbox::MailboxAuthorityFence::try_acquire(&sidecar_path)
-            .map_err(|error| error.to_string())?;
         let state_head = completion_continuity_head_on(&tx).map_err(|error| error.to_string())?;
-        let mut mailbox = if state_head.is_none() {
-            MailboxDb::open_for_state_authority(&sidecar_authority)?
+        let sidecar_start = SpanStart::new(
+            "completion_authority_registration",
+            "pid_mailbox_sqlite",
+        )
+        .with_lifecycle_phase("completion_authority")
+        .with_diagnostic_id(state_span.diagnostic_id().clone())
+        .with_parent_span_id(state_span.span_id().clone())
+        .with_identifier("completion_event_id", registration.event_id)
+        .with_identifier("authority_basis", authority_basis)
+        .with_identifier("owner_invocation_uuid", owner_invocation_uuid)
+        .with_identifier("owner_session_id", owner_session_id)
+        .with_hashed_correlation("admission_id", &admission_id)
+        .with_busy_timeout(std::time::Duration::ZERO);
+        state_span.with_deferred_requested_span(sidecar_start, |sidecar_span| {
+        let sidecar_authority = match crate::mailbox::MailboxAuthorityFence::try_acquire(&sidecar_path) {
+            Ok(authority) => authority,
+            Err(error) => {
+                sidecar_failure_recorded.set(true);
+                let _ = sidecar_span.record(
+                    DiagnosticPhase::Failed,
+                    PhaseObservation::not_started()
+                        .with_cause("completion_authority_namespace_failed"),
+                );
+                record_unacquired_release(sidecar_span);
+                return Err(error.to_string());
+            }
+        };
+        let mut mailbox = match if state_head.is_none() {
+            MailboxDb::open_for_state_authority(&sidecar_authority)
         } else {
             MailboxDb::open_existing_for_completion_authority(&sidecar_authority).map_err(|error| {
                 format!(
                     "process_integrity: invocation {owner_invocation_uuid} has admitted completion authority but the sidecar is unavailable: {error}"
                 )
-            })?
+            })
+        } {
+            Ok(mailbox) => mailbox,
+            Err(error) => {
+                sidecar_failure_recorded.set(true);
+                let _ = sidecar_span.record(
+                    DiagnosticPhase::Failed,
+                    PhaseObservation::not_started()
+                        .with_cause("completion_authority_open_failed"),
+                );
+                record_unacquired_release(sidecar_span);
+                return Err(error);
+            }
         };
-        let sidecar_fence = mailbox
-            .begin_completion_authority_fence()
+        let (sidecar_fence, sidecar_attempt) = mailbox
+            .begin_completion_authority_fence_instrumented(sidecar_span)
             .map_err(|error| {
+                sidecar_failure_recorded.set(true);
                 if state_head.is_none() {
                     error
                 } else {
@@ -727,20 +796,33 @@ impl StateDb {
                     )
                 }
             })?;
-        let sidecar_generation = sidecar_fence.sidecar_generation().map_err(|error| {
-            if state_head.is_none() {
-                error
-            } else {
-                format!(
-                    "process_integrity: invocation {owner_invocation_uuid} has invalid admitted completion authority: {error}"
-                )
+        let mut sidecar_phases =
+            TransactionPhaseGuard::acquired(sidecar_span, sidecar_attempt);
+        let sidecar_result = (|| {
+        let sidecar_generation = match sidecar_fence.sidecar_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                sidecar_failure_recorded.set(true);
+                sidecar_phases.failed("completion_authority_generation_failed");
+                return Err(if state_head.is_none() {
+                    error
+                } else {
+                    format!(
+                        "process_integrity: invocation {owner_invocation_uuid} has invalid admitted completion authority: {error}"
+                    )
+                });
             }
-        })?;
-        let sidecar_head = sidecar_fence.completion_continuity_head().map_err(|error| {
-            format!(
-                "process_integrity: invocation {owner_invocation_uuid} cannot read completion continuity authority: {error}"
-            )
-        })?;
+        };
+        let sidecar_head = match sidecar_fence.completion_continuity_head() {
+            Ok(head) => head,
+            Err(error) => {
+                sidecar_failure_recorded.set(true);
+                sidecar_phases.failed("completion_authority_continuity_read_failed");
+                return Err(format!(
+                    "process_integrity: invocation {owner_invocation_uuid} cannot read completion continuity authority: {error}"
+                ));
+            }
+        };
         let obligation = CompletionObligationAdmission {
             admission_id: &admission_id,
             invocation_uuid: owner_invocation_uuid,
@@ -749,24 +831,48 @@ impl StateDb {
             owner_session_id,
             expected_sidecar_generation: &sidecar_generation,
         };
-        owner_authorization.validate_observed_generation(&obligation)?;
+        if let Err(error) = owner_authorization.validate_observed_generation(&obligation) {
+            sidecar_failure_recorded.set(true);
+            sidecar_phases.failed("completion_authority_generation_mismatch");
+            return Err(error);
+        }
         let replay_continuity = if state_head != sidecar_head {
             completion_continuity_by_admission_on(&tx, &admission_id)
                 .map_err(|error| error.to_string())?
         } else {
             None
         };
-        validate_completion_continuity_alignment(
+        if let Err(error) = validate_completion_continuity_alignment(
             state_head.as_ref(),
             sidecar_head.as_ref(),
             replay_continuity.as_ref(),
             &obligation,
-        )?;
-        if let Some(binding) = binding {
-            sidecar_fence.preflight_continuation_binding(binding, admitted_replay_only)?;
+        ) {
+            sidecar_failure_recorded.set(true);
+            sidecar_phases.failed("completion_authority_continuity_mismatch");
+            return Err(error);
         }
-        sidecar_fence.require_continuation_binding(registration.event_id, binding.is_some())?;
-        sidecar_fence.preflight_completion_event_registration(&registration)?;
+        if let Some(binding) = binding {
+            if let Err(error) =
+                sidecar_fence.preflight_continuation_binding(binding, admitted_replay_only)
+            {
+                sidecar_failure_recorded.set(true);
+                sidecar_phases.failed("completion_authority_binding_preflight_failed");
+                return Err(error);
+            }
+        }
+        if let Err(error) = sidecar_fence
+            .require_continuation_binding(registration.event_id, binding.is_some())
+        {
+            sidecar_failure_recorded.set(true);
+            sidecar_phases.failed("completion_authority_binding_failed");
+            return Err(error);
+        }
+        if let Err(error) = sidecar_fence.preflight_completion_event_registration(&registration) {
+            sidecar_failure_recorded.set(true);
+            sidecar_phases.failed("completion_authority_registration_preflight_failed");
+            return Err(error);
+        }
         let (_, continuity) = record_completion_obligation_with_continuity_on(
             &tx,
             obligation,
@@ -775,10 +881,44 @@ impl StateDb {
         )
         .map_err(|error| error.to_string())?;
         before_state_commit();
-        tx.commit()
-            .map_err(|error| format!("Failed to commit completion admission: {error}"))?;
+        state_phases.commit_started();
+        match tx.commit() {
+            Ok(()) => state_phases.committed(),
+            Err(error) => {
+                state_phases.sqlite_failure(&error);
+                return Err(format!("Failed to commit completion admission: {error}"));
+            }
+        }
         after_state_commit();
-        sidecar_fence.register_completion_event(registration, &continuity, binding)
+        state_committed.set(true);
+        state_phases.release();
+        drop(state_phases);
+        let registration_result = sidecar_fence.register_completion_event_instrumented(
+            registration,
+            &continuity,
+            binding,
+            &mut sidecar_phases,
+        );
+        if registration_result.is_err() {
+            sidecar_failure_recorded.set(true);
+            sidecar_phases.failed("completion_authority_registration_failed");
+        }
+        registration_result
+        })();
+        sidecar_result
+        })
+        })();
+        if state_result.is_err()
+            && !state_committed.get()
+            && !sidecar_failure_recorded.get()
+        {
+            record_effects_possible_failure(
+                state_span,
+                "completion_registration_state_transaction_failed",
+            );
+        }
+        state_result
+        })
     }
 
     pub(super) fn completion_obligations_for_invocation_on(
@@ -1763,6 +1903,9 @@ fn persistence_message(message: impl Into<String>) -> OwnershipAuthorityError {
 mod tests {
     use super::*;
     use crate::InvocationStart;
+    use crate::diagnostic_recorder::{
+        FlightRecorder, FlightRecorderReader, RecorderConfig, with_test_process_recorder,
+    };
     use crate::mailbox::CompletionEventTriggerInput;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -2230,6 +2373,110 @@ mod tests {
                 .contains_completion_obligation(EVENT_ID, INVOCATION_UUID, SESSION_ID)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn completion_registration_sidecar_contention_is_parented_and_not_state_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut state = StateDb::open(&state_path).unwrap();
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age319".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let holder = sqlite::Connection::open(&sidecar_path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let recorder_root = directory.path().join("recorder");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+
+        let error = with_test_process_recorder(recorder.clone(), || {
+            state
+                .register_completion_event_with_obligation(
+                    crate::InvocationMutationAuthority::Standalone,
+                    "age319-completion-contention-admission",
+                    registration(),
+                )
+                .unwrap_err()
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        assert!(error.contains("completion_authority_contention"), "{error}");
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            state
+                .completion_obligations_for_invocation(INVOCATION_UUID)
+                .unwrap()
+                .is_empty()
+        );
+
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let events = report
+            .events
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.event.operation.as_str(),
+                    "completion_registration" | "completion_authority_registration"
+                )
+            })
+            .map(|record| &record.event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.operation.as_str(), event.phase))
+                .collect::<Vec<_>>(),
+            vec![
+                ("completion_registration", DiagnosticPhase::Requested),
+                ("completion_registration", DiagnosticPhase::Acquired),
+                (
+                    "completion_authority_registration",
+                    DiagnosticPhase::Requested,
+                ),
+                (
+                    "completion_authority_registration",
+                    DiagnosticPhase::Contention,
+                ),
+                (
+                    "completion_authority_registration",
+                    DiagnosticPhase::Released,
+                ),
+                ("completion_registration", DiagnosticPhase::Released),
+            ]
+        );
+        let state_requested = events[0];
+        for event in &events[2..5] {
+            assert_eq!(event.diagnostic_id, state_requested.diagnostic_id);
+            assert_eq!(
+                event.parent_span_id.as_ref(),
+                Some(&state_requested.span_id)
+            );
+            assert_eq!(event.resource, "pid_mailbox_sqlite");
+            assert_eq!(event.observation.busy_timeout_millis, Some(0));
+            assert_eq!(
+                event
+                    .correlations
+                    .get("completion_event_id")
+                    .map(String::as_str),
+                Some(EVENT_ID)
+            );
+            assert_eq!(
+                event
+                    .correlations
+                    .get("authority_basis")
+                    .map(String::as_str),
+                Some("live_registration")
+            );
+        }
+        let contention = events[3].observation.sqlite_failure.as_ref().unwrap();
+        assert!(contention.contention);
+        assert!(events[3].observation.wait_micros.is_some());
     }
 
     #[test]

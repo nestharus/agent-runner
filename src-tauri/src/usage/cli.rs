@@ -243,6 +243,11 @@ pub(crate) enum Subcommands {
         #[command(subcommand)]
         command: MailboxSubcommands,
     },
+    /// Inspect DB-independent flight-recorder artifacts without starting runtime services.
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticsSubcommands,
+    },
     /// Hidden normalized form for `resume --list <UUID>`.
     #[command(hide = true, name = "resume-list")]
     ResumeList { uuid: String },
@@ -315,6 +320,28 @@ pub(crate) enum Subcommands {
         /// Override models directory.
         #[arg(long = "models-dir")]
         models_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum DiagnosticsSubcommands {
+    /// Show recent recorder failures and their coalesced presentation groups.
+    Recent {
+        /// Maximum number of raw recent failures to return.
+        #[arg(long)]
+        limit: std::num::NonZeroUsize,
+
+        /// Emit structured JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Trace all retained recorder events for one diagnostic ID.
+    Trace {
+        diagnostic_id: String,
+
+        /// Emit structured JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -737,6 +764,50 @@ mod observation_rearm_cli_tests {
             Some(Subcommands::Mailbox {
                 command: MailboxSubcommands::Resume { .. }
             })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod offline_diagnostics_cli_tests {
+    use super::*;
+
+    #[test]
+    fn parses_recent_with_positive_limit_and_json() {
+        let cli =
+            Cli::try_parse_from(["runner", "diagnostics", "recent", "--limit", "17", "--json"])
+                .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Subcommands::Diagnostics {
+                command: DiagnosticsSubcommands::Recent {
+                    limit,
+                    json: true,
+                },
+            }) if limit.get() == 17
+        ));
+    }
+
+    #[test]
+    fn recent_rejects_zero_limit() {
+        assert!(Cli::try_parse_from(["runner", "diagnostics", "recent", "--limit", "0"]).is_err());
+    }
+
+    #[test]
+    fn parses_trace_diagnostic_id_and_json() {
+        let cli =
+            Cli::try_parse_from(["runner", "diagnostics", "trace", "diagnostic-17", "--json"])
+                .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Subcommands::Diagnostics {
+                command: DiagnosticsSubcommands::Trace {
+                    diagnostic_id,
+                    json: true,
+                },
+            }) if diagnostic_id == "diagnostic-17"
         ));
     }
 }

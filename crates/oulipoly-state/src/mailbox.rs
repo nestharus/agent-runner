@@ -21,6 +21,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
 
+use crate::diagnostic_producer::{
+    TransactionAttempt, TransactionPhaseGuard, record_sqlite_failure, record_unacquired_release,
+};
+use crate::diagnostic_recorder::{
+    DiagnosticPhase, DiagnosticSpan, PhaseObservation, SpanStart, process_recorder,
+};
 use crate::pid_identity::{self, ProcessIdentity};
 
 mod completion_continuation;
@@ -66,6 +72,24 @@ const PENDING_MAILBOX_TARGET_PREDICATE: &str = "(
     OR (target_kind = 'session' AND target_id = ?1)
     OR (?2 IS NOT NULL AND target_kind = 'chain' AND target_id = ?2)
 )";
+
+fn commit_instrumented_transaction(
+    tx: Transaction<'_>,
+    phases: &mut TransactionPhaseGuard<'_>,
+    context: &'static str,
+) -> Result<(), String> {
+    phases.commit_started();
+    match tx.commit() {
+        Ok(()) => {
+            phases.committed();
+            Ok(())
+        }
+        Err(error) => {
+            phases.sqlite_failure(&error);
+            Err(format!("{context}: {error}"))
+        }
+    }
+}
 
 fn bounded_pending_mailbox_query() -> String {
     format!(
@@ -1148,11 +1172,22 @@ impl CompletionAuthorityFence<'_> {
         preflight_completion_event_registration_on(&self.tx, input)
     }
 
-    pub(crate) fn register_completion_event(
+    pub(crate) fn register_completion_event_instrumented(
         self,
         input: CompletionEventRegistrationInput<'_>,
         continuity: &CompletionContinuityHead,
         binding: Option<&crate::completion_continuation::AdmittedSourceBinding>,
+        phases: &mut TransactionPhaseGuard<'_>,
+    ) -> Result<CompletionEventRegistrationResult, String> {
+        self.register_completion_event_inner(input, continuity, binding, Some(phases))
+    }
+
+    fn register_completion_event_inner(
+        self,
+        input: CompletionEventRegistrationInput<'_>,
+        continuity: &CompletionContinuityHead,
+        binding: Option<&crate::completion_continuation::AdmittedSourceBinding>,
+        mut phases: Option<&mut TransactionPhaseGuard<'_>>,
     ) -> Result<CompletionEventRegistrationResult, String> {
         let inserted = register_completion_event_on(&self.tx, &input, &now_rfc3339())?;
         if let Some(binding) = binding {
@@ -1168,9 +1203,25 @@ impl CompletionAuthorityFence<'_> {
         }
         append_completion_continuity_on(&self.tx, continuity)?;
         let result = completion_event_registration_on(&self.tx, input.event_id, inserted)?;
-        self.tx
-            .commit()
-            .map_err(|err| format!("Failed to commit completion event registration: {err}"))?;
+        if let Some(phases) = phases.as_deref_mut() {
+            phases.commit_started();
+        }
+        match self.tx.commit() {
+            Ok(()) => {
+                if let Some(phases) = phases.as_deref_mut() {
+                    phases.committed();
+                    phases.release();
+                }
+            }
+            Err(error) => {
+                if let Some(phases) = phases.as_deref_mut() {
+                    phases.sqlite_failure(&error);
+                }
+                return Err(format!(
+                    "Failed to commit completion event registration: {error}"
+                ));
+            }
+        }
         Ok(result)
     }
 }
@@ -1580,6 +1631,40 @@ impl MailboxDb {
                     format!("Failed to fence PID mailbox sidecar authority: {err}")
                 }
             })
+    }
+
+    pub(crate) fn begin_completion_authority_fence_instrumented(
+        &mut self,
+        span: &DiagnosticSpan,
+    ) -> Result<(CompletionAuthorityFence<'_>, TransactionAttempt), String> {
+        if let Err(error) = self.conn.busy_timeout(StdDuration::ZERO) {
+            let _ = span.record(
+                DiagnosticPhase::Failed,
+                PhaseObservation::not_started().with_sqlite_failure(&error),
+            );
+            record_unacquired_release(span);
+            return Err(error.to_string());
+        }
+        let attempt = TransactionAttempt::start();
+        match self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+        {
+            Ok(tx) => Ok((CompletionAuthorityFence { tx }, attempt)),
+            Err(error) => {
+                record_sqlite_failure(span, &error, attempt);
+                record_unacquired_release(span);
+                if sqlite_error_is_contention(&error) {
+                    Err(format!(
+                        "completion_authority_contention: PID mailbox SQLite writer unavailable without waiting: {error}"
+                    ))
+                } else {
+                    Err(format!(
+                        "Failed to fence PID mailbox sidecar authority: {error}"
+                    ))
+                }
+            }
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -5532,53 +5617,94 @@ impl SessionAdmissionRepository<'_> {
         validate_session_admission_identity(admission_id, "admission_id")?;
         validate_session_admission_identity(registration_identity, "registration_identity")?;
         validate_optional_session_admission_identity(session_id, "session_id")?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|err| format!("Failed to start session admission enqueue: {err}"))?;
-        tx.execute(
-            "INSERT OR IGNORE INTO session_admission_queue (
-                admission_id, registration_identity, session_id, state, queue_reason,
-                launcher_os_pid, launcher_os_boot_id,
-                launcher_os_pid_starttime_ticks,
-                created_at_unix_ms, updated_at_unix_ms
-             ) VALUES (?1, ?2, ?3, 'queued', 'fifo_wait', ?4, ?5, ?6, ?7, ?7)",
-            params![
-                admission_id,
-                registration_identity,
-                session_id,
-                launcher.os_pid,
-                &launcher.os_boot_id,
-                launcher.os_pid_starttime_ticks,
-                now_unix_ms,
-            ],
-        )
-        .map_err(|err| format!("Failed to enqueue session admission: {err}"))?;
-        let existing = session_admission_by_registration_on(&tx, registration_identity)?
-            .ok_or_else(|| "Session admission row is missing after enqueue".to_string())?;
-        if let (Some(existing_session), Some(requested_session)) =
-            (existing.session_id.as_deref(), session_id)
-            && existing_session != requested_session
-        {
-            return Err(format!(
-                "Session admission {} is already bound to session {existing_session}, not {requested_session}",
-                existing.admission_id
-            ));
+        let mut start = SpanStart::new("session_admission_enqueue", "pid_mailbox_sqlite")
+            .with_lifecycle_phase("launch_admission")
+            .with_identifier("admission_id", admission_id)
+            .with_hashed_correlation("registration_identity", registration_identity)
+            .with_identifier("launcher_pid", launcher.os_pid.to_string())
+            .with_busy_timeout(mailbox_writer_sqlite_timeout());
+        if let Some(session_id) = session_id {
+            start = start.with_identifier("session_id", session_id);
         }
-        if existing.session_id.is_none() && session_id.is_some() {
+        process_recorder().with_requested_span(start, |span| {
+            let attempt = TransactionAttempt::start();
+            let tx = match self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+            {
+                Ok(tx) => tx,
+                Err(error) => {
+                    record_sqlite_failure(span, &error, attempt);
+                    record_unacquired_release(span);
+                    return Err(format!("Failed to start session admission enqueue: {error}"));
+                }
+            };
+            let mut phases = TransactionPhaseGuard::acquired(span, attempt);
+            let result = (|| {
             tx.execute(
-                "UPDATE session_admission_queue
-                 SET session_id = ?2, updated_at_unix_ms = ?3
-                 WHERE registration_identity = ?1 AND session_id IS NULL",
-                params![registration_identity, session_id, now_unix_ms],
+                "INSERT OR IGNORE INTO session_admission_queue (
+                    admission_id, registration_identity, session_id, state, queue_reason,
+                    launcher_os_pid, launcher_os_boot_id,
+                    launcher_os_pid_starttime_ticks,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, 'queued', 'fifo_wait', ?4, ?5, ?6, ?7, ?7)",
+                params![
+                    admission_id,
+                    registration_identity,
+                    session_id,
+                    launcher.os_pid,
+                    &launcher.os_boot_id,
+                    launcher.os_pid_starttime_ticks,
+                    now_unix_ms,
+                ],
             )
-            .map_err(|err| format!("Failed to bind queued session admission: {err}"))?;
-        }
-        let row = session_admission_by_registration_on(&tx, registration_identity)?
-            .ok_or_else(|| "Session admission row disappeared during enqueue".to_string())?;
-        tx.commit()
-            .map_err(|err| format!("Failed to commit session admission enqueue: {err}"))?;
-        Ok(row)
+            .map_err(|error| {
+                phases.sqlite_failure(&error);
+                format!("Failed to enqueue session admission: {error}")
+            })?;
+            let existing = session_admission_by_registration_on(&tx, registration_identity)?
+                .ok_or_else(|| "Session admission row is missing after enqueue".to_string())?;
+            if let (Some(existing_session), Some(requested_session)) =
+                (existing.session_id.as_deref(), session_id)
+                && existing_session != requested_session
+            {
+                phases.failed("session_admission_identity_conflict");
+                return Err(format!(
+                    "Session admission {} is already bound to session {existing_session}, not {requested_session}",
+                    existing.admission_id
+                ));
+            }
+            if existing.session_id.is_none() && session_id.is_some() {
+                tx.execute(
+                    "UPDATE session_admission_queue
+                     SET session_id = ?2, updated_at_unix_ms = ?3
+                     WHERE registration_identity = ?1 AND session_id IS NULL",
+                    params![registration_identity, session_id, now_unix_ms],
+                )
+                .map_err(|error| {
+                    phases.sqlite_failure(&error);
+                    format!("Failed to bind queued session admission: {error}")
+                })?;
+            }
+            let row = session_admission_by_registration_on(&tx, registration_identity)?
+                .ok_or_else(|| "Session admission row disappeared during enqueue".to_string())?;
+            phases.commit_started();
+            match tx.commit() {
+                Ok(()) => phases.committed(),
+                Err(error) => {
+                    phases.sqlite_failure(&error);
+                    return Err(format!(
+                        "Failed to commit session admission enqueue: {error}"
+                    ));
+                }
+            }
+            Ok(row)
+            })();
+            if result.is_err() {
+                phases.failed("session_admission_enqueue_failed");
+            }
+            result
+        })
     }
 
     pub fn row(&self, registration_identity: &str) -> Result<Option<SessionAdmissionRow>, String> {
@@ -5699,52 +5825,94 @@ impl SessionAdmissionRepository<'_> {
         requested_registration_identity: Option<&str>,
     ) -> Result<SessionAdmissionAttempt, String> {
         validate_session_admission_identity(claim_token, "claim_token")?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|err| format!("Failed to start session admission drain: {err}"))?;
-        if cancel_dead_session_admission_head_on(&tx, now_unix_ms)? {
-            tx.commit()
-                .map_err(|err| format!("Failed to commit dead admission cancellation: {err}"))?;
-            return Ok(SessionAdmissionAttempt::Waiting);
+        let mut start = SpanStart::new("session_admission_try_admit", "pid_mailbox_sqlite")
+            .with_lifecycle_phase("launch_admission")
+            .with_busy_timeout(mailbox_writer_sqlite_timeout());
+        if let Some(registration_identity) = requested_registration_identity {
+            start = start.with_hashed_correlation("registration_identity", registration_identity);
         }
-        reconcile_dead_starting_generations_on(&tx, now_unix_ms)?;
-        recover_stale_session_admissions_on(&tx, stale_before_unix_ms, now_unix_ms)?;
-        if unmaterialized_session_admission_exists_on(&tx)? {
-            tx.commit()
-                .map_err(|err| format!("Failed to commit materializing admission drain: {err}"))?;
-            return Ok(SessionAdmissionAttempt::LaunchMaterializing);
-        }
-        let next = next_session_admission_on(&tx)?;
-        let Some(registration_identity) = next else {
-            tx.commit()
-                .map_err(|err| format!("Failed to commit empty admission drain: {err}"))?;
-            return Ok(SessionAdmissionAttempt::Empty);
-        };
-        if requested_registration_identity
-            .is_some_and(|requested| requested != registration_identity)
-        {
-            tx.commit()
-                .map_err(|err| format!("Failed to commit waiting admission drain: {err}"))?;
-            return Ok(SessionAdmissionAttempt::Waiting);
-        };
-        let changed = tx
-            .execute(
-                "UPDATE session_admission_queue
-                 SET state = 'admitted', queue_reason = 'admission_claimed', claim_token = ?2,
-                     claimed_at_unix_ms = ?3, updated_at_unix_ms = ?3
-                 WHERE registration_identity = ?1 AND state = 'queued'",
-                params![&registration_identity, claim_token, now_unix_ms],
-            )
-            .map_err(|err| format!("Failed to reserve session admission: {err}"))?;
-        if changed != 1 {
-            return Err("Session admission changed during serialized drain".to_string());
-        }
-        let row = session_admission_by_registration_on(&tx, &registration_identity)?
-            .ok_or_else(|| "Admitted session row disappeared".to_string())?;
-        tx.commit()
-            .map_err(|err| format!("Failed to commit session admission: {err}"))?;
-        Ok(SessionAdmissionAttempt::Admitted(Box::new(row)))
+        process_recorder().with_requested_span(start, |span| {
+            let attempt = TransactionAttempt::start();
+            let tx = match self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+            {
+                Ok(tx) => tx,
+                Err(error) => {
+                    record_sqlite_failure(span, &error, attempt);
+                    record_unacquired_release(span);
+                    return Err(format!("Failed to start session admission drain: {error}"));
+                }
+            };
+            let mut phases = TransactionPhaseGuard::acquired(span, attempt);
+            let result = (|| {
+                if cancel_dead_session_admission_head_on(&tx, now_unix_ms)? {
+                    commit_instrumented_transaction(
+                        tx,
+                        &mut phases,
+                        "Failed to commit dead admission cancellation",
+                    )?;
+                    return Ok(SessionAdmissionAttempt::Waiting);
+                }
+                reconcile_dead_starting_generations_on(&tx, now_unix_ms)?;
+                recover_stale_session_admissions_on(&tx, stale_before_unix_ms, now_unix_ms)?;
+                if unmaterialized_session_admission_exists_on(&tx)? {
+                    commit_instrumented_transaction(
+                        tx,
+                        &mut phases,
+                        "Failed to commit materializing admission drain",
+                    )?;
+                    return Ok(SessionAdmissionAttempt::LaunchMaterializing);
+                }
+                let next = next_session_admission_on(&tx)?;
+                let Some(registration_identity) = next else {
+                    commit_instrumented_transaction(
+                        tx,
+                        &mut phases,
+                        "Failed to commit empty admission drain",
+                    )?;
+                    return Ok(SessionAdmissionAttempt::Empty);
+                };
+                if requested_registration_identity
+                    .is_some_and(|requested| requested != registration_identity)
+                {
+                    commit_instrumented_transaction(
+                        tx,
+                        &mut phases,
+                        "Failed to commit waiting admission drain",
+                    )?;
+                    return Ok(SessionAdmissionAttempt::Waiting);
+                };
+                let changed = tx
+                    .execute(
+                        "UPDATE session_admission_queue
+                     SET state = 'admitted', queue_reason = 'admission_claimed', claim_token = ?2,
+                         claimed_at_unix_ms = ?3, updated_at_unix_ms = ?3
+                     WHERE registration_identity = ?1 AND state = 'queued'",
+                        params![&registration_identity, claim_token, now_unix_ms],
+                    )
+                    .map_err(|error| {
+                        phases.sqlite_failure(&error);
+                        format!("Failed to reserve session admission: {error}")
+                    })?;
+                if changed != 1 {
+                    phases.failed("session_admission_serialization_changed");
+                    return Err("Session admission changed during serialized drain".to_string());
+                }
+                let row = session_admission_by_registration_on(&tx, &registration_identity)?
+                    .ok_or_else(|| "Admitted session row disappeared".to_string())?;
+                commit_instrumented_transaction(
+                    tx,
+                    &mut phases,
+                    "Failed to commit session admission",
+                )?;
+                Ok(SessionAdmissionAttempt::Admitted(Box::new(row)))
+            })();
+            if result.is_err() {
+                phases.failed("session_admission_try_admit_failed");
+            }
+            result
+        })
     }
 
     pub fn begin_launch(
@@ -5889,41 +6057,96 @@ impl WakeSessionRepository<'_> {
         selected: Option<Option<&SessionMetadataRow>>,
     ) -> Result<WakeClaimAcquireResult, String> {
         let now = now_rfc3339();
-        let tx = begin_wake_claim_transaction(self.conn)?;
-        if session_admission_intent_on(&tx, input.session_id)?
-            || wake_claim_runtime_is_busy_tx(&tx, input.session_id)?
-        {
-            commit_empty_wake_claim_transaction(tx)?;
-            return Ok(WakeClaimAcquireResult::Busy);
+        let mut start = SpanStart::new("wake_claim_acquire", "pid_mailbox_sqlite")
+            .with_lifecycle_phase("wake_claim")
+            .with_identifier("session_id", input.session_id)
+            .with_hashed_correlation("wake_reason", input.reason)
+            .with_identifier("auto_wake_count", input.auto_wake_count.to_string())
+            .with_busy_timeout(mailbox_writer_sqlite_timeout());
+        if let Some(invocation_uuid) = input.wake_invocation_uuid {
+            start = start.with_identifier("wake_invocation_uuid", invocation_uuid);
         }
-        if wake_claim_notifications_paused_tx(&tx, input.session_id)?
-            || mailbox_observation_stopped_on(&tx, input.session_id)?
-        {
-            commit_empty_wake_claim_transaction(tx)?;
-            return Ok(WakeClaimAcquireResult::NoPending);
-        }
-        let pending_bounds = pending_seq_bounds_for_claim_tx(&tx, input.session_id)?;
-        let Some((min_seq, max_seq)) = pending_bounds else {
-            commit_empty_wake_claim_transaction(tx)?;
-            return Ok(WakeClaimAcquireResult::NoPending);
-        };
-        if let Some(existing) = fresh_in_flight_wake_claim_for_input(&tx, input, renew_token)? {
-            commit_existing_wake_claim_transaction(tx)?;
-            return Ok(WakeClaimAcquireResult::AlreadyInFlight(existing));
-        }
-        let runtime = session_metadata_row(&tx, input.session_id)?;
-        let changed = selected.is_some_and(|selected| selected != runtime.as_ref());
-        if changed
-            || (completion_continuation::domain_on(&tx)?.is_some()
-                && !native_wake_runtime_ready(runtime.as_ref()))
-        {
-            commit_empty_wake_claim_transaction(tx)?;
-            return Ok(WakeClaimAcquireResult::RuntimeUnavailable);
-        }
-        let claim = acquire_wake_claim_tx(&tx, input, &now, min_seq, max_seq)?;
-        completion_continuation::reserve_activation_on(&tx, input, self.data_root)?;
-        commit_wake_claim_transaction(tx)?;
-        Ok(WakeClaimAcquireResult::Acquired(claim))
+        process_recorder().with_requested_span(start, |span| {
+            let attempt = TransactionAttempt::start();
+            let tx = match self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+            {
+                Ok(tx) => tx,
+                Err(error) => {
+                    record_sqlite_failure(span, &error, attempt);
+                    record_unacquired_release(span);
+                    return Err(format_start_wake_claim_tx_error(error));
+                }
+            };
+            let mut phases = TransactionPhaseGuard::acquired(span, attempt);
+            let result = (|| {
+                if session_admission_intent_on(&tx, input.session_id)?
+                    || wake_claim_runtime_is_busy_tx(&tx, input.session_id)?
+                {
+                    commit_instrumented_transaction(
+                        tx,
+                        &mut phases,
+                        "Failed to commit empty wake claim transaction",
+                    )?;
+                    return Ok(WakeClaimAcquireResult::Busy);
+                }
+                if wake_claim_notifications_paused_tx(&tx, input.session_id)?
+                    || mailbox_observation_stopped_on(&tx, input.session_id)?
+                {
+                    commit_instrumented_transaction(
+                        tx,
+                        &mut phases,
+                        "Failed to commit empty wake claim transaction",
+                    )?;
+                    return Ok(WakeClaimAcquireResult::NoPending);
+                }
+                let pending_bounds = pending_seq_bounds_for_claim_tx(&tx, input.session_id)?;
+                let Some((min_seq, max_seq)) = pending_bounds else {
+                    commit_instrumented_transaction(
+                        tx,
+                        &mut phases,
+                        "Failed to commit empty wake claim transaction",
+                    )?;
+                    return Ok(WakeClaimAcquireResult::NoPending);
+                };
+                if let Some(existing) =
+                    fresh_in_flight_wake_claim_for_input(&tx, input, renew_token)?
+                {
+                    commit_instrumented_transaction(
+                        tx,
+                        &mut phases,
+                        "Failed to commit existing wake claim transaction",
+                    )?;
+                    return Ok(WakeClaimAcquireResult::AlreadyInFlight(existing));
+                }
+                let runtime = session_metadata_row(&tx, input.session_id)?;
+                let changed = selected.is_some_and(|selected| selected != runtime.as_ref());
+                if changed
+                    || (completion_continuation::domain_on(&tx)?.is_some()
+                        && !native_wake_runtime_ready(runtime.as_ref()))
+                {
+                    commit_instrumented_transaction(
+                        tx,
+                        &mut phases,
+                        "Failed to commit empty wake claim transaction",
+                    )?;
+                    return Ok(WakeClaimAcquireResult::RuntimeUnavailable);
+                }
+                let claim = acquire_wake_claim_tx(&tx, input, &now, min_seq, max_seq)?;
+                completion_continuation::reserve_activation_on(&tx, input, self.data_root)?;
+                commit_instrumented_transaction(
+                    tx,
+                    &mut phases,
+                    "Failed to commit wake claim transaction",
+                )?;
+                Ok(WakeClaimAcquireResult::Acquired(claim))
+            })();
+            if result.is_err() {
+                phases.failed("wake_claim_transaction_failed");
+            }
+            result
+        })
     }
 }
 
@@ -7048,13 +7271,6 @@ fn wake_sweep_candidate(
     }
 }
 
-fn begin_wake_claim_transaction(
-    conn: &mut Connection,
-) -> Result<rusqlite::Transaction<'_>, String> {
-    conn.transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(format_start_wake_claim_tx_error)
-}
-
 fn format_start_wake_claim_tx_error(err: rusqlite::Error) -> String {
     format!("Failed to start wake claim transaction: {err}")
 }
@@ -7122,30 +7338,6 @@ fn fresh_in_flight_wake_claim_for_input(
         input.stale_after_seconds,
         renew_token,
     )
-}
-
-fn commit_empty_wake_claim_transaction(tx: rusqlite::Transaction<'_>) -> Result<(), String> {
-    tx.commit().map_err(format_empty_wake_claim_commit_error)
-}
-
-fn format_empty_wake_claim_commit_error(err: rusqlite::Error) -> String {
-    format!("Failed to commit empty wake claim transaction: {err}")
-}
-
-fn commit_existing_wake_claim_transaction(tx: rusqlite::Transaction<'_>) -> Result<(), String> {
-    tx.commit().map_err(format_existing_wake_claim_commit_error)
-}
-
-fn format_existing_wake_claim_commit_error(err: rusqlite::Error) -> String {
-    format!("Failed to commit existing wake claim transaction: {err}")
-}
-
-fn commit_wake_claim_transaction(tx: rusqlite::Transaction<'_>) -> Result<(), String> {
-    tx.commit().map_err(format_wake_claim_commit_error)
-}
-
-fn format_wake_claim_commit_error(err: rusqlite::Error) -> String {
-    format!("Failed to commit wake claim transaction: {err}")
 }
 
 fn claim_auto_wake_count(claim: Option<&WakeClaimRow>) -> Option<i64> {
@@ -12324,6 +12516,86 @@ mod fixture_process;
 mod tests {
     use super::*;
     use crate::StateDb;
+    use crate::diagnostic_recorder::{
+        DiagnosticPhase, FlightRecorder, FlightRecorderReader, RecorderConfig,
+        with_test_process_recorder,
+    };
+
+    #[test]
+    fn admission_enqueue_records_requested_before_typed_sidecar_contention() {
+        const RAW_REGISTRATION_SENTINEL: &str =
+            "age319-raw-registration-secret-sentinel-never-persist";
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let blocker = Connection::open(&sidecar_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let recorder_root = directory.path().join("recorder");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+        let launcher = ProcessIdentity {
+            os_pid: 4242,
+            os_boot_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            os_pid_starttime_ticks: 12,
+        };
+
+        let error = with_test_process_recorder(recorder.clone(), || {
+            mailbox
+                .session_admissions()
+                .enqueue(
+                    "22222222-2222-4222-8222-222222222222",
+                    RAW_REGISTRATION_SENTINEL,
+                    Some("fixture-session"),
+                    &launcher,
+                    1,
+                )
+                .unwrap_err()
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        assert!(
+            error.starts_with("Failed to start session admission enqueue:"),
+            "{error}"
+        );
+        assert!(error.to_ascii_lowercase().contains("locked"), "{error}");
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let events = report
+            .events
+            .iter()
+            .filter(|record| record.event.operation == "session_admission_enqueue")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .map(|record| record.event.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                DiagnosticPhase::Requested,
+                DiagnosticPhase::Contention,
+                DiagnosticPhase::Released
+            ]
+        );
+        let failure = events[1].event.observation.sqlite_failure.as_ref().unwrap();
+        assert!(failure.contention);
+        assert!(failure.primary_code.is_some());
+        assert!(failure.extended_code.is_some());
+
+        let raw_shards = fs::read_dir(&recorder_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .flatten()
+            .collect::<Vec<_>>();
+        let raw_shards = String::from_utf8_lossy(&raw_shards);
+        assert!(!raw_shards.contains(RAW_REGISTRATION_SENTINEL));
+        assert!(
+            raw_shards.contains(&format!(
+                "sha256:{:x}",
+                Sha256::digest(RAW_REGISTRATION_SENTINEL.as_bytes())
+            )),
+            "{raw_shards}"
+        );
+    }
 
     // Relational final-system fixtures: exact live driver, never a transport
     // liveness claim. Native endpoint/custodian execution is tested separately.

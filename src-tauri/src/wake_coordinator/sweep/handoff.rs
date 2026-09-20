@@ -144,7 +144,14 @@ pub(crate) fn run_wake_reclaim_handoff_invocation() -> Result<(), String> {
             continue;
         }
         match run_wake_reclaim_sweep("process_start_handoff", &|| false)? {
-            WakeSweepRunOutcome::Completed | WakeSweepRunOutcome::Contended(_) => return Ok(()),
+            WakeSweepRunOutcome::CancelledBeforeWork
+            | WakeSweepRunOutcome::MailboxAbsent
+            | WakeSweepRunOutcome::MailboxUnavailableAfterAdmission
+            | WakeSweepRunOutcome::CancelledAfterWork
+            | WakeSweepRunOutcome::NoCandidates
+            | WakeSweepRunOutcome::NoStartableCandidate
+            | WakeSweepRunOutcome::WakeStartAttempted
+            | WakeSweepRunOutcome::Contended(_) => return Ok(()),
             WakeSweepRunOutcome::CoordinationBusy => {
                 std::thread::sleep(WAKE_SWEEP_HANDOFF_RETRY_INTERVAL);
             }
@@ -164,7 +171,13 @@ fn run_wake_reclaim_bootstrap_handoff(expected_owner: Option<&str>) -> Result<()
     let mut waiting_owner: Option<(String, Instant)> = None;
     loop {
         match run_wake_reclaim_sweep("process_start_handoff", &|| false)? {
-            WakeSweepRunOutcome::Completed => return Ok(()),
+            WakeSweepRunOutcome::CancelledBeforeWork
+            | WakeSweepRunOutcome::MailboxAbsent
+            | WakeSweepRunOutcome::MailboxUnavailableAfterAdmission
+            | WakeSweepRunOutcome::CancelledAfterWork
+            | WakeSweepRunOutcome::NoCandidates
+            | WakeSweepRunOutcome::NoStartableCandidate
+            | WakeSweepRunOutcome::WakeStartAttempted => return Ok(()),
             WakeSweepRunOutcome::Contended(owner_token) => {
                 if let Some(expected_owner) = expected_owner {
                     if owner_token != expected_owner {

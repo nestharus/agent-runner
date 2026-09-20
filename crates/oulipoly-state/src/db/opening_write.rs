@@ -670,7 +670,7 @@ impl StateDb {
     }
 }
 
-fn state_writer_busy_timeout() -> std::time::Duration {
+pub(crate) fn state_writer_busy_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(5)
 }
 
