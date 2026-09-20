@@ -6,6 +6,40 @@ use crate::diagnostic_recorder::{
 };
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_RELEASE_OBSERVATION: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_before_release_observation_for_test<T>(
+    hook: impl FnMut() + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    BEFORE_RELEASE_OBSERVATION.with_borrow_mut(|slot| {
+        assert!(
+            slot.is_none(),
+            "release-observation hook is already installed"
+        );
+        *slot = Some(Box::new(hook));
+    });
+    let result = operation();
+    BEFORE_RELEASE_OBSERVATION.with_borrow_mut(|slot| {
+        *slot = None;
+    });
+    result
+}
+
+#[cfg(test)]
+fn before_release_observation_for_test() {
+    BEFORE_RELEASE_OBSERVATION.with_borrow_mut(|slot| {
+        if let Some(hook) = slot.as_deref_mut() {
+            hook();
+        }
+    });
+}
+
 /// Clock started immediately before a real SQLite transaction-begin attempt.
 /// It deliberately excludes recorder work performed before the attempt.
 #[derive(Debug, Clone, Copy)]
@@ -25,7 +59,7 @@ pub(crate) struct TransactionPhaseGuard<'a> {
     span: &'a DiagnosticSpan,
     transaction_started: Instant,
     acquired_at: Instant,
-    writer_wait: Duration,
+    writer_acquisition: Duration,
     execution: Option<Duration>,
     commit_started_at: Option<Instant>,
     commit: Option<Duration>,
@@ -38,26 +72,25 @@ pub(crate) struct TransactionPhaseGuard<'a> {
 
 impl<'a> TransactionPhaseGuard<'a> {
     pub(crate) fn acquired(span: &'a DiagnosticSpan, attempt: TransactionAttempt) -> Self {
-        let writer_wait = attempt.elapsed();
+        let writer_acquisition = attempt.elapsed();
         let _ = span.record(
             DiagnosticPhase::Acquired,
-            PhaseObservation::started_unknown()
-                .with_wait(writer_wait)
-                .with_sqlite_evidence(
-                    SqlitePhaseEvidence::for_phase(SqliteTransactionPhase::WriterAuthority)
-                        .with_writer_wait(writer_wait)
-                        .with_gap(SqliteMeasurementGap::ExecutionNotReached)
-                        .with_gap(SqliteMeasurementGap::CommitNotReached)
-                        .with_gap(SqliteMeasurementGap::PostCommitNotReached)
-                        .with_gap(SqliteMeasurementGap::RowsExaminedNotExposed)
-                        .with_gap(SqliteMeasurementGap::RowsChangedNotReported),
-                ),
+            PhaseObservation::started_unknown().with_sqlite_evidence(
+                SqlitePhaseEvidence::for_phase(SqliteTransactionPhase::WriterAuthority)
+                    .with_writer_acquisition(writer_acquisition)
+                    .with_gap(SqliteMeasurementGap::WriterWaitNotExposedByApi)
+                    .with_gap(SqliteMeasurementGap::ExecutionNotReached)
+                    .with_gap(SqliteMeasurementGap::CommitNotReached)
+                    .with_gap(SqliteMeasurementGap::PostCommitNotReached)
+                    .with_gap(SqliteMeasurementGap::RowsExaminedNotExposed)
+                    .with_gap(SqliteMeasurementGap::RowsChangedNotReported),
+            ),
         );
         Self {
             span,
             transaction_started: attempt.0,
             acquired_at: Instant::now(),
-            writer_wait,
+            writer_acquisition,
             execution: None,
             commit_started_at: None,
             commit: None,
@@ -167,9 +200,14 @@ impl<'a> TransactionPhaseGuard<'a> {
         self.failure_recorded = true;
     }
 
-    pub(crate) fn release(&mut self) {
+    /// Emits terminal evidence only after the caller has explicitly ended the
+    /// owning SQLite transaction (commit, rollback, or drop).
+    pub(crate) fn release_after_owner(&mut self) {
         if self.released {
             return;
+        }
+        if self.execution.is_none() {
+            self.execution = Some(self.acquired_at.elapsed());
         }
         let mut observation = if self.committed {
             PhaseObservation::committed()
@@ -180,17 +218,46 @@ impl<'a> TransactionPhaseGuard<'a> {
         if let Some(committed_at) = self.committed_at {
             evidence = evidence.with_post_commit(committed_at.elapsed());
         } else {
+            if self.commit.is_none() {
+                evidence = evidence.with_gap(SqliteMeasurementGap::CommitNotReached);
+            }
             evidence = evidence.with_gap(SqliteMeasurementGap::PostCommitNotReached);
         }
         observation = observation.with_sqlite_evidence(evidence);
+        #[cfg(test)]
+        before_release_observation_for_test();
         let _ = self.span.record(DiagnosticPhase::Released, observation);
+        self.released = true;
+    }
+
+    /// Records a deliberately non-committing transaction after its owner has
+    /// been rolled back/dropped. Validation fences use this to distinguish an
+    /// inapplicable commit from a commit that failed or was abandoned.
+    pub(crate) fn release_after_rollback(&mut self) {
+        if self.execution.is_none() {
+            self.execution = Some(self.acquired_at.elapsed());
+        }
+        if self.released {
+            return;
+        }
+        let evidence = self
+            .evidence(SqliteTransactionPhase::Released)
+            .with_gap(SqliteMeasurementGap::CommitNotApplicable)
+            .with_gap(SqliteMeasurementGap::PostCommitNotApplicable);
+        #[cfg(test)]
+        before_release_observation_for_test();
+        let _ = self.span.record(
+            DiagnosticPhase::Released,
+            PhaseObservation::terminal().with_sqlite_evidence(evidence),
+        );
         self.released = true;
     }
 
     fn evidence(&self, phase: SqliteTransactionPhase) -> SqlitePhaseEvidence {
         let mut evidence = SqlitePhaseEvidence::for_phase(phase)
             .with_total_elapsed(self.transaction_started.elapsed())
-            .with_writer_wait(self.writer_wait)
+            .with_writer_acquisition(self.writer_acquisition)
+            .with_gap(SqliteMeasurementGap::WriterWaitNotExposedByApi)
             .with_gap(SqliteMeasurementGap::RowsExaminedNotExposed);
         if let Some(execution) = self.execution {
             evidence = evidence.with_execution(execution);
@@ -207,18 +274,12 @@ impl<'a> TransactionPhaseGuard<'a> {
     }
 }
 
-impl Drop for TransactionPhaseGuard<'_> {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
 pub(crate) fn record_sqlite_failure(
     span: &DiagnosticSpan,
     error: &rusqlite::Error,
     attempt: TransactionAttempt,
 ) {
-    let writer_wait = attempt.elapsed();
+    let writer_acquisition = attempt.elapsed();
     let failure = SqliteFailure::from_error(error);
     let phase = if failure.contention {
         DiagnosticPhase::Contention
@@ -228,12 +289,12 @@ pub(crate) fn record_sqlite_failure(
     let _ = span.record(
         phase,
         PhaseObservation::not_started()
-            .with_wait(writer_wait)
             .with_sqlite_failure(error)
             .with_sqlite_evidence(
                 SqlitePhaseEvidence::for_phase(SqliteTransactionPhase::WriterAuthority)
-                    .with_total_elapsed(writer_wait)
-                    .with_writer_wait(writer_wait)
+                    .with_total_elapsed(writer_acquisition)
+                    .with_writer_acquisition(writer_acquisition)
+                    .with_gap(SqliteMeasurementGap::WriterWaitNotExposedByApi)
                     .with_gap(SqliteMeasurementGap::ExecutionNotReached)
                     .with_gap(SqliteMeasurementGap::CommitNotReached)
                     .with_gap(SqliteMeasurementGap::PostCommitNotReached)

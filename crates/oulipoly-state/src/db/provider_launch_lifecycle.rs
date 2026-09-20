@@ -553,6 +553,7 @@ impl StateDb {
             if result.is_err() {
                 phases.failed("provider_launch_begin_transaction_failed");
             }
+            phases.release_after_owner();
             result
         })
     }
@@ -1324,8 +1325,9 @@ impl StateDb {
                         return Err(error.to_string());
                     }
                 };
-                let mut mailbox = match crate::mailbox::MailboxDb::open_existing_for_completion_authority(
+                let mut mailbox = match crate::mailbox::MailboxDb::open_existing_for_completion_authority_instrumented(
                     &authority,
+                    sidecar_span,
                 ) {
                     Ok(mailbox) => mailbox,
                     Err(error) => {
@@ -1350,7 +1352,7 @@ impl StateDb {
                 };
                 let mut sidecar_phases =
                     TransactionPhaseGuard::acquired(sidecar_span, sidecar_attempt);
-                if let Err(error) = super::provider_launch_publication::validate(
+                let sidecar_result = if let Err(error) = super::provider_launch_publication::validate(
                     &tx,
                     &sidecar_fence,
                     owner,
@@ -1359,14 +1361,19 @@ impl StateDb {
                 ) {
                     sidecar_failure_recorded.set(true);
                     sidecar_phases.failed("provider_transition_authority_validation_failed");
-                    return Err(error);
-                }
-                finish_state_transaction(tx)
+                    Err(error)
+                } else {
+                    finish_state_transaction(tx)
+                };
+                drop(sidecar_fence);
+                sidecar_phases.release_after_rollback();
+                sidecar_result
             })
             })();
             if result.is_err() && !sidecar_failure_recorded.get() {
                 phases.failed("provider_launch_transition_failed");
             }
+            phases.release_after_owner();
             result
         })
     }

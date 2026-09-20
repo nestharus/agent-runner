@@ -223,6 +223,7 @@ pub enum SqliteTransactionPhase {
 pub enum SqliteMeasurementGap {
     WriterAuthorityNotApplicable,
     WriterAuthorityNotReached,
+    WriterWaitNotExposedByApi,
     WriterWaitAndExecutionNotSeparable,
     ExecutionNotApplicable,
     ExecutionNotReached,
@@ -279,6 +280,13 @@ pub struct SqlitePhaseEvidence {
     /// Total time inside a single SQLite statement API when acquisition/busy
     /// wait cannot be separated from VM execution.
     pub statement_total_micros: Option<u64>,
+    /// Total duration of the SQLite transaction-begin API call. SQLite does
+    /// not expose the subset spent in its busy handler, so this must not be
+    /// interpreted as exact writer-lock wait time.
+    pub writer_authority_acquisition_micros: Option<u64>,
+    /// Exact time spent waiting for writer authority, when exposed by the
+    /// adapter. rusqlite does not expose it for `BEGIN IMMEDIATE`, so current
+    /// producers leave this absent and report `WriterWaitNotExposedByApi`.
     pub writer_authority_wait_micros: Option<u64>,
     /// Time from explicit transaction authority acquisition until commit was
     /// requested, or time inside a directly observed read/open API. For a
@@ -302,8 +310,8 @@ impl SqlitePhaseEvidence {
         }
     }
 
-    pub fn with_writer_wait(mut self, wait: Duration) -> Self {
-        self.writer_authority_wait_micros = Some(saturating_micros(wait));
+    pub fn with_writer_acquisition(mut self, acquisition: Duration) -> Self {
+        self.writer_authority_acquisition_micros = Some(saturating_micros(acquisition));
         self
     }
 
@@ -801,9 +809,26 @@ impl FlightRecorder {
         start: SpanStart,
         elapsed: Duration,
         phase: DiagnosticPhase,
-        mut observation: PhaseObservation,
+        observation: PhaseObservation,
     ) -> RecordStatus {
         emit_pending_gaps();
+        self.record_completed_observation_with_coordination(
+            start,
+            elapsed,
+            phase,
+            observation,
+            AppendCoordination::Synchronous,
+        )
+    }
+
+    fn record_completed_observation_with_coordination(
+        &self,
+        start: SpanStart,
+        elapsed: Duration,
+        phase: DiagnosticPhase,
+        mut observation: PhaseObservation,
+        coordination: AppendCoordination,
+    ) -> RecordStatus {
         if observation.busy_timeout_millis.is_none() {
             observation.busy_timeout_millis = start.busy_timeout_millis;
         }
@@ -831,7 +856,7 @@ impl FlightRecorder {
                 correlations: start.correlations,
                 sqlite: start.sqlite,
             },
-            AppendCoordination::Synchronous,
+            coordination,
         )
     }
 
@@ -957,7 +982,7 @@ impl FlightRecorder {
     }
 
     #[cfg(test)]
-    fn block_writer_for_test(&self) -> Result<mpsc::Sender<()>, String> {
+    pub(crate) fn block_writer_for_test(&self) -> Result<mpsc::Sender<()>, String> {
         let writer = self
             .inner
             .writer
@@ -1010,6 +1035,29 @@ impl DiagnosticSpan {
         operation: impl FnOnce(&DiagnosticSpan) -> T,
     ) -> T {
         self.recorder.with_deferred_requested_span(start, operation)
+    }
+
+    /// Records a completed child observation on this span's already-selected
+    /// recorder without waiting for recorder capacity or file I/O. This is the
+    /// late-observation counterpart to `with_deferred_requested_span` for work
+    /// performed while the parent still holds database authority.
+    pub(crate) fn record_deferred_completed_child(
+        &self,
+        mut start: SpanStart,
+        elapsed: Duration,
+        phase: DiagnosticPhase,
+        observation: PhaseObservation,
+    ) -> RecordStatus {
+        start.diagnostic_id = self.start.diagnostic_id.clone();
+        start.parent_span_id = Some(self.span_id.clone());
+        self.recorder
+            .record_completed_observation_with_coordination(
+                start,
+                elapsed,
+                phase,
+                observation,
+                AppendCoordination::Deferred,
+            )
     }
 
     pub fn record(

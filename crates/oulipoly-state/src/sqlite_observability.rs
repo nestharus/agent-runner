@@ -6,8 +6,8 @@
 //! the repository boundary are both safer and more useful to operators.
 
 use crate::diagnostic_recorder::{
-    DiagnosticPhase, OutcomeCertainty, PhaseObservation, SpanStart, SqliteMeasurementGap,
-    SqlitePhaseEvidence, SqliteQueryPlanEvidence, SqliteQueryPlanOperator,
+    DiagnosticPhase, DiagnosticSpan, OutcomeCertainty, PhaseObservation, SpanStart,
+    SqliteMeasurementGap, SqlitePhaseEvidence, SqliteQueryPlanEvidence, SqliteQueryPlanOperator,
     SqliteQueryPlanOperatorCount, process_recorder,
 };
 use rusqlite::{Connection, Params};
@@ -130,9 +130,10 @@ pub enum SqliteRecordDecision {
 }
 
 /// A late-emitting observation. Fast successful operations do not initialize
-/// or touch the flight recorder under the default policy. Retained events are
-/// synchronously handed to the recorder only after database authority has been
-/// released, and use its existing bounded shards.
+/// or touch the flight recorder under the default policy. Top-level retained
+/// events are synchronously handed off only after database authority has been
+/// released. Nested callers that still hold an outer authority must use the
+/// deferred parent methods so they reuse its recorder and never wait.
 pub struct SqliteOperationObserver {
     policy: SqliteObservationPolicy,
     started: Option<Instant>,
@@ -171,7 +172,38 @@ impl SqliteOperationObserver {
         } else {
             return SqliteRecordDecision::FilteredFastSuccess;
         };
-        self.emit(
+        Self::emit(
+            None,
+            span,
+            elapsed,
+            phase,
+            certainty,
+            evidence(elapsed).with_total_elapsed(elapsed),
+            None,
+        );
+        decision
+    }
+
+    pub(crate) fn record_success_deferred(
+        self,
+        parent: &DiagnosticSpan,
+        span: impl FnOnce() -> SpanStart,
+        phase: DiagnosticPhase,
+        certainty: OutcomeCertainty,
+        evidence: impl FnOnce(Duration) -> SqlitePhaseEvidence,
+    ) -> SqliteRecordDecision {
+        let Some(elapsed) = self.elapsed() else {
+            return SqliteRecordDecision::Disabled;
+        };
+        let decision = if elapsed >= self.policy.slow_threshold {
+            SqliteRecordDecision::RecordedSlow
+        } else if sampled(self.policy.normal_sample_every) {
+            SqliteRecordDecision::RecordedSample
+        } else {
+            return SqliteRecordDecision::FilteredFastSuccess;
+        };
+        Self::emit(
+            Some(parent),
             span,
             elapsed,
             phase,
@@ -197,7 +229,44 @@ impl SqliteOperationObserver {
             Some(rusqlite::ffi::ErrorCode::DatabaseBusy)
                 | Some(rusqlite::ffi::ErrorCode::DatabaseLocked)
         );
-        self.emit(
+        Self::emit(
+            None,
+            span,
+            elapsed,
+            if contention {
+                DiagnosticPhase::Contention
+            } else {
+                DiagnosticPhase::Failed
+            },
+            certainty,
+            evidence(elapsed).with_total_elapsed(elapsed),
+            Some(error),
+        );
+        if contention {
+            SqliteRecordDecision::RecordedContention
+        } else {
+            SqliteRecordDecision::RecordedFailure
+        }
+    }
+
+    pub(crate) fn record_failure_deferred(
+        self,
+        parent: &DiagnosticSpan,
+        span: impl FnOnce() -> SpanStart,
+        error: &rusqlite::Error,
+        certainty: OutcomeCertainty,
+        evidence: impl FnOnce(Duration) -> SqlitePhaseEvidence,
+    ) -> SqliteRecordDecision {
+        let Some(elapsed) = self.elapsed() else {
+            return SqliteRecordDecision::Disabled;
+        };
+        let contention = matches!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ffi::ErrorCode::DatabaseBusy)
+                | Some(rusqlite::ffi::ErrorCode::DatabaseLocked)
+        );
+        Self::emit(
+            Some(parent),
             span,
             elapsed,
             if contention {
@@ -217,7 +286,7 @@ impl SqliteOperationObserver {
     }
 
     fn emit(
-        self,
+        parent: Option<&DiagnosticSpan>,
         span: impl FnOnce() -> SpanStart,
         elapsed: Duration,
         phase: DiagnosticPhase,
@@ -233,8 +302,12 @@ impl SqliteOperationObserver {
         if let Some(error) = error {
             observation = observation.with_sqlite_failure(error);
         }
-        let _ =
-            process_recorder().record_completed_observation(span(), elapsed, phase, observation);
+        let start = span();
+        let _ = if let Some(parent) = parent {
+            parent.record_deferred_completed_child(start, elapsed, phase, observation)
+        } else {
+            process_recorder().record_completed_observation(start, elapsed, phase, observation)
+        };
     }
 }
 
@@ -553,13 +626,31 @@ mod tests {
                     transaction.commit().unwrap();
                     phases.committed();
                     std::thread::sleep(Duration::from_millis(1));
-                    phases.release();
+                    phases.release_after_owner();
                 },
             );
         });
         recorder.drain_deferred_for_test().unwrap();
 
         let report = FlightRecorderReader::new(directory.path()).inspect();
+        let acquired = report
+            .events
+            .iter()
+            .find(|record| record.event.phase == DiagnosticPhase::Acquired)
+            .unwrap();
+        assert_eq!(acquired.event.observation.wait_micros, None);
+        let acquired_evidence = acquired.event.observation.sqlite.as_ref().unwrap();
+        assert!(
+            acquired_evidence
+                .writer_authority_acquisition_micros
+                .is_some()
+        );
+        assert_eq!(acquired_evidence.writer_authority_wait_micros, None);
+        assert!(
+            acquired_evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::WriterWaitNotExposedByApi)
+        );
         let released = report
             .events
             .iter()
@@ -570,7 +661,13 @@ mod tests {
             evidence.transaction_phase,
             Some(SqliteTransactionPhase::Released)
         );
-        assert!(evidence.writer_authority_wait_micros.is_some());
+        assert!(evidence.writer_authority_acquisition_micros.is_some());
+        assert_eq!(evidence.writer_authority_wait_micros, None);
+        assert!(
+            evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::WriterWaitNotExposedByApi)
+        );
         assert!(evidence.total_elapsed_micros.is_some());
         assert!(evidence.execution_micros.is_some());
         assert!(evidence.commit_micros.is_some());
@@ -591,6 +688,69 @@ mod tests {
             Some("3758143f-547f-4296-834b-dadea4531ab8")
         );
         assert!(released.event.elapsed_micros >= evidence.post_commit_micros.unwrap());
+    }
+
+    #[test]
+    fn rollback_release_follows_owner_drop_and_reports_noncommit_terminal_gaps() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("rollback-release.db");
+        let recorder_root = directory.path().join("recorder");
+        let recorder = recorder(&recorder_root);
+        let mut owner = Connection::open(&database).unwrap();
+        owner
+            .execute_batch("CREATE TABLE item (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let contender = Connection::open(&database).unwrap();
+        contender.busy_timeout(Duration::ZERO).unwrap();
+
+        with_test_process_recorder(recorder.clone(), || {
+            process_recorder().with_requested_span(
+                SpanStart::new("rollback_fixture", "pid_mailbox_sqlite").with_sqlite_identity(
+                    SqliteEventIdentity::new(
+                        SqliteDatabaseRole::PidMailbox,
+                        SqlitePathClass::ManagedFile,
+                        "fixture.rollback_release",
+                    )
+                    .with_transaction_mode(SqliteTransactionMode::Immediate),
+                ),
+                |span| {
+                    let attempt = TransactionAttempt::start();
+                    let transaction = owner
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .unwrap();
+                    let mut phases = TransactionPhaseGuard::acquired(span, attempt);
+                    transaction
+                        .execute("INSERT INTO item (id) VALUES (?1)", [1])
+                        .unwrap();
+                    drop(transaction);
+                    contender
+                        .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+                        .expect("rollback must release the owner before terminal evidence");
+                    phases.release_after_rollback();
+                },
+            );
+        });
+        recorder.drain_deferred_for_test().unwrap();
+
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let released = report
+            .events
+            .iter()
+            .find(|record| record.event.phase == DiagnosticPhase::Released)
+            .unwrap();
+        let evidence = released.event.observation.sqlite.as_ref().unwrap();
+        assert!(evidence.execution_micros.is_some());
+        assert_eq!(evidence.commit_micros, None);
+        assert!(
+            evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::CommitNotApplicable)
+        );
+        assert!(
+            evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::PostCommitNotApplicable)
+        );
     }
 
     #[test]

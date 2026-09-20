@@ -823,13 +823,20 @@ impl StateDb {
             }
         };
         let mut mailbox = match if state_head.is_none() {
-            MailboxDb::open_for_state_authority(&sidecar_authority)
+            MailboxDb::open_for_state_authority_instrumented(
+                &sidecar_authority,
+                sidecar_span,
+            )
         } else {
-            MailboxDb::open_existing_for_completion_authority(&sidecar_authority).map_err(|error| {
-                format!(
-                    "process_integrity: invocation {owner_invocation_uuid} has admitted completion authority but the sidecar is unavailable: {error}"
-                )
-            })
+            MailboxDb::open_existing_for_completion_authority_instrumented(
+                &sidecar_authority,
+                sidecar_span,
+            )
+            .map_err(|error| {
+                    format!(
+                        "process_integrity: invocation {owner_invocation_uuid} has admitted completion authority but the sidecar is unavailable: {error}"
+                    )
+                })
         } {
             Ok(mailbox) => mailbox,
             Err(error) => {
@@ -855,10 +862,15 @@ impl StateDb {
                     )
                 }
             })?;
+        let mut sidecar_fence = Some(sidecar_fence);
         let mut sidecar_phases =
             TransactionPhaseGuard::acquired(sidecar_span, sidecar_attempt);
         let sidecar_result = (|| {
-        let sidecar_generation = match sidecar_fence.sidecar_generation() {
+        let sidecar_generation = match sidecar_fence
+            .as_ref()
+            .expect("sidecar fence remains owned until registration")
+            .sidecar_generation()
+        {
             Ok(generation) => generation,
             Err(error) => {
                 sidecar_failure_recorded.set(true);
@@ -872,7 +884,11 @@ impl StateDb {
                 });
             }
         };
-        let sidecar_head = match sidecar_fence.completion_continuity_head() {
+        let sidecar_head = match sidecar_fence
+            .as_ref()
+            .expect("sidecar fence remains owned until registration")
+            .completion_continuity_head()
+        {
             Ok(head) => head,
             Err(error) => {
                 sidecar_failure_recorded.set(true);
@@ -911,23 +927,30 @@ impl StateDb {
             sidecar_phases.failed("completion_authority_continuity_mismatch");
             return Err(error);
         }
-        if let Some(binding) = binding {
-            if let Err(error) =
-                sidecar_fence.preflight_continuation_binding(binding, admitted_replay_only)
-            {
-                sidecar_failure_recorded.set(true);
-                sidecar_phases.failed("completion_authority_binding_preflight_failed");
-                return Err(error);
-            }
+        if let Some(binding) = binding
+            && let Err(error) = sidecar_fence
+                .as_ref()
+                .expect("sidecar fence remains owned until registration")
+                .preflight_continuation_binding(binding, admitted_replay_only)
+        {
+            sidecar_failure_recorded.set(true);
+            sidecar_phases.failed("completion_authority_binding_preflight_failed");
+            return Err(error);
         }
         if let Err(error) = sidecar_fence
+            .as_ref()
+            .expect("sidecar fence remains owned until registration")
             .require_continuation_binding(registration.event_id, binding.is_some())
         {
             sidecar_failure_recorded.set(true);
             sidecar_phases.failed("completion_authority_binding_failed");
             return Err(error);
         }
-        if let Err(error) = sidecar_fence.preflight_completion_event_registration(&registration) {
+        if let Err(error) = sidecar_fence
+            .as_ref()
+            .expect("sidecar fence remains owned until registration")
+            .preflight_completion_event_registration(&registration)
+        {
             sidecar_failure_recorded.set(true);
             sidecar_phases.failed("completion_authority_registration_preflight_failed");
             return Err(error);
@@ -950,19 +973,26 @@ impl StateDb {
         }
         after_state_commit();
         state_committed.set(true);
-        state_phases.release();
-        let registration_result = sidecar_fence.register_completion_event_instrumented(
-            registration,
-            &continuity,
-            binding,
-            &mut sidecar_phases,
-        );
+        state_phases.release_after_owner();
+        let registration_result = sidecar_fence
+            .take()
+            .expect("sidecar fence remains owned until registration")
+            .register_completion_event_instrumented(
+                registration,
+                &continuity,
+                binding,
+                &mut sidecar_phases,
+            );
         if registration_result.is_err() {
             sidecar_failure_recorded.set(true);
             sidecar_phases.failed("completion_authority_registration_failed");
         }
         registration_result
         })();
+        // Validation and replay failures deliberately roll back. End that
+        // owner before emitting terminal sidecar evidence.
+        drop(sidecar_fence.take());
+        sidecar_phases.release_after_owner();
         sidecar_result
         })
         })();
@@ -972,6 +1002,7 @@ impl StateDb {
         {
             state_phases.failed("completion_registration_state_transaction_failed");
         }
+        state_phases.release_after_owner();
         state_result
         })
     }
@@ -1990,7 +2021,8 @@ mod tests {
     use super::*;
     use crate::InvocationStart;
     use crate::diagnostic_recorder::{
-        FlightRecorder, FlightRecorderReader, RecorderConfig, with_test_process_recorder,
+        FlightRecorder, FlightRecorderReader, RecorderConfig, SqliteMeasurementGap,
+        with_test_process_recorder,
     };
     use crate::mailbox::CompletionEventTriggerInput;
     use std::sync::mpsc;
@@ -2562,7 +2594,15 @@ mod tests {
         }
         let contention = events[3].observation.sqlite_failure.as_ref().unwrap();
         assert!(contention.contention);
-        assert!(events[3].observation.wait_micros.is_some());
+        assert_eq!(events[3].observation.wait_micros, None);
+        let evidence = events[3].observation.sqlite.as_ref().unwrap();
+        assert!(evidence.writer_authority_acquisition_micros.is_some());
+        assert_eq!(evidence.writer_authority_wait_micros, None);
+        assert!(
+            evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::WriterWaitNotExposedByApi)
+        );
     }
 
     #[test]

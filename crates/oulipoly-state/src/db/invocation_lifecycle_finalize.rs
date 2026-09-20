@@ -427,6 +427,7 @@ impl StateDb {
             if result.is_err() && !sidecar_failure_recorded.get() {
                 phases.failed("invocation_terminal_finalize_failed");
             }
+            phases.release_after_owner();
             result
         })
     }
@@ -584,6 +585,7 @@ impl StateDb {
                     Some(&sidecar_authority),
                     invocation_uuid,
                     Some(obligation),
+                    Some(sidecar_span),
                 ) {
                     Ok(Some(sidecar)) => sidecar,
                     Ok(None) => unreachable!("an admitted obligation requires a sidecar"),
@@ -620,7 +622,7 @@ impl StateDb {
                     };
                 let mut sidecar_phases =
                     TransactionPhaseGuard::acquired(sidecar_span, sidecar_attempt);
-                if let Err(error) = self.validate_completion_sidecar_authority(
+                let sidecar_result = if let Err(error) = self.validate_completion_sidecar_authority(
                     &sidecar_fence,
                     invocation_uuid,
                     obligation,
@@ -629,9 +631,13 @@ impl StateDb {
                 ) {
                     sidecar_failure_recorded.set(true);
                     sidecar_phases.failed("finalization_completion_authority_validation_failed");
-                    return Err(error);
-                }
-                write_and_commit(tx)
+                    Err(error)
+                } else {
+                    write_and_commit(tx)
+                };
+                drop(sidecar_fence);
+                sidecar_phases.release_after_rollback();
+                sidecar_result
             });
         }
         #[cfg(test)]
@@ -650,6 +656,7 @@ impl StateDb {
             sidecar_authority.as_ref(),
             invocation_uuid,
             obligation.as_ref(),
+            None,
         )?;
         let sidecar_fence = sidecar
             .as_mut()
@@ -714,6 +721,7 @@ impl StateDb {
         authority: Option<&crate::mailbox::MailboxAuthorityFence>,
         invocation_uuid: &str,
         obligation: Option<&CompletionObligationExpectation>,
+        parent: Option<&DiagnosticSpan>,
     ) -> Result<Option<crate::mailbox::MailboxDb>, String> {
         let Some(obligation) = obligation else {
             return Ok(None);
@@ -730,11 +738,16 @@ impl StateDb {
                 obligation,
             ));
         }
-        crate::mailbox::MailboxDb::open_existing_for_completion_authority(authority)
-            .map(Some)
-            .map_err(|error| {
-                Self::format_unreadable_completion_sidecar(invocation_uuid, obligation, error)
-            })
+        let opened = if let Some(parent) = parent {
+            crate::mailbox::MailboxDb::open_existing_for_completion_authority_instrumented(
+                authority, parent,
+            )
+        } else {
+            crate::mailbox::MailboxDb::open_existing_for_completion_authority(authority)
+        };
+        opened.map(Some).map_err(|error| {
+            Self::format_unreadable_completion_sidecar(invocation_uuid, obligation, error)
+        })
     }
 
     fn validate_completion_sidecar_authority(
@@ -930,10 +943,12 @@ mod tests {
     use super::*;
     use crate::InvocationStart;
     use crate::diagnostic_recorder::{
-        FlightRecorder, FlightRecorderReader, RecorderConfig, with_test_process_recorder,
+        FlightRecorder, FlightRecorderReader, RecorderConfig, SqliteMeasurementGap,
+        with_test_process_recorder,
     };
     use crate::mailbox::{CompletionEventRegistrationInput, MailboxDb};
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
     thread_local! {
@@ -1149,7 +1164,76 @@ mod tests {
         }
         let contention = events[3].observation.sqlite_failure.as_ref().unwrap();
         assert!(contention.contention);
-        assert!(events[3].observation.wait_micros.is_some());
+        assert_eq!(events[3].observation.wait_micros, None);
+        let evidence = events[3].observation.sqlite.as_ref().unwrap();
+        assert!(evidence.writer_authority_acquisition_micros.is_some());
+        assert_eq!(evidence.writer_authority_wait_micros, None);
+        assert!(
+            evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::WriterWaitNotExposedByApi)
+        );
+    }
+
+    #[test]
+    fn successful_finalize_releases_sidecar_before_terminal_observation() {
+        let (directory, state, invocation_row_id, sidecar_path) =
+            state_with_completion_obligation();
+        let recorder_root = directory.path().join("recorder");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+        let release_checks = Arc::new(AtomicUsize::new(0));
+        let hook_checks = Arc::clone(&release_checks);
+        let hook_path = sidecar_path.clone();
+
+        with_test_process_recorder(recorder.clone(), || {
+            crate::diagnostic_producer::with_before_release_observation_for_test(
+                move || {
+                    let contender = sqlite::Connection::open(&hook_path).unwrap();
+                    contender.busy_timeout(Duration::ZERO).unwrap();
+                    contender
+                        .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+                        .expect("sidecar owner must be released before Released evidence");
+                    hook_checks.fetch_add(1, Ordering::Relaxed);
+                },
+                || {
+                    state
+                        .finalize_invocation(
+                            crate::InvocationMutationAuthority::Standalone,
+                            invocation_row_id,
+                            true,
+                            0,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                },
+            );
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        assert_eq!(release_checks.load(Ordering::Relaxed), 2);
+
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let released = report
+            .events
+            .iter()
+            .find(|record| {
+                record.event.operation == "invocation_terminal_finalize_completion_authority"
+                    && record.event.phase == DiagnosticPhase::Released
+            })
+            .expect("sidecar release evidence");
+        let evidence = released.event.observation.sqlite.as_ref().unwrap();
+        assert!(evidence.execution_micros.is_some());
+        assert_eq!(evidence.commit_micros, None);
+        assert!(
+            evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::CommitNotApplicable)
+        );
+        assert!(
+            evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::PostCommitNotApplicable)
+        );
     }
 
     #[test]
