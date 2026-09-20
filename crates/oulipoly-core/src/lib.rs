@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 mod auto_wake_environment;
 mod cancellation;
+pub mod runtime_cap;
 
 pub use auto_wake_environment::AutoWakeEnvironmentVariable;
 pub use cancellation::{CancellationRegistration, CancellationToken};

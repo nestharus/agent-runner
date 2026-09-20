@@ -7,6 +7,8 @@ use oulipoly_agent_messenger::ReturnedArtifactRef;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+const COMPLETED_TURN_RECOVERY_IDENTITY_LIMIT: usize = 100;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletedTurnEffects {
     pub invocation_row_id: i64,
@@ -948,7 +950,7 @@ impl StateDb {
         Ok(self
             .completed_turn_recovery_duties()?
             .into_iter()
-            .take(100)
+            .take(COMPLETED_TURN_RECOVERY_IDENTITY_LIMIT)
             .map(|duty| CompletedTurnRecoveryIdentity {
                 invocation_uuid: duty.invocation_uuid,
                 phase: duty.phase,

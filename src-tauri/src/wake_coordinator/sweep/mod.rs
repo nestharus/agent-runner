@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use super::auto_wake_env::is_auto_wake_invocation;
 use super::constants::{
-    WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS, WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS,
+    WAKE_RECLAIM_STATE_SNAPSHOT_STALE_PROGRESS_AFTER_SECONDS, WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS,
     WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
 };
 use super::wake_start::start_wake_chain;
@@ -397,7 +397,7 @@ fn run_wake_reclaim_sweep_with_owner(
                 &mut db,
                 candidates,
                 state::open_default_state_read_only_with_timeout_and_cancel(
-                    Duration::from_secs(WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS),
+                    Duration::from_secs(WAKE_RECLAIM_STATE_SNAPSHOT_STALE_PROGRESS_AFTER_SECONDS),
                     is_cancelled,
                 ),
             )?;

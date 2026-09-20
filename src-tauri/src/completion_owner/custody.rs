@@ -15,6 +15,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+const ROOT_WORKER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const RESULT_PERSIST_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
 #[cfg(test)]
 mod birth_tests;
 #[cfg(test)]
@@ -1102,7 +1105,7 @@ pub(super) fn root_worker_entry() -> Result<(), String> {
             }
         }
         if waited <= 0 {
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(ROOT_WORKER_WAIT_POLL_INTERVAL);
         }
     }
     let classification = if attempt.operation == "source_recovery" && !spawn_failed {
@@ -1201,7 +1204,7 @@ fn persist_root_worker_result(
                     });
                 }
                 retained_error = Some(error);
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(RESULT_PERSIST_RETRY_INTERVAL);
             }
         }
     }

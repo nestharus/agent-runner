@@ -4,6 +4,8 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::types::Type;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
@@ -662,7 +664,7 @@ fn tombstoned_receipt(
 
 fn configure_connection(conn: &Connection) -> Result<(), StoreError> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.busy_timeout(Duration::from_millis(5000))?;
+    conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
     Ok(())
 }
 

@@ -11,6 +11,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 pub(super) const PENDING_LIMIT: usize = 128;
+const SERVER_CONTROL_IO_TIMEOUT: Duration = Duration::from_millis(50);
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -181,7 +183,7 @@ fn serve(
         match listener.accept() {
             Ok((socket, _)) => serve_request(socket, &owner, &reply, accepting, answering, &joins),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10))
+                std::thread::sleep(ACCEPT_POLL_INTERVAL)
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return,
@@ -222,10 +224,10 @@ fn serve_request(
 ) {
     let Ok(peer) = peer_pid(&socket) else { return };
     if socket
-        .set_read_timeout(Some(Duration::from_millis(50)))
+        .set_read_timeout(Some(SERVER_CONTROL_IO_TIMEOUT))
         .is_err()
         || socket
-            .set_write_timeout(Some(Duration::from_millis(50)))
+            .set_write_timeout(Some(SERVER_CONTROL_IO_TIMEOUT))
             .is_err()
     {
         return;

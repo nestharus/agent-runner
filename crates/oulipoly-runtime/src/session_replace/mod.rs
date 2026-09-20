@@ -46,6 +46,8 @@ pub enum ReplaceSource {
 }
 
 const TEST_HOOK_ENV: &str = "OULIPOLY_IMPORT_REPLACE_TEST_HOOK";
+const IMPORT_REPLACE_LEASE_TTL: Duration = Duration::from_secs(300);
+const TEST_BLOCK_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const TEST_SLEEP_AFTER_LOCK_MS: &str = "sleep-after-lock-ms";
 const TEST_BLOCK_AFTER_RENAME: &str = "block-after-transcript-rename-before-db-commit";
 const TEST_FAIL_POSTIMAGE_VERIFY: &str = "fail-postimage-verification";
@@ -658,7 +660,7 @@ fn acquire_import_replace_lease<'a>(
     let (process_authority, lease) = match lock.acquire_with_process_authority(
         &metadata.session_id,
         &metadata.provider_name,
-        Duration::from_secs(300),
+        IMPORT_REPLACE_LEASE_TTL,
     ) {
         Ok(lease) => lease,
         Err(err) => {
@@ -1820,7 +1822,7 @@ fn maybe_test_hook(name: &str) {
             thread::sleep(Duration::from_millis(millis));
         }
         TEST_BLOCK_AFTER_RENAME => loop {
-            thread::sleep(Duration::from_secs(60));
+            thread::sleep(TEST_BLOCK_POLL_INTERVAL);
         },
         _ => {}
     }

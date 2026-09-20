@@ -39,6 +39,9 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(120);
+const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 pub struct SetupAgent {
     session_id: Option<String>,
     system_prompt: String,
@@ -137,11 +140,11 @@ impl SetupAgent {
         {
             #[cfg(feature = "__test_fixtures")]
             {
-                self.effective_timeout.unwrap_or(Duration::from_secs(120))
+                self.effective_timeout.unwrap_or(DEFAULT_TURN_TIMEOUT)
             }
             #[cfg(not(feature = "__test_fixtures"))]
             {
-                Duration::from_secs(120)
+                DEFAULT_TURN_TIMEOUT
             }
         }
     }
@@ -220,7 +223,7 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<(), Child
                 if start.elapsed() > timeout {
                     return Err(ChildWaitFailure::Timeout);
                 }
-                std::thread::sleep(Duration::from_millis(250));
+                std::thread::sleep(CHILD_EXIT_POLL_INTERVAL);
             }
             Err(err) => return Err(ChildWaitFailure::CheckStatus(err)),
         }

@@ -22,6 +22,8 @@
 
 set -euo pipefail
 
+HTTP_TIMEOUT_SECONDS=20
+
 CREDS="${1:?usage: zai-usage PATH_TO_OPENCODE_AUTH_JSON}"
 
 if [[ ! -r "$CREDS" ]]; then
@@ -38,7 +40,7 @@ fi
 # Z.ai's monitoring endpoint expects the raw token in Authorization (NO Bearer prefix).
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
-HTTP_CODE="$(curl -sS --max-time 20 -o "$TMP" -w '%{http_code}' \
+HTTP_CODE="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" -o "$TMP" -w '%{http_code}' \
   -H "Authorization: $TOKEN" \
   -H "Accept-Language: en-US,en" \
   -H "Content-Type: application/json" \

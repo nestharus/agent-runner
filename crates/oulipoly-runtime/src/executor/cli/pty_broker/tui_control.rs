@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+const CONTROL_COMMAND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
 enum Event {
     Prepared,
     Started(Vec<u8>),
@@ -362,7 +364,7 @@ fn next_command(shared: &Shared, commands: &mpsc::Receiver<Command>) -> Result<C
         if shared.cancelled() {
             return Err("control_worker_stopped".to_string());
         }
-        match commands.recv_timeout(std::time::Duration::from_millis(25)) {
+        match commands.recv_timeout(CONTROL_COMMAND_POLL_INTERVAL) {
             Ok(command) => return Ok(command),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {

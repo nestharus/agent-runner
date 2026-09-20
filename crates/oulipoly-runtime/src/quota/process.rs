@@ -27,6 +27,7 @@ const SCRIPT_TIMEOUT_SECS: u64 = 90;
 /// Auth-refresh command timeout. Should be quick (the CLI hits its own auth
 /// endpoint and exits); kept tight to avoid hanging the quota path.
 const REFRESH_TIMEOUT_SECS: u64 = 15;
+const CHILD_STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Raw `auth_refresh_command` shell-out. This rotates a single-use OAuth
 /// refresh token, so production callers MUST go through
@@ -123,7 +124,7 @@ fn wait_for_child(
     let start = std::time::Instant::now();
     let mut step = wait_step(child, kind, start, timeout)?;
     while matches!(step, WaitStep::Pending) {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(CHILD_STATUS_POLL_INTERVAL);
         step = wait_step(child, kind, start, timeout)?;
     }
     finish_wait_step(child, step, kind, timeout_secs)

@@ -4,6 +4,9 @@ use crate::custody::{OperationCustody, ProcessIdentity};
 use crate::generated::ProcessStatus;
 use std::process::{Child, ExitStatus};
 
+const GROUP_DEATH_OBSERVATION_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+const GROUP_DEATH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
 pub(crate) struct OwnedChild {
     child: Child,
     #[cfg(target_os = "linux")]
@@ -242,13 +245,13 @@ impl OwnedChild {
             return;
         }
         let start = std::time::Instant::now();
-        while start.elapsed() < std::time::Duration::from_secs(1) {
+        while start.elapsed() < GROUP_DEATH_OBSERVATION_BOUND {
             match group_dead(self.child.id()) {
                 Ok(true) => {
                     r.process_tree_terminated = true;
                     return;
                 }
-                Ok(false) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                Ok(false) => std::thread::sleep(GROUP_DEATH_POLL_INTERVAL),
                 Err(_) => {
                     r.uncertain = true;
                     return;

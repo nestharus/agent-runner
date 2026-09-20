@@ -1295,18 +1295,18 @@ impl CompletionAuthorityFence<'_> {
         }
         append_completion_continuity_on(&self.tx, continuity)?;
         let result = completion_event_registration_on(&self.tx, input.event_id, inserted)?;
-        if let Some(phases) = phases.as_deref_mut() {
+        if let Some(phases) = phases.as_mut() {
             phases.commit_started();
         }
         match self.tx.commit() {
             Ok(()) => {
-                if let Some(phases) = phases.as_deref_mut() {
+                if let Some(phases) = phases.as_mut() {
                     phases.committed();
                     phases.release_after_owner();
                 }
             }
             Err(error) => {
-                if let Some(phases) = phases.as_deref_mut() {
+                if let Some(phases) = phases.as_mut() {
                     phases.sqlite_failure(&error);
                 }
                 return Err(format!(
@@ -1340,8 +1340,6 @@ impl MailboxAuthorityFence {
         timeout: Option<StdDuration>,
     ) -> Result<Self, MailboxAuthorityFenceError> {
         const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(10);
-        #[cfg(not(test))]
-        const ACQUISITION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
         #[cfg(test)]
         const ACQUISITION_TIMEOUT: StdDuration = StdDuration::from_millis(500);
 
@@ -1405,8 +1403,11 @@ impl MailboxAuthorityFence {
                 ),
             });
         }
-        let timeout = timeout.unwrap_or(ACQUISITION_TIMEOUT);
-        let deadline = Instant::now() + timeout;
+        #[cfg(test)]
+        let acquisition_timeout = timeout.or(Some(ACQUISITION_TIMEOUT));
+        #[cfg(not(test))]
+        let acquisition_timeout = timeout;
+        let deadline = acquisition_timeout.map(|timeout| Instant::now() + timeout);
         loop {
             let lock_result = if exclusive {
                 <std::fs::File as fs4::FileExt>::try_lock(&file)
@@ -1449,13 +1450,15 @@ impl MailboxAuthorityFence {
                         target_identity: retained_target_identity,
                     });
                 }
-                Err(fs4::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                Err(fs4::TryLockError::WouldBlock)
+                    if deadline.is_none_or(|deadline| Instant::now() < deadline) =>
+                {
                     std::thread::sleep(RETRY_INTERVAL);
                 }
                 Err(fs4::TryLockError::WouldBlock) => {
                     return Err(MailboxAuthorityFenceError::Timeout {
                         path: authority_path,
-                        timeout,
+                        timeout: acquisition_timeout.expect("bounded acquisition has a timeout"),
                     });
                 }
                 Err(error) => return Err(MailboxAuthorityFenceError::Lock(error)),
@@ -1670,17 +1673,17 @@ impl MailboxDb {
         Self::open_snapshot(path, snapshot)
     }
 
-    pub fn open_read_only_with_pid_identity_and_work_timeout(
+    pub fn open_read_only_with_pid_identity_and_stale_progress(
         path: &Path,
         retry_timeout: StdDuration,
-        work_timeout: StdDuration,
+        stale_progress_after: StdDuration,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<(crate::pid_identity::PidIdentityDb, Self), String> {
         let snapshot =
-            crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_and_work_timeout(
+            crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_and_stale_progress(
                 path,
                 retry_timeout,
-                work_timeout,
+                stale_progress_after,
                 is_cancelled,
             )
             .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
@@ -7073,8 +7076,11 @@ fn sqlite_error_is_contention(error: &rusqlite::Error) -> bool {
 }
 
 #[cfg(not(any(test, feature = "test-support")))]
+const MAILBOX_WRITER_SQLITE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+#[cfg(not(any(test, feature = "test-support")))]
 fn mailbox_writer_sqlite_timeout() -> StdDuration {
-    StdDuration::from_secs(5)
+    MAILBOX_WRITER_SQLITE_TIMEOUT
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -10688,13 +10694,11 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
 
 pub(crate) fn set_wal_mode(conn: &Connection) -> Result<(), String> {
     const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(10);
-    const TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
-    let deadline = Instant::now() + TIMEOUT;
     loop {
         match conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;") {
             Ok(()) => return Ok(()),
-            Err(error) if sqlite_error_is_contention(&error) && Instant::now() < deadline => {
+            Err(error) if sqlite_error_is_contention(&error) => {
                 std::thread::sleep(RETRY_INTERVAL);
             }
             Err(error) => {
@@ -13028,7 +13032,7 @@ mod tests {
         let sidecar_path = directory.path().join("pid-identity.db");
         drop(MailboxDb::open(&sidecar_path).unwrap());
 
-        let (pid, mailbox) = MailboxDb::open_read_only_with_pid_identity_and_work_timeout(
+        let (pid, mailbox) = MailboxDb::open_read_only_with_pid_identity_and_stale_progress(
             &sidecar_path,
             StdDuration::from_millis(250),
             StdDuration::from_secs(5),

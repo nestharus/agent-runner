@@ -11,6 +11,8 @@ use oulipoly_state::mailbox::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+const RETENTION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ExitOperation {
     FinalizeDrain,
@@ -110,7 +112,7 @@ impl PendingExit {
             {
                 Ok(Some(row)) => break row,
                 Ok(None) => return Err(GenerationOperationError::MissingGeneration),
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(_) => std::thread::sleep(RETENTION_RETRY_INTERVAL),
             }
         };
         self.before(&row)
@@ -237,7 +239,7 @@ fn retain_prerequisite(path: &Path, value: &impl Serialize, _failure_boundary: &
     while write.retain(path, value).is_err() {
         #[cfg(feature = "age360-fault-fixtures")]
         oulipoly_state::completion_continuation::age360_fault_barrier(_failure_boundary);
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(RETENTION_RETRY_INTERVAL);
         #[cfg(feature = "age360-fault-fixtures")]
         oulipoly_state::completion_continuation::age360_fault_barrier(
             "native-exit-prerequisite-retry",

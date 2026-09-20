@@ -29,6 +29,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+const NATIVE_CANCELLATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
 #[derive(Clone)]
 pub struct AllocatedProviderLaunchAttempt {
     pub lease: ProviderLaunchLease,
@@ -1224,7 +1226,7 @@ impl NativeCancellationWatch {
                     token.cancel();
                     return;
                 }
-                if receiver.recv_timeout(std::time::Duration::from_millis(25))
+                if receiver.recv_timeout(NATIVE_CANCELLATION_POLL_INTERVAL)
                     != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
                 {
                     return;

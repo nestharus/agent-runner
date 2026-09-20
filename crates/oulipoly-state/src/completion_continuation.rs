@@ -391,7 +391,9 @@ pub fn age360_fault_barrier(name: &str) {
         std::process::id().to_string(),
     );
     while hold.exists() {
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        const FAULT_BARRIER_POLL_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(20);
+        std::thread::sleep(FAULT_BARRIER_POLL_INTERVAL);
     }
 }
 #[cfg(all(feature = "age360-fault-fixtures", not(target_os = "linux")))]

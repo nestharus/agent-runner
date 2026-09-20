@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const OBSERVATION_DEADLINE: Duration = Duration::from_secs(30);
+const DELIVERY_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const OBSERVATION_MAX_PAGES: usize = 16;
 pub(crate) const OBSERVATION_MAX_TURNS: u64 = 64;
 pub(crate) const OBSERVATION_MAX_RESPONSE_BYTES: u64 = 128 * 1024;
@@ -634,7 +635,7 @@ pub(crate) fn poll_headless_receipt_tick_with<
         &cwd,
         &anchor,
         1,
-        Duration::from_secs(2),
+        DELIVERY_CONFIRMATION_TIMEOUT,
     )?;
     Ok(())
 }

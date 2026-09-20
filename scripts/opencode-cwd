@@ -18,6 +18,8 @@ from pathlib import Path
 DEFAULT_TIMEOUT_MS = 10_000
 DEFAULT_STDOUT_LIMIT = 16 * 1024 * 1024
 DEFAULT_STDERR_LIMIT = 64 * 1024
+PROCESS_REAP_TIMEOUT_SECS = 1
+CAPTURE_POLL_INTERVAL_SECS = 0.05
 READ_CHUNK_SIZE = 64 * 1024
 INFO_PROOF_LIMIT = 1024 * 1024
 
@@ -258,7 +260,7 @@ def terminate_process_group(process):
     except ProcessLookupError:
         pass
     try:
-        process.wait(timeout=1)
+        process.wait(timeout=PROCESS_REAP_TIMEOUT_SECS)
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait()
@@ -364,7 +366,7 @@ def capture_step(process, selector, state, deadline, stdout_capture, stdout_limi
         terminate_process_group(process)
         map_failed_capture_state(state, "opencode_export_timeout")
         return
-    timeout = max(0, min(0.05, deadline - time.monotonic()))
+    timeout = max(0, min(CAPTURE_POLL_INTERVAL_SECS, deadline - time.monotonic()))
     events = selector.select(timeout=timeout)
     for key, _ in events:
         read_stream(selector, key.fd, state)
@@ -376,7 +378,7 @@ def capture_step(process, selector, state, deadline, stdout_capture, stdout_limi
         state["error"] == "opencode_export_stdout_limit"
     )
     if stdout_limited:
-        grace = max(0, min(0.05, deadline - time.monotonic()))
+        grace = max(0, min(CAPTURE_POLL_INTERVAL_SECS, deadline - time.monotonic()))
         for key, _ in selector.select(timeout=grace):
             read_stream(selector, key.fd, state)
         if state["error"] not in (None, "opencode_export_stdout_limit"):

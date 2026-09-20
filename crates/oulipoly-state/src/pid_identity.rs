@@ -9,7 +9,7 @@ use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::diagnostic_recorder::{
     DiagnosticPhase, OutcomeCertainty, SpanStart, SqliteDatabaseRole, SqliteEventIdentity,
@@ -502,7 +502,6 @@ fn observe_live_process_identity_impl(_os_pid: i64) -> ProcessIdentityObservatio
 
 pub(crate) fn ensure_identity_schema(conn: &Connection) -> Result<(), String> {
     const RETRY_INTERVAL: Duration = Duration::from_millis(10);
-    const TIMEOUT: Duration = Duration::from_secs(5);
     const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pid_identity (
             os_pid                  INTEGER NOT NULL,
             os_boot_id              TEXT    NOT NULL,
@@ -516,7 +515,6 @@ pub(crate) fn ensure_identity_schema(conn: &Connection) -> Result<(), String> {
             PRIMARY KEY (os_pid, os_boot_id, os_pid_starttime_ticks)
         );";
 
-    let deadline = Instant::now() + TIMEOUT;
     loop {
         match conn.execute_batch(SCHEMA) {
             Ok(()) => return Ok(()),
@@ -525,7 +523,7 @@ pub(crate) fn ensure_identity_schema(conn: &Connection) -> Result<(), String> {
                     error.sqlite_error_code(),
                     Some(rusqlite::ffi::ErrorCode::DatabaseBusy)
                         | Some(rusqlite::ffi::ErrorCode::DatabaseLocked)
-                ) && Instant::now() < deadline =>
+                ) =>
             {
                 std::thread::sleep(RETRY_INTERVAL);
             }

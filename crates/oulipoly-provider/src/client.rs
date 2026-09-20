@@ -85,6 +85,7 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Grace period between SIGTERM and SIGKILL when tearing down a timed-out or
 /// cancelled provider process tree.
 const DEFAULT_KILL_AFTER_GRACE: Duration = Duration::from_millis(100);
+const LAUNCH_KILL_AFTER_GRACE_MIN: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderTimeouts {
@@ -915,7 +916,7 @@ fn kill_after_grace_for(subcommand: &str, options: &ProviderClientOptions) -> Du
         options
             .timeouts
             .kill_after_grace
-            .max(Duration::from_millis(250))
+            .max(LAUNCH_KILL_AFTER_GRACE_MIN)
     } else {
         options.timeouts.kill_after_grace
     }

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 const OBSERVATION_INTERVAL: Duration = Duration::from_millis(250);
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+const IDLE_WAKE_INTERVAL: Duration = Duration::from_secs(60);
 const OBSERVATION_MAX_TURNS: u64 = 64;
 const OBSERVATION_MAX_RESPONSE_BYTES: u64 = 128 * 1024;
 const OBSERVATION_MAX_SOURCE_BYTES: u64 = 512 * 1024;
@@ -592,7 +593,7 @@ fn wait_for_read(shared: &ObserverShared, deadline: Instant) -> Option<(u64, boo
         {
             deadline.saturating_duration_since(Instant::now())
         } else {
-            Duration::from_secs(60)
+            IDLE_WAKE_INTERVAL
         };
         state = match shared.wake.wait_timeout(state, wait) {
             Ok((guard, _)) => guard,

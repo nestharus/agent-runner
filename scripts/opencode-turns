@@ -79,6 +79,7 @@ DEFAULT_WINDOW_HOURS = 6.0
 DEFAULT_MAX_SESSIONS = 25
 DEFAULT_CALL_TIMEOUT_SECS = 20.0
 DEFAULT_DEADLINE_SECS = 60.0
+PROCESS_REAP_TIMEOUT_SECS = 1.0
 JSON_PARSE_FAILED = object()
 
 
@@ -713,7 +714,7 @@ def kill_process_group(process: subprocess.Popen) -> None:
         except OSError:
             pass
     try:
-        process.communicate(timeout=1)
+        process.communicate(timeout=PROCESS_REAP_TIMEOUT_SECS)
     except subprocess.TimeoutExpired:
         try:
             process.kill()

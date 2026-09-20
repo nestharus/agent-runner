@@ -80,10 +80,13 @@ const OVERLAY_INPUT_TRACE_MAX_BYTES: u64 = 1024 * 1024;
 const OVERLAY_INPUT_TRACE_FILE: &str = "overlay-input-trace.log";
 const OVERLAY_INPUT_TRACE_ROTATED_FILE: &str = "overlay-input-trace.log.1";
 const BOUNDARY_PROBE_MAX_BYTES: usize = 16;
+const SOCKET_COMPONENT_MAX_CHARS: usize = 12;
 // Integration-only fault controls are inert unless explicitly supplied to the broker process.
 const PTY_DELIVERY_TEST_FAULT_ENV: &str = "OULIPOLY_PTY_DELIVERY_TEST_FAULT";
 const PTY_DELIVERY_AFTER_CONFIRM_TEST_BARRIER_ENV: &str =
     "OULIPOLY_PTY_DELIVERY_AFTER_CONFIRM_TEST_BARRIER";
+const PTY_DELIVERY_TEST_BARRIER_PATIENCE: Duration = Duration::from_secs(10);
+const PTY_DELIVERY_TEST_BARRIER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub(super) struct InteractiveChildExit {
     pub(super) status: ExitStatus,
@@ -1212,7 +1215,7 @@ fn sanitized_short_component(value: &str) -> String {
     value
         .chars()
         .filter(allowed_socket_component_char)
-        .take(12)
+        .take(SOCKET_COMPONENT_MAX_CHARS)
         .collect()
 }
 
@@ -2453,12 +2456,12 @@ fn wait_at_pty_delivery_after_confirm_test_barrier() -> Result<(), String> {
         .map_err(|error| format!("Failed to create PTY delivery test barrier: {error}"))?;
     fs::write(directory.join("ready"), b"ready")
         .map_err(|error| format!("Failed to signal PTY delivery test barrier: {error}"))?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + PTY_DELIVERY_TEST_BARRIER_PATIENCE;
     while Instant::now() < deadline {
         if directory.join("release").exists() {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(PTY_DELIVERY_TEST_BARRIER_POLL_INTERVAL);
     }
     Err("Timed out waiting at PTY delivery test barrier".to_string())
 }

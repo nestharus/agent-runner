@@ -8,6 +8,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
+use oulipoly_core::runtime_cap::{
+    PeerLiveness, ProgressWait, ProgressWaitOutcome, RuntimeCapClass,
+};
+
+use crate::diagnostic_recorder::{
+    DiagnosticPhase, OutcomeCertainty, PhaseObservation, RuntimeCapEvidence, SpanStart,
+    process_recorder,
+};
+
 #[cfg(target_os = "linux")]
 use std::os::{fd::AsRawFd, unix::process::CommandExt};
 
@@ -15,14 +24,17 @@ const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 // One observability scan opens up to three stores serially. Keep transient
 // source churn from turning best-effort observation into multi-second delay.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(250);
-const SNAPSHOT_WORK_TIMEOUT: Duration = Duration::from_secs(5);
+const SNAPSHOT_STALE_PROGRESS_AFTER: Duration = Duration::from_secs(5);
 const SQLITE_ARTIFACT_SUFFIXES: [&str; 3] = ["", "-wal", "-journal"];
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const HELPER_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const HELPER_COMPARE_TIMEOUT: Duration = Duration::from_secs(30);
-const HELPER_RETRY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 const HELPER_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+#[cfg(test)]
+const STALLED_HELPER_TEST_DELAY: Duration = Duration::from_millis(500);
 const HELPER_RETRY_MARKER: &str = "retry";
+const HELPER_PROGRESS_MARKER: &str = "progress";
+const SNAPSHOT_STALE_PROGRESS_CAP_ID: &str = "state.read-only-snapshot.stale-progress";
 #[cfg(test)]
 const STALLED_HELPER_SOURCE_NAME: &str = "stall-snapshot-helper.db";
 
@@ -65,27 +77,39 @@ impl SnapshotHelperGuard {
             .ok_or_else(|| io::Error::other("snapshot helper is unavailable"))
     }
 
-    fn request_retry(&mut self, is_cancelled: &dyn Fn() -> bool) -> io::Result<()> {
+    fn request_retry(
+        &mut self,
+        is_cancelled: &dyn Fn() -> bool,
+        progress_wait: &mut Option<SnapshotProgressWait>,
+    ) -> io::Result<()> {
         ensure_snapshot_not_cancelled(is_cancelled)?;
         let retry_marker = self.control_path()?.join(HELPER_RETRY_MARKER);
         std::fs::write(&retry_marker, [])?;
-        let deadline = Instant::now() + HELPER_RETRY_ACCEPT_TIMEOUT;
         while retry_marker.exists() {
-            ensure_snapshot_not_cancelled(is_cancelled)?;
-            if self.child_mut()?.try_wait()?.is_some() {
-                return Err(io::Error::other(
-                    "snapshot helper exited before accepting a retry",
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "snapshot helper did not accept a retry",
-                ));
-            }
-            std::thread::sleep(HELPER_POLL_INTERVAL);
+            let control = self.control_path()?.to_path_buf();
+            wait_for_snapshot_progress(
+                self.child_mut()?,
+                &control,
+                is_cancelled,
+                progress_wait,
+                "retry_acceptance",
+            )?;
         }
         Ok(())
+    }
+}
+
+struct SnapshotProgressWait {
+    started: Instant,
+    policy: ProgressWait,
+}
+
+impl SnapshotProgressWait {
+    fn new(stale_after: Duration, progress: u64) -> Self {
+        Self {
+            started: Instant::now(),
+            policy: ProgressWait::new(stale_after, HELPER_POLL_INTERVAL, Duration::ZERO, progress),
+        }
     }
 }
 
@@ -197,10 +221,10 @@ impl ReadOnlySnapshot {
         source: &Path,
         is_cancelled: &dyn Fn() -> bool,
     ) -> io::Result<Self> {
-        Self::create_with_retry_and_work_timeout(
+        Self::create_with_retry_and_stale_progress(
             source,
             SNAPSHOT_TIMEOUT,
-            SNAPSHOT_WORK_TIMEOUT,
+            SNAPSHOT_STALE_PROGRESS_AFTER,
             is_cancelled,
         )
     }
@@ -214,23 +238,23 @@ impl ReadOnlySnapshot {
             source,
             timeout,
             SNAPSHOT_RETRY_INTERVAL,
-            Some(SNAPSHOT_WORK_TIMEOUT),
+            Some(SNAPSHOT_STALE_PROGRESS_AFTER),
             is_cancelled,
             || Ok(()),
         )
     }
 
-    pub(crate) fn create_with_retry_and_work_timeout(
+    pub(crate) fn create_with_retry_and_stale_progress(
         source: &Path,
         retry_timeout: Duration,
-        work_timeout: Duration,
+        stale_progress_after: Duration,
         is_cancelled: &dyn Fn() -> bool,
     ) -> io::Result<Self> {
         Self::create_with_retry_and_work_policy(
             source,
             retry_timeout,
             SNAPSHOT_RETRY_INTERVAL,
-            Some(work_timeout),
+            Some(stale_progress_after),
             is_cancelled,
             || Ok(()),
         )
@@ -272,7 +296,7 @@ impl ReadOnlySnapshot {
         source: &Path,
         timeout: Duration,
         retry_interval: Duration,
-        work_timeout: Option<Duration>,
+        stale_progress_after: Option<Duration>,
         is_cancelled: &dyn Fn() -> bool,
         mut after_copy: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Self> {
@@ -283,26 +307,22 @@ impl ReadOnlySnapshot {
         })?;
         let path = dir.path().join(file_name);
         let mut retry_deadline = None;
-        let work_deadline = work_timeout.map(|timeout| Instant::now() + timeout);
         let mut helper = start_snapshot_helper(&source, &path, dir)?;
+        let control = helper.control_path()?.to_path_buf();
+        let mut progress_wait = stale_progress_after.map(|stale_after| {
+            SnapshotProgressWait::new(stale_after, read_snapshot_progress(&control))
+        });
         loop {
-            ensure_snapshot_work_active(is_cancelled, work_deadline)?;
+            ensure_snapshot_not_cancelled(is_cancelled)?;
             if let Some(deadline) = retry_deadline {
                 ensure_retry_active(deadline, is_cancelled)?;
             }
-            let control = helper.control_path()?.to_path_buf();
-            let should_abort = || {
-                is_cancelled() || work_deadline.is_some_and(|deadline| Instant::now() >= deadline)
-            };
-            let outcome = map_work_timeout(
-                wait_for_helper_copy(
-                    helper.child_mut()?,
-                    &control,
-                    &should_abort,
-                    &mut after_copy,
-                ),
+            let outcome = wait_for_helper_copy(
+                helper.child_mut()?,
+                &control,
                 is_cancelled,
-                work_deadline,
+                &mut progress_wait,
+                &mut after_copy,
             )?;
             if outcome == HelperCopyOutcome::Stable {
                 return Ok(Self {
@@ -320,19 +340,9 @@ impl ReadOnlySnapshot {
             if remaining.is_zero() {
                 return Err(snapshot_changed_error());
             }
-            let mut retry_sleep = retry_interval.min(remaining);
-            if let Some(deadline) = work_deadline {
-                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                    return Err(snapshot_work_timeout_error());
-                };
-                retry_sleep = retry_sleep.min(remaining);
-            }
+            let retry_sleep = retry_interval.min(remaining);
             std::thread::sleep(retry_sleep);
-            map_work_timeout(
-                helper.request_retry(&should_abort),
-                is_cancelled,
-                work_deadline,
-            )?;
+            helper.request_retry(is_cancelled, &mut progress_wait)?;
         }
     }
 
@@ -341,38 +351,14 @@ impl ReadOnlySnapshot {
     }
 }
 
-fn ensure_snapshot_work_active(
-    is_cancelled: &dyn Fn() -> bool,
-    work_deadline: Option<Instant>,
-) -> io::Result<()> {
-    ensure_snapshot_not_cancelled(is_cancelled)?;
-    if work_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        return Err(snapshot_work_timeout_error());
-    }
-    Ok(())
-}
-
-fn map_work_timeout<T>(
-    result: io::Result<T>,
-    is_cancelled: &dyn Fn() -> bool,
-    work_deadline: Option<Instant>,
-) -> io::Result<T> {
-    match result {
-        Err(error)
-            if error.kind() == io::ErrorKind::Interrupted
-                && !is_cancelled()
-                && work_deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
-        {
-            Err(snapshot_work_timeout_error())
-        }
-        result => result,
-    }
-}
-
-fn snapshot_work_timeout_error() -> io::Error {
+fn snapshot_stalled_error(stale_after: Duration, phase: &'static str) -> io::Error {
+    record_snapshot_cap_outcome(stale_after, phase, ProgressWaitOutcome::Stalled);
     io::Error::new(
         io::ErrorKind::TimedOut,
-        "Read-only SQLite snapshot exceeded its total work budget",
+        format!(
+            "Read-only SQLite snapshot made no defined progress for {}ms",
+            stale_after.as_millis()
+        ),
     )
 }
 
@@ -455,48 +441,133 @@ fn wait_for_helper_copy(
     child: &mut Child,
     control: &Path,
     is_cancelled: &dyn Fn() -> bool,
+    progress_wait: &mut Option<SnapshotProgressWait>,
     after_copy: &mut dyn FnMut() -> io::Result<()>,
 ) -> io::Result<HelperCopyOutcome> {
     let ready = control.join("ready");
     loop {
-        terminate_cancelled_helper(is_cancelled)?;
         if control.join("result").exists() {
             return read_helper_result(control);
         }
         if ready.exists() {
             break;
         }
-        if child.try_wait()?.is_some() {
-            return Err(io::Error::other(
-                "snapshot helper exited before assuming cleanup guardianship",
-            ));
-        }
-        std::thread::sleep(HELPER_POLL_INTERVAL);
+        wait_for_snapshot_progress(child, control, is_cancelled, progress_wait, "copy")?;
     }
     after_copy()?;
     std::fs::write(control.join("compare"), [])?;
     loop {
-        terminate_cancelled_helper(is_cancelled)?;
         if control.join("result").exists() {
             return read_helper_result(control);
         }
-        if child.try_wait()?.is_some() {
-            return Err(io::Error::other(
-                "snapshot helper exited before assuming cleanup guardianship",
-            ));
-        }
-        std::thread::sleep(HELPER_POLL_INTERVAL);
+        wait_for_snapshot_progress(child, control, is_cancelled, progress_wait, "validation")?;
     }
 }
 
-fn terminate_cancelled_helper(is_cancelled: &dyn Fn() -> bool) -> io::Result<()> {
-    if !is_cancelled() {
-        return Ok(());
+fn wait_for_snapshot_progress(
+    child: &mut Child,
+    control: &Path,
+    is_cancelled: &dyn Fn() -> bool,
+    progress_wait: &mut Option<SnapshotProgressWait>,
+    phase: &'static str,
+) -> io::Result<()> {
+    let cancelled = is_cancelled();
+    let peer = if child.try_wait()?.is_some() {
+        PeerLiveness::Exited
+    } else {
+        PeerLiveness::Alive
+    };
+    if let Some(wait) = progress_wait {
+        let decision = wait.policy.observe(
+            wait.started.elapsed(),
+            read_snapshot_progress(control),
+            cancelled,
+            peer,
+            false,
+        );
+        match decision.outcome {
+            ProgressWaitOutcome::Pending => {
+                std::thread::sleep(decision.poll_after.unwrap_or(HELPER_POLL_INTERVAL));
+                return Ok(());
+            }
+            ProgressWaitOutcome::Cancelled => return Err(snapshot_cancelled_error()),
+            ProgressWaitOutcome::PeerExited => return Err(snapshot_helper_exited_error()),
+            ProgressWaitOutcome::Stalled => {
+                return Err(snapshot_stalled_error(wait.policy.stale_after(), phase));
+            }
+            ProgressWaitOutcome::Complete => return Ok(()),
+        }
     }
-    Err(io::Error::new(
+    if cancelled {
+        return Err(snapshot_cancelled_error());
+    }
+    if peer == PeerLiveness::Exited {
+        return Err(snapshot_helper_exited_error());
+    }
+    std::thread::sleep(HELPER_POLL_INTERVAL);
+    Ok(())
+}
+
+fn snapshot_cancelled_error() -> io::Error {
+    io::Error::new(
         io::ErrorKind::Interrupted,
         "Read-only SQLite snapshot cancelled",
-    ))
+    )
+}
+
+fn snapshot_helper_exited_error() -> io::Error {
+    io::Error::other("snapshot helper exited before assuming cleanup guardianship")
+}
+
+fn read_snapshot_progress(control: &Path) -> u64 {
+    std::fs::read_to_string(control.join(HELPER_PROGRESS_MARKER))
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn publish_snapshot_progress(control: &Path) -> io::Result<()> {
+    let next = read_snapshot_progress(control).saturating_add(1);
+    std::fs::write(control.join(HELPER_PROGRESS_MARKER), next.to_string())
+}
+
+fn record_snapshot_cap_outcome(
+    configured: Duration,
+    phase: &'static str,
+    outcome: ProgressWaitOutcome,
+) {
+    let start = SpanStart::new("runtime_cap_exhausted", "read_only_snapshot")
+        .with_lifecycle_phase(phase)
+        .with_identifier("cap_id", SNAPSHOT_STALE_PROGRESS_CAP_ID)
+        .with_identifier("cap_class", "resource_guard");
+    let trace_correlation = start.diagnostic_id().to_string();
+    process_recorder().with_requested_span(start, |span| {
+        let evidence = snapshot_cap_evidence(configured, phase, outcome, trace_correlation);
+        let _ = span.record(
+            DiagnosticPhase::Failed,
+            PhaseObservation::not_started()
+                .with_runtime_cap(evidence)
+                .with_cause("snapshot_progress_stalled"),
+        );
+    });
+}
+
+fn snapshot_cap_evidence(
+    configured: Duration,
+    phase: &'static str,
+    outcome: ProgressWaitOutcome,
+    trace_correlation: impl AsRef<str>,
+) -> RuntimeCapEvidence {
+    RuntimeCapEvidence::new(
+        SNAPSHOT_STALE_PROGRESS_CAP_ID,
+        RuntimeCapClass::ResourceGuard,
+        "read_only_sqlite_snapshot",
+        phase,
+        format!("{}ms", configured.as_millis()),
+        outcome,
+        OutcomeCertainty::NotStarted,
+        trace_correlation,
+    )
 }
 
 fn read_helper_result(control: &Path) -> io::Result<HelperCopyOutcome> {
@@ -533,7 +604,7 @@ pub(crate) fn run_helper(source: &Path, destination: &Path, control: &Path) -> i
         .is_some_and(|name| name == std::ffi::OsStr::new(STALLED_HELPER_SOURCE_NAME))
     {
         let _ = std::fs::write(control.join("ready"), []);
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(STALLED_HELPER_TEST_DELAY);
     }
     let exit_code = 'attempts: loop {
         let outcome = execute_helper(source, destination, control, &is_cancelled);
@@ -596,6 +667,7 @@ fn cleanup_abandoned_helper_files(destination: &Path, control: &Path) {
         "compare",
         "result",
         ".result-writing",
+        HELPER_PROGRESS_MARKER,
         HELPER_RETRY_MARKER,
     ] {
         let _ = std::fs::remove_file(control.join(marker));
@@ -614,8 +686,13 @@ fn execute_helper(
     control: &Path,
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<HelperCopyOutcome> {
-    let Some(mut copied) = copy_artifact_set_inline(source, destination, is_cancelled)
-        .map_err(|error| path_io_error("copying the SQLite artifact set", source, error))?
+    let mut progress = || {
+        publish_snapshot_progress(control)
+            .map_err(|error| path_io_error("publishing snapshot progress", control, error))
+    };
+    let Some(mut copied) =
+        copy_artifact_set_inline_with_progress(source, destination, is_cancelled, &mut progress)
+            .map_err(|error| path_io_error("copying the SQLite artifact set", source, error))?
     else {
         publish_helper_result(control, "changed\n")?;
         return Ok(HelperCopyOutcome::Changed);
@@ -634,14 +711,19 @@ fn execute_helper(
         }
         std::thread::sleep(HELPER_POLL_INTERVAL);
     }
-    let outcome =
-        if artifact_sets_match(source, destination, &mut copied, is_cancelled).map_err(|error| {
-            path_io_error("validating the copied SQLite artifact set", source, error)
-        })? {
-            HelperCopyOutcome::Stable
-        } else {
-            HelperCopyOutcome::Changed
-        };
+    let outcome = if artifact_sets_match_with_progress(
+        source,
+        destination,
+        &mut copied,
+        is_cancelled,
+        &mut progress,
+    )
+    .map_err(|error| path_io_error("validating the copied SQLite artifact set", source, error))?
+    {
+        HelperCopyOutcome::Stable
+    } else {
+        HelperCopyOutcome::Changed
+    };
     drop(copied);
     publish_helper_result(
         control,
@@ -711,10 +793,20 @@ fn canonical_sqlite_source(source: &Path) -> io::Result<PathBuf> {
     Ok(canonical)
 }
 
+#[cfg(test)]
 fn copy_artifact_set_inline(
     source: &Path,
     destination: &Path,
     is_cancelled: &dyn Fn() -> bool,
+) -> io::Result<Option<OpenedSqliteArtifactSet>> {
+    copy_artifact_set_inline_with_progress(source, destination, is_cancelled, &mut || Ok(()))
+}
+
+fn copy_artifact_set_inline_with_progress(
+    source: &Path,
+    destination: &Path,
+    is_cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut() -> io::Result<()>,
 ) -> io::Result<Option<OpenedSqliteArtifactSet>> {
     let mut artifacts = std::array::from_fn(|_| None);
     for (index, suffix) in SQLITE_ARTIFACT_SUFFIXES.into_iter().enumerate() {
@@ -740,7 +832,13 @@ fn copy_artifact_set_inline(
             }
             ValidatedSourceArtifact::Changed => return Ok(None),
             ValidatedSourceArtifact::Present { mut file, identity } => {
-                copy_artifact(&mut file, &destination_artifact, is_cancelled).map_err(|error| {
+                copy_artifact_with_progress(
+                    &mut file,
+                    &destination_artifact,
+                    is_cancelled,
+                    progress,
+                )
+                .map_err(|error| {
                     path_io_error(
                         "copying a SQLite snapshot artifact",
                         &destination_artifact,
@@ -760,17 +858,31 @@ fn copy_artifact_set_inline(
                 artifacts[index] = Some(OpenedSqliteArtifact { file, identity });
             }
         }
+        progress()?;
     }
     Ok(Some(OpenedSqliteArtifactSet { artifacts }))
 }
 
+#[cfg(test)]
 fn artifact_sets_match(
     source: &Path,
     destination: &Path,
     copied: &mut OpenedSqliteArtifactSet,
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<bool> {
-    artifact_sets_match_with_hook(source, destination, copied, is_cancelled, |_| Ok(()))
+    artifact_sets_match_with_progress(source, destination, copied, is_cancelled, &mut || Ok(()))
+}
+
+fn artifact_sets_match_with_progress(
+    source: &Path,
+    destination: &Path,
+    copied: &mut OpenedSqliteArtifactSet,
+    is_cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<bool> {
+    artifact_sets_match_with_hook(source, destination, copied, is_cancelled, progress, |_| {
+        Ok(())
+    })
 }
 
 fn artifact_sets_match_with_hook(
@@ -778,6 +890,7 @@ fn artifact_sets_match_with_hook(
     destination: &Path,
     copied: &mut OpenedSqliteArtifactSet,
     is_cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut() -> io::Result<()>,
     mut after_artifact: impl FnMut(usize) -> io::Result<()>,
 ) -> io::Result<bool> {
     for (index, suffix) in SQLITE_ARTIFACT_SUFFIXES.into_iter().enumerate() {
@@ -789,8 +902,12 @@ fn artifact_sets_match_with_hook(
             Some(opened)
                 if validated_artifact_identity(&source_artifact)? == Some(opened.identity) =>
             {
-                if !files_match(&mut opened.file, &destination_artifact, is_cancelled)?
-                    || validated_artifact_identity(&source_artifact)? != Some(opened.identity)
+                if !files_match_with_progress(
+                    &mut opened.file,
+                    &destination_artifact,
+                    is_cancelled,
+                    progress,
+                )? || validated_artifact_identity(&source_artifact)? != Some(opened.identity)
                 {
                     return Ok(false);
                 }
@@ -820,10 +937,20 @@ fn artifact_identity_set_matches(
     Ok(true)
 }
 
+#[cfg(test)]
 fn copy_artifact(
     reader: &mut File,
     destination: &Path,
     is_cancelled: &dyn Fn() -> bool,
+) -> io::Result<()> {
+    copy_artifact_with_progress(reader, destination, is_cancelled, &mut || Ok(()))
+}
+
+fn copy_artifact_with_progress(
+    reader: &mut File,
+    destination: &Path,
+    is_cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     reader.seek(SeekFrom::Start(0))?;
     let mut writer = OpenOptions::new()
@@ -839,10 +966,16 @@ fn copy_artifact(
             return Ok(());
         }
         writer.write_all(&buffer[..read])?;
+        progress()?;
     }
 }
 
-fn files_match(left: &mut File, right: &Path, is_cancelled: &dyn Fn() -> bool) -> io::Result<bool> {
+fn files_match_with_progress(
+    left: &mut File,
+    right: &Path,
+    is_cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<bool> {
     left.seek(SeekFrom::Start(0))?;
     let mut right = match File::open(right) {
         Ok(file) => file,
@@ -861,6 +994,7 @@ fn files_match(left: &mut File, right: &Path, is_cancelled: &dyn Fn() -> bool) -
         if left_read == 0 {
             return Ok(true);
         }
+        progress()?;
     }
 }
 
@@ -1002,9 +1136,7 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(
-            error
-                .to_string()
-                .contains("publishing snapshot copy readiness"),
+            error.to_string().contains("publishing snapshot progress"),
             "{error}"
         );
         assert!(!missing_control.join("result").exists());
@@ -1456,7 +1588,10 @@ mod tests {
 
         let cancellation_checks = std::sync::atomic::AtomicUsize::new(0);
         let error = helper
-            .request_retry(&|| cancellation_checks.fetch_add(1, Ordering::SeqCst) > 0)
+            .request_retry(
+                &|| cancellation_checks.fetch_add(1, Ordering::SeqCst) > 0,
+                &mut None,
+            )
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(
@@ -1486,24 +1621,73 @@ mod tests {
     }
 
     #[test]
-    fn total_work_budget_bounds_a_stalled_first_attempt() {
+    fn stale_progress_policy_bounds_a_stalled_first_attempt() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join(STALLED_HELPER_SOURCE_NAME);
         std::fs::write(&source, vec![7_u8; COPY_BUFFER_BYTES * 4]).unwrap();
         let started = Instant::now();
 
-        let error = ReadOnlySnapshot::create_with_retry_and_work_timeout(
+        let error = ReadOnlySnapshot::create_with_retry_and_stale_progress(
             &source,
             Duration::from_secs(5),
             Duration::from_millis(25),
             &|| false,
         )
         .err()
-        .expect("a stalled first attempt must exhaust its total work budget");
+        .expect("a stalled first attempt must exhaust its stale-progress policy");
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(error.to_string().contains("total work budget"));
+        assert!(error.to_string().contains("made no defined progress"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn startup_snapshot_defined_progress_continues_beyond_old_five_second_wall_clock() {
+        let mut wait = ProgressWait::new(
+            SNAPSHOT_STALE_PROGRESS_AFTER,
+            HELPER_POLL_INTERVAL,
+            Duration::ZERO,
+            0,
+        );
+        for second in 1..=12 {
+            let decision = wait.observe(
+                Duration::from_secs(second),
+                second,
+                false,
+                PeerLiveness::Alive,
+                false,
+            );
+            assert_eq!(decision.outcome, ProgressWaitOutcome::Pending);
+        }
+        assert_eq!(
+            wait.observe(
+                Duration::from_secs(13),
+                12,
+                false,
+                PeerLiveness::Alive,
+                true,
+            )
+            .outcome,
+            ProgressWaitOutcome::Complete
+        );
+    }
+
+    #[test]
+    fn stalled_snapshot_diagnostic_has_complete_cap_and_trace_identity() {
+        let evidence = snapshot_cap_evidence(
+            SNAPSHOT_STALE_PROGRESS_AFTER,
+            "copy",
+            ProgressWaitOutcome::Stalled,
+            "trace-fixture",
+        );
+        assert_eq!(evidence.cap_id, SNAPSHOT_STALE_PROGRESS_CAP_ID);
+        assert_eq!(evidence.class, RuntimeCapClass::ResourceGuard);
+        assert_eq!(evidence.operation, "read_only_sqlite_snapshot");
+        assert_eq!(evidence.phase, "copy");
+        assert_eq!(evidence.configured_value, "5000ms");
+        assert_eq!(evidence.outcome, ProgressWaitOutcome::Stalled);
+        assert_eq!(evidence.outcome_certainty, OutcomeCertainty::NotStarted);
+        assert_eq!(evidence.trace_correlation, "trace-fixture");
     }
 
     #[test]
@@ -1718,15 +1902,21 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let matches =
-            artifact_sets_match_with_hook(&source, &destination, &mut copied, &|| false, |index| {
+        let matches = artifact_sets_match_with_hook(
+            &source,
+            &destination,
+            &mut copied,
+            &|| false,
+            &mut || Ok(()),
+            |index| {
                 if index == 0 {
                     std::fs::rename(&source, &replaced)?;
                     std::fs::write(&source, "replacement main")?;
                 }
                 Ok(())
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert!(!matches);
     }

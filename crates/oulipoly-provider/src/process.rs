@@ -63,6 +63,12 @@ use std::time::{Duration, Instant};
 // Terminal observation has a fixed bound even when the OS cannot confirm death
 // or a pipe/worker remains live. It is not additional provider execution time.
 const SETTLEMENT_OBSERVATION_BOUND: Duration = Duration::from_secs(1);
+const DEFAULT_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_PROCESS_KILL_AFTER_GRACE: Duration = Duration::from_millis(100);
+const TERMINATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const SETTLEMENT_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const STDIN_REJECTION_GRACE: Duration = Duration::from_millis(10);
+const WAIT_ERROR_DETAIL_MAX_CHARS: usize = 256;
 
 // Set only inside the dedicated Runner receipt helper, before any threads or
 // provider operations. Nested providers belong to that disposable inspection
@@ -377,8 +383,8 @@ impl Default for ProcessLimits {
     fn default() -> Self {
         Self {
             custody: None,
-            timeout: Duration::from_secs(30),
-            kill_after_grace: Duration::from_millis(100),
+            timeout: DEFAULT_PROCESS_TIMEOUT,
+            kill_after_grace: DEFAULT_PROCESS_KILL_AFTER_GRACE,
             stdout_limit: ByteLimit::new(1024 * 1024),
             stderr_limit: ByteLimit::new(128 * 1024),
             cancellation: None,
@@ -1375,7 +1381,7 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
                 }
                 break reap_after_kill(child, admitted);
             }
-            Ok(false) => thread::sleep(Duration::from_millis(5)),
+            Ok(false) => thread::sleep(TERMINATION_POLL_INTERVAL),
             Err(_) => {
                 child.uncertain();
                 break None;
@@ -1420,7 +1426,7 @@ fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) ->
                 }
                 break reap_after_kill(child, admitted);
             }
-            Ok(None) => thread::sleep(Duration::from_millis(5)),
+            Ok(None) => thread::sleep(TERMINATION_POLL_INTERVAL),
             Err(_) => {
                 child.uncertain();
                 break None;
@@ -1509,7 +1515,11 @@ fn wait_operation_error(
     operation: &'static str,
     error: std::io::Error,
 ) -> ProviderClientError {
-    let detail: String = error.to_string().chars().take(256).collect();
+    let detail: String = error
+        .to_string()
+        .chars()
+        .take(WAIT_ERROR_DETAIL_MAX_CHARS)
+        .collect();
     let errno = match error.raw_os_error() {
         Some(errno) => errno.to_string(),
         None => "unavailable".into(),
@@ -1774,7 +1784,7 @@ fn write_stdin_bytes(stdin: &mut impl Write, bytes: &[u8]) -> std::io::Result<()
     };
     // Give a provider that rejects stdin a bounded chance to close before the bulk write.
     stdin.write_all(std::slice::from_ref(first))?;
-    thread::sleep(Duration::from_millis(10));
+    thread::sleep(STDIN_REJECTION_GRACE);
     stdin.write_all(remaining)
 }
 
@@ -2492,7 +2502,7 @@ fn reap_after_kill(child: &mut Child, admitted: bool) -> Option<ExitStatus> {
         match result {
             Ok(Some(status)) => return Some(status),
             Ok(None) if started.elapsed() < SETTLEMENT_OBSERVATION_BOUND => {
-                thread::sleep(Duration::from_millis(2))
+                thread::sleep(SETTLEMENT_POLL_INTERVAL)
             }
             _ => {
                 child.uncertain();
@@ -2526,7 +2536,7 @@ fn collect_or_retain_process_threads<T: StdoutDrainOutput>(
         && child.is_reaped()
         && started.elapsed() < SETTLEMENT_OBSERVATION_BOUND
     {
-        thread::sleep(Duration::from_millis(2));
+        thread::sleep(SETTLEMENT_POLL_INTERVAL);
     }
     if threads.stdout.is_finished()
         && threads.stderr.is_finished()
