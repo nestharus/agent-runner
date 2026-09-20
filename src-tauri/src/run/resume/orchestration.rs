@@ -160,6 +160,15 @@ struct ResumeLoopInput<'a> {
     working_dir: Option<&'a Path>,
 }
 
+fn same_resume_identity(
+    left: &oulipoly_state::ResolvedResume,
+    right: &oulipoly_state::ResolvedResume,
+) -> bool {
+    left.chain_id == right.chain_id
+        && left.active_provider == right.active_provider
+        && left.active_session_id == right.active_session_id
+}
+
 fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
     let mut attempts = 0usize;
     let mut last_exit_code = 1;
@@ -174,14 +183,24 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
         }
         attempts += 1;
 
+        // Refuse the original completed duty before queue coordination, refresh,
+        // or external rotation can release its claim or move its session lookup.
+        input
+            .prepared
+            .env
+            .state
+            .refuse_completed_turn_resolved_resume(&input.prepared.resolved)?;
+
         let registration = super::composite_invocation_id(
             &input.prepared.resolved.active_provider,
             input.reservation,
         )
         .id;
-        let mut admitted_session = input.prepared.resolved.active_session_id.clone();
-        let mut admission =
-            crate::wake_coordinator::admit_session_launch(&registration, Some(&admitted_session))?;
+        let mut admitted_identity = input.prepared.resolved.clone();
+        let mut admission = crate::wake_coordinator::admit_resolved_session_launch(
+            &registration,
+            &input.prepared.resolved,
+        )?;
         // A chain can advance during the queued wait. Refresh before publishing
         // tokenized input or selecting a notification batch, not afterward.
         if attempts == 1 {
@@ -192,19 +211,24 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
                     input.session_id,
                     input.working_dir,
                 )?;
-                if input.prepared.resolved.active_session_id == admitted_session {
+                if same_resume_identity(&input.prepared.resolved, &admitted_identity) {
                     break;
                 }
-                admitted_session = input.prepared.resolved.active_session_id.clone();
-                admission = admission.retarget(&admitted_session)?;
+                admitted_identity = input.prepared.resolved.clone();
+                admission = admission.retarget(&input.prepared.resolved)?;
             }
         }
-        wake::reset_manual_resume_wake_claim(&admitted_session)?;
+        wake::reset_manual_resume_wake_claim(&input.prepared.resolved)?;
         let mut target = crate::resume_cli::renderable_resume_execution_target(
             &input.prepared.resolved,
             &input.prepared.env.providers_cfg,
         )
         .map_err(|code| format!("resume target unavailable: {code}"))?;
+        input
+            .prepared
+            .env
+            .state
+            .refuse_completed_turn_resolved_resume(&input.prepared.resolved)?;
         if super::migration_allowed(input.reservation) {
             super::migration::migrate_resume_target(
                 input.agent_runtime_services,
@@ -217,9 +241,9 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
             )
             .map_err(|code| format!("resume migration failed: {code}"))?;
         }
-        while input.prepared.resolved.active_session_id != admitted_session {
-            admitted_session = input.prepared.resolved.active_session_id.clone();
-            admission = admission.retarget(&admitted_session)?;
+        while !same_resume_identity(&input.prepared.resolved, &admitted_identity) {
+            admitted_identity = input.prepared.resolved.clone();
+            admission = admission.retarget(&input.prepared.resolved)?;
             execution::refresh_admitted_resume(
                 input.agent_runtime_services,
                 input.prepared,
@@ -319,6 +343,10 @@ fn run_resume_attempt(
         Ok(strategy) => strategy,
         Err(exit_code) => return Ok(ResumeAttemptLoopControl::Return(exit_code)),
     };
+    input
+        .env
+        .state
+        .refuse_completed_turn_resolved_resume(input.resolved)?;
     let mut bound_attempt = lifecycle::setup_bound_resume_attempt_with_identity(
         &input,
         &provider,

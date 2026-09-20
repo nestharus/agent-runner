@@ -703,6 +703,17 @@ fn assert_resume_artifact_order(source: &str) {
     );
     assert_contains(
         &completed,
+        "ifsuccess{super::retention::complete(&mutinput,error_category.as_deref())?;",
+        "successful completion must cross retained-custody boundary",
+    );
+    assert_order(
+        &completed,
+        "super::retention::complete(&mutinput,error_category.as_deref())?;",
+        "finalize_regular_completed_attempt(",
+        "retained custody precedes ordinary finalization",
+    );
+    assert_contains(
+        &completed,
         "ifinput.confirmed_delivery.is_none()",
         "atomic delivery branch selection",
     );
@@ -763,10 +774,15 @@ fn resume_finalization_guards_reject_standalone_and_late_artifacts() {
     );
     assert!(std::panic::catch_unwind(|| assert_resume_artifact_order(&missing)).is_err());
     let late = missing.replace(
-        "if success {",
-        "persist_returned_artifacts(&input); if success {",
+        "    finalize_regular_completed_attempt(&mut input, success, error_category.as_deref())?;",
+        "    finalize_regular_completed_attempt(&mut input, success, error_category.as_deref())?;\n    persist_returned_artifacts(&input);",
     );
     assert!(std::panic::catch_unwind(|| assert_resume_artifact_order(&late)).is_err());
+    let retention_omitted = finalization.replace(
+        "        super::retention::complete(&mut input, error_category.as_deref())?;\n",
+        "",
+    );
+    assert!(std::panic::catch_unwind(|| assert_resume_artifact_order(&retention_omitted)).is_err());
 }
 
 fn artifact_finalization_positions(body: &str) -> (Option<usize>, Option<usize>) {

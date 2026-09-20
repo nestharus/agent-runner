@@ -24,18 +24,77 @@ pub(super) fn migrate(
     request: MigrationServiceRequest<'_>,
     provider_registry: Option<&ProviderRegistryHandle>,
 ) -> Result<MigrationServiceOutput, ServiceError> {
-    if external_branch_orchestration::model_declares_external_provider(&request, provider_registry)
-    {
+    let external_declared = external_branch_orchestration::model_declares_external_provider(
+        &request,
+        provider_registry,
+    );
+    // A durable journal belongs to an older operation. Recover it under its
+    // own record-derived fence before any capability probe or new-operation
+    // fence, avoiding both provider-before-recovery and nested file locks.
+    if external_declared {
         crate::rotation_journal::startup_recovery_before_provider_dispatch(&request)
             .map_err(error_formatter::construct_migration_service_error)?;
     }
+
+    // A model-level implementation reference is already an authentic external
+    // declaration. Select its target from local configuration/State, then hold
+    // provider-wide protection before provider identity/capability discovery.
+    // The selected target is passed forward unchanged so a fair-cursor target
+    // cannot drift between the fence and identity resolution.
+    if request.migration_model.provider.is_some() {
+        let target_provider = external_identity_accessor::select_external_target_provider(
+            &request,
+            provider_registry,
+        )
+        .map_err(error_formatter::construct_migration_service_error)?;
+        let migration_fence = request
+            .state
+            .begin_completed_turn_migration(
+                request.resolved,
+                &target_provider,
+                None,
+                oulipoly_state::CompletedTurnMigrationScope::ExternalProviderWide,
+                oulipoly_state::CompletedTurnMigrationStage::ExternalBeforeProvider,
+            )
+            .map_err(|message| ServiceError::Dependency { message })?;
+        let identity = external_identity_accessor::resolve_external_provider_identity_for_target(
+            &request,
+            provider_registry,
+            &target_provider,
+        )
+        .map_err(error_formatter::construct_migration_service_error)?;
+        return crate::rotation_external_provider::materialize_rotation_with_fence(
+            provider_registry.expect("external identity requires registry"),
+            identity,
+            &request,
+            &migration_fence,
+        )
+        .map_err(error_formatter::construct_migration_service_error);
+    }
+
     match external_branch_orchestration::select_migration_branch(&request, provider_registry)? {
         external_branch_orchestration::MigrationBranch::BuiltIn => migrate_built_in(request),
         external_branch_orchestration::MigrationBranch::External { identity } => {
-            crate::rotation_external_provider::materialize_rotation(
+            // Account endpoints must first advertise rotation. A legacy endpoint
+            // that returns rotation=false reaches built-in exact-session behavior
+            // without a false provider-wide refusal. Once external rotation is
+            // selected, this fence covers all materialization/journal/host-State
+            // effects without retaining a SQLite writer.
+            let migration_fence = request
+                .state
+                .begin_completed_turn_migration(
+                    request.resolved,
+                    &identity.target_provider,
+                    None,
+                    oulipoly_state::CompletedTurnMigrationScope::ExternalProviderWide,
+                    oulipoly_state::CompletedTurnMigrationStage::ExternalBeforeProvider,
+                )
+                .map_err(|message| ServiceError::Dependency { message })?;
+            crate::rotation_external_provider::materialize_rotation_with_fence(
                 provider_registry.expect("external identity requires registry"),
                 identity,
                 &request,
+                &migration_fence,
             )
             .map_err(error_formatter::construct_migration_service_error)
         }

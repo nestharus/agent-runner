@@ -101,9 +101,7 @@ pub use interactive::{
     execute_interactive_with_result_and_model_config_and_live_session_binding,
     execute_interactive_with_result_and_model_identity,
 };
-pub(crate) use ipc::{
-    captured_child_invocations_from_stderr, prepare_return_channel, read_and_cleanup_return_channel,
-};
+pub(crate) use ipc::{captured_child_invocations_from_stderr, prepare_return_channel};
 pub use live_session_binding::InteractiveLiveSessionBinding;
 pub use live_session_binding::PENDING_CAPTURE_METHOD as PENDING_LIVE_SESSION_CAPTURE_METHOD;
 pub use live_session_binding::report_live_session_binding_from_env;
@@ -112,7 +110,7 @@ pub use request::EffectiveExecuteRequest;
 pub use resume::{ResumePayload, compose_resume_args};
 pub use resume_execution::{
     execute_resume, execute_resume_optional_prompt,
-    execute_resume_optional_prompt_with_model_identity,
+    execute_resume_optional_prompt_with_model_identity, execute_resume_with_completed_turn_owner,
 };
 pub use session_capture::start_known_provider_session_id;
 pub use terminal_signal::classify_terminal_reason;

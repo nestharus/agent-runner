@@ -19,9 +19,6 @@ use crate::session_ingest_cli::{
 };
 use crate::wiring;
 
-const TERMINAL_PERSISTENCE_ERROR_CATEGORY: &str = "terminal_persistence";
-const TERMINAL_PERSISTENCE_TERMINAL_REASON: &str = "terminal_persistence_failed";
-
 pub(super) enum CompletedAttemptControl {
     Continue,
     Return(i32),
@@ -40,6 +37,11 @@ pub(super) struct ConfirmedDeliverySettlement<'a> {
 pub(super) struct CompletedAttemptInput<'a, 'state> {
     pub(super) agent_runtime_services: &'a wiring::AgentRuntimeServices,
     pub(super) env: &'a ResumeExecutionEnvironment,
+    pub(super) mailbox_session_id: &'a str,
+    pub(super) chain_id: &'a str,
+    pub(super) mailbox_seqs: &'a [i64],
+    pub(super) mailbox_nonce: Option<&'a str>,
+    pub(super) original_wake_claim: Option<&'a str>,
     pub(super) invocation: &'a CompositeInvocationId,
     pub(super) invocation_row_id: i64,
     pub(super) guard: &'a mut FinalizerGuard<'state>,
@@ -74,64 +76,18 @@ pub(super) fn finalize_completed_attempt(
         super::predicate::completed_attempt_quota_exhausted(error_category.as_deref());
 
     if input.confirmed_delivery.is_none()
+        && !success
         && let Err(err) = persist_returned_artifacts(&input)
     {
         return Ok(handle_returned_artifacts_persist_failure(&mut input, err));
     }
 
-    if success
-        && let Err(error) = input.result.persist_output_for_invocation(
-            &input.env.state,
-            input.invocation_row_id,
-            &input.invocation.id,
-        )
-    {
-        formatter::emit_stderr(&format!("failed to persist provider output: {error}"));
-        // The confirmed-turn transaction below will not run on this failure.
-        // Preserve its owed references independently of raw output, using the
-        // producing invocation's retained authority (including native fences).
-        // This neither settles input delivery nor claims successful output.
-        if input.confirmed_delivery.is_some()
-            && let Err(error) = persist_returned_artifacts(&input)
-        {
-            formatter::emit_returned_artifacts_error(&error);
-        }
-        let finalize_result = finalize_retained_outcome_with_contention_retry(
-            input
-                .agent_runtime_services
-                .invocation_lifecycle_service
-                .as_ref(),
-            mapper::finalize_request(
-                &input.env.state,
-                input.invocation_row_id,
-                false,
-                1,
-                Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
-                Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
-            ),
-        );
-        match finalize_result {
-            Ok(_) => input.guard.mark_finalized(),
-            Err(error) => formatter::emit_finalize_invocation_warning(error),
-        }
-        formatter::emit_resume_failure_output(formatter::ResumeFailureOutputInput {
-            state: &input.env.state,
-            invocation_id: &input.invocation.id,
-            provider_name: input.provider_name,
-            provider_session_id: input.provider_session_id,
-            exit_code: 1,
-            error_category: Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
-            terminal_reason: Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
-            stderr: &input.result.stderr,
-        });
-        return Ok(CompletedAttemptControl::Return(1));
+    if success {
+        super::retention::complete(&mut input, error_category.as_deref())?;
+        return Ok(handle_completed_success(&input, error_category.as_deref()));
     }
 
     finalize_regular_completed_attempt(&mut input, success, error_category.as_deref())?;
-
-    if success {
-        return Ok(handle_completed_success(&input, error_category.as_deref()));
-    }
 
     if quota_exhausted {
         return Ok(handle_quota_exhausted(&input));
@@ -193,7 +149,7 @@ fn finalize_regular_completed_attempt(
     error_category: Option<&str>,
 ) -> Result<(), String> {
     if let Some(settlement) = input.confirmed_delivery {
-        finalize_confirmed_delivery(
+        let finalized = finalize_confirmed_delivery(
             &input.env.state,
             input.invocation_row_id,
             input.result,
@@ -201,7 +157,20 @@ fn finalize_regular_completed_attempt(
             error_category,
             input.result.terminal_reason.as_deref(),
             settlement,
-        )?;
+        );
+        if let Err(error) = &finalized
+            && success
+        {
+            // Correct input confirmation is not outgoing completion authority.
+            // As on the ordinary path, a refused integrity fence must not be
+            // replaced by guard-drop failure or an unconditional success.
+            input.guard.preserve_running_after_process_integrity(
+                &oulipoly_runtime::services::ServiceError::Dependency {
+                    message: error.clone(),
+                },
+            );
+        }
+        finalized?;
         input.guard.mark_finalized();
         return Ok(());
     }

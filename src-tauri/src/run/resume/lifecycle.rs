@@ -31,6 +31,7 @@ use crate::quota_zero_turn::zero_turn_record_baseline;
 
 pub(super) struct ResumeInvocationAttempt<'state> {
     pub(super) allocation: Option<oulipoly_runtime::executor::AllocatedProviderLaunchAttempt>,
+    pub(super) original_wake_claim: Option<String>,
     pub(super) invocation: oulipoly_state::CompositeInvocationId,
     pub(super) invocation_row_id: i64,
     pub(super) completion_registration_authority: oulipoly_state::CompletionRegistrationAuthority,
@@ -60,7 +61,12 @@ pub(super) fn setup_bound_resume_attempt_with_identity<'state>(
     provider_index: usize,
     registration_identity: &str,
 ) -> Result<BoundResumeAttempt<'state>, String> {
-    let attempt = start_resume_invocation(input, provider, provider_index, registration_identity)?;
+    let mut attempt =
+        start_resume_invocation(input, provider, provider_index, registration_identity)?;
+    attempt.original_wake_claim = super::retention::original_wake_claim(
+        input.env.state.path(),
+        &input.resolved.active_session_id,
+    )?;
     let provider_session_id = input.resolved.active_session_id.clone();
     bind_resume_attempt_session(
         input,
@@ -174,6 +180,7 @@ fn start_resume_invocation<'state>(
         // and still owns this exact allocation's logical settlement obligation.
         guard.retain_rejected_launch(Some(&lease.owner));
         return Ok(ResumeInvocationAttempt {
+            original_wake_claim: None,
             invocation,
             invocation_row_id: row,
             completion_registration_authority: allocation.completion_authority.clone(),
@@ -448,6 +455,11 @@ pub(super) fn finalize_completed_attempt_control_for_resume(
     finalize_completed_attempt(CompletedAttemptInput {
         agent_runtime_services: input.agent_runtime_services,
         env: input.env,
+        mailbox_session_id: input.mailbox_session_id,
+        chain_id: &input.resolved.chain_id,
+        mailbox_seqs: input.mailbox_delivery_seqs,
+        mailbox_nonce: input.mailbox_delivery_nonce,
+        original_wake_claim: attempt.original_wake_claim.as_deref(),
         invocation: &attempt.invocation,
         invocation_row_id: attempt.invocation_row_id,
         guard: &mut attempt.guard,

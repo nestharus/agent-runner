@@ -53,11 +53,13 @@ pub(super) fn validate_auto_wake_child(session_id: &str) -> Result<Option<i32>, 
     crate::wake_coordinator::validate_auto_wake_child(session_id)
 }
 
-pub(super) fn reset_manual_resume_wake_claim(session_id: &str) -> Result<(), String> {
+pub(super) fn reset_manual_resume_wake_claim(
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<(), String> {
     if crate::wake_coordinator::is_auto_wake_invocation() {
         return Ok(());
     }
-    crate::wake_coordinator::reset_manual_resume_wake_claim(session_id)
+    crate::wake_coordinator::reset_manual_resume_wake_claim(resolved)
 }
 
 pub(super) fn release_current_auto_wake_claim(session_id: &str) {

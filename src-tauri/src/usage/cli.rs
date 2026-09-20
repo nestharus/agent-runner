@@ -246,6 +246,16 @@ pub(crate) enum Subcommands {
     /// Hidden normalized form for `resume --list <UUID>`.
     #[command(hide = true, name = "resume-list")]
     ResumeList { uuid: String },
+    /// Inspect or settle an admitted completed turn without provider execution.
+    CompletedTurn {
+        #[arg(long)]
+        invocation: Option<String>,
+        #[arg(long)]
+        settle: bool,
+        /// Explicitly replay retained stdout bytes; never asserts prior delivery.
+        #[arg(long)]
+        output: bool,
+    },
     /// Run chain-table backfill explicitly.
     MigrateDb,
     /// Run the session ownership migration harness.

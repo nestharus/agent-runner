@@ -1686,7 +1686,11 @@ mod tests {
     fn remove_continuation_schema_for_legacy_fixture(connection: &rusqlite::Connection) {
         connection
             .execute_batch(
-                "DROP TRIGGER completion_continuation_notification_ack;
+                "DROP VIEW mailbox_retained_delivery_finalizers;
+        DROP INDEX mailbox_completed_turn_pins_attempt;
+        DROP TABLE mailbox_completed_turn_pins;
+        DROP TABLE mailbox_completed_turn_tails;
+        DROP TRIGGER completion_continuation_notification_ack;
             DROP TABLE completion_continuation_notification;
             DROP TABLE completion_continuation_attempt;
             DROP TABLE completion_continuation_source;

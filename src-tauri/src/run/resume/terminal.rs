@@ -905,3 +905,7 @@ mod tests {
 #[cfg(test)]
 #[path = "terminal_races_tests.rs"]
 pub(super) mod races_tests;
+
+#[cfg(test)]
+#[path = "finalization_guard_tests.rs"]
+mod finalization_guard_tests;

@@ -32,6 +32,7 @@ mod mapper;
 mod migration;
 mod orchestration;
 mod predicate;
+pub(crate) mod retention;
 #[cfg(test)]
 mod source_guard;
 mod terminal;

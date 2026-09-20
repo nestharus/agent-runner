@@ -37,6 +37,43 @@ pub fn validate_host_state_plan(
     identity: &ExternalRotationIdentity,
 ) -> Result<(), ExternalRotationError> {
     let plan = plan_validation::validate_host_plan_header(host_state_plan, request, identity)?;
+    let target_session_id = plan_validation::required_plan_string(plan, "target_session_id")?;
+    let migration_fence = request
+        .state
+        .begin_completed_turn_migration(
+            request.resolved,
+            &identity.target_provider,
+            Some(target_session_id),
+            oulipoly_state::CompletedTurnMigrationScope::BuiltInExact,
+            oulipoly_state::CompletedTurnMigrationStage::ExternalAfterProviderBeforeHostApply,
+        )
+        .map_err(host_apply_conflict)?;
+    validate_host_state_plan_with_fence(
+        host_state_plan,
+        result_artifacts,
+        request,
+        identity,
+        &migration_fence,
+    )
+}
+
+pub(crate) fn validate_host_state_plan_with_fence(
+    host_state_plan: &Value,
+    result_artifacts: &[Artifact],
+    request: &MigrationServiceRequest<'_>,
+    identity: &ExternalRotationIdentity,
+    migration_fence: &oulipoly_state::CompletedTurnMigrationFence,
+) -> Result<(), ExternalRotationError> {
+    let plan = plan_validation::validate_host_plan_header(host_state_plan, request, identity)?;
+    let target_session_id = plan_validation::required_plan_string(plan, "target_session_id")?;
+    request
+        .state
+        .recheck_completed_turn_migration_exact_target(
+            migration_fence,
+            target_session_id,
+            oulipoly_state::CompletedTurnMigrationStage::ExternalAfterProviderBeforeHostApply,
+        )
+        .map_err(host_apply_conflict)?;
     let snapshot = transaction_orchestration::load_chain_segment_snapshot(request)?;
     plan_validation::validate_host_plan_body(plan, &snapshot, result_artifacts, identity)?;
     artifact_orchestration::validate_plan_artifact_files(
@@ -45,7 +82,7 @@ pub fn validate_host_state_plan(
     transaction_orchestration::ensure_no_conflicting_active_segment(
         request,
         identity,
-        plan_validation::required_plan_string(plan, "target_session_id")?,
+        target_session_id,
     )
 }
 

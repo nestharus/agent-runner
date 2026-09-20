@@ -91,6 +91,15 @@ pub(crate) use predicate::{
 };
 
 pub(crate) fn run(cli: Cli) -> Result<i32, String> {
+    // Must precede ALL startup recovery, wake sweeps and provider registries.
+    if let Some(Subcommands::CompletedTurn {
+        invocation,
+        settle,
+        output,
+    }) = &cli.command
+    {
+        return crate::run::resume::retention::command(invocation.as_deref(), *settle, *output);
+    }
     // Keep read-only session inspection ahead of startup recovery and provider dispatch.
     if let Some(Subcommands::Session { command }) = &cli.command
         && let Some(result) = dispatch_inspection_only_session(command)
@@ -378,6 +387,11 @@ fn dispatch_subcommand(
         Subcommands::Notify { command } => dispatch_notify_subcommand(command),
         Subcommands::Mailbox { command } => dispatch_mailbox_subcommand(command),
         Subcommands::ResumeList { uuid } => crate::commands::resume_list::run_resume_list(&uuid),
+        Subcommands::CompletedTurn {
+            invocation,
+            settle,
+            output,
+        } => crate::run::resume::retention::command(invocation.as_deref(), settle, output),
         Subcommands::MigrateDb => commands::migrate::run_migrate_db(),
         Subcommands::MigrateSessionOwnership {
             dry_run,

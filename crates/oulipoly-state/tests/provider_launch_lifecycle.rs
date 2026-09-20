@@ -1846,3 +1846,163 @@ fn native_retained_channel_rejects_fresh_successor_after_old_certification() {
         assert_eq!(db.pending_native_channel_duties().unwrap(), vec![duty]);
     }
 }
+
+#[test]
+fn combined_success_requires_exact_current_native_mutation_authority() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    let mut stale = lease.owner.clone();
+    stale.owner_epoch += 1;
+    let mut wrong = lease.owner.clone();
+    wrong.invocation_uuid = Uuid::new_v4();
+    let ids = ["independently-confirmed-input".to_string()];
+    let turn = lease.owner.invocation_uuid.to_string();
+    let input = || ProviderTurnEffectInput {
+        invocation_row_id: lease.owner.invocation_row_id,
+        delivery_ids: &ids,
+        accept_delivery_if_missing: true,
+        session_id: "session",
+        turn_generation_id: &turn,
+        submitted_evidence: Some("fixture submission"),
+        confirmed_evidence: Some("fixture confirmation"),
+        observed_at: 17,
+        returned_artifacts: &[],
+        resume_acceptance_status: Some("accepted"),
+        resume_acceptance_evidence: Some("fixture confirmation"),
+        success: true,
+        exit_code: 0,
+        error_category: None,
+        terminal_reason: None,
+    };
+    for authority in [
+        InvocationMutationAuthority::Standalone,
+        InvocationMutationAuthority::ProviderLaunch(&stale),
+        InvocationMutationAuthority::ProviderLaunch(&wrong),
+    ] {
+        let error = db
+            .apply_provider_turn_effects(authority, input())
+            .err()
+            .unwrap();
+        assert!(error.contains("owner_fence"), "{error}");
+        assert_eq!(count(&db, "session_delivery_acknowledgements"), 0);
+        assert_eq!(
+            db.get_invocation_by_id(lease.owner.invocation_row_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Running
+        );
+    }
+    db.apply_provider_turn_effects(
+        InvocationMutationAuthority::ProviderLaunch(&lease.owner),
+        input(),
+    )
+    .unwrap();
+    assert_eq!(count(&db, "session_delivery_acknowledgements"), 1);
+    assert_eq!(
+        db.get_invocation_by_id(lease.owner.invocation_row_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        InvocationStatus::Succeeded
+    );
+}
+
+fn completed_effects(lease: &ProviderLaunchLease) -> CompletedTurnEffects {
+    CompletedTurnEffects {
+        invocation_row_id: lease.owner.invocation_row_id,
+        delivery_ids: vec![],
+        session_id: "fixture".into(),
+        turn_generation_id: lease.owner.invocation_uuid.to_string(),
+        submitted_evidence: None,
+        confirmed_evidence: None,
+        observed_at: 0,
+        returned_artifacts: vec![],
+        resume_acceptance_status: None,
+        resume_acceptance_evidence: None,
+        success: true,
+        exit_code: 0,
+        error_category: None,
+        terminal_reason: Some("completed".into()),
+    }
+}
+#[test]
+fn completed_native_custody_requires_original_fence_and_respects_cancel() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    let effects = completed_effects(&lease);
+    assert!(
+        db.admit_completed_turn(
+            InvocationMutationAuthority::Standalone,
+            &effects,
+            &serde_json::json!({})
+        )
+        .is_err()
+    );
+    let mut wrong = lease.owner.clone();
+    wrong.owner_epoch += 1;
+    assert!(
+        db.admit_completed_turn(
+            InvocationMutationAuthority::ProviderLaunch(&wrong),
+            &effects,
+            &serde_json::json!({})
+        )
+        .is_err()
+    );
+    db.admit_completed_turn(
+        InvocationMutationAuthority::ProviderLaunch(&lease.owner),
+        &effects,
+        &serde_json::json!({}),
+    )
+    .unwrap();
+    db.request_cancel(request.logical_launch_id).unwrap();
+    let record = db
+        .completed_turn(&lease.owner.invocation_uuid.to_string())
+        .unwrap()
+        .unwrap();
+    assert!(
+        db.settle_completed_turn(&record)
+            .unwrap_err()
+            .contains("cancellation")
+    );
+    assert!(
+        !db.completed_turn(&record.invocation_uuid)
+            .unwrap()
+            .unwrap()
+            .committed
+    );
+}
+#[test]
+fn completed_native_commit_replay_survives_original_connection_exit() {
+    let (dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    db.activate_attempt(&lease, &request.allocation.completion_authority)
+        .unwrap();
+    let effects = completed_effects(&lease);
+    let id = db
+        .admit_completed_turn(
+            InvocationMutationAuthority::ProviderLaunch(&lease.owner),
+            &effects,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    drop(db);
+    let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+    let record = db
+        .completed_turn(&lease.owner.invocation_uuid.to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.settlement_id, id);
+    db.settle_completed_turn(&record).unwrap();
+    db.complete_completed_turn_native(&record.invocation_uuid, &id)
+        .unwrap();
+    db.settle_completed_turn(&record).unwrap();
+    db.complete_completed_turn_native(&record.invocation_uuid, &id)
+        .unwrap();
+    let calls:i64=Connection::open(db.path()).unwrap().query_row("SELECT invocation_count FROM providers WHERE model_name='model' AND provider_name='first'",[],|r|r.get(0)).unwrap();
+    assert_eq!(calls, 1);
+}

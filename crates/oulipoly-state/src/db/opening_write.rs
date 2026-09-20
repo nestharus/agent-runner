@@ -416,6 +416,15 @@ impl StateDb {
         )
     }
 
+    /// Admission must not interpret a missing custody database as an empty one.
+    /// Keep namespace authority from the existence check through writable open.
+    pub fn open_existing(path: &Path) -> Result<Self, String> {
+        let authority = Self::acquire_writer_authority(path)?;
+        std::fs::metadata(authority.path())
+            .map_err(|e| format!("resume custody State unavailable: {e}"))?;
+        Self::open(authority.path())
+    }
+
     pub fn open_default() -> Result<Self, String> {
         let db_path = Self::default_path()?;
         Self::open(&db_path)

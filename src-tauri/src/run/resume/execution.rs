@@ -332,7 +332,7 @@ pub(super) fn execute_resume_attempt_command(
         &input.resolved.active_session_id,
         strategy.expect("legacy resume target must have a resume strategy"),
     );
-    executor::cli::execute_resume_optional_prompt_with_model_identity(
+    executor::cli::execute_resume_with_completed_turn_owner(
         provider,
         provider_index,
         prompt_mode,
@@ -342,6 +342,7 @@ pub(super) fn execute_resume_attempt_command(
         resume_payload,
         input.resolved.model_name.as_deref().unwrap_or("<unknown>"),
         Some(&input.env.models_dir),
+        &authority,
     )
 }
 

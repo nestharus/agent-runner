@@ -32,6 +32,7 @@ use super::request_builder::{
     RETURN_CHANNEL_ENV, build_launch_candidate, build_launch_request, build_policy_request,
 };
 use super::terminal_classify_handoff::classify_after_launch_success;
+use crate::executor::cli::prepare_return_channel;
 use crate::executor::cli::spawn_identity::{
     GenerationOperationError, GenerationOperationOutcome, RunningRuntimeGeneration,
     SpawnIdentityContext, SpawnRuntimeMode, attach_captured_session_id, child_custody_test_fault,
@@ -39,7 +40,6 @@ use crate::executor::cli::spawn_identity::{
     mark_runtime_generation_orderly_completed, record_child_identity,
     register_runtime_generation_starting_diagnostic,
 };
-use crate::executor::cli::{prepare_return_channel, read_and_cleanup_return_channel};
 use crate::executor::{ExecutionOutputSpool, ExecutionResult, ExternalProviderSessionAuthority};
 use crate::provider_registry::ProviderRegistry;
 use crate::services::ServiceError;
@@ -325,7 +325,10 @@ fn attempt_account_dispatch_with_custody(
         return_channel
     };
     let launch_outcome = invoke_provider_launch(&client, launch_request);
-    let returned_artifacts = match read_and_cleanup_return_channel(standalone_channel) {
+    let returned_artifacts = match crate::executor::cli::ipc::read_and_retain_return_channel(
+        standalone_channel,
+        context.live_session_authority.as_ref(),
+    ) {
         Ok(artifacts) => artifacts,
         Err(message) if launch_outcome.is_ok() => {
             let _ = finalize_failed_external_launch(

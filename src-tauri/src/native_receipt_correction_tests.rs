@@ -107,6 +107,12 @@ fn age355_private_inspection_child() {
     let mut byte = [0];
     std::io::stdin().read_exact(&mut byte).unwrap();
     assert_eq!(byte, [1]);
+    if mode == "diagnostic" {
+        eprintln!("provider-private-diagnostic-must-not-inherit");
+        std::io::stdout().write_all(b"!").unwrap();
+        std::io::stdout().flush().unwrap();
+        return;
+    }
     let mut descendant = if mode == "blocked-descendant" {
         let mut command = private_child(&root, "descendant");
         command
@@ -134,6 +140,21 @@ fn age355_private_inspection_child() {
         let _ = child.wait();
     }
     std::fs::write(root.join("inspection-finished"), b"returned").unwrap();
+}
+
+#[test]
+fn age360_helper_never_inherits_provider_diagnostics_to_terminal() {
+    let root = tempfile::tempdir().unwrap();
+    let captured = root.path().join("inherited-stderr");
+    let mut command = private_child(root.path(), "diagnostic");
+    command.stderr(std::fs::File::create(&captured).unwrap());
+    helper::supervise(
+        &mut command,
+        &CancellationToken::new(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&captured).unwrap(), b"");
 }
 
 #[test]

@@ -444,7 +444,11 @@ mod tests {
         // removed sequence/actor attribution. Migration must not invent either.
         db.conn
             .execute_batch(
-                "DROP TRIGGER completion_continuation_notification_ack;
+                "DROP VIEW mailbox_retained_delivery_finalizers;
+            DROP INDEX mailbox_completed_turn_pins_attempt;
+            DROP TABLE mailbox_completed_turn_pins;
+            DROP TABLE mailbox_completed_turn_tails;
+            DROP TRIGGER completion_continuation_notification_ack;
             DROP TABLE completion_continuation_notification; PRAGMA user_version=18;",
             )
             .unwrap();

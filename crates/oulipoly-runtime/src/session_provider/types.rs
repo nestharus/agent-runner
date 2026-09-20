@@ -233,6 +233,12 @@ impl SessionProviderError {
     pub(crate) fn token(&self) -> &str {
         &self.token
     }
+
+    /// Typed classification for the sole bounded continuation-refresh case.
+    /// Callers must not infer this authority from provider message text.
+    pub fn is_stale_page_continuation(&self) -> bool {
+        self.token == "session_turn_page_token_stale"
+    }
 }
 
 impl fmt::Display for SessionProviderError {

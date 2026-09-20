@@ -118,3 +118,173 @@ pub(super) fn reap_abandoned_finalizers_with(
     }
     tx.commit().map_err(|err| err.to_string())
 }
+
+impl MailboxDb {
+    /// Durable history pin; not an ACK and not authority to launch or settle.
+    pub fn retain_completed_delivery(
+        &self,
+        invocation_uuid: &str,
+        attempt: &str,
+        session: &str,
+        chain: &str,
+        seqs: &[i64],
+    ) -> Result<(), String> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        exact_delivery_attempt_pending_on(&tx, attempt, session, Some(chain), seqs)?;
+        let bound: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mailbox_delivery_attempts WHERE attempt_id=?1 AND delivery_invocation_uuid=?2)",
+            params![attempt, invocation_uuid], |r|r.get(0)).map_err(|e|e.to_string())?;
+        if !bound {
+            return Err("completed_turn_delivery_owner_mismatch".into());
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO mailbox_completed_turn_pins VALUES (?1,?2)",
+            params![invocation_uuid, attempt],
+        )
+        .map_err(|e| e.to_string())?;
+        let recorded: String = tx
+            .query_row(
+                "SELECT attempt_id FROM mailbox_completed_turn_pins WHERE invocation_uuid=?1",
+                [invocation_uuid],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if recorded != attempt {
+            return Err("completed_turn_history_pin_conflict".into());
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+}
+
+impl MailboxDb {
+    /// Exact postcommit bookkeeping only: no scheduler or process launch. The
+    /// marker and claim release share a transaction, making a lost response
+    /// replayable without releasing a successor's claim.
+    pub fn finish_completed_turn_bookkeeping(
+        &mut self,
+        session: &str,
+        invocation: &str,
+        settlement: &str,
+        original_claim: Option<&str>,
+        exit_code: i32,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let recorded: Option<(String,String,Option<String>)> = tx.query_row(
+            "SELECT settlement_id,session_id,claim_token FROM mailbox_completed_turn_tails WHERE invocation_uuid=?1",
+            [invocation], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
+        if let Some((id, target, token)) = recorded {
+            if id != settlement || target != session || token.as_deref() != original_claim {
+                return Err("completed_turn_tail_identity_conflict".into());
+            }
+            return tx.commit().map_err(|e| e.to_string());
+        }
+        let current = wake_claim_tx(&tx, session)?;
+        if current.as_ref().map(|c| c.claim_token.as_str()) != original_claim {
+            // Original native drain legitimately removes its claim. Absence by
+            // itself is not proof; require the exact integrated activation and
+            // terminal runtime relationship, not the recovery process's env.
+            let drained: bool = if current.is_none() && original_claim.is_some() {
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt a JOIN runtime_generation g ON g.generation_uuid=a.runtime_generation_uuid AND g.spawn_invocation_uuid=a.spawn_invocation_uuid WHERE a.operation='activation' AND a.session_id=?1 AND a.spawn_invocation_uuid=?2 AND a.claim_token=?3 AND a.phase='drained' AND a.integrated=1 AND a.drain_receipt IS NOT NULL AND g.lifecycle_state='exited')",
+                    params![session,invocation,original_claim],|r|r.get(0)).map_err(|e|e.to_string())?
+            } else {
+                false
+            };
+            if !drained {
+                return Err("completed_turn_tail_authority_conflict".into());
+            }
+        }
+        if let Some(claim) = &current
+            && claim.wake_invocation_uuid.as_deref() != Some(invocation)
+        {
+            return Err("completed_turn_tail_claim_owner_conflict".into());
+        }
+        let (generations, exited):(i64,i64) = tx.query_row(
+            "SELECT count(*),COALESCE(sum(lifecycle_state='exited'),0) FROM runtime_generation WHERE session_id=?1 AND spawn_invocation_uuid=?2",
+            params![session,invocation],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
+        if generations > 0 && (generations != 1 || exited != 1) {
+            return Err("completed_turn_original_runtime_not_exited".into());
+        }
+        if generations == 0 {
+            settle_runtime_compatibility_row(
+                &tx,
+                LegacyRuntimeProjectionSettlement {
+                    session_id: session,
+                    invocation_uuid: invocation,
+                    last_exit_code: Some(exit_code),
+                },
+                &now_rfc3339(),
+            )?;
+        }
+        if let Some(claim) = current {
+            // Existing native trigger refuses deletion while physical custody
+            // remains outstanding. This operation cannot manufacture its drain.
+            let changed = tx.execute("DELETE FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2 AND wake_invocation_uuid=?3",
+                params![session,claim.claim_token,invocation]).map_err(|e|e.to_string())?;
+            if changed != 1 {
+                return Err("completed_turn_tail_claim_changed".into());
+            }
+        }
+        tx.execute("INSERT INTO mailbox_completed_turn_tails(invocation_uuid,settlement_id,session_id,claim_token) VALUES (?1,?2,?3,?4)",
+            params![invocation,settlement,session,original_claim]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod completed_tests {
+    use super::*;
+    #[test]
+    fn exact_tail_release_replays_without_releasing_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.conn.execute("INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,wake_invocation_uuid,reason,auto_wake_count) VALUES ('s','old','now','original','fixture',1)",[]).unwrap();
+        db.finish_completed_turn_bookkeeping("s", "original", "settled", Some("old"), 0)
+            .unwrap();
+        assert!(db.wake_session_reader().wake_claim("s").unwrap().is_none());
+        db.conn.execute("INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,wake_invocation_uuid,reason,auto_wake_count) VALUES ('s','new','now','successor','fixture',2)",[]).unwrap();
+        db.finish_completed_turn_bookkeeping("s", "original", "settled", Some("old"), 0)
+            .unwrap();
+        assert_eq!(
+            db.wake_session_reader()
+                .wake_claim("s")
+                .unwrap()
+                .unwrap()
+                .claim_token,
+            "new"
+        );
+        assert!(
+            db.finish_completed_turn_bookkeeping("s", "original", "different", Some("old"), 0)
+                .is_err()
+        );
+    }
+    #[test]
+    fn absent_or_foreign_original_claim_does_not_grant_tail_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        assert!(
+            db.finish_completed_turn_bookkeeping("s", "original", "settled", Some("lost"), 0)
+                .unwrap_err()
+                .contains("authority_conflict")
+        );
+        db.conn.execute("INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,wake_invocation_uuid,reason,auto_wake_count) VALUES ('s','old','now','foreign','fixture',1)",[]).unwrap();
+        assert!(
+            db.finish_completed_turn_bookkeeping("s", "original", "settled", Some("old"), 0)
+                .unwrap_err()
+                .contains("claim_owner_conflict")
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT count(*) FROM mailbox_completed_turn_tails",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+}

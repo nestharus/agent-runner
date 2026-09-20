@@ -71,6 +71,7 @@ pub fn execute_resume_optional_prompt(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -100,6 +101,38 @@ pub fn execute_resume_optional_prompt_with_model_identity(
         Some(model_name),
         models_dir,
         None,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "original caller authority must accompany standalone custody"
+)]
+pub fn execute_resume_with_completed_turn_owner(
+    provider: &ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    prompt: Option<&str>,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: ResumePayload<'_>,
+    model_name: &str,
+    models_dir: Option<&Path>,
+    owner: &crate::services::LiveSessionAuthorityTarget,
+) -> Result<ExecutionResult, String> {
+    execute_resume_with_optional_supervisor_config(
+        provider,
+        provider_index,
+        prompt_mode,
+        prompt,
+        working_dir,
+        parent_invocation_env,
+        resume,
+        Some(model_name),
+        models_dir,
+        None,
+        Some(owner),
     )
 }
 
@@ -118,6 +151,7 @@ fn execute_resume_with_optional_supervisor_config(
     model_name: Option<&str>,
     models_dir: Option<&Path>,
     supervisor_config: Option<SupervisorConfig>,
+    completed_turn_owner: Option<&crate::services::LiveSessionAuthorityTarget>,
 ) -> Result<ExecutionResult, String> {
     let input = resume_execution_input(
         provider,
@@ -139,6 +173,7 @@ fn execute_resume_with_optional_supervisor_config(
         None,
         input.spawn_identity,
         supervisor_config,
+        completed_turn_owner,
     )?;
     cleanup_temp_files(temp_files);
     Ok(resume_execution_result(

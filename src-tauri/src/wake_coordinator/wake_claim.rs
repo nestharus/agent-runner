@@ -78,12 +78,32 @@ fn current_process_identity() -> Result<ProcessIdentity, String> {
         .ok_or_else(|| format!("Auto-wake child process {pid} is not live during claim admission"))
 }
 
-pub(crate) fn reset_manual_resume_wake_claim(session_id: &str) -> Result<(), String> {
-    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
-        return Ok(());
-    };
+pub(super) fn coordinate_manual_resume_at(
+    mailbox_path: &std::path::Path,
+    session_id: &str,
+    resolved: Option<&oulipoly_state::ResolvedResume>,
+) -> Result<oulipoly_state::mailbox::ManualWakeCoordination, String> {
+    // The sidecar and State share the data root. Do not hold a sidecar handle
+    // while opening State: namespace ordering is State -> sidecar as well.
+    let state = oulipoly_state::StateDb::open_existing(&mailbox_path.with_file_name("state.db"))?;
+    match resolved {
+        Some(resolved) if resolved.active_session_id == session_id => {
+            state.coordinate_resolved_manual_resume(resolved)
+        }
+        Some(_) => Err("manual_resume_identity_session_mismatch".into()),
+        None => state.coordinate_manual_resume(session_id),
+    }
+}
+
+pub(crate) fn reset_manual_resume_wake_claim(
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<(), String> {
     use oulipoly_state::mailbox::ManualWakeCoordination;
-    match db.wake_sessions().coordinate_manual_resume(session_id)? {
+    match coordinate_manual_resume_at(
+        &MailboxDb::default_path()?,
+        &resolved.active_session_id,
+        Some(resolved),
+    )? {
         ManualWakeCoordination::Absent | ManualWakeCoordination::Released => Ok(()),
         observation => Err(format!("Manual resume admission changed: {observation:?}")),
     }

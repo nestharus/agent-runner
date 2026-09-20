@@ -9,6 +9,7 @@ use rusqlite::{Connection, params};
 struct Fixture {
     _dir: tempfile::TempDir,
     db: MailboxDb,
+    state: oulipoly_state::StateDb,
     sql: Connection,
     live: ProcessIdentity,
 }
@@ -16,6 +17,7 @@ impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
+        let state = oulipoly_state::StateDb::open(&dir.path().join("state.db")).unwrap();
         let db = MailboxDb::open(&path).unwrap();
         let sql = Connection::open(&path).unwrap();
         let live = read_live_process_identity(i64::from(std::process::id()))
@@ -24,6 +26,7 @@ impl Fixture {
         Self {
             _dir: dir,
             db,
+            state,
             sql,
             live,
         }
@@ -88,9 +91,7 @@ fn native_publication_and_drain_debt_do_not_take_global_capacity() {
             "queued"
         );
         assert_eq!(
-            f.db.wake_sessions()
-                .coordinate_manual_resume("session")
-                .unwrap(),
+            f.state.coordinate_manual_resume("session").unwrap(),
             if phase == "unknown_custody" {
                 ManualWakeCoordination::UnknownCustody
             } else {
@@ -168,29 +169,21 @@ fn manual_intent_prevents_fresh_automatic_overtaking_and_storage_errors_propagat
         WakeClaimAcquireResult::Busy
     ));
     assert_eq!(
-        f.db.wake_sessions()
-            .coordinate_manual_resume("session")
-            .unwrap(),
+        f.state.coordinate_manual_resume("session").unwrap(),
         ManualWakeCoordination::Absent
     );
     f.sql
         .execute_batch("DROP TABLE session_wake_claim")
         .unwrap();
-    assert!(
-        f.db.wake_sessions()
-            .coordinate_manual_resume("session")
-            .is_err()
-    );
+    assert!(f.state.coordinate_manual_resume("session").is_err());
 }
 
 #[test]
 fn unknown_native_custody_waits_only_for_a_live_original_custodian() {
-    let mut f = Fixture::new();
+    let f = Fixture::new();
     f.native("unknown_custody", false);
     assert_eq!(
-        f.db.wake_sessions()
-            .coordinate_manual_resume("session")
-            .unwrap(),
+        f.state.coordinate_manual_resume("session").unwrap(),
         ManualWakeCoordination::UnknownCustody
     );
     let identity = serde_json::json!({"pid":f.live.os_pid,"boot_id":f.live.os_boot_id,"starttime_ticks":f.live.os_pid_starttime_ticks}).to_string();
@@ -201,9 +194,7 @@ fn unknown_native_custody_waits_only_for_a_live_original_custodian() {
         )
         .unwrap();
     assert_eq!(
-        f.db.wake_sessions()
-            .coordinate_manual_resume("session")
-            .unwrap(),
+        f.state.coordinate_manual_resume("session").unwrap(),
         ManualWakeCoordination::NativeBusy
     );
     assert!(
@@ -216,33 +207,25 @@ fn unknown_native_custody_waits_only_for_a_live_original_custodian() {
 
 #[test]
 fn manual_legacy_identity_unknown_live_and_exact_releasable_are_distinct() {
-    let mut f = Fixture::new();
+    let f = Fixture::new();
     f.sql.execute_batch("INSERT INTO session_wake_claim(session_id,claim_token,reason,auto_wake_count,claimed_at,wake_invocation_uuid) VALUES('session','legacy','fixture',1,'fixture','invocation')").unwrap();
     assert_eq!(
-        f.db.wake_sessions()
-            .coordinate_manual_resume("session")
-            .unwrap(),
+        f.state.coordinate_manual_resume("session").unwrap(),
         ManualWakeCoordination::UnknownCustody
     );
     f.sql.execute("UPDATE session_wake_claim SET wake_pid=?1,wake_os_boot_id=?2,wake_os_pid_starttime_ticks=?3", params![f.live.os_pid,f.live.os_boot_id,f.live.os_pid_starttime_ticks]).unwrap();
     assert_eq!(
-        f.db.wake_sessions()
-            .coordinate_manual_resume("session")
-            .unwrap(),
+        f.state.coordinate_manual_resume("session").unwrap(),
         ManualWakeCoordination::LegacyLiveBusy
     );
     // A mismatched recorded incarnation is releasable, not a live-owner timeout.
     f.sql.execute("UPDATE session_wake_claim SET wake_os_pid_starttime_ticks=wake_os_pid_starttime_ticks+1",[]).unwrap();
     assert_eq!(
-        f.db.wake_sessions()
-            .coordinate_manual_resume("session")
-            .unwrap(),
+        f.state.coordinate_manual_resume("session").unwrap(),
         ManualWakeCoordination::Released
     );
     assert_eq!(
-        f.db.wake_sessions()
-            .coordinate_manual_resume("session")
-            .unwrap(),
+        f.state.coordinate_manual_resume("session").unwrap(),
         ManualWakeCoordination::Absent
     );
 }
@@ -303,12 +286,10 @@ fn native_launcher_boot_mismatch_cannot_borrow_the_admission_exception() {
 // The actual independent writer remains held until after the observation.
 #[test]
 fn absent_manual_observation_does_not_request_a_sidecar_writer() {
-    let mut f = Fixture::new();
+    let f = Fixture::new();
     f.sql.execute_batch("BEGIN IMMEDIATE").unwrap();
     assert_eq!(
-        f.db.wake_sessions()
-            .coordinate_manual_resume("session")
-            .unwrap(),
+        f.state.coordinate_manual_resume("session").unwrap(),
         ManualWakeCoordination::Absent
     );
     f.sql.execute_batch("ROLLBACK").unwrap();
@@ -316,13 +297,11 @@ fn absent_manual_observation_does_not_request_a_sidecar_writer() {
 
 #[test]
 fn native_busy_observation_does_not_request_a_sidecar_writer_or_release_custody() {
-    let mut f = Fixture::new();
+    let f = Fixture::new();
     f.native("accepted", false);
     f.sql.execute_batch("BEGIN IMMEDIATE").unwrap();
     assert_eq!(
-        f.db.wake_sessions()
-            .coordinate_manual_resume("session")
-            .unwrap(),
+        f.state.coordinate_manual_resume("session").unwrap(),
         ManualWakeCoordination::NativeBusy
     );
     assert!(

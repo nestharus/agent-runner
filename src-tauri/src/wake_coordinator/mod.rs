@@ -29,6 +29,13 @@ pub(crate) fn admit_session_launch(
     admission::enqueue_and_wait(registration_identity, session_id)
 }
 
+pub(crate) fn admit_resolved_session_launch(
+    registration_identity: &str,
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<SessionAdmissionGuard, String> {
+    admission::enqueue_resolved_and_wait(registration_identity, resolved)
+}
+
 pub(crate) fn mark_session_idle_after_turn(
     session_id: &str,
     invocation_uuid: &str,
@@ -85,8 +92,10 @@ pub(crate) fn is_auto_wake_invocation() -> bool {
     auto_wake_env::is_auto_wake_invocation()
 }
 
-pub(crate) fn reset_manual_resume_wake_claim(session_id: &str) -> Result<(), String> {
-    wake_claim::reset_manual_resume_wake_claim(session_id)
+pub(crate) fn reset_manual_resume_wake_claim(
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<(), String> {
+    wake_claim::reset_manual_resume_wake_claim(resolved)
 }
 
 pub(crate) fn release_current_auto_wake_claim_for_session(session_id: &str) {

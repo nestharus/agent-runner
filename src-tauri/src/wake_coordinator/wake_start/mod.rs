@@ -553,7 +553,13 @@ mod tests {
         );
         crate::completion_owner::test_support::revoke_unspent(&mut db, session, "existing-owner");
         assert!(
-            db.wake_sessions()
+            db.wake_session_reader()
+                .wake_claim(session)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !db.wake_sessions()
                 .release_wake_claim(session, "existing-owner")
                 .unwrap()
         );

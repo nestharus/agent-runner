@@ -105,9 +105,30 @@ impl Fixture {
         self.db = MailboxDb::open(&self.root.path().join("pid-identity.db")).unwrap();
     }
     fn assert_pending_without_replay(&mut self) {
+        let stopped = self.db.mailbox_observation_stop(SESSION).unwrap().is_some();
         assert_eq!(
             deliverable_pending_count_on(&mut self.db, &self.state, SESSION).unwrap(),
-            1
+            usize::from(!stopped)
+        );
+        let evidence = rusqlite::Connection::open(self.db.path()).unwrap();
+        let pending: i64 = evidence
+            .query_row(
+                "SELECT COUNT(*) FROM mailbox WHERE session_id=?1 AND delivered_at IS NULL",
+                [SESSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "the stopped row remains physically pending");
+        let selected: i64 = evidence
+            .query_row(
+                "SELECT COUNT(*) FROM mailbox_delivery_attempt_items WHERE attempt_id=?1 AND mailbox_seq=?2",
+                rusqlite::params![self.attempt, self.seq],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            selected, 1,
+            "the exact attempt-to-row selection is retained"
         );
         assert!(
             prepare_headless_resume_delivery_on(&mut self.db, SESSION, "chain", None, None)
@@ -790,6 +811,228 @@ fn age355_final_confirmation_rechecks_stop_owner_checkpoint_and_full_ack() {
         );
         let row = &f.db.list_mailbox(SESSION, true).unwrap()[0];
         assert_eq!(row.delivered_at.is_some(), race == "full_ack");
+    }
+}
+
+fn seed_derived_observation_checkpoint(f: &Fixture) {
+    assert!(
+        !observe_delivery_bounded_with(
+            &f.db,
+            &f.attempt,
+            &f.anchor,
+            1,
+            Duration::from_secs(2),
+            |cursor, index, sequence, _| {
+                assert_eq!(
+                    cursor,
+                    SessionProviderPageCursor::Beginning {
+                        after_token: Some("opaque-tail".into())
+                    }
+                );
+                Ok(page(&f.anchor, index, sequence, false, 0))
+            },
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn age360_stale_continuation_refreshes_once_from_original_anchor_without_replay_or_ack() {
+    let mut f = Fixture::new();
+    f.anchored_submit();
+    seed_derived_observation_checkpoint(&f);
+    let mut calls = 0;
+    assert!(
+        observe_delivery_stale_fixture_with(
+            &f.db,
+            &f.attempt,
+            &f.anchor,
+            |cursor, index, sequence, _| {
+                calls += 1;
+                if calls == 1 {
+                    assert!(matches!(
+                        cursor,
+                        SessionProviderPageCursor::Continuation { .. }
+                    ));
+                    return Err(true);
+                }
+                assert_eq!(
+                    cursor,
+                    SessionProviderPageCursor::Beginning {
+                        after_token: Some("opaque-tail".into())
+                    }
+                );
+                assert_eq!((index, sequence), (0, 0));
+                Ok(page(&f.anchor, index, sequence, true, 1))
+            },
+        )
+        .unwrap()
+    );
+    assert_eq!(calls, 2);
+    assert_eq!(f.submissions, 1);
+    let evidence = rusqlite::Connection::open(f.db.path()).unwrap();
+    let (attempts, acknowledged, confirmation): (i64, Option<String>, Option<String>) = evidence
+        .query_row(
+            "SELECT m.delivery_attempts,a.acknowledged_at,a.observation_confirmed_turn_id
+             FROM mailbox_delivery_attempts a
+             JOIN mailbox_delivery_attempt_items i ON i.attempt_id=a.attempt_id
+             JOIN mailbox m ON m.seq=i.mailbox_seq
+             WHERE a.attempt_id=?1",
+            [&f.attempt],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(attempts, 1);
+    assert_eq!(acknowledged, None);
+    assert_eq!(confirmation.as_deref(), Some("native-user-0"));
+}
+
+#[test]
+fn age360_repeated_stale_stops_durably_and_leaves_other_attempts_fair() {
+    let mut f = Fixture::new();
+    f.anchored_submit();
+    seed_derived_observation_checkpoint(&f);
+    let error =
+        observe_delivery_stale_fixture_with(&f.db, &f.attempt, &f.anchor, |cursor, _, _, _| {
+            assert!(matches!(
+                cursor,
+                SessionProviderPageCursor::Continuation { .. }
+                    | SessionProviderPageCursor::Beginning { .. }
+            ));
+            Err(true)
+        })
+        .unwrap_err();
+    assert!(error.contains("stale_after_anchor_refresh"), "{error}");
+    let stop = f.db.mailbox_observation_stop(SESSION).unwrap().unwrap();
+    assert_eq!(stop.attempt_id, f.attempt);
+    assert_eq!(stop.reason, "session_turn_page_token_stale");
+    assert!(stop.error.contains("replay=forbidden"));
+    assert!(
+        f.db.delivery_observation_confirmation(&f.attempt)
+            .unwrap()
+            .is_none()
+    );
+    let evidence = rusqlite::Connection::open(f.db.path()).unwrap();
+    let acknowledged: Option<String> = evidence
+        .query_row(
+            "SELECT acknowledged_at FROM mailbox_delivery_attempts WHERE attempt_id=?1",
+            [&f.attempt],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(acknowledged, None);
+    f.restart();
+    assert!(
+        observe_delivery_with(&f.db, &f.attempt, &f.anchor, |_, _, _, _| {
+            panic!("durably stopped work must not be retried")
+        })
+        .unwrap_err()
+        .contains("mailbox_observation_stopped")
+    );
+    f.assert_pending_without_replay();
+
+    const OTHER_SESSION: &str = "22222222-2222-4222-8222-222222222222";
+    let EnqueueResult::Inserted(_other_row) =
+        f.db.enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            session_id: OTHER_SESSION,
+            handle: "unrelated-fair-work",
+            payload_json: "{}",
+            owner_invocation_uuid: Some("other-owner"),
+            matched_os_pid: Some(1),
+            matched_os_boot_id: Some("boot"),
+            matched_os_pid_starttime_ticks: Some(1),
+            matched_chain_index: Some(0),
+            state_dir: "/offline/other-state",
+            meta_path: "/offline/other-meta",
+            log_path: "/offline/other-log",
+            rc_path: "/offline/other-rc",
+            rc: 0,
+        })
+        .unwrap()
+    else {
+        panic!("missing unrelated row")
+    };
+    let prepared =
+        prepare_headless_resume_delivery_on(&mut f.db, OTHER_SESSION, "other-chain", None, None)
+            .unwrap();
+    let other_attempt = prepared.delivery_nonce.unwrap();
+    f.db.bind_delivery_attempt_invocation(&other_attempt, OTHER_SESSION, "other-invocation")
+        .unwrap();
+    let other_anchor = MailboxDeliveryObservationAnchor {
+        provider_session_id: OTHER_SESSION.into(),
+        expected_sha256: normalized_text_sha256(&prepared.answer.unwrap()),
+        ..f.anchor.clone()
+    };
+    f.db.record_delivery_observation_anchor(&other_attempt, OTHER_SESSION, &other_anchor)
+        .unwrap();
+    f.db.wake_sessions()
+        .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+            session_id: OTHER_SESSION,
+            mode: "headless",
+            invocation_uuid: Some("other-invocation"),
+            provider_name: Some("account"),
+            model_name: Some("offline"),
+            models_dir: None,
+            effective_cwd: Some("/offline"),
+        })
+        .unwrap();
+    f.db.begin_headless_delivery_submission(
+        &other_attempt,
+        OTHER_SESSION,
+        "other-invocation",
+        true,
+    )
+    .unwrap();
+    let visits = [
+        f.db.next_headless_receipt_attempt().unwrap(),
+        f.db.next_headless_receipt_attempt().unwrap(),
+    ];
+    assert!(
+        visits
+            .iter()
+            .any(|candidate| candidate.as_ref() == Some(&other_attempt)),
+        "the fair keyset cursor must move past the stopped slot to unrelated work: {visits:?}"
+    );
+}
+
+#[test]
+fn age360_stale_without_anchor_or_after_cas_loss_stops_without_replay() {
+    for case in ["missing-anchor", "cas-loss"] {
+        let mut f = Fixture::new();
+        f.anchored_submit();
+        seed_derived_observation_checkpoint(&f);
+        if case == "missing-anchor" {
+            f.anchor.resume_token = None;
+        }
+        let competing = MailboxDb::open(f.db.path()).unwrap();
+        let attempt = f.attempt.clone();
+        let error =
+            observe_delivery_stale_fixture_with(&f.db, &f.attempt, &f.anchor, |_, _, _, _| {
+                if case == "cas-loss" {
+                    let previous = competing
+                        .delivery_observation_progress(&attempt)
+                        .unwrap()
+                        .unwrap();
+                    let mut changed: ObservationProgress = serde_json::from_str(&previous).unwrap();
+                    changed.page_index += 1;
+                    let changed = serde_json::to_string(&changed).unwrap();
+                    competing
+                        .advance_delivery_observation_progress(&attempt, Some(&previous), &changed)
+                        .unwrap();
+                }
+                Err(true)
+            })
+            .unwrap_err();
+        assert!(
+            error.contains(if case == "missing-anchor" {
+                "immutable_anchor_unavailable"
+            } else {
+                "anchor_refresh_cas_lost"
+            }),
+            "{case}: {error}"
+        );
+        assert!(f.db.mailbox_observation_stop(SESSION).unwrap().is_some());
+        f.assert_pending_without_replay();
     }
 }
 

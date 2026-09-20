@@ -19,7 +19,10 @@ use oulipoly_runtime::services::MigrationServicePort;
 use oulipoly_runtime::services::{
     MigrationServiceOutput, MigrationServiceRequest, ProductionMigrationService, ServiceError,
 };
-use oulipoly_state::{InvocationStart, ResolvedResume, SessionTurnIngest, StateDb};
+use oulipoly_state::{
+    CompletedTurnEffects, InvocationMutationAuthority, InvocationStart, ProviderSessionBinding,
+    ResolvedResume, SessionTurnIngest, StateDb,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -729,6 +732,96 @@ fn s7c_fake_provider_crash_modes_are_hard_failures_or_recoverable_journal_states
 }
 
 #[test]
+fn s7c_journal_recovery_retains_recoverable_record_on_late_completed_turn_conflict() {
+    let fixture = RuntimeFixture::new("s7c-rotation-materialize-success");
+    let result = fixture.materialize_result();
+    oulipoly_runtime::rotation_journal::publish_after_artifact_record(
+        &fixture.request(&mut Vec::new()),
+        &fixture.identity(),
+        &result,
+    )
+    .unwrap();
+    let invocation_uuid = uuid::Uuid::new_v4().to_string();
+    let invocation_row_id = fixture
+        .state
+        .start_invocation(&InvocationStart {
+            invocation_uuid: invocation_uuid.clone(),
+            model_name: MODEL.into(),
+            provider_name: TARGET_PROVIDER.into(),
+            provider_index: 1,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    fixture
+        .state
+        .bind_invocation_provider_session_start(
+            InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: TARGET_SESSION.into(),
+                capture_method: "late-journal-conflict",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+        .unwrap();
+    fixture
+        .state
+        .admit_completed_turn(
+            InvocationMutationAuthority::Standalone,
+            &CompletedTurnEffects {
+                invocation_row_id,
+                delivery_ids: vec![],
+                session_id: TARGET_SESSION.into(),
+                turn_generation_id: invocation_uuid,
+                submitted_evidence: None,
+                confirmed_evidence: None,
+                observed_at: 0,
+                returned_artifacts: vec![],
+                resume_acceptance_status: None,
+                resume_acceptance_evidence: None,
+                success: true,
+                exit_code: 0,
+                error_category: None,
+                terminal_reason: Some("completed".into()),
+            },
+            &serde_json::json!({"provider_session":TARGET_SESSION}),
+        )
+        .unwrap();
+    let error = oulipoly_runtime::rotation_journal::startup_recovery_before_provider_dispatch(
+        &fixture.request(&mut Vec::new()),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("JournalRecoveryBeforeEffects"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("journal remains authoritative"),
+        "{error}"
+    );
+    let journal = oulipoly_runtime::rotation_journal::rotation_journal_path(&fixture.workspace);
+    assert!(journal.exists());
+    assert!(fixture.artifact_path.exists());
+
+    // Simulate the separate authorized settlement/disposition completing. The
+    // unchanged journal must still execute its original rollback successfully.
+    rusqlite::Connection::open(fixture.state.path())
+        .unwrap()
+        .execute(
+            "DELETE FROM completed_turns WHERE invocation_id=?1",
+            [invocation_row_id],
+        )
+        .unwrap();
+    oulipoly_runtime::rotation_journal::startup_recovery_before_provider_dispatch(
+        &fixture.request(&mut Vec::new()),
+    )
+    .unwrap();
+    assert!(!journal.exists());
+    assert!(!fixture.artifact_path.exists());
+}
+
+#[test]
 fn s7c_rotation_journal_lock_is_exclusive_before_host_apply_mutation() {
     let fixture = RuntimeFixture::new("s7c-rotation-materialize-success");
     let lock_path =
@@ -941,6 +1034,168 @@ fn s7c_production_migration_service_runs_journal_recovery_before_provider_reques
         journal_path.exists(),
         "quarantined journal remains for operator inspection"
     );
+}
+
+#[test]
+fn s7c_external_rotation_refuses_retained_target_before_provider_or_artifact_effects() {
+    let fixture = RuntimeFixture::new("s7c-rotation-materialize-success");
+    let invocation_uuid = uuid::Uuid::new_v4().to_string();
+    let invocation_row_id = fixture
+        .state
+        .start_invocation(&InvocationStart {
+            invocation_uuid: invocation_uuid.clone(),
+            model_name: MODEL.into(),
+            provider_name: TARGET_PROVIDER.into(),
+            provider_index: 1,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    fixture
+        .state
+        .bind_invocation_provider_session_start(
+            InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: TARGET_SESSION.into(),
+                capture_method: "retained-target-fixture",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+        .unwrap();
+    fixture
+        .state
+        .admit_completed_turn(
+            InvocationMutationAuthority::Standalone,
+            &CompletedTurnEffects {
+                invocation_row_id,
+                delivery_ids: vec![],
+                session_id: TARGET_SESSION.into(),
+                turn_generation_id: invocation_uuid.clone(),
+                submitted_evidence: None,
+                confirmed_evidence: None,
+                observed_at: 0,
+                returned_artifacts: vec![],
+                resume_acceptance_status: None,
+                resume_acceptance_evidence: None,
+                success: true,
+                exit_code: 0,
+                error_category: None,
+                terminal_reason: Some("completed".into()),
+            },
+            &serde_json::json!({
+                "provider_session": TARGET_SESSION,
+                "original_wake_claim": null
+            }),
+        )
+        .unwrap();
+    let before = fixture.snapshot();
+    let provider_calls_before = std::fs::read_to_string(&fixture.count_path).unwrap();
+    let service = ProductionMigrationService::with_registry_handle(fixture.registry.clone());
+    let error = service
+        .migrate(fixture.request_manual(&mut Vec::new(), TARGET_PROVIDER))
+        .unwrap_err();
+    let ServiceError::Dependency { message } = error else {
+        panic!("retained target must be a dependency refusal")
+    };
+    assert!(
+        message.contains("completed_turn_target_pending"),
+        "{message}"
+    );
+    assert!(message.contains("settlement_pending"), "{message}");
+    assert_eq!(
+        std::fs::read_to_string(&fixture.count_path).unwrap(),
+        provider_calls_before,
+        "retained-target refusal must precede any new provider request"
+    );
+    assert!(!fixture.artifact_path.exists());
+    assert_eq!(fixture.snapshot(), before);
+    assert!(
+        !oulipoly_runtime::rotation_journal::rotation_journal_path(&fixture.workspace).exists()
+    );
+    assert!(
+        !fixture
+            .state
+            .completed_turn(&invocation_uuid)
+            .unwrap()
+            .unwrap()
+            .committed
+    );
+}
+
+#[test]
+fn s7c_legacy_account_without_rotation_uses_exact_builtin_retained_scope() {
+    let mut fixture = RuntimeFixture::new("describe-rotation-disabled");
+    fixture.model.provider = None;
+    fixture.resolved.model = None;
+    let invocation_uuid = uuid::Uuid::new_v4().to_string();
+    let invocation_row_id = fixture
+        .state
+        .start_invocation(&InvocationStart {
+            invocation_uuid: invocation_uuid.clone(),
+            model_name: MODEL.into(),
+            provider_name: TARGET_PROVIDER.into(),
+            provider_index: 1,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    fixture
+        .state
+        .bind_invocation_provider_session_start(
+            InvocationMutationAuthority::Standalone,
+            invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: TARGET_SESSION.into(),
+                capture_method: "legacy-no-rotation-control",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+        .unwrap();
+    fixture
+        .state
+        .admit_completed_turn(
+            InvocationMutationAuthority::Standalone,
+            &CompletedTurnEffects {
+                invocation_row_id,
+                delivery_ids: vec![],
+                session_id: TARGET_SESSION.into(),
+                turn_generation_id: invocation_uuid,
+                submitted_evidence: None,
+                confirmed_evidence: None,
+                observed_at: 0,
+                returned_artifacts: vec![],
+                resume_acceptance_status: None,
+                resume_acceptance_evidence: None,
+                success: true,
+                exit_code: 0,
+                error_category: None,
+                terminal_reason: Some("completed".into()),
+            },
+            &serde_json::json!({"provider_session":TARGET_SESSION}),
+        )
+        .unwrap();
+    let service = ProductionMigrationService::with_registry_handle(fixture.registry.clone());
+    let output = service
+        .migrate(fixture.request_manual(&mut Vec::new(), TARGET_PROVIDER))
+        .unwrap();
+    let oulipoly_runtime::services::MigrationServiceOutput::RotationFailed {
+        reason:
+            oulipoly_runtime::services::RotationFailedReason::ManualTargetNotMigratable {
+                source,
+                target,
+            },
+    } = output
+    else {
+        panic!(
+            "rotation=false must reach built-in target adjudication instead of provider-wide retained-duty refusal: {output:?}"
+        )
+    };
+    assert_eq!(source, SOURCE_PROVIDER);
+    assert_eq!(target, TARGET_PROVIDER);
+    let request = std::fs::read_to_string(&fixture.record_path).unwrap();
+    assert!(request.contains("\ndescribe\n"), "{request}");
+    assert!(!request.contains("rotation.materialize"), "{request}");
 }
 
 #[test]

@@ -677,8 +677,16 @@ pub(crate) fn prepare_return_channel(
 }
 // Standalone callers consume artifacts, not a transfer certificate. Their
 // explicit Child lifecycle precedes this read; no lifecycle authority is minted.
-pub(crate) fn read_and_cleanup_return_channel(
+#[cfg(test)]
+fn read_and_cleanup_return_channel(
     channel: Option<ReturnChannel>,
+) -> Result<Vec<ReturnedArtifactRef>, String> {
+    read_and_retain_return_channel(channel, None)
+}
+
+pub(crate) fn read_and_retain_return_channel(
+    channel: Option<ReturnChannel>,
+    owner: Option<&crate::services::LiveSessionAuthorityTarget>,
 ) -> Result<Vec<ReturnedArtifactRef>, String> {
     let Some(mut channel) = channel else {
         return Ok(vec![]);
@@ -687,7 +695,24 @@ pub(crate) fn read_and_cleanup_return_channel(
     // returned_artifacts error category. Carry structurally valid foreign refs
     // to that rejecting sink, but quarantine their channel: never bless or
     // delete them as accepted custody. Allocated seals never commit such refs.
-    let settlement = channel.read_settled(|_| Ok(()), ChannelUse::StandaloneConsumption);
+    let settlement = channel.read_settled(
+        |refs| {
+            let Some(owner) = owner else { return Ok(()) };
+            let state = oulipoly_state::StateDb::open(&owner.state_path)?;
+            let invocation = state
+                .get_invocation_by_uuid(&owner.invocation_uuid)?
+                .ok_or("completed_turn_original_owner_missing")?;
+            if invocation.id != owner.invocation_row_id {
+                return Err("completed_turn_original_owner_mismatch".into());
+            }
+            state.retain_completed_turn_selection(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                owner.invocation_row_id,
+                refs,
+            )
+        },
+        ChannelUse::StandaloneConsumption,
+    );
     match settlement {
         ReturnChannelSettlement::NotCreated | ReturnChannelSettlement::EmptyRemoved => Ok(vec![]),
         ReturnChannelSettlement::ArtifactsCommitted(refs) => Ok(refs),

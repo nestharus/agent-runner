@@ -94,6 +94,10 @@ pub use db::{
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};
 pub use db::{
+    CompletedTurnEffects, CompletedTurnMigrationFence, CompletedTurnMigrationScope,
+    CompletedTurnMigrationStage, CompletedTurnRecord, CompletedTurnRecoveryIdentity,
+};
+pub use db::{
     CompletionContinuityRecoveryState, CompletionObligationAdmission,
     CompletionObligationAdmissionResult, CompletionObligationAuthority,
     CompletionObligationExpectation, EffectiveTerminalDisposition, ListenerSettlementClass,

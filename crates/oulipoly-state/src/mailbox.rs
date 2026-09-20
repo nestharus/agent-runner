@@ -1004,6 +1004,7 @@ pub struct PayloadRetentionRepository<'a> {
 /// Session metadata plus atomic wake-claim admission and lifecycle authority.
 pub struct WakeSessionRepository<'a> {
     conn: &'a mut Connection,
+    data_root: &'a Path,
 }
 
 /// Durable FIFO admission and in-flight launch reservation authority.
@@ -1546,6 +1547,19 @@ impl MailboxDb {
         })
     }
 
+    /// Only called while State owns the completed-turn admission reservation.
+    pub(crate) fn coordinate_manual_resume_without_wait(
+        &mut self,
+        session: &str,
+        retained_claims: &[RetainedWakeClaim],
+    ) -> Result<ManualWakeCoordination, String> {
+        self.conn
+            .busy_timeout(StdDuration::ZERO)
+            .map_err(|e| e.to_string())?;
+        self.wake_sessions()
+            .coordinate_manual_resume(session, retained_claims)
+    }
+
     pub(crate) fn begin_completion_authority_fence(
         &mut self,
     ) -> Result<CompletionAuthorityFence<'_>, String> {
@@ -1615,6 +1629,7 @@ impl MailboxDb {
     pub fn wake_sessions(&mut self) -> WakeSessionRepository<'_> {
         WakeSessionRepository {
             conn: &mut self.conn,
+            data_root: self.path.parent().unwrap_or(Path::new(".")),
         }
     }
 
@@ -3045,7 +3060,7 @@ impl MailboxDb {
                     "SELECT EXISTS (
                          SELECT 1 FROM mailbox_delivery_attempts
                          WHERE attempt_id = ?1
-                           AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                           AND NOT EXISTS (SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                                            WHERE finalizer.attempt_id = ?1)
                            AND resolved_at IS NOT NULL
                            AND (
@@ -3098,7 +3113,7 @@ impl MailboxDb {
                                  ON attempt.attempt_id = item.attempt_id
                                WHERE item.mailbox_seq = candidate.seq
                                  AND (attempt.resolved_at IS NULL OR EXISTS (
-                                     SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                                     SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                                      WHERE finalizer.attempt_id = attempt.attempt_id
                                  ))
                            )
@@ -4067,6 +4082,35 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to persist observation progress: {err}"))?;
         if changed != 1 {
             return Err("mailbox observation progress changed or resolved".into());
+        }
+        Ok(())
+    }
+
+    /// CAS a stale derived continuation back to its immutable anchor while
+    /// retaining a bounded structured diagnostic for the exact attempt.
+    pub fn reset_delivery_observation_progress_after_stale(
+        &self,
+        attempt_id: &str,
+        previous: &str,
+        next: &str,
+        diagnostic: &str,
+    ) -> Result<(), String> {
+        if next.len() > 128 * 1024 {
+            return Err("mailbox observation progress exceeds bound".into());
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts
+                 SET observation_progress=?3,observation_error=?4
+                 WHERE attempt_id=?1 AND observation_progress=?2
+                   AND resolved_at IS NULL AND observation_confirmed_at IS NULL
+                   AND observation_expected_sha256 IS NOT NULL",
+                params![attempt_id, previous, next, truncate_utf8(diagnostic, 1024)],
+            )
+            .map_err(|error| format!("Failed to reset stale observation progress: {error}"))?;
+        if changed != 1 {
+            return Err("mailbox stale observation reset changed or resolved".into());
         }
         Ok(())
     }
@@ -5399,6 +5443,17 @@ pub enum ManualWakeCoordination {
     UnknownCustody,
 }
 
+/// State-authenticated original claim identity whose completed-turn tail has
+/// not yet been proven complete. This grants no claim or settlement authority;
+/// it only prevents ordinary coordination from deleting that exact authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetainedWakeClaim {
+    pub(crate) invocation_uuid: String,
+    pub(crate) settlement_id: String,
+    pub(crate) claim_token: String,
+    pub(crate) phase: String,
+}
+
 impl WakeSessionRepository<'_> {
     pub fn upsert_session_metadata(
         &mut self,
@@ -5569,6 +5624,46 @@ impl SessionAdmissionRepository<'_> {
             )
             .map(|changed| changed == 1)
             .map_err(|err| format!("Failed to cancel exact queued session admission: {err}"))
+    }
+
+    /// Cancel only the caller's exact reservation while custody is still
+    /// provably unmaterialized. An admitted row requires its exact claim token;
+    /// launching and generation-bound rows are never changed here.
+    pub fn cancel_exact_unmaterialized(
+        &mut self,
+        registration_identity: &str,
+        admission_id: &str,
+        observed_claim_token: Option<&str>,
+        reason: &str,
+        now_unix_ms: i64,
+    ) -> Result<bool, String> {
+        validate_session_admission_identity(registration_identity, "registration_identity")?;
+        validate_session_admission_identity(admission_id, "admission_id")?;
+        validate_optional_session_admission_identity(observed_claim_token, "claim_token")?;
+        validate_session_admission_identity(reason, "queue_reason")?;
+        self.conn
+            .execute(
+                "UPDATE session_admission_queue
+                 SET state = 'cancelled', queue_reason = ?4,
+                     claim_token = NULL, claimed_at_unix_ms = NULL,
+                     updated_at_unix_ms = ?5
+                 WHERE registration_identity = ?1
+                   AND admission_id = ?2
+                   AND runtime_generation_uuid IS NULL
+                   AND ((state = 'queued' AND claim_token IS NULL AND ?3 IS NULL)
+                        OR (state = 'admitted' AND claim_token = ?3))",
+                params![
+                    registration_identity,
+                    admission_id,
+                    observed_claim_token,
+                    reason,
+                    now_unix_ms
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|err| {
+                format!("Failed to cancel exact unmaterialized session admission: {err}")
+            })
     }
 
     pub fn try_admit_next(
@@ -5826,7 +5921,7 @@ impl WakeSessionRepository<'_> {
             return Ok(WakeClaimAcquireResult::RuntimeUnavailable);
         }
         let claim = acquire_wake_claim_tx(&tx, input, &now, min_seq, max_seq)?;
-        completion_continuation::reserve_activation_on(&tx, input)?;
+        completion_continuation::reserve_activation_on(&tx, input, self.data_root)?;
         commit_wake_claim_transaction(tx)?;
         Ok(WakeClaimAcquireResult::Acquired(claim))
     }
@@ -5853,9 +5948,10 @@ impl WakeSessionRepository<'_> {
 
     /// Observe without a writer; recheck and release exact releasable legacy
     /// claims under a writer. Native custody is never cancelled by this command.
-    pub fn coordinate_manual_resume(
+    fn coordinate_manual_resume(
         &mut self,
         session: &str,
+        retained_claims: &[RetainedWakeClaim],
     ) -> Result<ManualWakeCoordination, String> {
         // A live coherent read is only a wait/release hint, not launch authority.
         // Drop it before acquiring a writer: never upgrade a read transaction.
@@ -5876,6 +5972,34 @@ impl WakeSessionRepository<'_> {
             return Ok(ManualWakeCoordination::Absent);
         };
         if wake_claim_is_releasable_for_manual_resume(&tx, &claim)? {
+            if let Some(retained) = retained_claims.iter().find(|retained| {
+                retained.claim_token == claim.claim_token
+                    && claim.wake_invocation_uuid.as_deref()
+                        == Some(retained.invocation_uuid.as_str())
+            }) {
+                let tail_finished: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM mailbox_completed_turn_tails
+                         WHERE invocation_uuid=?1 AND settlement_id=?2
+                           AND session_id=?3 AND claim_token=?4)",
+                        params![
+                            retained.invocation_uuid,
+                            retained.settlement_id,
+                            session,
+                            retained.claim_token
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        format!("Failed to inspect retained completed-turn claim tail: {error}")
+                    })?;
+                if !tail_finished {
+                    return Err(format!(
+                        "completed_turn_claim_pending: invocation={} phase={}; exact original claim remains required for non-provider recovery",
+                        retained.invocation_uuid, retained.phase
+                    ));
+                }
+            }
             let changed = tx
                 .execute(
                     "DELETE FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
@@ -7191,7 +7315,7 @@ fn terminal_history_retention_stats_on(
                  ON attempt.attempt_id = item.attempt_id
                WHERE item.mailbox_seq = candidate.seq
                  AND (attempt.resolved_at IS NULL OR EXISTS (
-                       SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                       SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                        WHERE finalizer.attempt_id = attempt.attempt_id
                    ))
            )",
@@ -7209,7 +7333,7 @@ fn terminal_history_retention_stats_on(
         "SELECT COUNT(*)
          FROM mailbox_delivery_attempts AS candidate
          WHERE candidate.resolved_at IS NOT NULL
-           AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+           AND NOT EXISTS (SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                            WHERE finalizer.attempt_id = candidate.attempt_id)
            AND (
                candidate.evidence_disposition IS NULL
@@ -7290,7 +7414,7 @@ fn prunable_delivery_attempt_ids(
             "SELECT attempt_id
              FROM mailbox_delivery_attempts AS candidate
              WHERE candidate.resolved_at IS NOT NULL
-           AND NOT EXISTS (SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+           AND NOT EXISTS (SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                            WHERE finalizer.attempt_id = candidate.attempt_id)
                AND (
                    candidate.evidence_disposition IS NULL
@@ -7348,7 +7472,7 @@ fn prunable_terminal_mailbox_rows(
                      ON attempt.attempt_id = item.attempt_id
                    WHERE item.mailbox_seq = candidate.seq
                      AND (attempt.resolved_at IS NULL OR EXISTS (
-                       SELECT 1 FROM mailbox_delivery_finalizers AS finalizer
+                       SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                        WHERE finalizer.attempt_id = attempt.attempt_id
                    ))
                )
@@ -13006,11 +13130,11 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            // Schema 19 includes three additional notification definitions in the
-            // fingerprint (measured 1390 VM steps). Keep a tight fixed ceiling,
+            // Schema 20 includes retained completed-turn definitions in the
+            // fingerprint (measured 1473 VM steps). Keep a tight fixed ceiling,
             // the no-backfill assertion, and the separate retained-history
             // growth test; this does not grant a data-size-dependent budget.
-            current_open_steps < 1420,
+            current_open_steps < 1510,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
         );
     }
@@ -18532,7 +18656,13 @@ mod tests {
         assert!(matches!(first, WakeClaimAcquireResult::Acquired(_)));
         revoke_unspent_wake(&mut db, "token-a");
         assert!(
-            db.wake_sessions()
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !db.wake_sessions()
                 .release_wake_claim("session-a", "token-a")
                 .unwrap()
         );
@@ -18602,9 +18732,11 @@ mod tests {
             5
         );
         revoke_unspent_wake(&mut db, "token-a");
-        db.wake_sessions()
-            .release_wake_claim("session-a", "token-a")
-            .unwrap();
+        assert!(
+            !db.wake_sessions()
+                .release_wake_claim("session-a", "token-a")
+                .unwrap()
+        );
         let candidates = db.wake_sessions().wake_sweep_candidates(600, 10).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].auto_wake_count, 6);
@@ -18646,7 +18778,13 @@ mod tests {
         );
         revoke_unspent_wake(&mut db, "token-a");
         assert!(
-            db.wake_sessions()
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !db.wake_sessions()
                 .release_wake_claim("session-a", "token-a")
                 .unwrap()
         );

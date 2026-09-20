@@ -140,9 +140,6 @@ pub(crate) fn entry_target(once: bool, target: Option<Target>) -> Result<(), Str
         })
         .map_err(|e| e.to_string())?;
     let result = inspect(once, target);
-    if let Err(error) = &result {
-        eprintln!("receipt helper: {error}");
-    }
     if result.is_ok() {
         // Process completion only, never receipt evidence. Unix cleanup kills
         // this helper too, so communicate completion before group teardown.
@@ -197,11 +194,10 @@ fn inspect(once: bool, target: Option<Target>) -> Result<(), String> {
         write!(owner, "{now}").map_err(|e| e.to_string())?;
         // Reopen under real shared custody every visit; rebuild may have
         // replaced the DB while idle. No stale connection/anchor survives it.
-        if let Some(mut db) = MailboxDb::open_default_if_exists()?
-            && let Err(error) =
-                super::poll_headless_receipt_tick_with(&mut db, |dir| registry.registry(dir))
-        {
-            eprintln!("receipt inspection: {error}");
+        if let Some(mut db) = MailboxDb::open_default_if_exists()? {
+            // The exact attempt retains bounded storage diagnostics. Provider
+            // observation failures never inherit the user's terminal stream.
+            let _ = super::poll_headless_receipt_tick_with(&mut db, |dir| registry.registry(dir));
         }
         std::io::stdout()
             .write_all(b".")
@@ -396,7 +392,7 @@ impl OwnedHelper {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::null());
         for key in [
             "OULIPOLY_PARENT_INVOCATION",
             "OULIPOLY_RETURN_CHANNEL",

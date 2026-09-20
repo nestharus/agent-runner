@@ -40,12 +40,12 @@ fn account_owns_rotation(
     Ok(endpoint.capabilities().capabilities.rotation)
 }
 
-pub(super) fn select_migration_branch(
+pub(super) fn external_rotation_selected(
     request: &MigrationServiceRequest<'_>,
     provider_registry: Option<&ProviderRegistryHandle>,
-) -> Result<MigrationBranch, ServiceError> {
+) -> Result<bool, ServiceError> {
     if !model_declares_external_provider(request, provider_registry) {
-        return Ok(MigrationBranch::BuiltIn);
+        return Ok(false);
     }
     if request.migration_model.provider.is_none()
         && !account_owns_rotation(
@@ -53,6 +53,16 @@ pub(super) fn select_migration_branch(
             provider_registry.expect("account endpoint requires registry"),
         )?
     {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+pub(super) fn select_migration_branch(
+    request: &MigrationServiceRequest<'_>,
+    provider_registry: Option<&ProviderRegistryHandle>,
+) -> Result<MigrationBranch, ServiceError> {
+    if !external_rotation_selected(request, provider_registry)? {
         return Ok(MigrationBranch::BuiltIn);
     }
     match external_identity_accessor::resolve_external_provider_identity(request, provider_registry)

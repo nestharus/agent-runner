@@ -6,7 +6,12 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 19;
+fn migrate_completed_turn_retention(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0020_completed_turn_retention.sql"))
+        .map_err(|error| error.to_string())
+}
+
+pub(super) const CURRENT_VERSION: i64 = 20;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -144,6 +149,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         owner: SidecarEntity::CompletionAuthority,
         apply: migrate_notification_settlement,
     },
+    MigrationStep {
+        target_version: 20,
+        owner: SidecarEntity::MailboxDelivery,
+        apply: migrate_completed_turn_retention,
+    },
 ];
 
 fn migrate_notification_settlement(conn: &Connection) -> Result<(), String> {
@@ -204,6 +214,7 @@ fn ensure_with_timeout(conn: &mut Connection, timeout: Duration) -> Result<(), S
         if observe_valid_current(conn)? {
             return Ok(());
         }
+
         #[cfg(test)]
         after_stale_observation();
         let tx = match rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
@@ -660,7 +671,11 @@ fn migrate_receipt_scan(conn: &Connection) -> Result<(), String> {
 #[cfg(test)]
 pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
     conn.execute_batch(
-        "DROP TRIGGER completion_continuation_notification_ack;
+        "DROP VIEW mailbox_retained_delivery_finalizers;
+        DROP INDEX mailbox_completed_turn_pins_attempt;
+        DROP TABLE mailbox_completed_turn_pins;
+        DROP TABLE mailbox_completed_turn_tails;
+        DROP TRIGGER completion_continuation_notification_ack;
         DROP TABLE completion_continuation_notification;
         DROP TABLE completion_continuation_attempt;
         DROP TABLE completion_continuation_source;
@@ -677,6 +692,68 @@ pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
 mod contention_tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn populated_v19_fixture_migrates_without_newer_schema_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut mailbox = super::super::MailboxDb::open(&path).unwrap();
+        mailbox
+            .enqueue_agent_bash_complete(&super::super::AgentBashCompleteEnqueue {
+                session_id: "historical-session",
+                handle: "historical-handle",
+                payload_json: "{}",
+                owner_invocation_uuid: Some("historical-owner"),
+                matched_os_pid: Some(1),
+                matched_os_boot_id: Some("boot"),
+                matched_os_pid_starttime_ticks: Some(1),
+                matched_chain_index: Some(0),
+                state_dir: "/private/state",
+                meta_path: "/private/meta",
+                log_path: "/private/log",
+                rc_path: "/private/rc",
+                rc: 0,
+            })
+            .unwrap();
+        drop(mailbox);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP VIEW mailbox_retained_delivery_finalizers;
+                 DROP INDEX mailbox_completed_turn_pins_attempt;
+                 DROP TABLE mailbox_completed_turn_pins;
+                 DROP TABLE mailbox_completed_turn_tails;",
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 19).unwrap();
+        drop(connection);
+        let migrated = super::super::MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .list_mailbox("historical-session", true)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            sidecar_version(migrated.connection()).unwrap(),
+            CURRENT_VERSION
+        );
+        for object in [
+            "mailbox_completed_turn_pins",
+            "mailbox_completed_turn_tails",
+        ] {
+            let present: bool = migrated
+                .connection()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                    [object],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing migrated object {object}");
+        }
+    }
 
     #[test]
     fn stale_reader_validates_committed_schema_with_unrelated_writer_held() {

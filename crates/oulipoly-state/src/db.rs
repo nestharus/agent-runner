@@ -88,6 +88,8 @@ macro_rules! invocation_returned_artifacts_schema_sql {
     };
 }
 
+mod completed_turns;
+pub use completed_turns::*;
 mod accounts;
 mod chain_backfill;
 mod chain_segments_compaction;

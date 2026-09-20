@@ -308,7 +308,7 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    if version != 19 || definitions(conn)? != *expected {
+    if version != super::schema::CURRENT_VERSION || definitions(conn)? != *expected {
         return Err(
             "unsupported_transition_required: completion domain schema lineage differs".into(),
         );
@@ -517,7 +517,7 @@ mod tests {
                 .conn
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            19
+            super::super::schema::CURRENT_VERSION
         );
         drop(upgraded);
 

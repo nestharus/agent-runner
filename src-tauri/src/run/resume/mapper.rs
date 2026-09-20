@@ -71,6 +71,7 @@ pub(super) fn resume_invocation_attempt<'state>(
 ) -> super::lifecycle::ResumeInvocationAttempt<'state> {
     super::lifecycle::ResumeInvocationAttempt {
         allocation: None,
+        original_wake_claim: None,
         invocation,
         invocation_row_id,
         completion_registration_authority,

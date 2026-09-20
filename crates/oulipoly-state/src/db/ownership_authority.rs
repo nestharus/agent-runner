@@ -2343,6 +2343,7 @@ mod tests {
     fn completion_admission_serializes_finalization_through_sidecar_materialization() {
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
         let state = StateDb::open(&state_path).unwrap();
         let invocation_row_id = state
             .start_invocation(&InvocationStart {
@@ -2385,35 +2386,133 @@ mod tests {
         let (finalize_tx, finalize_rx) = mpsc::channel();
         let finalizer = std::thread::spawn(move || {
             finalize_tx
-                .send(finalizer_state.finalize_invocation(
+                .send(finalizer_state.finalize_invocation_typed(
                     crate::InvocationMutationAuthority::Standalone,
                     invocation_row_id,
                     true,
                     0,
                     None,
-                    None,
+                    Some("completed"),
                 ))
                 .unwrap();
         });
-        assert!(
-            finalize_rx.recv_timeout(Duration::from_millis(25)).is_err(),
-            "finalization must wait behind the completion-admission state writer"
-        );
 
+        // Release the State writer but deliberately retain the independent
+        // sidecar namespace/fence. The finalizer must fail closed promptly,
+        // not hold a State writer while waiting through sidecar publication.
         admission_release_tx.send(()).unwrap();
         state_committed_rx.recv().unwrap();
+        let first = finalize_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let crate::InvocationFinalizeError::Contention { message } = first.unwrap_err() else {
+            panic!("sidecar contention must remain a typed retryable result");
+        };
         assert!(
-            finalize_rx.recv_timeout(Duration::from_millis(25)).is_err(),
-            "finalization must wait behind sidecar materialization"
+            message.contains("completion_authority_contention"),
+            "{message}"
         );
+        finalizer.join().unwrap();
+
+        let observed = StateDb::open(&state_path).unwrap();
+        let invocation = observed
+            .get_invocation_by_uuid(INVOCATION_UUID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(invocation.status, InvocationStatus::Running);
+        assert_eq!(invocation.success, None);
+        assert_eq!(invocation.exit_code, None);
+        assert_eq!(invocation.error_category, None);
+        assert_eq!(invocation.terminal_reason, None);
+        assert!(
+            observed
+                .get_provider("age299-s2", "test-provider")
+                .unwrap()
+                .is_none()
+        );
+        let sidecar_before = MailboxDb::open(&sidecar_path).unwrap();
+        assert!(sidecar_before.completion_event(EVENT_ID).unwrap().is_none());
+        assert!(
+            sidecar_before
+                .completion_event_listeners(EVENT_ID)
+                .unwrap()
+                .is_empty()
+        );
+        drop(sidecar_before);
+
+        // A disjoint State writer proves the failed finalizer returned its
+        // SQLite transaction while sidecar materialization is still paused.
+        let disjoint_row = observed
+            .start_invocation(&InvocationStart {
+                invocation_uuid: SECOND_INVOCATION_UUID.to_string(),
+                model_name: "disjoint".to_string(),
+                provider_name: "disjoint-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        assert!(disjoint_row > invocation_row_id);
+        drop(observed);
 
         sidecar_release_tx.send(()).unwrap();
         writer.join().unwrap();
-        finalize_rx
-            .recv_timeout(Duration::from_secs(5))
+        let materialized = MailboxDb::open(&sidecar_path).unwrap();
+        assert!(materialized.completion_event(EVENT_ID).unwrap().is_some());
+        assert_eq!(
+            materialized
+                .completion_event_listeners(EVENT_ID)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(materialized);
+
+        let retry = StateDb::open(&state_path).unwrap();
+        retry
+            .finalize_invocation(
+                crate::InvocationMutationAuthority::Standalone,
+                invocation_row_id,
+                true,
+                0,
+                None,
+                Some("completed"),
+            )
+            .unwrap();
+        let invocation = retry
+            .get_invocation_by_uuid(INVOCATION_UUID)
             .unwrap()
             .unwrap();
-        finalizer.join().unwrap();
+        assert_eq!(invocation.status, InvocationStatus::Succeeded);
+        assert_eq!(invocation.success, Some(true));
+        assert_eq!(invocation.exit_code, Some(0));
+        assert_eq!(invocation.terminal_reason.as_deref(), Some("completed"));
+        assert_eq!(
+            retry
+                .get_provider("age299-s2", "test-provider")
+                .unwrap()
+                .unwrap()
+                .invocation_count,
+            1
+        );
+        assert!(
+            retry
+                .finalize_invocation(
+                    crate::InvocationMutationAuthority::Standalone,
+                    invocation_row_id,
+                    true,
+                    0,
+                    None,
+                    Some("completed"),
+                )
+                .unwrap_err()
+                .contains("already finalized")
+        );
+        assert_eq!(
+            retry
+                .get_provider("age299-s2", "test-provider")
+                .unwrap()
+                .unwrap()
+                .invocation_count,
+            1
+        );
     }
 
     #[test]
@@ -3768,7 +3867,11 @@ mod completion_continuation_tests {
             mailbox
                 .connection()
                 .execute_batch(
-                    "DROP TRIGGER completion_continuation_notification_ack;
+                    "DROP VIEW mailbox_retained_delivery_finalizers;
+                DROP INDEX mailbox_completed_turn_pins_attempt;
+                DROP TABLE mailbox_completed_turn_pins;
+                DROP TABLE mailbox_completed_turn_tails;
+                DROP TRIGGER completion_continuation_notification_ack;
                 DROP TABLE completion_continuation_notification; PRAGMA user_version=18;",
                 )
                 .unwrap();

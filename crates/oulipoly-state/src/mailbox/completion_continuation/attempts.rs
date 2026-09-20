@@ -230,6 +230,7 @@ impl MailboxDb {
 pub(in crate::mailbox) fn reserve_activation_on(
     tx: &Transaction<'_>,
     input: WakeClaimRequest<'_>,
+    data_root: &std::path::Path,
 ) -> Result<(), String> {
     let Some(domain) = domain_on(tx)? else {
         return Ok(());
@@ -264,7 +265,7 @@ pub(in crate::mailbox) fn reserve_activation_on(
         source_listener_revision: source.as_ref().map(|id| tx.query_row("SELECT COUNT(*) FROM completion_event_listener l JOIN completion_continuation_source s ON s.event_id=l.event_id WHERE s.registration_id=?1",[id],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())).transpose()?,
         session_id: Some(input.session_id.into()),
         claim_token: Some(input.claim_token.into()),
-        result_path: crate::paths::data_dir()?
+        result_path: data_root
             .join("completion-continuation")
             .join(&domain)
             .join("attempts")
