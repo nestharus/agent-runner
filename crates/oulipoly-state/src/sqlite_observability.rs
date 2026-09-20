@@ -6,7 +6,7 @@
 //! the repository boundary are both safer and more useful to operators.
 
 use crate::diagnostic_recorder::{
-    DiagnosticPhase, DiagnosticSpan, OutcomeCertainty, PhaseObservation, SpanStart,
+    DiagnosticPhase, DiagnosticSpan, FlightRecorder, OutcomeCertainty, PhaseObservation, SpanStart,
     SqliteMeasurementGap, SqlitePhaseEvidence, SqliteQueryPlanEvidence, SqliteQueryPlanOperator,
     SqliteQueryPlanOperatorCount, process_recorder,
 };
@@ -139,6 +139,16 @@ pub struct SqliteOperationObserver {
     started: Option<Instant>,
 }
 
+pub(crate) enum DeferredObservationTarget<'a> {
+    Parent(&'a DiagnosticSpan),
+    SelectedRecorder(&'a FlightRecorder),
+}
+
+enum ObservationTarget<'a> {
+    Process,
+    Deferred(DeferredObservationTarget<'a>),
+}
+
 impl SqliteOperationObserver {
     pub fn process() -> Self {
         Self::with_policy(process_policy())
@@ -173,7 +183,7 @@ impl SqliteOperationObserver {
             return SqliteRecordDecision::FilteredFastSuccess;
         };
         Self::emit(
-            None,
+            ObservationTarget::Process,
             span,
             elapsed,
             phase,
@@ -186,7 +196,7 @@ impl SqliteOperationObserver {
 
     pub(crate) fn record_success_deferred(
         self,
-        parent: &DiagnosticSpan,
+        target: DeferredObservationTarget<'_>,
         span: impl FnOnce() -> SpanStart,
         phase: DiagnosticPhase,
         certainty: OutcomeCertainty,
@@ -203,7 +213,7 @@ impl SqliteOperationObserver {
             return SqliteRecordDecision::FilteredFastSuccess;
         };
         Self::emit(
-            Some(parent),
+            ObservationTarget::Deferred(target),
             span,
             elapsed,
             phase,
@@ -230,7 +240,7 @@ impl SqliteOperationObserver {
                 | Some(rusqlite::ffi::ErrorCode::DatabaseLocked)
         );
         Self::emit(
-            None,
+            ObservationTarget::Process,
             span,
             elapsed,
             if contention {
@@ -251,7 +261,7 @@ impl SqliteOperationObserver {
 
     pub(crate) fn record_failure_deferred(
         self,
-        parent: &DiagnosticSpan,
+        target: DeferredObservationTarget<'_>,
         span: impl FnOnce() -> SpanStart,
         error: &rusqlite::Error,
         certainty: OutcomeCertainty,
@@ -266,7 +276,7 @@ impl SqliteOperationObserver {
                 | Some(rusqlite::ffi::ErrorCode::DatabaseLocked)
         );
         Self::emit(
-            Some(parent),
+            ObservationTarget::Deferred(target),
             span,
             elapsed,
             if contention {
@@ -286,7 +296,7 @@ impl SqliteOperationObserver {
     }
 
     fn emit(
-        parent: Option<&DiagnosticSpan>,
+        target: ObservationTarget<'_>,
         span: impl FnOnce() -> SpanStart,
         elapsed: Duration,
         phase: DiagnosticPhase,
@@ -303,10 +313,17 @@ impl SqliteOperationObserver {
             observation = observation.with_sqlite_failure(error);
         }
         let start = span();
-        let _ = if let Some(parent) = parent {
-            parent.record_deferred_completed_child(start, elapsed, phase, observation)
-        } else {
-            process_recorder().record_completed_observation(start, elapsed, phase, observation)
+        let _ = match target {
+            ObservationTarget::Process => {
+                process_recorder().record_completed_observation(start, elapsed, phase, observation)
+            }
+            ObservationTarget::Deferred(target) => match target {
+                DeferredObservationTarget::Parent(parent) => {
+                    parent.record_deferred_completed_child(start, elapsed, phase, observation)
+                }
+                DeferredObservationTarget::SelectedRecorder(recorder) => recorder
+                    .record_deferred_completed_observation(start, elapsed, phase, observation),
+            },
         };
     }
 }
@@ -322,13 +339,43 @@ pub(crate) fn process_query_plan_node_limit() -> usize {
 fn process_policy() -> SqliteObservationPolicy {
     #[cfg(test)]
     {
-        SqliteObservationPolicy::default()
+        TEST_PROCESS_POLICY
+            .with(|policy| *policy.borrow())
+            .unwrap_or_default()
     }
     #[cfg(not(test))]
     {
         static POLICY: OnceLock<SqliteObservationPolicy> = OnceLock::new();
         *POLICY.get_or_init(SqliteObservationPolicy::from_environment)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PROCESS_POLICY: std::cell::RefCell<Option<SqliteObservationPolicy>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct TestProcessPolicyReset(Option<SqliteObservationPolicy>);
+
+#[cfg(test)]
+impl Drop for TestProcessPolicyReset {
+    fn drop(&mut self) {
+        TEST_PROCESS_POLICY.with(|slot| {
+            *slot.borrow_mut() = self.0.take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_process_policy<T>(
+    policy: SqliteObservationPolicy,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let previous = TEST_PROCESS_POLICY.with(|slot| slot.borrow_mut().replace(policy));
+    let _reset = TestProcessPolicyReset(previous);
+    operation()
 }
 
 fn sampled(every: u64) -> bool {

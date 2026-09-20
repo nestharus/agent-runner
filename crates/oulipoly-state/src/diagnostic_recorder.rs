@@ -821,6 +821,25 @@ impl FlightRecorder {
         )
     }
 
+    /// Retains one completed observation on an already-selected recorder
+    /// without waiting for recorder capacity or file I/O. Callers must select
+    /// the recorder before acquiring database authority.
+    pub(crate) fn record_deferred_completed_observation(
+        &self,
+        start: SpanStart,
+        elapsed: Duration,
+        phase: DiagnosticPhase,
+        observation: PhaseObservation,
+    ) -> RecordStatus {
+        self.record_completed_observation_with_coordination(
+            start,
+            elapsed,
+            phase,
+            observation,
+            AppendCoordination::Deferred,
+        )
+    }
+
     fn record_completed_observation_with_coordination(
         &self,
         start: SpanStart,

@@ -31,8 +31,9 @@ use crate::diagnostic_producer::{
     TransactionAttempt, TransactionPhaseGuard, record_sqlite_failure, record_unacquired_release,
 };
 use crate::diagnostic_recorder::{
-    DiagnosticPhase, DiagnosticSpan, PhaseObservation, SpanStart, SqliteDatabaseRole,
-    SqliteEventIdentity, SqlitePathClass, SqliteTransactionMode, process_recorder,
+    DiagnosticPhase, DiagnosticSpan, FlightRecorder, PhaseObservation, SpanStart,
+    SqliteDatabaseRole, SqliteEventIdentity, SqlitePathClass, SqliteTransactionMode,
+    process_recorder,
 };
 use crate::result_envelope::{ResultEnvelopeFailureIdentity, ResultEnvelopeInput};
 
@@ -46,6 +47,15 @@ pub enum InvocationFinalizeError {
     Failure {
         message: String,
     },
+}
+
+#[derive(Clone, Copy)]
+enum FinalizationObservation<'a> {
+    Instrumented {
+        parent_span: &'a DiagnosticSpan,
+        sidecar_failure_recorded: &'a std::cell::Cell<bool>,
+    },
+    Deferred(&'a FlightRecorder),
 }
 
 impl InvocationFinalizeError {
@@ -440,13 +450,14 @@ impl StateDb {
         tx: sqlite::Transaction<'tx>,
         invocation_uuid: &str,
         success: bool,
+        recorder: &FlightRecorder,
         write_and_commit: impl FnOnce(sqlite::Transaction<'tx>) -> Result<T, String>,
     ) -> Result<T, String> {
         self.with_finalization_completion_authority_observed(
             tx,
             invocation_uuid,
             success,
-            None,
+            FinalizationObservation::Deferred(recorder),
             write_and_commit,
         )
     }
@@ -464,7 +475,10 @@ impl StateDb {
             tx,
             invocation_uuid,
             success,
-            Some((parent_span, sidecar_failure_recorded)),
+            FinalizationObservation::Instrumented {
+                parent_span,
+                sidecar_failure_recorded,
+            },
             write_and_commit,
         )
     }
@@ -474,7 +488,7 @@ impl StateDb {
         tx: sqlite::Transaction<'tx>,
         invocation_uuid: &str,
         success: bool,
-        diagnostic: Option<(&DiagnosticSpan, &std::cell::Cell<bool>)>,
+        observation: FinalizationObservation<'_>,
         write_and_commit: impl FnOnce(sqlite::Transaction<'tx>) -> Result<T, String>,
     ) -> Result<T, String> {
         if success {
@@ -530,7 +544,11 @@ impl StateDb {
         if obligation.is_none() {
             return write_and_commit(tx);
         }
-        if let Some((parent_span, sidecar_failure_recorded)) = diagnostic {
+        if let FinalizationObservation::Instrumented {
+            parent_span,
+            sidecar_failure_recorded,
+        } = observation
+        {
             let obligation = obligation
                 .as_ref()
                 .expect("instrumented completion authority requires an obligation");
@@ -585,7 +603,10 @@ impl StateDb {
                     Some(&sidecar_authority),
                     invocation_uuid,
                     Some(obligation),
-                    Some(sidecar_span),
+                    FinalizationObservation::Instrumented {
+                        parent_span: sidecar_span,
+                        sidecar_failure_recorded,
+                    },
                 ) {
                     Ok(Some(sidecar)) => sidecar,
                     Ok(None) => unreachable!("an admitted obligation requires a sidecar"),
@@ -656,7 +677,7 @@ impl StateDb {
             sidecar_authority.as_ref(),
             invocation_uuid,
             obligation.as_ref(),
-            None,
+            observation,
         )?;
         let sidecar_fence = sidecar
             .as_mut()
@@ -721,7 +742,7 @@ impl StateDb {
         authority: Option<&crate::mailbox::MailboxAuthorityFence>,
         invocation_uuid: &str,
         obligation: Option<&CompletionObligationExpectation>,
-        parent: Option<&DiagnosticSpan>,
+        observation: FinalizationObservation<'_>,
     ) -> Result<Option<crate::mailbox::MailboxDb>, String> {
         let Some(obligation) = obligation else {
             return Ok(None);
@@ -738,12 +759,18 @@ impl StateDb {
                 obligation,
             ));
         }
-        let opened = if let Some(parent) = parent {
-            crate::mailbox::MailboxDb::open_existing_for_completion_authority_instrumented(
-                authority, parent,
-            )
-        } else {
-            crate::mailbox::MailboxDb::open_existing_for_completion_authority(authority)
+        let opened = match observation {
+            FinalizationObservation::Instrumented { parent_span, .. } => {
+                crate::mailbox::MailboxDb::open_existing_for_completion_authority_instrumented(
+                    authority,
+                    parent_span,
+                )
+            }
+            FinalizationObservation::Deferred(recorder) => {
+                crate::mailbox::MailboxDb::open_existing_for_completion_authority_deferred(
+                    authority, recorder,
+                )
+            }
         };
         opened.map(Some).map_err(|error| {
             Self::format_unreadable_completion_sidecar(invocation_uuid, obligation, error)
@@ -947,6 +974,7 @@ mod tests {
         with_test_process_recorder,
     };
     use crate::mailbox::{CompletionEventRegistrationInput, MailboxDb};
+    use crate::sqlite_observability::{SqliteObservationPolicy, with_test_process_policy};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
@@ -1513,6 +1541,74 @@ mod tests {
                 combined_input(id),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn combined_success_sidecar_open_never_waits_for_blocked_recorder() {
+        let (directory, state, id, _sidecar) = state_with_completion_obligation();
+        let recorder_root = directory.path().join("recorder");
+        let recorder = FlightRecorder::open(
+            &recorder_root,
+            RecorderConfig {
+                deferred_queue_capacity: 2,
+                ..RecorderConfig::default()
+            },
+        )
+        .unwrap();
+        let release_writer = recorder.block_writer_for_test().unwrap();
+        let worker_recorder = recorder.clone();
+        let (completed, completion) = mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            let result = with_test_process_recorder(worker_recorder, || {
+                with_test_process_policy(SqliteObservationPolicy::all(), || {
+                    state.apply_provider_turn_effects(
+                        crate::InvocationMutationAuthority::Standalone,
+                        combined_input(id),
+                    )
+                })
+            });
+            completed.send(result).unwrap();
+        });
+
+        let result = completion.recv_timeout(Duration::from_millis(250));
+        release_writer.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "provider-turn finalization waited for recorder progress while holding State"
+        );
+        result.unwrap().unwrap();
+        recorder.drain_deferred_for_test().unwrap();
+
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let observation = report
+            .events
+            .iter()
+            .find(|record| {
+                record.event.sqlite.as_ref().is_some_and(|sqlite| {
+                    sqlite.query_family == "pid_mailbox.connection.open_completion_authority"
+                })
+            })
+            .expect("provider-turn finalization retained sidecar-open evidence");
+        assert_eq!(observation.event.phase, DiagnosticPhase::Released);
+        assert_eq!(observation.event.parent_span_id, None);
+        let evidence = observation.event.observation.sqlite.as_ref().unwrap();
+        assert_eq!(
+            evidence.transaction_phase,
+            Some(crate::diagnostic_recorder::SqliteTransactionPhase::ConnectionOpen)
+        );
+        assert!(evidence.execution_micros.is_some());
+        assert!(
+            evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::WriterAuthorityNotApplicable)
+        );
+        assert!(
+            evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::CommitNotApplicable)
+        );
     }
 
     #[test]
