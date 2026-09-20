@@ -27,7 +27,12 @@
 //! State database write/open entry points and current validator repairs.
 
 use super::*;
+use crate::diagnostic_recorder::{
+    DiagnosticPhase, OutcomeCertainty, SpanStart, SqliteDatabaseRole, SqliteEventIdentity,
+    SqlitePathClass, SqliteTransactionMode,
+};
 use crate::migrations;
+use crate::sqlite_observability::{SqliteOperationObserver, connection_open_evidence};
 
 pub struct StateReadConnection<'a> {
     conn: &'a sqlite::Connection,
@@ -273,7 +278,27 @@ impl StateDb {
     }
 
     fn open_state_connection(path: &Path) -> Result<sqlite::Connection, String> {
-        let conn = sqlite::Connection::open(path).map_err(Self::format_state_db_open_error)?;
+        let observer = SqliteOperationObserver::process();
+        let conn = match sqlite::Connection::open(path) {
+            Ok(conn) => {
+                let _ = observer.record_success(
+                    Self::state_connection_open_span,
+                    DiagnosticPhase::Released,
+                    OutcomeCertainty::Terminal,
+                    connection_open_evidence,
+                );
+                conn
+            }
+            Err(error) => {
+                let _ = observer.record_failure(
+                    Self::state_connection_open_span,
+                    &error,
+                    OutcomeCertainty::StartedUnknown,
+                    connection_open_evidence,
+                );
+                return Err(Self::format_state_db_open_error(error));
+            }
+        };
         conn.pragma_update(None, "foreign_keys", true)
             .map_err(Self::format_state_db_foreign_keys_error)?;
         migrations::register_connection_primitives(&conn)
@@ -281,6 +306,19 @@ impl StateDb {
         conn.busy_timeout(state_writer_busy_timeout())
             .map_err(|err| format!("Failed to configure state DB busy timeout: {err}"))?;
         Ok(conn)
+    }
+
+    fn state_connection_open_span() -> SpanStart {
+        SpanStart::new("state_connection_open", "state_sqlite")
+            .with_lifecycle_phase("database_open")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::State,
+                    SqlitePathClass::ManagedFile,
+                    "state.connection.open",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Autocommit),
+            )
     }
 
     fn format_state_db_foreign_keys_error(err: sqlite::Error) -> String {

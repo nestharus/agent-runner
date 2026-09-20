@@ -25,9 +25,12 @@ use crate::diagnostic_producer::{
     TransactionAttempt, TransactionPhaseGuard, record_sqlite_failure, record_unacquired_release,
 };
 use crate::diagnostic_recorder::{
-    DiagnosticPhase, DiagnosticSpan, PhaseObservation, SpanStart, process_recorder,
+    DiagnosticPhase, DiagnosticSpan, OutcomeCertainty, PhaseObservation, SpanStart,
+    SqliteDatabaseRole, SqliteEventIdentity, SqlitePathClass, SqliteTransactionMode,
+    process_recorder,
 };
 use crate::pid_identity::{self, ProcessIdentity};
+use crate::sqlite_observability::{SqliteOperationObserver, connection_open_evidence};
 
 mod completion_continuation;
 mod finalization;
@@ -74,6 +77,48 @@ const PENDING_MAILBOX_TARGET_PREDICATE: &str = "(
     OR (target_kind = 'session' AND target_id = ?1)
     OR (?2 IS NOT NULL AND target_kind = 'chain' AND target_id = ?2)
 )";
+
+fn open_observed_mailbox_connection(
+    query_family: &'static str,
+    path_class: SqlitePathClass,
+    transaction_mode: SqliteTransactionMode,
+    open: impl FnOnce() -> rusqlite::Result<Connection>,
+) -> rusqlite::Result<Connection> {
+    let observer = SqliteOperationObserver::process();
+    match open() {
+        Ok(connection) => {
+            let _ = observer.record_success(
+                || mailbox_connection_span(query_family, path_class, transaction_mode),
+                DiagnosticPhase::Released,
+                OutcomeCertainty::Terminal,
+                connection_open_evidence,
+            );
+            Ok(connection)
+        }
+        Err(error) => {
+            let _ = observer.record_failure(
+                || mailbox_connection_span(query_family, path_class, transaction_mode),
+                &error,
+                OutcomeCertainty::StartedUnknown,
+                connection_open_evidence,
+            );
+            Err(error)
+        }
+    }
+}
+
+fn mailbox_connection_span(
+    query_family: &'static str,
+    path_class: SqlitePathClass,
+    transaction_mode: SqliteTransactionMode,
+) -> SpanStart {
+    SpanStart::new("pid_mailbox_connection_open", "pid_mailbox_sqlite")
+        .with_lifecycle_phase("database_open")
+        .with_sqlite_identity(
+            SqliteEventIdentity::new(SqliteDatabaseRole::PidMailbox, path_class, query_family)
+                .with_transaction_mode(transaction_mode),
+        )
+}
 
 fn commit_instrumented_transaction(
     tx: Transaction<'_>,
@@ -1489,8 +1534,13 @@ impl MailboxDb {
 
     pub(crate) fn open_with_authority(authority: &MailboxAuthorityFence) -> Result<Self, String> {
         let path = authority.path();
-        let mut conn = Connection::open(path)
-            .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
+        let mut conn = open_observed_mailbox_connection(
+            "pid_mailbox.connection.open",
+            SqlitePathClass::ManagedFile,
+            SqliteTransactionMode::Autocommit,
+            || Connection::open(path),
+        )
+        .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
         set_wal_mode(&conn)?;
@@ -1509,7 +1559,13 @@ impl MailboxDb {
         authority: &MailboxAuthorityFence,
     ) -> Result<Self, String> {
         let path = authority.path();
-        let mut conn = Connection::open(path).map_err(|e| e.to_string())?;
+        let mut conn = open_observed_mailbox_connection(
+            "pid_mailbox.connection.open_for_state_authority",
+            SqlitePathClass::ManagedFile,
+            SqliteTransactionMode::Autocommit,
+            || Connection::open(path),
+        )
+        .map_err(|e| e.to_string())?;
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
         conn.busy_timeout(StdDuration::ZERO)
@@ -1572,8 +1628,13 @@ impl MailboxDb {
         path: &Path,
         snapshot: crate::read_only_snapshot::ReadOnlySnapshot,
     ) -> Result<Self, String> {
-        let conn = Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
+        let conn = open_observed_mailbox_connection(
+            "pid_mailbox.connection.open_snapshot",
+            SqlitePathClass::ReadOnlySnapshot,
+            SqliteTransactionMode::ReadOnly,
+            || Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY),
+        )
+        .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
@@ -1586,8 +1647,13 @@ impl MailboxDb {
         authority: &MailboxAuthorityFence,
     ) -> Result<Self, String> {
         let path = authority.path();
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
+        let conn = open_observed_mailbox_connection(
+            "pid_mailbox.connection.open_completion_authority",
+            SqlitePathClass::ManagedFile,
+            SqliteTransactionMode::Autocommit,
+            || Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE),
+        )
+        .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
         conn.busy_timeout(COMPLETION_AUTHORITY_SQLITE_TIMEOUT)
@@ -5621,6 +5687,14 @@ impl SessionAdmissionRepository<'_> {
         validate_optional_session_admission_identity(session_id, "session_id")?;
         let mut start = SpanStart::new("session_admission_enqueue", "pid_mailbox_sqlite")
             .with_lifecycle_phase("launch_admission")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::PidMailbox,
+                    SqlitePathClass::ManagedFile,
+                    "session_admission.enqueue",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            )
             .with_identifier("admission_id", admission_id)
             .with_hashed_correlation("registration_identity", registration_identity)
             .with_identifier("launcher_pid", launcher.os_pid.to_string())
@@ -5829,6 +5903,14 @@ impl SessionAdmissionRepository<'_> {
         validate_session_admission_identity(claim_token, "claim_token")?;
         let mut start = SpanStart::new("session_admission_try_admit", "pid_mailbox_sqlite")
             .with_lifecycle_phase("launch_admission")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::PidMailbox,
+                    SqlitePathClass::ManagedFile,
+                    "session_admission.try_admit",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            )
             .with_busy_timeout(mailbox_writer_sqlite_timeout());
         if let Some(registration_identity) = requested_registration_identity {
             start = start.with_hashed_correlation("registration_identity", registration_identity);
@@ -6061,6 +6143,14 @@ impl WakeSessionRepository<'_> {
         let now = now_rfc3339();
         let mut start = SpanStart::new("wake_claim_acquire", "pid_mailbox_sqlite")
             .with_lifecycle_phase("wake_claim")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::PidMailbox,
+                    SqlitePathClass::ManagedFile,
+                    "wake_claim.acquire",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            )
             .with_identifier("session_id", input.session_id)
             .with_hashed_correlation("wake_reason", input.reason)
             .with_identifier("auto_wake_count", input.auto_wake_count.to_string())

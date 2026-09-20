@@ -51,6 +51,7 @@ pub mod result_envelope;
 pub mod schema;
 pub mod schema_probe;
 mod snapshot_helper;
+pub mod sqlite_observability;
 
 pub type StateDbError = String;
 

@@ -1,4 +1,12 @@
 use super::*;
+use crate::diagnostic_recorder::{
+    OutcomeCertainty, SqliteMeasurementGap, SqlitePhaseEvidence, SqliteQueryPlanEvidence,
+    SqliteTransactionPhase,
+};
+use crate::sqlite_observability::{
+    SqliteOperationObserver, capture_query_plan, process_query_plan_node_limit,
+    process_query_plans_enabled,
+};
 
 impl MailboxDb {
     pub fn reserve_continuation_attempt(
@@ -101,7 +109,40 @@ impl MailboxDb {
         if !matches!((from, to), ("accepted", "starting")) {
             return Err("invalid continuation attempt transition".into());
         }
-        let changed = self.conn.execute("UPDATE completion_continuation_attempt SET phase=?4,revision=revision+1,custodian_identity=?5 WHERE attempt_id=?1 AND revision=?2 AND phase=?3 AND custodian_identity=?5 AND owner_generation=?6 AND EXISTS(SELECT 1 FROM completion_continuation_owner WHERE generation=?6 AND phase='running')", params![attempt.attempt_id,revision,from,to,serde_json::to_string(custodian).map_err(|e| e.to_string())?,attempt.owner_generation]).map_err(|e| e.to_string())?;
+        let custodian = serde_json::to_string(custodian).map_err(|e| e.to_string())?;
+        let observer = SqliteOperationObserver::process();
+        let changed = match self.conn.execute("UPDATE completion_continuation_attempt SET phase=?4,revision=revision+1,custodian_identity=?5 WHERE attempt_id=?1 AND revision=?2 AND phase=?3 AND custodian_identity=?5 AND owner_generation=?6 AND EXISTS(SELECT 1 FROM completion_continuation_owner WHERE generation=?6 AND phase='running')", params![attempt.attempt_id,revision,from,to,custodian,attempt.owner_generation]) {
+            Ok(changed) => {
+                let _ = observer.record_success(
+                    || {
+                        continuation_write_span(
+                            "root_supervisor_advance_attempt",
+                            "completion_continuation.advance",
+                            attempt,
+                        )
+                    },
+                    DiagnosticPhase::Committed,
+                    OutcomeCertainty::Committed,
+                    |elapsed| autocommit_write_evidence(elapsed, Some(changed)),
+                );
+                changed
+            }
+            Err(error) => {
+                let _ = observer.record_failure(
+                    || {
+                        continuation_write_span(
+                            "root_supervisor_advance_attempt",
+                            "completion_continuation.advance",
+                            attempt,
+                        )
+                    },
+                    &error,
+                    OutcomeCertainty::StartedUnknown,
+                    |elapsed| autocommit_write_evidence(elapsed, None),
+                );
+                return Err(error.to_string());
+            }
+        };
         if changed != 1 {
             return Err("stale continuation attempt owner/revision".into());
         }
@@ -222,14 +263,7 @@ impl MailboxDb {
         after: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<Vec<ContinuationAttempt>, String> {
-        let limit = i64::try_from(limit).map_err(|_| "continuation attempt limit overflow")?;
-        let (after_generation, after_attempt) = after
-            .map(|(generation, attempt)| (Some(generation), Some(attempt)))
-            .unwrap_or((None, None));
-        let mut statement = self
-            .conn
-            .prepare(
-                "WITH RECURSIVE supervisor_scope(authority_id) AS (
+        const QUERY: &str = "WITH RECURSIVE supervisor_scope(authority_id) AS (
                     SELECT ?1
                     UNION
                     SELECT inheritance.predecessor_authority_id
@@ -245,35 +279,157 @@ impl MailboxDb {
                AND phase NOT IN ('drained','never_started')
                AND (?2 IS NULL OR owner_generation>?2
                     OR (owner_generation=?2 AND attempt_id>?3))
-             ORDER BY owner_generation,attempt_id LIMIT ?4",
-            )
-            .map_err(|error| error.to_string())?;
-        statement
-            .query_map(
-                params![
-                    supervisor_authority_id,
-                    after_generation,
-                    after_attempt,
-                    limit
-                ],
-                |row| {
-                    Ok(ContinuationAttempt {
-                        attempt_id: row.get(0)?,
-                        owner_generation: row.get(1)?,
-                        operation: row.get(2)?,
-                        request_sha256: row.get(3)?,
-                        source_registration_id: row.get(4)?,
-                        source_listener_revision: row.get(5)?,
-                        session_id: row.get(6)?,
-                        claim_token: row.get(7)?,
-                        result_path: row.get(8)?,
-                    })
-                },
-            )
-            .map_err(|error| error.to_string())?
-            .map(|row| row.map_err(|error| error.to_string()))
-            .collect()
+             ORDER BY owner_generation,attempt_id LIMIT ?4";
+        let limit = i64::try_from(limit).map_err(|_| "continuation attempt limit overflow")?;
+        let (after_generation, after_attempt) = after
+            .map(|(generation, attempt)| (Some(generation), Some(attempt)))
+            .unwrap_or((None, None));
+        let query_plans_enabled = process_query_plans_enabled();
+        let query_plan_node_limit = process_query_plan_node_limit();
+        let observer = SqliteOperationObserver::process();
+        let execution_started = Instant::now();
+        let result = (|| -> rusqlite::Result<Vec<ContinuationAttempt>> {
+            let mut statement = self.conn.prepare(QUERY)?;
+            statement
+                .query_map(
+                    params![
+                        supervisor_authority_id,
+                        after_generation,
+                        after_attempt,
+                        limit
+                    ],
+                    |row| {
+                        Ok(ContinuationAttempt {
+                            attempt_id: row.get(0)?,
+                            owner_generation: row.get(1)?,
+                            operation: row.get(2)?,
+                            request_sha256: row.get(3)?,
+                            source_registration_id: row.get(4)?,
+                            source_listener_revision: row.get(5)?,
+                            session_id: row.get(6)?,
+                            claim_token: row.get(7)?,
+                            result_path: row.get(8)?,
+                        })
+                    },
+                )?
+                .collect()
+        })();
+        let execution = execution_started.elapsed();
+        match result {
+            Ok(attempts) => {
+                let rows_returned = u64::try_from(attempts.len()).unwrap_or(u64::MAX);
+                let _ = observer.record_success(
+                    || pending_supervisor_attempts_span(supervisor_authority_id),
+                    DiagnosticPhase::Released,
+                    OutcomeCertainty::Terminal,
+                    |_| {
+                        let plan = capture_query_plan(
+                            &self.conn,
+                            QUERY,
+                            params![
+                                supervisor_authority_id,
+                                after_generation,
+                                after_attempt,
+                                limit
+                            ],
+                            query_plans_enabled,
+                            query_plan_node_limit,
+                        );
+                        read_query_evidence(execution, plan).with_rows_returned(rows_returned)
+                    },
+                );
+                Ok(attempts)
+            }
+            Err(error) => {
+                let _ = observer.record_failure(
+                    || pending_supervisor_attempts_span(supervisor_authority_id),
+                    &error,
+                    OutcomeCertainty::StartedUnknown,
+                    |_| {
+                        let plan = capture_query_plan(
+                            &self.conn,
+                            QUERY,
+                            params![
+                                supervisor_authority_id,
+                                after_generation,
+                                after_attempt,
+                                limit
+                            ],
+                            query_plans_enabled,
+                            query_plan_node_limit,
+                        );
+                        read_query_evidence(execution, plan)
+                    },
+                );
+                Err(error.to_string())
+            }
+        }
     }
+}
+
+fn read_query_evidence(
+    execution: StdDuration,
+    plan: SqliteQueryPlanEvidence,
+) -> SqlitePhaseEvidence {
+    SqlitePhaseEvidence::for_phase(SqliteTransactionPhase::StatementExecution)
+        .with_execution(execution)
+        .with_gap(SqliteMeasurementGap::WriterAuthorityNotApplicable)
+        .with_gap(SqliteMeasurementGap::CommitNotApplicable)
+        .with_gap(SqliteMeasurementGap::PostCommitNotApplicable)
+        .with_gap(SqliteMeasurementGap::RowsChangedNotApplicable)
+        .with_gap(SqliteMeasurementGap::RowsExaminedNotExposed)
+        .with_query_plan(plan)
+}
+
+fn autocommit_write_evidence(
+    statement_total: StdDuration,
+    rows_changed: Option<usize>,
+) -> SqlitePhaseEvidence {
+    let mut evidence = SqlitePhaseEvidence::for_phase(SqliteTransactionPhase::StatementExecution)
+        .with_statement_total(statement_total)
+        .with_gap(SqliteMeasurementGap::WriterWaitAndExecutionNotSeparable)
+        .with_gap(SqliteMeasurementGap::CommitNotExposedByApi)
+        .with_gap(SqliteMeasurementGap::RowsExaminedNotExposed)
+        .with_gap(SqliteMeasurementGap::PostCommitOutsideBoundary);
+    if let Some(rows_changed) = rows_changed {
+        evidence = evidence.with_rows_changed(u64::try_from(rows_changed).unwrap_or(u64::MAX));
+    } else {
+        evidence = evidence.with_gap(SqliteMeasurementGap::RowsChangedNotReported);
+    }
+    evidence
+}
+
+fn pending_supervisor_attempts_span(supervisor_authority_id: &str) -> SpanStart {
+    SpanStart::new("root_supervisor_pending_attempts", "pid_mailbox_sqlite")
+        .with_lifecycle_phase("completion_recovery_authority")
+        .with_sqlite_identity(
+            SqliteEventIdentity::new(
+                SqliteDatabaseRole::PidMailbox,
+                SqlitePathClass::ManagedFile,
+                "completion_continuation.pending_for_supervisor",
+            )
+            .with_transaction_mode(SqliteTransactionMode::ReadOnly),
+        )
+        .with_hashed_correlation("supervisor_authority_id", supervisor_authority_id)
+}
+
+fn continuation_write_span(
+    operation: &'static str,
+    query_family: &'static str,
+    attempt: &ContinuationAttempt,
+) -> SpanStart {
+    SpanStart::new(operation, "pid_mailbox_sqlite")
+        .with_lifecycle_phase("completion_launch_authority")
+        .with_sqlite_identity(
+            SqliteEventIdentity::new(
+                SqliteDatabaseRole::PidMailbox,
+                SqlitePathClass::ManagedFile,
+                query_family,
+            )
+            .with_transaction_mode(SqliteTransactionMode::Autocommit),
+        )
+        .with_hashed_correlation("attempt_id", &attempt.attempt_id)
+        .with_hashed_correlation("owner_generation", &attempt.owner_generation)
 }
 
 fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(), String> {
@@ -437,7 +593,39 @@ impl MailboxDb {
         attempt: &ContinuationAttempt,
     ) -> Result<(), String> {
         require_exact_attempt(&self.conn, attempt)?;
-        let changed=self.conn.execute("UPDATE completion_continuation_attempt SET phase='accepted',revision=revision+1 WHERE attempt_id=?1 AND owner_generation=?2 AND phase='reserved' AND revision=1 AND EXISTS(SELECT 1 FROM completion_continuation_owner WHERE generation=?2 AND phase='running')",params![attempt.attempt_id,attempt.owner_generation]).map_err(|e|e.to_string())?;
+        let observer = SqliteOperationObserver::process();
+        let changed = match self.conn.execute("UPDATE completion_continuation_attempt SET phase='accepted',revision=revision+1 WHERE attempt_id=?1 AND owner_generation=?2 AND phase='reserved' AND revision=1 AND EXISTS(SELECT 1 FROM completion_continuation_owner WHERE generation=?2 AND phase='running')",params![attempt.attempt_id,attempt.owner_generation]) {
+            Ok(changed) => {
+                let _ = observer.record_success(
+                    || {
+                        continuation_write_span(
+                            "root_supervisor_accept_attempt",
+                            "completion_continuation.accept",
+                            attempt,
+                        )
+                    },
+                    DiagnosticPhase::Committed,
+                    OutcomeCertainty::Committed,
+                    |elapsed| autocommit_write_evidence(elapsed, Some(changed)),
+                );
+                changed
+            }
+            Err(error) => {
+                let _ = observer.record_failure(
+                    || {
+                        continuation_write_span(
+                            "root_supervisor_accept_attempt",
+                            "completion_continuation.accept",
+                            attempt,
+                        )
+                    },
+                    &error,
+                    OutcomeCertainty::StartedUnknown,
+                    |elapsed| autocommit_write_evidence(elapsed, None),
+                );
+                return Err(error.to_string());
+            }
+        };
         if changed != 1 {
             return Err("continuation acceptance lost current reservation".into());
         }
@@ -457,7 +645,44 @@ impl MailboxDb {
         adopter: Option<&SourceProcessIdentity>,
     ) -> Result<(), String> {
         require_exact_attempt(&self.conn, attempt)?;
-        let changed=self.conn.execute("UPDATE completion_continuation_attempt SET revision=revision+1,custodian_identity=?3,adopter_identity=?4 WHERE attempt_id=?1 AND owner_generation=?2 AND phase='accepted' AND revision=2 AND custodian_identity IS NULL AND EXISTS(SELECT 1 FROM completion_continuation_owner WHERE generation=?2 AND phase='running')",params![attempt.attempt_id,attempt.owner_generation,serde_json::to_string(custodian).map_err(|e|e.to_string())?,adopter.map(serde_json::to_string).transpose().map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        let custodian = serde_json::to_string(custodian).map_err(|e| e.to_string())?;
+        let adopter = adopter
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let observer = SqliteOperationObserver::process();
+        let changed = match self.conn.execute("UPDATE completion_continuation_attempt SET revision=revision+1,custodian_identity=?3,adopter_identity=?4 WHERE attempt_id=?1 AND owner_generation=?2 AND phase='accepted' AND revision=2 AND custodian_identity IS NULL AND EXISTS(SELECT 1 FROM completion_continuation_owner WHERE generation=?2 AND phase='running')",params![attempt.attempt_id,attempt.owner_generation,custodian,adopter]) {
+            Ok(changed) => {
+                let _ = observer.record_success(
+                    || {
+                        continuation_write_span(
+                            "root_supervisor_attach_custodian",
+                            "completion_continuation.attach_custodian",
+                            attempt,
+                        )
+                    },
+                    DiagnosticPhase::Committed,
+                    OutcomeCertainty::Committed,
+                    |elapsed| autocommit_write_evidence(elapsed, Some(changed)),
+                );
+                changed
+            }
+            Err(error) => {
+                let _ = observer.record_failure(
+                    || {
+                        continuation_write_span(
+                            "root_supervisor_attach_custodian",
+                            "completion_continuation.attach_custodian",
+                            attempt,
+                        )
+                    },
+                    &error,
+                    OutcomeCertainty::StartedUnknown,
+                    |elapsed| autocommit_write_evidence(elapsed, None),
+                );
+                return Err(error.to_string());
+            }
+        };
         if changed != 1 {
             return Err("continuation custodian publication lost current reservation".into());
         }

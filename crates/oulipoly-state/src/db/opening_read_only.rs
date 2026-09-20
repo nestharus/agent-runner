@@ -28,6 +28,54 @@
 //! Read-only state database open error classification and path validation.
 
 use super::*;
+use crate::diagnostic_recorder::{
+    DiagnosticPhase, OutcomeCertainty, SpanStart, SqliteDatabaseRole, SqliteEventIdentity,
+    SqlitePathClass, SqliteTransactionMode,
+};
+use crate::sqlite_observability::{SqliteOperationObserver, connection_open_evidence};
+
+fn open_observed_read_only_snapshot(
+    source_path: &Path,
+    snapshot: &crate::read_only_snapshot::ReadOnlySnapshot,
+) -> Result<sqlite::Connection, ReadOnlyOpenError> {
+    let observer = SqliteOperationObserver::process();
+    match sqlite::Connection::open_with_flags(
+        snapshot.path(),
+        sqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(connection) => {
+            let _ = observer.record_success(
+                read_only_snapshot_span,
+                DiagnosticPhase::Released,
+                OutcomeCertainty::Terminal,
+                connection_open_evidence,
+            );
+            Ok(connection)
+        }
+        Err(error) => {
+            let _ = observer.record_failure(
+                read_only_snapshot_span,
+                &error,
+                OutcomeCertainty::StartedUnknown,
+                connection_open_evidence,
+            );
+            Err(classify_read_only_open_error(source_path, error))
+        }
+    }
+}
+
+fn read_only_snapshot_span() -> SpanStart {
+    SpanStart::new("state_read_only_connection_open", "state_sqlite")
+        .with_lifecycle_phase("database_open")
+        .with_sqlite_identity(
+            SqliteEventIdentity::new(
+                SqliteDatabaseRole::State,
+                SqlitePathClass::ReadOnlySnapshot,
+                "state.connection.open_read_only_snapshot",
+            )
+            .with_transaction_mode(SqliteTransactionMode::ReadOnly),
+        )
+}
 
 pub(super) fn classify_read_only_open_error(path: &Path, err: sqlite::Error) -> ReadOnlyOpenError {
     match sqlite::project_read_only_open_error(path, &err) {
@@ -174,11 +222,7 @@ impl StateDb {
                 .map_err(|err| ReadOnlyOpenError::Operational {
                     message: format!("Failed to snapshot read-only SQLite database: {err}"),
                 })?;
-        let conn = sqlite::Connection::open_with_flags(
-            snapshot.path(),
-            sqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|err| classify_read_only_open_error(path, err))?;
+        let conn = open_observed_read_only_snapshot(path, &snapshot)?;
         Ok((conn, snapshot))
     }
 
@@ -201,11 +245,7 @@ impl StateDb {
         .map_err(|err| ReadOnlyOpenError::Operational {
             message: format!("Failed to snapshot read-only SQLite database: {err}"),
         })?;
-        let conn = sqlite::Connection::open_with_flags(
-            snapshot.path(),
-            sqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|err| classify_read_only_open_error(path, err))?;
+        let conn = open_observed_read_only_snapshot(path, &snapshot)?;
         Ok((conn, snapshot))
     }
 
@@ -231,11 +271,7 @@ impl StateDb {
             .map_err(|err| ReadOnlyOpenError::Operational {
                 message: format!("Failed to snapshot read-only SQLite database: {err}"),
             })?;
-        let conn = sqlite::Connection::open_with_flags(
-            snapshot.path(),
-            sqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|err| classify_read_only_open_error(path, err))?;
+        let conn = open_observed_read_only_snapshot(path, &snapshot)?;
         Ok((conn, snapshot))
     }
 

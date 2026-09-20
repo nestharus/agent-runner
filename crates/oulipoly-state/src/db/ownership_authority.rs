@@ -7,10 +7,12 @@
 use super::{InvocationStatus, RusqliteOptionalExtension, StateDb, sqlite};
 use crate::completion_continuation::AdmittedSourceBinding;
 use crate::diagnostic_producer::{
-    TransactionAttempt, TransactionPhaseGuard, record_effects_possible_failure,
-    record_sqlite_failure, record_unacquired_release,
+    TransactionAttempt, TransactionPhaseGuard, record_sqlite_failure, record_unacquired_release,
 };
-use crate::diagnostic_recorder::{DiagnosticPhase, PhaseObservation, SpanStart, process_recorder};
+use crate::diagnostic_recorder::{
+    DiagnosticPhase, PhaseObservation, SpanStart, SqliteDatabaseRole, SqliteEventIdentity,
+    SqlitePathClass, SqliteTransactionMode, process_recorder,
+};
 use crate::mailbox::{
     COMPLETION_CONTINUITY_GENESIS_DIGEST, CompletionContinuityHead,
     CompletionEventRegistrationInput, CompletionEventRegistrationResult, MailboxDb,
@@ -674,6 +676,14 @@ impl StateDb {
         let sidecar_path = MailboxDb::path_for_state_db(completion_authority_state_path);
         let state_start = SpanStart::new("completion_registration", "state_sqlite")
             .with_lifecycle_phase("completion_registration")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::State,
+                    SqlitePathClass::ManagedFile,
+                    "completion.registration.state",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            )
             .with_busy_timeout(super::opening_write::state_writer_busy_timeout())
             .with_identifier("completion_event_id", registration.event_id)
             .with_identifier("authority_basis", authority_basis)
@@ -782,6 +792,14 @@ impl StateDb {
             "pid_mailbox_sqlite",
         )
         .with_lifecycle_phase("completion_authority")
+        .with_sqlite_identity(
+            SqliteEventIdentity::new(
+                SqliteDatabaseRole::PidMailbox,
+                SqlitePathClass::ManagedFile,
+                "completion.registration.sidecar",
+            )
+            .with_transaction_mode(SqliteTransactionMode::Immediate),
+        )
         .with_diagnostic_id(state_span.diagnostic_id().clone())
         .with_parent_span_id(state_span.span_id().clone())
         .with_identifier("completion_event_id", registration.event_id)
@@ -933,7 +951,6 @@ impl StateDb {
         after_state_commit();
         state_committed.set(true);
         state_phases.release();
-        drop(state_phases);
         let registration_result = sidecar_fence.register_completion_event_instrumented(
             registration,
             &continuity,
@@ -953,10 +970,7 @@ impl StateDb {
             && !state_committed.get()
             && !sidecar_failure_recorded.get()
         {
-            record_effects_possible_failure(
-                state_span,
-                "completion_registration_state_transaction_failed",
-            );
+            state_phases.failed("completion_registration_state_transaction_failed");
         }
         state_result
         })

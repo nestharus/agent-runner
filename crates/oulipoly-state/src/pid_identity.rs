@@ -11,8 +11,56 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::diagnostic_recorder::{
+    DiagnosticPhase, OutcomeCertainty, SpanStart, SqliteDatabaseRole, SqliteEventIdentity,
+    SqlitePathClass, SqliteTransactionMode,
+};
+use crate::sqlite_observability::{SqliteOperationObserver, connection_open_evidence};
+
 const SIDECAR_DB_NAME: &str = "pid-identity.db";
 const DIRECT_LOOKUP_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn open_observed_pid_identity_connection(
+    query_family: &'static str,
+    path_class: SqlitePathClass,
+    mode: SqliteTransactionMode,
+    open: impl FnOnce() -> rusqlite::Result<Connection>,
+) -> rusqlite::Result<Connection> {
+    let observer = SqliteOperationObserver::process();
+    match open() {
+        Ok(connection) => {
+            let _ = observer.record_success(
+                || pid_identity_connection_span(query_family, path_class, mode),
+                DiagnosticPhase::Released,
+                OutcomeCertainty::Terminal,
+                connection_open_evidence,
+            );
+            Ok(connection)
+        }
+        Err(error) => {
+            let _ = observer.record_failure(
+                || pid_identity_connection_span(query_family, path_class, mode),
+                &error,
+                OutcomeCertainty::StartedUnknown,
+                connection_open_evidence,
+            );
+            Err(error)
+        }
+    }
+}
+
+fn pid_identity_connection_span(
+    query_family: &'static str,
+    path_class: SqlitePathClass,
+    mode: SqliteTransactionMode,
+) -> SpanStart {
+    SpanStart::new("pid_identity_connection_open", "pid_identity_sqlite")
+        .with_lifecycle_phase("database_open")
+        .with_sqlite_identity(
+            SqliteEventIdentity::new(SqliteDatabaseRole::PidIdentity, path_class, query_family)
+                .with_transaction_mode(mode),
+        )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProcessIdentity {
@@ -122,8 +170,13 @@ impl PidIdentityDb {
         authority: &crate::mailbox::MailboxAuthorityFence,
     ) -> Result<Self, String> {
         let path = authority.path();
-        let conn = Connection::open(path)
-            .map_err(|err| format!("Failed to open PID identity sidecar: {err}"))?;
+        let conn = open_observed_pid_identity_connection(
+            "pid_identity.connection.open",
+            SqlitePathClass::ManagedFile,
+            SqliteTransactionMode::Autocommit,
+            || Connection::open(path),
+        )
+        .map_err(|err| format!("Failed to open PID identity sidecar: {err}"))?;
         authority.validate_opened_target()?;
         crate::mailbox::configure_writable_sidecar_connection(&conn)?;
         crate::mailbox::set_wal_mode(&conn)?;
@@ -143,8 +196,13 @@ impl PidIdentityDb {
 
     pub fn open_read_only(path: &Path) -> Result<Self, String> {
         let path = canonical_read_only_path(path)?;
-        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
+        let conn = open_observed_pid_identity_connection(
+            "pid_identity.connection.open_read_only",
+            SqlitePathClass::ExternalFile,
+            SqliteTransactionMode::ReadOnly,
+            || Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY),
+        )
+        .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
         conn.busy_timeout(DIRECT_LOOKUP_BUSY_TIMEOUT)
             .map_err(|err| format!("Failed to configure PID identity sidecar read-only: {err}"))?;
         conn.pragma_update(None, "query_only", true)
@@ -171,9 +229,13 @@ impl PidIdentityDb {
         path: &Path,
         snapshot: crate::read_only_snapshot::ReadOnlySnapshot,
     ) -> Result<Self, String> {
-        let conn =
-            Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
+        let conn = open_observed_pid_identity_connection(
+            "pid_identity.connection.open_snapshot",
+            SqlitePathClass::ReadOnlySnapshot,
+            SqliteTransactionMode::ReadOnly,
+            || Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY),
+        )
+        .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),

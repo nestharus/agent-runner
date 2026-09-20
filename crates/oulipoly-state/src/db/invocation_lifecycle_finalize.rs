@@ -31,7 +31,8 @@ use crate::diagnostic_producer::{
     TransactionAttempt, TransactionPhaseGuard, record_sqlite_failure, record_unacquired_release,
 };
 use crate::diagnostic_recorder::{
-    DiagnosticPhase, DiagnosticSpan, PhaseObservation, SpanStart, process_recorder,
+    DiagnosticPhase, DiagnosticSpan, PhaseObservation, SpanStart, SqliteDatabaseRole,
+    SqliteEventIdentity, SqlitePathClass, SqliteTransactionMode, process_recorder,
 };
 use crate::result_envelope::{ResultEnvelopeFailureIdentity, ResultEnvelopeInput};
 
@@ -344,6 +345,14 @@ impl StateDb {
     {
         let start = SpanStart::new("invocation_terminal_finalize", "state_sqlite")
             .with_lifecycle_phase("terminal_finalize")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::State,
+                    SqlitePathClass::ManagedFile,
+                    "invocation.terminal_finalize.state",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            )
             .with_busy_timeout(super::opening_write::state_writer_busy_timeout())
             .with_identifier("invocation_row_id", id.to_string())
             .with_identifier("success", success.to_string())
@@ -535,6 +544,14 @@ impl StateDb {
                 "pid_mailbox_sqlite",
             )
             .with_lifecycle_phase("completion_authority")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::PidMailbox,
+                    SqlitePathClass::ManagedFile,
+                    "invocation.terminal_finalize.sidecar",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            )
             .with_diagnostic_id(parent_span.diagnostic_id().clone())
             .with_parent_span_id(parent_span.span_id().clone())
             .with_identifier("invocation_uuid", invocation_uuid)
