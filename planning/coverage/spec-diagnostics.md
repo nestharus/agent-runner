@@ -2,8 +2,18 @@
 
 ## Source files
 
+- `crates/oulipoly-state/src/diagnostic_recorder.rs`
+- `crates/oulipoly-state/src/diagnostic_producer.rs`
+- `crates/oulipoly-state/src/db/invocation_lifecycle_finalize.rs`
+- `crates/oulipoly-state/src/db/opening_write.rs`
+- `crates/oulipoly-state/src/db/ownership_authority.rs`
+- `crates/oulipoly-state/src/db/provider_launch_lifecycle.rs`
+- `crates/oulipoly-state/src/mailbox.rs`
+- `crates/oulipoly-state/src/lifecycle_log.rs`
 - `crates/oulipoly-runtime/src/lib.rs`
 - `crates/oulipoly-runtime/src/diagnostics/mod.rs`
+- `crates/oulipoly-runtime/src/executor/cli/pty_broker/mod.rs`
+- `crates/oulipoly-runtime/src/executor/cli/runtime_exit_journal.rs`
 - `crates/oulipoly-runtime/src/observability/invocation.rs`
 - `crates/oulipoly-runtime/src/trace/mod.rs`
 - `crates/oulipoly-runtime/src/services/adapters.rs`
@@ -23,15 +33,67 @@
 - `src-tauri/src/commands/diagnostics/formatter.rs`
 - `src-tauri/src/commands/diagnostics/mapper.rs`
 - `src-tauri/src/commands/diagnostics/orchestration.rs`
+- `src-tauri/src/commands/notify.rs`
+- `src-tauri/src/commands/offline_diagnostics.rs`
+- `src-tauri/src/dispatch.rs`
+- `src-tauri/src/mailbox_delivery.rs`
+- `src-tauri/src/main.rs`
+- `src-tauri/src/usage/cli.rs`
+- `src-tauri/src/wake_coordinator/sweep/mod.rs`
 
 ## Preconditions
 
-- A configured `StateDb` connection used as the diagnostics sink.
+- For the legacy runtime diagnostics sink, a configured `StateDb` connection.
 - The runtime caller has registered the relevant service adapters at
   startup (via `wiring.rs`); ports + adapters compose the runtime's
   outward-facing service interface.
 - For trace operations: an in-flight or completed invocation whose
   inputs, outputs, and timings should be recorded.
+- For offline flight-recorder inspection: a configured application data root;
+  primary State, PID-mailbox SQLite, provider configuration, and runtime services
+  are not preconditions.
+
+## AGE-319 flight-recorder coverage
+
+The version-1 flight recorder is a deliberately incomplete, DB-independent
+control-plane witness. The following table is the exact producer map for this
+slice; a row is included only where the named source constructs a `SpanStart`.
+
+| Included producer | Recorded operation/resource | Scope represented |
+|-------------------|-----------------------------|-------------------|
+| Completion registration in `db/ownership_authority.rs` | `completion_registration` / `state_sqlite`, with a parented `completion_authority_registration` / `pid_mailbox_sqlite` child | The State obligation transaction and the PID-mailbox authority/open/fence/registration participant. The shared diagnostic ID does not turn either resource commit into cross-store settlement. |
+| Invocation finalization in `db/invocation_lifecycle_finalize.rs` | `invocation_terminal_finalize` / `state_sqlite`, with a parented `invocation_terminal_finalize_completion_authority` / `pid_mailbox_sqlite` child when finalization enters that participant | The selected State terminal transaction and its in-scope completion-sidecar participation, not process exit or delivery. |
+| Provider launch lifecycle in `db/provider_launch_lifecycle.rs` | `provider_launch_begin` and `provider_launch_{operation}` / `state_sqlite`, with a parented `provider_launch_transition_completion_authority` / `pid_mailbox_sqlite` child when a transition enters sidecar publication | Begin plus exactly these current transition operation forms: `activate`, `endpoint`, `promotion/{observation_id}`, `transfer`, `certify`, `native-recovery`, `native-custody`, `native-recovered-custody`, `native-runtime-cancellation`, `native-channel-duty-owner`, `complete-native`, `complete`, `settle_cancel`, and `reconcile/{disposition}`. |
+| Session admission in `mailbox.rs` | `session_admission_enqueue` and `session_admission_try_admit` / `pid_mailbox_sqlite` | The selected queue/admit `BEGIN IMMEDIATE` transactions. |
+| Wake claim in `mailbox.rs` | `wake_claim_acquire` / `pid_mailbox_sqlite` | The selected wake-claim acquisition transaction. |
+| Wake recovery in `wake_coordinator/sweep/mod.rs` | `wake_recovery_sweep` / `wake_recovery_orchestration` | The bounded composite sweep outcome; it is not a synthetic SQLite commit. |
+| Runner-visible terminal handoff in `mailbox_delivery.rs` | `pty_terminal_handoff` / `runner_visible_handoff`, with observation beginning before mailbox open | The runner-side handoff attempt and bounded outcome; it is not an ACK, process-exit, or full delivery-settlement claim. |
+
+Explicit omissions are every other State or PID-mailbox transaction not named
+above, including generic invocation/artifact/session writes, schema/migration and
+quota work, mailbox delivery/receipt/ACK writes, wake-claim release, and the
+remaining admission mutations. Agent-bash-local pre-runner registration,
+pre-spawn, provisional-result, and publication phases are also omitted, as are a
+single-root-supervisor authority cutover, lifecycle repair, universal SQLite
+instrumentation, and Tauri IPC diagnostics. Nested work is covered only when it
+has its own named parented span; merely executing inside a composite span does
+not make an omitted transaction a recorded participant.
+
+This recorder runs in parallel with three older diagnostic practices and does
+not ingest, replace, or reconcile any of them:
+
+- The State `LifecycleEventSink` records and forwards invocation lifecycle
+  records through the State-backed lifecycle path. It still requires State and
+  has different event semantics.
+- The native runtime-exit journal retains provider-generation exit intent,
+  predecessor, and result artifacts for its custody protocol. Those artifacts,
+  not recorder events, remain authoritative for that protocol.
+- Opt-in legacy `notify-trace.log` is a shared textual notify/PTY/wake trace with
+  its existing shared rotation behavior. Its claim-token field is now only the
+  constant presence marker `redacted` or `none`, but this slice does not redesign
+  that file's writer/rotation authority and the offline reader does not read it.
+  Cross-producer rotation/deletion of that legacy evidence remains an explicit
+  residual authority and retention risk outside this slice.
 
 ## Input → Expected output
 
@@ -47,6 +109,12 @@
 | An external diagnostics model executes through `RuntimeDiagnosticsService`. | The service reuses its populated provider registry for the external model while built-in diagnostics remain on the registry-free executor path. |
 | Primary provider execution fails and fallback diagnostics also fails. | The primary exit, terminal reason, stderr, invocation, and provider-session identity remain authoritative; the secondary failure emits one `OULIPOLY_DIAGNOSTIC_FAILURE` marker with its operation and settles a typed non-null error category. |
 | A live-only observability snapshot reads chronological logical children after terminal history fills the invocation cap. | The invocation projection stably prioritizes durable `Running` candidates before terminal candidates, then applies the existing finite traversal cap and exact PID/boot/start-time liveness validation. Terminal-inclusive snapshots retain the chronological child order. |
+| `diagnostics recent --limit N [--json]` runs while State and PID-mailbox SQLite are unavailable or held in valid live write transactions. | The process routes before completion-owner bootstrap, recovery, tracing initialization, or runtime-service construction; one bounded inspection generation of the default flight-recorder root produces both the raw recent failures and their coalesced groups, with the same retained coverage and reader issues. It does not mutate the held stores. |
+| `diagnostics trace <diagnostic-id> [--json]` runs while State and PID-mailbox SQLite are unavailable. | The process routes through the same offline boundary and reports only retained source records for the diagnostic ID plus coverage/issues; an empty retained trace is not represented as database or delivery success. |
+| A selected State or PID-mailbox control-plane transaction is attempted. | Its top-level resource-scoped span synchronously appends `Requested` before the real `BEGIN IMMEDIATE`, then submits only phases actually observed: `Acquired`, `CommitStarted`, `Committed`, contention/failure, and `Released`. A nested sidecar child submits its `Requested` observation nonblockingly before sidecar authority/open/fence work because the parent database writer is already held. SQLite begin/commit failures retain primary and extended codes plus configured busy timeout and observed wait; recorder failure never changes the transaction result. |
+| Completion registration crosses State and PID-mailbox authority. | State and sidecar use distinct parent/child spans under one diagnostic ID. State `Released` occurs after its commit and before sidecar commit; neither resource commit is represented as delivery, ACK, process exit, or complete cross-store settlement. |
+| Launch admission, provider launch, wake claim, terminal finalization, or wake recovery runs. | The producer attaches a bounded lifecycle phase while retaining the exact resource/effect scope. Wake-recovery sweep and runner-visible terminal handoff are composite orchestration spans and do not synthesize SQLite `Committed` phases. |
+| Legacy completion wake tracing observes a claim token. | The trace preserves a constant `redacted`/`none` presence marker and never formats, hashes, or writes the capability value. |
 
 ## Edge cases
 
@@ -68,6 +136,99 @@
 - Durable `Running` status only changes candidate order in a live-only
   projection. Missing, dead, or mismatched process identity still fails
   closed, and unrelated invocations remain outside the logical subtree.
+- A truncated or unsupported flight-recorder record does not make offline
+  inspection fail as a whole. Output preserves the readable source records and
+  reports the ignored/truncated source coordinates and retained coverage.
+- `retention-status.json` is a separately bounded input. The reader opens it
+  directly and reads at most `MAX_RETENTION_STATUS_READ_BYTES` (64 KiB), without
+  allocating or deserializing the rest of an oversized file. It reports
+  `oversized_retention_status`, `truncated_retention_status` (missing the
+  completed-record newline), or `invalid_retention_status` distinctly, and
+  exposes `retention_status_bytes_read`, `retention_status_bytes_skipped`, and
+  `retention_status_limit_reached` independently of shard byte coverage.
+- Missing/unreadable recorder roots, a shard that disappears or whose pathname
+  resolves to a replacement file identity after discovery, growth beyond the
+  observed byte budget, work omitted by the discovery/shard/byte bounds, and an
+  unsatisfied aggregate retention target are explicit coverage issues. On the
+  Linux/WSL evidence path, a discovery-time device/inode identity must match the
+  descriptor opened for reading; a mismatch is skipped as
+  `concurrent_replacement`. A bounded query is one generation of best-effort
+  retained evidence, not a filesystem snapshot.
+- Raw and coalesced recent failures are derived from the same in-memory
+  inspection. Unique record event IDs are deduplicated; a redacted cause/failure
+  signature prevents unrelated generic failures from being merged solely by
+  operation/resource/phase.
+- State or sidecar `BEGIN IMMEDIATE` contention preserves the operation's
+  original lock error. The synchronously appended top-level `Requested` survives
+  independently of the database result; queued Contention/Released evidence
+  retains typed SQLite codes when the writer drains those later phases.
+- An acquired transaction that exits through an early error still emits a
+  bounded static failure category and `Released`; it does not manufacture a
+  commit, rollback success, or broader lifecycle outcome.
+- Completion capabilities, wake/claim/lease tokens, cursors, credentials,
+  prompts, transcripts, payloads, environment bodies, and arbitrary paths are
+  excluded from producer correlations and cause text.
+- Recorder initialization, queueing, append, or rotation failure remains
+  fail-open for the protected operation and never changes its result. The process
+  may retry initialization and attempts at most one bounded, non-secret
+  diagnostic-gap notification per failed stage; a gap notification is not
+  operation-failure or operation-success evidence. Nonblocking enqueue failure
+  uses the exact bounded stages `deferred_queue_full` and
+  `deferred_queue_disconnected`;
+  synchronous writer-channel loss uses `writer_disconnected`. Before resolving
+  the process-recorder root, initialization makes one best-effort attempt to
+  start the process-wide reporter; `FlightRecorder::open` makes the same
+  idempotent attempt for directly constructed recorders. At most one reporter
+  worker owns stderr and its bounded `GAP_REPORTER_QUEUE_CAPACITY` (16) channel.
+  Every operation and recorder-writer path performs only `try_send` against an
+  already observed sender and never writes stderr itself. A missing, full, or
+  disconnected reporter, reporter-start failure, or stderr write failure drops
+  diagnostic visibility without blocking, panicking, retrying indefinitely, or
+  changing protected work. A deferred/database-held producer only atomically
+  marks the stage pending and immediately returns its exact status; pending
+  stages receive their one nonblocking reporter-handoff attempt when the recorder
+  writer next makes progress or at the next top-level pre-database `Requested`
+  boundary. Once-per-stage therefore means at most one handoff attempt, not proof
+  that stderr accepted or retained the notification.
+- The default recorder has a bounded deferred queue of
+  `DEFAULT_DEFERRED_QUEUE_CAPACITY` (1024), configurable as
+  `RecorderConfig::deferred_queue_capacity`. A top-level `Requested` waits for the
+  writer and returns `RecordStatus::Appended` only after append/flush; all
+  non-Requested events and nested sidecar-child `Requested` events use
+  nonblocking queue submission and return `RecordStatus::Queued` when accepted.
+  The writer thread alone performs their regular-file append/rotation work, so an
+  already-held State or PID-mailbox writer performs no recorder file I/O. Queued
+  means accepted for deferred writing, not appended or crash-durable: abrupt
+  process exit may lose a later phase that was accepted but not drained, while
+  the earlier synchronous top-level `Requested` remains the retained boundary.
+- Each process keeps an advisory lease on its active shard for the writer
+  lifetime and transfers that lease on rotation. Aggregate cleanup first holds
+  the nonblocking cleanup lease, then obtains a candidate shard lease
+  nonblockingly before deleting only stale, confidently inactive shards.
+  Live, locked, or identity-uncertain shards remain; coverage/retention status
+  reports when those shards prevent the aggregate target from being met. Startup
+  cleanup examines at most `MAX_CLEANUP_DIRECTORY_ENTRIES` (1024) raw directory
+  entries and retains at most `MAX_CLEANUP_ISSUES` (128) issue strings of at most
+  `MAX_CLEANUP_ISSUE_BYTES` (64) bytes each. Status serialization is checked
+  against the same 64-KiB reader bound before the temporary file is written.
+  `directory_entries_examined`, `directory_entries_unreadable`,
+  `directory_limit_reached`, `issue_limit_reached`, and `issues_omitted` expose
+  that work. Reaching the directory cap or encountering an unreadable entry
+  or omitting issue detail makes `aggregate_limit_satisfied` false because
+  incomplete coverage cannot prove the aggregate target, while discovered
+  held/live/uncertain shards remain fail-closed against deletion.
+- Default writer retention is at most four one-MiB shards per process (one
+  active plus rotations), with a best-effort aggregate target of 64 shards and
+  a seven-day stale-age threshold. Reader work has four separate bounds. It
+  reads at most 64 KiB of retention status, examines at most
+  `MAX_INSPECTION_DIRECTORY_ENTRIES` (1024) raw directory entries before
+  metadata sorting, then selects at most 256 matching shards and reads at most
+  64 MiB total shard content; it rejects any individual record over one MiB.
+  `directory_entries_examined` and `directory_limit_reached` describe discovery;
+  `inspection_directory_limit` means unexamined entries may be omitted and does
+  not fabricate `files_skipped` or `bytes_skipped` for names/metadata it did not
+  read. Existing file/byte skipped fields describe only discovered content
+  excluded by the selected-shard or byte caps.
 
 ## Error conditions
 
@@ -91,6 +252,40 @@
   executor's domain.
 - Observability does NOT infer authority or liveness from PPID ancestry,
   bare PID, recency, cwd, or filenames.
+- Offline flight-recorder inspection does NOT open, reconcile, migrate, or infer
+  success from primary State or PID-mailbox SQLite; it does not bootstrap a
+  completion owner, run wake recovery, construct provider/runtime services, or
+  treat recorder append/read success as database, notification, receipt, ACK,
+  process-terminal, or settlement success.
+- The flight recorder observes existing authority boundaries; it does NOT move
+  completion, launch, wake, terminal, root-supervisor, or repair authority.
+- A transaction `Committed` phase belongs only to its named SQLite resource.
+  Composite wake recovery and runner-visible handoff use terminal/released
+  outcomes without claiming a database commit.
+- Top-level `Requested` persistence may synchronously wait for the recorder writer
+  only before the protected database attempt. Once State or PID-mailbox writer
+  authority is held, later and nested-child observations are queue submissions;
+  their producer path performs no recorder regular-file append, flush, or
+  rotation and their queued status does not assert durability.
+- Recorder files are private same-UID artifacts, not a security boundary against
+  a malicious same-UID peer. A record ID, diagnostic ID, span relationship, or
+  coalesced group grants no completion, launch, wake, repair, replay, delivery,
+  ACK, reap, or settlement authority.
+- The implementation uses portable filesystem primitives where practical, but
+  the candidate validation and emergency operational-evidence claim are bounded
+  to Linux/WSL. This specification makes no macOS/Windows operational-evidence
+  claim from the Linux/WSL witnesses.
+- Reverting the source does not erase
+  `diagnostics/flight-recorder-v1`. Retained, private, schema-versioned artifacts
+  are inert when reverted code does not read them; this slice performs no
+  rollback deletion. A later deletion request requires a separately identified,
+  bounded cleanup command with exact ownership rather than an implicit source
+  revert or broad directory removal.
+- This diagnostic slice does not repair inherited completion-endpoint succession.
+  A live managed descendant can still retain an older root's endpoint and fail to
+  join it without becoming an in-tree successor; a fresh independent entry may
+  recover later. Flight-recorder evidence observes that pre-existing lifecycle
+  boundary but does not transfer or repair its authority.
 
 ## Declared test patterns
 
@@ -114,6 +309,33 @@ tests on the ports surface, fixture tests on the trace envelope schema.
 - `src-tauri/tests/age175_failure_response_identity.rs`
 - `src-tauri/tests/pipeline_status_propagation_rca/rc1_abnormal_termination_under_tail_pipeline.rs`
 - `src-tauri/tests/initiative_09_internal_unification.rs`
+- `src-tauri/tests/age319_offline_diagnostics_cli.rs`
+  - unavailable leaf paths prove that the early route is independent of
+    available primary stores, not that no SQLite open syscall was attempted;
+  - valid State and PID-mailbox SQLite files held in real write transactions
+    prove that the compiled early CLI succeeds and leaves their database/journal
+    bytes and live uncommitted rows unchanged.
+- `crates/oulipoly-state/src/db/provider_launch_lifecycle.rs` — actual State
+  contention proves Requested precedes typed Contention without changing the
+  original error.
+- `crates/oulipoly-state/src/mailbox.rs` — actual PID-mailbox contention proves
+  the same ordering and code preservation at the admission producer.
+- `crates/oulipoly-state/src/diagnostic_recorder.rs` — deferred-writer tests
+  distinguish `Appended` from `Queued`, use an explicit drain/flush witness for
+  later phases, and exercise nonblocking queue saturation plus nested-child
+  submission without entering reporter handoff while the writer is blocked.
+  Full and disconnected reporter fixtures prove top-level closures still run
+  with unchanged results, and a failing sink fixture proves reporter write
+  errors are ignored; process-recorder initialization failure remains handed off
+  because reporter initialization precedes recorder-root resolution. The
+  reader tests separately exercise the hard status/directory-entry caps and
+  discovery/open file-identity replacement, while cleanup tests reach both its
+  discovery and persisted-issue bounds. The independent abrupt-exit witness
+  establishes the retained top-level Requested/crash-tail boundary, not survival
+  of undrained queued phases.
+- `crates/oulipoly-state/tests/provider_launch_lifecycle.rs`
+- `src-tauri/src/commands/notify.rs` — sentinel token-redaction formatting test.
+- `src-tauri/src/wake_coordinator/sweep/mod.rs`
 
 ## Cross-references
 

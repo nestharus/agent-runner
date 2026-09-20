@@ -4,6 +4,9 @@
 
 use oulipoly_runtime::delivery_evidence::PtyTransportAcknowledgementEvidence;
 use oulipoly_runtime::provider_turn_contract::MAILBOX_BATCH_MAX_ROWS;
+use oulipoly_state::diagnostic_recorder::{
+    DiagnosticPhase, PhaseObservation, SpanStart, process_recorder,
+};
 #[cfg(test)]
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, RuntimeGenerationId,
@@ -913,33 +916,84 @@ pub(crate) fn finalize_pty_mailbox_delivery_handoff(
     let Some(session_id) = session_id else {
         return Ok(false);
     };
-    let Some(mut mailbox) = MailboxDb::open_default_if_exists()? else {
-        return Ok(false);
-    };
-    reconcile_pending_pty_delivery_evidence(&mut mailbox, session_id)?;
-    let attempt_ids = mailbox
-        .accepted_delivery_attempt_windows(session_id)?
-        .into_iter()
-        .filter(|window| window.delivery_invocation_uuid == invocation_uuid)
-        .map(|window| window.attempt_id)
-        .collect::<Vec<_>>();
-    if attempt_ids.is_empty() {
-        return Ok(false);
-    }
-    for attempt_id in attempt_ids {
-        if !mailbox.confirm_delivery_attempt(&attempt_id)? {
-            return Err(format!(
-                "Mailbox delivery attempt {attempt_id} cannot be confirmed without an exact generation-bound State evidence obligation"
-            ));
+    let start = SpanStart::new("pty_terminal_handoff", "runner_visible_handoff")
+        .with_lifecycle_phase("terminal_handoff")
+        .with_identifier("session_id", session_id)
+        .with_identifier("invocation_uuid", invocation_uuid)
+        .with_identifier("exit_code", exit_code.to_string());
+    process_recorder().with_requested_span(start, |span| {
+        let mut mailbox = match MailboxDb::open_default_if_exists() {
+            Ok(Some(mailbox)) => mailbox,
+            Ok(None) => {
+                let _ = span.record(
+                    DiagnosticPhase::Released,
+                    PhaseObservation::not_started()
+                        .with_cause("terminal_handoff_mailbox_absent"),
+                );
+                return Ok(false);
+            }
+            Err(error) => {
+                let observation = PhaseObservation::not_started()
+                    .with_cause("terminal_handoff_mailbox_open_failed");
+                let _ = span.record(DiagnosticPhase::Failed, observation.clone());
+                let _ = span.record(DiagnosticPhase::Released, observation);
+                return Err(error);
+            }
+        };
+        let result = (|| {
+            reconcile_pending_pty_delivery_evidence(&mut mailbox, session_id)?;
+            let attempt_ids = mailbox
+                .accepted_delivery_attempt_windows(session_id)?
+                .into_iter()
+                .filter(|window| window.delivery_invocation_uuid == invocation_uuid)
+                .map(|window| window.attempt_id)
+                .collect::<Vec<_>>();
+            if attempt_ids.is_empty() {
+                return Ok(false);
+            }
+            for attempt_id in attempt_ids {
+                if !mailbox.confirm_delivery_attempt(&attempt_id)? {
+                    return Err(format!(
+                        "Mailbox delivery attempt {attempt_id} cannot be confirmed without an exact generation-bound State evidence obligation"
+                    ));
+                }
+            }
+            reconcile_pending_pty_delivery_evidence(&mut mailbox, session_id)?;
+            crate::wake_coordinator::mark_session_idle_after_turn(
+                session_id,
+                invocation_uuid,
+                Some(exit_code),
+            )?;
+            Ok(true)
+        })();
+        match &result {
+            Ok(true) => {
+                let _ = span.record(
+                    DiagnosticPhase::Released,
+                    PhaseObservation::terminal().with_cause("terminal_handoff_confirmed"),
+                );
+            }
+            Ok(false) => {
+                let _ = span.record(
+                    DiagnosticPhase::Released,
+                    PhaseObservation::effects_possible()
+                        .with_cause("terminal_handoff_no_matching_attempt"),
+                );
+            }
+            Err(_) => {
+                let _ = span.record(
+                    DiagnosticPhase::Failed,
+                    PhaseObservation::effects_possible()
+                        .with_cause("pty_terminal_handoff_failed"),
+                );
+                let _ = span.record(
+                    DiagnosticPhase::Released,
+                    PhaseObservation::effects_possible(),
+                );
+            }
         }
-    }
-    reconcile_pending_pty_delivery_evidence(&mut mailbox, session_id)?;
-    crate::wake_coordinator::mark_session_idle_after_turn(
-        session_id,
-        invocation_uuid,
-        Some(exit_code),
-    )?;
-    Ok(true)
+        result
+    })
 }
 
 fn pty_nack_status(message: &str) -> &str {

@@ -27,6 +27,12 @@
 //! Invocation finalize orchestration and lifecycle-log classification.
 
 use super::*;
+use crate::diagnostic_producer::{
+    TransactionAttempt, TransactionPhaseGuard, record_sqlite_failure, record_unacquired_release,
+};
+use crate::diagnostic_recorder::{
+    DiagnosticPhase, DiagnosticSpan, PhaseObservation, SpanStart, process_recorder,
+};
 use crate::result_envelope::{ResultEnvelopeFailureIdentity, ResultEnvelopeInput};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,50 +342,84 @@ impl StateDb {
         BeforeValidation: FnOnce(),
         AfterValidation: FnOnce(),
     {
-        let tx =
-            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
-                .map_err(|error| Self::format_finalize_begin_transaction_error(id, error))?;
-
-        super::completed_turns::refuse_pending_turn(&tx, id)?;
-        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
-            &tx,
-            id,
-            mutation_authority,
-        )?;
-        let invocation = Self::load_invocation_for_finalize(&tx, id)?;
-        Self::validate_invocation_is_running(id, &invocation.status)?;
-        self.with_finalization_completion_authority(
-            tx,
-            &invocation.invocation_uuid,
-            success,
-            |tx| {
-                Self::write_invocation_final_row(
+        let start = SpanStart::new("invocation_terminal_finalize", "state_sqlite")
+            .with_lifecycle_phase("terminal_finalize")
+            .with_busy_timeout(super::opening_write::state_writer_busy_timeout())
+            .with_identifier("invocation_row_id", id.to_string())
+            .with_identifier("success", success.to_string())
+            .with_identifier("exit_code", write.exit_code.to_string());
+        process_recorder().with_requested_span(start, |span| {
+            let attempt = TransactionAttempt::start();
+            let tx = match sqlite::Transaction::new_unchecked(
+                &self.conn,
+                sqlite::TransactionBehavior::Immediate,
+            ) {
+                Ok(tx) => tx,
+                Err(error) => {
+                    record_sqlite_failure(span, &error, attempt);
+                    record_unacquired_release(span);
+                    return Err(Self::format_finalize_begin_transaction_error(id, error));
+                }
+            };
+            let mut phases = TransactionPhaseGuard::acquired(span, attempt);
+            let sidecar_failure_recorded = std::cell::Cell::new(false);
+            let result = (|| {
+                super::completed_turns::refuse_pending_turn(&tx, id)?;
+                super::provider_launch_lifecycle::validate_invocation_mutation_authority(
                     &tx,
                     id,
-                    success,
-                    write.exit_code,
-                    write.error_category,
-                    write.terminal_reason,
-                    write.finished_at,
+                    mutation_authority,
                 )?;
-                Self::upsert_provider_finalize_aggregate(
-                    &tx,
-                    &invocation.model_name,
-                    invocation.provider_name.as_deref(),
+                let invocation = Self::load_invocation_for_finalize(&tx, id)?;
+                Self::validate_invocation_is_running(id, &invocation.status)?;
+                self.with_finalization_completion_authority_instrumented(
+                    tx,
+                    &invocation.invocation_uuid,
                     success,
-                    write.terminal_reason,
-                    write.finished_at,
+                    span,
+                    &sidecar_failure_recorded,
+                    |tx| {
+                        Self::write_invocation_final_row(
+                            &tx,
+                            id,
+                            success,
+                            write.exit_code,
+                            write.error_category,
+                            write.terminal_reason,
+                            write.finished_at,
+                        )?;
+                        Self::upsert_provider_finalize_aggregate(
+                            &tx,
+                            &invocation.model_name,
+                            invocation.provider_name.as_deref(),
+                            success,
+                            write.terminal_reason,
+                            write.finished_at,
+                        )?;
+
+                        before_validation();
+                        after_validation();
+
+                        phases.commit_started();
+                        match tx.commit() {
+                            Ok(()) => phases.committed(),
+                            Err(error) => {
+                                phases.sqlite_failure(&error);
+                                return Err(Self::format_finalize_commit_transaction_error(
+                                    id, error,
+                                ));
+                            }
+                        }
+                        Ok(())
+                    },
                 )?;
-
-                before_validation();
-                after_validation();
-
-                tx.commit()
-                    .map_err(|error| Self::format_finalize_commit_transaction_error(id, error))?;
-                Ok(())
-            },
-        )?;
-        Ok(invocation)
+                Ok(invocation)
+            })();
+            if result.is_err() && !sidecar_failure_recorded.get() {
+                phases.failed("invocation_terminal_finalize_failed");
+            }
+            result
+        })
     }
 
     /// Both ordinary and confirmed-input success use this fence. The callback
@@ -390,6 +430,41 @@ impl StateDb {
         tx: sqlite::Transaction<'tx>,
         invocation_uuid: &str,
         success: bool,
+        write_and_commit: impl FnOnce(sqlite::Transaction<'tx>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_finalization_completion_authority_observed(
+            tx,
+            invocation_uuid,
+            success,
+            None,
+            write_and_commit,
+        )
+    }
+
+    fn with_finalization_completion_authority_instrumented<'tx, T>(
+        &self,
+        tx: sqlite::Transaction<'tx>,
+        invocation_uuid: &str,
+        success: bool,
+        parent_span: &DiagnosticSpan,
+        sidecar_failure_recorded: &std::cell::Cell<bool>,
+        write_and_commit: impl FnOnce(sqlite::Transaction<'tx>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_finalization_completion_authority_observed(
+            tx,
+            invocation_uuid,
+            success,
+            Some((parent_span, sidecar_failure_recorded)),
+            write_and_commit,
+        )
+    }
+
+    fn with_finalization_completion_authority_observed<'tx, T>(
+        &self,
+        tx: sqlite::Transaction<'tx>,
+        invocation_uuid: &str,
+        success: bool,
+        diagnostic: Option<(&DiagnosticSpan, &std::cell::Cell<bool>)>,
         write_and_commit: impl FnOnce(sqlite::Transaction<'tx>) -> Result<T, String>,
     ) -> Result<T, String> {
         if success {
@@ -442,6 +517,106 @@ impl StateDb {
             .flatten();
         let sidecar_path =
             crate::mailbox::MailboxDb::path_for_state_db(completion_authority_state_path);
+        if obligation.is_none() {
+            return write_and_commit(tx);
+        }
+        if let Some((parent_span, sidecar_failure_recorded)) = diagnostic {
+            let obligation = obligation
+                .as_ref()
+                .expect("instrumented completion authority requires an obligation");
+            let materialization_expectation = materialization_expectation
+                .as_ref()
+                .expect("validated completion authority requires materialization");
+            let state_continuity_head = state_continuity_head
+                .as_ref()
+                .expect("validated completion authority requires continuity");
+            let sidecar_start = SpanStart::new(
+                "invocation_terminal_finalize_completion_authority",
+                "pid_mailbox_sqlite",
+            )
+            .with_lifecycle_phase("completion_authority")
+            .with_diagnostic_id(parent_span.diagnostic_id().clone())
+            .with_parent_span_id(parent_span.span_id().clone())
+            .with_identifier("invocation_uuid", invocation_uuid)
+            .with_busy_timeout(std::time::Duration::ZERO);
+            return parent_span.with_deferred_requested_span(sidecar_start, |sidecar_span| {
+                #[cfg(test)]
+                tests::BEFORE_SIDECAR_ACQUISITION.with_borrow_mut(|hook| {
+                    if let Some(hook) = hook.take() {
+                        hook();
+                    }
+                });
+                let sidecar_authority = match Self::acquire_finalize_sidecar_authority(
+                    &sidecar_path,
+                    invocation_uuid,
+                    obligation,
+                ) {
+                    Ok(authority) => authority,
+                    Err(error) => {
+                        sidecar_failure_recorded.set(true);
+                        let _ = sidecar_span.record(
+                            DiagnosticPhase::Failed,
+                            PhaseObservation::not_started()
+                                .with_cause("finalization_completion_authority_namespace_failed"),
+                        );
+                        record_unacquired_release(sidecar_span);
+                        return Err(error);
+                    }
+                };
+                let mut sidecar = match self.open_completion_authority_sidecar(
+                    Some(&sidecar_authority),
+                    invocation_uuid,
+                    Some(obligation),
+                ) {
+                    Ok(Some(sidecar)) => sidecar,
+                    Ok(None) => unreachable!("an admitted obligation requires a sidecar"),
+                    Err(error) => {
+                        sidecar_failure_recorded.set(true);
+                        let _ = sidecar_span.record(
+                            DiagnosticPhase::Failed,
+                            PhaseObservation::not_started()
+                                .with_cause("finalization_completion_authority_open_failed"),
+                        );
+                        record_unacquired_release(sidecar_span);
+                        return Err(error);
+                    }
+                };
+                let (sidecar_fence, sidecar_attempt) =
+                    match sidecar.begin_completion_authority_fence_instrumented(sidecar_span) {
+                        Ok(fence) => fence,
+                        Err(error) => {
+                            sidecar_failure_recorded.set(true);
+                            return Err(if error.starts_with("completion_authority_contention:") {
+                                Self::format_completion_sidecar_sqlite_contention(
+                                    invocation_uuid,
+                                    obligation,
+                                    error,
+                                )
+                            } else {
+                                Self::format_unreadable_completion_sidecar(
+                                    invocation_uuid,
+                                    obligation,
+                                    error,
+                                )
+                            });
+                        }
+                    };
+                let mut sidecar_phases =
+                    TransactionPhaseGuard::acquired(sidecar_span, sidecar_attempt);
+                if let Err(error) = self.validate_completion_sidecar_authority(
+                    &sidecar_fence,
+                    invocation_uuid,
+                    obligation,
+                    materialization_expectation,
+                    state_continuity_head,
+                ) {
+                    sidecar_failure_recorded.set(true);
+                    sidecar_phases.failed("finalization_completion_authority_validation_failed");
+                    return Err(error);
+                }
+                write_and_commit(tx)
+            });
+        }
         #[cfg(test)]
         tests::BEFORE_SIDECAR_ACQUISITION.with_borrow_mut(|hook| {
             if let Some(hook) = hook.take() {
@@ -737,6 +912,9 @@ fn sqlite_error_is_contention(error: &sqlite::Error) -> bool {
 mod tests {
     use super::*;
     use crate::InvocationStart;
+    use crate::diagnostic_recorder::{
+        FlightRecorder, FlightRecorderReader, RecorderConfig, with_test_process_recorder,
+    };
     use crate::mailbox::{CompletionEventRegistrationInput, MailboxDb};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -869,21 +1047,26 @@ mod tests {
 
     #[test]
     fn storage_finalize_sidecar_sqlite_contention_unwinds_state_without_waiting() {
-        let (_directory, state, invocation_row_id, sidecar_path) =
+        let (directory, state, invocation_row_id, sidecar_path) =
             state_with_completion_obligation();
         let holder = sqlite::Connection::open(&sidecar_path).unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
         let probe = concurrent_state_probe(&state.db_path);
-        let error = state
-            .finalize_invocation(
-                crate::InvocationMutationAuthority::Standalone,
-                invocation_row_id,
-                true,
-                0,
-                None,
-                None,
-            )
-            .unwrap_err();
+        let recorder_root = directory.path().join("recorder");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+        let error = with_test_process_recorder(recorder.clone(), || {
+            state
+                .finalize_invocation(
+                    crate::InvocationMutationAuthority::Standalone,
+                    invocation_row_id,
+                    true,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap_err()
+        });
+        recorder.drain_deferred_for_test().unwrap();
         probe.join().unwrap();
         assert!(error.contains("without waiting"), "{error}");
         assert_eq!(
@@ -900,6 +1083,56 @@ mod tests {
             .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
             .unwrap();
         holder.execute_batch("ROLLBACK").unwrap();
+
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let events = report
+            .events
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.event.operation.as_str(),
+                    "invocation_terminal_finalize"
+                        | "invocation_terminal_finalize_completion_authority"
+                )
+            })
+            .map(|record| &record.event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.operation.as_str(), event.phase))
+                .collect::<Vec<_>>(),
+            vec![
+                ("invocation_terminal_finalize", DiagnosticPhase::Requested),
+                ("invocation_terminal_finalize", DiagnosticPhase::Acquired),
+                (
+                    "invocation_terminal_finalize_completion_authority",
+                    DiagnosticPhase::Requested,
+                ),
+                (
+                    "invocation_terminal_finalize_completion_authority",
+                    DiagnosticPhase::Contention,
+                ),
+                (
+                    "invocation_terminal_finalize_completion_authority",
+                    DiagnosticPhase::Released,
+                ),
+                ("invocation_terminal_finalize", DiagnosticPhase::Released),
+            ]
+        );
+        let state_requested = events[0];
+        for event in &events[2..5] {
+            assert_eq!(event.diagnostic_id, state_requested.diagnostic_id);
+            assert_eq!(
+                event.parent_span_id.as_ref(),
+                Some(&state_requested.span_id)
+            );
+            assert_eq!(event.resource, "pid_mailbox_sqlite");
+            assert_eq!(event.observation.busy_timeout_millis, Some(0));
+        }
+        let contention = events[3].observation.sqlite_failure.as_ref().unwrap();
+        assert!(contention.contention);
+        assert!(events[3].observation.wait_micros.is_some());
     }
 
     #[test]

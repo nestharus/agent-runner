@@ -9,6 +9,9 @@ mod live_pty_retry;
 mod plan;
 mod state;
 
+use oulipoly_state::diagnostic_recorder::{
+    DiagnosticPhase, PhaseObservation, SpanStart, process_recorder,
+};
 use oulipoly_state::mailbox::MailboxDb;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -164,9 +167,68 @@ pub(crate) fn start_wake_reclaim_maintenance_driver() {
 }
 
 enum WakeSweepRunOutcome {
-    Completed,
+    CancelledBeforeWork,
+    MailboxAbsent,
+    MailboxUnavailableAfterAdmission,
+    CancelledAfterWork,
+    NoCandidates,
+    NoStartableCandidate,
+    WakeStartAttempted,
     Contended(String),
     CoordinationBusy,
+}
+
+impl WakeSweepRunOutcome {
+    fn diagnostic_observation(&self) -> PhaseObservation {
+        match self {
+            Self::CancelledBeforeWork => {
+                PhaseObservation::not_started().with_cause("wake_recovery_cancelled_before_work")
+            }
+            Self::MailboxAbsent => {
+                PhaseObservation::not_started().with_cause("wake_recovery_mailbox_absent")
+            }
+            Self::Contended(_) => {
+                PhaseObservation::not_started().with_cause("wake_recovery_lease_contended")
+            }
+            Self::CoordinationBusy => {
+                PhaseObservation::not_started().with_cause("wake_recovery_coordination_busy")
+            }
+            Self::MailboxUnavailableAfterAdmission => PhaseObservation::effects_possible()
+                .with_cause("wake_recovery_mailbox_unavailable_after_admission"),
+            Self::CancelledAfterWork => PhaseObservation::effects_possible()
+                .with_cause("wake_recovery_cancelled_after_work"),
+            Self::NoCandidates => {
+                PhaseObservation::effects_possible().with_cause("wake_recovery_no_candidates")
+            }
+            Self::NoStartableCandidate => PhaseObservation::effects_possible()
+                .with_cause("wake_recovery_no_startable_candidate"),
+            Self::WakeStartAttempted => {
+                PhaseObservation::terminal().with_cause("wake_recovery_start_attempted")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WakeSweepStage {
+    BeforeAdmission,
+    Admitted,
+    WorkAttempted,
+}
+
+impl WakeSweepStage {
+    fn failure_observation(self) -> PhaseObservation {
+        match self {
+            Self::BeforeAdmission => {
+                PhaseObservation::not_started().with_cause("wake_recovery_failed_before_admission")
+            }
+            Self::Admitted => PhaseObservation::effects_possible()
+                .with_cause("wake_recovery_failed_after_admission"),
+            Self::WorkAttempted => {
+                PhaseObservation::effects_possible().with_cause("wake_recovery_failed_after_work")
+            }
+        }
+    }
 }
 
 fn try_start_wake_reclaim_driver(
@@ -278,67 +340,90 @@ fn run_wake_reclaim_sweep_with_owner(
     is_cancelled: &dyn Fn() -> bool,
     owned_lease: Option<&Mutex<Option<String>>>,
 ) -> Result<WakeSweepRunOutcome, String> {
-    if is_cancelled() {
-        return Ok(WakeSweepRunOutcome::Completed);
-    }
-    let mailbox_path = MailboxDb::default_path()?;
-    if !mailbox_path.exists() {
-        return Ok(WakeSweepRunOutcome::Completed);
-    }
-    let _admission = match try_acquire_wake_sweep_admission(&mailbox_path)? {
-        WakeSweepAdmissionAttempt::Acquired(admission) => {
-            if let Some(owned_lease) = owned_lease {
-                *owned_lease
-                    .lock()
-                    .map_err(|_| "Wake sweep owner token lock was poisoned".to_string())? =
-                    Some(admission.token.clone());
+    let start = SpanStart::new("wake_recovery_sweep", "wake_recovery_orchestration")
+        .with_lifecycle_phase("wake_recovery_sweep")
+        .with_identifier("trigger", trigger)
+        .with_identifier("owned_lease_supplied", owned_lease.is_some().to_string())
+        .with_identifier("scan_limit", WAKE_RECLAIM_SWEEP_SCAN_LIMIT.to_string());
+    process_recorder().with_requested_span(start, |span| {
+        let mut stage = WakeSweepStage::BeforeAdmission;
+        let result = (|| {
+            if is_cancelled() {
+                return Ok(WakeSweepRunOutcome::CancelledBeforeWork);
             }
-            admission
+            let mailbox_path = MailboxDb::default_path()?;
+            if !mailbox_path.exists() {
+                return Ok(WakeSweepRunOutcome::MailboxAbsent);
+            }
+            let _admission = match try_acquire_wake_sweep_admission(&mailbox_path)? {
+                WakeSweepAdmissionAttempt::Acquired(admission) => {
+                    stage = WakeSweepStage::Admitted;
+                    if let Some(owned_lease) = owned_lease {
+                        *owned_lease.lock().map_err(|_| {
+                            "Wake sweep owner token lock was poisoned".to_string()
+                        })? = Some(admission.token.clone());
+                    }
+                    admission
+                }
+                WakeSweepAdmissionAttempt::Owned(owner_token) => {
+                    tracing::debug!(
+                        trigger,
+                        "Wake reclaim sweep already owned by another process"
+                    );
+                    return Ok(WakeSweepRunOutcome::Contended(owner_token));
+                }
+                WakeSweepAdmissionAttempt::CoordinationBusy => {
+                    tracing::debug!(trigger, "Wake reclaim sweep coordination is busy");
+                    return Ok(WakeSweepRunOutcome::CoordinationBusy);
+                }
+            };
+            let Some(mut db) = MailboxDb::open_default_if_exists()? else {
+                return Ok(WakeSweepRunOutcome::MailboxUnavailableAfterAdmission);
+            };
+            stage = WakeSweepStage::WorkAttempted;
+            super::admission::drain_one_owned(&mut db)?;
+            retry_pending_live_pty_deliveries(&mut db, trigger, is_cancelled)?;
+            if is_cancelled() {
+                return Ok(WakeSweepRunOutcome::CancelledAfterWork);
+            }
+            let candidates = db.wake_sessions().wake_sweep_candidates(
+                super::constants::WAKE_CLAIM_STALE_AFTER_SECONDS,
+                WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
+            )?;
+            if candidates.is_empty() {
+                return Ok(WakeSweepRunOutcome::NoCandidates);
+            }
+            let start = plan_wake_sweep(
+                &mut db,
+                candidates,
+                state::open_default_state_read_only_with_timeout_and_cancel(
+                    Duration::from_secs(WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS),
+                    is_cancelled,
+                ),
+            )?;
+            drop(db);
+            if let Some(candidate) = start {
+                if is_cancelled() {
+                    return Ok(WakeSweepRunOutcome::CancelledAfterWork);
+                }
+                let diagnostic = start_wake_chain(wake_sweep_start_input(&candidate, trigger));
+                trace_wake_sweep_candidate(&candidate.session_id, &diagnostic);
+                return Ok(WakeSweepRunOutcome::WakeStartAttempted);
+            }
+            Ok(WakeSweepRunOutcome::NoStartableCandidate)
+        })();
+        match &result {
+            Ok(outcome) => {
+                let _ = span.record(DiagnosticPhase::Released, outcome.diagnostic_observation());
+            }
+            Err(_) => {
+                let observation = stage.failure_observation();
+                let _ = span.record(DiagnosticPhase::Failed, observation.clone());
+                let _ = span.record(DiagnosticPhase::Released, observation);
+            }
         }
-        WakeSweepAdmissionAttempt::Owned(owner_token) => {
-            tracing::debug!(
-                trigger,
-                "Wake reclaim sweep already owned by another process"
-            );
-            return Ok(WakeSweepRunOutcome::Contended(owner_token));
-        }
-        WakeSweepAdmissionAttempt::CoordinationBusy => {
-            tracing::debug!(trigger, "Wake reclaim sweep coordination is busy");
-            return Ok(WakeSweepRunOutcome::CoordinationBusy);
-        }
-    };
-    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
-        return Ok(WakeSweepRunOutcome::Completed);
-    };
-    super::admission::drain_one_owned(&mut db)?;
-    retry_pending_live_pty_deliveries(&mut db, trigger, is_cancelled)?;
-    if is_cancelled() {
-        return Ok(WakeSweepRunOutcome::Completed);
-    }
-    let candidates = db.wake_sessions().wake_sweep_candidates(
-        super::constants::WAKE_CLAIM_STALE_AFTER_SECONDS,
-        WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
-    )?;
-    if candidates.is_empty() {
-        return Ok(WakeSweepRunOutcome::Completed);
-    }
-    let start = plan_wake_sweep(
-        &mut db,
-        candidates,
-        state::open_default_state_read_only_with_timeout_and_cancel(
-            Duration::from_secs(WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS),
-            is_cancelled,
-        ),
-    )?;
-    drop(db);
-    if let Some(candidate) = start {
-        if is_cancelled() {
-            return Ok(WakeSweepRunOutcome::Completed);
-        }
-        let diagnostic = start_wake_chain(wake_sweep_start_input(&candidate, trigger));
-        trace_wake_sweep_candidate(&candidate.session_id, &diagnostic);
-    }
-    Ok(WakeSweepRunOutcome::Completed)
+        result
+    })
 }
 
 #[cfg(test)]
@@ -355,6 +440,80 @@ mod tests {
     fn record_test_handoff(owner_token: Option<&str>) {
         TEST_HANDOFF_SCHEDULED.store(true, Ordering::SeqCst);
         TEST_HANDOFF_OWNER_MATCHED.store(owner_token == Some("test-owner"), Ordering::SeqCst);
+    }
+
+    #[test]
+    fn wake_sweep_outcomes_have_explicit_certainty_and_result_discriminators() {
+        use oulipoly_state::diagnostic_recorder::OutcomeCertainty;
+
+        for (outcome, certainty, cause) in [
+            (
+                WakeSweepRunOutcome::CancelledBeforeWork,
+                OutcomeCertainty::NotStarted,
+                "wake_recovery_cancelled_before_work",
+            ),
+            (
+                WakeSweepRunOutcome::MailboxAbsent,
+                OutcomeCertainty::NotStarted,
+                "wake_recovery_mailbox_absent",
+            ),
+            (
+                WakeSweepRunOutcome::MailboxUnavailableAfterAdmission,
+                OutcomeCertainty::EffectsPossible,
+                "wake_recovery_mailbox_unavailable_after_admission",
+            ),
+            (
+                WakeSweepRunOutcome::CancelledAfterWork,
+                OutcomeCertainty::EffectsPossible,
+                "wake_recovery_cancelled_after_work",
+            ),
+            (
+                WakeSweepRunOutcome::NoCandidates,
+                OutcomeCertainty::EffectsPossible,
+                "wake_recovery_no_candidates",
+            ),
+            (
+                WakeSweepRunOutcome::NoStartableCandidate,
+                OutcomeCertainty::EffectsPossible,
+                "wake_recovery_no_startable_candidate",
+            ),
+            (
+                WakeSweepRunOutcome::WakeStartAttempted,
+                OutcomeCertainty::Terminal,
+                "wake_recovery_start_attempted",
+            ),
+        ] {
+            let observation = outcome.diagnostic_observation();
+            assert_eq!(observation.certainty, certainty);
+            assert_eq!(observation.causes, vec![cause]);
+        }
+    }
+
+    #[test]
+    fn wake_sweep_errors_preserve_pre_and_post_admission_certainty() {
+        use oulipoly_state::diagnostic_recorder::OutcomeCertainty;
+
+        for (stage, certainty, cause) in [
+            (
+                WakeSweepStage::BeforeAdmission,
+                OutcomeCertainty::NotStarted,
+                "wake_recovery_failed_before_admission",
+            ),
+            (
+                WakeSweepStage::Admitted,
+                OutcomeCertainty::EffectsPossible,
+                "wake_recovery_failed_after_admission",
+            ),
+            (
+                WakeSweepStage::WorkAttempted,
+                OutcomeCertainty::EffectsPossible,
+                "wake_recovery_failed_after_work",
+            ),
+        ] {
+            let observation = stage.failure_observation();
+            assert_eq!(observation.certainty, certainty);
+            assert_eq!(observation.causes, vec![cause]);
+        }
     }
 
     fn reacquire_wake_sweep_admission_after_release(mailbox_path: &Path) -> WakeSweepAdmission {
@@ -561,7 +720,7 @@ mod tests {
                     attempted_tx.send(()).unwrap();
                 }
                 Ok(match attempt {
-                    WakeSweepAdmissionAttempt::Acquired(_) => WakeSweepRunOutcome::Completed,
+                    WakeSweepAdmissionAttempt::Acquired(_) => WakeSweepRunOutcome::NoCandidates,
                     WakeSweepAdmissionAttempt::Owned(owner_token) => {
                         WakeSweepRunOutcome::Contended(owner_token)
                     }

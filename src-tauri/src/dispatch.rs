@@ -66,7 +66,8 @@ use crate::cli::inputs::{
 };
 use crate::resume_cli::format_resume_error;
 use crate::usage::cli::{
-    Cli, MailboxSubcommands, NotifySubcommands, SessionSubcommands, Subcommands,
+    Cli, DiagnosticsSubcommands, MailboxSubcommands, NotifySubcommands, SessionSubcommands,
+    Subcommands,
 };
 use crate::{commands, run, usage, wiring};
 
@@ -89,6 +90,24 @@ pub(crate) use pre_invocation_failure::emit_pre_invocation_failure;
 pub(crate) use predicate::{
     diagnostics_model_configured, execution_succeeded, should_emit_resume_short_line,
 };
+
+/// Dispatch commands whose contract forbids completion-owner bootstrap, recovery,
+/// runtime-service construction, and primary SQLite access.
+pub(crate) fn run_offline_entry(cli: &Cli) -> Result<Option<i32>, String> {
+    let Some(Subcommands::Diagnostics { command }) = &cli.command else {
+        return Ok(None);
+    };
+    let code = match command {
+        DiagnosticsSubcommands::Recent { limit, json } => {
+            crate::commands::offline_diagnostics::run_recent(limit.get(), *json)
+        }
+        DiagnosticsSubcommands::Trace {
+            diagnostic_id,
+            json,
+        } => crate::commands::offline_diagnostics::run_trace(diagnostic_id, *json),
+    }?;
+    Ok(Some(code))
+}
 
 pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     // Must precede ALL startup recovery, wake sweeps and provider registries.
@@ -386,6 +405,9 @@ fn dispatch_subcommand(
         }
         Subcommands::Notify { command } => dispatch_notify_subcommand(command),
         Subcommands::Mailbox { command } => dispatch_mailbox_subcommand(command),
+        Subcommands::Diagnostics { .. } => {
+            unreachable!("diagnostics commands must execute through run_offline_entry")
+        }
         Subcommands::ResumeList { uuid } => crate::commands::resume_list::run_resume_list(&uuid),
         Subcommands::CompletedTurn {
             invocation,
@@ -881,6 +903,20 @@ mod tests {
         .unwrap();
 
         assert!(!startup_wake_reclaim_sweep_enabled(&cli));
+    }
+
+    #[test]
+    fn diagnostics_commands_are_claimed_by_the_offline_entry() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "diagnostics",
+            "trace",
+            "not-a-diagnostic-id",
+        ])
+        .unwrap();
+
+        let error = run_offline_entry(&cli).expect_err("offline trace validation must run");
+        assert!(error.contains("invalid diagnostic ID"), "{error}");
     }
 
     #[test]

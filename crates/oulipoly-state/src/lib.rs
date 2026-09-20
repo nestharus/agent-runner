@@ -35,6 +35,8 @@ pub mod completion_continuation;
 pub mod continuation;
 mod db;
 pub mod deployment;
+mod diagnostic_producer;
+pub mod diagnostic_recorder;
 mod filesystem_identity;
 pub mod invocation_marker;
 mod lifecycle_log;

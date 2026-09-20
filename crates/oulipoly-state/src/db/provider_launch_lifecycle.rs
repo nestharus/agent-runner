@@ -3,6 +3,10 @@
 //! orchestration, validator, accessor, mapper
 
 use super::*;
+use crate::diagnostic_producer::{
+    TransactionAttempt, TransactionPhaseGuard, record_sqlite_failure, record_unacquired_release,
+};
+use crate::diagnostic_recorder::{DiagnosticPhase, PhaseObservation, SpanStart, process_recorder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -414,33 +418,84 @@ impl StateDb {
             request.parent_invocation_id,
             request.allocation.identity()
         ]))?;
-        let tx = immediate(&self.conn)?;
-        if let Some(lease) = replay(&tx, request.logical_launch_id, "begin", &hash)? {
-            return Ok(lease);
-        }
-        let now = Self::current_rfc3339_timestamp();
-        let mode = match request.start_mode {
-            ProviderLaunchStartMode::Create => "create",
-            ProviderLaunchStartMode::Resume => "resume",
-        };
-        tx.execute("INSERT INTO provider_logical_launches (logical_launch_id,request_identity_sha256,model_name,start_mode,
-            expected_provider_session_id,candidate_plan_json,candidate_plan_sha256,status,current_attempt_id,owner_epoch,created_at,updated_at)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,'active',?8,1,?9,?9)",params![request.logical_launch_id.to_string(),request.request_identity_sha256,
-            request.model_name,mode,request.expected_provider_session_id,plan,plan_hash,request.allocation.attempt_id.to_string(),now]).map_err(sql_error)?;
-        let lease = Self::insert_launch_attempt(
-            &tx,
-            request.logical_launch_id,
-            0,
-            &request.model_name,
-            &request.candidates[0],
-            &plan_hash,
-            request.parent_invocation_id,
-            &request.allocation,
-            &now,
-        )?;
-        remember(&tx, request.logical_launch_id, "begin", &hash, &lease)?;
-        tx.commit().map_err(sql_error)?;
-        Ok(lease)
+        let start = SpanStart::new("provider_launch_begin", "state_sqlite")
+            .with_lifecycle_phase("launch_admission")
+            .with_busy_timeout(super::opening_write::state_writer_busy_timeout())
+            .with_identifier("logical_launch_id", request.logical_launch_id.to_string())
+            .with_identifier("attempt_id", request.allocation.attempt_id.to_string())
+            .with_identifier(
+                "invocation_uuid",
+                request.allocation.invocation_uuid.to_string(),
+            )
+            .with_identifier(
+                "runtime_generation_uuid",
+                request.allocation.runtime_generation_uuid.to_string(),
+            )
+            .with_identifier(
+                "start_mode",
+                match request.start_mode {
+                    ProviderLaunchStartMode::Create => "create",
+                    ProviderLaunchStartMode::Resume => "resume",
+                },
+            );
+        process_recorder().with_requested_span(start, |span| {
+            let attempt = TransactionAttempt::start();
+            let tx = match sqlite::Transaction::new_unchecked(
+                &self.conn,
+                sqlite::TransactionBehavior::Immediate,
+            ) {
+                Ok(tx) => tx,
+                Err(error) => {
+                    record_sqlite_failure(span, &error, attempt);
+                    record_unacquired_release(span);
+                    return Err(sql_error(error));
+                }
+            };
+            let mut phases = TransactionPhaseGuard::acquired(span, attempt);
+            let result = (|| {
+            if let Some(lease) = replay(&tx, request.logical_launch_id, "begin", &hash)? {
+                return Ok(lease);
+            }
+            let now = Self::current_rfc3339_timestamp();
+            let mode = match request.start_mode {
+                ProviderLaunchStartMode::Create => "create",
+                ProviderLaunchStartMode::Resume => "resume",
+            };
+            tx.execute("INSERT INTO provider_logical_launches (logical_launch_id,request_identity_sha256,model_name,start_mode,
+                expected_provider_session_id,candidate_plan_json,candidate_plan_sha256,status,current_attempt_id,owner_epoch,created_at,updated_at)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,'active',?8,1,?9,?9)",params![request.logical_launch_id.to_string(),request.request_identity_sha256,
+                request.model_name,mode,request.expected_provider_session_id,plan,plan_hash,request.allocation.attempt_id.to_string(),now])
+                .map_err(|error| {
+                    phases.sqlite_failure(&error);
+                    sql_error(error)
+                })?;
+            let lease = Self::insert_launch_attempt(
+                &tx,
+                request.logical_launch_id,
+                0,
+                &request.model_name,
+                &request.candidates[0],
+                &plan_hash,
+                request.parent_invocation_id,
+                &request.allocation,
+                &now,
+            )?;
+            remember(&tx, request.logical_launch_id, "begin", &hash, &lease)?;
+            phases.commit_started();
+            match tx.commit() {
+                Ok(()) => phases.committed(),
+                Err(error) => {
+                    phases.sqlite_failure(&error);
+                    return Err(sql_error(error));
+                }
+            }
+            Ok(lease)
+            })();
+            if result.is_err() {
+                phases.failed("provider_launch_begin_transaction_failed");
+            }
+            result
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1100,56 +1155,144 @@ impl StateDb {
         input: &T,
         apply: impl FnOnce(&sqlite::Transaction<'_>) -> Result<(), String>,
     ) -> Result<(), String> {
-        let tx = immediate(&self.conn)?;
-        validate_mutation_authority(
-            &tx,
-            owner.invocation_row_id,
-            InvocationMutationAuthority::ProviderLaunch(owner),
-        )?;
-        if operation == "activate" || operation == "endpoint" {
-            let executable: bool = tx.query_row("SELECT l.cancel_requested_at IS NULL AND l.status IN ('active','successor_leased')
-                AND a.status IN ('leased','active') FROM provider_logical_launches l JOIN provider_launch_attempts a ON a.attempt_id=l.current_attempt_id
-                WHERE l.logical_launch_id=?1",[owner.logical_launch_id.to_string()],|r|r.get(0)).map_err(sql_error)?;
-            if !executable {
-                return Err(conflict());
-            }
-        }
-        // State first, sidecar second, held through State commit. No filesystem
-        // journal reconstruction runs here. Replays validate publication too.
-        let sidecar_path = crate::mailbox::MailboxDb::path_for_state_db(&self.db_path);
-        let needs_publication =
-            super::provider_launch_publication::needs_publication(&tx, owner, operation)?;
-        let authority = needs_publication
-            .then(|| {
-                crate::mailbox::MailboxAuthorityFence::try_acquire(&sidecar_path)
-                    .map_err(|e| e.to_string())
-            })
-            .transpose()?;
-        let mut mailbox = authority
-            .as_ref()
-            .map(crate::mailbox::MailboxDb::open_existing_for_completion_authority)
-            .transpose()?;
-        let sidecar_fence = mailbox
-            .as_mut()
-            .map(crate::mailbox::MailboxDb::begin_completion_authority_fence)
-            .transpose()?;
-        if let Some(fence) = &sidecar_fence {
-            super::provider_launch_publication::validate(
+        let start = SpanStart::new(format!("provider_launch_{operation}"), "state_sqlite")
+            .with_lifecycle_phase("provider_launch_transition")
+            .with_busy_timeout(super::opening_write::state_writer_busy_timeout())
+            .with_identifier("logical_launch_id", owner.logical_launch_id.to_string())
+            .with_identifier("attempt_id", owner.attempt_id.to_string())
+            .with_identifier("invocation_uuid", owner.invocation_uuid.to_string())
+            .with_identifier("owner_epoch", owner.owner_epoch.to_string());
+        process_recorder().with_requested_span(start, |span| {
+            let attempt = TransactionAttempt::start();
+            let tx = match sqlite::Transaction::new_unchecked(
+                &self.conn,
+                sqlite::TransactionBehavior::Immediate,
+            ) {
+                Ok(tx) => tx,
+                Err(error) => {
+                    record_sqlite_failure(span, &error, attempt);
+                    record_unacquired_release(span);
+                    return Err(sql_error(error));
+                }
+            };
+            let mut phases = TransactionPhaseGuard::acquired(span, attempt);
+            let sidecar_failure_recorded = std::cell::Cell::new(false);
+            let result = (|| {
+            validate_mutation_authority(
                 &tx,
-                fence,
-                owner,
-                operation,
-                &serde_json::to_value(input).map_err(|e| e.to_string())?,
+                owner.invocation_row_id,
+                InvocationMutationAuthority::ProviderLaunch(owner),
             )?;
-        }
-        let key = format!("{}/{operation}", owner.attempt_id);
-        let hash = digest(&(owner, input))?;
-        if replay::<()>(&tx, owner.logical_launch_id, &key, &hash)?.is_some() {
-            return Ok(());
-        }
-        apply(&tx)?;
-        remember(&tx, owner.logical_launch_id, &key, &hash, &())?;
-        tx.commit().map_err(sql_error)
+            if operation == "activate" || operation == "endpoint" {
+                let executable: bool = tx.query_row("SELECT l.cancel_requested_at IS NULL AND l.status IN ('active','successor_leased')
+                    AND a.status IN ('leased','active') FROM provider_logical_launches l JOIN provider_launch_attempts a ON a.attempt_id=l.current_attempt_id
+                    WHERE l.logical_launch_id=?1",[owner.logical_launch_id.to_string()],|r|r.get(0)).map_err(sql_error)?;
+                if !executable {
+                    return Err(conflict());
+                }
+            }
+            // State first, sidecar second, held through State commit. No filesystem
+            // journal reconstruction runs here. Replays validate publication too.
+            let sidecar_path = crate::mailbox::MailboxDb::path_for_state_db(&self.db_path);
+            let needs_publication =
+                super::provider_launch_publication::needs_publication(&tx, owner, operation)?;
+            let finish_state_transaction = |tx: sqlite::Transaction<'_>| {
+                let key = format!("{}/{operation}", owner.attempt_id);
+                let hash = digest(&(owner, input))?;
+                if replay::<()>(&tx, owner.logical_launch_id, &key, &hash)?.is_some() {
+                    return Ok(());
+                }
+                apply(&tx)?;
+                remember(&tx, owner.logical_launch_id, &key, &hash, &())?;
+                phases.commit_started();
+                match tx.commit() {
+                    Ok(()) => {
+                        phases.committed();
+                        Ok(())
+                    }
+                    Err(error) => {
+                        phases.sqlite_failure(&error);
+                        Err(sql_error(error))
+                    }
+                }
+            };
+            if !needs_publication {
+                return finish_state_transaction(tx);
+            }
+            let publication_input = serde_json::to_value(input).map_err(|e| e.to_string())?;
+            let sidecar_start = SpanStart::new(
+                "provider_launch_transition_completion_authority",
+                "pid_mailbox_sqlite",
+            )
+            .with_lifecycle_phase("completion_authority")
+            .with_diagnostic_id(span.diagnostic_id().clone())
+            .with_parent_span_id(span.span_id().clone())
+            .with_identifier("logical_launch_id", owner.logical_launch_id.to_string())
+            .with_identifier("attempt_id", owner.attempt_id.to_string())
+            .with_identifier("invocation_uuid", owner.invocation_uuid.to_string())
+            .with_identifier("owner_epoch", owner.owner_epoch.to_string())
+            .with_busy_timeout(std::time::Duration::ZERO);
+            span.with_deferred_requested_span(sidecar_start, |sidecar_span| {
+                let authority = match crate::mailbox::MailboxAuthorityFence::try_acquire(
+                    &sidecar_path,
+                ) {
+                    Ok(authority) => authority,
+                    Err(error) => {
+                        sidecar_failure_recorded.set(true);
+                        let _ = sidecar_span.record(
+                            DiagnosticPhase::Failed,
+                            PhaseObservation::not_started()
+                                .with_cause("provider_transition_authority_namespace_failed"),
+                        );
+                        record_unacquired_release(sidecar_span);
+                        return Err(error.to_string());
+                    }
+                };
+                let mut mailbox = match crate::mailbox::MailboxDb::open_existing_for_completion_authority(
+                    &authority,
+                ) {
+                    Ok(mailbox) => mailbox,
+                    Err(error) => {
+                        sidecar_failure_recorded.set(true);
+                        let _ = sidecar_span.record(
+                            DiagnosticPhase::Failed,
+                            PhaseObservation::not_started()
+                                .with_cause("provider_transition_authority_open_failed"),
+                        );
+                        record_unacquired_release(sidecar_span);
+                        return Err(error);
+                    }
+                };
+                let (sidecar_fence, sidecar_attempt) = match mailbox
+                    .begin_completion_authority_fence_instrumented(sidecar_span)
+                {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        sidecar_failure_recorded.set(true);
+                        return Err(error);
+                    }
+                };
+                let mut sidecar_phases =
+                    TransactionPhaseGuard::acquired(sidecar_span, sidecar_attempt);
+                if let Err(error) = super::provider_launch_publication::validate(
+                    &tx,
+                    &sidecar_fence,
+                    owner,
+                    operation,
+                    &publication_input,
+                ) {
+                    sidecar_failure_recorded.set(true);
+                    sidecar_phases.failed("provider_transition_authority_validation_failed");
+                    return Err(error);
+                }
+                finish_state_transaction(tx)
+            })
+            })();
+            if result.is_err() && !sidecar_failure_recorded.get() {
+                phases.failed("provider_launch_transition_failed");
+            }
+            result
+        })
     }
 }
 
@@ -1360,6 +1503,69 @@ fn validate_proof(
         return Err(conflict());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod diagnostic_producer_tests {
+    use super::*;
+    use crate::diagnostic_recorder::{
+        DiagnosticPhase, FlightRecorder, FlightRecorderReader, RecorderConfig,
+        with_test_process_recorder,
+    };
+
+    #[test]
+    fn begin_launch_records_requested_before_typed_state_contention() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let state = StateDb::open(&state_path).unwrap();
+        let blocker = sqlite::Connection::open(&state_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let recorder_root = directory.path().join("recorder");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+        let request = BeginProviderLaunchRequest {
+            logical_launch_id: Uuid::new_v4(),
+            request_identity_sha256: "a".repeat(64),
+            model_name: "fixture-model".to_string(),
+            start_mode: ProviderLaunchStartMode::Create,
+            expected_provider_session_id: None,
+            candidates: vec![ProviderLaunchCandidate {
+                provider_index: 0,
+                account_name: "fixture-account".to_string(),
+            }],
+            parent_invocation_id: None,
+            allocation: ProviderLaunchAttemptAllocation::allocate().unwrap(),
+        };
+
+        let error = with_test_process_recorder(recorder.clone(), || {
+            state.begin_launch(&request).unwrap_err()
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        assert!(error.contains("provider launch persistence"), "{error}");
+        assert!(error.to_ascii_lowercase().contains("locked"), "{error}");
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let events = report
+            .events
+            .iter()
+            .filter(|record| record.event.operation == "provider_launch_begin")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .map(|record| record.event.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                DiagnosticPhase::Requested,
+                DiagnosticPhase::Contention,
+                DiagnosticPhase::Released
+            ]
+        );
+        let failure = events[1].event.observation.sqlite_failure.as_ref().unwrap();
+        assert!(failure.contention);
+        assert!(failure.primary_code.is_some());
+        assert!(failure.extended_code.is_some());
+    }
 }
 
 pub(super) fn validate_launch_schema(conn: &sqlite::Connection) -> Result<(), String> {

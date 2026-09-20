@@ -115,19 +115,26 @@ fn run_gui_entrypoint() -> ExitCode {
 
 fn run_cli_entrypoint() -> ExitCode {
     let cli = parse_cli();
-    let result = dispatch::preflight_entry(&cli).and_then(|early_exit| {
-        if let Some(code) = early_exit {
-            return Ok(code);
-        }
-        if let Err(error) = completion_owner::bootstrap(&cli) {
-            return dispatch::entry_bootstrap_error(&cli, error);
-        }
-        if let Some(code) = dispatch::validate_owned_entry(&cli)? {
-            return Ok(code);
-        }
-        initialize_tracing();
-        dispatch::run(cli)
-    });
+    let result = dispatch::run_offline_entry(&cli)
+        .and_then(|offline_exit| {
+            if let Some(code) = offline_exit {
+                return Ok(Some(code));
+            }
+            dispatch::preflight_entry(&cli)
+        })
+        .and_then(|early_exit| {
+            if let Some(code) = early_exit {
+                return Ok(code);
+            }
+            if let Err(error) = completion_owner::bootstrap(&cli) {
+                return dispatch::entry_bootstrap_error(&cli, error);
+            }
+            if let Some(code) = dispatch::validate_owned_entry(&cli)? {
+                return Ok(code);
+            }
+            initialize_tracing();
+            dispatch::run(cli)
+        });
     let exit = cli_exit(result);
     emit_cli_error_if_needed(&exit);
     cli_exit_to_code(&exit)

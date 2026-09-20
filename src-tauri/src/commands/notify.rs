@@ -528,20 +528,27 @@ fn wake_after_unsubmitted_delivery(
 
 #[cfg(unix)]
 fn trace_completion_wake(session_id: &str, wake: Option<&WakeDiagnostic>) {
-    use oulipoly_runtime::executor::cli::pty_broker::{append_notify_trace_record, trace_token};
+    use oulipoly_runtime::executor::cli::pty_broker::append_notify_trace_record;
 
     let Some(wake) = wake else {
         return;
     };
-    append_notify_trace_record(&format!(
+    append_notify_trace_record(&format_completion_wake_trace_record(session_id, wake));
+}
+
+#[cfg(unix)]
+fn format_completion_wake_trace_record(session_id: &str, wake: &WakeDiagnostic) -> String {
+    use oulipoly_runtime::executor::cli::pty_broker::trace_token;
+
+    format!(
         "trigger=completion-wake session_id={} attempted={} status={} claim_token={} wake_pid={} auto_wake_count={} message={}",
         trace_token(session_id),
         wake.attempted,
         trace_token(&wake.status),
         wake.claim_token
-            .as_deref()
-            .map(trace_token)
-            .unwrap_or_else(|| "none".to_string()),
+            .as_ref()
+            .map(|_| "redacted")
+            .unwrap_or("none"),
         wake.wake_pid
             .map_or_else(|| "none".to_string(), |value| value.to_string()),
         wake.auto_wake_count
@@ -550,7 +557,7 @@ fn trace_completion_wake(session_id: &str, wake: Option<&WakeDiagnostic>) {
             .as_deref()
             .map(trace_token)
             .unwrap_or_else(|| "none".to_string()),
-    ));
+    )
 }
 
 #[cfg(not(unix))]
@@ -946,6 +953,25 @@ mod tests {
             completion_obligation_admission_id("a", "b:owner:c"),
             completion_obligation_admission_id("a:owner:b", "c")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_wake_trace_redacts_claim_token() {
+        let sentinel = "claim-token-must-not-reach-trace";
+        let diagnostic = crate::wake_coordinator::WakeDiagnostic {
+            attempted: true,
+            status: "spawned".to_string(),
+            claim_token: Some(sentinel.to_string()),
+            wake_pid: Some(42),
+            auto_wake_count: Some(3),
+            message: None,
+        };
+
+        let record = super::format_completion_wake_trace_record("session", &diagnostic);
+
+        assert!(record.contains("claim_token=redacted"), "{record}");
+        assert!(!record.contains(sentinel), "{record}");
     }
 
     #[test]
