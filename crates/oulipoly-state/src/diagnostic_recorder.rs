@@ -177,6 +177,228 @@ pub enum OutcomeCertainty {
     Terminal,
 }
 
+/// Stable, non-path database classification. Producers must never attach a
+/// filesystem path, SQLite URI, SQL text, or bound value to this identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqliteDatabaseRole {
+    State,
+    PidMailbox,
+    PidIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqlitePathClass {
+    ManagedFile,
+    ReadOnlySnapshot,
+    Memory,
+    ExternalFile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqliteTransactionMode {
+    Autocommit,
+    Deferred,
+    Immediate,
+    Exclusive,
+    ReadOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqliteTransactionPhase {
+    ConnectionOpen,
+    Requested,
+    WriterAuthority,
+    StatementExecution,
+    Commit,
+    PostCommit,
+    Released,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqliteMeasurementGap {
+    WriterAuthorityNotApplicable,
+    WriterAuthorityNotReached,
+    WriterWaitNotExposedByApi,
+    WriterWaitAndExecutionNotSeparable,
+    ExecutionNotApplicable,
+    ExecutionNotReached,
+    ExecutionNotExposedByApi,
+    CommitNotApplicable,
+    CommitNotReached,
+    CommitNotExposedByApi,
+    PostCommitNotApplicable,
+    PostCommitNotReached,
+    RowsExaminedNotExposed,
+    RowsExaminedNotApplicable,
+    RowsChangedNotReported,
+    RowsChangedNotApplicable,
+    PostCommitOutsideBoundary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqliteEventIdentity {
+    pub database_role: SqliteDatabaseRole,
+    pub path_class: SqlitePathClass,
+    pub query_family: String,
+    #[serde(default)]
+    pub transaction_mode: Option<SqliteTransactionMode>,
+}
+
+impl SqliteEventIdentity {
+    pub fn new(
+        database_role: SqliteDatabaseRole,
+        path_class: SqlitePathClass,
+        query_family: &'static str,
+    ) -> Self {
+        Self {
+            database_role,
+            path_class,
+            query_family: stable_sqlite_label(query_family),
+            transaction_mode: None,
+        }
+    }
+
+    pub fn with_transaction_mode(mut self, mode: SqliteTransactionMode) -> Self {
+        self.transaction_mode = Some(mode);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SqlitePhaseEvidence {
+    pub transaction_phase: Option<SqliteTransactionPhase>,
+    /// End-to-end observed operation time. For early recorder spans the event's
+    /// `elapsed_micros` also carries this; late-filtered observations use this
+    /// field because recorder emission intentionally begins after the DB call.
+    pub total_elapsed_micros: Option<u64>,
+    /// Total time inside a single SQLite statement API when acquisition/busy
+    /// wait cannot be separated from VM execution.
+    pub statement_total_micros: Option<u64>,
+    /// Total duration of the SQLite transaction-begin API call. SQLite does
+    /// not expose the subset spent in its busy handler, so this must not be
+    /// interpreted as exact writer-lock wait time.
+    pub writer_authority_acquisition_micros: Option<u64>,
+    /// Exact time spent waiting for writer authority, when exposed by the
+    /// adapter. rusqlite does not expose it for `BEGIN IMMEDIATE`, so current
+    /// producers leave this absent and report `WriterWaitNotExposedByApi`.
+    pub writer_authority_wait_micros: Option<u64>,
+    /// Time from explicit transaction authority acquisition until commit was
+    /// requested, or time inside a directly observed read/open API. For a
+    /// multi-statement transaction this is a transaction-body phase duration,
+    /// not a claim about SQLite VM-only execution time.
+    pub execution_micros: Option<u64>,
+    pub commit_micros: Option<u64>,
+    pub post_commit_micros: Option<u64>,
+    pub rows_examined: Option<u64>,
+    pub rows_changed: Option<u64>,
+    pub rows_returned: Option<u64>,
+    pub measurement_gaps: Vec<SqliteMeasurementGap>,
+    pub query_plan: Option<SqliteQueryPlanEvidence>,
+}
+
+impl SqlitePhaseEvidence {
+    pub fn for_phase(transaction_phase: SqliteTransactionPhase) -> Self {
+        Self {
+            transaction_phase: Some(transaction_phase),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_writer_acquisition(mut self, acquisition: Duration) -> Self {
+        self.writer_authority_acquisition_micros = Some(saturating_micros(acquisition));
+        self
+    }
+
+    pub fn with_statement_total(mut self, elapsed: Duration) -> Self {
+        self.statement_total_micros = Some(saturating_micros(elapsed));
+        self
+    }
+
+    pub fn with_total_elapsed(mut self, elapsed: Duration) -> Self {
+        self.total_elapsed_micros = Some(saturating_micros(elapsed));
+        self
+    }
+
+    pub fn with_execution(mut self, execution: Duration) -> Self {
+        self.execution_micros = Some(saturating_micros(execution));
+        self
+    }
+
+    pub fn with_commit(mut self, commit: Duration) -> Self {
+        self.commit_micros = Some(saturating_micros(commit));
+        self
+    }
+
+    pub fn with_post_commit(mut self, post_commit: Duration) -> Self {
+        self.post_commit_micros = Some(saturating_micros(post_commit));
+        self
+    }
+
+    pub fn with_rows_changed(mut self, rows: u64) -> Self {
+        self.rows_changed = Some(rows);
+        self
+    }
+
+    pub fn with_rows_returned(mut self, rows: u64) -> Self {
+        self.rows_returned = Some(rows);
+        self
+    }
+
+    pub fn with_gap(mut self, gap: SqliteMeasurementGap) -> Self {
+        if !self.measurement_gaps.contains(&gap) && self.measurement_gaps.len() < 8 {
+            self.measurement_gaps.push(gap);
+        }
+        self
+    }
+
+    pub fn with_query_plan(mut self, plan: SqliteQueryPlanEvidence) -> Self {
+        self.query_plan = Some(plan);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqliteQueryPlanOperator {
+    Scan,
+    Search,
+    TemporaryBTree,
+    Compound,
+    Coroutine,
+    Materialize,
+    MultiIndex,
+    BloomFilter,
+    Subquery,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqliteQueryPlanOperatorCount {
+    pub operator: SqliteQueryPlanOperator,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SqliteQueryPlanEvidence {
+    Disabled,
+    Captured {
+        nodes_seen: u32,
+        truncated: bool,
+        operators: Vec<SqliteQueryPlanOperatorCount>,
+    },
+    Unavailable {
+        primary_code: Option<String>,
+        extended_code: Option<i32>,
+    },
+}
+
 impl Default for OutcomeCertainty {
     fn default() -> Self {
         Self::NotStarted
@@ -204,7 +426,15 @@ impl SqliteFailure {
         Self {
             primary_code,
             extended_code,
-            message: redact_text(&error.to_string()),
+            // SQLite error strings are not a safe telemetry boundary: virtual
+            // tables, user functions, and future adapters may include input in
+            // them. Typed codes carry the useful classification without SQL,
+            // paths, credentials, or bound values.
+            message: if error.sqlite_error().is_some() {
+                "sqlite operation failed".to_string()
+            } else {
+                "sqlite adapter operation failed".to_string()
+            },
             contention,
         }
     }
@@ -218,6 +448,7 @@ pub struct PhaseObservation {
     pub busy_timeout_millis: Option<u64>,
     pub retry_count: Option<u32>,
     pub sqlite_failure: Option<SqliteFailure>,
+    pub sqlite: Option<SqlitePhaseEvidence>,
     pub causes: Vec<String>,
 }
 
@@ -274,6 +505,11 @@ impl PhaseObservation {
         self
     }
 
+    pub fn with_sqlite_evidence(mut self, evidence: SqlitePhaseEvidence) -> Self {
+        self.sqlite = Some(evidence);
+        self
+    }
+
     pub fn with_cause(mut self, cause: impl AsRef<str>) -> Self {
         if self.causes.len() < 8 {
             self.causes.push(redact_text(cause.as_ref()));
@@ -292,6 +528,7 @@ pub struct SpanStart {
     correlations: BTreeMap<String, String>,
     busy_timeout_millis: Option<u64>,
     retry_count: u32,
+    sqlite: Option<SqliteEventIdentity>,
 }
 
 impl SpanStart {
@@ -305,6 +542,7 @@ impl SpanStart {
             correlations: BTreeMap::new(),
             busy_timeout_millis: None,
             retry_count: 0,
+            sqlite: None,
         }
     }
 
@@ -367,6 +605,11 @@ impl SpanStart {
         self
     }
 
+    pub fn with_sqlite_identity(mut self, identity: SqliteEventIdentity) -> Self {
+        self.sqlite = Some(identity);
+        self
+    }
+
     pub fn diagnostic_id(&self) -> &DiagnosticId {
         &self.diagnostic_id
     }
@@ -392,6 +635,8 @@ pub struct DiagnosticEvent {
     pub observation: PhaseObservation,
     #[serde(default)]
     pub correlations: BTreeMap<String, String>,
+    #[serde(default)]
+    pub sqlite: Option<SqliteEventIdentity>,
 }
 
 #[derive(Clone)]
@@ -556,6 +801,84 @@ impl FlightRecorder {
         self.with_span(start, AppendCoordination::Synchronous, operation)
     }
 
+    /// Synchronously retains one observation made after the protected work has
+    /// finished. This avoids inventing a post-hoc `Requested` event and is safe
+    /// only when the producer no longer holds the observed database authority.
+    pub(crate) fn record_completed_observation(
+        &self,
+        start: SpanStart,
+        elapsed: Duration,
+        phase: DiagnosticPhase,
+        observation: PhaseObservation,
+    ) -> RecordStatus {
+        emit_pending_gaps();
+        self.record_completed_observation_with_coordination(
+            start,
+            elapsed,
+            phase,
+            observation,
+            AppendCoordination::Synchronous,
+        )
+    }
+
+    /// Retains one completed observation on an already-selected recorder
+    /// without waiting for recorder capacity or file I/O. Callers must select
+    /// the recorder before acquiring database authority.
+    pub(crate) fn record_deferred_completed_observation(
+        &self,
+        start: SpanStart,
+        elapsed: Duration,
+        phase: DiagnosticPhase,
+        observation: PhaseObservation,
+    ) -> RecordStatus {
+        self.record_completed_observation_with_coordination(
+            start,
+            elapsed,
+            phase,
+            observation,
+            AppendCoordination::Deferred,
+        )
+    }
+
+    fn record_completed_observation_with_coordination(
+        &self,
+        start: SpanStart,
+        elapsed: Duration,
+        phase: DiagnosticPhase,
+        mut observation: PhaseObservation,
+        coordination: AppendCoordination,
+    ) -> RecordStatus {
+        if observation.busy_timeout_millis.is_none() {
+            observation.busy_timeout_millis = start.busy_timeout_millis;
+        }
+        if observation.retry_count.is_none() {
+            observation.retry_count = Some(start.retry_count);
+        }
+        for cause in &mut observation.causes {
+            *cause = redact_text(cause);
+        }
+        self.append(
+            &DiagnosticEvent {
+                schema_version: DIAGNOSTIC_SCHEMA_VERSION,
+                event_id: EventId::new(),
+                diagnostic_id: start.diagnostic_id,
+                span_id: SpanId::new(),
+                parent_span_id: start.parent_span_id,
+                recorded_at: now(),
+                elapsed_micros: saturating_micros(elapsed),
+                process: self.inner.process.clone(),
+                operation: start.operation,
+                resource: start.resource,
+                lifecycle_phase: start.lifecycle_phase,
+                phase,
+                observation,
+                correlations: start.correlations,
+                sqlite: start.sqlite,
+            },
+            coordination,
+        )
+    }
+
     /// Emits a child Requested event without waiting for recorder file I/O.
     /// This is for a nested resource span entered while its parent database
     /// transaction is already held.
@@ -581,12 +904,21 @@ impl FlightRecorder {
             requested_coordination,
             requested_status: OnceLock::new(),
         };
-        let requested_status = span.record(
-            DiagnosticPhase::Requested,
-            PhaseObservation::not_started()
-                .with_retry_count(span.start.retry_count)
-                .with_optional_busy_timeout(span.start.busy_timeout_millis),
-        );
+        let mut requested = PhaseObservation::not_started()
+            .with_retry_count(span.start.retry_count)
+            .with_optional_busy_timeout(span.start.busy_timeout_millis);
+        if span.start.sqlite.is_some() {
+            requested = requested.with_sqlite_evidence(
+                SqlitePhaseEvidence::for_phase(SqliteTransactionPhase::Requested)
+                    .with_gap(SqliteMeasurementGap::WriterAuthorityNotReached)
+                    .with_gap(SqliteMeasurementGap::ExecutionNotReached)
+                    .with_gap(SqliteMeasurementGap::CommitNotReached)
+                    .with_gap(SqliteMeasurementGap::PostCommitNotReached)
+                    .with_gap(SqliteMeasurementGap::RowsExaminedNotExposed)
+                    .with_gap(SqliteMeasurementGap::RowsChangedNotReported),
+            );
+        }
+        let requested_status = span.record(DiagnosticPhase::Requested, requested);
         let _ = span.requested_status.set(requested_status);
         operation(&span)
     }
@@ -669,7 +1001,7 @@ impl FlightRecorder {
     }
 
     #[cfg(test)]
-    fn block_writer_for_test(&self) -> Result<mpsc::Sender<()>, String> {
+    pub(crate) fn block_writer_for_test(&self) -> Result<mpsc::Sender<()>, String> {
         let writer = self
             .inner
             .writer
@@ -724,6 +1056,29 @@ impl DiagnosticSpan {
         self.recorder.with_deferred_requested_span(start, operation)
     }
 
+    /// Records a completed child observation on this span's already-selected
+    /// recorder without waiting for recorder capacity or file I/O. This is the
+    /// late-observation counterpart to `with_deferred_requested_span` for work
+    /// performed while the parent still holds database authority.
+    pub(crate) fn record_deferred_completed_child(
+        &self,
+        mut start: SpanStart,
+        elapsed: Duration,
+        phase: DiagnosticPhase,
+        observation: PhaseObservation,
+    ) -> RecordStatus {
+        start.diagnostic_id = self.start.diagnostic_id.clone();
+        start.parent_span_id = Some(self.span_id.clone());
+        self.recorder
+            .record_completed_observation_with_coordination(
+                start,
+                elapsed,
+                phase,
+                observation,
+                AppendCoordination::Deferred,
+            )
+    }
+
     pub fn record(
         &self,
         phase: DiagnosticPhase,
@@ -755,6 +1110,7 @@ impl DiagnosticSpan {
                 phase,
                 observation,
                 correlations: self.start.correlations.clone(),
+                sqlite: self.start.sqlite.clone(),
             },
             if phase == DiagnosticPhase::Requested {
                 self.requested_coordination
@@ -2159,6 +2515,19 @@ fn safe_key(value: &str) -> String {
     }
 }
 
+fn stable_sqlite_label(value: &str) -> String {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+        });
+    if valid {
+        value.to_ascii_lowercase()
+    } else {
+        "invalid_query_family".to_string()
+    }
+}
+
 fn sensitive_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     [
@@ -2559,7 +2928,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_queue_saturation_is_nonblocking_and_drain_preserves_order() {
+    fn sqlite_deferred_queue_saturation_is_bounded_nonblocking_and_ordered() {
         let directory = tempfile::tempdir().unwrap();
         let recorder = FlightRecorder::open(
             directory.path(),
@@ -2569,7 +2938,15 @@ mod tests {
             },
         )
         .unwrap();
-        recorder.with_requested_span(SpanStart::new("nonblocking", "state"), |span| {
+        let start = SpanStart::new("nonblocking", "state_sqlite").with_sqlite_identity(
+            SqliteEventIdentity::new(
+                SqliteDatabaseRole::State,
+                SqlitePathClass::Memory,
+                "fixture.queue_saturation",
+            )
+            .with_transaction_mode(SqliteTransactionMode::Immediate),
+        );
+        recorder.with_requested_span(start, |span| {
             let release = recorder.block_writer_for_test().unwrap();
             assert_eq!(
                 span.record(
@@ -2604,6 +2981,14 @@ mod tests {
         recorder.drain_deferred_for_test().unwrap();
         let report = FlightRecorderReader::new(directory.path()).inspect();
         assert_eq!(report.events.len(), 3);
+        assert!(report.events.iter().all(|record| {
+            record
+                .event
+                .sqlite
+                .as_ref()
+                .map(|identity| (identity.database_role, identity.query_family.as_str()))
+                == Some((SqliteDatabaseRole::State, "fixture.queue_saturation"))
+        }));
         let mut phases_by_line = report
             .events
             .iter()

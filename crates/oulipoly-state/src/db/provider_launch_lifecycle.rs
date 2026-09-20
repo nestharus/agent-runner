@@ -6,7 +6,10 @@ use super::*;
 use crate::diagnostic_producer::{
     TransactionAttempt, TransactionPhaseGuard, record_sqlite_failure, record_unacquired_release,
 };
-use crate::diagnostic_recorder::{DiagnosticPhase, PhaseObservation, SpanStart, process_recorder};
+use crate::diagnostic_recorder::{
+    DiagnosticPhase, PhaseObservation, SpanStart, SqliteDatabaseRole, SqliteEventIdentity,
+    SqlitePathClass, SqliteTransactionMode, process_recorder,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -36,6 +39,54 @@ impl InvocationMutationScope {
             .as_ref()
             .map(InvocationMutationAuthority::ProviderLaunch)
             .unwrap_or(InvocationMutationAuthority::Standalone)
+    }
+}
+
+fn provider_launch_diagnostic_identity(operation: &str) -> (&'static str, &'static str) {
+    if operation.starts_with("promotion/") {
+        return ("provider_launch_promotion", "provider_launch.promotion");
+    }
+    if operation.starts_with("reconcile/") {
+        return ("provider_launch_reconcile", "provider_launch.reconcile");
+    }
+    match operation {
+        "activate" => ("provider_launch_activate", "provider_launch.activate"),
+        "endpoint" => ("provider_launch_endpoint", "provider_launch.endpoint"),
+        "transfer" => ("provider_launch_transfer", "provider_launch.transfer"),
+        "certify" => ("provider_launch_certify", "provider_launch.certify"),
+        "native-recovery" => (
+            "provider_launch_native_recovery",
+            "provider_launch.native_recovery",
+        ),
+        "native-custody" => (
+            "provider_launch_native_custody",
+            "provider_launch.native_custody",
+        ),
+        "native-recovered-custody" => (
+            "provider_launch_native_recovered_custody",
+            "provider_launch.native_recovered_custody",
+        ),
+        "native-runtime-cancellation" => (
+            "provider_launch_native_runtime_cancellation",
+            "provider_launch.native_runtime_cancellation",
+        ),
+        "native-channel-duty-owner" => (
+            "provider_launch_native_channel_duty_owner",
+            "provider_launch.native_channel_duty_owner",
+        ),
+        "complete-native" => (
+            "provider_launch_complete_native",
+            "provider_launch.complete_native",
+        ),
+        "complete" => ("provider_launch_complete", "provider_launch.complete"),
+        "settle_cancel" => (
+            "provider_launch_settle_cancel",
+            "provider_launch.settle_cancel",
+        ),
+        _ => (
+            "provider_launch_transition",
+            "provider_launch.unknown_transition",
+        ),
     }
 }
 impl StateDb {
@@ -420,6 +471,14 @@ impl StateDb {
         ]))?;
         let start = SpanStart::new("provider_launch_begin", "state_sqlite")
             .with_lifecycle_phase("launch_admission")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::State,
+                    SqlitePathClass::ManagedFile,
+                    "provider_launch.begin",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            )
             .with_busy_timeout(super::opening_write::state_writer_busy_timeout())
             .with_identifier("logical_launch_id", request.logical_launch_id.to_string())
             .with_identifier("attempt_id", request.allocation.attempt_id.to_string())
@@ -494,6 +553,7 @@ impl StateDb {
             if result.is_err() {
                 phases.failed("provider_launch_begin_transaction_failed");
             }
+            phases.release_after_owner();
             result
         })
     }
@@ -1155,8 +1215,17 @@ impl StateDb {
         input: &T,
         apply: impl FnOnce(&sqlite::Transaction<'_>) -> Result<(), String>,
     ) -> Result<(), String> {
-        let start = SpanStart::new(format!("provider_launch_{operation}"), "state_sqlite")
+        let (diagnostic_operation, query_family) = provider_launch_diagnostic_identity(operation);
+        let start = SpanStart::new(diagnostic_operation, "state_sqlite")
             .with_lifecycle_phase("provider_launch_transition")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::State,
+                    SqlitePathClass::ManagedFile,
+                    query_family,
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            )
             .with_busy_timeout(super::opening_write::state_writer_busy_timeout())
             .with_identifier("logical_launch_id", owner.logical_launch_id.to_string())
             .with_identifier("attempt_id", owner.attempt_id.to_string())
@@ -1225,6 +1294,14 @@ impl StateDb {
                 "pid_mailbox_sqlite",
             )
             .with_lifecycle_phase("completion_authority")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::PidMailbox,
+                    SqlitePathClass::ManagedFile,
+                    "provider_launch.transition.sidecar",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            )
             .with_diagnostic_id(span.diagnostic_id().clone())
             .with_parent_span_id(span.span_id().clone())
             .with_identifier("logical_launch_id", owner.logical_launch_id.to_string())
@@ -1248,8 +1325,9 @@ impl StateDb {
                         return Err(error.to_string());
                     }
                 };
-                let mut mailbox = match crate::mailbox::MailboxDb::open_existing_for_completion_authority(
+                let mut mailbox = match crate::mailbox::MailboxDb::open_existing_for_completion_authority_instrumented(
                     &authority,
+                    sidecar_span,
                 ) {
                     Ok(mailbox) => mailbox,
                     Err(error) => {
@@ -1274,7 +1352,7 @@ impl StateDb {
                 };
                 let mut sidecar_phases =
                     TransactionPhaseGuard::acquired(sidecar_span, sidecar_attempt);
-                if let Err(error) = super::provider_launch_publication::validate(
+                let sidecar_result = if let Err(error) = super::provider_launch_publication::validate(
                     &tx,
                     &sidecar_fence,
                     owner,
@@ -1283,14 +1361,19 @@ impl StateDb {
                 ) {
                     sidecar_failure_recorded.set(true);
                     sidecar_phases.failed("provider_transition_authority_validation_failed");
-                    return Err(error);
-                }
-                finish_state_transaction(tx)
+                    Err(error)
+                } else {
+                    finish_state_transaction(tx)
+                };
+                drop(sidecar_fence);
+                sidecar_phases.release_after_rollback();
+                sidecar_result
             })
             })();
             if result.is_err() && !sidecar_failure_recorded.get() {
                 phases.failed("provider_launch_transition_failed");
             }
+            phases.release_after_owner();
             result
         })
     }
@@ -1512,6 +1595,25 @@ mod diagnostic_producer_tests {
         DiagnosticPhase, FlightRecorder, FlightRecorderReader, RecorderConfig,
         with_test_process_recorder,
     };
+
+    #[test]
+    fn provider_launch_diagnostic_identity_never_uses_dynamic_operation_suffixes() {
+        assert_eq!(
+            provider_launch_diagnostic_identity("promotion/3e5cf350-2304-4509-b912-0a0c34d4df89"),
+            ("provider_launch_promotion", "provider_launch.promotion")
+        );
+        assert_eq!(
+            provider_launch_diagnostic_identity("reconcile/sensitive-disposition"),
+            ("provider_launch_reconcile", "provider_launch.reconcile")
+        );
+        assert_eq!(
+            provider_launch_diagnostic_identity("unrecognized/input"),
+            (
+                "provider_launch_transition",
+                "provider_launch.unknown_transition"
+            )
+        );
+    }
 
     #[test]
     fn begin_launch_records_requested_before_typed_state_contention() {

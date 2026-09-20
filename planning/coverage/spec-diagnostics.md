@@ -4,11 +4,15 @@
 
 - `crates/oulipoly-state/src/diagnostic_recorder.rs`
 - `crates/oulipoly-state/src/diagnostic_producer.rs`
+- `crates/oulipoly-state/src/sqlite_observability.rs`
 - `crates/oulipoly-state/src/db/invocation_lifecycle_finalize.rs`
+- `crates/oulipoly-state/src/db/opening_read_only.rs`
 - `crates/oulipoly-state/src/db/opening_write.rs`
 - `crates/oulipoly-state/src/db/ownership_authority.rs`
 - `crates/oulipoly-state/src/db/provider_launch_lifecycle.rs`
 - `crates/oulipoly-state/src/mailbox.rs`
+- `crates/oulipoly-state/src/mailbox/completion_continuation/attempts.rs`
+- `crates/oulipoly-state/src/pid_identity.rs`
 - `crates/oulipoly-state/src/lifecycle_log.rs`
 - `crates/oulipoly-runtime/src/lib.rs`
 - `crates/oulipoly-runtime/src/diagnostics/mod.rs`
@@ -37,6 +41,7 @@
 - `src-tauri/src/commands/offline_diagnostics.rs`
 - `src-tauri/src/dispatch.rs`
 - `src-tauri/src/mailbox_delivery.rs`
+- `src-tauri/src/completion_owner/root_supervisor.rs`
 - `src-tauri/src/main.rs`
 - `src-tauri/src/usage/cli.rs`
 - `src-tauri/src/wake_coordinator/sweep/mod.rs`
@@ -95,6 +100,42 @@ not ingest, replace, or reconcile any of them:
   Cross-producer rotation/deletion of that legacy evidence remains an explicit
   residual authority and retention risk outside this slice.
 
+## AGE-369 SQLite observability extension
+
+SQLite events retain stable repository-owned operation and query-family labels,
+one of the typed `state` / `pid_mailbox` / `pid_identity` database roles, and a
+non-path classification (`managed_file`, `read_only_snapshot`, `memory`, or
+`external_file`). Raw paths, SQL text, expanded SQL, and bound parameters are
+not event fields. SQLite error messages are reduced to a constant safe summary;
+primary and extended result codes retain the actionable classification.
+
+Existing instrumented `BEGIN IMMEDIATE` boundaries separately measure time in
+the begin call (writer-authority/busy wait), transaction statement work, commit,
+and post-commit work before release. Missing measurements use typed gap reasons
+instead of zeroes or estimates. Autocommit write APIs report one combined
+statement duration and explicitly classify writer wait versus VM execution as
+not separable. Changed/returned row counts are recorded only from direct API
+results; SQLite's unavailable rows-examined count stays absent with an explicit
+gap.
+
+New connection-open and root-supervisor continuation statement observations use
+a late-emitting policy: failures, contention, and operations at or above the
+100-ms default threshold are retained; ordinary fast successes are dropped by
+default. `OULIPOLY_SQLITE_OBSERVABILITY=off` disables this layer, `all` retains
+all normal events, `OULIPOLY_SQLITE_SLOW_MILLIS` changes the threshold (bounded
+to 60 seconds), and `OULIPOLY_SQLITE_SAMPLE_EVERY=N` retains one ordinary fast
+success in every bounded N. Late retained records are handed off synchronously
+only after the observed database call has returned; database-held transaction
+phases continue to use the bounded deferred queue. Queue/retention gaps keep the
+AGE-319 fail-open policy.
+
+`OULIPOLY_SQLITE_QUERY_PLANS=true` opts retained root-supervisor reconciliation
+read observations into bounded `EXPLAIN QUERY PLAN` shape collection. Evidence
+contains at most 64 nodes and only operator categories/counts; SQLite detail
+strings, table/index names, SQL templates, and bound values are discarded. Plan
+collection is off by default, is skipped for filtered normal events, and never
+changes query results or adds a retry/deadline.
+
 ## Input → Expected output
 
 | Input situation | Expected output |
@@ -112,6 +153,8 @@ not ingest, replace, or reconcile any of them:
 | `diagnostics recent --limit N [--json]` runs while State and PID-mailbox SQLite are unavailable or held in valid live write transactions. | The process routes before completion-owner bootstrap, recovery, tracing initialization, or runtime-service construction; one bounded inspection generation of the default flight-recorder root produces both the raw recent failures and their coalesced groups, with the same retained coverage and reader issues. It does not mutate the held stores. |
 | `diagnostics trace <diagnostic-id> [--json]` runs while State and PID-mailbox SQLite are unavailable. | The process routes through the same offline boundary and reports only retained source records for the diagnostic ID plus coverage/issues; an empty retained trace is not represented as database or delivery success. |
 | A selected State or PID-mailbox control-plane transaction is attempted. | Its top-level resource-scoped span synchronously appends `Requested` before the real `BEGIN IMMEDIATE`, then submits only phases actually observed: `Acquired`, `CommitStarted`, `Committed`, contention/failure, and `Released`. A nested sidecar child submits its `Requested` observation nonblockingly before sidecar authority/open/fence work because the parent database writer is already held. SQLite begin/commit failures retain primary and extended codes plus configured busy timeout and observed wait; recorder failure never changes the transaction result. |
+| A typed SQLite observation is retained. | The event includes a stable query family, database role/path class, transaction mode and phase, observed operation elapsed time, only honestly separable sub-durations/counts, explicit measurement gaps, typed SQLite result codes on failure, and existing diagnostic/invocation correlations. It never contains SQL, expanded SQL, bound values, credentials, or raw database paths. |
+| Root-supervisor continuation acceptance, custody attachment, phase advance, or bounded reconciliation scan meets a retention condition. | The PID-mailbox statement is correlated by hashed attempt/owner/supervisor identity. Autocommit writes report exact rows changed and classify writer wait/execution as inseparable; the read reports execution time and exact rows returned while leaving rows examined unavailable. |
 | Completion registration crosses State and PID-mailbox authority. | State and sidecar use distinct parent/child spans under one diagnostic ID. State `Released` occurs after its commit and before sidecar commit; neither resource commit is represented as delivery, ACK, process exit, or complete cross-store settlement. |
 | Launch admission, provider launch, wake claim, terminal finalization, or wake recovery runs. | The producer attaches a bounded lifecycle phase while retaining the exact resource/effect scope. Wake-recovery sweep and runner-visible terminal handoff are composite orchestration spans and do not synthesize SQLite `Committed` phases. |
 | Legacy completion wake tracing observes a claim token. | The trace preserves a constant `redacted`/`none` presence marker and never formats, hashes, or writes the capability value. |

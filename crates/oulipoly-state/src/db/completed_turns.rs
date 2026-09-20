@@ -2,6 +2,7 @@
 //! ## Declared roles
 //! accessor, validator, orchestration, mapper
 use super::*;
+use crate::diagnostic_recorder::process_recorder;
 use oulipoly_agent_messenger::ReturnedArtifactRef;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -878,6 +879,9 @@ impl StateDb {
         session: &str,
         resolved: Option<&ResolvedResume>,
     ) -> Result<crate::mailbox::ManualWakeCoordination, String> {
+        // Recorder initialization and selection must precede the State writer
+        // reservation; the nested sidecar open uses only deferred handoff.
+        let recorder = process_recorder();
         #[cfg(test)]
         tests::BEFORE_MANUAL_RESERVATION.with_borrow_mut(|hook| {
             if let Some(hook) = hook.take() {
@@ -934,7 +938,9 @@ impl StateDb {
         let authority = crate::mailbox::MailboxAuthorityFence::try_acquire(&path)
             .map_err(|e| format!("manual_resume_authority_unavailable: {e}"))?;
         let mut sidecar =
-            crate::mailbox::MailboxDb::open_existing_for_completion_authority(&authority)?;
+            crate::mailbox::MailboxDb::open_existing_for_completion_authority_deferred(
+                &authority, &recorder,
+            )?;
         sidecar.coordinate_manual_resume_without_wait(session, &retained_claims)
     }
 
@@ -1041,6 +1047,13 @@ impl StateDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic_recorder::{
+        DiagnosticPhase, FlightRecorder, FlightRecorderReader, RecorderConfig,
+        SqliteMeasurementGap, SqliteTransactionPhase, with_test_process_recorder,
+    };
+    use crate::sqlite_observability::{SqliteObservationPolicy, with_test_process_policy};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     thread_local! {
         pub(super) static BEFORE_MANUAL_RESERVATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
@@ -1248,6 +1261,82 @@ mod tests {
         );
         println!(
             "actual competing State admission could not commit inside coordinated release reservation"
+        );
+    }
+
+    #[test]
+    fn manual_coordination_sidecar_open_never_waits_for_blocked_recorder() {
+        let (directory, state, uuid, effects) = fixture();
+        let mailbox = manual_fixture(&state, &effects, &uuid);
+        let recorder_root = directory.path().join("recorder");
+        let recorder = FlightRecorder::open(
+            &recorder_root,
+            RecorderConfig {
+                deferred_queue_capacity: 2,
+                ..RecorderConfig::default()
+            },
+        )
+        .unwrap();
+        let release_writer = recorder.block_writer_for_test().unwrap();
+        let worker_recorder = recorder.clone();
+        let (completed, completion) = mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            let result = with_test_process_recorder(worker_recorder, || {
+                with_test_process_policy(SqliteObservationPolicy::all(), || {
+                    state.coordinate_manual_resume("session")
+                })
+            });
+            completed.send(result).unwrap();
+        });
+
+        let result = completion.recv_timeout(Duration::from_millis(250));
+        release_writer.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "manual-resume coordination waited for recorder progress while holding State"
+        );
+        assert_eq!(
+            result.unwrap().unwrap(),
+            crate::mailbox::ManualWakeCoordination::Released
+        );
+        assert!(
+            mailbox
+                .wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+        recorder.drain_deferred_for_test().unwrap();
+
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let observation = report
+            .events
+            .iter()
+            .find(|record| {
+                record.event.sqlite.as_ref().is_some_and(|sqlite| {
+                    sqlite.query_family == "pid_mailbox.connection.open_completion_authority"
+                })
+            })
+            .expect("manual-resume coordination retained sidecar-open evidence");
+        assert_eq!(observation.event.phase, DiagnosticPhase::Released);
+        assert_eq!(observation.event.parent_span_id, None);
+        let evidence = observation.event.observation.sqlite.as_ref().unwrap();
+        assert_eq!(
+            evidence.transaction_phase,
+            Some(SqliteTransactionPhase::ConnectionOpen)
+        );
+        assert!(evidence.execution_micros.is_some());
+        assert!(
+            evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::WriterAuthorityNotApplicable)
+        );
+        assert!(
+            evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::CommitNotApplicable)
         );
     }
 

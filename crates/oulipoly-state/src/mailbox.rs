@@ -25,9 +25,14 @@ use crate::diagnostic_producer::{
     TransactionAttempt, TransactionPhaseGuard, record_sqlite_failure, record_unacquired_release,
 };
 use crate::diagnostic_recorder::{
-    DiagnosticPhase, DiagnosticSpan, PhaseObservation, SpanStart, process_recorder,
+    DiagnosticPhase, DiagnosticSpan, FlightRecorder, OutcomeCertainty, PhaseObservation, SpanStart,
+    SqliteDatabaseRole, SqliteEventIdentity, SqlitePathClass, SqliteTransactionMode,
+    process_recorder,
 };
 use crate::pid_identity::{self, ProcessIdentity};
+use crate::sqlite_observability::{
+    DeferredObservationTarget, SqliteOperationObserver, connection_open_evidence,
+};
 
 mod completion_continuation;
 mod finalization;
@@ -74,6 +79,91 @@ const PENDING_MAILBOX_TARGET_PREDICATE: &str = "(
     OR (target_kind = 'session' AND target_id = ?1)
     OR (?2 IS NOT NULL AND target_kind = 'chain' AND target_id = ?2)
 )";
+
+enum MailboxConnectionObservation<'a> {
+    Process,
+    Parent(&'a DiagnosticSpan),
+    SelectedRecorder(&'a FlightRecorder),
+}
+
+fn open_observed_mailbox_connection(
+    query_family: &'static str,
+    path_class: SqlitePathClass,
+    transaction_mode: SqliteTransactionMode,
+    observation: MailboxConnectionObservation<'_>,
+    open: impl FnOnce() -> rusqlite::Result<Connection>,
+) -> rusqlite::Result<Connection> {
+    let observer = SqliteOperationObserver::process();
+    match open() {
+        Ok(connection) => {
+            let span = || mailbox_connection_span(query_family, path_class, transaction_mode);
+            let _ = match observation {
+                MailboxConnectionObservation::Process => observer.record_success(
+                    span,
+                    DiagnosticPhase::Released,
+                    OutcomeCertainty::Terminal,
+                    connection_open_evidence,
+                ),
+                MailboxConnectionObservation::Parent(parent) => observer.record_success_deferred(
+                    DeferredObservationTarget::Parent(parent),
+                    span,
+                    DiagnosticPhase::Released,
+                    OutcomeCertainty::Terminal,
+                    connection_open_evidence,
+                ),
+                MailboxConnectionObservation::SelectedRecorder(recorder) => observer
+                    .record_success_deferred(
+                        DeferredObservationTarget::SelectedRecorder(recorder),
+                        span,
+                        DiagnosticPhase::Released,
+                        OutcomeCertainty::Terminal,
+                        connection_open_evidence,
+                    ),
+            };
+            Ok(connection)
+        }
+        Err(error) => {
+            let span = || mailbox_connection_span(query_family, path_class, transaction_mode);
+            let _ = match observation {
+                MailboxConnectionObservation::Process => observer.record_failure(
+                    span,
+                    &error,
+                    OutcomeCertainty::StartedUnknown,
+                    connection_open_evidence,
+                ),
+                MailboxConnectionObservation::Parent(parent) => observer.record_failure_deferred(
+                    DeferredObservationTarget::Parent(parent),
+                    span,
+                    &error,
+                    OutcomeCertainty::StartedUnknown,
+                    connection_open_evidence,
+                ),
+                MailboxConnectionObservation::SelectedRecorder(recorder) => observer
+                    .record_failure_deferred(
+                        DeferredObservationTarget::SelectedRecorder(recorder),
+                        span,
+                        &error,
+                        OutcomeCertainty::StartedUnknown,
+                        connection_open_evidence,
+                    ),
+            };
+            Err(error)
+        }
+    }
+}
+
+fn mailbox_connection_span(
+    query_family: &'static str,
+    path_class: SqlitePathClass,
+    transaction_mode: SqliteTransactionMode,
+) -> SpanStart {
+    SpanStart::new("pid_mailbox_connection_open", "pid_mailbox_sqlite")
+        .with_lifecycle_phase("database_open")
+        .with_sqlite_identity(
+            SqliteEventIdentity::new(SqliteDatabaseRole::PidMailbox, path_class, query_family)
+                .with_transaction_mode(transaction_mode),
+        )
+}
 
 fn commit_instrumented_transaction(
     tx: Transaction<'_>,
@@ -1212,7 +1302,7 @@ impl CompletionAuthorityFence<'_> {
             Ok(()) => {
                 if let Some(phases) = phases.as_deref_mut() {
                     phases.committed();
-                    phases.release();
+                    phases.release_after_owner();
                 }
             }
             Err(error) => {
@@ -1489,8 +1579,14 @@ impl MailboxDb {
 
     pub(crate) fn open_with_authority(authority: &MailboxAuthorityFence) -> Result<Self, String> {
         let path = authority.path();
-        let mut conn = Connection::open(path)
-            .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
+        let mut conn = open_observed_mailbox_connection(
+            "pid_mailbox.connection.open",
+            SqlitePathClass::ManagedFile,
+            SqliteTransactionMode::Autocommit,
+            MailboxConnectionObservation::Process,
+            || Connection::open(path),
+        )
+        .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
         set_wal_mode(&conn)?;
@@ -1505,11 +1601,36 @@ impl MailboxDb {
 
     /// Cross-store initialization has the same schema/identity checks as ordinary
     /// open, but cannot wait on a sidecar writer while State is reserved.
+    #[allow(dead_code)]
     pub(crate) fn open_for_state_authority(
         authority: &MailboxAuthorityFence,
     ) -> Result<Self, String> {
+        Self::open_for_state_authority_observed(authority, None)
+    }
+
+    pub(crate) fn open_for_state_authority_instrumented(
+        authority: &MailboxAuthorityFence,
+        parent: &DiagnosticSpan,
+    ) -> Result<Self, String> {
+        Self::open_for_state_authority_observed(authority, Some(parent))
+    }
+
+    fn open_for_state_authority_observed(
+        authority: &MailboxAuthorityFence,
+        parent: Option<&DiagnosticSpan>,
+    ) -> Result<Self, String> {
         let path = authority.path();
-        let mut conn = Connection::open(path).map_err(|e| e.to_string())?;
+        let mut conn = open_observed_mailbox_connection(
+            "pid_mailbox.connection.open_for_state_authority",
+            SqlitePathClass::ManagedFile,
+            SqliteTransactionMode::Autocommit,
+            parent.map_or(
+                MailboxConnectionObservation::Process,
+                MailboxConnectionObservation::Parent,
+            ),
+            || Connection::open(path),
+        )
+        .map_err(|e| e.to_string())?;
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
         conn.busy_timeout(StdDuration::ZERO)
@@ -1572,8 +1693,14 @@ impl MailboxDb {
         path: &Path,
         snapshot: crate::read_only_snapshot::ReadOnlySnapshot,
     ) -> Result<Self, String> {
-        let conn = Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
+        let conn = open_observed_mailbox_connection(
+            "pid_mailbox.connection.open_snapshot",
+            SqlitePathClass::ReadOnlySnapshot,
+            SqliteTransactionMode::ReadOnly,
+            MailboxConnectionObservation::Process,
+            || Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY),
+        )
+        .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
@@ -1585,9 +1712,45 @@ impl MailboxDb {
     pub(crate) fn open_existing_for_completion_authority(
         authority: &MailboxAuthorityFence,
     ) -> Result<Self, String> {
+        Self::open_existing_for_completion_authority_observed(
+            authority,
+            MailboxConnectionObservation::Process,
+        )
+    }
+
+    pub(crate) fn open_existing_for_completion_authority_instrumented(
+        authority: &MailboxAuthorityFence,
+        parent: &DiagnosticSpan,
+    ) -> Result<Self, String> {
+        Self::open_existing_for_completion_authority_observed(
+            authority,
+            MailboxConnectionObservation::Parent(parent),
+        )
+    }
+
+    pub(crate) fn open_existing_for_completion_authority_deferred(
+        authority: &MailboxAuthorityFence,
+        recorder: &FlightRecorder,
+    ) -> Result<Self, String> {
+        Self::open_existing_for_completion_authority_observed(
+            authority,
+            MailboxConnectionObservation::SelectedRecorder(recorder),
+        )
+    }
+
+    fn open_existing_for_completion_authority_observed(
+        authority: &MailboxAuthorityFence,
+        observation: MailboxConnectionObservation<'_>,
+    ) -> Result<Self, String> {
         let path = authority.path();
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
+        let conn = open_observed_mailbox_connection(
+            "pid_mailbox.connection.open_completion_authority",
+            SqlitePathClass::ManagedFile,
+            SqliteTransactionMode::Autocommit,
+            observation,
+            || Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE),
+        )
+        .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
         conn.busy_timeout(COMPLETION_AUTHORITY_SQLITE_TIMEOUT)
@@ -5621,6 +5784,14 @@ impl SessionAdmissionRepository<'_> {
         validate_optional_session_admission_identity(session_id, "session_id")?;
         let mut start = SpanStart::new("session_admission_enqueue", "pid_mailbox_sqlite")
             .with_lifecycle_phase("launch_admission")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::PidMailbox,
+                    SqlitePathClass::ManagedFile,
+                    "session_admission.enqueue",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            )
             .with_identifier("admission_id", admission_id)
             .with_hashed_correlation("registration_identity", registration_identity)
             .with_identifier("launcher_pid", launcher.os_pid.to_string())
@@ -5705,6 +5876,7 @@ impl SessionAdmissionRepository<'_> {
             if result.is_err() {
                 phases.failed("session_admission_enqueue_failed");
             }
+            phases.release_after_owner();
             result
         })
     }
@@ -5829,6 +6001,14 @@ impl SessionAdmissionRepository<'_> {
         validate_session_admission_identity(claim_token, "claim_token")?;
         let mut start = SpanStart::new("session_admission_try_admit", "pid_mailbox_sqlite")
             .with_lifecycle_phase("launch_admission")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::PidMailbox,
+                    SqlitePathClass::ManagedFile,
+                    "session_admission.try_admit",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            )
             .with_busy_timeout(mailbox_writer_sqlite_timeout());
         if let Some(registration_identity) = requested_registration_identity {
             start = start.with_hashed_correlation("registration_identity", registration_identity);
@@ -5913,6 +6093,7 @@ impl SessionAdmissionRepository<'_> {
             if result.is_err() {
                 phases.failed("session_admission_try_admit_failed");
             }
+            phases.release_after_owner();
             result
         })
     }
@@ -6061,6 +6242,14 @@ impl WakeSessionRepository<'_> {
         let now = now_rfc3339();
         let mut start = SpanStart::new("wake_claim_acquire", "pid_mailbox_sqlite")
             .with_lifecycle_phase("wake_claim")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::PidMailbox,
+                    SqlitePathClass::ManagedFile,
+                    "wake_claim.acquire",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            )
             .with_identifier("session_id", input.session_id)
             .with_hashed_correlation("wake_reason", input.reason)
             .with_identifier("auto_wake_count", input.auto_wake_count.to_string())
@@ -6147,6 +6336,7 @@ impl WakeSessionRepository<'_> {
             if result.is_err() {
                 phases.failed("wake_claim_transaction_failed");
             }
+            phases.release_after_owner();
             result
         })
     }
@@ -12530,8 +12720,121 @@ mod tests {
     use crate::StateDb;
     use crate::diagnostic_recorder::{
         DiagnosticPhase, FlightRecorder, FlightRecorderReader, RecorderConfig,
-        with_test_process_recorder,
+        SqliteTransactionPhase, with_test_process_recorder,
     };
+
+    #[test]
+    fn nested_connection_open_observation_never_waits_for_blocked_recorder() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        Connection::open(&state_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE fixture (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let missing_sidecar = directory.path().join("missing-sidecar.db");
+        let recorder_root = directory.path().join("recorder");
+        let recorder = FlightRecorder::open(
+            &recorder_root,
+            RecorderConfig {
+                deferred_queue_capacity: 2,
+                ..RecorderConfig::default()
+            },
+        )
+        .unwrap();
+        let parent_start = SpanStart::new("held_state_fixture", "state_sqlite")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::State,
+                    SqlitePathClass::ManagedFile,
+                    "fixture.held_state",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Immediate),
+            );
+
+        recorder.with_requested_span(parent_start, |state_span| {
+            let release_writer = recorder.block_writer_for_test().unwrap();
+            std::thread::scope(|scope| {
+                let (completed, completion) = std::sync::mpsc::channel();
+                scope.spawn(move || {
+                    let mut state = Connection::open(&state_path).unwrap();
+                    state.busy_timeout(StdDuration::ZERO).unwrap();
+                    let transaction = state
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .unwrap();
+                    let sidecar_start =
+                        SpanStart::new("nested_sidecar_open_fixture", "pid_mailbox_sqlite")
+                            .with_diagnostic_id(state_span.diagnostic_id().clone())
+                            .with_parent_span_id(state_span.span_id().clone())
+                            .with_sqlite_identity(
+                                SqliteEventIdentity::new(
+                                    SqliteDatabaseRole::PidMailbox,
+                                    SqlitePathClass::ManagedFile,
+                                    "fixture.nested_sidecar",
+                                )
+                                .with_transaction_mode(SqliteTransactionMode::Autocommit),
+                            );
+                    state_span.with_deferred_requested_span(sidecar_start, |sidecar_span| {
+                        let error = open_observed_mailbox_connection(
+                            "fixture.nested_connection_open",
+                            SqlitePathClass::ManagedFile,
+                            SqliteTransactionMode::Autocommit,
+                            MailboxConnectionObservation::Parent(sidecar_span),
+                            || {
+                                Connection::open_with_flags(
+                                    &missing_sidecar,
+                                    OpenFlags::SQLITE_OPEN_READ_WRITE,
+                                )
+                            },
+                        )
+                        .unwrap_err();
+                        assert_eq!(
+                            error.sqlite_error_code(),
+                            Some(rusqlite::ffi::ErrorCode::CannotOpen)
+                        );
+                    });
+                    transaction.commit().unwrap();
+                    completed.send(()).unwrap();
+                });
+
+                let completed_without_recorder = completion
+                    .recv_timeout(StdDuration::from_millis(250))
+                    .is_ok();
+                release_writer.send(()).unwrap();
+                assert!(
+                    completed_without_recorder,
+                    "held State transaction waited for recorder progress"
+                );
+            });
+        });
+        recorder.drain_deferred_for_test().unwrap();
+
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let sidecar_requested = report
+            .events
+            .iter()
+            .find(|record| record.event.operation == "nested_sidecar_open_fixture")
+            .expect("nested sidecar requested evidence");
+        let connection_failure = report
+            .events
+            .iter()
+            .find(|record| record.event.operation == "pid_mailbox_connection_open")
+            .expect("retained connection-open evidence");
+        assert_eq!(connection_failure.event.phase, DiagnosticPhase::Failed);
+        assert_eq!(
+            connection_failure.event.parent_span_id.as_ref(),
+            Some(&sidecar_requested.event.span_id)
+        );
+        assert_eq!(
+            connection_failure
+                .event
+                .observation
+                .sqlite
+                .as_ref()
+                .unwrap()
+                .transaction_phase,
+            Some(SqliteTransactionPhase::ConnectionOpen)
+        );
+    }
 
     #[test]
     fn admission_enqueue_records_requested_before_typed_sidecar_contention() {

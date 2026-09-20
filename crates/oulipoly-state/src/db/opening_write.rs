@@ -27,7 +27,12 @@
 //! State database write/open entry points and current validator repairs.
 
 use super::*;
+use crate::diagnostic_recorder::{
+    DiagnosticPhase, OutcomeCertainty, SpanStart, SqliteDatabaseRole, SqliteEventIdentity,
+    SqlitePathClass, SqliteTransactionMode,
+};
 use crate::migrations;
+use crate::sqlite_observability::{SqliteOperationObserver, connection_open_evidence};
 
 pub struct StateReadConnection<'a> {
     conn: &'a sqlite::Connection,
@@ -273,7 +278,33 @@ impl StateDb {
     }
 
     fn open_state_connection(path: &Path) -> Result<sqlite::Connection, String> {
-        let conn = sqlite::Connection::open(path).map_err(Self::format_state_db_open_error)?;
+        Self::open_state_connection_observed(path, SqliteOperationObserver::process())
+    }
+
+    fn open_state_connection_observed(
+        path: &Path,
+        observer: SqliteOperationObserver,
+    ) -> Result<sqlite::Connection, String> {
+        let conn = match sqlite::Connection::open(path) {
+            Ok(conn) => {
+                let _ = observer.record_success(
+                    || Self::state_connection_open_span(path),
+                    DiagnosticPhase::Released,
+                    OutcomeCertainty::Terminal,
+                    connection_open_evidence,
+                );
+                conn
+            }
+            Err(error) => {
+                let _ = observer.record_failure(
+                    || Self::state_connection_open_span(path),
+                    &error,
+                    OutcomeCertainty::StartedUnknown,
+                    connection_open_evidence,
+                );
+                return Err(Self::format_state_db_open_error(error));
+            }
+        };
         conn.pragma_update(None, "foreign_keys", true)
             .map_err(Self::format_state_db_foreign_keys_error)?;
         migrations::register_connection_primitives(&conn)
@@ -281,6 +312,24 @@ impl StateDb {
         conn.busy_timeout(state_writer_busy_timeout())
             .map_err(|err| format!("Failed to configure state DB busy timeout: {err}"))?;
         Ok(conn)
+    }
+
+    fn state_connection_open_span(path: &Path) -> SpanStart {
+        let path_class = if path == Path::new(":memory:") {
+            SqlitePathClass::Memory
+        } else {
+            SqlitePathClass::ManagedFile
+        };
+        SpanStart::new("state_connection_open", "state_sqlite")
+            .with_lifecycle_phase("database_open")
+            .with_sqlite_identity(
+                SqliteEventIdentity::new(
+                    SqliteDatabaseRole::State,
+                    path_class,
+                    "state.connection.open",
+                )
+                .with_transaction_mode(SqliteTransactionMode::Autocommit),
+            )
     }
 
     fn format_state_db_foreign_keys_error(err: sqlite::Error) -> String {
@@ -939,6 +988,39 @@ impl StateDbRebuildAuthority {
 #[cfg(test)]
 mod state_namespace_tests {
     use super::*;
+
+    #[test]
+    fn retained_state_open_classifies_memory_and_managed_file_paths() {
+        use crate::diagnostic_recorder::{
+            FlightRecorder, FlightRecorderReader, RecorderConfig, with_test_process_recorder,
+        };
+        use crate::sqlite_observability::SqliteObservationPolicy;
+
+        let directory = tempfile::tempdir().unwrap();
+        let recorder_root = directory.path().join("recorder");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+        let file_path = directory.path().join("state.db");
+        with_test_process_recorder(recorder.clone(), || {
+            for path in [Path::new(":memory:"), file_path.as_path()] {
+                let observer = SqliteOperationObserver::with_policy(SqliteObservationPolicy::all());
+                let connection = StateDb::open_state_connection_observed(path, observer).unwrap();
+                drop(connection);
+            }
+        });
+        recorder.drain_deferred_for_test().unwrap();
+
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let path_classes = report
+            .events
+            .iter()
+            .filter(|record| record.event.operation == "state_connection_open")
+            .map(|record| record.event.sqlite.as_ref().unwrap().path_class)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            path_classes,
+            vec![SqlitePathClass::Memory, SqlitePathClass::ManagedFile]
+        );
+    }
 
     #[cfg(unix)]
     #[test]

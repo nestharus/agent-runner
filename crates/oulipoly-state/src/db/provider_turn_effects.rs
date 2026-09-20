@@ -4,6 +4,7 @@ use super::session_lifecycle::{
     acknowledgement_with_fence, validate_acknowledgement_fence, validate_nonempty,
 };
 use super::*;
+use crate::diagnostic_recorder::{FlightRecorder, process_recorder};
 use oulipoly_agent_messenger::ReturnedArtifactRef;
 
 pub struct ProviderTurnEffectInput<'a> {
@@ -63,11 +64,15 @@ impl StateDb {
         let lifecycle_row = self.lifecycle_context_for_row_or_none(input.invocation_row_id);
         let timer = lc_log_adapter::start_timer();
         let finished_at = Self::current_rfc3339_timestamp();
+        // Select or initialize the recorder before State writer authority. Any
+        // nested sidecar-open evidence must only use its deferred handoff.
+        let recorder = process_recorder();
         let transaction_result = self.apply_provider_turn_effects_transaction(
             mutation_authority,
             &input,
             &finished_at,
             settlement,
+            &recorder,
         );
 
         match transaction_result {
@@ -111,6 +116,7 @@ impl StateDb {
         input: &ProviderTurnEffectInput<'_>,
         finished_at: &str,
         settlement: Option<&str>,
+        recorder: &FlightRecorder,
     ) -> Result<(FinalizeInvocationRow, AcknowledgementWrite), String> {
         let tx =
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
@@ -141,6 +147,7 @@ impl StateDb {
             tx,
             &invocation.invocation_uuid,
             input.success,
+            recorder,
             |tx| {
                 super::provider_launch_lifecycle::promote_invocation_effect(
                     &tx,
