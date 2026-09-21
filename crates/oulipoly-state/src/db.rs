@@ -139,6 +139,7 @@ mod provider_session_authority;
 mod provider_session_binding;
 mod provider_turn_effects;
 mod record_timestamps;
+mod retention;
 pub use provider_launch_lifecycle::*;
 pub use record_timestamps::*;
 mod providers;

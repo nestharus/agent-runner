@@ -280,6 +280,20 @@ pub(crate) fn register_connection_primitives(conn: &Connection) -> Result<(), ru
                 ValueRef::Text(bytes) if std::str::from_utf8(bytes).is_ok()
             ))
         },
+    )?;
+    conn.create_scalar_function(
+        "oulipoly_rfc3339_micros",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |context| {
+            let value = context.get::<String>(0)?;
+            Ok(chrono::DateTime::parse_from_rfc3339(&value)
+                .ok()
+                .map(|timestamp| timestamp.timestamp_micros())
+                .filter(|timestamp| *timestamp >= 0))
+        },
     )
 }
 

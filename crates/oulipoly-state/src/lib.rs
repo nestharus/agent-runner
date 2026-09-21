@@ -50,6 +50,7 @@ mod read_only_snapshot;
 pub mod rebuild_recovery;
 pub mod repositories;
 pub mod result_envelope;
+pub mod retention;
 pub mod schema;
 pub mod schema_probe;
 mod snapshot_helper;

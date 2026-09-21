@@ -12,6 +12,7 @@
 - `crates/oulipoly-state/src/db/invocation_schema_repair.rs`
 - `crates/oulipoly-state/src/db/completed_turns.rs`
 - `crates/oulipoly-state/src/db/record_timestamps.rs`
+- `crates/oulipoly-state/src/db/retention.rs`
 - `crates/oulipoly-state/src/db/invocation_timestamp_contract.rs`
 - `crates/oulipoly-state/src/db/opening_migrations.rs`
 - `crates/oulipoly-state/src/db/resume_lookup.rs`
@@ -19,9 +20,11 @@
 - `crates/oulipoly-state/src/db/resume_types.rs`
 - `crates/oulipoly-state/src/db/owned_turn_event.rs`
 - `crates/oulipoly-state/src/lib.rs`
+- `crates/oulipoly-state/src/retention.rs`
 - `crates/oulipoly-state/src/live_history.rs`
 - `crates/oulipoly-state/src/lifecycle_log.rs`
 - `crates/oulipoly-state/src/mailbox.rs`
+- `crates/oulipoly-state/src/mailbox/retention.rs`
 - `crates/oulipoly-state/src/mailbox/schema.rs`
 - `crates/oulipoly-state/src/mailbox/migrations/0022_live_history_barrier.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0023_record_timestamp_contract.sql`
@@ -96,6 +99,10 @@
 | A classifier-accepted versionless full runner has the exact seven-column pre-UUID invocation table. | One transaction establishes the shape-independent v5 baseline and version marker; migrations continue through v26, rebuild rows with stable generated UUIDs and unknown terminal age, then install v27. Reopen preserves the result exactly. |
 | A triggered completion listener is reactivated from retired to pending. | The same transition clears listener eligibility, blocks/clears the parent event, preserves first close, and keeps unknown/anomaly evidence sticky. Later retirement uses its new occurrence and updates the parent from the exact child plus the indexed pending projection. |
 | An operator supplies an evidenced terminal-time correction. | Only an explicit historical State handle may append the immutable audit row and repair terminal/eligibility fields in one transaction; ordinary/live writers are rejected. |
+| A caller requests one retention slice. | The complete per-family policy fixes an inclusive cutoff; indexed selection returns at most `limit + 1`, each selected authority root is revalidated in a short zero-wait transaction, and the outcome returns counts, typed preservation reasons, gaps, and an exact resumable cursor. |
+| A terminal row is active, unresolved, unacknowledged, inherited, recovery-authoritative, legacy-unknown, clock-anomalous, or younger than the horizon. | Retention preserves it with the corresponding reason; age or count pressure cannot override missing authority evidence. |
+| A writer changes authority or creates a related record after retention candidate selection. | Exact status/timestamp/dependency predicates preserve the stale candidate; the new record is never captured by the old snapshot. |
+| Independent retention observation cannot be recorded. | The already-completed bounded operation is not rolled back and returns an explicit observation-delivery gap. |
 
 ## Edge cases
 
@@ -123,6 +130,11 @@
   rewritten/reopened by ordinary replay.
 - Existing mailbox prune/reclaim paths require explicit eligibility. A terminal
   phase with unknown age, unresolved custody, or a clock anomaly is retained.
+- The default horizon is 30 days with an inclusive boundary: equal and older
+  authoritative times may proceed, while a value one microsecond younger is
+  preserved. Resume cursors cannot cross policy/family/cutoff snapshots.
+- Busy live writers return a typed nonblocking outcome without advancing past
+  the blocked candidate. Restarting the same slice is idempotent.
 - Unrecognized nonempty versionless pre-UUID invocation shapes are rejected
   before journal-mode, schema, or version mutation; no partially normalized
   identity is left for the next open.
@@ -174,6 +186,12 @@ table tests, repositories contract.
 - `crates/oulipoly-state/tests/age_62_readonly_schema_probe.rs`
 - `crates/oulipoly-state/tests/age_62_resolver_routing.rs`
 - `crates/oulipoly-state/tests/age371_record_timestamps.rs`
+- `crates/oulipoly-state/src/retention.rs`
+  (policy boundary, fail-closed record/generation facts, cursor and observation contracts)
+- `crates/oulipoly-state/src/db/retention.rs`
+  (bounded restart, stale snapshots, exact boundary, writer contention)
+- `crates/oulipoly-state/src/mailbox/retention.rs`
+  (authority preservation, payload fencing, bounded restart, writer contention)
 - `crates/oulipoly-state/tests/repositories_contract.rs`
 - `crates/oulipoly-state/src/db/tests/resume_resolution_tests_1.rs`
   (exact-chain precedence, provider-scoped native candidate preservation,

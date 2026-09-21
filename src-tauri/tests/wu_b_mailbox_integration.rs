@@ -1437,7 +1437,7 @@ fn completion_trigger_replay_accepts_delivery_bookkeeping_after_receipt() {
 }
 
 #[test]
-fn completion_trigger_replay_accepts_bookkeeping_after_exact_ack_payload_reclamation() {
+fn completion_trigger_replay_preserves_recent_exact_ack_payload_under_count_pressure() {
     let fixture = Fixture::new();
     fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
     let handle = "h-consumed-replay";
@@ -1461,9 +1461,9 @@ fn completion_trigger_replay_accepts_bookkeeping_after_exact_ack_payload_reclama
     assert!(acknowledged[0].acknowledged_at.is_some());
     assert_eq!(acknowledged[0].mailbox_seq, Some(seq));
     assert_eq!(fixture.mailbox_rows(SESSION_A, true)[0].seq, seq);
-    // ACK does not release bytes referenced by retained history. Fill the real
-    // production window with newer terminal notifications, then use its normal
-    // maintenance API; never unlink a payload or delete its referencing rows.
+    // ACK does not release bytes referenced by retained history. Count pressure
+    // is not age evidence: the default maintenance API must preserve this
+    // recent row and payload even after the former keep window is full.
     let newer = (0..TERMINAL_HISTORY_KEEP_ROWS)
         .map(|index| {
             fixture
@@ -1474,17 +1474,19 @@ fn completion_trigger_replay_accepts_bookkeeping_after_exact_ack_payload_reclama
     assert_eq!(fs::read(payload_path).unwrap(), original_bytes);
     db.acknowledge_range(SESSION_B, newer[0], *newer.last().unwrap(), INVOCATION_A)
         .unwrap();
+    drop(db);
+    let mut db = MailboxDb::open_historical(&fixture.sidecar_path()).unwrap();
     db.prune_terminal_history(TERMINAL_HISTORY_KEEP_ROWS)
         .unwrap();
     let original = db.completion_event(handle).unwrap().unwrap();
-    assert!(original.payload_reclaimed_at.is_some());
-    assert!(!payload_path.exists());
-    assert!(fixture.mailbox_rows(SESSION_A, true).is_empty());
+    assert!(original.payload_reclaimed_at.is_none());
+    assert_eq!(fs::read(payload_path).unwrap(), original_bytes);
+    assert_eq!(fixture.mailbox_rows(SESSION_A, true)[0].seq, seq);
     let newer_rows = fixture.mailbox_rows(SESSION_B, true);
     assert_eq!(newer_rows.len(), TERMINAL_HISTORY_KEEP_ROWS);
     assert!(newer_rows.iter().all(|row| row.delivered_at.is_some()));
     let listeners = db.completion_event_listeners(handle).unwrap();
-    assert_eq!(listeners[0].mailbox_seq, None);
+    assert_eq!(listeners[0].mailbox_seq, Some(seq));
     assert_eq!(
         listeners[0].acknowledged_at,
         acknowledged[0].acknowledged_at
@@ -1492,7 +1494,7 @@ fn completion_trigger_replay_accepts_bookkeeping_after_exact_ack_payload_reclama
     assert_eq!(original.payload_sha256, retained.payload_sha256);
     assert_eq!(original.payload_byte_len, retained.payload_byte_len);
     assert_eq!(original.triggered_at, retained.triggered_at);
-    println!("exact ACK retained={retained:?}; genuine history reclamation={original:?}");
+    println!("exact ACK retained={retained:?}; age-gated maintenance preserved={original:?}");
     metadata["delivery"] =
         json!({"attempted": true, "exit_code": 0, "error": null, "lifecycle": "admitted_outcome"});
     metadata["updated_at_unix_ms"] = json!(1788585398898_i64);
@@ -1505,7 +1507,7 @@ fn completion_trigger_replay_accepts_bookkeeping_after_exact_ack_payload_reclama
         assert_eq!(response["status"], "already_triggered");
         assert_eq!(response["pty_deliveries"], json!([]));
         assert_eq!(response["wake"], Value::Null);
-        assert!(fixture.mailbox_rows(SESSION_A, true).is_empty());
+        assert_eq!(fixture.mailbox_rows(SESSION_A, true)[0].seq, seq);
         assert_eq!(fixture.mailbox_rows(SESSION_B, true), newer_rows);
         let replayed = db.completion_event(handle).unwrap().unwrap();
         assert_eq!(replayed.payload_sha256, original.payload_sha256);
@@ -1513,7 +1515,7 @@ fn completion_trigger_replay_accepts_bookkeeping_after_exact_ack_payload_reclama
         assert_eq!(replayed.payload_file_path, original.payload_file_path);
         assert_eq!(replayed.triggered_at, original.triggered_at);
         assert_eq!(db.completion_event_listeners(handle).unwrap(), listeners);
-        println!("post-prune CLI replay: {response}; event={replayed:?}");
+        println!("post-retention CLI replay: {response}; event={replayed:?}");
     }
     fixture.assert_default_user_paths_untouched();
 }

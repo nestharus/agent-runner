@@ -13,9 +13,9 @@ rotation/recovery, checksummed two-slot head, prepared/sealed manifests,
 bounded readers/reconciliation, preservation-mode JSONL, bounded legacy import,
 bounded union reads, and non-destructive maintenance interfaces are implemented in
 `crates/oulipoly-state/src/event_store/` and the diagnostic producer modules.
-Historical scheduling, singleton maintenance jobs, policy approval, and actual
-repair/compaction/quarantine/retirement remain deliberately unimplemented here;
-they compose through AGE-372 and AGE-377.
+AGE-372 now supplies policy approval and exact receipt inputs. Historical
+scheduling, singleton maintenance jobs, and actual
+repair/compaction/quarantine/retirement remain AGE-377 work.
 
 Evidence: [`planning/age-375-event-storage-evaluation/report.md`](../../planning/age-375-event-storage-evaluation/report.md)
 
@@ -414,7 +414,7 @@ Ticket ownership is fixed as follows:
 
 | Ticket | Owns | Does not own |
 |---|---|---|
-| AGE-372 | The 30-day retention policy/engine: per-family policy, preservation of live/unresolved authority, and the decision that supplied eligibility evidence passes or fails. | Event-store layout, worker scheduling, leases, or filesystem deletion. |
+| AGE-372 | The implemented 30-day retention policy/engine: per-family policy, typed preservation of live/unresolved/unknown authority, and an exact generation approval bound to writer/generation and manifest digests. | Event-store layout, worker scheduling, leases, or filesystem deletion. |
 | AGE-376 | Event-store append/read implementation; current-head rotation primitives; generation/head/receipt formats; eligibility metadata; preservation-mode JSONL producer changes; bounded importer/cutover operations and their contracts; and fixtures/interfaces for catalog, repair, rebuild, compaction, and retirement. | Historical job scheduling, singleton maintenance leases, or executing destructive historical maintenance from the root supervisor. |
 | AGE-377 | Opportunistic detached scheduling, durable per-job/per-generation singleton leases, progress/restart, and actual execution of checkpoint, catalog/orphan audit, retention, repair, index rebuild, quarantine, and compaction. | Retention policy decisions or live-head append/rotation. |
 
@@ -458,7 +458,8 @@ Default event retention is 30 days for diagnostic, trace, metric, log, and
 maintenance families. AGE-372 considers an event generation eligible only when
 AGE-376 metadata proves it is closed, has valid prepared and sealed manifests,
 has no hold, is not the selected head, and
-`max(closed_at, max_ingested_at) + 30 days <= cutoff`. AGE-377 additionally
+`max(closed_at, max_ingested_at) <= as_of - 30 days` (inclusive). A proven
+empty generation uses `closed_at`. AGE-377 additionally
 requires absence of writer/reader/maintenance leases before execution. Unknown
 timestamps, incomplete manifests, live leases, corruption, and unclassified
 legacy input fail closed against deletion.

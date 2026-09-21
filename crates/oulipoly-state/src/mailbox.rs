@@ -43,6 +43,7 @@ use crate::sqlite_observability::{
 mod completion_continuation;
 mod finalization;
 mod native_publication;
+mod retention;
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
 mod schema;
@@ -1828,6 +1829,9 @@ impl MailboxDb {
             || Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY),
         )
         .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
+        crate::migrations::register_connection_primitives(&conn).map_err(|err| {
+            format!("Failed to register PID mailbox snapshot SQLite primitives: {err}")
+        })?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
@@ -3671,16 +3675,83 @@ impl MailboxDb {
     ) -> Result<TerminalHistoryRetentionStats, String> {
         self.access_scope
             .authorize(TERMINAL_RETENTION_STATS, None)?;
-        terminal_history_retention_stats_on(&self.conn, TERMINAL_HISTORY_KEEP_ROWS)
+        let policy = crate::retention::RetentionPolicy::default();
+        let cutoff_micros = policy
+            .cutoff_unix_micros(
+                crate::retention::RetentionFamily::Mailbox,
+                Utc::now().timestamp_micros().max(0),
+            )
+            .map_err(|error| error.to_string())?;
+        terminal_history_retention_stats_before(&self.conn, cutoff_micros)
     }
 
     pub fn prune_terminal_history(
         &mut self,
         limit: usize,
     ) -> Result<TerminalHistoryPruneReport, String> {
-        self.prune_terminal_history_with_keep(limit, TERMINAL_HISTORY_KEEP_ROWS)
+        if limit == 0 {
+            return Ok(TerminalHistoryPruneReport::default());
+        }
+        self.access_scope
+            .authorize(TERMINAL_RETENTION_PRUNE, None)?;
+        let sqlite_limit = i64::try_from(limit)
+            .map_err(|_| "Terminal history prune limit does not fit SQLite INTEGER".to_string())?;
+        let previous_busy_timeout: i64 = self
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .map_err(|error| format!("Failed to read mailbox maintenance timeout: {error}"))?;
+        self.conn
+            .busy_timeout(StdDuration::ZERO)
+            .map_err(|error| format!("Failed to make mailbox maintenance nonblocking: {error}"))?;
+        let finalizer_result =
+            finalization::reap_abandoned_finalizers(&mut self.conn, sqlite_limit);
+        self.conn
+            .busy_timeout(StdDuration::from_millis(
+                u64::try_from(previous_busy_timeout).unwrap_or(0),
+            ))
+            .map_err(|error| format!("Failed to restore mailbox maintenance timeout: {error}"))?;
+        finalizer_result?;
+        let policy = crate::retention::RetentionPolicy::default();
+        let as_of_unix_micros = Utc::now().timestamp_micros().max(0);
+        let mut report = TerminalHistoryPruneReport::default();
+        let mailbox = self.run_retention_batch(&crate::retention::RetentionBatchRequest {
+            policy: policy.clone(),
+            family: crate::retention::RetentionFamily::Mailbox,
+            as_of_unix_micros,
+            limit,
+            cursor: None,
+        })?;
+        report.mailbox_rows_deleted = mailbox.records_deleted;
+        let remaining = limit.saturating_sub(report.mailbox_rows_deleted);
+        if remaining > 0 {
+            let attempts = self.run_retention_batch(&crate::retention::RetentionBatchRequest {
+                policy: policy.clone(),
+                family: crate::retention::RetentionFamily::MailboxDeliveryAttempt,
+                as_of_unix_micros,
+                limit: remaining,
+                cursor: None,
+            })?;
+            report.delivery_attempts_deleted = attempts.records_deleted;
+        }
+        let remaining = limit.saturating_sub(
+            report
+                .mailbox_rows_deleted
+                .saturating_add(report.delivery_attempts_deleted),
+        );
+        if remaining > 0 {
+            let payloads = self.run_retention_batch(&crate::retention::RetentionBatchRequest {
+                policy,
+                family: crate::retention::RetentionFamily::CompletionEvent,
+                as_of_unix_micros,
+                limit: remaining,
+                cursor: None,
+            })?;
+            report.payload_files_deleted = payloads.artifacts_retired;
+        }
+        Ok(report)
     }
 
+    #[cfg(test)]
     fn prune_terminal_history_with_keep(
         &mut self,
         limit: usize,
@@ -3831,9 +3902,18 @@ impl MailboxDb {
         truncate_terminal_history_wal(&self.conn, "after VACUUM")
     }
 
+    #[cfg(test)]
     fn reclaim_payload_if_terminal(
         &mut self,
         payload: &RetiredPayload,
+    ) -> Result<PayloadReclaimResult, String> {
+        self.reclaim_payload_if_terminal_before(payload, None)
+    }
+
+    fn reclaim_payload_if_terminal_before(
+        &mut self,
+        payload: &RetiredPayload,
+        cutoff_micros: Option<i64>,
     ) -> Result<PayloadReclaimResult, String> {
         let expected_path = self.payloads().payload_path_for_sha256(&payload.sha256)?;
         if payload.file_path != expected_path {
@@ -3848,6 +3928,7 @@ impl MailboxDb {
         let _payload_fence = PayloadFileFence::acquire(&payload.file_path, &payload.sha256)?;
         if payload_has_live_reference(&self.conn, &payload.sha256)?
             || completion_continuation::retained_payload(&self.conn, &payload.sha256)?
+            || payload_has_policy_retained_reference(&self.conn, &payload.sha256, cutoff_micros)?
         {
             return Ok(PayloadReclaimResult::default());
         }
@@ -3867,10 +3948,37 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to start mailbox payload reclaim transaction: {err}"))?;
         if payload_has_live_reference(&tx, &payload.sha256)?
             || completion_continuation::retained_payload(&tx, &payload.sha256)?
+            || payload_has_policy_retained_reference(&tx, &payload.sha256, cutoff_micros)?
         {
             tx.commit()
                 .map_err(|err| format!("Failed to finish mailbox payload inspection: {err}"))?;
             return Ok(PayloadReclaimResult::default());
+        }
+        tx.commit()
+            .map_err(|err| format!("Failed to finish mailbox payload inspection: {err}"))?;
+        if reclaimed_bytes > 0 {
+            fs::remove_file(&payload.file_path).map_err(|err| {
+                format!(
+                    "Failed to remove terminal mailbox payload {}: {err}",
+                    payload.file_path.display()
+                )
+            })?;
+        }
+        // The content-addressed fence remains held. A crash after unlink and
+        // before this marker is safe: the next bounded pass observes an absent
+        // file and idempotently publishes the marker.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("Failed to record mailbox payload retirement: {err}"))?;
+        if payload_has_live_reference(&tx, &payload.sha256)?
+            || completion_continuation::retained_payload(&tx, &payload.sha256)?
+            || payload_has_policy_retained_reference(&tx, &payload.sha256, cutoff_micros)?
+        {
+            return Err(
+                "payload authority changed while its content-addressed retirement fence was held"
+                    .to_string(),
+            );
         }
         tx.execute(
             "UPDATE completion_event
@@ -3887,19 +3995,33 @@ impl MailboxDb {
         .map_err(|err| format!("Failed to record terminal payload reclamation: {err}"))?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox payload reclamation: {err}"))?;
-        if reclaimed_bytes > 0 {
-            fs::remove_file(&payload.file_path).map_err(|err| {
-                format!(
-                    "Failed to remove terminal mailbox payload {}: {err}",
-                    payload.file_path.display()
-                )
-            })?;
-        }
         Ok(PayloadReclaimResult {
             files_deleted: usize::from(reclaimed_bytes > 0),
             bytes_reclaimed: reclaimed_bytes,
         })
     }
+}
+
+fn payload_has_policy_retained_reference(
+    conn: &Connection,
+    sha256: &str,
+    cutoff_micros: Option<i64>,
+) -> Result<bool, String> {
+    let Some(cutoff_micros) = cutoff_micros else {
+        return Ok(false);
+    };
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM completion_event event
+             WHERE event.payload_sha256=?1
+               AND (event.retention_status!='eligible'
+                    OR event.retention_eligible_at IS NULL
+                    OR oulipoly_rfc3339_micros(event.retention_eligible_at) IS NULL
+                    OR oulipoly_rfc3339_micros(event.retention_eligible_at)>?2))",
+        params![sha256, cutoff_micros],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("Failed to inspect policy-retained payload references: {error}"))
 }
 
 fn payload_has_live_reference(conn: &Connection, sha256: &str) -> Result<bool, String> {
@@ -8109,6 +8231,7 @@ struct DeliveredPayloadCompactionCandidate {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct PrunableTerminalMailboxRow {
     seq: i64,
     payload: Option<RetiredPayload>,
@@ -8122,7 +8245,9 @@ struct RetiredPayload {
 
 #[derive(Debug, Default)]
 struct PayloadReclaimResult {
+    #[cfg_attr(not(test), allow(dead_code))]
     files_deleted: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
     bytes_reclaimed: u64,
 }
 
@@ -8158,6 +8283,122 @@ impl DeliveredPayloadCompactionCandidate {
     }
 }
 
+fn terminal_history_retention_stats_before(
+    conn: &Connection,
+    cutoff_micros: i64,
+) -> Result<TerminalHistoryRetentionStats, String> {
+    let next_second = cutoff_micros
+        .div_euclid(1_000_000)
+        .checked_add(1)
+        .and_then(|seconds| seconds.checked_mul(1_000_000))
+        .ok_or_else(|| "retention cutoff cannot be rounded for indexed statistics".to_string())?;
+    let candidate_upper_bound = crate::retention::format_timestamp_micros(next_second)?;
+    let terminal_mailbox_rows = count_rows(
+        conn,
+        "SELECT COUNT(*) FROM mailbox WHERE delivered_at IS NOT NULL",
+        [],
+        "terminal mailbox rows",
+    )?;
+    let prunable_mailbox_rows = count_rows(
+        conn,
+        "SELECT COUNT(*)
+         FROM mailbox AS candidate
+         WHERE candidate.delivered_at IS NOT NULL
+           AND candidate.retention_status='eligible'
+           AND candidate.retention_eligible_at IS NOT NULL
+           AND candidate.retention_eligible_at<?1
+           AND oulipoly_rfc3339_micros(candidate.retention_eligible_at)<=?2
+           AND candidate.kind=?3
+           AND (candidate.payload_file_path IS NULL OR EXISTS(
+                SELECT 1 FROM completion_event event
+                WHERE event.payload_sha256=candidate.payload_sha256))
+           AND NOT EXISTS(
+                SELECT 1 FROM completion_event_listener listener
+                WHERE listener.mailbox_seq=candidate.seq
+                  AND listener.acknowledged_at IS NULL)
+           AND NOT EXISTS(
+                SELECT 1 FROM mailbox_delivery_attempt_items item
+                JOIN mailbox_delivery_attempts attempt ON attempt.attempt_id=item.attempt_id
+                WHERE item.mailbox_seq=candidate.seq
+                  AND (attempt.resolved_at IS NULL OR EXISTS(
+                      SELECT 1 FROM mailbox_retained_delivery_finalizers finalizer
+                      WHERE finalizer.attempt_id=attempt.attempt_id)))",
+        params![
+            candidate_upper_bound,
+            cutoff_micros,
+            AGENT_BASH_COMPLETE_KIND
+        ],
+        "prunable terminal mailbox rows",
+    )?;
+    let resolved_delivery_attempts = count_rows(
+        conn,
+        "SELECT COUNT(*) FROM mailbox_delivery_attempts WHERE resolved_at IS NOT NULL",
+        [],
+        "resolved mailbox delivery attempts",
+    )?;
+    let prunable_delivery_attempts = count_rows(
+        conn,
+        "SELECT COUNT(*)
+         FROM mailbox_delivery_attempts AS candidate
+         WHERE candidate.resolved_at IS NOT NULL
+           AND candidate.retention_status='eligible'
+           AND candidate.retention_eligible_at IS NOT NULL
+           AND candidate.retention_eligible_at<?1
+           AND oulipoly_rfc3339_micros(candidate.retention_eligible_at)<=?2
+           AND NOT EXISTS(
+                SELECT 1 FROM mailbox_retained_delivery_finalizers finalizer
+                WHERE finalizer.attempt_id=candidate.attempt_id)
+           AND (candidate.evidence_disposition IS NULL
+                OR candidate.evidence_disposition NOT IN ('pending','legacy_pending')
+                OR candidate.evidence_reconciled_at IS NOT NULL)",
+        params![candidate_upper_bound, cutoff_micros],
+        "prunable mailbox delivery attempts",
+    )?;
+    let reclaimable_payload_files = count_rows(
+        conn,
+        &format!(
+            "SELECT COUNT(*) FROM (
+             SELECT DISTINCT event.payload_sha256
+             FROM completion_event event
+             WHERE event.state='triggered'
+               AND event.retention_status='eligible'
+               AND event.retention_eligible_at IS NOT NULL
+               AND event.retention_eligible_at<?1
+               AND oulipoly_rfc3339_micros(event.retention_eligible_at)<=?2
+               AND event.payload_reclaimed_at IS NULL
+               AND event.payload_file_path IS NOT NULL
+               AND event.payload_sha256 IS NOT NULL
+               {}
+               AND NOT EXISTS(SELECT 1 FROM mailbox
+                              WHERE mailbox.payload_sha256=event.payload_sha256)
+               AND NOT EXISTS(
+                    SELECT 1 FROM completion_event shared_event
+                    WHERE shared_event.payload_sha256=event.payload_sha256
+                      AND (shared_event.retention_status!='eligible'
+                           OR shared_event.retention_eligible_at IS NULL
+                           OR oulipoly_rfc3339_micros(shared_event.retention_eligible_at) IS NULL
+                           OR oulipoly_rfc3339_micros(shared_event.retention_eligible_at)>?2))
+               AND NOT EXISTS(
+                    SELECT 1 FROM completion_event shared_event
+                    JOIN completion_event_listener listener
+                      ON listener.event_id=shared_event.event_id
+                    WHERE shared_event.payload_sha256=event.payload_sha256
+                      AND listener.acknowledged_at IS NULL))",
+            continuation_payload_retention_predicate(conn)?
+        ),
+        params![candidate_upper_bound, cutoff_micros],
+        "reclaimable terminal payload files",
+    )?;
+    Ok(TerminalHistoryRetentionStats {
+        terminal_mailbox_rows,
+        prunable_mailbox_rows,
+        resolved_delivery_attempts,
+        prunable_delivery_attempts,
+        reclaimable_payload_files,
+    })
+}
+
+#[cfg(test)]
 fn terminal_history_retention_stats_on(
     conn: &Connection,
     keep: usize,
@@ -8294,6 +8535,7 @@ fn count_rows<P: rusqlite::Params>(
     usize::try_from(count).map_err(|_| format!("{target} count does not fit usize"))
 }
 
+#[cfg(test)]
 fn prunable_delivery_attempt_ids(
     conn: &Connection,
     keep: i64,
@@ -8337,6 +8579,7 @@ fn prunable_delivery_attempt_ids(
         .map_err(|err| format!("Failed to read resolved delivery attempt: {err}"))
 }
 
+#[cfg(test)]
 fn prunable_terminal_mailbox_rows(
     conn: &Connection,
     keep: i64,
@@ -8410,6 +8653,7 @@ fn continuation_payload_retention_predicate(conn: &Connection) -> Result<&'stati
     }
 }
 
+#[cfg(test)]
 fn reclaimable_completion_payloads(
     conn: &Connection,
     limit: i64,
@@ -8455,6 +8699,7 @@ fn reclaimable_completion_payloads(
         .map_err(|err| format!("Failed to read terminal payload: {err}"))
 }
 
+#[cfg(test)]
 fn merge_payload_reclaim_result(
     report: &mut TerminalHistoryPruneReport,
     reclaimed: PayloadReclaimResult,
@@ -11267,6 +11512,8 @@ pub(crate) fn configure_writable_sidecar_connection(conn: &Connection) -> Result
         .map_err(|err| format!("Failed to enable PID mailbox sidecar foreign keys: {err}"))?;
     conn.busy_timeout(mailbox_writer_sqlite_timeout())
         .map_err(|err| format!("Failed to configure PID mailbox writer wait: {err}"))?;
+    crate::migrations::register_connection_primitives(conn)
+        .map_err(|err| format!("Failed to register PID mailbox SQLite primitives: {err}"))?;
     #[cfg(test)]
     install_completion_finalization_vm_counter(conn);
     Ok(())
@@ -13308,6 +13555,41 @@ mod tests {
         );
         assert_eq!(evidence.query_family, "terminal_history.retention_stats");
         assert_eq!(evidence.decision, "blocked");
+    }
+
+    #[test]
+    fn live_history_prune_rejects_before_finalizer_maintenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let _first_finalizer = db.retain_delivery_finalization("first-attempt").unwrap();
+        let _second_finalizer = db.retain_delivery_finalization("second-attempt").unwrap();
+        let ordered_finalizers = |db: &MailboxDb| {
+            let mut statement = db
+                .conn
+                .prepare(
+                    "SELECT token, attempt_id, checked_order
+                     FROM mailbox_delivery_finalizers
+                     ORDER BY checked_order, token",
+                )
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap();
+            rows.collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        let before = ordered_finalizers(&db);
+        assert_eq!(before.len(), 2);
+
+        let error = db.prune_terminal_history(1).unwrap_err();
+
+        assert!(error.contains("live_history_barrier"), "{error}");
+        assert_eq!(ordered_finalizers(&db), before);
     }
 
     #[test]
@@ -18758,7 +19040,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_delivery_does_not_enter_terminal_history_maintenance() {
+    fn ordinary_recent_delivery_does_not_enter_age_based_retention() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let mut seqs = Vec::new();
@@ -18780,7 +19062,7 @@ mod tests {
             db.terminal_history_retention_stats()
                 .unwrap()
                 .prunable_mailbox_rows,
-            2
+            0
         );
     }
 

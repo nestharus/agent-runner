@@ -119,16 +119,17 @@ protected live call graph.
 | `maintenance.terminal_history.retention_stats` | historical/diagnostic | Read-only explicit command; never runs after a live commit. |
 | `maintenance.terminal_history.payload_compaction` | historical/diagnostic | Candidate scan and payload filesystem publication/verification precede each short revalidation/write transaction. |
 | `maintenance.terminal_history.payload_compaction_stats` | historical/diagnostic | Explicit read-only sizing operation on a historical handle. |
-| `maintenance.terminal_history.prune` | historical/diagnostic | Candidate scans and process-liveness observation precede bounded write transactions; payload filesystem reclamation is outside writer ownership. |
+| `maintenance.terminal_history.prune` | historical/diagnostic | Indexed age/eligibility candidate scans precede one short zero-wait revalidation transaction per row; payload reclamation uses its independent content-addressed fence outside writer ownership. |
 | `maintenance.terminal_history.vacuum` | historical/diagnostic | Explicit operation only; requires historical scope and never runs from startup, delivery, recovery, or supervisor coordination. |
 | `maintenance.record_timestamps.state_terminal_repair` | historical/diagnostic | Explicit audited repair only. A live handle is rejected before SQLite; the historical transaction appends the immutable audit row and changes the terminal/eligibility projection atomically. |
 | `maintenance.record_timestamps.sidecar_terminal_repair` | historical/diagnostic | Explicit audited repair only. A live sidecar handle is rejected before SQLite; the historical transaction appends the immutable audit row and changes the terminal/eligibility projection atomically. |
 
 Schema upgrade/repair, manual migration/backfill, full mailbox listing, and
 offline diagnostics remain historical/diagnostic operations outside live
-traces. AGE-372 owns retention policy/engine decisions; AGE-374 provides rotated
-coordination heads; AGE-376 provides event heads and eligibility metadata; and
-AGE-377 owns detached scheduling, singleton leases, and historical execution.
+traces. AGE-372 owns implemented retention policy/bounded coordination
+operations; AGE-376 provides atomic event heads, eligibility metadata, leases,
+and receipt formats; and AGE-377 owns detached scheduling, singleton leases,
+and destructive event-generation execution.
 AGE-373 only removes implicit maintenance and establishes the access boundary
 they must use.
 
