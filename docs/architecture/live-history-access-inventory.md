@@ -124,5 +124,15 @@ protected live call graph.
 
 Schema upgrade/repair, manual migration/backfill, full mailbox listing, and
 offline diagnostics remain historical/diagnostic operations outside live
-traces. AGE-374/AGE-376 own retention policy/worker scheduling; AGE-373 only
-removes implicit maintenance and establishes the access boundary they must use.
+traces. AGE-372 owns retention policy/engine decisions; AGE-374 provides rotated
+coordination heads; AGE-376 provides event heads and eligibility metadata; and
+AGE-377 owns detached scheduling, singleton leases, and historical execution.
+AGE-373 only removes implicit maintenance and establishes the access boundary
+they must use.
+
+AGE-375 selected independent producer-partitioned SQLite/WAL generations for
+non-authoritative diagnostic events. That decision does not reclassify or move
+any table in this inventory: all current State/PID-mailbox live authority and
+bounded cross-boundary records remain in their existing transactional stores.
+See [`event-storage-topology.md`](event-storage-topology.md) for the exact
+move/stay list and the rule that event presence or absence grants no authority.
