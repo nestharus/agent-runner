@@ -11,8 +11,20 @@ initializer, and a production reference in a named source scope. A
 `direct_control` reference is the branch or API call that applies the cap. A
 `configuration_source` reference initializes typed configuration; the checker
 proves that source edge but does not claim whole-program dataflow through the
-configured field. Exhaustion behavior remains a source-review obligation and
-is deliberately not inferred from a symbol name.
+configured field. Same-file references are bound to the nearest lexically
+visible declaration, including function-local and nested-block constants.
+Cross-file references must use a `crate`/`self`/`super` path or a qualified
+`oulipoly_*` workspace-crate path that the checker maps to the declaration's
+source module; bare import resolution is deliberately outside this
+syntax-level checker and is not claimed as whole-program name resolution.
+Normal Rust compilation validates those qualified paths.
+
+The machine-checked truth boundary is declaration coverage, exact initializer,
+lexical or qualified-path reference identity, and script declaration/use
+structure. Classification, protected-resource prose, exhaustion behavior,
+observability, configurability, and rationale remain source-review obligations;
+the validator rejects known placeholders but does not claim to prove prose
+semantics from a symbol or function name.
 
 The workspace `runtime_cap_registry` test verifies both directions over all
 production numeric/`Duration` declarations, independent of their names. Every
@@ -32,9 +44,13 @@ registered.
 Shipped top-level integration scripts are discovered from `scripts/` rather
 than enumerated. Their numeric declarations and raw timeout/sleep forms are
 checked in both directions. Cargo integration-test targets and source modules
-owned by `#[cfg(test)]` declarations are mechanically excluded; compiled fault
-hooks remain registered as `test_only_patience` even though they are inert
-without explicit test environment.
+owned only by test configurations are mechanically excluded. `cfg` expressions
+are evaluated as Boolean production reachability with `test` and the declared
+`test-support` feature disabled and other predicates left unknown, so
+`cfg(any(target_os = "macos", test))` remains production-reachable while
+`cfg(all(unix, test))` does not. Compiled fault hooks remain registered as
+`test_only_patience` when their declaration is production-reachable but their
+behavior is inert without explicit test environment.
 
 Classes have deliberately distinct semantics:
 

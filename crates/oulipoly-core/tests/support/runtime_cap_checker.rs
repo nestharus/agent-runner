@@ -15,6 +15,8 @@ pub struct Site {
 pub struct Declaration {
     pub site: Site,
     pub value_expression: String,
+    lexical_scope: Vec<String>,
+    canonical_path: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -22,6 +24,7 @@ pub struct UseSite {
     pub source: String,
     pub scope: String,
     pub symbol: String,
+    pub declaration: Site,
 }
 
 #[derive(Debug, Default)]
@@ -29,6 +32,21 @@ pub struct RustInventory {
     pub declarations: BTreeMap<Site, Declaration>,
     pub uses: BTreeSet<UseSite>,
     pub raw_cap_literals: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateUse {
+    source: String,
+    scope: String,
+    lexical_scope: Vec<String>,
+    path: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct RawRustInventory {
+    declarations: BTreeMap<Site, Declaration>,
+    candidate_uses: Vec<CandidateUse>,
+    raw_cap_literals: Vec<String>,
 }
 
 pub fn rust_sources(root: &Path) -> Vec<PathBuf> {
@@ -201,7 +219,7 @@ fn collect_module_ownership(
 }
 
 pub fn scan_workspace_rust(root: &Path) -> RustInventory {
-    let mut inventory = RustInventory::default();
+    let mut raw = RawRustInventory::default();
     for path in rust_sources(root) {
         let relative = path
             .strip_prefix(root)
@@ -209,25 +227,26 @@ pub fn scan_workspace_rust(root: &Path) -> RustInventory {
             .to_string_lossy()
             .replace('\\', "/");
         let source = fs::read_to_string(&path).unwrap();
-        let scanned = scan_rust_source(&relative, &source).unwrap_or_else(|error| {
+        let scanned = scan_rust_source_raw(&relative, &source).unwrap_or_else(|error| {
             panic!("failed to parse {relative} while checking runtime caps: {error}")
         });
         for (site, declaration) in scanned.declarations {
             assert!(
-                inventory
-                    .declarations
-                    .insert(site.clone(), declaration)
-                    .is_none(),
+                raw.declarations.insert(site.clone(), declaration).is_none(),
                 "duplicate discovered declaration site: {site:?}"
             );
         }
-        inventory.uses.extend(scanned.uses);
-        inventory.raw_cap_literals.extend(scanned.raw_cap_literals);
+        raw.candidate_uses.extend(scanned.candidate_uses);
+        raw.raw_cap_literals.extend(scanned.raw_cap_literals);
     }
-    inventory
+    resolve_inventory(raw)
 }
 
 pub fn scan_rust_source(relative: &str, source: &str) -> Result<RustInventory, syn::Error> {
+    scan_rust_source_raw(relative, source).map(resolve_inventory)
+}
+
+fn scan_rust_source_raw(relative: &str, source: &str) -> Result<RawRustInventory, syn::Error> {
     let syntax = syn::parse_file(source)?;
     let mut visitor = CapVisitor::new(relative);
     visitor.visit_file(&syntax);
@@ -237,7 +256,8 @@ pub fn scan_rust_source(relative: &str, source: &str) -> Result<RustInventory, s
 struct CapVisitor {
     source: String,
     scopes: Vec<String>,
-    inventory: RustInventory,
+    next_block_id: usize,
+    inventory: RawRustInventory,
 }
 
 impl CapVisitor {
@@ -245,12 +265,34 @@ impl CapVisitor {
         Self {
             source: source.to_string(),
             scopes: vec!["module".to_string()],
-            inventory: RustInventory::default(),
+            next_block_id: 0,
+            inventory: RawRustInventory::default(),
         }
     }
 
     fn scope(&self) -> String {
+        self.scopes
+            .iter()
+            .filter(|scope| !scope.starts_with("block:"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("::")
+    }
+
+    fn declaration_scope(&self) -> String {
         self.scopes.join("::")
+    }
+
+    fn lexical_scope(&self) -> Vec<String> {
+        self.scopes
+            .iter()
+            .filter(|scope| {
+                !scope.starts_with("cfg:")
+                    && !scope.starts_with("const:")
+                    && !scope.starts_with("static:")
+            })
+            .cloned()
+            .collect()
     }
 
     fn with_scope(&mut self, scope: String, visit: impl FnOnce(&mut Self)) {
@@ -265,12 +307,18 @@ impl CapVisitor {
         }
         let site = Site {
             source: self.source.clone(),
-            scope: self.scope(),
+            scope: self.declaration_scope(),
             symbol: symbol.to_string(),
         };
         let declaration = Declaration {
             site: site.clone(),
             value_expression: normalized_tokens(value),
+            lexical_scope: self.lexical_scope(),
+            canonical_path: canonical_declaration_path(
+                &self.source,
+                &self.lexical_scope(),
+                &symbol.to_string(),
+            ),
         };
         assert!(
             self.inventory
@@ -281,16 +329,23 @@ impl CapVisitor {
         );
     }
 
-    fn record_use(&mut self, symbol: &syn::Ident) {
-        let symbol = symbol.to_string();
+    fn record_use_path(&mut self, path: Vec<String>) {
+        let Some(symbol) = path.last().cloned() else {
+            return;
+        };
         if !constant_style_identifier(&symbol) {
             return;
         }
-        self.inventory.uses.insert(UseSite {
+        self.inventory.candidate_uses.push(CandidateUse {
             source: self.source.clone(),
             scope: self.scope(),
-            symbol,
+            lexical_scope: self.lexical_scope(),
+            path,
         });
+    }
+
+    fn record_use(&mut self, symbol: &syn::Ident) {
+        self.record_use_path(vec![symbol.to_string()]);
     }
 
     fn raw(&mut self, detail: impl Into<String>) {
@@ -304,8 +359,13 @@ impl CapVisitor {
 
     fn checks_anonymous_literals(&self) -> bool {
         self.scopes
-            .last()
-            .is_some_and(|scope| scope.starts_with("fn:"))
+            .iter()
+            .rev()
+            .any(|scope| scope.starts_with("fn:"))
+            && !self
+                .scopes
+                .iter()
+                .any(|scope| scope.starts_with("const:") || scope.starts_with("static:"))
     }
 
     fn with_cfg_scope(&mut self, attrs: &[syn::Attribute], visit: impl FnOnce(&mut Self)) {
@@ -314,6 +374,14 @@ impl CapVisitor {
         } else {
             visit(self);
         }
+    }
+
+    fn visit_root_block(&mut self, block: &syn::Block) {
+        let outer_next_block_id = std::mem::replace(&mut self.next_block_id, 0);
+        for statement in &block.stmts {
+            self.visit_stmt(statement);
+        }
+        self.next_block_id = outer_next_block_id;
     }
 }
 
@@ -379,7 +447,7 @@ impl<'ast> Visit<'ast> for CapVisitor {
             return;
         }
         self.with_scope(format!("fn:{}", item.sig.ident), |visitor| {
-            visitor.visit_block(&item.block)
+            visitor.visit_root_block(&item.block)
         });
     }
 
@@ -400,7 +468,7 @@ impl<'ast> Visit<'ast> for CapVisitor {
             return;
         }
         self.with_scope(format!("fn:{}", item.sig.ident), |visitor| {
-            visitor.visit_block(&item.block)
+            visitor.visit_root_block(&item.block)
         });
     }
 
@@ -417,9 +485,14 @@ impl<'ast> Visit<'ast> for CapVisitor {
     }
 
     fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
-        if let Some(segment) = expression.path.segments.last() {
-            self.record_use(&segment.ident);
-        }
+        self.record_use_path(
+            expression
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect(),
+        );
         syn::visit::visit_expr_path(self, expression);
     }
 
@@ -521,6 +594,163 @@ impl<'ast> Visit<'ast> for CapVisitor {
         }
         syn::visit::visit_expr_repeat(self, expression);
     }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        let block_id = self.next_block_id;
+        self.next_block_id += 1;
+        self.with_scope(format!("block:{block_id}"), |visitor| {
+            syn::visit::visit_block(visitor, block)
+        });
+    }
+}
+
+fn resolve_inventory(raw: RawRustInventory) -> RustInventory {
+    let mut uses = BTreeSet::new();
+    for candidate in &raw.candidate_uses {
+        if let Some(declaration) = resolve_candidate_use(candidate, &raw.declarations) {
+            uses.insert(UseSite {
+                source: candidate.source.clone(),
+                scope: candidate.scope.clone(),
+                symbol: candidate.path.last().unwrap().clone(),
+                declaration: declaration.site.clone(),
+            });
+        }
+    }
+    RustInventory {
+        declarations: raw.declarations,
+        uses,
+        raw_cap_literals: raw.raw_cap_literals,
+    }
+}
+
+fn resolve_candidate_use<'a>(
+    candidate: &CandidateUse,
+    declarations: &'a BTreeMap<Site, Declaration>,
+) -> Option<&'a Declaration> {
+    let symbol = candidate.path.last()?;
+    if candidate.path.len() == 1 || candidate.path.first().is_some_and(|part| part == "Self") {
+        let mut lexical = declarations
+            .values()
+            .filter(|declaration| {
+                declaration.site.source == candidate.source
+                    && declaration.site.symbol == *symbol
+                    && lexical_ancestor(&declaration.lexical_scope, &candidate.lexical_scope)
+            })
+            .collect::<Vec<_>>();
+        lexical.sort_by_key(|declaration| declaration.lexical_scope.len());
+        if let Some(nearest) = lexical.pop()
+            && lexical
+                .last()
+                .is_none_or(|other| other.lexical_scope.len() != nearest.lexical_scope.len())
+        {
+            return Some(nearest);
+        }
+    }
+
+    let canonical = canonical_use_path(candidate)?;
+    let mut matches = declarations
+        .values()
+        .filter(|declaration| declaration.canonical_path.as_ref() == Some(&canonical))
+        .collect::<Vec<_>>();
+    (matches.len() == 1).then(|| matches.pop().unwrap())
+}
+
+fn lexical_ancestor(declaration: &[String], use_scope: &[String]) -> bool {
+    declaration.len() <= use_scope.len()
+        && declaration
+            .iter()
+            .zip(use_scope)
+            .all(|(declaration, usage)| declaration == usage)
+}
+
+fn canonical_declaration_path(
+    source: &str,
+    lexical_scope: &[String],
+    symbol: &str,
+) -> Option<Vec<String>> {
+    if lexical_scope
+        .iter()
+        .any(|scope| scope.starts_with("fn:") || scope.starts_with("block:"))
+    {
+        return None;
+    }
+    let mut path = source_module_path(source)?;
+    for scope in lexical_scope {
+        if let Some(module) = scope.strip_prefix("mod:") {
+            path.push(module.to_string());
+        } else if scope.starts_with("impl:") {
+            return None;
+        }
+    }
+    path.push(symbol.to_string());
+    Some(path)
+}
+
+fn canonical_use_path(candidate: &CandidateUse) -> Option<Vec<String>> {
+    if candidate.path.len() < 2 {
+        return None;
+    }
+    let mut module = source_module_path(&candidate.source)?;
+    for scope in &candidate.lexical_scope {
+        if let Some(inline) = scope.strip_prefix("mod:") {
+            module.push(inline.to_string());
+        }
+    }
+    let mut parts = candidate.path.as_slice();
+    match parts.first()?.as_str() {
+        "crate" => {
+            module.truncate(1);
+            parts = &parts[1..];
+        }
+        "self" => parts = &parts[1..],
+        "super" => {
+            while parts.first().is_some_and(|part| part == "super") {
+                if module.len() == 1 {
+                    return None;
+                }
+                module.pop();
+                parts = &parts[1..];
+            }
+        }
+        "Self" => return None,
+        first if first == module.first()? || first.starts_with("oulipoly_") => {
+            module.clear();
+        }
+        _ => return None,
+    }
+    module.extend(parts.iter().cloned());
+    Some(module)
+}
+
+fn source_module_path(source: &str) -> Option<Vec<String>> {
+    let components = Path::new(source)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let (crate_name, source_index) = if components.first().is_some_and(|part| part == "crates") {
+        (
+            components.get(1)?.replace('-', "_"),
+            components.iter().position(|part| part == "src")?,
+        )
+    } else if components.first().is_some_and(|part| part == "src-tauri") {
+        (
+            "agent_runner_lib".to_string(),
+            components.iter().position(|part| part == "src")?,
+        )
+    } else {
+        return None;
+    };
+    let mut module = vec![crate_name];
+    let relative = &components[source_index + 1..];
+    for (index, component) in relative.iter().enumerate() {
+        let last = index + 1 == relative.len();
+        let stem = component.strip_suffix(".rs").unwrap_or(component);
+        if last && matches!(stem, "lib" | "main" | "mod") {
+            continue;
+        }
+        module.push(stem.to_string());
+    }
+    Some(module)
 }
 
 fn visit_token_identifiers(stream: proc_macro2::TokenStream, visit: &mut impl FnMut(syn::Ident)) {
@@ -666,12 +896,78 @@ fn cfg_test(attrs: &[syn::Attribute]) -> bool {
         if !attribute.path().is_ident("cfg") {
             return false;
         }
-        attribute.meta.require_list().is_ok_and(|list| {
-            let tokens = list.tokens.to_string().replace(' ', "");
-            !tokens.starts_with("not(")
-                && (tokens.contains("test") || tokens.contains("feature=\"test-support\""))
-        })
+        attribute
+            .parse_args::<syn::Meta>()
+            .is_ok_and(|meta| production_cfg_value(&meta) == ProductionCfgValue::Never)
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProductionCfgValue {
+    Always,
+    Never,
+    Maybe,
+}
+
+fn production_cfg_value(meta: &syn::Meta) -> ProductionCfgValue {
+    match meta {
+        syn::Meta::Path(path) if path.is_ident("test") => ProductionCfgValue::Never,
+        syn::Meta::Path(_) => ProductionCfgValue::Maybe,
+        syn::Meta::NameValue(value) if test_support_feature(value) => ProductionCfgValue::Never,
+        syn::Meta::NameValue(_) => ProductionCfgValue::Maybe,
+        syn::Meta::List(list) => {
+            let Ok(nested) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return ProductionCfgValue::Maybe;
+            };
+            let values = nested.iter().map(production_cfg_value).collect::<Vec<_>>();
+            if list.path.is_ident("all") {
+                if values.contains(&ProductionCfgValue::Never) {
+                    ProductionCfgValue::Never
+                } else if values
+                    .iter()
+                    .all(|value| *value == ProductionCfgValue::Always)
+                {
+                    ProductionCfgValue::Always
+                } else {
+                    ProductionCfgValue::Maybe
+                }
+            } else if list.path.is_ident("any") {
+                if values.contains(&ProductionCfgValue::Always) {
+                    ProductionCfgValue::Always
+                } else if values
+                    .iter()
+                    .all(|value| *value == ProductionCfgValue::Never)
+                {
+                    ProductionCfgValue::Never
+                } else {
+                    ProductionCfgValue::Maybe
+                }
+            } else if list.path.is_ident("not") && values.len() == 1 {
+                match values[0] {
+                    ProductionCfgValue::Always => ProductionCfgValue::Never,
+                    ProductionCfgValue::Never => ProductionCfgValue::Always,
+                    ProductionCfgValue::Maybe => ProductionCfgValue::Maybe,
+                }
+            } else {
+                ProductionCfgValue::Maybe
+            }
+        }
+    }
+}
+
+fn test_support_feature(value: &syn::MetaNameValue) -> bool {
+    if !value.path.is_ident("feature") {
+        return false;
+    }
+    matches!(
+        &value.value,
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(feature),
+            ..
+        }) if feature.value() == "test-support"
+    )
 }
 
 fn cfg_scope(attrs: &[syn::Attribute]) -> Option<String> {

@@ -6,8 +6,6 @@
 
 use oulipoly_core::AutoWakeEnvironmentVariable;
 
-use super::constants::DEFAULT_AUTO_WAKE_RETRY_BASE_MS;
-
 pub(super) struct AutoWakeEnv {
     pub(super) token: String,
     /// Chronology and cadence input, never an eligibility or exhaustion budget.
@@ -61,7 +59,7 @@ pub(super) fn current_auto_wake() -> Option<AutoWakeEnv> {
             .ok()
             .and_then(|value| value.parse().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_AUTO_WAKE_RETRY_BASE_MS);
+            .unwrap_or(super::constants::DEFAULT_AUTO_WAKE_RETRY_BASE_MS);
     Some(AutoWakeEnv {
         token,
         chronological_attempt_count,

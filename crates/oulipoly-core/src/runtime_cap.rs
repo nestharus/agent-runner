@@ -4,8 +4,9 @@
 //! The registry is data, not control flow: call sites retain domain-specific
 //! behavior while their stable ownership and classification remain queryable.
 //! `runtime_cap_registry` tests bind each entry to its source declaration,
-//! initializer, and a named production use scope. Every other numeric
-//! declaration must carry an explicit, source-bound non-cap exclusion.
+//! initializer, and a lexically or explicitly qualified production reference
+//! in the named use scope. Every other numeric declaration must carry an
+//! explicit, source-bound non-cap exclusion.
 
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;

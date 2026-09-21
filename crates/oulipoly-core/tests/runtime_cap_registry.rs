@@ -67,6 +67,7 @@ fn use_site(cap: &RuntimeCap) -> UseSite {
         source: cap.controlling_use.source.clone(),
         scope: cap.controlling_use.scope.clone(),
         symbol: cap.symbol.clone(),
+        declaration: cap_site(cap),
     }
 }
 
@@ -319,6 +320,89 @@ fn checker_excludes_only_sources_proven_test_only_by_module_ownership() {
     assert!(!test_only.contains(&lib));
     assert!(!test_only.contains(&shared));
     assert!(test_only.contains(&only_test));
+}
+
+#[test]
+fn checker_binds_same_named_local_constants_to_their_lexical_declarations() {
+    let root = workspace().join("crates/oulipoly-core/tests/fixtures/runtime_cap_checker");
+    let source = fs::read_to_string(root.join("lexical_collision.rs")).unwrap();
+    let scanned = checker::scan_rust_source("fixture/lexical_collision.rs", &source).unwrap();
+
+    let first = Site {
+        source: "fixture/lexical_collision.rs".into(),
+        scope: "module::fn:first_wait".into(),
+        symbol: "RETRY_INTERVAL".into(),
+    };
+    let second = Site {
+        source: "fixture/lexical_collision.rs".into(),
+        scope: "module::fn:second_wait".into(),
+        symbol: "RETRY_INTERVAL".into(),
+    };
+    assert!(scanned.declarations.contains_key(&first));
+    assert!(scanned.declarations.contains_key(&second));
+    assert!(scanned.uses.contains(&UseSite {
+        source: first.source.clone(),
+        scope: first.scope.clone(),
+        symbol: first.symbol.clone(),
+        declaration: first.clone(),
+    }));
+    assert!(scanned.uses.contains(&UseSite {
+        source: second.source.clone(),
+        scope: second.scope.clone(),
+        symbol: second.symbol.clone(),
+        declaration: second.clone(),
+    }));
+    assert!(!scanned.uses.contains(&UseSite {
+        source: second.source.clone(),
+        scope: second.scope.clone(),
+        symbol: second.symbol.clone(),
+        declaration: first,
+    }));
+
+    let nested_outer = Site {
+        source: "fixture/lexical_collision.rs".into(),
+        scope: "module::fn:nested_wait".into(),
+        symbol: "RETRY_INTERVAL".into(),
+    };
+    let nested_inner = scanned
+        .declarations
+        .keys()
+        .find(|site| {
+            site.symbol == "RETRY_INTERVAL"
+                && site.scope.starts_with("module::fn:nested_wait::block:")
+        })
+        .unwrap()
+        .clone();
+    let nested_uses = scanned
+        .uses
+        .iter()
+        .filter(|usage| usage.scope == "module::fn:nested_wait")
+        .map(|usage| usage.declaration.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(nested_uses, BTreeSet::from([nested_outer, nested_inner]));
+}
+
+#[test]
+fn checker_evaluates_test_cfg_as_boolean_production_reachability() {
+    let root = workspace().join("crates/oulipoly-core/tests/fixtures/runtime_cap_checker");
+    let source = fs::read_to_string(root.join("cfg_semantics.rs")).unwrap();
+    let scanned = checker::scan_rust_source("fixture/cfg_semantics.rs", &source).unwrap();
+    let symbols = scanned
+        .declarations
+        .keys()
+        .map(|site| site.symbol.as_str())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        symbols,
+        BTreeSet::from(["EXPLICIT_PRODUCTION_CFG", "MIXED_PRODUCTION_CFG"])
+    );
+    assert!(
+        scanned
+            .uses
+            .iter()
+            .any(|usage| usage.symbol == "MIXED_PRODUCTION_CFG")
+    );
 }
 
 #[test]

@@ -15,10 +15,6 @@ use std::time::Duration;
 
 use crate::mailbox_delivery::PtyMailboxDeliveryDiagnostic;
 use crate::wake_coordinator::auto_wake_env::is_auto_wake_invocation;
-use crate::wake_coordinator::constants::{
-    LIVE_PTY_RETRY_INTERVAL_SECONDS, WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
-};
-
 pub(crate) struct LivePtyRetryDriverGuard {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -60,7 +56,9 @@ pub(crate) fn start_live_pty_retry_driver_for_owner() -> Option<LivePtyRetryDriv
 fn live_pty_retry_loop(stop: Arc<AtomicBool>) {
     retry_pending_live_pty_deliveries_or_warn("live_pty_retry_start");
     loop {
-        std::thread::park_timeout(Duration::from_secs(LIVE_PTY_RETRY_INTERVAL_SECONDS));
+        std::thread::park_timeout(Duration::from_secs(
+            crate::wake_coordinator::constants::LIVE_PTY_RETRY_INTERVAL_SECONDS,
+        ));
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -86,8 +84,9 @@ pub(super) fn retry_pending_live_pty_deliveries(
     trigger: &str,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), String> {
-    let evidence_sessions =
-        db.pending_delivery_evidence_obligation_session_ids(WAKE_RECLAIM_SWEEP_SCAN_LIMIT)?;
+    let evidence_sessions = db.pending_delivery_evidence_obligation_session_ids(
+        crate::wake_coordinator::constants::WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
+    )?;
     for session_id in evidence_sessions {
         if is_cancelled() {
             return Ok(());
@@ -102,9 +101,9 @@ pub(super) fn retry_pending_live_pty_deliveries(
             );
         }
     }
-    let session_ids = db
-        .wake_sessions()
-        .pending_delivery_session_ids(WAKE_RECLAIM_SWEEP_SCAN_LIMIT)?;
+    let session_ids = db.wake_sessions().pending_delivery_session_ids(
+        crate::wake_coordinator::constants::WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
+    )?;
     for session_id in session_ids {
         if is_cancelled() {
             return Ok(());
