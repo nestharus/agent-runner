@@ -53,9 +53,10 @@ It does not schedule retention or introduce an age-based deletion worker.
 | Diagnostic cleanup status | `started_at` | bounded cleanup generation | `completed_at` | A completed status snapshot uses its completion as eligibility time. Missing/invalid shard mtime is unknown and retained; aggregate pressure never substitutes for proven age. Shard mtime is operational input, not record authority. |
 
 Every SQL family above has a partial eligibility index where candidate discovery
-is currently meaningful. Existing terminal-history prune/reclaim paths require
-eligibility but remain count based; AGE-374/AGE-376 own age policy and worker
-scheduling.
+is currently meaningful. AGE-372's bounded retention operations require these
+projections and apply the inclusive default 30-day cutoff; count pressure is no
+longer deletion evidence. AGE-377 owns detached scheduling and event-generation
+execution. See [`retention-engine.md`](retention-engine.md).
 
 The invocation contract has one idempotent installer shared by numbered v27,
 fresh/current initialization, current drift repair, and the supported current

@@ -14,6 +14,7 @@
 - `crates/oulipoly-state/src/diagnostic_producer.rs`
 - `crates/oulipoly-state/src/diagnostic_recorder.rs`
 - `crates/oulipoly-state/src/lifecycle_log.rs`
+- `crates/oulipoly-state/src/retention.rs`
 - `crates/oulipoly-state/src/lib.rs`
 - `runtime-caps.json`
 - `runtime-cap-exclusions.json`
@@ -27,6 +28,7 @@
 - `tools/event-storage-evaluation/src/framed.rs`
 - `tools/event-storage-evaluation/src/lsm.rs`
 - `docs/architecture/event-storage-topology.md`
+- `docs/architecture/retention-engine.md`
 - `docs/architecture/live-history-access-inventory.md`
 - `planning/age-375-event-storage-evaluation/report.md`
 - `planning/age-375-event-storage-evaluation/results/batch-1.json`
@@ -57,6 +59,9 @@
 | Current head reaches the day/size/lifecycle rotation boundary. | Writer syncs and validates the prepared successor manifest/database, renames the complete staging directory, drains already-ticketed batches, closes the old generation, and publishes the successor through the inactive two-slot head record. It does not scan, checkpoint, compact, or retain old history synchronously. |
 | Detached catalog is absent/stale. | Reader uses bounded manifest fallback or returns incomplete coverage; it never fabricates an empty complete result. |
 | Closed event partition passes the 30-day cutoff. | AGE-372 approves policy eligibility from AGE-376 prepared/sealed metadata; only an AGE-377 detached leased worker may checkpoint and atomically rename the complete generation directory to pending trash, publish a receipt, and unlink it. |
+| Closed event partition lacks an exact age, row count/watermark, validated manifest, non-head identity, hold/corruption clearance, or classified legacy provenance. | AGE-372 returns typed preservation evidence and does not produce a retirement approval. |
+| AGE-372 approves a closed event partition. | The approval and derived AGE-376 receipt bind the exact writer/generation IDs, prepared/sealed manifest digests, policy version, and cutoff; they grant no move/delete authority without AGE-377's exclusive lease and head revalidation. |
+| A preservation-mode rotated source is considered for retirement. | AGE-372 uses the later of authoritative close, maximum occurrence, and validated import-completion time; active, leased, held, corrupt, torn/unsupported, unimported, recovery-authoritative, or unknown-age sources are preserved. |
 | Event storage is unavailable. | Live coordination proceeds unchanged; the bounded emergency JSONL recorder records a gap/fallback when possible under preservation mode. |
 | JSONL shadow/fallback compatibility is enabled. | A durable preservation marker precedes shadowing. Activation and recorder open serialize marker selection plus active-shard creation/lease under one retention lock, and every legacy destructive rotation rechecks the marker under that lock. Present/unreadable state selects uniquely named create-once rotation without enumeration, truncation, overwrite, or deletion; import/retirement remain detached. |
 | Partition and exact preserved-source results overlap during cutover. | The bounded read-only union validates envelopes and source/checkpoint/receipt identity, deduplicates equal event IDs/digests, refuses conflicts, preserves both origins, and returns explicit incomplete source/limit coverage without discovery, import, or scheduling. |
@@ -85,6 +90,9 @@
 - A generation moved to deterministic pending trash without a receipt is
   `retirement_in_progress`; a valid receipt is `retired`; conflicting states
   are incomplete/corrupt, not authoritative absence.
+- A generation exactly 30 days old is policy-eligible; one microsecond younger
+  is preserved. A mixed generation uses the longest configured event-family
+  horizon.
 - Legacy four-shard/seven-day cleanup is disabled before shadowing so an
   importer source cannot disappear before its receipt and 30-day eligibility.
 - Legacy synthetic root/sequence/identity values carry explicit provenance and
@@ -160,6 +168,12 @@ and non-destructive
 bounded union reads, catalog/rebuild/eligibility interfaces. AGE-377 tests actual detached catalog
 rebuild, repair, compaction, and retirement execution under singleton leases
 using those fixtures/interfaces.
+
+`crates/oulipoly-state/src/retention.rs` additionally proves the inclusive
+30-day boundary, every fail-closed generation prerequisite, exact
+target/digest approval, and reuse of the create-once retirement-receipt
+contract. `event_store::generation` tests prove shared reader/writer leases
+exclude maintenance and receipt publication is idempotent/create-once.
 
 ## Cross-references
 
