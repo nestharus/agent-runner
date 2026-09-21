@@ -85,13 +85,16 @@ overlay trace, and opt-in TUI-profile JSON are not selected for automated
 not authoritative age evidence. Selecting any of them later requires a new
 family contract and migration; until then unknown artifacts are not age-reaped.
 
-AGE-375 separately selects producer-partitioned SQLite/WAL generations as the
-future primary store for non-authoritative diagnostic, trace, metric, log, and
-maintenance events. That topology preserves every State/PID-mailbox authority
-family above in its existing transactional store; event presence or absence
-grants no authority. Until AGE-376 implements and verifies the cutover, the
-schema-v2 JSONL diagnostic and lifecycle records in this contract remain the
-current sink and future emergency fallback. See
+AGE-375 selects, and AGE-376 implements, producer-partitioned SQLite/WAL
+generations as the primary store for non-authoritative diagnostic, trace,
+metric, log, and maintenance events. That topology preserves every
+State/PID-mailbox authority family above in its existing transactional store;
+event presence or absence grants no authority. AGE-376 lifecycle envelope
+normalization parses this contract's `recorded_at` as event occurrence time,
+validates the identical eligibility projection, and does not copy record-level
+retention fields into the event payload. Generation metadata is the separate
+event-store retention evidence. Schema-v2 JSONL diagnostic and lifecycle
+records remain the preservation/shadow/fallback format. See
 [`event-storage-topology.md`](event-storage-topology.md) for generation
 ownership, timestamp columns, and retention scheduling boundaries.
 

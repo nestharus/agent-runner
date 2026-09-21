@@ -485,6 +485,48 @@
       "reason": "Serialized-format version identifier compared for compatibility; it is neither a migration range bound nor a runtime budget."
     },
     {
+      "source": "crates/oulipoly-state/src/diagnostic_recorder.rs",
+      "declaration_scope": "module",
+      "symbol": "PRESERVE_LEGACY_MARKER_BYTES",
+      "value_expression": "b\"PRESERVE-LEGACY-V1\\n\"",
+      "reason": "Exact durable compatibility-protocol marker bytes; the embedded version identifies a format and does not bound work, storage, waiting, or retries."
+    },
+    {
+      "source": "crates/oulipoly-state/src/event_store/generation.rs",
+      "declaration_scope": "module",
+      "symbol": "EVENT_STORE_FORMAT_VERSION",
+      "value_expression": "1",
+      "reason": "Serialized generation/head/manifest format identifier compared for compatibility; it is neither a migration range bound nor a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-state/src/event_store/importer.rs",
+      "declaration_scope": "module::fn:hex",
+      "symbol": "HEX",
+      "value_expression": "b\"0123456789abcdef\"",
+      "reason": "Hexadecimal encoding alphabet used for deterministic text representation; its digits are protocol symbols and do not bound runtime work."
+    },
+    {
+      "source": "crates/oulipoly-state/src/event_store/maintenance.rs",
+      "declaration_scope": "module",
+      "symbol": "CATALOG_FORMAT_VERSION",
+      "value_expression": "1",
+      "reason": "Serialized derived-catalog control-record format identifier compared for compatibility; it does not bound work, storage, waiting, or retries."
+    },
+    {
+      "source": "crates/oulipoly-state/src/event_store/mod.rs",
+      "declaration_scope": "module",
+      "symbol": "EVENT_SCHEMA_VERSION",
+      "value_expression": "1",
+      "reason": "Serialized event-envelope and SQLite schema version identifier compared for compatibility; it is neither a migration range bound nor a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-state/src/lifecycle_log.rs",
+      "declaration_scope": "module::fn:encode_hex",
+      "symbol": "HEX",
+      "value_expression": "b\"0123456789abcdef\"",
+      "reason": "Hexadecimal encoding alphabet used for deterministic path fingerprints; its digits are protocol symbols and do not bound runtime work."
+    },
+    {
       "source": "crates/oulipoly-state/src/mailbox.rs",
       "declaration_scope": "module",
       "symbol": "COMPACTED_PAYLOAD_SCHEMA_VERSION",

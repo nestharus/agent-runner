@@ -122,12 +122,12 @@ impl Visit for LifecycleRecordVisitor {
 
 fn parse_lifecycle_record(raw: &str) -> Value {
     match serde_json::from_str::<Value>(raw) {
-        Ok(Value::String(inner)) => serde_json::from_str(&inner).unwrap(),
+        Ok(Value::String(inner)) => serde_json::from_str(&inner).unwrap_or(Value::String(inner)),
         Ok(value) => value,
-        Err(_) => {
-            let unescaped: String = serde_json::from_str(raw).unwrap();
-            serde_json::from_str(&unescaped).unwrap()
-        }
+        Err(_) => serde_json::from_str::<String>(raw)
+            .ok()
+            .map(|unescaped| serde_json::from_str(&unescaped).unwrap_or(Value::String(unescaped)))
+            .unwrap_or_else(|| Value::String(raw.to_string())),
     }
 }
 
@@ -815,7 +815,7 @@ fn memory_lifecycle_records_do_not_construct_raw_io_paths() {
 }
 
 #[test]
-fn lifecycle_method_sink_forward_invoked_with_same_record() {
+fn lifecycle_method_preserves_legacy_callback_and_traces_only_normalized_records() {
     let (sink_records, traces) = with_trace_capture(|_| {
         let (_dir, _db_path, db, sink) = fixture_db_with_capture();
         let ok_uuid = "12900000-0000-4000-8000-000000000701";
@@ -884,13 +884,71 @@ fn lifecycle_method_sink_forward_invoked_with_same_record() {
         "test must capture lifecycle sink records"
     );
 
-    let trace_records = traces
-        .iter()
-        .map(|trace| trace.lifecycle_record.clone())
-        .collect::<Vec<_>>();
     assert_eq!(
-        sink_records, trace_records,
-        "tracing and sink must receive JSON-equal lifecycle records in emission order"
+        sink_records.len(),
+        traces.len(),
+        "every compatible legacy callback record must have one normalized trace"
+    );
+    for (legacy, trace) in sink_records.iter().zip(&traces) {
+        let normalized = &trace.lifecycle_record;
+        for field in ["event_name", "invocation_uuid", "operation_result"] {
+            assert_eq!(
+                normalized[field], legacy[field],
+                "safe typed identity/result fields stay aligned across fanout: {legacy:#?} {normalized:#?}"
+            );
+        }
+        assert!(normalized.get("session_id").is_none(), "{normalized:#?}");
+        assert!(
+            normalized.get("raw_artifact_paths").is_none(),
+            "{normalized:#?}"
+        );
+        assert!(
+            normalized.get("resume_input_id").is_none(),
+            "{normalized:#?}"
+        );
+
+        if let Some(raw_session) = legacy.get("session_id").and_then(Value::as_str) {
+            let correlation = normalized["session_correlation_sha256"]
+                .as_str()
+                .expect("raw sessions become typed hashed correlations");
+            assert!(correlation.starts_with("sha256:"));
+            assert_ne!(correlation, raw_session);
+            assert!(
+                !serde_json::to_string(normalized)
+                    .unwrap()
+                    .contains(raw_session)
+            );
+        }
+        if let Some(paths) = legacy.get("raw_artifact_paths").and_then(Value::as_object) {
+            assert!(normalized["artifact_roles"].is_array(), "{normalized:#?}");
+            assert!(
+                normalized["artifact_path_fingerprints"].is_object(),
+                "{normalized:#?}"
+            );
+            let encoded = serde_json::to_string(normalized).unwrap();
+            for raw_path in paths.values().filter_map(Value::as_str) {
+                assert!(!encoded.contains(raw_path), "{normalized:#?}");
+            }
+        }
+        if legacy.get("resume_input_id").is_some() {
+            assert!(
+                normalized["resume_input_present"].is_boolean(),
+                "{normalized:#?}"
+            );
+        }
+    }
+
+    assert!(
+        sink_records
+            .iter()
+            .any(|record| record["session_id"] == "session-ok"),
+        "the external legacy callback contract still receives the raw session field"
+    );
+    assert!(
+        sink_records
+            .iter()
+            .any(|record| record["raw_artifact_paths"].is_object()),
+        "the external legacy callback contract still receives raw artifact paths"
     );
 }
 
@@ -1182,10 +1240,14 @@ fn finalize_failed_when_context_lookup_fails_emits_record_with_null_row_id() {
     let finalize_failed_traces = trace_events_by_name(&traces, "invocation.finalize_failed");
     assert_eq!(
         finalize_failed_traces.len(),
-        1,
-        "tracing must receive the same missing-row finalize_failed record"
+        0,
+        "an unresolved non-UUID identity must not be presented as a typed invocation correlation"
     );
-    assert_eq!(finalize_failed_traces[0].target, TARGET);
-    assert_eq!(finalize_failed_traces[0].level, "warn");
-    assert_eq!(finalize_failed_traces[0].lifecycle_record, *record);
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].target, TARGET);
+    assert_eq!(traces[0].level, "warn");
+    assert_eq!(
+        traces[0].lifecycle_record,
+        Value::String("normalization_failed".to_string())
+    );
 }
