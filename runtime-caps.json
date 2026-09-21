@@ -4809,6 +4809,44 @@
       }
     },
     {
+      "id": "state.diagnostic-recorder.max-preservation-source-bytes",
+      "owner": "state/diagnostic_recorder",
+      "class": "resource_guard",
+      "protected_resource": "bytes hashed from one legacy JSONL source during offline preservation activation",
+      "exhaustion_behavior": "Activation returns preservation_source_byte_limit_reached and publishes neither the preservation manifest nor marker.",
+      "observability": "The explicit activator returns the exact oversized-source error to its detached/offline caller.",
+      "configurability": "Fixed source declaration MAX_PRESERVATION_SOURCE_BYTES; no runtime override exists.",
+      "rationale": "Preservation activation remains bounded while oversized sources fail closed against cutover or deletion.",
+      "default_value": "64 * 1024 * 1024",
+      "source": "crates/oulipoly-state/src/diagnostic_recorder.rs",
+      "symbol": "MAX_PRESERVATION_SOURCE_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/diagnostic_recorder.rs",
+        "scope": "module::fn:activate_legacy_preservation",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.diagnostic-recorder.max-preservation-sources",
+      "owner": "state/diagnostic_recorder",
+      "class": "resource_guard",
+      "protected_resource": "raw directory entries inspected by one offline legacy-preservation activation",
+      "exhaustion_behavior": "Activation returns preservation_directory_limit_reached and publishes neither the preservation manifest nor marker.",
+      "observability": "The explicit activator returns the exact incomplete-discovery error to its detached/offline caller.",
+      "configurability": "Fixed source declaration MAX_PRESERVATION_SOURCES; no runtime override exists.",
+      "rationale": "The offline activator must bound hostile directory traversal without ever publishing a partial preservation baseline.",
+      "default_value": "1_024",
+      "source": "crates/oulipoly-state/src/diagnostic_recorder.rs",
+      "symbol": "MAX_PRESERVATION_SOURCES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/diagnostic_recorder.rs",
+        "scope": "module::fn:activate_legacy_preservation",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "state.diagnostic-recorder.max-read-record-bytes",
       "owner": "state/diagnostic_recorder",
       "class": "resource_guard",
@@ -4866,6 +4904,25 @@
       }
     },
     {
+      "id": "state.diagnostic-recorder.preservation-hash-buffer-bytes",
+      "owner": "state/diagnostic_recorder",
+      "class": "resource_guard",
+      "protected_resource": "stack scratch space used to hash a preserved legacy JSONL source",
+      "exhaustion_behavior": "A full chunk is hashed and reading continues until the already-bounded source length is consumed.",
+      "observability": "No degraded action occurs on a full chunk; source read failures are returned by the explicit activator.",
+      "configurability": "Fixed source declaration PRESERVATION_HASH_BUFFER_BYTES; no runtime override exists.",
+      "rationale": "Streaming hashing bounds scratch memory independently of source length.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-state/src/diagnostic_recorder.rs",
+      "symbol": "PRESERVATION_HASH_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/diagnostic_recorder.rs",
+        "scope": "module::fn:activate_legacy_preservation",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "state.diagnostic-recorder.safe-correlation-key-max-chars",
       "owner": "state/diagnostic_recorder",
       "class": "resource_guard",
@@ -4885,6 +4942,386 @@
       }
     },
     {
+      "id": "state.event-envelope.kind-bytes",
+      "owner": "state/event_store/envelope",
+      "class": "resource_guard",
+      "protected_resource": "indexed event-kind label bytes",
+      "exhaustion_behavior": "Envelope construction rejects an empty or oversized registered kind.",
+      "observability": "The producer receives EnvelopeError::InvalidField and may use the explicit JSONL gap path.",
+      "configurability": "Fixed version-1 schema bound with no runtime override.",
+      "rationale": "Keeps indexed repository-owned labels bounded and excludes user text.",
+      "default_value": "64",
+      "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+      "symbol": "MAX_KIND_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+        "scope": "module::impl:EventKind::fn:validate",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-envelope.legacy-synthetic-fields",
+      "owner": "state/event_store/envelope",
+      "class": "resource_guard",
+      "protected_resource": "legacy synthetic-field provenance entries",
+      "exhaustion_behavior": "The legacy envelope is rejected and its source remains explicitly unsupported/preserved.",
+      "observability": "Envelope/import coverage returns the validation failure without publishing a completion receipt.",
+      "configurability": "Fixed version-1 provenance bound with no runtime override.",
+      "rationale": "Bounds imported provenance while preventing silent omission.",
+      "default_value": "16",
+      "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+      "symbol": "MAX_LEGACY_SYNTHETIC_FIELDS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+        "scope": "module::impl:LegacyProvenance::fn:validate",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-envelope.legacy-unavailable-fields",
+      "owner": "state/event_store/envelope",
+      "class": "resource_guard",
+      "protected_resource": "legacy unavailable-field provenance entries",
+      "exhaustion_behavior": "The legacy envelope is rejected and its source remains explicitly unsupported/preserved.",
+      "observability": "Envelope/import coverage returns the validation failure without publishing a completion receipt.",
+      "configurability": "Fixed version-1 provenance bound with no runtime override.",
+      "rationale": "Bounds imported provenance while preventing silent omission.",
+      "default_value": "32",
+      "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+      "symbol": "MAX_LEGACY_UNAVAILABLE_FIELDS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+        "scope": "module::impl:LegacyProvenance::fn:validate",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-envelope.normalization-depth",
+      "owner": "state/event_store/envelope",
+      "class": "resource_guard",
+      "protected_resource": "recursive JSON payload normalization depth",
+      "exhaustion_behavior": "Normalization returns an explicit payload-depth error; no partial event is stored.",
+      "observability": "The producer receives EnvelopeError::NormalizationLimit and may record a bounded gap.",
+      "configurability": "Fixed version-1 normalization policy with no runtime override.",
+      "rationale": "Bounds stack/work for hostile nested diagnostic payloads.",
+      "default_value": "16",
+      "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+      "symbol": "DEFAULT_NORMALIZATION_DEPTH",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+        "scope": "module::impl:PayloadNormalizationPolicy::fn:registered",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-envelope.normalization-fields",
+      "owner": "state/event_store/envelope",
+      "class": "resource_guard",
+      "protected_resource": "JSON payload fields and array members normalized per event",
+      "exhaustion_behavior": "Normalization returns an explicit field-count/array-length error; no partial event is stored.",
+      "observability": "The producer receives EnvelopeError::NormalizationLimit and may record a bounded gap.",
+      "configurability": "Fixed version-1 normalization policy with no runtime override.",
+      "rationale": "Bounds CPU and allocation independently of serialized byte size.",
+      "default_value": "256",
+      "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+      "symbol": "DEFAULT_NORMALIZATION_FIELDS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+        "scope": "module::impl:PayloadNormalizationPolicy::fn:registered",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-envelope.normalization-string-bytes",
+      "owner": "state/event_store/envelope",
+      "class": "resource_guard",
+      "protected_resource": "bytes retained from one normalized payload string",
+      "exhaustion_behavior": "The redactor truncates at a UTF-8 boundary before canonical hashing.",
+      "observability": "The stored canonical payload itself exposes the bounded value; no raw suffix is retained.",
+      "configurability": "Fixed version-1 normalization policy with no runtime override.",
+      "rationale": "Bounds high-cardinality text while retaining deterministic redacted evidence.",
+      "default_value": "1024",
+      "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+      "symbol": "DEFAULT_NORMALIZATION_STRING_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+        "scope": "module::impl:PayloadNormalizationPolicy::fn:registered",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-envelope.payload-bytes",
+      "owner": "state/event_store",
+      "class": "resource_guard",
+      "protected_resource": "canonical payload bytes retained by one event",
+      "exhaustion_behavior": "Envelope normalization/validation rejects the event before sink fan-out.",
+      "observability": "PayloadTooLarge reports actual and maximum byte counts; producer fallback records a gap when possible.",
+      "configurability": "Fixed version-1 envelope/schema bound with no runtime override.",
+      "rationale": "Keeps queue, transaction, reader, and fallback memory/storage bounds honest.",
+      "default_value": "1024 * 1024",
+      "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+      "symbol": "MAX_EVENT_PAYLOAD_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+        "scope": "module::impl:EventEnvelopeV1::fn:normalize",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-envelope.provenance-label-bytes",
+      "owner": "state/event_store/envelope",
+      "class": "resource_guard",
+      "protected_resource": "legacy provenance and normalized JSON field-label bytes",
+      "exhaustion_behavior": "Validation rejects the envelope/source rather than truncating an identity label.",
+      "observability": "Envelope/import coverage reports the invalid field and withholds completion.",
+      "configurability": "Fixed version-1 label bound with no runtime override.",
+      "rationale": "Bounds indexed/serialized provenance names without creating aliases through truncation.",
+      "default_value": "64",
+      "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+      "symbol": "MAX_PROVENANCE_LABEL_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/envelope.rs",
+        "scope": "module::impl:LegacyProvenance::fn:validate",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-generation.control-record-bytes",
+      "owner": "state/event_store/generation",
+      "class": "resource_guard",
+      "protected_resource": "bytes read from one generation control record or manifest",
+      "exhaustion_behavior": "The bounded reader rejects the control record before parsing and reports the partition or publication as invalid.",
+      "observability": "GenerationError::Validation and reader coverage issues expose the oversized record without treating it as absent.",
+      "configurability": "Fixed version-1 physical-protocol ceiling with no runtime override.",
+      "rationale": "Bounds memory for corrupt HEAD, manifest, and retirement-receipt files while preserving explicit failure coverage.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-state/src/event_store/generation.rs",
+      "symbol": "MAX_GENERATION_CONTROL_RECORD_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/generation.rs",
+        "scope": "module::fn:read_bounded_control_file",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-generation.sealed-digest-buffer-bytes",
+      "owner": "state/event_store/generation",
+      "class": "resource_guard",
+      "protected_resource": "scratch memory used to hash one sealed-generation file",
+      "exhaustion_behavior": "A full chunk is hashed and reading continues to EOF; file errors abort manifest publication.",
+      "observability": "Seal publication returns the exact file read error and does not publish partial identity.",
+      "configurability": "Fixed streaming buffer with no runtime override.",
+      "rationale": "Bounds memory without imposing an arbitrary generation-size limit.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-state/src/event_store/generation.rs",
+      "symbol": "SEALED_FILE_DIGEST_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/generation.rs",
+        "scope": "module::fn:hash_file",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-maintenance.catalog-bloom-bytes",
+      "owner": "state/event_store/maintenance",
+      "class": "resource_guard",
+      "protected_resource": "derived exclusion-only Bloom filter bytes per catalog dimension and partition",
+      "exhaustion_behavior": "All values map into the fixed filter; positives still query the authoritative local index.",
+      "observability": "Catalog entries declare their versioned filter bytes and never use a positive result as proof.",
+      "configurability": "Fixed version-1 derived-catalog shape with no runtime override.",
+      "rationale": "Bounds derived catalog size while preserving correctness through false-positive-only semantics.",
+      "default_value": "256",
+      "source": "crates/oulipoly-state/src/event_store/maintenance.rs",
+      "symbol": "CATALOG_BLOOM_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/maintenance.rs",
+        "scope": "module::fn:inspect_closed_generation_for_catalog",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-maintenance.hash-buffer-bytes",
+      "owner": "state/event_store/maintenance",
+      "class": "resource_guard",
+      "protected_resource": "scratch memory used while validating a sealed maintenance target file",
+      "exhaustion_behavior": "A full chunk is hashed and reading continues within the caller-supplied byte bound.",
+      "observability": "Bound exhaustion or read failure returns an explicit maintenance inspection error.",
+      "configurability": "Fixed streaming buffer with no runtime override.",
+      "rationale": "Bounds verification scratch memory without using a timeout as an integrity substitute.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-state/src/event_store/maintenance.rs",
+      "symbol": "BUFFER_BYTES",
+      "declaration_scope": "module::fn:hash_file_bounded",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/maintenance.rs",
+        "scope": "module::fn:hash_file_bounded",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-schema.append-payload-bytes",
+      "owner": "state/event_store/schema",
+      "class": "resource_guard",
+      "protected_resource": "canonical payload bytes in one SQLite append transaction",
+      "exhaustion_behavior": "append_batch refuses the whole batch before beginning its transaction.",
+      "observability": "EventStoreError::BatchBounds is returned to the process writer for explicit unknown/fallback handling.",
+      "configurability": "Fixed version-1 group-commit bound with no runtime override.",
+      "rationale": "Defends the schema API independently of worker-side batching.",
+      "default_value": "1024 * 1024",
+      "source": "crates/oulipoly-state/src/event_store/schema.rs",
+      "symbol": "MAX_APPEND_BATCH_PAYLOAD_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/schema.rs",
+        "scope": "module::fn:append_batch",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-schema.append-records",
+      "owner": "state/event_store/schema",
+      "class": "resource_guard",
+      "protected_resource": "events in one SQLite append transaction",
+      "exhaustion_behavior": "append_batch refuses the whole batch before beginning its transaction.",
+      "observability": "EventStoreError::BatchBounds is returned to the process writer for explicit unknown/fallback handling.",
+      "configurability": "Fixed version-1 group-commit bound with no runtime override.",
+      "rationale": "Defends the schema API independently of worker-side batching.",
+      "default_value": "32",
+      "source": "crates/oulipoly-state/src/event_store/schema.rs",
+      "symbol": "MAX_APPEND_BATCH_RECORDS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/schema.rs",
+        "scope": "module::fn:append_batch",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-writer.default-queue-capacity",
+      "owner": "state/event_store/writer",
+      "class": "resource_guard",
+      "protected_resource": "pending process-local event-writer commands",
+      "exhaustion_behavior": "Nonblocking admission returns explicit backpressure; required append also refuses before waiting for commit.",
+      "observability": "EnqueueErrorKind::Full and EventSubmitStatus::Backpressure drive gap/fallback evidence.",
+      "configurability": "EventWriterConfig may select another positive bound; this is the production default.",
+      "rationale": "Prevents telemetry bursts from becoming unbounded memory or coordination delay.",
+      "default_value": "256",
+      "source": "crates/oulipoly-state/src/event_store/writer.rs",
+      "symbol": "DEFAULT_EVENT_WRITER_QUEUE_CAPACITY",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/writer.rs",
+        "scope": "module::impl:EventWriterConfig::fn:native",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-writer.default-rotation-soft-bytes",
+      "owner": "state/event_store/writer",
+      "class": "resource_guard",
+      "protected_resource": "database plus WAL bytes in one writable generation before rotation",
+      "exhaustion_behavior": "The writer rotates at the next group boundary; overshoot is bounded by one append group.",
+      "observability": "Generation/head metadata exposes each rotation and exact predecessor/successor.",
+      "configurability": "EventWriterConfig may select another positive threshold; this is the production default.",
+      "rationale": "Bounds live-head size without deleting or enumerating history.",
+      "default_value": "64 * 1024 * 1024",
+      "source": "crates/oulipoly-state/src/event_store/writer.rs",
+      "symbol": "DEFAULT_GENERATION_ROTATION_SOFT_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/writer.rs",
+        "scope": "module::impl:EventWriterConfig::fn:native",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-writer.group-payload-bytes",
+      "owner": "state/event_store/writer",
+      "class": "resource_guard",
+      "protected_resource": "payload bytes grouped into one writer transaction",
+      "exhaustion_behavior": "The overflowing event remains queued for the next group; no event is silently dropped.",
+      "observability": "Per-ticket receipts preserve each commit/unknown outcome across group boundaries.",
+      "configurability": "Fixed version-1 grouping bound with no runtime override.",
+      "rationale": "Bounds transaction size and group memory while retaining queue order.",
+      "default_value": "1024 * 1024",
+      "source": "crates/oulipoly-state/src/event_store/writer.rs",
+      "symbol": "EVENT_WRITER_GROUP_MAX_PAYLOAD_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/writer.rs",
+        "scope": "module::fn:collect_batch",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-writer.group-records",
+      "owner": "state/event_store/writer",
+      "class": "resource_guard",
+      "protected_resource": "events grouped into one writer transaction",
+      "exhaustion_behavior": "Collection stops and remaining queue entries form a later group.",
+      "observability": "Per-ticket receipts preserve each commit/unknown outcome across group boundaries.",
+      "configurability": "Fixed version-1 grouping bound with no runtime override.",
+      "rationale": "Bounds commit work while allowing sustained processing without a terminal timeout.",
+      "default_value": "32",
+      "source": "crates/oulipoly-state/src/event_store/writer.rs",
+      "symbol": "EVENT_WRITER_GROUP_MAX_RECORDS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/writer.rs",
+        "scope": "module::fn:collect_batch",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-writer.group-residence",
+      "owner": "state/event_store/writer",
+      "class": "resource_guard",
+      "protected_resource": "residence of the first accepted event while forming a group",
+      "exhaustion_behavior": "The current nonempty group commits; this is not an operation deadline or failure cap.",
+      "observability": "Tickets receive normal commit/unknown outcomes; expiry never fabricates failure.",
+      "configurability": "Fixed version-1 grouping window with no runtime override.",
+      "rationale": "Caps batching latency while preserving durable commit semantics.",
+      "default_value": "Duration :: from_millis (10)",
+      "source": "crates/oulipoly-state/src/event_store/writer.rs",
+      "symbol": "EVENT_WRITER_GROUP_MAX_RESIDENCE",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/writer.rs",
+        "scope": "module::fn:collect_batch",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-writer.reply-channel-capacity",
+      "owner": "state/event_store/writer",
+      "class": "resource_guard",
+      "protected_resource": "per-command writer reply messages retained in memory",
+      "exhaustion_behavior": "Each command has one result slot; the worker delivers the single terminal outcome without accumulating replies.",
+      "observability": "A disconnected receiver produces the existing unknown/disconnected outcome instead of silently discarding authority evidence.",
+      "configurability": "Fixed one-result protocol with no runtime override.",
+      "rationale": "A writer command has exactly one terminal result and requires no unbounded response queue.",
+      "default_value": "1",
+      "source": "crates/oulipoly-state/src/event_store/writer.rs",
+      "symbol": "EVENT_WRITER_REPLY_CHANNEL_CAPACITY",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/writer.rs",
+        "scope": "module::impl:ProcessEventWriter::fn:try_append",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "state.invocation-finalize.provider-error-snippet-max-chars",
       "owner": "state/db/invocation_lifecycle_finalize_write",
       "class": "resource_guard",
@@ -4900,6 +5337,25 @@
       "controlling_use": {
         "source": "crates/oulipoly-state/src/db/invocation_lifecycle_finalize_write.rs",
         "scope": "module::impl:StateDb::fn:provider_error_snippet",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.lifecycle-log.max-fields",
+      "owner": "state/lifecycle_log",
+      "class": "resource_guard",
+      "protected_resource": "top-level fields accepted from one lifecycle observation",
+      "exhaustion_behavior": "Normalization rejects the record, emits a bounded gap, and leaves the authoritative lifecycle operation unchanged.",
+      "observability": "LifecycleNormalizationError::FieldLimit and the lifecycle_normalize gap identify the omission.",
+      "configurability": "Fixed typed lifecycle schema bound with no runtime override.",
+      "rationale": "Prevents unknown expansion from bypassing the allowlist/redactor.",
+      "default_value": "32",
+      "source": "crates/oulipoly-state/src/lifecycle_log.rs",
+      "symbol": "MAX_LIFECYCLE_FIELDS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/lifecycle_log.rs",
+        "scope": "module::fn:normalize_lifecycle_record",
         "kind": "direct_control"
       }
     },

@@ -35,12 +35,18 @@ pub const MAX_RETENTION_STATUS_READ_BYTES: u64 = 64 * 1024;
 pub const MAX_CLEANUP_DIRECTORY_ENTRIES: usize = 1_024;
 pub const MAX_CLEANUP_ISSUES: usize = 128;
 pub const MAX_CLEANUP_ISSUE_BYTES: usize = 64;
+pub const MAX_PRESERVATION_SOURCES: usize = 1_024;
+pub const MAX_PRESERVATION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+const PRESERVATION_HASH_BUFFER_BYTES: usize = 64 * 1024;
 pub const DEFAULT_DEFERRED_QUEUE_CAPACITY: usize = 1_024;
 pub const GAP_REPORTER_QUEUE_CAPACITY: usize = 16;
 const DEFAULT_MAX_SHARD_BYTES: u64 = 1024 * 1024;
 const DEFAULT_MAX_SHARDS: usize = 4;
 const DEFAULT_MAX_TOTAL_SHARDS: usize = 64;
 const DEFAULT_STALE_SHARD_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const PRESERVE_LEGACY_MARKER: &str = "PRESERVE-LEGACY-V1";
+pub const PRESERVE_LEGACY_MANIFEST: &str = "preserve-legacy-v1.manifest.json";
+const PRESERVE_LEGACY_MARKER_BYTES: &[u8] = b"PRESERVE-LEGACY-V1\n";
 
 static DIAGNOSTIC_GAP_STAGES: AtomicU64 = AtomicU64::new(0);
 static PENDING_DIAGNOSTIC_GAP_STAGES: AtomicU64 = AtomicU64::new(0);
@@ -758,12 +764,16 @@ pub struct FlightRecorder {
     inner: Arc<RecorderInner>,
 }
 
+#[derive(Clone)]
 struct RecorderInner {
     process: RecorderProcessIdentity,
     #[cfg(test)]
     active_path: Option<PathBuf>,
     max_shard_bytes: u64,
     writer: Option<SyncSender<WriterCommand>>,
+    use_event_sink: bool,
+    #[cfg_attr(test, allow(dead_code))]
+    preservation_active: bool,
 }
 
 struct WriterState {
@@ -772,6 +782,180 @@ struct WriterState {
     active_file: fs::File,
     shard_prefix: String,
     config: RecorderConfig,
+    preservation_mode: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreservationState {
+    Absent,
+    Active,
+    /// A marker at the exact path has invalid contents. Producer behavior is
+    /// fail-safe preservation, while cutover remains disabled.
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyPreservationSource {
+    pub file_name: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub complete_line_terminated: bool,
+    pub producer_pid: Option<i64>,
+    pub producer_starttime_ticks: Option<i64>,
+    pub producer_boot_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyPreservationManifest {
+    pub schema: String,
+    pub activated_at: String,
+    /// Files deleted before the marker cannot be reconstructed. This remains
+    /// explicit even when every then-present source was inventoried.
+    pub baseline_coverage_uncertain: bool,
+    pub sources: Vec<LegacyPreservationSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyPreservationActivation {
+    Activated,
+    AlreadyActive,
+}
+
+/// Durably enables the legacy JSONL preservation protocol. This is an
+/// explicit offline/detached operation: it refuses active shard writers,
+/// inventories every then-present source within declared bounds, publishes the
+/// inventory first, and publishes the exact marker last. It is never invoked
+/// by recorder startup.
+pub fn activate_legacy_preservation(
+    root: impl AsRef<Path>,
+) -> Result<LegacyPreservationActivation, String> {
+    activate_legacy_preservation_serialized(root.as_ref(), || {})
+}
+
+fn activate_legacy_preservation_serialized(
+    root: &Path,
+    after_lock: impl FnOnce(),
+) -> Result<LegacyPreservationActivation, String> {
+    create_private_directory(root)?;
+    let retention_lock = private_append_file(&root.join(".retention.lock"))
+        .map_err(|error| format!("preservation_lock_open_failed:{error}"))?;
+    <fs::File as fs4::FileExt>::lock(&retention_lock)
+        .map_err(|error| format!("preservation_lock_failed:{error}"))?;
+    after_lock();
+
+    // The exact marker decision is serialized with recorder startup and every
+    // destructive legacy rotation. An opener that won the lock has already
+    // created and leased its active source before this inventory can begin.
+    match preservation_state(root) {
+        PreservationState::Active => {
+            read_preservation_manifest(root)?;
+            let _ = <fs::File as fs4::FileExt>::unlock(&retention_lock);
+            return Ok(LegacyPreservationActivation::AlreadyActive);
+        }
+        PreservationState::Invalid => {
+            return Err("invalid_preservation_marker".to_string());
+        }
+        PreservationState::Absent => {}
+    }
+
+    let mut paths = Vec::new();
+    let entries =
+        fs::read_dir(root).map_err(|error| format!("preservation_scan_failed:{error}"))?;
+    let mut directory_entries = 0_usize;
+    for entry in entries {
+        directory_entries = directory_entries.saturating_add(1);
+        if directory_entries > MAX_PRESERVATION_SOURCES {
+            return Err("preservation_directory_limit_reached".to_string());
+        }
+        let entry = entry.map_err(|error| format!("preservation_entry_unreadable:{error}"))?;
+        if is_flight_shard(&entry.path()) {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+
+    // Retain every lease until the inventory is complete so a compatible
+    // writer cannot mutate an earlier source while a later source is hashed.
+    let mut leased_sources = Vec::with_capacity(paths.len());
+    for path in paths {
+        match try_shard_lease(&path) {
+            ShardLease::Acquired(file) => leased_sources.push((path, file)),
+            ShardLease::Busy => return Err("incompatible_legacy_writer_active".to_string()),
+            ShardLease::Disappeared => return Err("legacy_source_disappeared".to_string()),
+            ShardLease::Uncertain => return Err("legacy_source_unreadable".to_string()),
+        }
+    }
+
+    let mut sources = Vec::with_capacity(leased_sources.len());
+    for (path, mut file) in leased_sources {
+        let before = file
+            .metadata()
+            .map_err(|error| format!("legacy_source_metadata_failed:{error}"))?;
+        if before.len() > MAX_PRESERVATION_SOURCE_BYTES {
+            return Err("preservation_source_byte_limit_reached".to_string());
+        }
+        let mut hasher = Sha256::new();
+        let mut remaining = before.len();
+        let mut buffer = [0_u8; PRESERVATION_HASH_BUFFER_BYTES];
+        let mut last = None;
+        while remaining > 0 {
+            let want = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+            let read = file
+                .read(&mut buffer[..want])
+                .map_err(|error| format!("legacy_source_read_failed:{error}"))?;
+            if read == 0 {
+                return Err("legacy_source_changed_during_inventory".to_string());
+            }
+            hasher.update(&buffer[..read]);
+            last = Some(buffer[read - 1]);
+            remaining = remaining.saturating_sub(read as u64);
+        }
+        let after = file
+            .metadata()
+            .map_err(|error| format!("legacy_source_metadata_failed:{error}"))?;
+        if after.len() != before.len() {
+            return Err("legacy_source_changed_during_inventory".to_string());
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "legacy_source_name_not_utf8".to_string())?
+            .to_string();
+        let parsed = shard_process_identity(&path);
+        sources.push(LegacyPreservationSource {
+            file_name,
+            bytes: before.len(),
+            sha256: format!("{:x}", hasher.finalize()),
+            complete_line_terminated: before.len() == 0 || last == Some(b'\n'),
+            producer_pid: parsed.as_ref().map(|identity| identity.0),
+            producer_starttime_ticks: parsed.as_ref().map(|identity| identity.1),
+            producer_boot_fingerprint: parsed.map(|identity| identity.2),
+        });
+    }
+
+    let manifest = LegacyPreservationManifest {
+        schema: "oulipoly.preserve-legacy.v1".to_string(),
+        activated_at: now(),
+        baseline_coverage_uncertain: true,
+        sources,
+    };
+    publish_preservation_manifest(root, &manifest)?;
+    publish_create_once(root, PRESERVE_LEGACY_MARKER, PRESERVE_LEGACY_MARKER_BYTES)?;
+    let _ = <fs::File as fs4::FileExt>::unlock(&retention_lock);
+    Ok(LegacyPreservationActivation::Activated)
+}
+
+#[cfg(test)]
+fn activate_legacy_preservation_with_lock_barrier(
+    root: &Path,
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+) -> Result<LegacyPreservationActivation, String> {
+    activate_legacy_preservation_serialized(root, || {
+        entered.send(()).unwrap();
+        release.recv().unwrap();
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -788,6 +972,10 @@ enum WriterCommand {
     Cleanup {
         completion: mpsc::Sender<CleanupReport>,
     },
+    CompleteEventAppend {
+        pending: crate::event_store::PendingAppend,
+        envelope: Box<crate::event_store::EventEnvelopeV1>,
+    },
     #[cfg(test)]
     Drain { completion: mpsc::Sender<()> },
     #[cfg(test)]
@@ -803,6 +991,15 @@ pub enum RecordStatus {
     Appended,
     /// Accepted by the in-process writer, but not yet appended or crash-durable.
     Queued,
+    /// Event-store persistence failed or was unavailable; the immutable
+    /// envelope was retained only in emergency JSONL.
+    FallbackAppended {
+        event_store_stage: String,
+    },
+    /// Emergency JSONL accepted the immutable envelope for deferred writing.
+    FallbackQueued {
+        event_store_stage: String,
+    },
     Disabled,
     Failed {
         stage: String,
@@ -818,6 +1015,9 @@ pub struct CleanupReport {
     pub completed_at: Option<String>,
     pub retention_eligible_at: Option<String>,
     pub retention_status: MaintenanceRetentionStatus,
+    /// Historical enumeration/deletion is delegated while the durable
+    /// preservation marker is present (valid or conservatively invalid).
+    pub preservation_deferred: bool,
     /// Raw directory entries examined by this cleanup generation.
     pub directory_entries_examined: usize,
     /// Directory entries that could not be classified as shards or non-shards.
@@ -847,11 +1047,18 @@ pub enum MaintenanceRetentionStatus {
 
 impl FlightRecorder {
     pub fn open(root: impl AsRef<Path>, config: RecorderConfig) -> Result<Self, String> {
+        Self::open_serialized(root.as_ref().to_path_buf(), config, || {})
+    }
+
+    fn open_serialized(
+        root: PathBuf,
+        config: RecorderConfig,
+        after_lock: impl FnOnce(),
+    ) -> Result<Self, String> {
         // Reporter startup is attempted at most once during recorder
         // initialization. Operation and writer paths only observe the resulting
         // sender and never start or wait for the reporter.
         ensure_gap_reporter();
-        let root = root.as_ref().to_path_buf();
         create_private_directory(&root)?;
         let instance = ProducerInstanceId::new();
         let process = RecorderProcessIdentity::current(instance.clone());
@@ -865,9 +1072,37 @@ impl FlightRecorder {
             process.os_pid,
             process.os_pid_starttime_ticks.unwrap_or(0)
         );
-        let active_path = root.join(format!("{shard_prefix}.jsonl"));
-        let active_file = open_leased_private_append_file(&active_path)
-            .map_err(|error| format!("Failed to lease diagnostic recorder shard: {error}"))?;
+
+        let retention_lock = private_append_file(&root.join(".retention.lock"))
+            .map_err(|error| format!("Failed to open diagnostic retention lock: {error}"))?;
+        <fs::File as fs4::FileExt>::lock(&retention_lock)
+            .map_err(|error| format!("Failed to acquire diagnostic retention lock: {error}"))?;
+        after_lock();
+        let preservation_state = preservation_state(&root);
+        let preservation_mode = !matches!(preservation_state, PreservationState::Absent);
+        let preservation_active = preservation_state == PreservationState::Active
+            && read_preservation_manifest(&root).is_ok();
+        let active_path = if preservation_mode {
+            unique_preserved_shard_path(&root, &shard_prefix)
+        } else {
+            root.join(format!("{shard_prefix}.jsonl"))
+        };
+        let active_file = if preservation_mode {
+            open_leased_private_create_file(&active_path)
+        } else {
+            open_leased_private_append_file(&active_path)
+        }
+        .map_err(|error| format!("Failed to lease diagnostic recorder shard: {error}"))?;
+        if preservation_mode {
+            active_file
+                .sync_all()
+                .and_then(|()| sync_directory(&root))
+                .map_err(|error| {
+                    format!("Failed to durably publish preserved recorder shard: {error}")
+                })?;
+        }
+        <fs::File as fs4::FileExt>::unlock(&retention_lock)
+            .map_err(|error| format!("Failed to release diagnostic retention lock: {error}"))?;
         let config = RecorderConfig {
             max_shard_bytes: config.max_shard_bytes.max(256),
             max_shards: config.max_shards.max(1),
@@ -883,10 +1118,13 @@ impl FlightRecorder {
             active_file,
             shard_prefix,
             config,
+            preservation_mode,
         };
         // Opening is not an observed database operation. Complete the
         // opportunistic sweep before the writer becomes solely thread-owned.
-        let _ = cleanup_stale_shards(&writer);
+        if !preservation_mode {
+            let _ = cleanup_stale_shards(&writer);
+        }
         let (sender, receiver) = mpsc::sync_channel(queue_capacity);
         std::thread::Builder::new()
             .name("oulipoly-flight-recorder".to_string())
@@ -899,9 +1137,24 @@ impl FlightRecorder {
                 active_path: Some(active_path),
                 max_shard_bytes,
                 writer: Some(sender),
+                use_event_sink: false,
+                preservation_active,
             }),
         };
         Ok(recorder)
+    }
+
+    #[cfg(test)]
+    fn open_with_lock_barrier(
+        root: PathBuf,
+        config: RecorderConfig,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    ) -> Result<Self, String> {
+        Self::open_serialized(root, config, || {
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        })
     }
 
     fn disabled() -> Self {
@@ -913,6 +1166,8 @@ impl FlightRecorder {
                 active_path: None,
                 max_shard_bytes: RecorderConfig::default().max_shard_bytes,
                 writer: None,
+                use_event_sink: false,
+                preservation_active: false,
             }),
         }
     }
@@ -1078,10 +1333,141 @@ impl FlightRecorder {
     }
 
     fn append(&self, event: &DiagnosticEvent, coordination: AppendCoordination) -> RecordStatus {
+        if self.inner.use_event_sink {
+            return self.append_via_event_store(event, coordination);
+        }
         let Ok(mut encoded) = serde_json::to_vec(event) else {
             return coordinated_record_failure(coordination, "serialize");
         };
         encoded.push(b'\n');
+        self.append_jsonl_encoded(encoded, coordination)
+    }
+
+    fn append_via_event_store(
+        &self,
+        event: &DiagnosticEvent,
+        coordination: AppendCoordination,
+    ) -> RecordStatus {
+        use crate::diagnostic_producer::EventSubmitDurability;
+        let durability = match coordination {
+            AppendCoordination::Synchronous => EventSubmitDurability::RequiredDurable,
+            AppendCoordination::Deferred => EventSubmitDurability::BestEffort,
+        };
+        let submission =
+            match crate::diagnostic_producer::submit_diagnostic_event(event, durability) {
+                Ok(submission) => submission,
+                Err(_) => {
+                    coordinated_gap(coordination, "event_store_append");
+                    let Ok(mut encoded) = serde_json::to_vec(event) else {
+                        return coordinated_record_failure(coordination, "serialize");
+                    };
+                    encoded.push(b'\n');
+                    return fallback_status(
+                        self.append_jsonl_encoded(encoded, coordination),
+                        "event_store_envelope",
+                    );
+                }
+            };
+        self.finish_event_submission(submission, coordination)
+    }
+
+    pub(crate) fn record_lifecycle_observation(
+        &self,
+        observation: &crate::lifecycle_log::NormalizedLifecycleObservation,
+    ) -> RecordStatus {
+        match crate::diagnostic_producer::submit_lifecycle_observation(
+            observation,
+            &self.inner.process,
+        ) {
+            Ok(submission) => {
+                self.finish_event_submission(submission, AppendCoordination::Deferred)
+            }
+            Err(_) => deferred_record_failure("event_store_append"),
+        }
+    }
+
+    fn finish_event_submission(
+        &self,
+        submission: crate::diagnostic_producer::PreparedEventSubmission,
+        coordination: AppendCoordination,
+    ) -> RecordStatus {
+        use crate::diagnostic_producer::{EventSinkMode, EventSubmitStatus};
+        let crate::diagnostic_producer::PreparedEventSubmission {
+            envelope,
+            status: event_status,
+            pending,
+            mode,
+        } = submission;
+        let shadow = mode == EventSinkMode::ShadowWithJsonl;
+        if !shadow {
+            match &event_status {
+                EventSubmitStatus::Appended => return RecordStatus::Appended,
+                EventSubmitStatus::Queued => {
+                    return match pending {
+                        Some(pending) => self.handoff_event_completion(pending, envelope),
+                        None => deferred_record_failure("event_store_completion_handoff"),
+                    };
+                }
+                _ => {}
+            }
+        }
+        let Ok(mut encoded) = serde_json::to_vec(&envelope) else {
+            return match event_status {
+                EventSubmitStatus::Appended => RecordStatus::Appended,
+                EventSubmitStatus::Queued => RecordStatus::Queued,
+                _ => coordinated_record_failure(coordination, "serialize"),
+            };
+        };
+        encoded.push(b'\n');
+        let jsonl_status = self.append_jsonl_encoded(encoded, coordination);
+        match event_status {
+            // Shadow failure never downgrades committed/accepted event-store
+            // evidence or feeds back into the protected operation.
+            EventSubmitStatus::Appended => RecordStatus::Appended,
+            EventSubmitStatus::Queued => RecordStatus::Queued,
+            EventSubmitStatus::Backpressure => {
+                coordinated_gap(coordination, "event_store_append");
+                fallback_status(jsonl_status, "event_store_backpressure")
+            }
+            EventSubmitStatus::Disconnected => {
+                coordinated_gap(coordination, "event_store_append");
+                fallback_status(jsonl_status, "event_store_disconnected")
+            }
+            EventSubmitStatus::Unavailable => {
+                coordinated_gap(coordination, "event_store_append");
+                fallback_status(jsonl_status, "event_store_unavailable")
+            }
+            EventSubmitStatus::Failed(_) => {
+                coordinated_gap(coordination, "event_store_append");
+                fallback_status(jsonl_status, "event_store_failed")
+            }
+        }
+    }
+
+    fn handoff_event_completion(
+        &self,
+        pending: crate::event_store::PendingAppend,
+        envelope: crate::event_store::EventEnvelopeV1,
+    ) -> RecordStatus {
+        let Some(writer) = self.inner.writer.as_ref() else {
+            return deferred_record_failure("event_store_completion_handoff");
+        };
+        match writer.try_send(WriterCommand::CompleteEventAppend {
+            pending,
+            envelope: Box::new(envelope),
+        }) {
+            Ok(()) => RecordStatus::Queued,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                deferred_record_failure("event_store_completion_handoff")
+            }
+        }
+    }
+
+    fn append_jsonl_encoded(
+        &self,
+        encoded: Vec<u8>,
+        coordination: AppendCoordination,
+    ) -> RecordStatus {
         if encoded.len() as u64 > self.inner.max_shard_bytes {
             return coordinated_record_failure(coordination, "record_too_large");
         }
@@ -1116,6 +1502,11 @@ impl FlightRecorder {
                 }
             },
         }
+    }
+
+    fn with_event_sink(mut self) -> Self {
+        Arc::make_mut(&mut self.inner).use_event_sink = true;
+        self
     }
 
     #[cfg(test)]
@@ -1266,16 +1657,32 @@ pub fn process_recorder() -> FlightRecorder {
     ensure_gap_reporter();
     #[cfg(test)]
     {
-        return TEST_PROCESS_RECORDER
+        TEST_PROCESS_RECORDER
             .with(|recorder| recorder.borrow().clone())
-            .unwrap_or_else(FlightRecorder::disabled);
+            .unwrap_or_else(FlightRecorder::disabled)
     }
     #[cfg(not(test))]
     {
         static PROCESS_RECORDER: OnceLock<Mutex<Option<FlightRecorder>>> = OnceLock::new();
         cached_or_retry_process_recorder(PROCESS_RECORDER.get_or_init(|| Mutex::new(None)), || {
-            default_recorder_root()
-                .and_then(|root| FlightRecorder::open(root, RecorderConfig::default()))
+            let recorder = default_recorder_root()
+                .and_then(|root| FlightRecorder::open(root, RecorderConfig::default()))?;
+            // Event-store initialization is evidence-only. On any failure the
+            // process recorder keeps the emergency JSONL worker. Cutover mode
+            // still builds the immutable envelope once before recording the
+            // explicit initialization-failure fallback.
+            if recorder.inner.preservation_active {
+                if crate::diagnostic_producer::ensure_default_process_event_sink(
+                    &recorder.inner.process,
+                )
+                .is_err()
+                {
+                    emit_gap_once("event_store_append");
+                }
+                Ok(recorder.with_event_sink())
+            } else {
+                Ok(recorder)
+            }
         })
     }
 }
@@ -1973,6 +2380,19 @@ fn writer_loop(mut writer: WriterState, receiver: Receiver<WriterCommand>) {
             WriterCommand::Cleanup { completion } => {
                 let _ = completion.send(cleanup_stale_shards(&writer));
             }
+            WriterCommand::CompleteEventAppend { pending, envelope } => {
+                if pending.wait().is_err() {
+                    let status = serde_json::to_vec(&envelope)
+                        .map(|mut encoded| {
+                            encoded.push(b'\n');
+                            append_encoded(&mut writer, &encoded)
+                        })
+                        .unwrap_or_else(|_| record_failure("serialize"));
+                    if !matches!(status, RecordStatus::Appended) {
+                        emit_gap_once("event_store_async_fallback");
+                    }
+                }
+            }
             #[cfg(test)]
             WriterCommand::Drain { completion } => {
                 let _ = completion.send(());
@@ -2015,6 +2435,20 @@ fn should_rotate(writer: &WriterState, incoming: u64) -> std::io::Result<bool> {
 }
 
 fn rotate(writer: &mut WriterState) -> std::io::Result<()> {
+    if writer.preservation_mode {
+        return rotate_preserved(writer);
+    }
+
+    // A cached legacy-mode decision never grants deletion authority. Serialize
+    // the exact marker recheck and every truncate/rename/unlink with activation.
+    // Present or unreadable marker state switches this writer permanently to
+    // create-once preservation rotation.
+    let retention_lock = private_append_file(&writer.root.join(".retention.lock"))?;
+    <fs::File as fs4::FileExt>::lock(&retention_lock)?;
+    if !matches!(preservation_state(&writer.root), PreservationState::Absent) {
+        writer.preservation_mode = true;
+        return rotate_preserved(writer);
+    }
     if writer.config.max_shards == 1 {
         writer.active_file.set_len(0)?;
         return writer.active_file.flush();
@@ -2046,6 +2480,21 @@ fn rotate(writer: &mut WriterState) -> std::io::Result<()> {
     }
 }
 
+fn rotate_preserved(writer: &mut WriterState) -> std::io::Result<()> {
+    // The old exact-current file keeps its unique name forever. Open a
+    // create-once successor and only then switch the process-local writer;
+    // there is no directory scan, ordinal reuse, truncation, or deletion.
+    writer.active_file.flush()?;
+    writer.active_file.sync_all()?;
+    let successor_path = unique_preserved_shard_path(&writer.root, &writer.shard_prefix);
+    let successor = open_leased_private_create_file(&successor_path)?;
+    successor.sync_all()?;
+    sync_directory(&writer.root)?;
+    writer.active_file = successor;
+    writer.active_path = successor_path;
+    Ok(())
+}
+
 fn rotated_path(writer: &WriterState, ordinal: usize) -> PathBuf {
     writer
         .active_path
@@ -2070,6 +2519,19 @@ fn cleanup_stale_shards(writer: &WriterState) -> CleanupReport {
     if <fs::File as fs4::FileExt>::try_lock(&lock).is_err() {
         cleanup_issue(&mut report, "retention_sweep_busy");
         complete_cleanup_report(&mut report);
+        return report;
+    }
+
+    // Recheck only the exact marker path while holding the same lock used by
+    // the offline activator. This closes the activation/cleanup race without
+    // enumerating historical sources in preservation mode. Invalid marker
+    // contents also fail safe against deletion.
+    if !matches!(preservation_state(&writer.root), PreservationState::Absent) {
+        report.preservation_deferred = true;
+        report.aggregate_limit_satisfied = false;
+        cleanup_issue(&mut report, "preservation_deferred");
+        complete_cleanup_report(&mut report);
+        let _ = <fs::File as fs4::FileExt>::unlock(&lock);
         return report;
     }
 
@@ -2470,6 +2932,140 @@ fn create_private_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn preservation_state(root: &Path) -> PreservationState {
+    let marker = root.join(PRESERVE_LEGACY_MARKER);
+    match read_file_bounded(&marker, PRESERVE_LEGACY_MARKER_BYTES.len()) {
+        Ok(bytes) if bytes == PRESERVE_LEGACY_MARKER_BYTES => PreservationState::Active,
+        Ok(_) => PreservationState::Invalid,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PreservationState::Absent,
+        // An unreadable exact marker is treated as present so producer cleanup
+        // cannot turn uncertainty into deletion authority.
+        Err(_) => PreservationState::Invalid,
+    }
+}
+
+fn read_preservation_manifest(root: &Path) -> Result<LegacyPreservationManifest, String> {
+    let path = root.join(PRESERVE_LEGACY_MANIFEST);
+    let bytes = read_file_bounded(&path, MAX_INSPECTION_BYTES as usize).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            "preservation_manifest_oversized".to_string()
+        } else {
+            format!("preservation_manifest_unreadable:{error}")
+        }
+    })?;
+    let manifest: LegacyPreservationManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("preservation_manifest_invalid:{error}"))?;
+    if manifest.schema != "oulipoly.preserve-legacy.v1"
+        || manifest.sources.len() > MAX_PRESERVATION_SOURCES
+        || manifest.sources.iter().any(|source| {
+            source.file_name.is_empty()
+                || source.file_name.len() > 255
+                || source.file_name.contains(['/', '\\'])
+                || source.sha256.len() != 64
+                || !source.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err("preservation_manifest_invalid".to_string());
+    }
+    Ok(manifest)
+}
+
+fn publish_preservation_manifest(
+    root: &Path,
+    manifest: &LegacyPreservationManifest,
+) -> Result<(), String> {
+    let mut encoded = serde_json::to_vec(manifest)
+        .map_err(|error| format!("preservation_manifest_serialize_failed:{error}"))?;
+    encoded.push(b'\n');
+    let final_path = root.join(PRESERVE_LEGACY_MANIFEST);
+    if final_path.exists() {
+        let existing = read_preservation_manifest(root)?;
+        if existing.schema == manifest.schema
+            && existing.baseline_coverage_uncertain == manifest.baseline_coverage_uncertain
+            && existing.sources == manifest.sources
+        {
+            // A prior activation can have reached rename but not the directory
+            // fsync. Complete that publication boundary before permitting the
+            // marker to be created.
+            sync_directory(root)
+                .map_err(|error| format!("preservation_manifest_sync_failed:{error}"))?;
+            return Ok(());
+        }
+        return Err("preservation_manifest_publication_conflict".to_string());
+    }
+    publish_create_once(root, PRESERVE_LEGACY_MANIFEST, &encoded)
+}
+
+fn publish_create_once(root: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    let final_path = root.join(name);
+    if final_path.exists() {
+        return if read_file_bounded(&final_path, bytes.len()).ok().as_deref() == Some(bytes) {
+            Ok(())
+        } else {
+            Err(format!("publication_conflict:{name}"))
+        };
+    }
+    let temporary = root.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        // A same-directory hard link is an atomic create-once publication:
+        // it cannot replace a concurrently published final name.
+        fs::hard_link(&temporary, &final_path)?;
+        sync_directory(root)?;
+        fs::remove_file(&temporary)?;
+        sync_directory(root)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|error| format!("publication_failed:{name}:{error}"))
+}
+
+fn read_file_bounded(path: &Path, maximum: usize) -> std::io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(maximum.min(4096));
+    file.take(maximum.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bounded control file is oversized",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+fn unique_preserved_shard_path(root: &Path, shard_prefix: &str) -> PathBuf {
+    root.join(format!("{shard_prefix}-preserved-{}.jsonl", Uuid::new_v4()))
+}
+
+fn open_leased_private_create_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).append(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    <fs::File as fs4::FileExt>::try_lock(&file)?;
+    Ok(file)
+}
+
 fn open_leased_private_append_file(path: &Path) -> std::io::Result<fs::File> {
     let file = private_append_file(path)?;
     #[cfg(unix)]
@@ -2511,6 +3107,18 @@ fn record_failure(stage: &'static str) -> RecordStatus {
     emit_gap_once(stage);
     RecordStatus::Failed {
         stage: stage.to_string(),
+    }
+}
+
+fn fallback_status(status: RecordStatus, event_store_stage: &'static str) -> RecordStatus {
+    match status {
+        RecordStatus::Appended => RecordStatus::FallbackAppended {
+            event_store_stage: event_store_stage.to_string(),
+        },
+        RecordStatus::Queued => RecordStatus::FallbackQueued {
+            event_store_stage: event_store_stage.to_string(),
+        },
+        other => other,
     }
 }
 
@@ -2567,6 +3175,10 @@ fn emit_gap_once(stage: &'static str) {
     }
 }
 
+pub(crate) fn report_diagnostic_gap(stage: &'static str) {
+    emit_gap_once(stage);
+}
+
 fn start_gap_reporter() -> Option<SyncSender<&'static str>> {
     let (sender, receiver) = mpsc::sync_channel(GAP_REPORTER_QUEUE_CAPACITY);
     std::thread::Builder::new()
@@ -2618,7 +3230,7 @@ fn write_gap_report(mut sink: impl Write, stage: &'static str) {
     let _ = writeln!(sink, "oulipoly diagnostic gap: stage={stage}");
 }
 
-const GAP_STAGE_NAMES: [&str; 11] = [
+const GAP_STAGE_NAMES: [&str; 15] = [
     "process_recorder_init",
     "recorder_disabled",
     "serialize",
@@ -2630,6 +3242,10 @@ const GAP_STAGE_NAMES: [&str; 11] = [
     "flush",
     "shard_metadata",
     "deferred_queue_disconnected",
+    "lifecycle_normalize",
+    "event_store_append",
+    "event_store_completion_handoff",
+    "event_store_async_fallback",
 ];
 
 fn gap_stage_index(stage: &str) -> u32 {
@@ -2769,6 +3385,8 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::Arc;
 
+    static EVENT_SINK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn recorder(root: &Path, max_shard_bytes: u64, max_shards: usize) -> FlightRecorder {
         FlightRecorder::open(
             root,
@@ -2850,6 +3468,291 @@ mod tests {
                 .lifecycle_phase,
             None
         );
+    }
+
+    #[test]
+    fn event_store_failure_falls_back_with_the_same_prefanout_envelope() {
+        use crate::diagnostic_producer::{
+            EventEnvelopeSink, EventSinkMode, EventSinkSubmission, EventSubmitDurability,
+            EventSubmitStatus, clear_process_event_sink_for_test, install_process_event_sink,
+        };
+        use crate::event_store::{
+            Digest32, EventEnvelopeV1, NativeProcessIdentity, ProcessInstanceId, ProducerIdentity,
+            WriterInstanceId,
+        };
+
+        struct ResetSink;
+        impl Drop for ResetSink {
+            fn drop(&mut self) {
+                clear_process_event_sink_for_test();
+            }
+        }
+
+        struct FailingSink {
+            events: Mutex<Vec<EventEnvelopeV1>>,
+            producer: ProducerIdentity,
+        }
+        impl EventEnvelopeSink for FailingSink {
+            fn producer_identity(&self) -> ProducerIdentity {
+                self.producer.clone()
+            }
+
+            fn submit(
+                &self,
+                envelope: &EventEnvelopeV1,
+                _durability: EventSubmitDurability,
+            ) -> EventSinkSubmission {
+                self.events.lock().unwrap().push(envelope.clone());
+                EventSinkSubmission::finished(EventSubmitStatus::Failed("fixture".to_string()))
+            }
+        }
+
+        let _event_sink_guard = EVENT_SINK_TEST_LOCK.lock().unwrap();
+        clear_process_event_sink_for_test();
+        let _reset = ResetSink;
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = recorder(directory.path(), 64 * 1024, 2).with_event_sink();
+        let producer = ProducerIdentity {
+            writer_instance_id: WriterInstanceId::from_bytes([1; 16]),
+            process_instance_id: ProcessInstanceId::from_bytes([2; 16]),
+            process_root_id: ProcessInstanceId::from_bytes([2; 16]),
+            parent_process_instance_id: None,
+            supervisor_authority_id: None,
+            native_process: Some(NativeProcessIdentity {
+                os_pid: 1,
+                os_boot_id_sha256: Digest32::sha256(b"fixture-boot"),
+                os_pid_starttime_ticks: 1,
+            }),
+        };
+        let sink = Arc::new(FailingSink {
+            events: Mutex::new(Vec::new()),
+            producer,
+        });
+        install_process_event_sink(sink.clone(), EventSinkMode::NormalWithJsonlFallback).unwrap();
+
+        recorder.with_requested_span(SpanStart::new("fallback", "state"), |span| {
+            assert!(matches!(
+                span.requested_status(),
+                Some(RecordStatus::FallbackAppended { event_store_stage })
+                    if event_store_stage == "event_store_failed"
+            ));
+            assert!(matches!(
+                span.record(
+                    DiagnosticPhase::Failed,
+                    PhaseObservation::started_unknown().with_cause("fixture")
+                ),
+                RecordStatus::FallbackQueued { event_store_stage }
+                    if event_store_stage == "event_store_failed"
+            ));
+        });
+        recorder.drain_deferred_for_test().unwrap();
+
+        let mut fallback = Vec::new();
+        for entry in fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+        {
+            if !is_flight_shard(&entry.path()) {
+                continue;
+            }
+            let mut reader = BufReader::new(fs::File::open(entry.path()).unwrap());
+            loop {
+                let mut encoded = Vec::new();
+                if reader.read_until(b'\n', &mut encoded).unwrap() == 0 {
+                    break;
+                }
+                fallback.push(encoded);
+            }
+        }
+        let captured = sink.events.lock().unwrap();
+        assert_eq!(fallback.len(), captured.len());
+        let captured = captured
+            .iter()
+            .map(|envelope| {
+                let mut encoded = serde_json::to_vec(envelope).unwrap();
+                encoded.push(b'\n');
+                encoded
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fallback, captured,
+            "emergency JSONL must preserve the exact pre-fanout envelope bytes"
+        );
+    }
+
+    #[test]
+    fn accepted_best_effort_completion_falls_back_exactly_and_success_does_not_shadow() {
+        use crate::diagnostic_producer::{
+            EventEnvelopeSink, EventSinkMode, EventSinkSubmission, EventSubmitDurability,
+            EventSubmitStatus, clear_process_event_sink_for_test, install_process_event_sink,
+        };
+        use crate::event_store::{
+            Digest32, EnqueueErrorKind, EventEnvelopeV1, EventWriterConfig, NativeProcessIdentity,
+            ProcessEventWriter, ProcessInstanceId, ProducerIdentity, WriterError, WriterInstanceId,
+        };
+
+        struct ResetSink;
+        impl Drop for ResetSink {
+            fn drop(&mut self) {
+                clear_process_event_sink_for_test();
+            }
+        }
+
+        struct WorkerSink {
+            events: Mutex<Vec<EventEnvelopeV1>>,
+            producer: ProducerIdentity,
+            writer: ProcessEventWriter,
+        }
+
+        impl EventEnvelopeSink for WorkerSink {
+            fn producer_identity(&self) -> ProducerIdentity {
+                self.producer.clone()
+            }
+
+            fn submit(
+                &self,
+                envelope: &EventEnvelopeV1,
+                durability: EventSubmitDurability,
+            ) -> EventSinkSubmission {
+                self.events.lock().unwrap().push(envelope.clone());
+                match durability {
+                    EventSubmitDurability::RequiredDurable => {
+                        let status = match self.writer.append(envelope.clone()) {
+                            Ok(_) => EventSubmitStatus::Appended,
+                            Err(WriterError::QueueFull) => EventSubmitStatus::Backpressure,
+                            Err(
+                                WriterError::QueueDisconnected
+                                | WriterError::ReplyDisconnected { .. },
+                            ) => EventSubmitStatus::Disconnected,
+                            Err(_) => EventSubmitStatus::Failed("append_failed".to_string()),
+                        };
+                        EventSinkSubmission::finished(status)
+                    }
+                    EventSubmitDurability::BestEffort => {
+                        match self.writer.try_append(envelope.clone()) {
+                            Ok(pending) => EventSinkSubmission::queued(pending),
+                            Err(error) => EventSinkSubmission::finished(match error.kind {
+                                EnqueueErrorKind::Full => EventSubmitStatus::Backpressure,
+                                EnqueueErrorKind::Disconnected => EventSubmitStatus::Disconnected,
+                            }),
+                        }
+                    }
+                }
+            }
+        }
+
+        fn producer(byte: u8) -> ProducerIdentity {
+            ProducerIdentity {
+                writer_instance_id: WriterInstanceId::from_bytes([byte; 16]),
+                process_instance_id: ProcessInstanceId::from_bytes([byte; 16]),
+                process_root_id: ProcessInstanceId::from_bytes([byte; 16]),
+                parent_process_instance_id: None,
+                supervisor_authority_id: None,
+                native_process: Some(NativeProcessIdentity {
+                    os_pid: i64::from(std::process::id()),
+                    os_boot_id_sha256: Digest32::sha256(&[byte]),
+                    os_pid_starttime_ticks: i64::from(byte),
+                }),
+            }
+        }
+
+        fn fallback_envelopes(root: &Path) -> Vec<EventEnvelopeV1> {
+            let mut envelopes = Vec::new();
+            for path in fs::read_dir(root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| is_flight_shard(path))
+            {
+                let reader = BufReader::new(fs::File::open(path).unwrap());
+                for line in reader.lines() {
+                    let line = line.unwrap();
+                    if !line.is_empty() {
+                        envelopes.push(serde_json::from_str(&line).unwrap());
+                    }
+                }
+            }
+            envelopes
+        }
+
+        let _event_sink_guard = EVENT_SINK_TEST_LOCK.lock().unwrap();
+        clear_process_event_sink_for_test();
+        let _reset = ResetSink;
+
+        let failed_root = tempfile::tempdir().unwrap();
+        let failed_recorder_root = failed_root.path().join("recorder");
+        let failed_recorder = recorder(&failed_recorder_root, 64 * 1024, 2).with_event_sink();
+        let failed_producer = producer(71);
+        let failed_writer = ProcessEventWriter::start(EventWriterConfig::native(
+            failed_root.path().join("event-store"),
+            failed_producer.clone(),
+        ))
+        .unwrap();
+        failed_writer.fail_next_append_for_test().unwrap();
+        let release_failure = failed_writer.pause_for_test().unwrap();
+        let failed_sink = Arc::new(WorkerSink {
+            events: Mutex::new(Vec::new()),
+            producer: failed_producer,
+            writer: failed_writer,
+        });
+        install_process_event_sink(failed_sink.clone(), EventSinkMode::NormalWithJsonlFallback)
+            .unwrap();
+
+        let worker_recorder = failed_recorder.clone();
+        let (completed, result) = mpsc::channel();
+        let protected = std::thread::spawn(move || {
+            let value = worker_recorder
+                .with_deferred_requested_span(SpanStart::new("post-admission", "state"), |_| 42);
+            completed.send(value).unwrap();
+        });
+        assert_eq!(
+            result.recv_timeout(Duration::from_millis(250)).unwrap(),
+            42,
+            "protected producer waited for event-writer completion"
+        );
+        release_failure.send(()).unwrap();
+        protected.join().unwrap();
+        failed_recorder.drain_deferred_for_test().unwrap();
+
+        let captured = failed_sink.events.lock().unwrap().clone();
+        let fallback = fallback_envelopes(&failed_recorder_root);
+        assert_eq!(captured.len(), 1);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].event_id, captured[0].event_id);
+        assert_eq!(fallback[0].producer_sequence, captured[0].producer_sequence);
+        assert_eq!(
+            fallback[0].immutable_digest().unwrap(),
+            captured[0].immutable_digest().unwrap()
+        );
+        assert_eq!(fallback[0], captured[0]);
+
+        clear_process_event_sink_for_test();
+        drop(failed_sink);
+
+        let success_root = tempfile::tempdir().unwrap();
+        let success_recorder_root = success_root.path().join("recorder");
+        let success_recorder = recorder(&success_recorder_root, 64 * 1024, 2).with_event_sink();
+        let success_producer = producer(72);
+        let success_sink = Arc::new(WorkerSink {
+            events: Mutex::new(Vec::new()),
+            producer: success_producer.clone(),
+            writer: ProcessEventWriter::start(EventWriterConfig::native(
+                success_root.path().join("event-store"),
+                success_producer,
+            ))
+            .unwrap(),
+        });
+        install_process_event_sink(success_sink.clone(), EventSinkMode::NormalWithJsonlFallback)
+            .unwrap();
+        assert_eq!(
+            success_recorder
+                .with_deferred_requested_span(SpanStart::new("committed", "state"), |_| 7),
+            7
+        );
+        success_recorder.drain_deferred_for_test().unwrap();
+        assert_eq!(success_sink.events.lock().unwrap().len(), 1);
+        assert!(fallback_envelopes(&success_recorder_root).is_empty());
+        clear_process_event_sink_for_test();
     }
 
     #[test]
@@ -3184,6 +4087,8 @@ mod tests {
                 active_path: None,
                 max_shard_bytes: 1,
                 writer: None,
+                use_event_sink: false,
+                preservation_active: false,
             }),
         };
         let handoffs_before = gap_handoff_attempts_for_test().len();
@@ -3367,6 +4272,295 @@ mod tests {
         assert!(fallback.exists());
         assert!(report.retained_uncertain_shards >= 1, "{report:?}");
         assert!(!report.aggregate_limit_satisfied);
+    }
+
+    #[test]
+    fn preservation_activation_is_durable_idempotent_and_refuses_active_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory
+            .path()
+            .join("flight-99999999-1-dead-fixture.jsonl");
+        let mut active = open_leased_private_append_file(&source).unwrap();
+        active.write_all(b"{}\n").unwrap();
+        active.sync_all().unwrap();
+
+        assert_eq!(
+            activate_legacy_preservation(directory.path()).unwrap_err(),
+            "incompatible_legacy_writer_active"
+        );
+        assert!(!directory.path().join(PRESERVE_LEGACY_MARKER).exists());
+        drop(active);
+
+        assert_eq!(
+            activate_legacy_preservation(directory.path()).unwrap(),
+            LegacyPreservationActivation::Activated
+        );
+        assert_eq!(
+            fs::read(directory.path().join(PRESERVE_LEGACY_MARKER)).unwrap(),
+            PRESERVE_LEGACY_MARKER_BYTES
+        );
+        let manifest = read_preservation_manifest(directory.path()).unwrap();
+        assert_eq!(manifest.sources.len(), 1);
+        assert_eq!(manifest.sources[0].bytes, 3);
+        assert!(manifest.sources[0].complete_line_terminated);
+        assert!(manifest.baseline_coverage_uncertain);
+        assert_eq!(
+            activate_legacy_preservation(directory.path()).unwrap(),
+            LegacyPreservationActivation::AlreadyActive
+        );
+    }
+
+    #[test]
+    fn preservation_activation_and_open_are_serialized_in_both_lock_orders() {
+        let activation_first = tempfile::tempdir().unwrap();
+        let activation_root = activation_first.path().to_path_buf();
+        let (activation_entered, activation_entered_result) = mpsc::channel();
+        let (activation_release, activation_release_result) = mpsc::channel();
+        let activation_thread = {
+            let root = activation_root.clone();
+            std::thread::spawn(move || {
+                activate_legacy_preservation_with_lock_barrier(
+                    &root,
+                    activation_entered,
+                    activation_release_result,
+                )
+            })
+        };
+        activation_entered_result.recv().unwrap();
+
+        let (open_entered, open_entered_result) = mpsc::channel();
+        let (open_release, open_release_result) = mpsc::channel();
+        let open_thread = {
+            let root = activation_root.clone();
+            std::thread::spawn(move || {
+                FlightRecorder::open_with_lock_barrier(
+                    root,
+                    RecorderConfig::default(),
+                    open_entered,
+                    open_release_result,
+                )
+            })
+        };
+        activation_release.send(()).unwrap();
+        assert_eq!(
+            activation_thread.join().unwrap().unwrap(),
+            LegacyPreservationActivation::Activated
+        );
+        open_entered_result.recv().unwrap();
+        open_release.send(()).unwrap();
+        let preserved_recorder = open_thread.join().unwrap().unwrap();
+        assert!(
+            preserved_recorder
+                .inner
+                .active_path
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("-preserved-")
+        );
+
+        let open_first = tempfile::tempdir().unwrap();
+        let open_root = open_first.path().to_path_buf();
+        let (open_entered, open_entered_result) = mpsc::channel();
+        let (open_release, open_release_result) = mpsc::channel();
+        let open_thread = {
+            let root = open_root.clone();
+            std::thread::spawn(move || {
+                FlightRecorder::open_with_lock_barrier(
+                    root,
+                    RecorderConfig::default(),
+                    open_entered,
+                    open_release_result,
+                )
+            })
+        };
+        open_entered_result.recv().unwrap();
+
+        let (activation_entered, activation_entered_result) = mpsc::channel();
+        let (activation_release, activation_release_result) = mpsc::channel();
+        let activation_thread = {
+            let root = open_root.clone();
+            std::thread::spawn(move || {
+                activate_legacy_preservation_with_lock_barrier(
+                    &root,
+                    activation_entered,
+                    activation_release_result,
+                )
+            })
+        };
+        open_release.send(()).unwrap();
+        let legacy_recorder = open_thread.join().unwrap().unwrap();
+        activation_entered_result.recv().unwrap();
+        activation_release.send(()).unwrap();
+        assert_eq!(
+            activation_thread.join().unwrap().unwrap_err(),
+            "incompatible_legacy_writer_active"
+        );
+        assert!(!open_root.join(PRESERVE_LEGACY_MARKER).exists());
+        assert!(
+            !legacy_recorder
+                .inner
+                .active_path
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("-preserved-")
+        );
+    }
+
+    #[test]
+    fn legacy_rotation_rechecks_marker_and_never_mutates_existing_shards() {
+        for (case, marker) in [
+            ("active", PRESERVE_LEGACY_MARKER_BYTES),
+            ("invalid", b"torn".as_slice()),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let recorder = recorder(directory.path(), 256, 1);
+            assert_eq!(
+                recorder.append_jsonl_encoded(
+                    b"before-marker\n".to_vec(),
+                    AppendCoordination::Synchronous,
+                ),
+                RecordStatus::Appended
+            );
+            let original_path = recorder.inner.active_path.clone().unwrap();
+            let original_bytes = fs::read(&original_path).unwrap();
+            publish_create_once(directory.path(), PRESERVE_LEGACY_MARKER, marker).unwrap();
+
+            let mut full_record = vec![b'x'; 255];
+            full_record.push(b'\n');
+            assert_eq!(
+                recorder
+                    .append_jsonl_encoded(full_record.clone(), AppendCoordination::Synchronous,),
+                RecordStatus::Appended,
+                "{case} marker did not switch to preservation rotation"
+            );
+            assert_eq!(fs::read(&original_path).unwrap(), original_bytes, "{case}");
+
+            let first_snapshot = fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| is_flight_shard(path))
+                .map(|path| {
+                    let bytes = fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(first_snapshot.len(), 2, "{case}: {first_snapshot:?}");
+            assert!(first_snapshot.keys().any(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("-preserved-")
+            }));
+            assert!(first_snapshot.keys().all(|path| {
+                !path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with(".jsonl.1")
+            }));
+
+            assert_eq!(
+                recorder.append_jsonl_encoded(full_record, AppendCoordination::Synchronous),
+                RecordStatus::Appended
+            );
+            for (path, bytes) in first_snapshot {
+                assert!(path.exists(), "{case}: removed {}", path.display());
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    bytes,
+                    "{case}: {}",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                fs::read_dir(directory.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| is_flight_shard(path))
+                    .count(),
+                3,
+                "{case} rotation did not create a unique successor"
+            );
+        }
+    }
+
+    #[test]
+    fn preservation_activation_directory_cap_never_publishes_a_partial_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        for ordinal in 0..MAX_PRESERVATION_SOURCES {
+            fs::write(directory.path().join(format!("unrelated-{ordinal}")), b"").unwrap();
+        }
+
+        assert_eq!(
+            activate_legacy_preservation(directory.path()).unwrap_err(),
+            "preservation_directory_limit_reached"
+        );
+        assert!(!directory.path().join(PRESERVE_LEGACY_MARKER).exists());
+        assert!(!directory.path().join(PRESERVE_LEGACY_MANIFEST).exists());
+    }
+
+    #[test]
+    fn preservation_mode_rotates_unique_immutable_shards_and_defers_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        activate_legacy_preservation(directory.path()).unwrap();
+        let recorder = recorder(directory.path(), 1_024, 1);
+        for ordinal in 0..24 {
+            failed_span(&recorder, &format!("preserved-rotation-{ordinal}"));
+        }
+        recorder.drain_deferred_for_test().unwrap();
+
+        let mut shards = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| is_flight_shard(path))
+            .collect::<Vec<_>>();
+        shards.sort();
+        assert!(shards.len() > 1, "{shards:?}");
+        assert!(shards.iter().all(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("-preserved-")
+        }));
+        assert!(
+            shards
+                .iter()
+                .all(|path| fs::metadata(path).unwrap().len() > 0)
+        );
+
+        let cleanup = recorder.cleanup_stale_shards();
+        assert!(cleanup.preservation_deferred);
+        assert_eq!(cleanup.directory_entries_examined, 0);
+        assert_eq!(cleanup.retired_shards, 0);
+        assert!(!cleanup.aggregate_limit_satisfied);
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| is_flight_shard(path))
+                .count(),
+            shards.len()
+        );
+    }
+
+    #[test]
+    fn invalid_preservation_marker_fails_safe_against_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join(PRESERVE_LEGACY_MARKER), b"torn").unwrap();
+        let recorder = recorder(directory.path(), 1_024, 1);
+        let cleanup = recorder.cleanup_stale_shards();
+        assert!(cleanup.preservation_deferred);
+        assert_eq!(cleanup.directory_entries_examined, 0);
     }
 
     #[test]
@@ -3648,6 +4842,7 @@ mod tests {
             completed_at: Some("2026-01-01T00:00:01Z".into()),
             retention_eligible_at: Some("2026-01-01T00:00:01Z".into()),
             retention_status: MaintenanceRetentionStatus::Eligible,
+            preservation_deferred: false,
             directory_entries_examined: usize::MAX,
             directory_entries_unreadable: usize::MAX,
             directory_limit_reached: true,

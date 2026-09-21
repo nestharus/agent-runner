@@ -7,6 +7,16 @@ Decision: **producer-partitioned SQLite/WAL event generations**
 Primary implementation owner: **AGE-376**, composed with **AGE-372** retention
 policy and **AGE-377** detached maintenance as assigned below
 
+Implementation status (AGE-376): the producer-partitioned version-1 envelope,
+STRICT SQLite/WAL generations, process-local bounded writer, exact-head
+rotation/recovery, checksummed two-slot head, prepared/sealed manifests,
+bounded readers/reconciliation, preservation-mode JSONL, bounded legacy import,
+bounded union reads, and non-destructive maintenance interfaces are implemented in
+`crates/oulipoly-state/src/event_store/` and the diagnostic producer modules.
+Historical scheduling, singleton maintenance jobs, policy approval, and actual
+repair/compaction/quarantine/retirement remain deliberately unimplemented here;
+they compose through AGE-372 and AGE-377.
+
 Evidence: [`planning/age-375-event-storage-evaluation/report.md`](../../planning/age-375-event-storage-evaluation/report.md)
 
 ## Decision
@@ -200,7 +210,7 @@ The version-1 `STRICT` event table has these required fields:
 | `schema_version INTEGER NOT NULL` | `1` for this envelope. Unknown versions remain discoverable but are not decoded. |
 | `family INTEGER NOT NULL` | Bounded enum: diagnostic, trace, metric, log, maintenance. |
 | `kind TEXT NOT NULL` | Registered label, UTF-8, at most 64 bytes; no arbitrary user input. |
-| `recorded_at_unix_micros INTEGER NOT NULL` | Producer wall time for range search. |
+| `recorded_at_unix_micros INTEGER NOT NULL` | Producer occurrence wall time for range search. For AGE-371 lifecycle records this is parsed from their authoritative `recorded_at`, not resampled during event-store submission. |
 | `ingested_at_unix_micros INTEGER NOT NULL` | Event-writer wall time for retention and lag. |
 | `producer_sequence INTEGER NOT NULL` | Monotonic source-local ordering; unique with writer instance. A native writer instance is one producer source; each legacy source is its own import writer. |
 | `writer_instance_id`, `process_instance_id`, `process_root_id` | 16-byte stable correlation IDs. |
@@ -230,6 +240,18 @@ shadow/fallback receive byte-equivalent immutable envelope fields. A sink must
 not mint an ID inside `append`. This is what makes shadow comparison and retry
 refer to one logical event rather than two observations that merely look alike.
 
+The version-1 logical identity digest includes the event ID, schema/family/kind,
+recorded time, stable process-tree/native-process identity, typed correlations,
+and normalized payload metadata and bytes. It deliberately excludes physical
+placement and import metadata: `writer_instance_id`, `ingested_at`,
+generation/retry linkage, and `legacy_provenance`. Producer sequence remains
+part of logical identity because it is assigned once before fanout. Native
+pre-fanout copies retain those fields byte-for-byte. A detached importer may
+replace writer/physical partition placement and attach provenance while
+retaining the same logical event ID, producer sequence, and digest; the
+original writer value remains explicit in its source evidence rather than
+being mistaken for the import partition's fact.
+
 ## Append, durability, and unknown outcomes
 
 The process-local writer groups at most 32 records, 1 MiB of encoded payload,
@@ -258,9 +280,18 @@ digests are one logical event and a repair issue; unequal digests are a hard
 conflict. No event retry changes coordination state.
 
 Backpressure is bounded. Best-effort observations may return an explicit
-`Dropped`/gap reason; required-durable callers may wait only under a registered
-runtime cap. Neither path may hold the State or PID-mailbox SQLite writer while
-waiting for event persistence.
+`Dropped`/gap reason. Once admitted, their `PendingAppend` and exact pre-fanout
+envelope move through a second bounded nonblocking handoff to the recorder
+worker, which waits outside State/PID-mailbox producer threads. A successful
+normal-mode commit produces no JSONL copy; an unknown write, identity/append
+failure, or lost reply routes that same envelope nonblockingly to emergency
+JSONL. Completion-handoff or fallback loss emits an explicit bounded gap.
+Required-durable callers use the same nonwaiting bounded queue admission and,
+once accepted, wait for the real commit/reconciliation outcome only at the
+top-level safe boundary before acquiring a State or PID-mailbox writer. No
+synthetic timeout turns unfinished persistence into a fabricated failure.
+Neither path may hold the State or PID-mailbox SQLite writer while waiting for
+event persistence.
 
 Event-store SQLite operations do not recursively emit per-transaction
 `DiagnosticEvent` records into the same sink. They update bounded in-memory
@@ -485,11 +516,18 @@ be reconstructed and is reported as baseline coverage uncertainty. Updated
 recorder initialization checks that exact path before cleanup and then obeys
 these rules:
 
-- `FlightRecorder::open` does not enumerate the recorder directory and does not
-  invoke stale-shard cleanup in preservation mode;
+- `FlightRecorder::open` serializes its exact-marker decision and active-shard
+  creation/lease with activation under the same retention lock. Thus activation
+  either inventories after detecting/refusing the active legacy writer, or the
+  opener observes the durably published marker. Open does not enumerate the
+  recorder directory and does not invoke stale-shard cleanup in preservation
+  mode;
 - rotation closes the exact current shard and creates a uniquely named
   immutable successor; it never reuses/truncates ordinal names or deletes the
-  fourth shard; and
+  fourth shard. A legacy-mode writer reacquires the retention lock and rechecks
+  the exact marker before every ordinal truncate/rename/unlink; present or
+  unreadable state permanently switches it to create-once preservation
+  rotation; and
 - the seven-day/aggregate cleanup and explicit `cleanup_stale_shards` request
   perform no scan or deletion in-process. The request may emit a bounded
   detached-work notification and returns `preservation_deferred`; AGE-377 work
@@ -510,6 +548,9 @@ complete-line byte offset/ordinal, prefix digest, supported/unsupported/torn
 counts, and imported event IDs. Device/inode and path are change-detection
 evidence only; rename does not change identity. Active, changing, torn-tail,
 unreadable, or replaced sources remain preserved and explicitly incomplete.
+The source read itself is capped at one byte beyond the declared limit, so a
+file that grows after its first metadata read cannot turn a bounded operation
+into an unbounded allocation.
 
 Legacy field derivation is deterministic and provenance-bearing:
 
@@ -517,7 +558,7 @@ Legacy field derivation is deterministic and provenance-bearing:
 |---|---|
 | AGE-369 diagnostic event with valid `event_id` | Preserve the ID. Otherwise use the first 16 bytes of SHA-256 over `oulipoly.legacy-event.v1`, `legacy_source_id`, complete-line byte offset, and line SHA-256. |
 | Producer/process identity | Preserve non-nil `producer_instance` as `process_instance_id`. Otherwise derive a 16-byte domain-separated hash from `legacy_source_id` and the available PID/boot/start tuple. Route each legacy source to a deterministic import partition whose `writer_instance_id` is a separate domain-separated hash of `legacy_source_id`. |
-| Producer sequence and process tree | Use the zero-based complete-record ordinal within that immutable source. If no stable root identity exists, set `process_root_id=process_instance_id`, leave parent null, and mark provenance `synthetic_self_root`; never infer a parent from PID alone. |
+| Producer sequence and process tree | Preserve an existing version-1 envelope's pre-fanout producer sequence. For older diagnostic/lifecycle inputs, use the zero-based complete-record ordinal within that immutable source. If no stable root identity exists, set `process_root_id=process_instance_id`, leave parent null, and mark provenance `synthetic_self_root`; never infer a parent from PID alone. |
 | Trace/span/time | Preserve valid diagnostic/span/parent UUID bytes and parsed RFC3339 record time. Missing/invalid required values make the record unsupported rather than guessed. Import time is `ingested_at`; original time remains `recorded_at`. |
 | Payload/correlations | Normalize through the version-1 redactor, calculate length/SHA-256 after normalization, and attach source ID, offset, original schema, and every synthetic/unavailable field as `legacy_provenance`. |
 | Lifecycle-log record without an event ID | Use the same source/offset/line-digest event-ID rule. Import only a complete recognized frame with trustworthy source timestamp and valid invocation UUID; otherwise preserve and report unsupported. |
@@ -531,6 +572,11 @@ presence plus domain-separated path fingerprints, never path text. Error chains,
 provider/model/source values, terminal reasons, and other strings pass through
 the AGE-369 size/secret/path redactor before payload hashing. Unknown fields are
 rejected or recorded as bounded provenance; they are not copied wholesale.
+The normalizer validates AGE-371's identical `recorded_at` /
+`retention_eligible_at` projection and eligible status. It uses `recorded_at`
+as the envelope occurrence time but omits all three record-timestamp fields
+from the normalized payload: lifecycle JSONL owns that record projection,
+while sealed generation metadata and AGE-372 policy own event-store retention.
 
 Cutover then proceeds in these stages:
 
@@ -538,8 +584,8 @@ Cutover then proceeds in these stages:
    tables; establish one pre-fanout event identity.
 2. Shadow-write eligible normalized envelopes to both sinks and compare IDs,
    counts, digests, gaps, and bounded reader results.
-3. Add a union reader that deduplicates by event ID and exposes source/import
-   coverage.
+3. Use the bounded union reader, which deduplicates by event ID and exposes
+   source/import coverage without performing discovery or import itself.
 4. Run the bounded importer against leased closed sources and publish completion
    receipts.
 5. Make partitioned SQLite the normal sink after shadow verification. JSONL is
@@ -583,9 +629,11 @@ their authority-neutral provenance.
 - Preservation mode deliberately removes the legacy four-shard/seven-day
   deletion bounds, so fallback/shadow disk growth remains a visible risk until
   AGE-372 eligibility and AGE-377 execution retire imported sources.
-- The generation-directory/two-slot protocol is specified but not implemented
-  here. AGE-376 must prove same-filesystem rename and durable directory-sync
-  behavior on supported platforms; unsupported semantics fail to fallback.
+- The generation-directory/two-slot protocol requires same-filesystem rename
+  and durable file/directory sync. AGE-376 validates those preconditions and
+  fails producer initialization to JSONL fallback when they are unavailable;
+  platform/filesystem durability still depends on the underlying VFS honoring
+  sync operations.
 - The 64-MiB, 32-record, 1-MiB, and 10-ms thresholds are accepted version-1
   defaults. Later tuning may change bounds without changing topology, identity,
   authority, or publication semantics.

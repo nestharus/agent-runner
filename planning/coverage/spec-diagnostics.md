@@ -4,6 +4,15 @@
 
 - `crates/oulipoly-state/src/diagnostic_recorder.rs`
 - `crates/oulipoly-state/src/diagnostic_producer.rs`
+- `crates/oulipoly-state/src/event_store/mod.rs`
+- `crates/oulipoly-state/src/event_store/envelope.rs`
+- `crates/oulipoly-state/src/event_store/schema.rs`
+- `crates/oulipoly-state/src/event_store/generation.rs`
+- `crates/oulipoly-state/src/event_store/writer.rs`
+- `crates/oulipoly-state/src/event_store/reader.rs`
+- `crates/oulipoly-state/src/event_store/union_reader.rs`
+- `crates/oulipoly-state/src/event_store/importer.rs`
+- `crates/oulipoly-state/src/event_store/maintenance.rs`
 - `crates/oulipoly-state/src/sqlite_observability.rs`
 - `crates/oulipoly-state/src/db/invocation_lifecycle_finalize.rs`
 - `crates/oulipoly-state/src/db/opening_read_only.rs`
@@ -63,6 +72,9 @@
 - For offline flight-recorder inspection: a configured application data root;
   primary State, PID-mailbox SQLite, provider configuration, and runtime services
   are not preconditions.
+- Partitioned SQLite cutover additionally requires the exact durable
+  `PRESERVE-LEGACY-V1` marker and preservation manifest. Without that explicit
+  offline activation, the legacy JSONL producer remains the normal sink.
 
 ## AGE-319 flight-recorder coverage
 
@@ -177,6 +189,9 @@ family-specific contract supplies authoritative clocks.
 | `diagnostics recent --limit N [--json]` runs while State and PID-mailbox SQLite are unavailable or held in valid live write transactions. | The process routes before completion-owner bootstrap, recovery, tracing initialization, or runtime-service construction; one bounded inspection generation of the default flight-recorder root produces both the raw recent failures and their coalesced groups, with the same retained coverage and reader issues. It does not mutate the held stores. |
 | `diagnostics trace <diagnostic-id> [--json]` runs while State and PID-mailbox SQLite are unavailable. | The process routes through the same offline boundary and reports only retained source records for the diagnostic ID plus coverage/issues; an empty retained trace is not represented as database or delivery success. |
 | A selected State or PID-mailbox control-plane transaction is attempted. | Its top-level resource-scoped span synchronously appends `Requested` before the real `BEGIN IMMEDIATE`, then submits only phases actually observed: `Acquired`, `CommitStarted`, `Committed`, contention/failure, and `Released`. A nested sidecar child submits its `Requested` observation nonblockingly before sidecar authority/open/fence work because the parent database writer is already held. SQLite begin/commit failures retain primary and extended codes plus configured busy timeout and observed wait; recorder failure never changes the transaction result. |
+| Preservation has been durably activated for a producer process. | Eligible diagnostic and lifecycle observations receive one normalized event ID/digest before fan-out. The process-local SQLite/WAL writer is the normal sink; shadow mode or SQLite failure/backpressure writes that same envelope to the process's uniquely named exact-current JSONL shard without changing State/PID-mailbox results. |
+| Preservation is absent or its exact marker is invalid. | Absence keeps the legacy JSONL path active. An invalid marker fails safe against historical cleanup and does not authorize SQLite cutover. Neither case causes root-process history enumeration or import. |
+| Invocation lifecycle telemetry is emitted. | A typed allowlist parses invocation identity, hashes raw session identity, converts artifact paths to role/fingerprint evidence, normalizes/redacts bounded scalar values, validates the AGE-371 record timestamp/eligibility projection, and constructs the event envelope before SQLite/JSONL sink selection. The envelope occurrence is the record's authoritative `recorded_at`; record-level retention fields are not duplicated into its payload, and the pre-existing lifecycle callback retains its input shape and authority behavior. |
 | A typed SQLite observation is retained. | The event includes a stable query family, database role/path class, transaction mode and phase, observed operation elapsed time, only honestly separable sub-durations/counts, explicit measurement gaps, typed SQLite result codes on failure, and existing diagnostic/invocation correlations. It never contains SQL, expanded SQL, bound values, credentials, or raw database paths. |
 | Root-supervisor continuation acceptance, custody attachment, phase advance, or bounded reconciliation scan meets a retention condition. | The PID-mailbox statement is correlated by hashed attempt/owner/supervisor identity. Autocommit writes report exact rows changed and classify writer wait/execution as inseparable; the read reports execution time and exact rows returned while leaving rows examined unavailable. |
 | Completion registration crosses State and PID-mailbox authority. | State and sidecar use distinct parent/child spans under one diagnostic ID. State `Released` occurs after its commit and before sidecar commit; neither resource commit is represented as delivery, ACK, process exit, or complete cross-store settlement. |
@@ -260,6 +275,23 @@ family-specific contract supplies authoritative clocks.
   writer next makes progress or at the next top-level pre-database `Requested`
   boundary. Once-per-stage therefore means at most one handoff attempt, not proof
   that stderr accepted or retained the notification.
+- Event-store append is evidence-only. A top-level pre-transaction observation
+  may wait after bounded queue admission for its SQLite commit; observations
+  emitted while a State/PID-mailbox writer may be held use nonblocking enqueue.
+  Accepted best-effort work hands its pending reply and exact envelope to the
+  bounded recorder worker without waiting. Worker-side unknown writes,
+  identity/append failures, and reply loss route that envelope to emergency
+  JSONL; successful normal-mode commits do not shadow-write. Completion-handoff
+  saturation/disconnection and fallback failure produce explicit diagnostic
+  gaps and never alter the protected operation.
+- Under the exact preservation marker, legacy cleanup performs no directory
+  scan or deletion. Rotation syncs and closes only the exact active shard and
+  opens a create-once, uniquely named successor; the four-shard, seven-day, and
+  aggregate cleanup policies are suspended until AGE-372/AGE-377 retirement.
+  Startup marker selection plus active-shard creation/lease and activation
+  inventory are serialized by the retention lock. A legacy writer also
+  rechecks the marker under that lock before every destructive rotation and
+  switches to create-once rotation when marker state is present or unreadable.
 - The default recorder has a bounded deferred queue of
   `DEFAULT_DEFERRED_QUEUE_CAPACITY` (1024), configurable as
   `RecorderConfig::deferred_queue_capacity`. A top-level `Requested` waits for the

@@ -37,6 +37,7 @@ mod db;
 pub mod deployment;
 mod diagnostic_producer;
 pub mod diagnostic_recorder;
+pub mod event_store;
 mod filesystem_identity;
 pub mod invocation_marker;
 mod lifecycle_log;

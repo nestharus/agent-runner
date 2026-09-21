@@ -1,7 +1,22 @@
-# spec-event-storage — Durable diagnostic event-storage decision and evaluator
+# spec-event-storage — Producer-partitioned diagnostic event store and evaluator
 
 ## Source files
 
+- `crates/oulipoly-state/src/event_store/mod.rs`
+- `crates/oulipoly-state/src/event_store/envelope.rs`
+- `crates/oulipoly-state/src/event_store/schema.rs`
+- `crates/oulipoly-state/src/event_store/generation.rs`
+- `crates/oulipoly-state/src/event_store/writer.rs`
+- `crates/oulipoly-state/src/event_store/reader.rs`
+- `crates/oulipoly-state/src/event_store/union_reader.rs`
+- `crates/oulipoly-state/src/event_store/importer.rs`
+- `crates/oulipoly-state/src/event_store/maintenance.rs`
+- `crates/oulipoly-state/src/diagnostic_producer.rs`
+- `crates/oulipoly-state/src/diagnostic_recorder.rs`
+- `crates/oulipoly-state/src/lifecycle_log.rs`
+- `crates/oulipoly-state/src/lib.rs`
+- `runtime-caps.json`
+- `runtime-cap-exclusions.json`
 - `tools/event-storage-evaluation/Cargo.toml`
 - `tools/event-storage-evaluation/Cargo.lock`
 - `tools/event-storage-evaluation/README.md`
@@ -36,18 +51,23 @@
 | Evaluator receives an existing root or exceeds smoke guardrails. | It fails without deleting, truncating, or reusing the root. |
 | Concurrent producers append to producer-partitioned SQLite. | Each producer uses a distinct SQLite/WAL database; successful batch return follows a `synchronous=FULL` transaction commit. |
 | Multiple threads emit production events in one process. | They use that process's bounded event-writer worker and group commit; other process partitions do not share its WAL writer. |
+| A best-effort append is admitted and later fails in the event-writer worker. | The producer returns without waiting and protected work is unchanged. A bounded recorder-worker handoff retains the exact pre-fanout envelope until completion, then routes unknown write, identity/append failure, or reply loss to emergency JSONL. Handoff/fallback loss is an explicit bounded gap; successful normal-mode completion creates no shadow copy. |
 | Commit result is unknown. | Exact generation/event-ID/digest reconciliation precedes retry; missing/corrupt evidence remains `Unknown`, not absence. |
 | Reader searches time, family/kind, trace/span, invocation/session digest, process tree, or supervisor authority. | Local SQLite indexes answer candidate partitions; response includes partition watermarks, discovery/catalog coverage, and missing/corrupt/limited work. |
 | Current head reaches the day/size/lifecycle rotation boundary. | Writer syncs and validates the prepared successor manifest/database, renames the complete staging directory, drains already-ticketed batches, closes the old generation, and publishes the successor through the inactive two-slot head record. It does not scan, checkpoint, compact, or retain old history synchronously. |
 | Detached catalog is absent/stale. | Reader uses bounded manifest fallback or returns incomplete coverage; it never fabricates an empty complete result. |
-| Closed event partition passes the 30-day cutoff. | AGE-372 approves policy eligibility from AGE-376 metadata; only an AGE-377 detached leased worker may checkpoint/seal and atomically rename the complete generation directory to pending trash, publish a receipt, and unlink it. |
+| Closed event partition passes the 30-day cutoff. | AGE-372 approves policy eligibility from AGE-376 prepared/sealed metadata; only an AGE-377 detached leased worker may checkpoint and atomically rename the complete generation directory to pending trash, publish a receipt, and unlink it. |
 | Event storage is unavailable. | Live coordination proceeds unchanged; the bounded emergency JSONL recorder records a gap/fallback when possible under preservation mode. |
-| JSONL shadow/fallback compatibility is enabled. | A durable preservation marker precedes shadowing; root processes rotate uniquely named exact current shards without directory enumeration or deletion, and import/retirement remain detached. |
+| JSONL shadow/fallback compatibility is enabled. | A durable preservation marker precedes shadowing. Activation and recorder open serialize marker selection plus active-shard creation/lease under one retention lock, and every legacy destructive rotation rechecks the marker under that lock. Present/unreadable state selects uniquely named create-once rotation without enumeration, truncation, overwrite, or deletion; import/retirement remain detached. |
+| Partition and exact preserved-source results overlap during cutover. | The bounded read-only union validates envelopes and source/checkpoint/receipt identity, deduplicates equal event IDs/digests, refuses conflicts, preserves both origins, and returns explicit incomplete source/limit coverage without discovery, import, or scheduling. |
 
 ## Edge cases
 
 - Equal event ID and equal immutable digest is idempotent; equal ID with unequal
   bytes is an identity conflict.
+- Native fallback and its imported copy retain one logical digest even though
+  the importer assigns deterministic physical partition placement and explicit
+  legacy provenance; its pre-fanout producer sequence is preserved.
 - One SQLite transaction rolls back entirely after interruption; an uncommitted
   row and its indexes do not become visible on reopen.
 - Torn framed prototype tail is removed only to the last complete frame; a
@@ -69,6 +89,8 @@
   importer source cannot disappear before its receipt and 30-day eligibility.
 - Legacy synthetic root/sequence/identity values carry explicit provenance and
   never masquerade as observed process-tree facts.
+- A legacy source that grows after its metadata snapshot consumes at most the
+  declared byte limit plus one byte and returns explicit incomplete coverage.
 - Cross-partition reads are per-generation snapshots with explicit high-water
   marks, not one fabricated global snapshot.
 - Clock discontinuity does not define causality; producer sequence and explicit
@@ -128,13 +150,16 @@
 - `framed::tests::corrupt_shard_is_detected_independently`
 - `lsm::tests::duplicate_keys_remain_one_logical_record_after_reopen`
 
-AGE-376 must add subprocess interruption tests for every generation-directory
-and two-slot-head boundary, real SQLite crash/reopen, concurrent processes,
-unknown outcome reconciliation, bounded readers, corrupt/missing/pending-trash
-partitions, preservation-mode JSONL rotation, deterministic import provenance,
-lifecycle normalization/redaction, and 30-day eligibility metadata. AGE-377
-tests actual detached catalog rebuild, repair, compaction, and retirement
-execution under singleton leases using those fixtures/interfaces.
+Production tests under `oulipoly-state` cover envelope normalization/redaction,
+STRICT schema and indexes, duplicate/conflicting identities, exact-generation
+reconciliation, bounded readers and isolated partition failures, process-local
+writer rotation/restart, checksummed head publication, preservation-mode JSONL,
+deterministic import provenance, lifecycle normalization that retains the
+AGE-371 source occurrence time without duplicating its record-retention fields,
+and non-destructive
+bounded union reads, catalog/rebuild/eligibility interfaces. AGE-377 tests actual detached catalog
+rebuild, repair, compaction, and retirement execution under singleton leases
+using those fixtures/interfaces.
 
 ## Cross-references
 
