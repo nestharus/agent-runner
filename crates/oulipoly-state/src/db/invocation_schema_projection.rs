@@ -217,7 +217,8 @@ impl StateDb {
                     {provider_session_id}, {resume_input_id}, {provider_session_capture_method},
                     {provider_session_resolved_account},
                     resume_acceptance_status, resume_acceptance_evidence,
-                    created_at, finished_at
+                    created_at, finished_at, lifecycle_updated_at,
+                    retention_eligible_at, retention_status
              FROM invocations
              {tail_sql}"
         )

@@ -125,10 +125,17 @@ pub(super) struct FinalizeInvocationRow {
     pub(super) provider_name: Option<String>,
     pub(super) provider_session_id: Option<String>,
     pub(super) status: String,
+    pub(super) finished_at: Option<String>,
 }
 
-pub(super) type FinalizeInvocationRowColumns =
-    (String, String, Option<String>, Option<String>, String);
+pub(super) type FinalizeInvocationRowColumns = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+);
 
 pub(super) type OperationResult = &'static str;
 

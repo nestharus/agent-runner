@@ -53,7 +53,7 @@ fn migration_backfills_resolved_and_legacy_rows() {
     assert_eq!(rows[0].0, "mapped-model");
     assert_eq!(rows[0].1.as_deref(), Some("fixture-provider"));
     assert_eq!(rows[0].2, "succeeded");
-    assert_eq!(rows[0].4, "2026-04-17T08:00:00Z");
+    assert_eq!(rows[0].4, None);
     assert!(Uuid::parse_str(&rows[0].3).is_ok());
 
     // A model absent from the pushed lookup falls through to status='legacy'
@@ -61,7 +61,7 @@ fn migration_backfills_resolved_and_legacy_rows() {
     assert_eq!(rows[1].0, "missing-model");
     assert_eq!(rows[1].1, None);
     assert_eq!(rows[1].2, "legacy");
-    assert_eq!(rows[1].4, "2026-04-17T08:05:00Z");
+    assert_eq!(rows[1].4, None);
     assert!(Uuid::parse_str(&rows[1].3).is_ok());
 }
 
@@ -131,12 +131,12 @@ fn migration_with_empty_provider_lookup_marks_rows_legacy() {
         assert!(r.1.is_none(), "provider_name must be NULL on empty lookup");
         assert_eq!(r.2, "legacy", "status must be legacy on empty lookup");
         assert!(Uuid::parse_str(&r.3).is_ok());
-        assert!(!r.4.is_empty(), "finished_at must be backfilled");
+        assert_eq!(r.4, None, "legacy closure time must remain unknown");
     }
     drop(db);
 }
 
-type MigratedInvocationRow = (String, Option<String>, String, String, String);
+type MigratedInvocationRow = (String, Option<String>, String, String, Option<String>);
 
 fn migrated_invocation_rows(conn: &sqlite::Connection) -> Vec<MigratedInvocationRow> {
     conn.prepare(

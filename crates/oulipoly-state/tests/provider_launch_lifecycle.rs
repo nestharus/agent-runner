@@ -1,6 +1,7 @@
 use oulipoly_state::*;
 use rusqlite::{Connection, params};
 use uuid::Uuid;
+mod timestamp_fixture;
 
 fn fixture() -> (tempfile::TempDir, StateDb, BeginProviderLaunchRequest) {
     let dir = tempfile::tempdir().unwrap();
@@ -100,6 +101,7 @@ fn schema_22_migrates_provider_ownership_once_to_current() {
     let path = db.path().to_path_buf();
     drop(db);
     let conn = Connection::open(&path).unwrap();
+    timestamp_fixture::remove_v27_timestamp_contract(&conn);
     conn.execute_batch(
         "PRAGMA foreign_keys=OFF;
          DROP TRIGGER trg_invocation_completion_v2_identity_append_only_update;
@@ -139,6 +141,7 @@ fn schema_25_backfills_all_live_history_projections_from_explicit_evidence() {
     drop(db);
 
     let conn = Connection::open(&path).unwrap();
+    timestamp_fixture::remove_v27_timestamp_contract(&conn);
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/age360-paired-wire.json")).unwrap();
     let mut registration: serde_json::Value =

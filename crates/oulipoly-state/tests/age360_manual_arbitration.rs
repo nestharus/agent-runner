@@ -44,7 +44,13 @@ impl Fixture {
             .unwrap();
     }
     fn native(&self, phase: &str, launcher: bool) {
-        self.sql.execute_batch("INSERT INTO completion_continuation_owner SELECT 'owner',domain_id,'running','{}','{}','fixture' FROM completion_continuation_domain;
+        self.sql.execute_batch("UPDATE completion_supervisor_authority
+                SET phase='active',guardian_identity='{}'
+                WHERE authority_id='00000000-0000-4000-8000-000000000021';
+            INSERT INTO completion_continuation_owner(
+                generation,domain_id,phase,guardian_identity,driver_identity,endpoint)
+                SELECT 'owner',domain_id,'running','{}','{}','fixture'
+                FROM completion_continuation_domain;
             INSERT INTO session_wake_claim(session_id,claim_token,reason,auto_wake_count,claimed_at,min_pending_seq_at_claim,max_pending_seq_at_claim)
                 VALUES('session','token','fixture',1,'2026-01-01',1,1);
             INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,session_id,claim_token,phase,result_path)

@@ -45,7 +45,14 @@ fn migrate_live_history_barrier(conn: &Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-pub(super) const CURRENT_VERSION: i64 = 22;
+fn migrate_record_timestamp_contract(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!(
+        "migrations/0023_record_timestamp_contract.sql"
+    ))
+    .map_err(|error| error.to_string())
+}
+
+pub(super) const CURRENT_VERSION: i64 = 23;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -196,6 +203,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 22,
         owner: SidecarEntity::MailboxDelivery,
         apply: migrate_live_history_barrier,
+    },
+    MigrationStep {
+        target_version: 23,
+        owner: SidecarEntity::PayloadRetention,
+        apply: migrate_record_timestamp_contract,
     },
 ];
 
@@ -712,6 +724,7 @@ fn migrate_receipt_scan(conn: &Connection) -> Result<(), String> {
 /// user_version; this helper is never available to production migration code.
 #[cfg(test)]
 pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
+    remove_record_timestamp_contract_for_legacy_fixture(conn);
     conn.execute_batch(
         "DROP VIEW mailbox_retained_delivery_finalizers;
         DROP INDEX mailbox_completed_turn_pins_attempt;
@@ -736,6 +749,7 @@ pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
 /// tables while removing the additive v21 root-supervisor authority layer.
 #[cfg(test)]
 pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &Connection) {
+    remove_record_timestamp_contract_for_legacy_fixture(conn);
     conn.execute_batch(
         "DROP INDEX IF EXISTS idx_mailbox_pending_session_live;
          DROP INDEX IF EXISTS idx_mailbox_pending_target_live;
@@ -763,6 +777,69 @@ pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &C
          ALTER TABLE completion_continuation_owner DROP COLUMN supervisor_authority_id;
          ALTER TABLE completion_continuation_source DROP COLUMN supervisor_authority_id;
          ALTER TABLE completion_continuation_attempt DROP COLUMN supervisor_authority_id;",
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+fn remove_record_timestamp_contract_for_legacy_fixture(conn: &Connection) {
+    let present: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                           WHERE type='table' AND name='sidecar_timestamp_repairs')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !present {
+        return;
+    }
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS mailbox_timestamp_after_insert;
+         DROP TRIGGER IF EXISTS mailbox_timestamp_after_delivery;
+         DROP TRIGGER IF EXISTS mailbox_timestamp_after_terminal_error;
+         DROP TRIGGER IF EXISTS mailbox_enqueued_at_immutable;
+         DROP TRIGGER IF EXISTS mailbox_closed_at_immutable;
+         DROP TRIGGER IF EXISTS mailbox_delivered_at_immutable;
+         DROP TRIGGER IF EXISTS mailbox_delivery_attempt_timestamp_after_insert;
+         DROP TRIGGER IF EXISTS mailbox_delivery_attempt_timestamp_after_update;
+         DROP TRIGGER IF EXISTS mailbox_delivery_attempt_created_at_immutable;
+         DROP TRIGGER IF EXISTS mailbox_delivery_attempt_resolved_at_immutable;
+         DROP TRIGGER IF EXISTS completion_event_timestamp_after_trigger;
+         DROP TRIGGER IF EXISTS completion_event_triggered_at_immutable;
+         DROP TRIGGER IF EXISTS completion_event_created_at_immutable;
+         DROP TRIGGER IF EXISTS completion_event_terminal_reopen_forbidden;
+         DROP TRIGGER IF EXISTS completion_listener_timestamp_after_reactivation;
+         DROP TRIGGER IF EXISTS completion_listener_timestamp_after_retirement;
+         DROP TRIGGER IF EXISTS completion_listener_created_at_immutable;
+         DROP TRIGGER IF EXISTS completion_listener_closed_at_immutable;
+         DROP TRIGGER IF EXISTS runtime_generation_timestamp_after_transition;
+         DROP TRIGGER IF EXISTS runtime_generation_created_at_immutable;
+         DROP TRIGGER IF EXISTS runtime_generation_exited_at_immutable;
+         DROP TRIGGER IF EXISTS runtime_generation_terminal_reopen_forbidden;
+         DROP INDEX IF EXISTS idx_mailbox_retention_eligible_v23;
+         DROP INDEX IF EXISTS idx_mailbox_delivery_attempt_retention_v23;
+         DROP INDEX IF EXISTS idx_completion_event_retention_v23;
+         DROP INDEX IF EXISTS idx_completion_event_listener_retention_v23;
+         DROP INDEX IF EXISTS idx_runtime_generation_retention_v23;
+         ALTER TABLE mailbox DROP COLUMN retention_status;
+         ALTER TABLE mailbox DROP COLUMN retention_eligible_at;
+         ALTER TABLE mailbox DROP COLUMN closed_at;
+         ALTER TABLE mailbox_delivery_attempts DROP COLUMN retention_status;
+         ALTER TABLE mailbox_delivery_attempts DROP COLUMN retention_eligible_at;
+         ALTER TABLE mailbox_delivery_attempts DROP COLUMN updated_at;
+         ALTER TABLE completion_event DROP COLUMN retention_status;
+         ALTER TABLE completion_event DROP COLUMN retention_eligible_at;
+         ALTER TABLE completion_event DROP COLUMN closed_at;
+         ALTER TABLE completion_event DROP COLUMN updated_at;
+         ALTER TABLE completion_event_listener DROP COLUMN retention_status;
+         ALTER TABLE completion_event_listener DROP COLUMN retention_eligible_at;
+         ALTER TABLE completion_event_listener DROP COLUMN closed_at;
+         ALTER TABLE completion_event_listener DROP COLUMN updated_at;
+         ALTER TABLE runtime_generation DROP COLUMN retention_status;
+         ALTER TABLE runtime_generation DROP COLUMN retention_eligible_at;
+         ALTER TABLE runtime_generation DROP COLUMN updated_at;
+         DROP TABLE sidecar_timestamp_repairs;",
     )
     .unwrap();
 }

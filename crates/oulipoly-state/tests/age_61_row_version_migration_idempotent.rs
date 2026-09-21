@@ -69,6 +69,9 @@ fn ti_04_loader_level_idempotence_preserves_representative_rows() {
             "0022_provider_session_authority",
             "0023_provider_launch_lifecycle",
             "0024_completion_continuation_binding",
+            "0025_completed_turns",
+            "0026_live_history_barrier",
+            "0027_record_timestamp_contract",
         ]
     );
 

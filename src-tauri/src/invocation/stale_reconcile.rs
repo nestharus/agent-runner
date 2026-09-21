@@ -3,6 +3,7 @@
 //! Declared roles: orchestration, accessor, mapper, parser, predicate, formatter
 
 use chrono::{DateTime, Utc};
+use oulipoly_core::CancellationToken;
 use oulipoly_state::StateDb;
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRow, ProcessIdentity, ProcessIdentityObservation,
@@ -17,12 +18,6 @@ struct RunningInvocation {
     row_id: i64,
     invocation_uuid: String,
     created_at: DateTime<Utc>,
-}
-
-struct RunningInvocationRow {
-    row_id: i64,
-    invocation_uuid: String,
-    created_at_raw: String,
 }
 
 enum LiveProcessIdentityState {
@@ -61,109 +56,17 @@ fn path_exists(path: &Path) -> bool {
 }
 
 fn running_invocations(state: &StateDb) -> Result<Vec<RunningInvocation>, String> {
-    running_invocation_rows(state)?
+    state
+        .list_running_invocations_with_cancel(&CancellationToken::new())?
         .into_iter()
-        .map(running_invocation_from_row)
-        .collect()
-}
-
-fn running_invocation_rows(state: &StateDb) -> Result<Vec<RunningInvocationRow>, String> {
-    running_invocation_row_values(state)?
-        .into_iter()
-        .map(running_invocation_row_from_values)
-        .collect()
-}
-
-fn running_invocation_row_values(
-    state: &StateDb,
-) -> Result<Vec<RunningInvocationRowValues>, String> {
-    let connection = state.connection();
-    let mut stmt = connection
-        .prepare(
-            "SELECT id, invocation_uuid, created_at
-             FROM invocations
-             WHERE status = 'running' AND finished_at IS NULL",
-        )
-        .map_err(format_stale_running_prepare_error)?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(running_invocation_row_value(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-            ))
+        .map(|row| {
+            Ok(RunningInvocation {
+                row_id: row.id,
+                invocation_uuid: row.invocation_uuid,
+                created_at: row.created_at,
+            })
         })
-        .map_err(format_stale_running_query_error)?;
-    rows.map(|row| row.map_err(format_stale_running_row_error))
         .collect()
-}
-
-struct RunningInvocationRowValues {
-    row_id: i64,
-    invocation_uuid: String,
-    created_at_raw: String,
-}
-
-fn running_invocation_row_value(
-    row_id: i64,
-    invocation_uuid: String,
-    created_at_raw: String,
-) -> RunningInvocationRowValues {
-    RunningInvocationRowValues {
-        row_id,
-        invocation_uuid,
-        created_at_raw,
-    }
-}
-
-fn running_invocation_row_from_values(
-    values: RunningInvocationRowValues,
-) -> Result<RunningInvocationRow, String> {
-    Ok(running_invocation_row(
-        values.row_id,
-        values.invocation_uuid,
-        values.created_at_raw,
-    ))
-}
-
-fn format_stale_running_prepare_error(err: impl std::fmt::Display) -> String {
-    format!("Failed to prepare stale-running query: {err}")
-}
-
-fn format_stale_running_query_error(err: impl std::fmt::Display) -> String {
-    format!("Failed to query stale-running rows: {err}")
-}
-
-fn format_stale_running_row_error(err: impl std::fmt::Display) -> String {
-    format!("Failed to map stale-running row: {err}")
-}
-
-fn running_invocation_row(
-    row_id: i64,
-    invocation_uuid: String,
-    created_at_raw: String,
-) -> RunningInvocationRow {
-    RunningInvocationRow {
-        row_id,
-        invocation_uuid,
-        created_at_raw,
-    }
-}
-
-fn running_invocation_from_row(row: RunningInvocationRow) -> Result<RunningInvocation, String> {
-    let created_at = parse_running_invocation_created_at(&row.created_at_raw)?;
-    Ok(RunningInvocation {
-        row_id: row.row_id,
-        invocation_uuid: row.invocation_uuid,
-        created_at,
-    })
-}
-
-fn parse_running_invocation_created_at(created_at_raw: &str) -> Result<DateTime<Utc>, String> {
-    let created_at = DateTime::parse_from_rfc3339(created_at_raw)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|err| format!("Failed to parse stale-running created_at: {err}"))?;
-    Ok(created_at)
 }
 
 fn running_invocation_is_stale(row: &RunningInvocation, now: DateTime<Utc>) -> bool {

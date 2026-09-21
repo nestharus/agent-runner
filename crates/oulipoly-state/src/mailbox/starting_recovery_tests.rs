@@ -130,10 +130,9 @@ fn admission_recovers_later_ended_rows_behind_unknown_oldest() {
     eventually(|| root.path().join("ready").exists());
     let mut db = MailboxDb::open(&root.path().join("pid-identity.db")).unwrap();
     let unknown = RuntimeGenerationId::parse(UNKNOWN_ID).unwrap();
-    // Persisted ordering fixture: an older unresolved historical row. Only
-    // timestamps/old epoch are synthesized, not same-boot custody evidence.
-    db.conn.execute("UPDATE runtime_generation SET created_at = '2000-01-01T00:00:00Z' WHERE generation_uuid = ?1",
-        params![unknown.to_string()]).unwrap();
+    // Persisted ordering fixture: the first-created unresolved historical row.
+    // Its creation timestamp remains immutable; only old-epoch custody
+    // evidence is synthesized below for the later recoverable row.
     let boot_ended = RuntimeGenerationId::new();
     create(&mut db, &boot_ended, "boot-ended", None);
     db.conn.execute("UPDATE runtime_generation SET creator_identity_os_boot_id = ?1 WHERE generation_uuid = ?2",

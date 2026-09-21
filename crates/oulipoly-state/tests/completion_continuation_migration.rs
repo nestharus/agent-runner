@@ -1,11 +1,13 @@
 use oulipoly_state::{StateDb, migrations, schema::CURRENT_SCHEMA_VERSION};
 use rusqlite::Connection;
+mod timestamp_fixture;
 
 fn schema_23() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     drop(StateDb::open(&path).unwrap());
     let conn = Connection::open(&path).unwrap();
+    timestamp_fixture::remove_v27_timestamp_contract(&conn);
     conn.execute_batch(
         "PRAGMA foreign_keys=OFF;
          DROP TRIGGER trg_invocation_completion_v2_identity_append_only_update;

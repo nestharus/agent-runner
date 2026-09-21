@@ -181,7 +181,11 @@ pub(in crate::db::tests) fn seed_invocation_for_session(
     created_at: &str,
 ) {
     let id = db
-        .start_invocation(&session_seed_invocation_start(model_name, provider_name))
+        .insert_invocation_start_row_raw(
+            &session_seed_invocation_start(model_name, provider_name),
+            created_at,
+            None,
+        )
         .unwrap();
     db.update_session_capture(
         crate::InvocationMutationAuthority::Standalone,
@@ -192,7 +196,7 @@ pub(in crate::db::tests) fn seed_invocation_for_session(
     .unwrap();
     db.conn
         .execute(
-            "UPDATE invocations SET created_at = ?1, finished_at = ?1 WHERE id = ?2",
+            "UPDATE invocations SET finished_at = ?1 WHERE id = ?2",
             sqlite::params![created_at, id],
         )
         .unwrap();

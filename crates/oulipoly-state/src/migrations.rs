@@ -159,6 +159,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0026_live_history_barrier.sql"),
         post_sql_hook: None,
     },
+    Migration {
+        target_version: 27,
+        id: "0027_record_timestamp_contract",
+        sql: include_str!("../migrations/0027_record_timestamp_contract.sql"),
+        post_sql_hook: Some(crate::StateDb::install_invocation_timestamp_contract),
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {
@@ -221,6 +227,44 @@ pub fn run_with_db_path(
         run_planned_step_with_path(conn, migration, db_path.clone())?;
     }
     Ok(())
+}
+
+/// Establish the v5 baseline for the one sanctioned versionless pre-UUID
+/// invocation shape without executing v4/v5 statements that name columns the
+/// legacy table cannot have. Baseline DDL and the version stamp commit
+/// together, so every crash boundary is either the original versionless shape
+/// or a resumable v5 database.
+pub(crate) fn normalize_versionless_pre_uuid_baseline(
+    conn: &mut Connection,
+    db_path: PathBuf,
+) -> Result<(), MigrationError> {
+    const STEP_ID: &str = "0004_versionless_pre_uuid_baseline";
+    register_connection_primitives(conn)
+        .map_err(|source| map_primitive_registration_error(db_path.clone(), source))?;
+    begin_migration_transaction(conn).map_err(|source| MigrationError::StepFailed {
+        db_path: db_path.clone(),
+        id: STEP_ID,
+        target_version: 5,
+        source,
+    })?;
+    let result = apply_versionless_pre_uuid_baseline(conn)
+        .and_then(|_| record_migration_target_version(conn, 5))
+        .and_then(|_| commit_migration_transaction(conn));
+    finalize_migration_transaction(conn, result).map_err(|source| MigrationError::StepFailed {
+        db_path,
+        id: STEP_ID,
+        target_version: 5,
+        source,
+    })
+}
+
+fn apply_versionless_pre_uuid_baseline(conn: &Connection) -> Result<(), rusqlite::Error> {
+    const FIRST_SHAPE_INDEPENDENT_STATEMENT: &str = "CREATE TABLE IF NOT EXISTS providers";
+    let baseline = include_str!("../migrations/0004_state_db_schema_boundary.sql");
+    let offset = baseline
+        .find(FIRST_SHAPE_INDEPENDENT_STATEMENT)
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    conn.execute_batch(&baseline[offset..])
 }
 
 pub(crate) fn register_connection_primitives(conn: &Connection) -> Result<(), rusqlite::Error> {

@@ -52,6 +52,34 @@ impl StateDb {
         Self::create_migrated_invocation_indexes(&tx)?;
         Self::ensure_completion_registration_authority_trigger(&tx)?;
         Self::ensure_invocations_row_version_support(&tx)?;
+        Self::install_invocation_timestamp_contract(&tx).map_err(|error| {
+            format!("Failed to install migrated invocation timestamp contract: {error}")
+        })?;
+
+        Self::commit_invocation_migration(tx)
+    }
+
+    /// Rebuild the one supported pre-UUID invocation shape after migrations
+    /// through v26, but before v27 installs the timestamp contract. Keeping
+    /// the rebuild and row-count guards in one transaction ensures a crash
+    /// cannot expose a partially replaced table to the v27 migration.
+    pub(super) fn migrate_legacy_invocations_before_timestamp_contract(
+        conn: &sqlite::Connection,
+        provider_names: &LegacyProviderNames,
+    ) -> Result<(), String> {
+        let tx = Self::begin_invocation_migration(conn)?;
+        Self::validate_providers_schema(&tx)?;
+        let old_count = Self::legacy_invocations_count(&tx)?;
+        let old_rows = Self::load_legacy_invocation_rows(&tx)?;
+        Self::validate_legacy_invocation_scan_count(old_rows.len(), old_count)?;
+        Self::create_migrated_invocations_table_before_timestamp_contract(&tx)?;
+        Self::insert_migrated_invocation_rows(&tx, old_rows, provider_names)?;
+        let new_count = Self::migrated_invocations_count(&tx)?;
+        Self::validate_migrated_invocation_count(new_count, old_count)?;
+        Self::replace_invocations_with_migrated_table(&tx)?;
+        Self::create_pre_timestamp_migrated_invocation_indexes(&tx)?;
+        Self::ensure_completion_registration_authority_trigger(&tx)?;
+        Self::ensure_invocations_row_version_support(&tx)?;
 
         Self::commit_invocation_migration(tx)
     }
@@ -76,6 +104,13 @@ impl StateDb {
 
     fn create_migrated_invocation_indexes(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(Self::invocations_index_sql())
+            .map_err(Self::format_migrated_invocation_indexes_error)
+    }
+
+    fn create_pre_timestamp_migrated_invocation_indexes(
+        conn: &sqlite::Connection,
+    ) -> Result<(), String> {
+        conn.execute_batch(Self::invocations_pre_timestamp_index_sql())
             .map_err(Self::format_migrated_invocation_indexes_error)
     }
 
@@ -187,7 +222,29 @@ impl StateDb {
     pub(super) fn create_migrated_invocations_table(
         conn: &sqlite::Connection,
     ) -> Result<(), String> {
-        conn.execute_batch(
+        Self::create_migrated_invocations_table_with_timestamp_columns(conn, true)
+    }
+
+    fn create_migrated_invocations_table_before_timestamp_contract(
+        conn: &sqlite::Connection,
+    ) -> Result<(), String> {
+        Self::create_migrated_invocations_table_with_timestamp_columns(conn, false)
+    }
+
+    fn create_migrated_invocations_table_with_timestamp_columns(
+        conn: &sqlite::Connection,
+        include_timestamp_columns: bool,
+    ) -> Result<(), String> {
+        let timestamp_columns = if include_timestamp_columns {
+            "lifecycle_updated_at TEXT,
+                retention_eligible_at TEXT,
+                retention_status TEXT NOT NULL DEFAULT 'legacy_unknown'
+                    CHECK (retention_status IN ('pending', 'eligible', 'legacy_unknown', 'clock_anomaly')),
+                "
+        } else {
+            ""
+        };
+        let sql = format!(
             "CREATE TABLE invocations_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 invocation_uuid TEXT NOT NULL UNIQUE,
@@ -210,6 +267,7 @@ impl StateDb {
                 resume_acceptance_evidence TEXT,
                 created_at TEXT NOT NULL,
                 finished_at TEXT,
+                {timestamp_columns}
                 row_version INTEGER NOT NULL DEFAULT 0,
                 completion_registration_capability_digest TEXT
                     CONSTRAINT invocation_completion_registration_capability_digest_shape
@@ -220,9 +278,10 @@ impl StateDb {
                             AND completion_registration_capability_digest NOT GLOB '*[^0-9a-f]*'
                         )
                     )
-            );",
-        )
-        .map_err(Self::format_migrated_invocations_table_create_error)
+            );"
+        );
+        conn.execute_batch(&sql)
+            .map_err(Self::format_migrated_invocations_table_create_error)
     }
 
     fn format_migrated_invocations_table_create_error(err: sqlite::Error) -> String {
@@ -299,7 +358,7 @@ impl StateDb {
             resume_acceptance_evidence,
             created_at,
             finished_at
-         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?9, ?9)"
+         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?9, NULL)"
     }
 
     pub(super) fn map_legacy_invocation_insert(

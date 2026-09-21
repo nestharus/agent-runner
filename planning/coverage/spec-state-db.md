@@ -7,7 +7,13 @@
 - `crates/oulipoly-state/src/db.rs`
 - `crates/oulipoly-state/src/db/session_lifecycle.rs`
 - `crates/oulipoly-state/src/db/invocation_records.rs`
+- `crates/oulipoly-state/src/db/invocation_schema_indexes.rs`
+- `crates/oulipoly-state/src/db/invocation_schema_legacy_migration.rs`
+- `crates/oulipoly-state/src/db/invocation_schema_repair.rs`
 - `crates/oulipoly-state/src/db/completed_turns.rs`
+- `crates/oulipoly-state/src/db/record_timestamps.rs`
+- `crates/oulipoly-state/src/db/invocation_timestamp_contract.rs`
+- `crates/oulipoly-state/src/db/opening_migrations.rs`
 - `crates/oulipoly-state/src/db/resume_lookup.rs`
 - `crates/oulipoly-state/src/db/resume_resolution.rs`
 - `crates/oulipoly-state/src/db/resume_types.rs`
@@ -18,8 +24,10 @@
 - `crates/oulipoly-state/src/mailbox.rs`
 - `crates/oulipoly-state/src/mailbox/schema.rs`
 - `crates/oulipoly-state/src/mailbox/migrations/0022_live_history_barrier.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0023_record_timestamp_contract.sql`
 - `crates/oulipoly-state/migrations/0012_session_ingress_evidence.sql`
 - `crates/oulipoly-state/migrations/0026_live_history_barrier.sql`
+- `crates/oulipoly-state/migrations/0027_record_timestamp_contract.sql`
 - `crates/oulipoly-state/src/migrations.rs`
 - `crates/oulipoly-state/src/repositories/mod.rs`
 - `crates/oulipoly-state/src/schema.rs`
@@ -56,6 +64,7 @@
 - `crates/oulipoly-state/src/deployment/row_version/triggers_sql/generate.rs`
 - `crates/oulipoly-state/src/deployment/row_version/triggers_sql/mod.rs`
 - `crates/oulipoly-state/src/deployment/routing.rs`
+- `src-tauri/src/invocation/stale_reconcile.rs`
 
 ## Preconditions
 
@@ -81,6 +90,12 @@
 | PTY transport or manual acknowledgement evidence arrives. | Store its explicit evidence kind under the exact delivery/session/generation fence without advancing provider `submitted` or `confirmed`. |
 | A caller reports that one materialized completion mailbox row was consumed in-band. | When the durable completion owner matches the exact listener owner, acknowledge only that mailbox row and listener once as `consumed_in_call`, resolve its delivery attempt, and leave sibling event listeners and unrelated pending rows active. |
 | A caller lists direct logical invocation children. | `list_invocation_children` returns only direct children in deterministic chronological `created_at, id` order; consumer-specific projections may reorder their already-loaded copy without changing this history contract. |
+| A selected retained lifecycle reaches terminal state. | Its terminal/closed time and explicit eligibility projection are written atomically with the state transition. Backward wall time is preserved as `clock_anomaly` and is not eligible. |
+| A legacy row lacks strong timestamp evidence. | Migration preserves known bytes, records `legacy_unknown`, and leaves `retention_eligible_at` null rather than inventing migration/epoch/file time. |
+| A current-stamped invocation schema is initialized, drift-repaired, or rebuilt from the sanctioned pre-UUID shape. | The shared idempotent timestamp installer supplies safe projections, retention index, immutable creation/terminal guards, terminal-reopen rejection, and append-only audited repair authorization before the route completes. |
+| A classifier-accepted versionless full runner has the exact seven-column pre-UUID invocation table. | One transaction establishes the shape-independent v5 baseline and version marker; migrations continue through v26, rebuild rows with stable generated UUIDs and unknown terminal age, then install v27. Reopen preserves the result exactly. |
+| A triggered completion listener is reactivated from retired to pending. | The same transition clears listener eligibility, blocks/clears the parent event, preserves first close, and keeps unknown/anomaly evidence sticky. Later retirement uses its new occurrence and updates the parent from the exact child plus the indexed pending projection. |
+| An operator supplies an evidenced terminal-time correction. | Only an explicit historical State handle may append the immutable audit row and repair terminal/eligibility fields in one transaction; ordinary/live writers are rejected. |
 
 ## Edge cases
 
@@ -102,6 +117,15 @@
   their mailbox rows unchanged.
 - A sibling row presented with another listener's durable owner identity remains
   pending even when both rows reference the same completion marker.
+- Equal terminal and creation time is valid for newly authoritative writes, but
+  historical equality known to originate from the legacy rebuild is not treated
+  as closure evidence. Established terminal time and terminal state cannot be
+  rewritten/reopened by ordinary replay.
+- Existing mailbox prune/reclaim paths require explicit eligibility. A terminal
+  phase with unknown age, unresolved custody, or a clock anomaly is retained.
+- Unrecognized nonempty versionless pre-UUID invocation shapes are rejected
+  before journal-mode, schema, or version mutation; no partially normalized
+  identity is left for the next open.
 
 ## Error conditions
 
@@ -149,6 +173,7 @@ table tests, repositories contract.
 - `crates/oulipoly-state/tests/age_62_opener_contract.rs`
 - `crates/oulipoly-state/tests/age_62_readonly_schema_probe.rs`
 - `crates/oulipoly-state/tests/age_62_resolver_routing.rs`
+- `crates/oulipoly-state/tests/age371_record_timestamps.rs`
 - `crates/oulipoly-state/tests/repositories_contract.rs`
 - `crates/oulipoly-state/src/db/tests/resume_resolution_tests_1.rs`
   (exact-chain precedence, provider-scoped native candidate preservation,

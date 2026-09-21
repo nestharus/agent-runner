@@ -411,9 +411,13 @@ fn remember(
     result: &impl Serialize,
 ) -> Result<(), String> {
     let json = serde_json::to_string(result).map_err(|e| e.to_string())?;
+    let recorded_at = StateDb::current_rfc3339_timestamp();
     conn.execute(
-        "INSERT INTO provider_launch_transition_replays VALUES (?1,?2,?3,?4)",
-        params![launch.to_string(), key, hash, json],
+        "INSERT INTO provider_launch_transition_replays (
+            logical_launch_id,operation_key,request_sha256,result_json,
+            recorded_at,retention_status
+         ) VALUES (?1,?2,?3,?4,?5,'inherits_parent')",
+        params![launch.to_string(), key, hash, json, recorded_at],
     )
     .map_err(sql_error)?;
     Ok(())
@@ -625,7 +629,7 @@ impl StateDb {
                     lease.candidate.account_name,lease.candidate.provider_index as i64,lease.runtime_generation_uuid.to_string(),lease.return_channel_id,
                     lease.owner.logical_launch_id.to_string(),lease.candidate_plan_sha256]).map_err(sql_error)?;
             require_one(changed)?;
-            set_launch_status(tx,&lease.owner,"active",None)?;
+            set_launch_status(tx,&lease.owner,"active",None,&Self::current_rfc3339_timestamp())?;
             Ok(())
         })
     }
@@ -727,7 +731,7 @@ impl StateDb {
                  AND json_array_length(l.candidate_plan_json)>provider_launch_attempts.attempt_ordinal+1)"),params![failure.kind.as_str(),failure.request_id.to_string(),
                  failure.code,owner.attempt_id.to_string(),owner.logical_launch_id.to_string()]).map_err(sql_error)?)?;
             remember(tx,owner.logical_launch_id,&format!("{}/failure-record",owner.attempt_id),&digest(failure)?,failure)?;
-            set_launch_status(tx,owner,"transfer_requested",None)
+            set_launch_status(tx,owner,"transfer_requested",None,&Self::current_rfc3339_timestamp())
         })
     }
 
@@ -1447,9 +1451,10 @@ fn set_launch_status(
     owner: &ProviderLaunchOwnerFence,
     status: &str,
     code: Option<&str>,
+    transition_at: &str,
 ) -> Result<(), String> {
     require_one(conn.execute("UPDATE provider_logical_launches SET status=?1,terminal_code=?2,updated_at=?3 WHERE logical_launch_id=?4",
-        params![status,code,StateDb::current_rfc3339_timestamp(),owner.logical_launch_id.to_string()]).map_err(sql_error)?)
+        params![status,code,transition_at,owner.logical_launch_id.to_string()]).map_err(sql_error)?)
 }
 fn terminalize(
     conn: &sqlite::Connection,
@@ -1461,11 +1466,11 @@ fn terminalize(
     let now = if status == "recovery_blocked" {
         None
     } else {
-        Some(timestamp)
+        Some(timestamp.as_str())
     };
     conn.execute("UPDATE provider_launch_attempts SET status=?1,terminal_code=?2,finished_at=?3 WHERE attempt_id=?4",
         params![status,code,now,owner.attempt_id.to_string()]).map_err(sql_error)?;
-    set_launch_status(conn, owner, status, Some(code))?;
+    set_launch_status(conn, owner, status, Some(code), &timestamp)?;
     conn.execute(
         "UPDATE provider_logical_launches SET finished_at=?1 WHERE logical_launch_id=?2",
         params![now, owner.logical_launch_id.to_string()],
@@ -1730,10 +1735,37 @@ pub(super) fn validate_launch_schema(conn: &sqlite::Connection) -> Result<(), St
     // Compare the complete registered schema, including constraints, indexes and triggers.
     // Never repair a partial current schema.
     let expected = sqlite::Connection::open_in_memory().map_err(sql_error)?;
-    expected.execute_batch("CREATE TABLE invocations(id INTEGER PRIMARY KEY,invocation_uuid TEXT,provider_name TEXT,provider_index INTEGER,status TEXT);").map_err(sql_error)?;
+    expected
+        .execute_batch(
+            "CREATE TABLE invocations(
+        id INTEGER PRIMARY KEY,
+        invocation_uuid TEXT,
+        provider_name TEXT,
+        provider_index INTEGER,
+        status TEXT,
+        created_at TEXT,
+        finished_at TEXT
+    );",
+        )
+        .map_err(sql_error)?;
     expected
         .execute_batch(include_str!(
             "../../migrations/0023_provider_launch_lifecycle.sql"
+        ))
+        .map_err(sql_error)?;
+    expected
+        .execute_batch(
+            "CREATE TABLE completed_turns(
+            invocation_id INTEGER PRIMARY KEY,
+            invocation_uuid TEXT,
+            recovery_pending INTEGER,
+            committed_at TEXT
+         );",
+        )
+        .map_err(sql_error)?;
+    expected
+        .execute_batch(include_str!(
+            "../../migrations/0027_record_timestamp_contract.sql"
         ))
         .map_err(sql_error)?;
     let mut statement = expected.prepare("SELECT type,name,sql FROM sqlite_master WHERE name LIKE 'provider_launch_%' OR name='provider_logical_launches' OR name='provider_logical_launch_immutable'").map_err(sql_error)?;

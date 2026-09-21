@@ -690,6 +690,7 @@ impl StateDb {
         if current_identity != admission_identity || current_chains != admission_chains {
             return Err("completed_turn_admission_scope_changed: retry without effects".into());
         }
+        let created_at = Self::current_rfc3339_timestamp();
         let tx =
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
                 .map_err(custody_error)?;
@@ -735,7 +736,23 @@ impl StateDb {
             return Err("completed_turn_selection_conflict".into());
         }
         let id = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO completed_turns (invocation_id,invocation_uuid,settlement_id,owner_json,effects_json,context_json,content_sha256) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![row,invocation.invocation_uuid,id,owner,effects_json,context_json,digest]).map_err(custody_error)?;
+        tx.execute(
+            "INSERT INTO completed_turns (
+            invocation_id,invocation_uuid,settlement_id,owner_json,effects_json,
+            context_json,content_sha256,created_at,updated_at,retention_status
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,'pending')",
+            params![
+                row,
+                invocation.invocation_uuid,
+                id,
+                owner,
+                effects_json,
+                context_json,
+                digest,
+                created_at
+            ],
+        )
+        .map_err(custody_error)?;
         tx.commit().map_err(custody_error)?;
         Ok(id)
     }
@@ -994,7 +1011,34 @@ impl StateDb {
         tails: &serde_json::Value,
     ) -> Result<(), String> {
         let recovery_pending = i64::from(!completed_turn_tails_finished(tails));
-        let changed = self.conn.execute("UPDATE completed_turns SET tails_json=?3,recovery_pending=?4 WHERE invocation_uuid=?1 AND settlement_id=?2 AND committed_at IS NOT NULL",params![uuid,settlement,encode(tails)?,recovery_pending]).map_err(custody_error)?;
+        let transition_at = Self::current_rfc3339_timestamp();
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE completed_turns
+             SET tails_json=?3,
+                 recovery_pending=?4,
+                 updated_at=?5,
+                 closed_at=CASE WHEN ?4=0 THEN COALESCE(closed_at,?5) ELSE closed_at END,
+                 retention_eligible_at=CASE
+                   WHEN ?4=0 AND created_at IS NOT NULL
+                    AND julianday(COALESCE(closed_at,?5))>=julianday(created_at)
+                   THEN COALESCE(closed_at,?5) ELSE NULL END,
+                 retention_status=CASE
+                   WHEN ?4=1 THEN 'pending'
+                   WHEN created_at IS NULL THEN 'legacy_unknown'
+                   WHEN julianday(COALESCE(closed_at,?5))<julianday(created_at)
+                   THEN 'clock_anomaly' ELSE 'eligible' END
+             WHERE invocation_uuid=?1 AND settlement_id=?2 AND committed_at IS NOT NULL",
+                params![
+                    uuid,
+                    settlement,
+                    encode(tails)?,
+                    recovery_pending,
+                    transition_at
+                ],
+            )
+            .map_err(custody_error)?;
         if changed == 1 {
             Ok(())
         } else {

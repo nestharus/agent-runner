@@ -57,7 +57,7 @@ impl StateDb {
         id: i64,
     ) -> sqlite::Result<Option<FinalizeInvocationRowColumns>> {
         conn.query_row(
-            "SELECT invocation_uuid, model_name, provider_name, provider_session_id, status
+            "SELECT invocation_uuid, model_name, provider_name, provider_session_id, status, finished_at
              FROM invocations WHERE id = ?1",
             sqlite::params![id],
             Self::read_invocation_row_for_finalize,
@@ -74,19 +74,22 @@ impl StateDb {
             row.get(2)?,
             row.get(3)?,
             row.get(4)?,
+            row.get(5)?,
         ))
     }
 
     pub(super) fn map_invocation_row_for_finalize(
         columns: FinalizeInvocationRowColumns,
     ) -> FinalizeInvocationRow {
-        let (invocation_uuid, model_name, provider_name, provider_session_id, status) = columns;
+        let (invocation_uuid, model_name, provider_name, provider_session_id, status, finished_at) =
+            columns;
         FinalizeInvocationRow {
             invocation_uuid,
             model_name,
             provider_name,
             provider_session_id,
             status,
+            finished_at,
         }
     }
 

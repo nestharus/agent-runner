@@ -24,6 +24,7 @@
 //!       - tempfile::tempdir database fixture directory surface
 
 mod fixtures;
+mod timestamp_fixture;
 
 use fixtures::schema4_invocations::build_schema4_invocation_fixture;
 use fixtures::v3_full_state_db::{
@@ -105,6 +106,7 @@ fn schema_18_migration_installs_the_running_projection_index() {
     let db_path = dir.path().join("state.db");
     drop(StateDb::open(&db_path).unwrap());
     let mut connection = Connection::open(&db_path).unwrap();
+    timestamp_fixture::remove_v27_timestamp_contract(&connection);
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
@@ -321,6 +323,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             23,
             24,
             25,
+            26,
             CURRENT_SCHEMA_VERSION,
         ],
         "schema-4 DBs must take every ordered migration through the current schema"
@@ -350,6 +353,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0024_completion_continuation_binding",
             "0025_completed_turns",
             "0026_live_history_barrier",
+            "0027_record_timestamp_contract",
         ]
     );
 }

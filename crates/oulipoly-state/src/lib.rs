@@ -122,11 +122,13 @@ pub use db::{
 pub use db::{
     SessionTurnReplacement, SessionTurnRestoreRow, SessionTurnsReplacement, SessionTurnsRestore,
 };
+pub use db::{StateTerminalTimestampRepair, StateTimestampRecordFamily};
 pub use invocation_marker::CompositeInvocationId;
 pub use lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
 pub use mailbox::{
     InboxTarget, InboxTargetKind, MAILBOX_PAYLOAD_RETENTION_POLICY, PublishedMailboxPayload,
-    SUBMITTED_INPUT_KIND, SubmittedInputEnqueue, submitted_input_handle,
+    SUBMITTED_INPUT_KIND, SidecarTerminalTimestampRepair, SidecarTimestampRecord,
+    SubmittedInputEnqueue, submitted_input_handle,
 };
 pub use result_envelope::{
     ResultEnvelopeFailureIdentity, ResultEnvelopeInput, result_envelope_payload,

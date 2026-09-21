@@ -1463,7 +1463,7 @@ mod tests {
         assert_eq!((small.0, small.1), (1, 1));
         assert_eq!((mature.0, mature.1), (1, 1));
         assert!(
-            small.2 < 2_000,
+            small.2 < 2_300,
             "small-owner finalization used {} VM steps",
             small.2
         );

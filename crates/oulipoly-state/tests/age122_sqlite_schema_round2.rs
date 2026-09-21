@@ -51,6 +51,10 @@ const EXPECTED_INVOCATIONS_SCHEMA_SNIPPET: &str = r#"CREATE TABLE IF NOT EXISTS 
             resume_acceptance_evidence TEXT,
             created_at TEXT NOT NULL,
             finished_at TEXT,
+            lifecycle_updated_at TEXT,
+            retention_eligible_at TEXT,
+            retention_status TEXT NOT NULL DEFAULT 'legacy_unknown'
+                CHECK (retention_status IN ('pending', 'eligible', 'legacy_unknown', 'clock_anomaly')),
             row_version INTEGER NOT NULL DEFAULT 0,
             completion_registration_capability_digest TEXT
                 CONSTRAINT invocation_completion_registration_capability_digest_shape
@@ -70,7 +74,7 @@ fn invocations_schema_sql_keeps_raw_io_sidecar_based_with_completion_authority()
         "invocations repair SQL must remain sidecar-based and include completion authority"
     );
     assert!(
-        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 24;"),
+        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 27;"),
         "schema version must include immutable completion recovery binding"
     );
     assert!(
@@ -126,6 +130,9 @@ fn invocations_schema_sql_keeps_raw_io_sidecar_based_with_completion_authority()
             "0022_provider_session_authority.sql",
             "0023_provider_launch_lifecycle.sql",
             "0024_completion_continuation_binding.sql",
+            "0025_completed_turns.sql",
+            "0026_live_history_barrier.sql",
+            "0027_record_timestamp_contract.sql",
         ],
         "migration inventory must include only sanctioned state-db migrations"
     );

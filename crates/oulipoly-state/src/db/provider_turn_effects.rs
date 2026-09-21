@@ -77,13 +77,17 @@ impl StateDb {
 
         match transaction_result {
             Ok((invocation, acknowledgement)) => {
+                let authoritative_finished_at = invocation
+                    .finished_at
+                    .clone()
+                    .unwrap_or_else(|| finished_at.clone());
                 self.report_finalize_invocation(
                     input.invocation_row_id,
                     input.success,
                     input.exit_code,
                     input.error_category,
                     input.terminal_reason,
-                    &finished_at,
+                    &authoritative_finished_at,
                     lifecycle_row.as_ref(),
                     timer,
                     Ok(invocation),
@@ -307,8 +311,17 @@ impl StateDb {
                     finished_at,
                 )?;
                 if let Some(id) = settlement {
-                    let changed = tx.execute("UPDATE completed_turns SET committed_at=?2 WHERE settlement_id=?1 AND committed_at IS NULL", params![id, finished_at]).map_err(|e|e.to_string())?;
-                    if changed != 1 { return Err("completed_turn_settlement_conflict".into()); }
+                    let changed = tx
+                        .execute(
+                            "UPDATE completed_turns
+                         SET committed_at=?2, updated_at=?2
+                         WHERE settlement_id=?1 AND committed_at IS NULL",
+                            params![id, finished_at],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if changed != 1 {
+                        return Err("completed_turn_settlement_conflict".into());
+                    }
                 }
                 tx.commit().map_err(|error| {
                     Self::format_finalize_commit_transaction_error(input.invocation_row_id, error)

@@ -54,10 +54,10 @@
 //!       - accounts, chain_backfill, chain_segments_compaction, chain_segments_import, chain_segments_open
 //!       - cli_providers, discovered_models, discovery_types, invocation_artifacts
 //!       - invocation_lifecycle_finalize, invocation_lifecycle_finalize_context, invocation_lifecycle_finalize_write, invocation_lifecycle_start
-//!       - invocation_live_load, invocation_records, invocation_schema_legacy_migration, invocation_schema_projection, invocation_schema_repair, invocation_schema_session_turns, invocation_schema_table
+//!       - invocation_live_load, invocation_records, invocation_schema_legacy_migration, invocation_schema_projection, invocation_schema_repair, invocation_schema_session_turns, invocation_schema_table, invocation_timestamp_contract
 //!       - invocation_window, lifecycle_invocation_row, lifecycle_log_adapter, model_parameters
 //!       - opening_migrations, opening_read_only, opening_write, owned_turn_event_read, owned_turn_event_write
-//!       - provider_quota_reads, provider_quota_refresh, provider_quota_status, provider_quota_test_support, provider_quota_window_writes, provider_quotas
+//!       - provider_quota_reads, provider_quota_refresh, provider_quota_status, provider_quota_test_support, provider_quota_window_writes, provider_quotas, record_timestamps
 //!       - ownership_authority, provider_schema_migration, provider_schema_validation, provider_session_binding, providers
 //!       - resume_active_segment, resume_lookup, resume_preview, resume_resolution, resume_types
 //!       - returned_artifacts_codec, returned_artifacts_read, returned_artifacts_write
@@ -114,6 +114,7 @@ mod invocation_schema_projection;
 mod invocation_schema_repair;
 mod invocation_schema_session_turns;
 mod invocation_schema_table;
+mod invocation_timestamp_contract;
 mod invocation_window;
 mod lifecycle_invocation_row;
 mod lifecycle_log_adapter;
@@ -137,7 +138,9 @@ mod provider_schema_validation;
 mod provider_session_authority;
 mod provider_session_binding;
 mod provider_turn_effects;
+mod record_timestamps;
 pub use provider_launch_lifecycle::*;
+pub use record_timestamps::*;
 mod providers;
 mod resume_active_segment;
 mod resume_lookup;
