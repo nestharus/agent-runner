@@ -31,9 +31,8 @@ pub(in crate::db::tests) fn insert_invocation_fixture(
     created_at: &str,
 ) -> i64 {
     let start = fixture_invocation_start(invocation_uuid, parent_invocation_id);
-    let id = start_fixture_invocation(db, &start);
-    set_invocation_created_at(db, id, created_at);
-    id
+    db.insert_invocation_start_row_raw(&start, created_at, None)
+        .unwrap()
 }
 
 fn fixture_invocation_start(
@@ -51,15 +50,6 @@ fn fixture_invocation_start(
 
 fn start_fixture_invocation(db: &StateDb, start: &InvocationStart) -> i64 {
     db.start_invocation(start).unwrap()
-}
-
-fn set_invocation_created_at(db: &StateDb, id: i64, created_at: &str) {
-    db.conn
-        .execute(
-            "UPDATE invocations SET created_at = ?1 WHERE id = ?2",
-            sqlite::params![created_at, id],
-        )
-        .unwrap();
 }
 
 pub(in crate::db::tests) fn seed_running_invocation(db: &StateDb) -> i64 {

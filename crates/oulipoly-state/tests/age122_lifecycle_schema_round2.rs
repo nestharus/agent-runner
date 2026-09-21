@@ -204,6 +204,9 @@ fn assert_common_record(record: &Value, event_name: &str, invocation_uuid: &str,
         record["latency_us"].as_u64().is_some(),
         "latency_us must be a u64: {record:#?}"
     );
+    assert!(record["recorded_at"].is_string(), "{record:#?}");
+    assert_eq!(record["retention_eligible_at"], record["recorded_at"]);
+    assert_eq!(record["retention_status"], "eligible");
     assert_eq!(record["operation_result"], result);
 
     if result == "ok" {
@@ -228,6 +231,9 @@ fn assert_start_keys(record: &Value) {
             "chain_id",
             "session_id",
             "latency_us",
+            "recorded_at",
+            "retention_eligible_at",
+            "retention_status",
             "operation_result",
             "error_chain",
             "invocation_row_id",
@@ -248,6 +254,9 @@ fn assert_start_failed_keys(record: &Value) {
             "chain_id",
             "session_id",
             "latency_us",
+            "recorded_at",
+            "retention_eligible_at",
+            "retention_status",
             "operation_result",
             "error_chain",
             "model",
@@ -270,6 +279,9 @@ fn assert_session_keys(record: &Value) {
             "chain_id",
             "session_id",
             "latency_us",
+            "recorded_at",
+            "retention_eligible_at",
+            "retention_status",
             "operation_result",
             "error_chain",
             "invocation_row_id",
@@ -302,6 +314,9 @@ fn assert_finalize_keys(record: &Value) {
             "chain_id",
             "session_id",
             "latency_us",
+            "recorded_at",
+            "retention_eligible_at",
+            "retention_status",
             "operation_result",
             "error_chain",
             "invocation_row_id",
@@ -324,6 +339,9 @@ fn assert_finalize_failed_keys(record: &Value) {
             "chain_id",
             "session_id",
             "latency_us",
+            "recorded_at",
+            "retention_eligible_at",
+            "retention_status",
             "operation_result",
             "error_chain",
             "invocation_row_id",

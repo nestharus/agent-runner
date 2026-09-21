@@ -1,3 +1,4 @@
+use chrono::{SecondsFormat, Utc};
 use serde_json::{Value, json};
 use std::error::Error;
 use std::io;
@@ -388,6 +389,7 @@ fn io_error_from_message(message: &str) -> io::Error {
 }
 
 fn common_record(input: CommonRecordInput<'_>) -> Value {
+    let recorded_at = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
     json!({
         "event_name": input.event_name,
         "invocation_uuid": input.invocation_uuid,
@@ -395,6 +397,9 @@ fn common_record(input: CommonRecordInput<'_>) -> Value {
         "chain_id": input.chain_id,
         "session_id": input.session_id,
         "latency_us": input.latency_us,
+        "recorded_at": recorded_at.clone(),
+        "retention_eligible_at": recorded_at,
+        "retention_status": "eligible",
         "operation_result": input.operation_result,
         "error_chain": input.error_chain,
     })

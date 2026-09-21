@@ -228,13 +228,17 @@ fn age132_timestamp_policies_preserve_strict_forgiving_and_fallback_callers() {
     assert!(db.get_windows("provider-a").is_err());
 
     let id = db
-        .start_invocation(&InvocationStart {
-            invocation_uuid: Uuid::new_v4().to_string(),
-            model_name: "provider-a-opus".to_string(),
-            provider_name: "provider-a".to_string(),
-            provider_index: 0,
-            parent_invocation_id: None,
-        })
+        .insert_invocation_start_row_raw(
+            &InvocationStart {
+                invocation_uuid: Uuid::new_v4().to_string(),
+                model_name: "provider-a-opus".to_string(),
+                provider_name: "provider-a".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            },
+            "not-a-timestamp",
+            None,
+        )
         .unwrap();
     db.update_session_capture(
         crate::InvocationMutationAuthority::Standalone,
@@ -243,12 +247,6 @@ fn age132_timestamp_policies_preserve_strict_forgiving_and_fallback_callers() {
         "verified",
     )
     .unwrap();
-    db.conn
-        .execute(
-            "UPDATE invocations SET created_at = 'not-a-timestamp' WHERE id = ?1",
-            sqlite::params![id],
-        )
-        .unwrap();
     let before = Utc::now();
     db.mint_chain_for_invocation_session(crate::InvocationMutationAuthority::Standalone, id)
         .unwrap();

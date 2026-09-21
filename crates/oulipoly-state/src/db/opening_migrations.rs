@@ -43,6 +43,7 @@ impl StateDb {
         path: &Path,
         conn: &mut sqlite::Connection,
         compatibility: SchemaCompatibility,
+        provider_names: &LegacyProviderNames,
     ) -> Result<(), WritableOpenError> {
         match compatibility {
             SchemaCompatibility::Fresh => {
@@ -53,12 +54,43 @@ impl StateDb {
             SchemaCompatibility::Migratable { stored } => {
                 Self::set_wal_mode(conn)?;
                 let stored = Self::promote_existing_dual_id_schema5_if_present(conn, stored)?;
-                Self::run_current_plan_from(path, conn, stored)
+                if stored < 27 && Self::legacy_invocations_shape_needs_pre_v27_rebuild(conn)? {
+                    Self::run_migration_plan_through(path, conn, stored, 26)?;
+                    Self::migrate_legacy_invocations_before_timestamp_contract(
+                        conn,
+                        provider_names,
+                    )?;
+                    Self::run_current_plan_from(path, conn, 26)
+                } else {
+                    Self::run_current_plan_from(path, conn, stored)
+                }
             }
             SchemaCompatibility::LegacyVersionless => {
                 Self::validate_versionless_shape(path, conn)?;
-                Self::set_wal_mode(conn)?;
-                Self::run_current_plan_from(path, conn, MINIMUM_SUPPORTED_SCHEMA_VERSION)
+                let columns = Self::invocations_columns(conn)?;
+                match Self::classify_invocations_schema(&columns) {
+                    InvocationsSchemaShape::Empty | InvocationsSchemaShape::Current => {
+                        Self::set_wal_mode(conn)?;
+                        Self::run_current_plan_from(path, conn, MINIMUM_SUPPORTED_SCHEMA_VERSION)
+                    }
+                    InvocationsSchemaShape::LegacyPreUuid => {
+                        Self::set_wal_mode(conn)?;
+                        migrations::normalize_versionless_pre_uuid_baseline(
+                            conn,
+                            path.to_path_buf(),
+                        )
+                        .map_err(WritableOpenError::Migration)?;
+                        Self::run_migration_plan_through(path, conn, 5, 26)?;
+                        Self::migrate_legacy_invocations_before_timestamp_contract(
+                            conn,
+                            provider_names,
+                        )?;
+                        Self::run_current_plan_from(path, conn, 26)
+                    }
+                    InvocationsSchemaShape::UnrecognizedPreUuid(_) => {
+                        Err(Self::unrecognized_versionless_error(path))
+                    }
+                }
             }
             SchemaCompatibility::Future { stored } => Err(Self::future_schema_error(path, stored)),
             SchemaCompatibility::UnrecognizedVersionless => {
@@ -78,6 +110,24 @@ impl StateDb {
         let plan = migrations::current_plan_from(stored).map_err(WritableOpenError::Migration)?;
         migrations::run_with_db_path(conn, &plan, path.to_path_buf())
             .map_err(WritableOpenError::Migration)
+    }
+
+    fn run_migration_plan_through(
+        path: &Path,
+        conn: &mut sqlite::Connection,
+        stored: i32,
+        target: i32,
+    ) -> Result<(), WritableOpenError> {
+        let plan = migrations::plan(stored, target).map_err(WritableOpenError::Migration)?;
+        migrations::run_with_db_path(conn, &plan, path.to_path_buf())
+            .map_err(WritableOpenError::Migration)
+    }
+
+    fn legacy_invocations_shape_needs_pre_v27_rebuild(
+        conn: &sqlite::Connection,
+    ) -> Result<bool, String> {
+        let columns = Self::invocations_columns(conn)?;
+        Ok(Self::legacy_invocations_shape_is_pre_uuid(&columns))
     }
 
     pub(super) fn validate_versionless_shape(

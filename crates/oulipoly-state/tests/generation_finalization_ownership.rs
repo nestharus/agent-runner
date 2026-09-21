@@ -319,7 +319,9 @@ fn creator_death_recovery(unreaped: bool, draining: bool) {
         ));
     }
     // Live reference retention is not an age-based lease.
-    db.prune_terminal_history(2048).unwrap();
+    let mut maintenance = MailboxDb::open_historical(&path).unwrap();
+    maintenance.prune_terminal_history(2048).unwrap();
+    drop(maintenance);
     let conn = rusqlite::Connection::open(&path).unwrap();
     let references = || {
         conn.query_row(
@@ -353,7 +355,9 @@ fn creator_death_recovery(unreaped: bool, draining: bool) {
     } else {
         assert!(!creator.0.wait().unwrap().success());
     }
-    db.prune_terminal_history(2048).unwrap();
+    let mut maintenance = MailboxDb::open_historical(&path).unwrap();
+    maintenance.prune_terminal_history(2048).unwrap();
+    drop(maintenance);
     assert_eq!(
         references(),
         0,

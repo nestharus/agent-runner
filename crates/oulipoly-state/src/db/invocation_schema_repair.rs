@@ -68,7 +68,8 @@ impl StateDb {
             .map_err(Self::format_initialize_invocations_schema_error)?;
         Self::ensure_invocation_indexes(conn)?;
         Self::ensure_completion_registration_authority_trigger(conn)?;
-        Self::ensure_invocations_row_version_support(conn)
+        Self::ensure_invocations_row_version_support(conn)?;
+        Self::ensure_invocation_timestamp_contract(conn)
     }
 
     fn format_initialize_invocations_schema_error(err: sqlite::Error) -> String {
@@ -87,7 +88,13 @@ impl StateDb {
         )?;
         Self::ensure_invocation_indexes(conn)?;
         Self::ensure_completion_registration_authority_trigger(conn)?;
-        Self::ensure_invocations_row_version_support(conn)
+        Self::ensure_invocations_row_version_support(conn)?;
+        Self::ensure_invocation_timestamp_contract(conn)
+    }
+
+    fn ensure_invocation_timestamp_contract(conn: &sqlite::Connection) -> Result<(), String> {
+        Self::install_invocation_timestamp_contract(conn)
+            .map_err(|error| format!("Failed to install invocation timestamp contract: {error}"))
     }
 
     pub(super) fn ensure_completion_registration_authority_trigger(

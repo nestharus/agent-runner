@@ -142,6 +142,10 @@ pub(crate) const DELIVERED_PAYLOAD_COMPACTION_STATS: StatementAccess =
     StatementAccess::historical("terminal_history.payload_compaction_stats");
 pub(crate) const DELIVERED_PAYLOAD_COMPACTION: StatementAccess =
     StatementAccess::historical("terminal_history.payload_compaction");
+pub(crate) const STATE_TIMESTAMP_REPAIR: StatementAccess =
+    StatementAccess::historical("record_timestamps.state_terminal_repair");
+pub(crate) const SIDECAR_TIMESTAMP_REPAIR: StatementAccess =
+    StatementAccess::historical("record_timestamps.sidecar_terminal_repair");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InventoryKind {
@@ -532,6 +536,16 @@ pub const ACCESS_INVENTORY: &[InventoryEntry] = &[
     },
     InventoryEntry {
         id: "maintenance.terminal_history.vacuum",
+        kind: InventoryKind::Maintenance,
+        class: SqliteAccessClass::HistoricalDiagnostic,
+    },
+    InventoryEntry {
+        id: "maintenance.record_timestamps.state_terminal_repair",
+        kind: InventoryKind::Maintenance,
+        class: SqliteAccessClass::HistoricalDiagnostic,
+    },
+    InventoryEntry {
+        id: "maintenance.record_timestamps.sidecar_terminal_repair",
         kind: InventoryKind::Maintenance,
         class: SqliteAccessClass::HistoricalDiagnostic,
     },

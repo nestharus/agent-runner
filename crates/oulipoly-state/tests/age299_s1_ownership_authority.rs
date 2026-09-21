@@ -174,6 +174,9 @@ fn schema_13_migrates_through_current_and_preserves_invocation_data() {
             (22, "0022_provider_session_authority"),
             (23, "0023_provider_launch_lifecycle"),
             (24, "0024_completion_continuation_binding"),
+            (25, "0025_completed_turns"),
+            (26, "0026_live_history_barrier"),
+            (27, "0027_record_timestamp_contract"),
         ]
     );
 

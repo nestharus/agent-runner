@@ -22,7 +22,7 @@ use std::time::SystemTime;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub const DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
+pub const DIAGNOSTIC_SCHEMA_VERSION: u32 = 2;
 const RECORDER_DIRECTORY: &str = "diagnostics/flight-recorder-v1";
 const MAX_TEXT_BYTES: usize = 1_024;
 const MAX_CORRELATIONS: usize = 24;
@@ -723,6 +723,13 @@ pub struct DiagnosticEvent {
     #[serde(default)]
     pub parent_span_id: Option<SpanId>,
     pub recorded_at: String,
+    /// The occurrence timestamp is also this immutable event's retention root.
+    /// Version-one records deserialize as explicitly unknown instead of
+    /// borrowing a file timestamp that may have been rewritten or copied.
+    #[serde(default)]
+    pub retention_eligible_at: Option<String>,
+    #[serde(default)]
+    pub retention_status: DiagnosticRetentionStatus,
     pub elapsed_micros: u64,
     pub process: RecorderProcessIdentity,
     pub operation: String,
@@ -736,6 +743,14 @@ pub struct DiagnosticEvent {
     pub correlations: BTreeMap<String, String>,
     #[serde(default)]
     pub sqlite: Option<SqliteEventIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticRetentionStatus {
+    #[default]
+    LegacyUnknown,
+    Eligible,
 }
 
 #[derive(Clone)]
@@ -797,6 +812,12 @@ pub enum RecordStatus {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CleanupReport {
+    /// UTC wall-clock bounds for the maintenance generation. In-process
+    /// latency remains available separately through diagnostic spans.
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub retention_eligible_at: Option<String>,
+    pub retention_status: MaintenanceRetentionStatus,
     /// Raw directory entries examined by this cleanup generation.
     pub directory_entries_examined: usize,
     /// Directory entries that could not be classified as shards or non-shards.
@@ -813,6 +834,15 @@ pub struct CleanupReport {
     /// Issue details omitted after `MAX_CLEANUP_ISSUES` was reached.
     pub issues_omitted: usize,
     pub issues: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceRetentionStatus {
+    #[default]
+    LegacyUnknown,
+    Pending,
+    Eligible,
 }
 
 impl FlightRecorder {
@@ -956,6 +986,7 @@ impl FlightRecorder {
         for cause in &mut observation.causes {
             *cause = redact_text(cause);
         }
+        let recorded_at = now();
         self.append(
             &DiagnosticEvent {
                 schema_version: DIAGNOSTIC_SCHEMA_VERSION,
@@ -963,7 +994,9 @@ impl FlightRecorder {
                 diagnostic_id: start.diagnostic_id,
                 span_id: SpanId::new(),
                 parent_span_id: start.parent_span_id,
-                recorded_at: now(),
+                recorded_at: recorded_at.clone(),
+                retention_eligible_at: Some(recorded_at),
+                retention_status: DiagnosticRetentionStatus::Eligible,
                 elapsed_micros: saturating_micros(elapsed),
                 process: self.inner.process.clone(),
                 operation: start.operation,
@@ -1193,6 +1226,7 @@ impl DiagnosticSpan {
         for cause in &mut observation.causes {
             *cause = redact_text(cause);
         }
+        let recorded_at = now();
         self.recorder.append(
             &DiagnosticEvent {
                 schema_version: DIAGNOSTIC_SCHEMA_VERSION,
@@ -1200,7 +1234,9 @@ impl DiagnosticSpan {
                 diagnostic_id: self.start.diagnostic_id.clone(),
                 span_id: self.span_id.clone(),
                 parent_span_id: self.start.parent_span_id.clone(),
-                recorded_at: now(),
+                recorded_at: recorded_at.clone(),
+                retention_eligible_at: Some(recorded_at),
+                retention_status: DiagnosticRetentionStatus::Eligible,
                 elapsed_micros,
                 process: self.recorder.inner.process.clone(),
                 operation: self.start.operation.clone(),
@@ -1866,7 +1902,7 @@ fn read_shard(candidate: &ShardCandidate, byte_budget: u64, report: &mut Inspect
             break;
         }
         match serde_json::from_slice::<DiagnosticEvent>(&line) {
-            Ok(event) if event.schema_version == DIAGNOSTIC_SCHEMA_VERSION => {
+            Ok(event) if (1..=DIAGNOSTIC_SCHEMA_VERSION).contains(&event.schema_version) => {
                 report.events.push(RecordedEvent {
                     source: source(path, line_number),
                     event,
@@ -2017,17 +2053,23 @@ fn rotated_path(writer: &WriterState, ordinal: usize) -> PathBuf {
 }
 
 fn cleanup_stale_shards(writer: &WriterState) -> CleanupReport {
-    let mut report = CleanupReport::default();
+    let mut report = CleanupReport {
+        started_at: Some(now()),
+        retention_status: MaintenanceRetentionStatus::Pending,
+        ..CleanupReport::default()
+    };
     let lock_path = writer.root.join(".retention.lock");
     let lock = match private_append_file(&lock_path) {
         Ok(lock) => lock,
         Err(_) => {
             cleanup_issue(&mut report, "retention_lock_open_failed");
+            complete_cleanup_report(&mut report);
             return report;
         }
     };
     if <fs::File as fs4::FileExt>::try_lock(&lock).is_err() {
         cleanup_issue(&mut report, "retention_sweep_busy");
+        complete_cleanup_report(&mut report);
         return report;
     }
 
@@ -2036,6 +2078,7 @@ fn cleanup_stale_shards(writer: &WriterState) -> CleanupReport {
         Err(_) => {
             cleanup_issue(&mut report, "retention_scan_failed");
             let _ = <fs::File as fs4::FileExt>::unlock(&lock);
+            complete_cleanup_report(&mut report);
             return report;
         }
     };
@@ -2124,9 +2167,22 @@ fn cleanup_stale_shards(writer: &WriterState) -> CleanupReport {
             ShardLiveness::Live => report.retained_live_shards += 1,
             ShardLiveness::Uncertain => report.retained_uncertain_shards += 1,
             ShardLiveness::Inactive => {
-                let modified = fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                let modified = match fs::metadata(&path).and_then(|metadata| metadata.modified()) {
+                    Ok(modified) => modified,
+                    Err(_) => {
+                        report.retained_uncertain_shards += 1;
+                        cleanup_issue(
+                            &mut report,
+                            format!(
+                                "shard_age_unknown:{}",
+                                path.file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("unknown")
+                            ),
+                        );
+                        continue;
+                    }
+                };
                 inactive.push((modified, path, shard_lease));
             }
         }
@@ -2145,11 +2201,17 @@ fn cleanup_stale_shards(writer: &WriterState) -> CleanupReport {
         .saturating_sub(retired.len())
         .saturating_sub(disappeared);
     if retained > writer.config.max_total_shards {
-        for (_, path, _) in &inactive {
+        for (modified, path, _) in &inactive {
             if retained <= writer.config.max_total_shards {
                 break;
             }
-            if !retired.contains(path) && retire_shard(path, &mut report) {
+            // Aggregate pressure never substitutes for authoritative age.
+            // A wall-clock regression also leaves the shard conservatively
+            // ineligible because duration_since returns an error.
+            let age_eligible = now
+                .duration_since(*modified)
+                .is_ok_and(|age| age >= writer.config.stale_shard_age);
+            if age_eligible && !retired.contains(path) && retire_shard(path, &mut report) {
                 retired.push(path.clone());
                 retained -= 1;
             }
@@ -2169,11 +2231,19 @@ fn cleanup_stale_shards(writer: &WriterState) -> CleanupReport {
     if retained > writer.config.max_total_shards {
         cleanup_issue(&mut report, "aggregate_limit_retained_live_or_uncertain");
     }
+    complete_cleanup_report(&mut report);
     if persist_cleanup_status(&writer.root, &report).is_err() {
         cleanup_issue(&mut report, "retention_status_write_failed");
     }
     let _ = <fs::File as fs4::FileExt>::unlock(&lock);
     report
+}
+
+fn complete_cleanup_report(report: &mut CleanupReport) {
+    let completed_at = now();
+    report.completed_at = Some(completed_at.clone());
+    report.retention_eligible_at = Some(completed_at);
+    report.retention_status = MaintenanceRetentionStatus::Eligible;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3574,6 +3644,10 @@ mod tests {
     fn worst_case_cleanup_status_fits_the_reader_bound() {
         let directory = tempfile::tempdir().unwrap();
         let report = CleanupReport {
+            started_at: Some("2026-01-01T00:00:00Z".into()),
+            completed_at: Some("2026-01-01T00:00:01Z".into()),
+            retention_eligible_at: Some("2026-01-01T00:00:01Z".into()),
+            retention_status: MaintenanceRetentionStatus::Eligible,
             directory_entries_examined: usize::MAX,
             directory_entries_unreadable: usize::MAX,
             directory_limit_reached: true,

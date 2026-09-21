@@ -268,7 +268,7 @@ impl StateDb {
     ) -> Result<Self, WritableOpenError> {
         let mut conn = Self::open_state_connection(&db_path)?;
 
-        let ran_open_migrations = Self::run_open_migrations(&db_path, &mut conn)?;
+        let ran_open_migrations = Self::run_open_migrations(&db_path, &mut conn, provider_names)?;
         Self::apply_current_schema_repairs(&mut conn, ran_open_migrations, provider_names)?;
         let completion_authority_state =
             Self::durable_completion_authority_path(source_path, &db_path);
@@ -843,10 +843,11 @@ impl StateDb {
     pub(super) fn run_open_migrations(
         path: &Path,
         conn: &mut sqlite::Connection,
+        provider_names: &LegacyProviderNames,
     ) -> Result<bool, WritableOpenError> {
         let compatibility = migrations::classify(conn)?;
         let ran_open_migrations = Self::compatibility_runs_open_migrations(&compatibility);
-        Self::dispatch_open_migration_plan(path, conn, compatibility)?;
+        Self::dispatch_open_migration_plan(path, conn, compatibility, provider_names)?;
         Ok(ran_open_migrations)
     }
 }

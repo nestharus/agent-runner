@@ -32,8 +32,8 @@ use crate::diagnostic_recorder::{
 use crate::live_history::{
     AccessScope, DELIVERED_PAYLOAD_COMPACTION, DELIVERED_PAYLOAD_COMPACTION_STATS,
     MAILBOX_FULL_HISTORY, MAILBOX_PENDING_COUNT, MAILBOX_PENDING_DELIVERY, MAILBOX_PENDING_EXACT,
-    MAILBOX_PENDING_SESSIONS, SUPERVISOR_PENDING_ATTEMPTS, TERMINAL_RETENTION_PRUNE,
-    TERMINAL_RETENTION_STATS, TERMINAL_RETENTION_VACUUM,
+    MAILBOX_PENDING_SESSIONS, SIDECAR_TIMESTAMP_REPAIR, SUPERVISOR_PENDING_ATTEMPTS,
+    TERMINAL_RETENTION_PRUNE, TERMINAL_RETENTION_STATS, TERMINAL_RETENTION_VACUUM,
 };
 use crate::pid_identity::{self, ProcessIdentity};
 use crate::sqlite_observability::{
@@ -720,6 +720,26 @@ pub struct TerminalHistoryPruneReport {
     pub delivery_attempt_items_deleted: usize,
     pub payload_files_deleted: usize,
     pub payload_bytes_reclaimed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidecarTimestampRecord<'a> {
+    Mailbox(i64),
+    DeliveryAttempt(&'a str),
+    CompletionEvent(&'a str),
+    CompletionListener {
+        event_id: &'a str,
+        listener_id: &'a str,
+    },
+    RuntimeGeneration(&'a str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarTerminalTimestampRepair<'a> {
+    pub record: SidecarTimestampRecord<'a>,
+    pub new_timestamp: &'a str,
+    pub actor: &'a str,
+    pub reason: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3399,6 +3419,253 @@ impl PayloadRetentionRepository<'_> {
 }
 
 impl MailboxDb {
+    pub fn repair_terminal_timestamp(
+        &mut self,
+        request: SidecarTerminalTimestampRepair<'_>,
+    ) -> Result<String, String> {
+        self.access_scope
+            .authorize(SIDECAR_TIMESTAMP_REPAIR, None)?;
+        if request.actor.trim().is_empty() || request.reason.trim().is_empty() {
+            return Err("sidecar timestamp repair requires actor and reason".into());
+        }
+        DateTime::parse_from_rfc3339(request.new_timestamp)
+            .map_err(|_| "sidecar timestamp repair requires an RFC3339 timestamp".to_string())?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start sidecar timestamp repair: {error}"))?;
+        let (family, record_key, field_name, old_value) = match &request.record {
+            SidecarTimestampRecord::Mailbox(seq) => {
+                let old = tx
+                    .query_row(
+                        "SELECT closed_at FROM mailbox
+                         WHERE seq=?1 AND closed_at IS NOT NULL",
+                        [seq],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("Failed to read mailbox terminal time: {error}"))?;
+                ("mailbox", seq.to_string(), "closed_at", old)
+            }
+            SidecarTimestampRecord::DeliveryAttempt(attempt_id) => {
+                let old = tx
+                    .query_row(
+                        "SELECT resolved_at FROM mailbox_delivery_attempts
+                         WHERE attempt_id=?1 AND resolved_at IS NOT NULL",
+                        [attempt_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        format!("Failed to read delivery-attempt terminal time: {error}")
+                    })?;
+                (
+                    "mailbox_delivery_attempt",
+                    (*attempt_id).to_string(),
+                    "resolved_at",
+                    old,
+                )
+            }
+            SidecarTimestampRecord::CompletionEvent(event_id) => {
+                let old = tx
+                    .query_row(
+                        "SELECT triggered_at FROM completion_event
+                         WHERE event_id=?1 AND state='triggered' AND triggered_at IS NOT NULL",
+                        [event_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        format!("Failed to read completion-event terminal time: {error}")
+                    })?;
+                (
+                    "completion_event",
+                    (*event_id).to_string(),
+                    "triggered_at",
+                    old,
+                )
+            }
+            SidecarTimestampRecord::CompletionListener {
+                event_id,
+                listener_id,
+            } => {
+                let old = tx
+                    .query_row(
+                        "SELECT closed_at FROM completion_event_listener
+                         WHERE event_id=?1 AND listener_id=?2 AND retirement_pending=0
+                           AND closed_at IS NOT NULL",
+                        params![event_id, listener_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        format!("Failed to read completion-listener terminal time: {error}")
+                    })?;
+                (
+                    "completion_event_listener",
+                    format!("{event_id}/{listener_id}"),
+                    "closed_at",
+                    old,
+                )
+            }
+            SidecarTimestampRecord::RuntimeGeneration(generation_id) => {
+                let old = tx
+                    .query_row(
+                        "SELECT exited_at FROM runtime_generation
+                         WHERE generation_uuid=?1 AND lifecycle_state='exited'
+                           AND exited_at IS NOT NULL",
+                        [generation_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        format!("Failed to read runtime-generation terminal time: {error}")
+                    })?;
+                (
+                    "runtime_generation",
+                    (*generation_id).to_string(),
+                    "exited_at",
+                    old,
+                )
+            }
+        };
+        let old_value = old_value.ok_or_else(|| {
+            "sidecar timestamp repair requires an established terminal record".to_string()
+        })?;
+        if old_value == request.new_timestamp {
+            return Err("sidecar timestamp repair must change the terminal timestamp".into());
+        }
+
+        let repair_id = Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO sidecar_timestamp_repairs(
+                repair_id,record_family,record_key,field_name,old_value,new_value,
+                actor,reason,repaired_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                repair_id,
+                family,
+                record_key,
+                field_name,
+                old_value,
+                request.new_timestamp,
+                request.actor,
+                request.reason,
+                now_rfc3339(),
+            ],
+        )
+        .map_err(|error| format!("Failed to append sidecar timestamp repair audit: {error}"))?;
+
+        let changed = match &request.record {
+            SidecarTimestampRecord::Mailbox(seq) => tx.execute(
+                "UPDATE mailbox
+                 SET closed_at=?1,
+                     retention_eligible_at=CASE
+                       WHEN julianday(?1)>=julianday(enqueued_at) THEN ?1 ELSE NULL END,
+                     retention_status=CASE
+                       WHEN julianday(?1) IS NULL OR julianday(enqueued_at) IS NULL
+                       THEN 'legacy_unknown'
+                       WHEN julianday(?1)<julianday(enqueued_at) THEN 'clock_anomaly'
+                       ELSE 'eligible' END
+                 WHERE seq=?2 AND closed_at IS ?3",
+                params![request.new_timestamp, seq, old_value],
+            ),
+            SidecarTimestampRecord::DeliveryAttempt(attempt_id) => tx.execute(
+                "UPDATE mailbox_delivery_attempts
+                 SET resolved_at=?1
+                 WHERE attempt_id=?2 AND resolved_at IS ?3",
+                params![request.new_timestamp, attempt_id, old_value],
+            ),
+            SidecarTimestampRecord::CompletionEvent(event_id) => tx.execute(
+                "UPDATE completion_event
+                 SET triggered_at=?1,closed_at=?1,updated_at=?1,
+                     retention_eligible_at=CASE
+                       WHEN julianday(?1)>=julianday(created_at)
+                        AND NOT EXISTS(SELECT 1 FROM completion_event_listener listener
+                                       WHERE listener.event_id=completion_event.event_id
+                                         AND listener.retirement_pending=1)
+                        AND NOT EXISTS(SELECT 1 FROM completion_event_listener listener
+                                       WHERE listener.event_id=completion_event.event_id
+                                         AND listener.retention_status!='eligible')
+                       THEN MAX(?1,COALESCE((SELECT MAX(listener.closed_at)
+                                            FROM completion_event_listener listener
+                                            WHERE listener.event_id=completion_event.event_id),?1))
+                       ELSE NULL END,
+                     retention_status=CASE
+                       WHEN julianday(?1) IS NULL OR julianday(created_at) IS NULL
+                       THEN 'legacy_unknown'
+                       WHEN julianday(?1)<julianday(created_at) THEN 'clock_anomaly'
+                       WHEN EXISTS(SELECT 1 FROM completion_event_listener listener
+                                   WHERE listener.event_id=completion_event.event_id
+                                     AND listener.retirement_pending=1) THEN 'blocked'
+                       WHEN EXISTS(SELECT 1 FROM completion_event_listener listener
+                                   WHERE listener.event_id=completion_event.event_id
+                                     AND listener.retention_status!='eligible') THEN 'legacy_unknown'
+                       ELSE 'eligible' END
+                 WHERE event_id=?2 AND state='triggered' AND triggered_at IS ?3",
+                params![request.new_timestamp, event_id, old_value],
+            ),
+            SidecarTimestampRecord::CompletionListener {
+                event_id,
+                listener_id,
+            } => tx.execute(
+                "UPDATE completion_event_listener
+                 SET closed_at=?1,
+                     retention_eligible_at=CASE
+                       WHEN julianday(?1)>=julianday(created_at) THEN ?1 ELSE NULL END,
+                     retention_status=CASE
+                       WHEN julianday(?1) IS NULL OR julianday(created_at) IS NULL
+                       THEN 'legacy_unknown'
+                       WHEN julianday(?1)<julianday(created_at) THEN 'clock_anomaly'
+                       ELSE 'eligible' END
+                 WHERE event_id=?2 AND listener_id=?3 AND retirement_pending=0
+                   AND closed_at IS ?4",
+                params![request.new_timestamp, event_id, listener_id, old_value],
+            ),
+            SidecarTimestampRecord::RuntimeGeneration(generation_id) => tx.execute(
+                "UPDATE runtime_generation SET exited_at=?1
+                 WHERE generation_uuid=?2 AND lifecycle_state='exited' AND exited_at IS ?3",
+                params![request.new_timestamp, generation_id, old_value],
+            ),
+        }
+        .map_err(|error| format!("Failed to apply sidecar timestamp repair: {error}"))?;
+        if changed != 1 {
+            return Err("sidecar timestamp repair target changed concurrently".into());
+        }
+        if let SidecarTimestampRecord::CompletionListener { event_id, .. } = &request.record {
+            tx.execute(
+                "UPDATE completion_event
+                 SET retention_eligible_at=CASE
+                       WHEN retention_status!='clock_anomaly'
+                        AND NOT EXISTS(SELECT 1 FROM completion_event_listener listener
+                                       WHERE listener.event_id=?1 AND listener.retirement_pending=1)
+                        AND NOT EXISTS(SELECT 1 FROM completion_event_listener listener
+                                       WHERE listener.event_id=?1 AND listener.retention_status!='eligible')
+                       THEN MAX(closed_at,COALESCE((SELECT MAX(listener.closed_at)
+                                                  FROM completion_event_listener listener
+                                                  WHERE listener.event_id=?1),closed_at))
+                       ELSE NULL END,
+                     retention_status=CASE
+                       WHEN retention_status='clock_anomaly' THEN 'clock_anomaly'
+                       WHEN EXISTS(SELECT 1 FROM completion_event_listener listener
+                                   WHERE listener.event_id=?1 AND listener.retirement_pending=1)
+                       THEN 'blocked'
+                       WHEN EXISTS(SELECT 1 FROM completion_event_listener listener
+                                   WHERE listener.event_id=?1 AND listener.retention_status!='eligible')
+                       THEN 'legacy_unknown' ELSE 'eligible' END
+                 WHERE event_id=?1 AND state='triggered'",
+                [event_id],
+            )
+            .map_err(|error| {
+                format!("Failed to refresh repaired completion-event retention: {error}")
+            })?;
+        }
+        tx.commit()
+            .map_err(|error| format!("Failed to commit sidecar timestamp repair: {error}"))?;
+        Ok(repair_id)
+    }
+
     pub fn terminal_history_retention_stats(
         &self,
     ) -> Result<TerminalHistoryRetentionStats, String> {
@@ -3445,6 +3712,8 @@ impl MailboxDb {
                     "SELECT EXISTS (
                          SELECT 1 FROM mailbox_delivery_attempts
                          WHERE attempt_id = ?1
+                           AND retention_status = 'eligible'
+                           AND retention_eligible_at IS NOT NULL
                            AND NOT EXISTS (SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                                            WHERE finalizer.attempt_id = ?1)
                            AND resolved_at IS NOT NULL
@@ -3484,6 +3753,8 @@ impl MailboxDb {
                          FROM mailbox AS candidate
                          WHERE candidate.seq = ?1
                            AND candidate.delivered_at IS NOT NULL
+                           AND candidate.retention_status = 'eligible'
+                           AND candidate.retention_eligible_at IS NOT NULL
                            AND candidate.kind = ?2
                            AND NOT EXISTS (
                                SELECT 1
@@ -7904,10 +8175,15 @@ fn terminal_history_retention_stats_on(
         "SELECT COUNT(*)
          FROM mailbox AS candidate
          WHERE candidate.delivered_at IS NOT NULL
+           AND candidate.retention_status = 'eligible'
+           AND candidate.retention_eligible_at IS NOT NULL
            AND candidate.kind = ?2
            AND candidate.seq NOT IN (
                 SELECT seq FROM mailbox
-                WHERE delivered_at IS NOT NULL AND kind = ?2
+                WHERE delivered_at IS NOT NULL
+                  AND retention_status = 'eligible'
+                  AND retention_eligible_at IS NOT NULL
+                  AND kind = ?2
                 ORDER BY seq DESC
                 LIMIT ?1
            )
@@ -7941,6 +8217,8 @@ fn terminal_history_retention_stats_on(
         "SELECT COUNT(*)
          FROM mailbox_delivery_attempts AS candidate
          WHERE candidate.resolved_at IS NOT NULL
+           AND candidate.retention_status = 'eligible'
+           AND candidate.retention_eligible_at IS NOT NULL
            AND NOT EXISTS (SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                            WHERE finalizer.attempt_id = candidate.attempt_id)
            AND (
@@ -7951,6 +8229,8 @@ fn terminal_history_retention_stats_on(
            AND candidate.attempt_id NOT IN (
                 SELECT attempt_id FROM mailbox_delivery_attempts
                 WHERE resolved_at IS NOT NULL
+                  AND retention_status = 'eligible'
+                  AND retention_eligible_at IS NOT NULL
                   AND (
                       evidence_disposition IS NULL
                       OR evidence_disposition NOT IN ('pending', 'legacy_pending')
@@ -7969,6 +8249,8 @@ fn terminal_history_retention_stats_on(
              SELECT DISTINCT event.payload_sha256
              FROM completion_event AS event
              WHERE event.state = 'triggered'
+               AND event.retention_status = 'eligible'
+               AND event.retention_eligible_at IS NOT NULL
                AND event.payload_reclaimed_at IS NULL
                {}
                AND event.payload_file_path IS NOT NULL
@@ -8022,6 +8304,8 @@ fn prunable_delivery_attempt_ids(
             "SELECT attempt_id
              FROM mailbox_delivery_attempts AS candidate
              WHERE candidate.resolved_at IS NOT NULL
+               AND candidate.retention_status = 'eligible'
+               AND candidate.retention_eligible_at IS NOT NULL
            AND NOT EXISTS (SELECT 1 FROM mailbox_retained_delivery_finalizers AS finalizer
                            WHERE finalizer.attempt_id = candidate.attempt_id)
                AND (
@@ -8032,6 +8316,8 @@ fn prunable_delivery_attempt_ids(
                AND candidate.attempt_id NOT IN (
                     SELECT attempt_id FROM mailbox_delivery_attempts
                     WHERE resolved_at IS NOT NULL
+                      AND retention_status = 'eligible'
+                      AND retention_eligible_at IS NOT NULL
                       AND (
                           evidence_disposition IS NULL
                           OR evidence_disposition NOT IN ('pending', 'legacy_pending')
@@ -8061,10 +8347,15 @@ fn prunable_terminal_mailbox_rows(
             "SELECT candidate.seq, candidate.payload_file_path, candidate.payload_sha256
              FROM mailbox AS candidate
              WHERE candidate.delivered_at IS NOT NULL
+               AND candidate.retention_status = 'eligible'
+               AND candidate.retention_eligible_at IS NOT NULL
                AND candidate.kind = ?2
                AND candidate.seq NOT IN (
                    SELECT seq FROM mailbox
-                   WHERE delivered_at IS NOT NULL AND kind = ?2
+                   WHERE delivered_at IS NOT NULL
+                     AND retention_status = 'eligible'
+                     AND retention_eligible_at IS NOT NULL
+                     AND kind = ?2
                    ORDER BY seq DESC
                    LIMIT ?1
                )
@@ -8128,6 +8419,8 @@ fn reclaimable_completion_payloads(
             "SELECT event.payload_file_path, event.payload_sha256
              FROM completion_event AS event
              WHERE event.state = 'triggered'
+               AND event.retention_status = 'eligible'
+               AND event.retention_eligible_at IS NOT NULL
                AND event.payload_reclaimed_at IS NULL
                {}
                AND event.payload_file_path IS NOT NULL
@@ -12714,7 +13007,7 @@ fn settle_unverifiable_runtime_generations(conn: &Connection) -> Result<(), Stri
     Ok(())
 }
 
-fn runtime_generation_column_additions() -> [(&'static str, &'static str); 6] {
+fn runtime_generation_column_additions() -> [(&'static str, &'static str); 8] {
     [
         ("active_delivery_claimed_at", "TEXT"),
         ("active_delivery_seqs_json", "TEXT"),
@@ -12722,6 +13015,8 @@ fn runtime_generation_column_additions() -> [(&'static str, &'static str); 6] {
         ("creator_identity_os_boot_id", "TEXT"),
         ("creator_identity_os_pid_starttime_ticks", "INTEGER"),
         ("created_at", "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'"),
+        ("running_at", "TEXT"),
+        ("draining_at", "TEXT"),
     ]
 }
 
@@ -14010,12 +14305,12 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            // Schema 22 includes the terminal-excluding live indexes in
-            // addition to the root-supervisor fingerprint (measured 2878 VM
-            // steps). Keep a tight fixed ceiling,
+            // Schema 23 includes the terminal-excluding live indexes and the
+            // timestamp-contract fingerprints (measured 3687 VM steps). Keep
+            // a tight fixed ceiling,
             // the no-backfill assertion, and the separate retained-history
             // growth test; this does not grant a data-size-dependent budget.
-            current_open_steps < 3000,
+            current_open_steps < 4000,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
         );
     }
@@ -15068,6 +15363,8 @@ mod tests {
         connection
             .execute_batch("DROP INDEX IF EXISTS idx_mailbox_receipt_scan_candidates;")
             .unwrap();
+        // Strip v23 triggers before removing columns referenced by them.
+        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         for column in [
             "headless_submission_state",
             "observation_progress",
@@ -15083,7 +15380,6 @@ mod tests {
                 ))
                 .unwrap();
         }
-        schema::remove_continuation_schema_for_legacy_fixture(&connection);
         connection.pragma_update(None, "user_version", 4).unwrap();
         drop(connection);
 
@@ -16446,7 +16742,8 @@ mod tests {
     #[test]
     fn mark_delivered_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
         let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
 
         db.mark_delivered("session-a", None, &[row.seq], "resume-1")
@@ -16462,6 +16759,359 @@ mod tests {
             Some("resume-1")
         );
         assert_eq!(second.delivery_attempts, 1);
+        let retention: (String, String, String) = db
+            .conn
+            .query_row(
+                "SELECT closed_at,retention_eligible_at,retention_status
+                 FROM mailbox WHERE seq=?1",
+                [row.seq],
+                |record| Ok((record.get(0)?, record.get(1)?, record.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(retention.0, first.delivered_at.unwrap());
+        assert_eq!(retention.0, retention.1);
+        assert_eq!(retention.2, "eligible");
+        let immutable = db
+            .conn
+            .execute(
+                "UPDATE mailbox SET closed_at='2030-01-01T00:00:00Z' WHERE seq=?1",
+                [row.seq],
+            )
+            .unwrap_err();
+        assert!(
+            immutable
+                .to_string()
+                .contains("terminal timestamp is immutable")
+        );
+
+        let repair = SidecarTerminalTimestampRepair {
+            record: SidecarTimestampRecord::Mailbox(row.seq),
+            new_timestamp: "2030-01-01T00:00:00Z",
+            actor: "age371-test",
+            reason: "repair verified mailbox evidence",
+        };
+        let blocked = db.repair_terminal_timestamp(repair.clone()).unwrap_err();
+        assert!(blocked.contains("live_history_barrier"), "{blocked}");
+        drop(db);
+
+        let mut historical = MailboxDb::open_historical(&path).unwrap();
+        historical.repair_terminal_timestamp(repair).unwrap();
+        let repaired: (String, String, String) = historical
+            .conn
+            .query_row(
+                "SELECT closed_at,retention_eligible_at,retention_status
+                 FROM mailbox WHERE seq=?1",
+                [row.seq],
+                |record| Ok((record.get(0)?, record.get(1)?, record.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(repaired.0, "2030-01-01T00:00:00Z");
+        assert_eq!(repaired.0, repaired.1);
+        assert_eq!(repaired.2, "eligible");
+        historical
+            .repair_terminal_timestamp(SidecarTerminalTimestampRepair {
+                record: SidecarTimestampRecord::Mailbox(row.seq),
+                new_timestamp: &retention.0,
+                actor: "age371-test",
+                reason: "restore verified original mailbox evidence",
+            })
+            .unwrap();
+        let stale_authorization = historical
+            .conn
+            .execute(
+                "UPDATE mailbox SET closed_at='2030-01-01T00:00:00Z' WHERE seq=?1",
+                [row.seq],
+            )
+            .unwrap_err();
+        assert!(
+            stale_authorization
+                .to_string()
+                .contains("terminal timestamp is immutable")
+        );
+    }
+
+    #[test]
+    fn completion_listener_reactivation_resets_eligibility_and_preserves_first_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        seed_retired_completion_listener(&db, "reactivation", "eligible", "eligible", 0);
+        let before = completion_retention_snapshot(&db, "reactivation");
+
+        let activated = db
+            .request_completion_notification(CompletionNotificationRequest {
+                event_id: "reactivation",
+                listener_id: "target-listener",
+            })
+            .unwrap();
+        let pending = completion_retention_snapshot(&db, "reactivation");
+        assert_eq!(pending.listener_closed_at, before.listener_closed_at);
+        assert_eq!(pending.event_closed_at, before.event_closed_at);
+        assert_eq!(pending.listener_retention, (None, "pending".into()));
+        assert_eq!(pending.event_retention, (None, "blocked".into()));
+        assert_eq!(activated.mailbox_rows.len(), 1);
+
+        let mailbox_seq = activated.mailbox_rows[0].seq;
+        db.mark_delivered(
+            "target-session",
+            None,
+            &[mailbox_seq],
+            "delivery-invocation",
+        )
+        .unwrap();
+        let retired_again = completion_retention_snapshot(&db, "reactivation");
+        assert_eq!(retired_again.listener_closed_at, before.listener_closed_at);
+        assert_eq!(retired_again.event_closed_at, before.event_closed_at);
+        assert_eq!(
+            retired_again.listener_retention.0,
+            Some(retired_again.listener_updated_at.clone())
+        );
+        assert_eq!(retired_again.listener_retention.1, "eligible");
+        assert_eq!(
+            retired_again.event_retention.0,
+            Some(retired_again.listener_updated_at.clone())
+        );
+        assert_eq!(
+            retired_again.event_updated_at,
+            retired_again.listener_updated_at
+        );
+        assert_eq!(retired_again.event_retention.1, "eligible");
+        assert_ne!(
+            retired_again.listener_retention.0,
+            Some(before.listener_closed_at)
+        );
+    }
+
+    #[test]
+    fn completion_listener_reactivation_keeps_unknown_and_anomaly_evidence_sticky() {
+        for status in ["legacy_unknown", "clock_anomaly"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+            seed_retired_completion_listener(&db, status, status, status, 0);
+            let first_close = completion_retention_snapshot(&db, status).listener_closed_at;
+
+            db.request_completion_notification(CompletionNotificationRequest {
+                event_id: status,
+                listener_id: "target-listener",
+            })
+            .unwrap();
+            let reactivated = completion_retention_snapshot(&db, status);
+            assert_eq!(reactivated.listener_retention, (None, status.into()));
+            assert_eq!(reactivated.event_retention, (None, status.into()));
+
+            db.conn
+                .execute(
+                    "UPDATE completion_event_listener
+                     SET active=0,retirement_pending=0
+                     WHERE event_id=?1 AND listener_id='target-listener'",
+                    [status],
+                )
+                .unwrap();
+            let retired = completion_retention_snapshot(&db, status);
+            assert_eq!(retired.listener_closed_at, first_close);
+            assert_eq!(retired.listener_retention, (None, status.into()));
+            assert_eq!(retired.event_retention, (None, status.into()));
+        }
+    }
+
+    #[test]
+    fn completion_listener_transition_uses_only_exact_child_and_pending_projection() {
+        const RETIRED_SIBLINGS: usize = 4_096;
+
+        let small_steps = completion_listener_transition_vm_steps(0);
+        let large_steps = completion_listener_transition_vm_steps(RETIRED_SIBLINGS);
+        assert!(
+            large_steps <= small_steps + 256,
+            "listener transition work grew with retired history: small={small_steps}, large={large_steps}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let mut statement = db
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT 1 FROM completion_event_listener AS pending
+                 INDEXED BY idx_completion_event_listener_retirement_pending
+                 WHERE pending.event_id=?1 AND pending.retirement_pending=1 LIMIT 1",
+            )
+            .unwrap();
+        let details = statement
+            .query_map(["bounded-plan"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("idx_completion_event_listener_retirement_pending")
+            }),
+            "pending projection plan did not use its partial index: {details:?}"
+        );
+        let trigger_sql: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type='trigger' AND name='completion_listener_timestamp_after_retirement'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            trigger_sql.contains("INDEXED BY idx_completion_event_listener_retirement_pending")
+        );
+        assert!(!trigger_sql.contains("MAX("));
+        assert!(!trigger_sql.contains("retention_status!='eligible'"));
+    }
+
+    #[derive(Debug)]
+    struct CompletionRetentionSnapshot {
+        listener_updated_at: String,
+        listener_closed_at: String,
+        listener_retention: (Option<String>, String),
+        event_updated_at: String,
+        event_closed_at: String,
+        event_retention: (Option<String>, String),
+    }
+
+    fn completion_retention_snapshot(
+        db: &MailboxDb,
+        event_id: &str,
+    ) -> CompletionRetentionSnapshot {
+        db.conn
+            .query_row(
+                "SELECT listener.updated_at,listener.closed_at,
+                        listener.retention_eligible_at,listener.retention_status,
+                        event.updated_at,event.closed_at,
+                        event.retention_eligible_at,event.retention_status
+                 FROM completion_event_listener AS listener
+                 JOIN completion_event AS event ON event.event_id=listener.event_id
+                 WHERE listener.event_id=?1 AND listener.listener_id='target-listener'",
+                [event_id],
+                |row| {
+                    Ok(CompletionRetentionSnapshot {
+                        listener_updated_at: row.get(0)?,
+                        listener_closed_at: row.get(1)?,
+                        listener_retention: (row.get(2)?, row.get(3)?),
+                        event_updated_at: row.get(4)?,
+                        event_closed_at: row.get(5)?,
+                        event_retention: (row.get(6)?, row.get(7)?),
+                    })
+                },
+            )
+            .unwrap()
+    }
+
+    fn seed_retired_completion_listener(
+        db: &MailboxDb,
+        event_id: &str,
+        listener_status: &str,
+        event_status: &str,
+        retired_siblings: usize,
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO completion_event(
+                    event_id,kind,state,delivery_mode,state_dir,meta_path,log_path,rc_path,
+                    rc,payload_json,payload_file_path,payload_sha256,payload_byte_len,
+                    payload_retention_policy,created_at,triggered_at,updated_at,closed_at,
+                    retention_eligible_at,retention_status
+                 ) VALUES(?1,'agent_bash_complete','triggered','sync','/fixture','/fixture/meta',
+                    '/fixture/log','/fixture/rc',0,'{}','/fixture/payload',?2,2,'immutable',
+                    '2000-01-01T00:00:00Z','2000-01-01T00:00:01Z',
+                    '2000-01-01T00:00:02Z','2000-01-01T00:00:01Z',
+                    CASE WHEN ?3='eligible' THEN '2000-01-01T00:00:02Z' ELSE NULL END,?3)",
+                params![event_id, "a".repeat(64), event_status],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO completion_event_listener(
+                    event_id,listener_id,session_id,owner_invocation_uuid,active,created_at,
+                    retirement_pending,updated_at,closed_at,retention_eligible_at,retention_status
+                 ) VALUES(?1,'target-listener','target-session','target-listener',0,
+                    '2000-01-01T00:00:00Z',0,'2000-01-01T00:00:02Z',
+                    '2000-01-01T00:00:02Z',
+                    CASE WHEN ?2='eligible' THEN '2000-01-01T00:00:02Z' ELSE NULL END,?2)",
+                params![event_id, listener_status],
+            )
+            .unwrap();
+        if retired_siblings == 0 {
+            return;
+        }
+        let tx = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO completion_event_listener(
+                        event_id,listener_id,session_id,owner_invocation_uuid,active,created_at,
+                        retirement_pending,updated_at,closed_at,retention_eligible_at,retention_status
+                     ) VALUES(?1,?2,?3,?2,0,'2000-01-01T00:00:00Z',0,
+                        '2000-01-01T00:00:02Z','2000-01-01T00:00:02Z',
+                        '2000-01-01T00:00:02Z','eligible')",
+                )
+                .unwrap();
+            for ordinal in 0..retired_siblings {
+                let listener_id = format!("retired-{ordinal}");
+                let session_id = format!("retired-session-{ordinal}");
+                insert
+                    .execute(params![event_id, listener_id, session_id])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    fn completion_listener_transition_vm_steps(retired_siblings: usize) -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        seed_retired_completion_listener(
+            &db,
+            "bounded-transition",
+            "eligible",
+            "eligible",
+            retired_siblings,
+        );
+        begin_completion_finalization_vm_count();
+        db.conn
+            .execute(
+                "UPDATE completion_event_listener SET active=1,retirement_pending=1
+                 WHERE event_id='bounded-transition' AND listener_id='target-listener'",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE completion_event_listener SET active=0,retirement_pending=0
+                 WHERE event_id='bounded-transition' AND listener_id='target-listener'",
+                [],
+            )
+            .unwrap();
+        end_completion_finalization_vm_count()
+    }
+
+    #[test]
+    fn mailbox_wall_clock_regression_is_explicitly_retention_ineligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO mailbox(
+                session_id,kind,handle,payload_json,enqueued_at,state_dir,meta_path,
+                log_path,rc_path,rc
+             ) VALUES('clock-session','agent_bash_complete','clock-handle','{}',
+                '2030-01-01T00:00:00Z','/tmp/state','/tmp/meta','/tmp/log','/tmp/rc',0)",
+                [],
+            )
+            .unwrap();
+        db.conn.execute(
+            "UPDATE mailbox SET delivered_at='2029-12-31T23:59:59Z' WHERE handle='clock-handle'",
+            [],
+        ).unwrap();
+        let retention: (Option<String>, String) = db.conn.query_row(
+            "SELECT retention_eligible_at,retention_status FROM mailbox WHERE handle='clock-handle'",
+            [],
+            |record| Ok((record.get(0)?,record.get(1)?)),
+        ).unwrap();
+        assert_eq!(retention, (None, "clock_anomaly".into()));
     }
 
     #[test]

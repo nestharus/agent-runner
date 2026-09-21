@@ -142,6 +142,24 @@ strings, table/index names, SQL templates, and bound values are discarded. Plan
 collection is off by default, is skipped for filtered normal events, and never
 changes query results or adds a retry/deadline.
 
+## AGE-371 timestamp and retention semantics
+
+Flight-recorder schema v2 keeps UTC wall-clock occurrence in `recorded_at` and
+copies that exact value to `retention_eligible_at`; monotonic
+`elapsed_micros` remains the only latency measure. Schema-v1 records decode as
+explicitly `legacy_unknown`. JSONL shard mtime is never event age authority.
+
+Cleanup status generations now carry `started_at`, `completed_at`, and explicit
+eligibility. An inactive shard whose mtime cannot be read is retained as
+uncertain, and aggregate file-count pressure cannot retire a shard below the
+stale-age threshold. Rotated 30-day diagnostic storage remains later work.
+Lifecycle sink records likewise carry UTC `recorded_at` / identical
+`retention_eligible_at` while preserving monotonic `latency_us`. Runtime trace
+reports are derived views rather than an independent retained trace family; no
+general durable metrics family is selected. Native exit journals and opt-in
+notify/overlay/TUI-profile files remain retention-ineligible unless a later
+family-specific contract supplies authoritative clocks.
+
 ## Input → Expected output
 
 | Input situation | Expected output |
@@ -203,6 +221,9 @@ changes query results or adds a retry/deadline.
   descriptor opened for reading; a mismatch is skipped as
   `concurrent_replacement`. A bounded query is one generation of best-effort
   retained evidence, not a filesystem snapshot.
+- A missing or unreadable shard mtime is unknown evidence, never an epoch-age
+  substitute. A wall-clock regression yields no eligible age, and aggregate
+  shard pressure does not override this conservative result.
 - Raw and coalesced recent failures are derived from the same in-memory
   inspection. Unique record event IDs are deduplicated; a redacted cause/failure
   signature prevents unrelated generic failures from being merged solely by

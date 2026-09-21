@@ -121,6 +121,8 @@ protected live call graph.
 | `maintenance.terminal_history.payload_compaction_stats` | historical/diagnostic | Explicit read-only sizing operation on a historical handle. |
 | `maintenance.terminal_history.prune` | historical/diagnostic | Candidate scans and process-liveness observation precede bounded write transactions; payload filesystem reclamation is outside writer ownership. |
 | `maintenance.terminal_history.vacuum` | historical/diagnostic | Explicit operation only; requires historical scope and never runs from startup, delivery, recovery, or supervisor coordination. |
+| `maintenance.record_timestamps.state_terminal_repair` | historical/diagnostic | Explicit audited repair only. A live handle is rejected before SQLite; the historical transaction appends the immutable audit row and changes the terminal/eligibility projection atomically. |
+| `maintenance.record_timestamps.sidecar_terminal_repair` | historical/diagnostic | Explicit audited repair only. A live sidecar handle is rejected before SQLite; the historical transaction appends the immutable audit row and changes the terminal/eligibility projection atomically. |
 
 Schema upgrade/repair, manual migration/backfill, full mailbox listing, and
 offline diagnostics remain historical/diagnostic operations outside live
@@ -136,3 +138,7 @@ any table in this inventory: all current State/PID-mailbox live authority and
 bounded cross-boundary records remain in their existing transactional stores.
 See [`event-storage-topology.md`](event-storage-topology.md) for the exact
 move/stay list and the rule that event presence or absence grants no authority.
+
+AGE-371 eligibility indexes are historical candidate projections and are not
+live-path scan authority. Their semantics and selected/excluded record families
+are defined in `docs/architecture/record-timestamp-contract.md`.

@@ -65,6 +65,9 @@ fn age160_lifecycle_log_facade_start_finalize_session_capture_preserves_records(
             "parent_invocation_uuid",
             "provider",
             "provider_source",
+            "recorded_at",
+            "retention_eligible_at",
+            "retention_status",
             "session_id",
         ]
     );
@@ -81,7 +84,10 @@ fn age160_lifecycle_log_facade_start_finalize_session_capture_preserves_records(
             "marker_emitted",
             "operation_result",
             "provider_source",
+            "recorded_at",
             "resume_input_id",
+            "retention_eligible_at",
+            "retention_status",
             "session_id",
         ]
     );
@@ -99,6 +105,9 @@ fn age160_lifecycle_log_facade_start_finalize_session_capture_preserves_records(
             "operation_result",
             "provider_source",
             "raw_artifact_paths",
+            "recorded_at",
+            "retention_eligible_at",
+            "retention_status",
             "session_id",
             "terminal_reason",
             "terminal_status",

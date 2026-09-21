@@ -185,6 +185,9 @@ pub struct InvocationRecord {
     pub resume_acceptance_evidence: Option<String>,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+    pub lifecycle_updated_at: Option<DateTime<Utc>>,
+    pub retention_eligible_at: Option<DateTime<Utc>>,
+    pub retention_status: String,
 }
 
 pub struct InvocationChildrenPage {
@@ -229,12 +232,17 @@ struct InvocationRecordRawFields {
     resume_acceptance_evidence: Option<String>,
     created_at_raw: String,
     finished_at_raw: Option<String>,
+    lifecycle_updated_at_raw: Option<String>,
+    retention_eligible_at_raw: Option<String>,
+    retention_status: String,
 }
 
 struct InvocationRecordParsedFields {
     status: InvocationStatus,
     created_at: DateTime<Utc>,
     finished_at: Option<DateTime<Utc>>,
+    lifecycle_updated_at: Option<DateTime<Utc>>,
+    retention_eligible_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -749,6 +757,9 @@ impl StateDb {
             resume_acceptance_evidence: row.get(18)?,
             created_at_raw: row.get(19)?,
             finished_at_raw: row.get(20)?,
+            lifecycle_updated_at_raw: row.get(21)?,
+            retention_eligible_at_raw: row.get(22)?,
+            retention_status: row.get(23)?,
         })
     }
 
@@ -759,6 +770,14 @@ impl StateDb {
             status: Self::parse_invocation_status_at(&raw.status_raw, 6)?,
             created_at: Self::strict_rfc3339_at(&raw.created_at_raw, 18)?,
             finished_at: Self::optional_strict_rfc3339_at(raw.finished_at_raw.clone(), 19)?,
+            lifecycle_updated_at: Self::optional_strict_rfc3339_at(
+                raw.lifecycle_updated_at_raw.clone(),
+                20,
+            )?,
+            retention_eligible_at: Self::optional_strict_rfc3339_at(
+                raw.retention_eligible_at_raw.clone(),
+                21,
+            )?,
         })
     }
 
@@ -788,6 +807,9 @@ impl StateDb {
             resume_acceptance_evidence: raw.resume_acceptance_evidence,
             created_at: parsed.created_at,
             finished_at: parsed.finished_at,
+            lifecycle_updated_at: parsed.lifecycle_updated_at,
+            retention_eligible_at: parsed.retention_eligible_at,
+            retention_status: raw.retention_status,
         }
     }
 

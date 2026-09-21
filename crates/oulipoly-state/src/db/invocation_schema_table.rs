@@ -72,6 +72,10 @@ impl StateDb {
             resume_acceptance_evidence TEXT,
             created_at TEXT NOT NULL,
             finished_at TEXT,
+            lifecycle_updated_at TEXT,
+            retention_eligible_at TEXT,
+            retention_status TEXT NOT NULL DEFAULT 'legacy_unknown'
+                CHECK (retention_status IN ('pending', 'eligible', 'legacy_unknown', 'clock_anomaly')),
             row_version INTEGER NOT NULL DEFAULT 0,
             completion_registration_capability_digest TEXT
                 CONSTRAINT invocation_completion_registration_capability_digest_shape

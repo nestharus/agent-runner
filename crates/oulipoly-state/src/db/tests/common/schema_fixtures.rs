@@ -38,6 +38,7 @@ pub(in crate::db::tests) fn mark_current_schema_version(conn: &sqlite::Connectio
         ))
         .unwrap();
     }
+    seed_current_provider_timestamp_contract(conn);
     // This helper stamps CURRENT, so include the current admission extension
     // even when the fixture intentionally exercises an older unrelated shape.
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='invocation_completion_obligations')",[],|r|r.get(0)).unwrap();
@@ -56,6 +57,40 @@ pub(in crate::db::tests) fn mark_current_schema_version(conn: &sqlite::Connectio
     }
     conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
         .unwrap();
+}
+
+fn seed_current_provider_timestamp_contract(conn: &sqlite::Connection) {
+    let present: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('provider_logical_launches')
+                           WHERE name='retention_status')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if present {
+        return;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS record_timestamp_repairs (
+            repair_id TEXT PRIMARY KEY,
+            record_family TEXT NOT NULL,
+            record_key TEXT NOT NULL,
+            field_name TEXT NOT NULL,
+            old_value TEXT,
+            new_value TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            repaired_at TEXT NOT NULL
+        );",
+    )
+    .unwrap();
+    let migration = include_str!("../../../../migrations/0027_record_timestamp_contract.sql");
+    let start = migration
+        .find("ALTER TABLE provider_logical_launches")
+        .unwrap();
+    let end = migration.find("ALTER TABLE completed_turns").unwrap();
+    conn.execute_batch(&migration[start..end]).unwrap();
 }
 
 pub(in crate::db::tests) fn seed_current_drift_required_tables(conn: &sqlite::Connection) {

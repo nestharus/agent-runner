@@ -227,19 +227,37 @@ pub fn create_full_state_schema(conn: &Connection, user_version: i32) {
         "
     ))
     .unwrap();
-    if user_version >= 24 {
+    if user_version >= 14 {
         conn.execute_batch(include_str!(
             "../../migrations/0014_invocation_completion_obligations.sql"
-        ))
-        .unwrap();
-        conn.execute_batch(include_str!(
-            "../../migrations/0024_completion_continuation_binding.sql"
         ))
         .unwrap();
     }
     if user_version >= 23 {
         conn.execute_batch(include_str!(
             "../../migrations/0023_provider_launch_lifecycle.sql"
+        ))
+        .unwrap();
+    }
+    if user_version >= 24 {
+        conn.execute_batch(include_str!(
+            "../../migrations/0024_completion_continuation_binding.sql"
+        ))
+        .unwrap();
+    }
+    if user_version >= 25 {
+        conn.execute_batch(include_str!("../../migrations/0025_completed_turns.sql"))
+            .unwrap();
+    }
+    if user_version >= 26 {
+        conn.execute_batch(include_str!(
+            "../../migrations/0026_live_history_barrier.sql"
+        ))
+        .unwrap();
+    }
+    if user_version >= 27 {
+        conn.execute_batch(include_str!(
+            "../../migrations/0027_record_timestamp_contract.sql"
         ))
         .unwrap();
     }

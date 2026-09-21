@@ -4,6 +4,7 @@ use oulipoly_state::{
     CURRENT_SCHEMA_VERSION, CompletionContinuityRecoveryState, CompletionObligationAdmission,
     CompletionRegistrationAuthority, InvocationStart, ProviderSessionBinding, StateDb,
 };
+mod timestamp_fixture;
 const ROOT_UUID: &str = "11111111-1111-4111-8111-111111111111";
 const EVENT_ID: &str = "ab_age299_s2_event";
 const ADMISSION_ID: &str = "admission-age299-s2";
@@ -660,6 +661,7 @@ fn schema_17_upgrade_backfills_only_an_exact_proven_materialization_summary() {
         .unwrap();
     drop(state);
     let connection = rusqlite::Connection::open(&state_path).unwrap();
+    timestamp_fixture::remove_v27_timestamp_contract(&connection);
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
