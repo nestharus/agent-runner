@@ -396,4 +396,7 @@ tests on the ports surface, fixture tests on the trace envelope schema.
   inputs.
 - `planning/coverage/spec-result-envelope.md` — consumes settled
   `unknown` diagnostics for the AGE-175 structured stderr marker.
+- `planning/coverage/spec-event-storage.md` — accepted successor sink for
+  non-authoritative diagnostic, trace, metric, and log records; the current
+  JSONL recorder remains the emergency fallback during cutover.
 - `AGENTS.md` § Rust Workspace Structure.

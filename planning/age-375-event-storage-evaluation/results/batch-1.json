@@ -1,0 +1,412 @@
+{
+  "schema": "age375.event-storage-evaluation.v1",
+  "warning": "bounded synthetic smoke fixture; not AGE-353 stress or a production SLO",
+  "environment": {
+    "os": "linux",
+    "architecture": "x86_64",
+    "kernel": "Linux 5.15.167.4-microsoft-standard-WSL2",
+    "fjall_version": "3.1.10",
+    "rusqlite_version": "3.51.3"
+  },
+  "config": {
+    "records": 4096,
+    "producers": 4,
+    "batch_size": 1,
+    "repetitions": 3,
+    "payload_bytes": 256
+  },
+  "expected": {
+    "full_scan_records": 4096,
+    "time_query_records": 409,
+    "trace_query_records": 32,
+    "full_scan_checksum": 14118683692379698994,
+    "time_query_checksum": 4844468282038765174,
+    "trace_query_checksum": 16986026667418407242
+  },
+  "observations": [
+    {
+      "candidate": "partitioned_sqlite",
+      "append_ms": 3297.217424,
+      "reopen_ms": 0.140482,
+      "full_scan_ms": 28.82797,
+      "time_query_ms": 2.830865,
+      "trace_query_ms": 0.48251499999999997,
+      "full_scan": {
+        "records": 4096,
+        "body_bytes": 4952007,
+        "checksum": 14118683692379698994
+      },
+      "time_query": {
+        "records": 409,
+        "body_bytes": 494362,
+        "checksum": 4844468282038765174
+      },
+      "trace_query": {
+        "records": 32,
+        "body_bytes": 38628,
+        "checksum": 16986026667418407242
+      },
+      "bytes_on_disk": 19726336,
+      "notes": [
+        "one SQLite/WAL database per producer; FULL synchronous transactions",
+        "one durability acknowledgement per configured batch"
+      ]
+    },
+    {
+      "candidate": "wal_write_broker",
+      "append_ms": 4760.302530999999,
+      "reopen_ms": 0.059611000000000004,
+      "full_scan_ms": 28.913046,
+      "time_query_ms": 2.973547,
+      "trace_query_ms": 0.412255,
+      "full_scan": {
+        "records": 4096,
+        "body_bytes": 4952007,
+        "checksum": 14118683692379698994
+      },
+      "time_query": {
+        "records": 409,
+        "body_bytes": 494362,
+        "checksum": 4844468282038765174
+      },
+      "trace_query": {
+        "records": 32,
+        "body_bytes": 38628,
+        "checksum": 16986026667418407242
+      },
+      "bytes_on_disk": 19566592,
+      "notes": [
+        "one SQLite/WAL database and one broker writer",
+        "producers wait for their batch transaction acknowledgement"
+      ]
+    },
+    {
+      "candidate": "framed_shards_side_index",
+      "append_ms": 7435.234279,
+      "reopen_ms": 23.953194,
+      "full_scan_ms": 25.638916000000002,
+      "time_query_ms": 2.5312910000000004,
+      "trace_query_ms": 0.225573,
+      "full_scan": {
+        "records": 4096,
+        "body_bytes": 4952007,
+        "checksum": 14118683692379698994
+      },
+      "time_query": {
+        "records": 409,
+        "body_bytes": 494362,
+        "checksum": 4844468282038765174
+      },
+      "trace_query": {
+        "records": 32,
+        "body_bytes": 38628,
+        "checksum": 16986026667418407242
+      },
+      "bytes_on_disk": 5591047,
+      "notes": [
+        "one framed data shard and fixed-width side index per producer",
+        "CRC32C frames; data sync precedes index sync for each batch",
+        "reopen measurement scans data and reconciles the side index"
+      ]
+    },
+    {
+      "candidate": "embedded_lsm_fjall",
+      "append_ms": 6010.539470000001,
+      "reopen_ms": 21.954517,
+      "full_scan_ms": 5.150710999999999,
+      "time_query_ms": 0.645018,
+      "trace_query_ms": 0.09599099999999999,
+      "full_scan": {
+        "records": 4096,
+        "body_bytes": 4952007,
+        "checksum": 14118683692379698994
+      },
+      "time_query": {
+        "records": 409,
+        "body_bytes": 494362,
+        "checksum": 4844468282038765174
+      },
+      "trace_query": {
+        "records": 32,
+        "body_bytes": 38628,
+        "checksum": 16986026667418407242
+      },
+      "bytes_on_disk": 5801449,
+      "notes": [
+        "Fjall 3.1.10, default compression disabled, atomic multi-keyspace batches",
+        "SyncAll durability per configured batch",
+        "single embedded database with internal journal/compaction ownership"
+      ]
+    },
+    {
+      "candidate": "wal_write_broker",
+      "append_ms": 4841.181092,
+      "reopen_ms": 0.076014,
+      "full_scan_ms": 30.035829,
+      "time_query_ms": 3.086691,
+      "trace_query_ms": 0.42247999999999997,
+      "full_scan": {
+        "records": 4096,
+        "body_bytes": 4952007,
+        "checksum": 14118683692379698994
+      },
+      "time_query": {
+        "records": 409,
+        "body_bytes": 494362,
+        "checksum": 4844468282038765174
+      },
+      "trace_query": {
+        "records": 32,
+        "body_bytes": 38628,
+        "checksum": 16986026667418407242
+      },
+      "bytes_on_disk": 19566592,
+      "notes": [
+        "one SQLite/WAL database and one broker writer",
+        "producers wait for their batch transaction acknowledgement"
+      ]
+    },
+    {
+      "candidate": "framed_shards_side_index",
+      "append_ms": 8570.694015000001,
+      "reopen_ms": 24.373212,
+      "full_scan_ms": 26.566021,
+      "time_query_ms": 2.6129439999999997,
+      "trace_query_ms": 0.23946199999999998,
+      "full_scan": {
+        "records": 4096,
+        "body_bytes": 4952007,
+        "checksum": 14118683692379698994
+      },
+      "time_query": {
+        "records": 409,
+        "body_bytes": 494362,
+        "checksum": 4844468282038765174
+      },
+      "trace_query": {
+        "records": 32,
+        "body_bytes": 38628,
+        "checksum": 16986026667418407242
+      },
+      "bytes_on_disk": 5591047,
+      "notes": [
+        "one framed data shard and fixed-width side index per producer",
+        "CRC32C frames; data sync precedes index sync for each batch",
+        "reopen measurement scans data and reconciles the side index"
+      ]
+    },
+    {
+      "candidate": "embedded_lsm_fjall",
+      "append_ms": 5764.488948,
+      "reopen_ms": 22.055761999999998,
+      "full_scan_ms": 5.229068,
+      "time_query_ms": 0.667841,
+      "trace_query_ms": 0.103235,
+      "full_scan": {
+        "records": 4096,
+        "body_bytes": 4952007,
+        "checksum": 14118683692379698994
+      },
+      "time_query": {
+        "records": 409,
+        "body_bytes": 494362,
+        "checksum": 4844468282038765174
+      },
+      "trace_query": {
+        "records": 32,
+        "body_bytes": 38628,
+        "checksum": 16986026667418407242
+      },
+      "bytes_on_disk": 5801449,
+      "notes": [
+        "Fjall 3.1.10, default compression disabled, atomic multi-keyspace batches",
+        "SyncAll durability per configured batch",
+        "single embedded database with internal journal/compaction ownership"
+      ]
+    },
+    {
+      "candidate": "partitioned_sqlite",
+      "append_ms": 3327.154449,
+      "reopen_ms": 0.140267,
+      "full_scan_ms": 28.130739,
+      "time_query_ms": 2.7419990000000003,
+      "trace_query_ms": 0.385088,
+      "full_scan": {
+        "records": 4096,
+        "body_bytes": 4952007,
+        "checksum": 14118683692379698994
+      },
+      "time_query": {
+        "records": 409,
+        "body_bytes": 494362,
+        "checksum": 4844468282038765174
+      },
+      "trace_query": {
+        "records": 32,
+        "body_bytes": 38628,
+        "checksum": 16986026667418407242
+      },
+      "bytes_on_disk": 19726336,
+      "notes": [
+        "one SQLite/WAL database per producer; FULL synchronous transactions",
+        "one durability acknowledgement per configured batch"
+      ]
+    },
+    {
+      "candidate": "framed_shards_side_index",
+      "append_ms": 7322.078998,
+      "reopen_ms": 23.876185,
+      "full_scan_ms": 25.749118000000003,
+      "time_query_ms": 2.5450180000000002,
+      "trace_query_ms": 0.232858,
+      "full_scan": {
+        "records": 4096,
+        "body_bytes": 4952007,
+        "checksum": 14118683692379698994
+      },
+      "time_query": {
+        "records": 409,
+        "body_bytes": 494362,
+        "checksum": 4844468282038765174
+      },
+      "trace_query": {
+        "records": 32,
+        "body_bytes": 38628,
+        "checksum": 16986026667418407242
+      },
+      "bytes_on_disk": 5591047,
+      "notes": [
+        "one framed data shard and fixed-width side index per producer",
+        "CRC32C frames; data sync precedes index sync for each batch",
+        "reopen measurement scans data and reconciles the side index"
+      ]
+    },
+    {
+      "candidate": "embedded_lsm_fjall",
+      "append_ms": 5444.123454,
+      "reopen_ms": 19.396389,
+      "full_scan_ms": 4.525924,
+      "time_query_ms": 0.5467850000000001,
+      "trace_query_ms": 0.061003,
+      "full_scan": {
+        "records": 4096,
+        "body_bytes": 4952007,
+        "checksum": 14118683692379698994
+      },
+      "time_query": {
+        "records": 409,
+        "body_bytes": 494362,
+        "checksum": 4844468282038765174
+      },
+      "trace_query": {
+        "records": 32,
+        "body_bytes": 38628,
+        "checksum": 16986026667418407242
+      },
+      "bytes_on_disk": 5801449,
+      "notes": [
+        "Fjall 3.1.10, default compression disabled, atomic multi-keyspace batches",
+        "SyncAll durability per configured batch",
+        "single embedded database with internal journal/compaction ownership"
+      ]
+    },
+    {
+      "candidate": "partitioned_sqlite",
+      "append_ms": 3316.240929,
+      "reopen_ms": 0.135196,
+      "full_scan_ms": 27.389891,
+      "time_query_ms": 2.661652,
+      "trace_query_ms": 0.397289,
+      "full_scan": {
+        "records": 4096,
+        "body_bytes": 4952007,
+        "checksum": 14118683692379698994
+      },
+      "time_query": {
+        "records": 409,
+        "body_bytes": 494362,
+        "checksum": 4844468282038765174
+      },
+      "trace_query": {
+        "records": 32,
+        "body_bytes": 38628,
+        "checksum": 16986026667418407242
+      },
+      "bytes_on_disk": 19726336,
+      "notes": [
+        "one SQLite/WAL database per producer; FULL synchronous transactions",
+        "one durability acknowledgement per configured batch"
+      ]
+    },
+    {
+      "candidate": "wal_write_broker",
+      "append_ms": 4793.904814,
+      "reopen_ms": 0.109495,
+      "full_scan_ms": 29.755817,
+      "time_query_ms": 2.934393,
+      "trace_query_ms": 0.391148,
+      "full_scan": {
+        "records": 4096,
+        "body_bytes": 4952007,
+        "checksum": 14118683692379698994
+      },
+      "time_query": {
+        "records": 409,
+        "body_bytes": 494362,
+        "checksum": 4844468282038765174
+      },
+      "trace_query": {
+        "records": 32,
+        "body_bytes": 38628,
+        "checksum": 16986026667418407242
+      },
+      "bytes_on_disk": 19566592,
+      "notes": [
+        "one SQLite/WAL database and one broker writer",
+        "producers wait for their batch transaction acknowledgement"
+      ]
+    }
+  ],
+  "summaries": [
+    {
+      "candidate": "embedded_lsm_fjall",
+      "append_ms_median": 5764.488948,
+      "append_events_per_second_median": 710.5573515621214,
+      "reopen_ms_median": 21.954517,
+      "full_scan_ms_median": 5.150710999999999,
+      "time_query_ms_median": 0.645018,
+      "trace_query_ms_median": 0.09599099999999999,
+      "bytes_on_disk_median": 5801449
+    },
+    {
+      "candidate": "framed_shards_side_index",
+      "append_ms_median": 7435.234279,
+      "append_events_per_second_median": 550.8905094717326,
+      "reopen_ms_median": 23.953194,
+      "full_scan_ms_median": 25.749118000000003,
+      "time_query_ms_median": 2.5450180000000002,
+      "trace_query_ms_median": 0.232858,
+      "bytes_on_disk_median": 5591047
+    },
+    {
+      "candidate": "partitioned_sqlite",
+      "append_ms_median": 3316.240929,
+      "append_events_per_second_median": 1235.1334199457979,
+      "reopen_ms_median": 0.140267,
+      "full_scan_ms_median": 28.130739,
+      "time_query_ms_median": 2.7419990000000003,
+      "trace_query_ms_median": 0.397289,
+      "bytes_on_disk_median": 19726336
+    },
+    {
+      "candidate": "wal_write_broker",
+      "append_ms_median": 4793.904814,
+      "append_events_per_second_median": 854.4182996788221,
+      "reopen_ms_median": 0.076014,
+      "full_scan_ms_median": 29.755817,
+      "time_query_ms_median": 2.973547,
+      "trace_query_ms_median": 0.412255,
+      "bytes_on_disk_median": 19566592
+    }
+  ]
+}
