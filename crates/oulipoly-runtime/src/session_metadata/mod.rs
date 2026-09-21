@@ -71,6 +71,11 @@ pub use registry::{
     hydrate_transcript_locator_registry,
 };
 
+/// Shared ambiguity lookback used by every resume/session-identity surface.
+pub fn recent_resume_preview_cutoff() -> chrono::DateTime<chrono::Utc> {
+    ambiguity::recency_cutoff_for_resume_previews()
+}
+
 use crate::provider_registry::ProviderRegistry;
 use crate::session_provider::{self, SessionProviderIdentity, SessionProviderLocateRequest};
 use ambiguity::{

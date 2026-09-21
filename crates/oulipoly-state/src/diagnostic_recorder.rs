@@ -37,6 +37,10 @@ pub const MAX_CLEANUP_ISSUES: usize = 128;
 pub const MAX_CLEANUP_ISSUE_BYTES: usize = 64;
 pub const DEFAULT_DEFERRED_QUEUE_CAPACITY: usize = 1_024;
 pub const GAP_REPORTER_QUEUE_CAPACITY: usize = 16;
+const DEFAULT_MAX_SHARD_BYTES: u64 = 1024 * 1024;
+const DEFAULT_MAX_SHARDS: usize = 4;
+const DEFAULT_MAX_TOTAL_SHARDS: usize = 64;
+const DEFAULT_STALE_SHARD_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 static DIAGNOSTIC_GAP_STAGES: AtomicU64 = AtomicU64::new(0);
 static PENDING_DIAGNOSTIC_GAP_STAGES: AtomicU64 = AtomicU64::new(0);
@@ -104,10 +108,10 @@ pub struct RecorderConfig {
 impl Default for RecorderConfig {
     fn default() -> Self {
         Self {
-            max_shard_bytes: 1024 * 1024,
-            max_shards: 4,
-            max_total_shards: 64,
-            stale_shard_age: Duration::from_secs(7 * 24 * 60 * 60),
+            max_shard_bytes: DEFAULT_MAX_SHARD_BYTES,
+            max_shards: DEFAULT_MAX_SHARDS,
+            max_total_shards: DEFAULT_MAX_TOTAL_SHARDS,
+            stale_shard_age: DEFAULT_STALE_SHARD_AGE,
             deferred_queue_capacity: DEFAULT_DEFERRED_QUEUE_CAPACITY,
         }
     }

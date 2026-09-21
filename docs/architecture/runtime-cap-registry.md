@@ -6,16 +6,35 @@ cadences, and provisional stopgaps shipped by agent-runner. The Rust query API
 is `oulipoly_core::runtime_cap::registry()`; `registry_json()` exposes the same
 stable operator-readable document without requiring the State database.
 
-Every entry owns one named source declaration. The workspace
-`runtime_cap_registry` test verifies both directions: every entry resolves to a
-real production declaration, and every cap-shaped production declaration has
-an entry. It also rejects duration literals used outside named declarations,
-literal `take`/`truncate` resource ceilings, literal bounded-channel capacities,
-and literal durations passed to terminal APIs. Shipped integration-script
-constants are checked in both directions. Test modules and integration-test
-source trees are mechanically excluded; compiled fault hooks remain registered
-as `test_only_patience` even though they are inert without explicit test
-environment.
+Every entry owns one numeric/`Duration` source declaration, its exact tokenized
+initializer, and a production reference in a named source scope. A
+`direct_control` reference is the branch or API call that applies the cap. A
+`configuration_source` reference initializes typed configuration; the checker
+proves that source edge but does not claim whole-program dataflow through the
+configured field. Exhaustion behavior remains a source-review obligation and
+is deliberately not inferred from a symbol name.
+
+The workspace `runtime_cap_registry` test verifies both directions over all
+production numeric/`Duration` declarations, independent of their names. Every
+declaration must be a registry entry or a source-bound entry in
+`runtime-cap-exclusions.json`; exclusions cover numeric protocol/schema IDs,
+OS flag encodings, presentation geometry, and business decision thresholds
+that have no runtime exhaustion policy. The checker also rejects relevant
+anonymous duration constructors, positive raw `libc::poll`/sleep timeouts,
+bounded-channel capacities, `Read::take` ceilings, cap-shaped numeric fields in
+typed configuration literals, and anonymous fixed allocations of at least one
+KiB. Literal arithmetic is evaluated for these forms. It intentionally ignores
+ordinary `Vec::truncate`, iterator `take`, and allocation `with_capacity`
+calls, which do not establish a ceiling by themselves; sub-KiB fixed arrays are
+treated as protocol/layout storage unless their named declaration is otherwise
+registered.
+
+Shipped top-level integration scripts are discovered from `scripts/` rather
+than enumerated. Their numeric declarations and raw timeout/sleep forms are
+checked in both directions. Cargo integration-test targets and source modules
+owned by `#[cfg(test)]` declarations are mechanically excluded; compiled fault
+hooks remain registered as `test_only_patience` even though they are inert
+without explicit test environment.
 
 Classes have deliberately distinct semantics:
 

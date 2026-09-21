@@ -6,6 +6,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::sync::Mutex;
 
 const REMOTE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const REMOTE_REAP_BUFFER_BYTES: usize = 1024;
 
 pub struct RemoteStatus(Mutex<Channel>);
 struct Channel {
@@ -205,7 +206,7 @@ unsafe fn reap_others(root: i32) -> Result<(bool, bool), ()> {
         if fd < 0 {
             return Err(());
         }
-        let mut buffer = [0u8; 1024];
+        let mut buffer = [0u8; REMOTE_REAP_BUFFER_BYTES];
         let mut pid = 0i32;
         let mut other = false;
         let mut reaped = false;

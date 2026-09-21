@@ -57,6 +57,7 @@ pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
 pub const TERMINAL_HISTORY_KEEP_ROWS: usize = 1_024;
+const PAYLOAD_DIGEST_BUFFER_BYTES: usize = 8 * 1024;
 const TERMINAL_HISTORY_MAINTENANCE_BATCH: usize = 256;
 const TERMINAL_HISTORY_MAINTENANCE_PROGRESS_OPS: i32 = 1_000;
 const TERMINAL_HISTORY_MAINTENANCE_TIMEOUT: StdDuration = StdDuration::from_millis(100);
@@ -7310,7 +7311,7 @@ fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
     let mut file = File::open(path)
         .map_err(|err| format!("Failed to open mailbox payload for verification: {err}"))?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 8192];
+    let mut buffer = [0_u8; PAYLOAD_DIGEST_BUFFER_BYTES];
     loop {
         let read = file
             .read(&mut buffer)

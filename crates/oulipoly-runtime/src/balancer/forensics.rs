@@ -11,6 +11,11 @@ use crate::migration::MigrationError;
 use chrono::{DateTime, Duration, Utc};
 use oulipoly_state::StateDb;
 
+const ROLLING_WINDOW_UNAVAILABLE_HOURS: i64 = 5;
+const WEEKLY_UNAVAILABLE_DAYS: i64 = 7;
+const UPSTREAM_OUTAGE_UNAVAILABLE_MINUTES: i64 = 5;
+const STORAGE_CONTENTION_UNAVAILABLE_MINUTES: i64 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureClass {
     RollingWindow5h,
@@ -57,10 +62,16 @@ impl FailureClass {
     /// `None` for transient classes — those write only `last_refresh_at`.
     pub fn next_available_at_offset(self) -> Option<Duration> {
         match self {
-            FailureClass::RollingWindow5h => Some(Duration::hours(5)),
-            FailureClass::WeeklyOrLonger => Some(Duration::days(7)),
-            FailureClass::UpstreamApiDown => Some(Duration::minutes(5)),
-            FailureClass::ProviderStorageContention => Some(Duration::minutes(2)),
+            FailureClass::RollingWindow5h => {
+                Some(Duration::hours(ROLLING_WINDOW_UNAVAILABLE_HOURS))
+            }
+            FailureClass::WeeklyOrLonger => Some(Duration::days(WEEKLY_UNAVAILABLE_DAYS)),
+            FailureClass::UpstreamApiDown => {
+                Some(Duration::minutes(UPSTREAM_OUTAGE_UNAVAILABLE_MINUTES))
+            }
+            FailureClass::ProviderStorageContention => {
+                Some(Duration::minutes(STORAGE_CONTENTION_UNAVAILABLE_MINUTES))
+            }
             FailureClass::TransientStderrNoise => None,
         }
     }

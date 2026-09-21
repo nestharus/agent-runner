@@ -13,6 +13,7 @@ use std::{cell::RefCell, io};
 pub const TERMINATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(250);
 #[cfg(target_os = "linux")]
 const CUSTODIAN_READINESS_POLL_INTERVAL_MS: i32 = 100;
+const CUSTODY_IO_BUFFER_BYTES: usize = 4 * 1024;
 
 /// Signal only this thread's direct unreaped children. The caller must retain
 /// exclusive wait ownership and repeat after adoption to consume an escaped tree.
@@ -638,7 +639,7 @@ mod linux {
                         c"/proc/self/stat".as_ptr(),
                         libc::O_RDONLY | libc::O_CLOEXEC,
                     );
-                    let mut bytes = [0u8; 4096];
+                    let mut bytes = [0u8; CUSTODY_IO_BUFFER_BYTES];
                     let count = if stat < 0 {
                         -1
                     } else {
@@ -1143,7 +1144,7 @@ mod linux {
     // is only the end of this traversal, never ECHILD or proof of tree drain.
     unsafe fn signal_child_list(fd: RawFd, signal: i32) -> bool {
         unsafe {
-            let mut bytes = [0u8; 4096];
+            let mut bytes = [0u8; CUSTODY_IO_BUFFER_BYTES];
             let mut pid: i32 = 0;
             loop {
                 let count = libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len());

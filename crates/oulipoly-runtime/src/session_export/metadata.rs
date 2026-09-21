@@ -29,7 +29,7 @@ pub fn resolve_export_session_metadata(
     let previews = state
         .resume_previews(session_id)
         .map_err(|message| ExportError::Operational { message })?;
-    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    let cutoff = crate::session_metadata::recent_resume_preview_cutoff();
     let recent_count = previews
         .iter()
         .filter(|preview| preview.last_used_at >= cutoff)

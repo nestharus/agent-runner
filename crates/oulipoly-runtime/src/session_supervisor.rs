@@ -14,6 +14,9 @@ use oulipoly_state::{
 };
 
 const SUPERVISOR_REPLY_QUEUE_CAPACITY: usize = 0;
+const DEFAULT_SUPERVISOR_QUEUE_CAPACITY: usize = 64;
+const DEFAULT_SUPERVISOR_MAX_RETRIES: usize = 0;
+const DEFAULT_SUPERVISOR_RECONSTRUCTION_LIMIT: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProcessObservation {
@@ -62,10 +65,10 @@ pub struct SupervisorConfig {
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
-            queue_capacity: 64,
-            max_retries: 0,
+            queue_capacity: DEFAULT_SUPERVISOR_QUEUE_CAPACITY,
+            max_retries: DEFAULT_SUPERVISOR_MAX_RETRIES,
             consumer_id: "resident-session-supervisor".to_owned(),
-            reconstruction_limit: 256,
+            reconstruction_limit: DEFAULT_SUPERVISOR_RECONSTRUCTION_LIMIT,
         }
     }
 }

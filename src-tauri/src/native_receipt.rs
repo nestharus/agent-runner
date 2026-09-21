@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 pub(crate) const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const OBSERVATION_DEADLINE: Duration = Duration::from_secs(30);
 const DELIVERY_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(2);
+const DELIVERY_OBSERVATION_MAX_INLINE_BODY_BYTES: u64 = 0;
 pub(crate) const OBSERVATION_MAX_PAGES: usize = 16;
 pub(crate) const OBSERVATION_MAX_TURNS: u64 = 64;
 pub(crate) const OBSERVATION_MAX_RESPONSE_BYTES: u64 = 128 * 1024;
@@ -154,7 +155,7 @@ pub(crate) fn confirm_delivery_observation_bounded(
                 max_turns: OBSERVATION_MAX_TURNS,
                 max_response_bytes: OBSERVATION_MAX_RESPONSE_BYTES,
                 max_source_bytes: OBSERVATION_MAX_SOURCE_BYTES,
-                max_inline_body_bytes: 0,
+                max_inline_body_bytes: DELIVERY_OBSERVATION_MAX_INLINE_BODY_BYTES,
                 cancellation: &cancellation,
                 timeout: remaining.min(OBSERVATION_TIMEOUT),
             })

@@ -400,6 +400,13 @@ enum HelperCopyOutcome {
     Changed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HelperMarker {
+    Pending,
+    Ready,
+    Result(HelperCopyOutcome),
+}
+
 struct SnapshotHelperCommand {
     command: Command,
     #[cfg(target_os = "linux")]
@@ -444,24 +451,43 @@ fn wait_for_helper_copy(
     progress_wait: &mut Option<SnapshotProgressWait>,
     after_copy: &mut dyn FnMut() -> io::Result<()>,
 ) -> io::Result<HelperCopyOutcome> {
-    let ready = control.join("ready");
     loop {
-        if control.join("result").exists() {
-            return read_helper_result(control);
-        }
-        if ready.exists() {
-            break;
+        match observe_helper_marker(control, is_cancelled, true)? {
+            HelperMarker::Pending => {}
+            HelperMarker::Ready => break,
+            HelperMarker::Result(outcome) => return Ok(outcome),
         }
         wait_for_snapshot_progress(child, control, is_cancelled, progress_wait, "copy")?;
     }
+    ensure_snapshot_not_cancelled(is_cancelled)?;
     after_copy()?;
+    ensure_snapshot_not_cancelled(is_cancelled)?;
     std::fs::write(control.join("compare"), [])?;
     loop {
-        if control.join("result").exists() {
-            return read_helper_result(control);
+        match observe_helper_marker(control, is_cancelled, false)? {
+            HelperMarker::Pending | HelperMarker::Ready => {}
+            HelperMarker::Result(outcome) => return Ok(outcome),
         }
         wait_for_snapshot_progress(child, control, is_cancelled, progress_wait, "validation")?;
     }
+}
+
+fn observe_helper_marker(
+    control: &Path,
+    is_cancelled: &dyn Fn() -> bool,
+    accept_ready: bool,
+) -> io::Result<HelperMarker> {
+    ensure_snapshot_not_cancelled(is_cancelled)?;
+    if control.join("result").exists() {
+        let outcome = read_helper_result(control)?;
+        ensure_snapshot_not_cancelled(is_cancelled)?;
+        return Ok(HelperMarker::Result(outcome));
+    }
+    if accept_ready && control.join("ready").exists() {
+        ensure_snapshot_not_cancelled(is_cancelled)?;
+        return Ok(HelperMarker::Ready);
+    }
+    Ok(HelperMarker::Pending)
 }
 
 fn wait_for_snapshot_progress(
@@ -1123,6 +1149,42 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_race_wins_before_ready_marker_is_accepted() {
+        let control = tempfile::tempdir().unwrap();
+        std::fs::write(control.path().join("ready"), []).unwrap();
+        let observations = std::cell::Cell::new(0);
+        let cancel_during_marker_observation = || {
+            let observation = observations.get();
+            observations.set(observation + 1);
+            observation > 0
+        };
+
+        let error = observe_helper_marker(control.path(), &cancel_during_marker_observation, true)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(observations.get(), 2);
+    }
+
+    #[test]
+    fn cancellation_race_wins_before_result_marker_is_accepted() {
+        let control = tempfile::tempdir().unwrap();
+        std::fs::write(control.path().join("result"), "stable\n").unwrap();
+        let observations = std::cell::Cell::new(0);
+        let cancel_during_marker_observation = || {
+            let observation = observations.get();
+            observations.set(observation + 1);
+            observation > 0
+        };
+
+        let error = observe_helper_marker(control.path(), &cancel_during_marker_observation, true)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(observations.get(), 2);
+    }
 
     #[test]
     fn missing_control_path_remains_a_control_protocol_error() {

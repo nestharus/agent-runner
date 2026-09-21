@@ -20,6 +20,7 @@ const IDLE_WAKE_INTERVAL: Duration = Duration::from_secs(60);
 const OBSERVATION_MAX_TURNS: u64 = 64;
 const OBSERVATION_MAX_RESPONSE_BYTES: u64 = 128 * 1024;
 const OBSERVATION_MAX_SOURCE_BYTES: u64 = 512 * 1024;
+const OBSERVATION_MAX_INLINE_BODY_BYTES: u64 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct OutboundObservationIdentity {
@@ -216,7 +217,7 @@ impl ProviderSessionTurnSource {
             max_turns: OBSERVATION_MAX_TURNS,
             max_response_bytes: OBSERVATION_MAX_RESPONSE_BYTES,
             max_source_bytes: OBSERVATION_MAX_SOURCE_BYTES,
-            max_inline_body_bytes: 0,
+            max_inline_body_bytes: OBSERVATION_MAX_INLINE_BODY_BYTES,
             cancellation,
             timeout: OBSERVATION_TIMEOUT,
         })

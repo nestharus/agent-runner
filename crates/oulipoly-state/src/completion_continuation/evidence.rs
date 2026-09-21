@@ -40,6 +40,7 @@ pub struct SourceOutcome {
 }
 
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
+const OUTPUT_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -350,7 +351,7 @@ impl OutputArtifact {
             return Err("output artifact length conflict".into());
         }
         let mut hasher = Sha256::new();
-        let mut bytes = [0; 65536];
+        let mut bytes = [0; OUTPUT_COPY_BUFFER_BYTES];
         let mut total = 0u64;
         loop {
             let count = input.read(&mut bytes).map_err(|e| e.to_string())?;

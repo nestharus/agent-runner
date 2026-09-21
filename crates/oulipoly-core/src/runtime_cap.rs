@@ -3,8 +3,9 @@
 //!
 //! The registry is data, not control flow: call sites retain domain-specific
 //! behavior while their stable ownership and classification remain queryable.
-//! `runtime_cap_registry` tests bind each entry to its source declaration and
-//! reject newly introduced cap-shaped production constants without ownership.
+//! `runtime_cap_registry` tests bind each entry to its source declaration,
+//! initializer, and a named production use scope. Every other numeric
+//! declaration must carry an explicit, source-bound non-cap exclusion.
 
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -25,6 +26,26 @@ pub enum RuntimeCapClass {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RuntimeCapUse {
+    pub source: String,
+    pub scope: String,
+    pub kind: RuntimeCapUseKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCapUseKind {
+    /// The named declaration is referenced by the branch or API invocation
+    /// that applies the cap.
+    DirectControl,
+    /// The declaration initializes typed runtime configuration. The checker
+    /// proves this source edge, but deliberately does not claim whole-program
+    /// dataflow through the configured field.
+    ConfigurationSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeCap {
     pub id: String,
     pub owner: String,
@@ -36,7 +57,9 @@ pub struct RuntimeCap {
     pub rationale: String,
     pub default_value: String,
     pub source: String,
+    pub declaration_scope: String,
     pub symbol: String,
+    pub controlling_use: RuntimeCapUse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,7 +88,7 @@ pub fn registry() -> &'static [RuntimeCap] {
             let mut document: RegistryDocument = serde_json::from_str(REGISTRY_JSON)
                 .expect("embedded runtime-cap registry must be valid JSON");
             assert_eq!(
-                document.schema_version, 1,
+                document.schema_version, 2,
                 "unsupported cap registry schema"
             );
             validate_registry(&document.caps).expect("embedded runtime-cap registry is invalid");
@@ -110,7 +133,13 @@ pub fn validate_registry(caps: &[RuntimeCap]) -> Result<(), RegistryValidationEr
             ("rationale", cap.rationale.as_str()),
             ("default_value", cap.default_value.as_str()),
             ("source", cap.source.as_str()),
+            ("declaration_scope", cap.declaration_scope.as_str()),
             ("symbol", cap.symbol.as_str()),
+            (
+                "controlling_use.source",
+                cap.controlling_use.source.as_str(),
+            ),
+            ("controlling_use.scope", cap.controlling_use.scope.as_str()),
         ] {
             if value.trim().is_empty() {
                 return Err(RegistryValidationError(format!(
@@ -125,11 +154,61 @@ pub fn validate_registry(caps: &[RuntimeCap]) -> Result<(), RegistryValidationEr
                 cap.id, cap.source
             )));
         }
-        let site = (cap.source.as_str(), cap.symbol.as_str());
+        if cap.controlling_use.source.starts_with('/') || cap.controlling_use.source.contains("..")
+        {
+            return Err(RegistryValidationError(format!(
+                "cap {} controlling-use source must be workspace-relative: {}",
+                cap.id, cap.controlling_use.source
+            )));
+        }
+        for (field, value) in [
+            ("rationale", cap.rationale.as_str()),
+            ("default_value", cap.default_value.as_str()),
+            ("protected_resource", cap.protected_resource.as_str()),
+            ("exhaustion_behavior", cap.exhaustion_behavior.as_str()),
+            ("observability", cap.observability.as_str()),
+            ("configurability", cap.configurability.as_str()),
+        ] {
+            if value.contains("cannot be changed without registry review")
+                || value.starts_with("source expression ")
+                || value == "bounded traversal, retry, or state-machine invariant"
+                || value == "bounded memory or payload retention"
+                || value == "bounded process resources and work queues"
+                || value == "scheduler and observation cadence"
+                || value == "external peer or protocol liveness"
+                || value
+                    == "typed error/result or bounded owning-operation diagnostic before terminal/degraded action"
+                || value
+                    == "fixed source default unless the owning API or documented environment variable supplies an override"
+                || value == "PENDING"
+                || value.contains("initializer and production reference are registry-checked")
+                || value.contains("rejects, truncates, or")
+                || value.contains("typed result, bounded output, or")
+                || value.contains("takes its existing bounded rejection")
+                || value.contains("expires, reclaims, suppresses, or")
+                || value.contains("existing typed")
+                || value.contains("source-defined")
+                || value.contains("keeps one operation finite")
+                || value.contains("prevents the caller and worker slot")
+                || value.contains("typed result/remaining-work")
+                || value.contains("bounded item/traversal")
+                || value.contains("in-memory queue occupancy")
+            {
+                return Err(RegistryValidationError(format!(
+                    "cap {} retains non-specific generated {field}: {value}",
+                    cap.id
+                )));
+            }
+        }
+        let site = (
+            cap.source.as_str(),
+            cap.declaration_scope.as_str(),
+            cap.symbol.as_str(),
+        );
         if !sites.insert(site) {
             return Err(RegistryValidationError(format!(
-                "duplicate cap site: {}#{}",
-                cap.source, cap.symbol
+                "duplicate cap site: {}#{}#{}",
+                cap.source, cap.declaration_scope, cap.symbol
             )));
         }
     }

@@ -69,6 +69,7 @@ const TERMINATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const SETTLEMENT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const STDIN_REJECTION_GRACE: Duration = Duration::from_millis(10);
 const WAIT_ERROR_DETAIL_MAX_CHARS: usize = 256;
+const PROCESS_DRAIN_BUFFER_BYTES: usize = 8 * 1024;
 
 // Set only inside the dedicated Runner receipt helper, before any threads or
 // provider operations. Nested providers belong to that disposable inspection
@@ -1742,7 +1743,7 @@ fn drain_reader_with_processor<P: StdoutProcessor>(
     stdout_line_activity: Option<ProcessEventPublisher>,
     mut processor: P,
 ) -> P::Output {
-    let mut buffer = [0_u8; 8192];
+    let mut buffer = [0_u8; PROCESS_DRAIN_BUFFER_BYTES];
     let mut processor_error = None;
     loop {
         match reader.read(&mut buffer) {

@@ -5,6 +5,8 @@
 
 use super::MetadataError;
 
+const RECENT_RESUME_PREVIEW_HOURS: i64 = 24;
+
 #[derive(Debug, Clone, Copy)]
 pub(super) enum AmbiguityPolicy {
     Reject,
@@ -16,7 +18,7 @@ pub(super) fn rejects_recent_ambiguity(policy: AmbiguityPolicy) -> bool {
 }
 
 pub(super) fn recency_cutoff_for_resume_previews() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() - chrono::Duration::hours(24)
+    chrono::Utc::now() - chrono::Duration::hours(RECENT_RESUME_PREVIEW_HOURS)
 }
 
 pub(super) fn count_recent_previews(
