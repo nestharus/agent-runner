@@ -36,7 +36,7 @@ sections. The auditor returns the spec(s) that match.
 | `spec-tauri-client.md` | Top-level Tauri client wiring + CLIs. |
 | `spec-result-envelope.md` | Result markers, failure identity, pre-invocation failures. |
 | `spec-provider-client.md` | Provider artifact client, resolver, process substrate, launch stream. |
-| `spec-event-storage.md` | Durable diagnostic event-store decision, evaluator, rotation, readers, and retention boundary. |
+| `spec-event-storage.md` | Durable diagnostic event store, rotation/readers, retention policy, and detached maintenance lifecycle. |
 
 ## Spec schema
 

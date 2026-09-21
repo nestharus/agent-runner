@@ -29,6 +29,7 @@ mod error_emit;
 mod invocation;
 mod json_error;
 mod mailbox_delivery;
+mod maintenance_worker;
 mod migration_providers;
 mod native_receipt;
 #[allow(dead_code)]
@@ -55,6 +56,21 @@ mod zero_turn_orchestration;
 use crate::usage::cli::Cli;
 
 fn main() -> ExitCode {
+    if maintenance_worker::is_worker_invocation() {
+        return match maintenance_worker::run_worker_invocation() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let fallback = maintenance_worker::record_worker_failure_fallback(&error);
+                eprintln!("OULIPOLY_MAINTENANCE_GAP=worker_failed:{error}");
+                if let Err(fallback_error) = fallback {
+                    eprintln!(
+                        "OULIPOLY_MAINTENANCE_GAP=worker_failure_fallback_failed:{fallback_error}"
+                    );
+                }
+                ExitCode::FAILURE
+            }
+        };
+    }
     #[cfg(target_os = "linux")]
     if let Some(result) = completion_owner::custodian_entry() {
         return match result {
@@ -108,6 +124,10 @@ fn process_entrypoint() -> ExitCode {
 }
 
 fn run_gui_entrypoint() -> ExitCode {
+    schedule_entrypoint_opportunity(
+        None,
+        maintenance_worker::schedule_daily_opportunity_fail_open,
+    );
     initialize_tracing();
     agent_runner_lib::run_tauri();
     ExitCode::SUCCESS
@@ -115,6 +135,10 @@ fn run_gui_entrypoint() -> ExitCode {
 
 fn run_cli_entrypoint() -> ExitCode {
     let cli = parse_cli();
+    schedule_entrypoint_opportunity(
+        Some(&cli),
+        maintenance_worker::schedule_daily_opportunity_fail_open,
+    );
     let result = dispatch::run_offline_entry(&cli)
         .and_then(|offline_exit| {
             if let Some(code) = offline_exit {
@@ -138,6 +162,22 @@ fn run_cli_entrypoint() -> ExitCode {
     let exit = cli_exit(result);
     emit_cli_error_if_needed(&exit);
     cli_exit_to_code(&exit)
+}
+
+/// This is the common production placement boundary: opportunity admission is
+/// attempted after argv parsing but before offline dispatch, owner bootstrap,
+/// runtime construction, or the GUI event loop.
+fn schedule_entrypoint_opportunity(
+    cli: Option<&Cli>,
+    schedule: impl FnOnce(maintenance_worker::ScheduleBasis),
+) {
+    match cli {
+        None => schedule(maintenance_worker::ScheduleBasis::GuiStartup),
+        Some(cli) if maintenance_worker::cli_requests_opportunity(cli) => {
+            schedule(maintenance_worker::ScheduleBasis::ProviderStartup);
+        }
+        Some(_) => {}
+    }
 }
 
 fn initialize_tracing() {
@@ -194,4 +234,61 @@ fn cli_exit(result: Result<i32, String>) -> CliExit {
 
 fn emit_cli_error(error: &str) {
     eprintln!("Error: {error}");
+}
+
+#[cfg(test)]
+mod maintenance_entrypoint_tests {
+    use super::*;
+
+    #[test]
+    fn common_entrypoint_placement_fixture_schedules_gui_and_provider_before_bootstrap_only() {
+        let provider = Cli::try_parse_from(["runner", "--model", "test"]).unwrap();
+        let diagnostics = Cli::try_parse_from([
+            "runner",
+            "diagnostics",
+            "maintenance",
+            "--kind",
+            "event_discovery",
+            "--partition",
+            "event-store-v1",
+        ])
+        .unwrap();
+        let maintenance = Cli::try_parse_from([
+            "runner",
+            "maintenance",
+            "status",
+            "--kind",
+            "event_discovery",
+            "--partition",
+            "event-store-v1",
+        ])
+        .unwrap();
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Step {
+            Scheduled(maintenance_worker::ScheduleBasis),
+            Bootstrap,
+        }
+        let mut observed = Vec::new();
+        schedule_entrypoint_opportunity(None, |basis| observed.push(Step::Scheduled(basis)));
+        schedule_entrypoint_opportunity(Some(&provider), |basis| {
+            observed.push(Step::Scheduled(basis))
+        });
+        schedule_entrypoint_opportunity(Some(&diagnostics), |basis| {
+            observed.push(Step::Scheduled(basis))
+        });
+        schedule_entrypoint_opportunity(Some(&maintenance), |basis| {
+            observed.push(Step::Scheduled(basis))
+        });
+        observed.push(Step::Bootstrap);
+
+        assert_eq!(
+            observed,
+            [
+                Step::Scheduled(maintenance_worker::ScheduleBasis::GuiStartup),
+                Step::Scheduled(maintenance_worker::ScheduleBasis::ProviderStartup),
+                Step::Bootstrap,
+            ]
+        );
+    }
 }

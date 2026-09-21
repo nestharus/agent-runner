@@ -5,7 +5,8 @@ Status: **accepted for AGE-375**
 Decision: **producer-partitioned SQLite/WAL event generations**
 
 Primary implementation owner: **AGE-376**, composed with **AGE-372** retention
-policy and **AGE-377** detached maintenance as assigned below
+policy and the implemented **AGE-377** lifecycle in
+[`detached-maintenance.md`](detached-maintenance.md)
 
 Implementation status (AGE-376): the producer-partitioned version-1 envelope,
 STRICT SQLite/WAL generations, process-local bounded writer, exact-head
@@ -13,9 +14,11 @@ rotation/recovery, checksummed two-slot head, prepared/sealed manifests,
 bounded readers/reconciliation, preservation-mode JSONL, bounded legacy import,
 bounded union reads, and non-destructive maintenance interfaces are implemented in
 `crates/oulipoly-state/src/event_store/` and the diagnostic producer modules.
-AGE-372 now supplies policy approval and exact receipt inputs. Historical
-scheduling, singleton maintenance jobs, and actual
-repair/compaction/quarantine/retirement remain AGE-377 work.
+AGE-372 supplies policy approval and exact receipt inputs. AGE-377 implements
+historical scheduling, singleton maintenance jobs, bounded coordination
+retention/compaction, and exact event retirement. Unsafe repair-copy or
+quarantine requests remain fail-closed; maintenance never edits a corrupt
+generation in place.
 
 Evidence: [`planning/age-375-event-storage-evaluation/report.md`](../../planning/age-375-event-storage-evaluation/report.md)
 
@@ -401,7 +404,10 @@ closed selected head with an exact prepared successor. A crash during inactive
 slot replacement leaves either only the previous valid slot or both valid slots;
 it never exposes a head whose manifest was not already synced and validated.
 Unreferenced candidates and temporary files are not deleted at startup; AGE-377
-classifies them through detached orphan audit.
+classifies them through the exact detached orphan-classification job. Actual
+location is authoritative for that classification: a retained staging basename
+cannot make an artifact at the final generation path “incomplete staging.” A
+manifest-less, corrupt, or otherwise unprovable final generation is preserved.
 
 Processes alive across many days rotate their own heads by the same protocol.
 Root-supervisor startup does not enumerate writer directories. Event-sink
@@ -416,7 +422,7 @@ Ticket ownership is fixed as follows:
 |---|---|---|
 | AGE-372 | The implemented 30-day retention policy/engine: per-family policy, typed preservation of live/unresolved/unknown authority, and an exact generation approval bound to writer/generation and manifest digests. | Event-store layout, worker scheduling, leases, or filesystem deletion. |
 | AGE-376 | Event-store append/read implementation; current-head rotation primitives; generation/head/receipt formats; eligibility metadata; preservation-mode JSONL producer changes; bounded importer/cutover operations and their contracts; and fixtures/interfaces for catalog, repair, rebuild, compaction, and retirement. | Historical job scheduling, singleton maintenance leases, or executing destructive historical maintenance from the root supervisor. |
-| AGE-377 | Opportunistic detached scheduling, durable per-job/per-generation singleton leases, progress/restart, and actual execution of checkpoint, catalog/orphan audit, retention, repair, index rebuild, quarantine, and compaction. | Retention policy decisions or live-head append/rotation. |
+| AGE-377 | Pre-spawn singleton scheduling, durable per-job/per-generation singleton leases, isolated sharded discovery, orphan classification, checkpoint/seal/retirement, bounded AGE-372 retention and compaction, rotation follow-up, and production admission of AGE-376 catalog/index inspection. | Retention policy decisions, live-head append/rotation, or inventing repair-copy/catalog publication authority absent from AGE-376. |
 
 The three tickets compose rather than duplicate work: AGE-376 exposes immutable
 facts and callable boundaries, AGE-372 decides policy eligibility, and AGE-377
@@ -427,30 +433,37 @@ work.
 
 The following are never root-supervisor work: WAL checkpoint/truncation on a
 closed generation, `ANALYZE`, cross-partition catalog build, integrity scan,
-index rebuild, repair copy, orphan audit, compaction/VACUUM, or retention.
-Rotation only publishes a request; it does not wait for maintenance.
+index rebuild, repair copy, orphan classification, compaction/VACUUM, or retention.
+Rotation only publishes a request; it does not wait for maintenance. AGE-377
+fails closed when AGE-376 says a repair copy is required or when bounded catalog
+inspection lacks a resumable cursor/publication interface; it does not claim an
+unsupported rebuild, repair, quarantine, or catalog publication occurred.
 
-A detached AGE-377 worker must hold its per-job/per-generation durable singleton
-lease. It may work only on a closed generation and must not open or retain the
-current head writer. Progress is bounded and checkpointed.
+A detached AGE-377 worker must hold its per-job singleton and the exact
+generation lease. Destructive retirement works only on a closed generation;
+orphan classification may discharge an exact unselected empty prepared or
+incomplete staging artifact only after proving its producer dead. Neither path
+may open or retain the current head writer. Progress is bounded and checkpointed.
+The orphan worker publishes a stable create-once disposition before moving the
+exact source, then resumes deterministic pending-trash unlink from its durable
+cursor; it does not reclassify remaining files after a crash.
 
 - A missing expected generation directory is `retirement_in_progress` when its
   exact pending-trash path exists, `retired` when a valid receipt names its
   manifest digests, and otherwise `missing_partition`.
 - SQLite open/query/`quick_check` failure is `corrupt_partition`. Other
   partitions remain readable; the query reports incomplete coverage.
-- Repair copies verifiable rows into a new staging generation directory,
-  verifies payload digests, builds indexes there, and publishes the complete
-  replacement directory and prepared manifest through the generation protocol.
-  It never edits the corrupt original in place. AGE-377 moves the original
-  generation directory to quarantine as one unit only after leases prove no
-  reader/writer owns it.
+- A future repair owner may copy verifiable rows into a new staging generation,
+  verify payload digests, build indexes there, and publish through a dedicated
+  replacement protocol. AGE-376 does not currently expose that publication
+  authority, so AGE-377 preserves the original and records the exact gap.
 - If a current head is corrupt, that writer fails its event sink, emits the
   bounded emergency JSONL gap, and may publish a fresh successor with
   `predecessor_status='corrupt'`. It does not claim the missing head was empty.
-- Local index repair uses `REINDEX` only on a closed healthy database or copies
-  rows into a new generation. Cross-partition catalog rebuild reads manifests
-  and local metadata in bounded batches.
+- AGE-377 invokes the AGE-376 local-index planner only for a closed, non-head
+  generation. `RepairCopyRequired` is a preserved terminal outcome, not an
+  in-place `REINDEX`. Catalog inspection is bounded and admitted, but a catalog
+  build is not claimed because AGE-376 has no authoritative publication API.
 
 ## Thirty-day retirement
 
@@ -473,14 +486,22 @@ AGE-377 retires one complete generation directory with this resumable protocol:
    races the move.
 2. Open the closed database, run `PRAGMA wal_checkpoint(TRUNCATE)`, and require
    a non-busy complete result. Run `quick_check`, validate row/payload digests
-   and bounds, close every SQLite handle, then sync the database and any WAL.
-   SQLite may remove or retain a zero-length WAL on clean close; the application
-   never moves or deletes it separately.
-3. Write `sealed.manifest.json.tmp` with the final inventory/digests, sync it,
-   rename it to the absent final manifest name, and sync the generation
-   directory. Re-read and validate the sealed manifest and recorded file
-   digests before continuing.
-4. Atomically rename the single directory
+   in resumable slices, close every SQLite handle, then sync the database and
+   any WAL. SQLite may remove or retain a zero-length WAL on clean close; the
+   application never moves or deletes it separately. Payload byte targets yield
+   between rows rather than rejecting a large valid row. The sealed digest and
+   validation phase are checkpointed so later slices do not repeat these
+   operations.
+3. Hash each immutable durable file once while deriving
+   `sealed.manifest.json`, publish it create-once, and sync the generation
+   directory. Retirement later re-reads the manifest and performs a second
+   complete hash traversal to independently revalidate its recorded file
+   identities immediately before destruction. Both traversals are detached;
+   neither has a hard time or correctness-size cutoff.
+4. Re-read both head slots, persist the destructive-ready proof, move the exact
+   discovery leaf to pending, and re-read epoch-fenced cancellation under the
+   same transition gate used by cancellation. Then
+   atomically rename the single directory
    `writers/<writer>/generations/<id>/` to the absent same-filesystem path
    `retirement/trash/<writer>/<id>.pending/`. Sync both source and trash parent
    directories. This one rename moves the database, WAL, sidecars, and
@@ -670,3 +691,28 @@ AGE-372 policy engine and AGE-377 worker are composed with them.
 
 Changing to custom framed files, a global broker database, an LSM engine, or a
 required service is a new architecture decision, not an implementation detail.
+
+## AGE-377 cycle-4 operational refinements
+
+Detached discovery retains the complete source-trie skeleton; retirement and
+archive paths do not prune producer-visible ancestors. Bad candidate identities
+consume the raw-node budget, advance the durable discovery cursor, and produce
+bounded gap evidence, so restart does not pin healthy later leaves. Derived
+discovery archive is ordered after authoritative retirement-job terminalization
+and can be retried independently.
+
+Legacy discovery remains a bounded detached daily rewalk. Registration or
+top-level enumeration failure is a preserved terminal outcome, and the next UTC
+opportunity retries from durable bounded state. AGE-377 does not publish an
+irreversible legacy cutover marker because directory EOF cannot prove that a
+still-live parent-version process will not lazily create its first legacy-only
+writer afterward. A future cutover requires an enforceable process-drain or
+deployment barrier owned by the consolidated supervisor architecture.
+
+Detached launch evidence is epoch-partitioned and begins with a durable
+pre-spawn intent. Parent admission failures and child execution failures keep
+separate causes and evidence-gap flags, including cross-epoch fallback-only
+reconciliation. Terminal launch outcomes distinguish completed, yielded,
+cancelled, preserved/gapped, and failed. A bounded historical-compaction job
+removes only terminal launch epochs at least 30 days old while preserving active,
+incomplete, and corrupt evidence.

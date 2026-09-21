@@ -523,8 +523,11 @@ impl WriterState {
         let generation_id = GenerationId::random();
         let created_at = now_unix_micros()?;
         let manifest = build_manifest(&config, generation_id, None, created_at, 0);
-        let published = publish_generation(&layout, &manifest)?;
+        // Own the exact shared generation lease before the discovery intent
+        // becomes visible. Detached classification can therefore never win an
+        // exclusive lease over an in-progress live publication.
         let lease = layout.acquire_generation_lease(generation_id)?;
+        let published = publish_generation(&layout, &manifest)?;
         let head = HeadRecord::new(
             0,
             config.producer.writer_instance_id,
@@ -532,6 +535,12 @@ impl WriterState {
             published.prepared_manifest_sha256,
         )?;
         let head_slot = layout.publish_head(None, &head)?;
+        let _ = super::maintenance_discovery::record_generation_phase(
+            layout.event_store_root(),
+            config.producer.writer_instance_id,
+            generation_id,
+            super::maintenance_discovery::DiscoveryPhase::Selected,
+        );
         let connection = open_writable_generation(&published.database_path, &manifest)?;
         Ok(Self {
             config,
@@ -562,6 +571,14 @@ impl WriterState {
         match selected_metadata.state {
             GenerationState::Prepared => {
                 let lease = layout.acquire_generation_lease(selected.record.generation_id)?;
+                let _ = super::maintenance_discovery::register_legacy_generation(
+                    layout.event_store_root(),
+                    config.producer.writer_instance_id,
+                    selected.record.generation_id,
+                    super::maintenance_discovery::DiscoveryPhase::Selected,
+                    None,
+                    Some(&selected_manifest),
+                );
                 mark_generation_writable(&selected_connection)?;
                 Ok(Self {
                     config,
@@ -577,6 +594,14 @@ impl WriterState {
             }
             GenerationState::Writable => {
                 let lease = layout.acquire_generation_lease(selected.record.generation_id)?;
+                let _ = super::maintenance_discovery::register_legacy_generation(
+                    layout.event_store_root(),
+                    config.producer.writer_instance_id,
+                    selected.record.generation_id,
+                    super::maintenance_discovery::DiscoveryPhase::Selected,
+                    None,
+                    Some(&selected_manifest),
+                );
                 Ok(Self {
                     config,
                     layout,
@@ -610,6 +635,14 @@ impl WriterState {
                     ));
                 }
                 let lease = layout.acquire_generation_lease(successor)?;
+                let _ = super::maintenance_discovery::register_legacy_generation(
+                    layout.event_store_root(),
+                    config.producer.writer_instance_id,
+                    successor,
+                    super::maintenance_discovery::DiscoveryPhase::Prepared,
+                    None,
+                    Some(&successor_manifest),
+                );
                 let successor_head = HeadRecord::new(
                     successor_manifest.head_epoch,
                     config.producer.writer_instance_id,
@@ -617,6 +650,17 @@ impl WriterState {
                     successor_manifest.sha256()?,
                 )?;
                 let head_slot = layout.publish_head(Some(selected.slot), &successor_head)?;
+                let _ = super::maintenance_discovery::record_closed_generation(
+                    layout.event_store_root(),
+                    config.producer.writer_instance_id,
+                    selected.record.generation_id,
+                );
+                let _ = super::maintenance_discovery::record_generation_phase(
+                    layout.event_store_root(),
+                    config.producer.writer_instance_id,
+                    successor,
+                    super::maintenance_discovery::DiscoveryPhase::Selected,
+                );
                 let connection = open_writable_generation(
                     &layout.generation_db(successor),
                     &successor_manifest,
@@ -901,8 +945,8 @@ fn rotate_exact_current(
         created_at,
         next_epoch,
     );
-    let published = publish_generation(&state.layout, &manifest)?;
     let successor_lease = state.layout.acquire_generation_lease(successor)?;
+    let published = publish_generation(&state.layout, &manifest)?;
 
     let mut fence = admission
         .lock()
@@ -926,6 +970,11 @@ fn rotate_exact_current(
     let closed_at = now_unix_micros()?;
     close_generation(state.connection_mut()?, closed_at, successor)?;
     drop(state.connection.take());
+    let _ = super::maintenance_discovery::record_closed_generation(
+        state.layout.event_store_root(),
+        state.config.producer.writer_instance_id,
+        previous_generation_id,
+    );
     let head = HeadRecord::new(
         next_epoch,
         state.config.producer.writer_instance_id,
@@ -933,6 +982,12 @@ fn rotate_exact_current(
         published.prepared_manifest_sha256,
     )?;
     let new_slot = state.layout.publish_head(Some(state.head_slot), &head)?;
+    let _ = super::maintenance_discovery::record_generation_phase(
+        state.layout.event_store_root(),
+        state.config.producer.writer_instance_id,
+        successor,
+        super::maintenance_discovery::DiscoveryPhase::Selected,
+    );
     let successor_connection = open_writable_generation(&published.database_path, &manifest)?;
 
     state.connection = Some(successor_connection);
@@ -1187,7 +1242,7 @@ mod tests {
     };
     use serde_json::json;
     use std::fs;
-    use std::sync::Barrier;
+    use std::sync::{Arc, Barrier, Mutex};
 
     fn producer(byte: u8) -> ProducerIdentity {
         ProducerIdentity {
@@ -1421,6 +1476,80 @@ mod tests {
         assert_ne!(first_db, second_db);
         first.shutdown().unwrap();
         second.shutdown().unwrap();
+    }
+
+    #[test]
+    fn unavailable_discovery_shard_does_not_veto_concurrent_independent_producer() {
+        let root = tempfile::tempdir().unwrap();
+        let discovery = root.path().join("maintenance-discovery-v1/active");
+        fs::create_dir_all(&discovery).unwrap();
+        fs::write(discovery.join("01"), b"blocked exact writer shard").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let blocked_barrier = Arc::clone(&barrier);
+        let healthy_barrier = Arc::clone(&barrier);
+        let blocked_root = root.path().to_path_buf();
+        let healthy_root = root.path().to_path_buf();
+
+        let blocked = thread::spawn(move || {
+            blocked_barrier.wait();
+            ProcessEventWriter::start(EventWriterConfig::native(blocked_root, producer(1)))
+        });
+        let healthy = thread::spawn(move || {
+            healthy_barrier.wait();
+            ProcessEventWriter::start(EventWriterConfig::native(healthy_root, producer(2)))
+        });
+        barrier.wait();
+
+        assert!(matches!(
+            blocked.join().unwrap(),
+            Err(WriterError::Generation(GenerationError::Validation(_)))
+        ));
+        let healthy = healthy.join().unwrap().unwrap();
+        healthy.shutdown().unwrap();
+        assert!(
+            !root
+                .path()
+                .join("maintenance-inventory-v1.sqlite3")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn producer_shared_lease_is_owned_before_discovery_intent_is_actionable() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = producer(88);
+        let expected_writer = identity.writer_instance_id;
+        let generation = Arc::new(Mutex::new(None));
+        let generation_from_hook = Arc::clone(&generation);
+        let intent_visible = Arc::new(Barrier::new(2));
+        let intent_visible_from_hook = Arc::clone(&intent_visible);
+        let release = Arc::new(Barrier::new(2));
+        let release_from_hook = Arc::clone(&release);
+        let hook = Arc::new(move |_: &Path, writer, observed_generation| {
+            if writer == expected_writer {
+                *generation_from_hook.lock().unwrap() = Some(observed_generation);
+                intent_visible_from_hook.wait();
+                release_from_hook.wait();
+            }
+        });
+
+        let writer = super::super::maintenance_discovery::with_generation_intent_hook(hook, || {
+            let producer_root = root.path().to_path_buf();
+            let writer_thread = thread::spawn(move || {
+                ProcessEventWriter::start(EventWriterConfig::native(producer_root, identity))
+            });
+            intent_visible.wait();
+            let generation = generation.lock().unwrap().unwrap();
+            let layout =
+                WriterLayout::open_existing(root.path(), *expected_writer.as_bytes()).unwrap();
+            assert!(matches!(
+                layout.acquire_generation_maintenance_lease(generation),
+                Err(GenerationError::GenerationAlreadyOwned(_))
+            ));
+            release.wait();
+            writer_thread.join().unwrap().unwrap()
+        });
+        writer.shutdown().unwrap();
     }
 
     #[test]

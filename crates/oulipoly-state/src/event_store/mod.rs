@@ -4,15 +4,25 @@
 //! coordination authority. In particular, callers must not make State or
 //! PID-mailbox outcomes depend on an event append succeeding.
 
+mod detached;
 mod envelope;
 pub mod generation;
 mod importer;
 mod maintenance;
+pub(crate) mod maintenance_discovery;
 mod reader;
 mod schema;
 mod union_reader;
 mod writer;
 
+pub use detached::{
+    EventRetirementError, EventRetirementRequest, EventRetirementSlice, EventRetirementWorkLimits,
+    execute_event_retirement_slice,
+};
+pub(crate) use detached::{
+    archive_event_generation_discovery, audit_event_generation_indexes,
+    inspect_event_generation_catalog,
+};
 pub use envelope::normalize_payload_v1;
 pub use envelope::{
     CorrelationId, Digest32, EnvelopeError, EventCorrelations, EventEnvelopeV1, EventFamily,
@@ -27,9 +37,10 @@ pub use generation::{
     HeadCoverageIssue, HeadRecord, HeadSlot, PREPARED_MANIFEST_FILE_NAME, PreparedManifest,
     PublishedGeneration, RetirementReceipt, SEALED_FILE_DIGEST_BUFFER_BYTES,
     SEALED_MANIFEST_FILE_NAME, SealedManifest, SelectedHead, WriterLayout, WriterOwnershipGuard,
-    acquire_generation_maintenance_lease_at, acquire_generation_reader_lease_at, digest_hex,
-    id_hex, parse_id_hex, publish_retirement_receipt, read_prepared_manifest,
-    seal_closed_generation,
+    acquire_generation_maintenance_lease_at, acquire_generation_reader_lease_at,
+    checkpoint_closed_generation_under_lease, digest_hex, id_hex, parse_id_hex,
+    publish_retirement_receipt, read_prepared_manifest, seal_closed_generation,
+    seal_closed_generation_under_lease,
 };
 pub use importer::{
     LegacyCoverageIssue, LegacyImportCheckpoint, LegacyImportCoverage, LegacyImportDisposition,

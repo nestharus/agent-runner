@@ -71,7 +71,9 @@ the existing AGE-376 `RetirementReceipt`. AGE-377 must still acquire the exact
 exclusive generation lease, re-read both HEAD slots, revalidate the approval,
 checkpoint and validate the closed generation, move the whole directory to its
 deterministic pending-trash identity, and publish the create-once receipt.
-AGE-372 never deletes or moves an event generation.
+AGE-372 never deletes or moves an event generation. AGE-377 consumes this
+approval only in the separate exact-generation lifecycle described in
+[`detached-maintenance.md`](detached-maintenance.md).
 
 ## Bounded execution and restart
 

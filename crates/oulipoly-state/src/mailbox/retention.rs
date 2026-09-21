@@ -29,10 +29,28 @@ impl MailboxDb {
         self.run_retention_batch_after_snapshot(request, || {})
     }
 
+    /// Detached maintenance reports through its exact maintenance job instead
+    /// of opening the normal event-writer diagnostic sink.
+    pub(crate) fn run_retention_batch_without_observation(
+        &mut self,
+        request: &RetentionBatchRequest,
+    ) -> Result<RetentionBatchOutcome, String> {
+        self.run_retention_batch_inner(request, || {}, false)
+    }
+
     fn run_retention_batch_after_snapshot(
         &mut self,
         request: &RetentionBatchRequest,
         after_snapshot: impl FnOnce(),
+    ) -> Result<RetentionBatchOutcome, String> {
+        self.run_retention_batch_inner(request, after_snapshot, true)
+    }
+
+    fn run_retention_batch_inner(
+        &mut self,
+        request: &RetentionBatchRequest,
+        after_snapshot: impl FnOnce(),
+        emit_observation: bool,
     ) -> Result<RetentionBatchOutcome, String> {
         self.access_scope
             .authorize(TERMINAL_RETENTION_PRUNE, None)?;
@@ -47,7 +65,9 @@ impl MailboxDb {
             // recovery authority. Their eligible timestamp can release owned
             // payloads, but the authority rows are intentionally retained.
             outcome.preserve(PreservationReason::RecoveryAuthoritative);
-            outcome.emit_independent_observation();
+            if emit_observation {
+                outcome.emit_independent_observation();
+            }
             return Ok(outcome);
         }
         let mut candidates = match request.family {
@@ -91,7 +111,6 @@ impl MailboxDb {
                         Ok(false) => outcome.preserve(PreservationReason::StaleCandidate),
                         Err(reason) => {
                             outcome.gap("payload_receipt", reason);
-                            break;
                         }
                     },
                     Err(reason) if sqlite_contention_reason(&reason) => {
@@ -101,7 +120,6 @@ impl MailboxDb {
                     }
                     Err(reason) => {
                         outcome.gap("completion_payload", reason);
-                        break;
                     }
                 }
                 outcome.next_cursor = Some(RetentionBatchCursor {
@@ -121,7 +139,9 @@ impl MailboxDb {
             {
                 outcome.gap("restore_busy_timeout", typed_sqlite_reason(&error));
             }
-            outcome.emit_independent_observation();
+            if emit_observation {
+                outcome.emit_independent_observation();
+            }
             return Ok(outcome);
         }
 
@@ -156,7 +176,6 @@ impl MailboxDb {
                 }
                 Err(error) => {
                     outcome.gap("mailbox_delete", typed_sqlite_reason(&error));
-                    break;
                 }
             }
             outcome.next_cursor = Some(RetentionBatchCursor {
@@ -176,7 +195,9 @@ impl MailboxDb {
         {
             outcome.gap("restore_busy_timeout", typed_sqlite_reason(&error));
         }
-        outcome.emit_independent_observation();
+        if emit_observation {
+            outcome.emit_independent_observation();
+        }
         Ok(outcome)
     }
 }
