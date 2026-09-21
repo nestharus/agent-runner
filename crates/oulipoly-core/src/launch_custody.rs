@@ -11,6 +11,9 @@ use std::{cell::RefCell, io};
 /// Shared published-launch and executor supervision grace. Provider remote
 /// cancellation retains its own configured grace policy.
 pub const TERMINATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(target_os = "linux")]
+const CUSTODIAN_READINESS_POLL_INTERVAL_MS: i32 = 100;
+const CUSTODY_IO_BUFFER_BYTES: usize = 4 * 1024;
 
 /// Signal only this thread's direct unreaped children. The caller must retain
 /// exclusive wait ownership and repeat after adoption to consume an escaped tree.
@@ -413,15 +416,10 @@ mod linux {
         }
         let owner = MonitorOwner(Some(pid));
         drop(server);
-        // Readiness is bounded even if the detached child cannot initialize.
-        let mut pollfd = libc::pollfd {
-            fd: client.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pollfd, 1, 5000) } <= 0 {
-            return Err(io::Error::other("launch custodian readiness timeout"));
-        }
+        // Readiness has no fabricated wall-clock deadline. The peer socket is
+        // the liveness authority: a dead monitor closes it, while a live slow
+        // monitor remains eligible to publish readiness.
+        wait_for_monitor_readiness(client.as_raw_fd())?;
         let mut byte = 0u8;
         if unsafe { libc::recv(client.as_raw_fd(), (&mut byte as *mut u8).cast(), 1, 0) } != 1
             || byte != b'R'
@@ -437,6 +435,41 @@ mod linux {
             #[cfg(test)]
             monitor_pid: pid,
         })
+    }
+
+    pub(super) fn wait_for_monitor_readiness(fd: RawFd) -> io::Result<()> {
+        loop {
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result =
+                unsafe { libc::poll(&mut pollfd, 1, CUSTODIAN_READINESS_POLL_INTERVAL_MS) };
+            if result > 0 && pollfd.revents & libc::POLLIN != 0 {
+                let mut byte = 0u8;
+                let available = unsafe {
+                    libc::recv(
+                        fd,
+                        (&mut byte as *mut u8).cast(),
+                        1,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    )
+                };
+                if available == 1 {
+                    return Ok(());
+                }
+            }
+            if result > 0 && pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+            {
+                return Err(io::Error::other(
+                    "launch custodian exited before publishing readiness",
+                ));
+            }
+            if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return Err(io::Error::last_os_error());
+            }
+        }
     }
 
     pub(super) fn configure(custody: &LaunchCustody, command: &mut Command) -> io::Result<()> {
@@ -606,7 +639,7 @@ mod linux {
                         c"/proc/self/stat".as_ptr(),
                         libc::O_RDONLY | libc::O_CLOEXEC,
                     );
-                    let mut bytes = [0u8; 4096];
+                    let mut bytes = [0u8; CUSTODY_IO_BUFFER_BYTES];
                     let count = if stat < 0 {
                         -1
                     } else {
@@ -1111,7 +1144,7 @@ mod linux {
     // is only the end of this traversal, never ECHILD or proof of tree drain.
     unsafe fn signal_child_list(fd: RawFd, signal: i32) -> bool {
         unsafe {
-            let mut bytes = [0u8; 4096];
+            let mut bytes = [0u8; CUSTODY_IO_BUFFER_BYTES];
             let mut pid: i32 = 0;
             loop {
                 let count = libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len());
@@ -1265,9 +1298,35 @@ mod linux {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Stdio};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn dead_readiness_peer_terminates_without_a_wall_clock_deadline() {
+        let mut sockets = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    sockets.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let client = unsafe { OwnedFd::from_raw_fd(sockets[0]) };
+        let server = unsafe { OwnedFd::from_raw_fd(sockets[1]) };
+        drop(server);
+        let error = linux::wait_for_monitor_readiness(client.as_raw_fd()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exited before publishing readiness")
+        );
+    }
 
     struct Fixture {
         root: PathBuf,

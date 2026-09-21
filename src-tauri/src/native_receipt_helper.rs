@@ -18,6 +18,11 @@ const STALL_BOUND: Duration = Duration::from_secs(30);
 // Scope containment also bounds descendants that close provider pipes but keep
 // running. Registry/hash reuse lasts across ticks, not across helper generations.
 const MAX_LIFETIME: Duration = Duration::from_secs(60);
+const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const TERMINAL_SCAN_ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
+const SCAN_ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const ADMISSION_TIMESTAMP_MAX_BYTES: u64 = 32;
+const HEARTBEAT_QUEUE_CAPACITY: usize = 1;
 
 fn admission_file(path: &Path, suffix: &str) -> Result<File, String> {
     OpenOptions::new()
@@ -170,7 +175,7 @@ fn inspect(once: bool, target: Option<Target>) -> Result<(), String> {
         use std::io::{Seek, SeekFrom};
         owner.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         (&mut owner)
-            .take(32)
+            .take(ADMISSION_TIMESTAMP_MAX_BYTES)
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
         let last = String::from_utf8_lossy(&bytes).parse::<u128>().unwrap_or(0);
@@ -231,7 +236,7 @@ fn wait_for_scan_admission(
         if remaining.is_zero() {
             return Err("receipt target scan admission deadline; attempt remains pending".into());
         }
-        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        std::thread::sleep(remaining.min(SCAN_ADMISSION_POLL_INTERVAL));
     }
 }
 
@@ -273,7 +278,7 @@ fn inspect_target(target: Target) -> Result<(), String> {
             admission
         }
         AdmissionPurpose::TerminalBounded => {
-            wait_for_scan_admission(try_scan_admission, Duration::from_secs(5))?
+            wait_for_scan_admission(try_scan_admission, TERMINAL_SCAN_ADMISSION_TIMEOUT)?
         }
     };
     let Some(db) = MailboxDb::open_default_if_exists()? else {
@@ -490,7 +495,7 @@ pub(crate) fn supervise(
         .stdout
         .take()
         .ok_or("receipt helper missing stdout")?;
-    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let (send, receive) = std::sync::mpsc::sync_channel(HEARTBEAT_QUEUE_CAPACITY);
     let completed = Arc::new(AtomicBool::new(false));
     let completion = completed.clone();
     let reader = std::thread::Builder::new()
@@ -523,7 +528,7 @@ pub(crate) fn supervise(
             if heartbeat.elapsed() >= bound {
                 return Err("receipt helper stalled; terminated and reaped".into());
             }
-            match receive.recv_timeout(Duration::from_millis(10)) {
+            match receive.recv_timeout(SUPERVISOR_POLL_INTERVAL) {
                 Ok(()) => heartbeat = Instant::now(),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(true),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}

@@ -20,10 +20,6 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use super::auto_wake_env::is_auto_wake_invocation;
-use super::constants::{
-    WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS, WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS,
-    WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
-};
 use super::wake_start::start_wake_chain;
 use handoff::{
     WAKE_SWEEP_HANDOFF_RETRY_INTERVAL, ensure_wake_sweep_handoff,
@@ -263,7 +259,9 @@ fn warn_wake_reclaim_driver_start_failed(err: std::io::Error) {
 fn wake_reclaim_maintenance_loop(initial_trigger: &'static str) {
     run_wake_reclaim_sweep_or_warn(initial_trigger);
     loop {
-        std::thread::sleep(Duration::from_secs(WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS));
+        std::thread::sleep(Duration::from_secs(
+            super::constants::WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS,
+        ));
         run_wake_reclaim_sweep_or_warn("maintenance_tick");
     }
 }
@@ -344,7 +342,10 @@ fn run_wake_reclaim_sweep_with_owner(
         .with_lifecycle_phase("wake_recovery_sweep")
         .with_identifier("trigger", trigger)
         .with_identifier("owned_lease_supplied", owned_lease.is_some().to_string())
-        .with_identifier("scan_limit", WAKE_RECLAIM_SWEEP_SCAN_LIMIT.to_string());
+        .with_identifier(
+            "scan_limit",
+            super::constants::WAKE_RECLAIM_SWEEP_SCAN_LIMIT.to_string(),
+        );
     process_recorder().with_requested_span(start, |span| {
         let mut stage = WakeSweepStage::BeforeAdmission;
         let result = (|| {
@@ -388,7 +389,7 @@ fn run_wake_reclaim_sweep_with_owner(
             }
             let candidates = db.wake_sessions().wake_sweep_candidates(
                 super::constants::WAKE_CLAIM_STALE_AFTER_SECONDS,
-                WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
+                super::constants::WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
             )?;
             if candidates.is_empty() {
                 return Ok(WakeSweepRunOutcome::NoCandidates);
@@ -397,7 +398,9 @@ fn run_wake_reclaim_sweep_with_owner(
                 &mut db,
                 candidates,
                 state::open_default_state_read_only_with_timeout_and_cancel(
-                    Duration::from_secs(WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS),
+                    Duration::from_secs(
+                        super::constants::WAKE_RECLAIM_STATE_SNAPSHOT_STALE_PROGRESS_AFTER_SECONDS,
+                    ),
                     is_cancelled,
                 ),
             )?;

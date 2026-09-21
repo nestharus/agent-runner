@@ -154,9 +154,10 @@ impl StateDb {
     fn resume_input_validation_error(input: &str) -> Option<String> {
         if input.trim().is_empty() {
             Some("session id is required".to_string())
-        } else if input.len() > RESUME_INPUT_MAX_LEN {
+        } else if input.len() > super::resume_types::RESUME_INPUT_MAX_LEN {
             Some(format!(
-                "session id exceeds maximum length of {RESUME_INPUT_MAX_LEN} bytes"
+                "session id exceeds maximum length of {} bytes",
+                super::resume_types::RESUME_INPUT_MAX_LEN
             ))
         } else if input.chars().any(char::is_control) {
             Some("session id contains control characters".to_string())

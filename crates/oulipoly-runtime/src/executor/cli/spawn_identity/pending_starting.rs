@@ -3,6 +3,8 @@
 use super::*;
 use std::sync::{Mutex, OnceLock};
 
+const FINALIZER_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
 #[derive(Default)]
 struct Pending {
     contexts: Vec<SpawnIdentityContext>,
@@ -70,6 +72,6 @@ fn drain() {
             .unwrap_or_else(|e| e.into_inner())
             .contexts
             .extend(remaining);
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(FINALIZER_RETRY_INTERVAL);
     }
 }

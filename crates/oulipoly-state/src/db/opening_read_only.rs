@@ -249,10 +249,10 @@ impl StateDb {
         Ok((conn, snapshot))
     }
 
-    pub(super) fn open_read_only_connection_with_retry_and_work_timeout(
+    pub(super) fn open_read_only_connection_with_retry_and_stale_progress(
         path: &Path,
         retry_timeout: std::time::Duration,
-        work_timeout: std::time::Duration,
+        stale_progress_after: std::time::Duration,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<
         (
@@ -262,10 +262,10 @@ impl StateDb {
         ReadOnlyOpenError,
     > {
         let snapshot =
-            crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_and_work_timeout(
+            crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_and_stale_progress(
                 path,
                 retry_timeout,
-                work_timeout,
+                stale_progress_after,
                 is_cancelled,
             )
             .map_err(|err| ReadOnlyOpenError::Operational {

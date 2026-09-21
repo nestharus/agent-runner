@@ -32,6 +32,8 @@
 use super::*;
 use crate::result_envelope::{ResultEnvelopeFailureIdentity, ResultEnvelopeInput};
 
+const PROVIDER_ERROR_SNIPPET_MAX_CHARS: usize = 500;
+
 impl StateDb {
     pub(super) fn load_invocation_for_finalize(
         conn: &sqlite::Connection,
@@ -316,7 +318,7 @@ impl StateDb {
     }
 
     pub(super) fn provider_error_snippet(value: &str) -> String {
-        Self::collect_snippet(value.chars().take(500))
+        Self::collect_snippet(value.chars().take(PROVIDER_ERROR_SNIPPET_MAX_CHARS))
     }
 
     fn collect_snippet(chars: impl Iterator<Item = char>) -> String {

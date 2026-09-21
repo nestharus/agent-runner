@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const VERSION_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -94,7 +96,7 @@ impl VersionTracker {
             .unwrap_or(db_path);
         let conn = Connection::open(connection_path)
             .map_err(|e| format!("Failed to open version DB: {e}"))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
+        conn.busy_timeout(VERSION_DB_BUSY_TIMEOUT)
             .map_err(|e| format!("Failed to configure version DB busy timeout: {e}"))?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")

@@ -13,6 +13,11 @@ use oulipoly_state::{
     SessionLifecycleRepository, SessionReconstruction, SupervisorFence, TurnFence, TurnState,
 };
 
+const SUPERVISOR_REPLY_QUEUE_CAPACITY: usize = 0;
+const DEFAULT_SUPERVISOR_QUEUE_CAPACITY: usize = 64;
+const DEFAULT_SUPERVISOR_MAX_RETRIES: usize = 0;
+const DEFAULT_SUPERVISOR_RECONSTRUCTION_LIMIT: usize = 256;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProcessObservation {
     ExactLive,
@@ -60,10 +65,10 @@ pub struct SupervisorConfig {
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
-            queue_capacity: 64,
-            max_retries: 0,
+            queue_capacity: DEFAULT_SUPERVISOR_QUEUE_CAPACITY,
+            max_retries: DEFAULT_SUPERVISOR_MAX_RETRIES,
             consumer_id: "resident-session-supervisor".to_owned(),
-            reconstruction_limit: 256,
+            reconstruction_limit: DEFAULT_SUPERVISOR_RECONSTRUCTION_LIMIT,
         }
     }
 }
@@ -334,7 +339,7 @@ impl<Input, Output> TurnCompletion<Input, Output> {
 
     fn send(&mut self, exit: ChildExit<Output>, completed_at: i64) -> Result<(), SupervisorError> {
         let commands = self.commands.take().ok_or(SupervisorError::Closed)?;
-        let (reply_tx, reply_rx) = mpsc::sync_channel(0);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(SUPERVISOR_REPLY_QUEUE_CAPACITY);
         commands
             .send(SupervisorCommand::ChildExited {
                 fence: self.fence.clone(),
@@ -356,7 +361,7 @@ impl<Input, Output> Drop for TurnCompletion<Input, Output> {
         let Some(commands) = self.commands.take() else {
             return;
         };
-        let (reply, _ignored) = mpsc::sync_channel(0);
+        let (reply, _ignored) = mpsc::sync_channel(SUPERVISOR_REPLY_QUEUE_CAPACITY);
         let _ = commands.send(SupervisorCommand::ChildExited {
             fence: self.fence.clone(),
             exit: ChildExit::Failed(ChildFailure::CompletionDropped),
@@ -572,7 +577,7 @@ where
         &self,
         command: impl FnOnce(SyncSender<Result<T, SupervisorError>>) -> SupervisorCommand<Input, Output>,
     ) -> Result<T, SupervisorError> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(0);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(SUPERVISOR_REPLY_QUEUE_CAPACITY);
         self.commands
             .send(command(reply_tx))
             .map_err(|_| SupervisorError::Closed)?;
@@ -592,7 +597,7 @@ impl<Input, Output> Drop for SessionSupervisor<Input, Output> {
         if self.owner.is_none() {
             return;
         }
-        let (reply, reply_rx) = mpsc::sync_channel(0);
+        let (reply, reply_rx) = mpsc::sync_channel(SUPERVISOR_REPLY_QUEUE_CAPACITY);
         let _ = self
             .commands
             .send(SupervisorCommand::HandleDropped { reply });

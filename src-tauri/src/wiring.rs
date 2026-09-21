@@ -43,6 +43,8 @@ use oulipoly_state::repositories::ProductionStateDbOpener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+const RECEIPT_PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
     pub config_root: PathBuf,
@@ -473,7 +475,7 @@ impl ReceiptRegistryCache {
         let options = ProviderRegistryOptions::default()
             .with_client_options(
                 oulipoly_provider::client::ProviderClientOptions::default()
-                    .with_timeout(std::time::Duration::from_secs(2)),
+                    .with_timeout(RECEIPT_PROVIDER_TIMEOUT),
             )
             .with_config_root(paths.config_root)
             .with_data_root(paths.data_root);

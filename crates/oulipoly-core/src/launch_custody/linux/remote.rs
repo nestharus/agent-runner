@@ -5,6 +5,9 @@ use super::*;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::Mutex;
 
+const REMOTE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const REMOTE_REAP_BUFFER_BYTES: usize = 1024;
+
 pub struct RemoteStatus(Mutex<Channel>);
 struct Channel {
     fd: OwnedFd,
@@ -36,7 +39,7 @@ impl Channel {
 impl RemoteStatus {
     pub fn wait_status(&self) -> io::Result<std::process::ExitStatus> {
         let mut channel = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + REMOTE_RESPONSE_TIMEOUT;
         while channel.status.is_none() {
             channel.response(deadline)?;
         }
@@ -54,7 +57,7 @@ impl RemoteStatus {
             ));
         }
         let mut channel = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + REMOTE_RESPONSE_TIMEOUT;
         if channel.pending_signal {
             // Discard the OLD syscall result, including its error. A valid
             // response frees the slot; a transport error leaves it outstanding.
@@ -203,7 +206,7 @@ unsafe fn reap_others(root: i32) -> Result<(bool, bool), ()> {
         if fd < 0 {
             return Err(());
         }
-        let mut buffer = [0u8; 1024];
+        let mut buffer = [0u8; REMOTE_REAP_BUFFER_BYTES];
         let mut pid = 0i32;
         let mut other = false;
         let mut reaped = false;

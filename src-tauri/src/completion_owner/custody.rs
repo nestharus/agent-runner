@@ -15,6 +15,12 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+const ROOT_WORKER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const RESULT_PERSIST_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const ROOT_WORKER_FRAME_BUFFER_BYTES: usize = 4 * 1024;
+const ROOT_WORKER_REQUEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const SOURCE_COMMAND_BUFFER_BYTES: usize = 64 * 1024;
+
 #[cfg(test)]
 mod birth_tests;
 #[cfg(test)]
@@ -977,10 +983,10 @@ pub(super) fn root_worker_entry() -> Result<(), String> {
     set_close_on_exec(cancellation.as_raw_fd())?;
     let mut bytes = Vec::new();
     (&mut file)
-        .take(4 * 1024 * 1024 + 1)
+        .take(ROOT_WORKER_REQUEST_MAX_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    if bytes.len() > 4 * 1024 * 1024 {
+    if bytes.len() as u64 > ROOT_WORKER_REQUEST_MAX_BYTES {
         return Err("root worker request too large".into());
     }
     let request: CustodianRequest =
@@ -1018,7 +1024,7 @@ pub(super) fn root_worker_entry() -> Result<(), String> {
     let mut cancellation_frame = Vec::new();
     loop {
         if cancellation_started.is_none() {
-            let mut frame_bytes = [0; 4096];
+            let mut frame_bytes = [0; ROOT_WORKER_FRAME_BUFFER_BYTES];
             match cancellation.read(&mut frame_bytes) {
                 Ok(0) => {
                     cancellation_started = Some((
@@ -1102,7 +1108,7 @@ pub(super) fn root_worker_entry() -> Result<(), String> {
             }
         }
         if waited <= 0 {
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(ROOT_WORKER_WAIT_POLL_INTERVAL);
         }
     }
     let classification = if attempt.operation == "source_recovery" && !spawn_failed {
@@ -1201,7 +1207,7 @@ fn persist_root_worker_result(
                     });
                 }
                 retained_error = Some(error);
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(RESULT_PERSIST_RETRY_INTERVAL);
             }
         }
     }
@@ -1252,7 +1258,7 @@ fn source_command(
     }
     let mut hasher = sha2::Sha256::new();
     use sha2::Digest;
-    let mut buffer = [0; 65536];
+    let mut buffer = [0; SOURCE_COMMAND_BUFFER_BYTES];
     loop {
         let count = executable.read(&mut buffer).map_err(|e| e.to_string())?;
         if count == 0 {

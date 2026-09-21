@@ -4,6 +4,7 @@
 //! deliberately not returned through the observed operation's result.
 
 use chrono::{SecondsFormat, Utc};
+use oulipoly_core::runtime_cap::{ProgressWaitOutcome, RuntimeCapClass};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -26,6 +27,7 @@ const RECORDER_DIRECTORY: &str = "diagnostics/flight-recorder-v1";
 const MAX_TEXT_BYTES: usize = 1_024;
 const MAX_CORRELATIONS: usize = 24;
 const MAX_READ_RECORD_BYTES: usize = 1024 * 1024;
+const SAFE_CORRELATION_KEY_MAX_CHARS: usize = 64;
 pub const MAX_INSPECTION_SHARDS: usize = 256;
 pub const MAX_INSPECTION_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_INSPECTION_DIRECTORY_ENTRIES: usize = 1_024;
@@ -35,6 +37,10 @@ pub const MAX_CLEANUP_ISSUES: usize = 128;
 pub const MAX_CLEANUP_ISSUE_BYTES: usize = 64;
 pub const DEFAULT_DEFERRED_QUEUE_CAPACITY: usize = 1_024;
 pub const GAP_REPORTER_QUEUE_CAPACITY: usize = 16;
+const DEFAULT_MAX_SHARD_BYTES: u64 = 1024 * 1024;
+const DEFAULT_MAX_SHARDS: usize = 4;
+const DEFAULT_MAX_TOTAL_SHARDS: usize = 64;
+const DEFAULT_STALE_SHARD_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 static DIAGNOSTIC_GAP_STAGES: AtomicU64 = AtomicU64::new(0);
 static PENDING_DIAGNOSTIC_GAP_STAGES: AtomicU64 = AtomicU64::new(0);
@@ -102,10 +108,10 @@ pub struct RecorderConfig {
 impl Default for RecorderConfig {
     fn default() -> Self {
         Self {
-            max_shard_bytes: 1024 * 1024,
-            max_shards: 4,
-            max_total_shards: 64,
-            stale_shard_age: Duration::from_secs(7 * 24 * 60 * 60),
+            max_shard_bytes: DEFAULT_MAX_SHARD_BYTES,
+            max_shards: DEFAULT_MAX_SHARDS,
+            max_total_shards: DEFAULT_MAX_TOTAL_SHARDS,
+            stale_shard_age: DEFAULT_STALE_SHARD_AGE,
             deferred_queue_capacity: DEFAULT_DEFERRED_QUEUE_CAPACITY,
         }
     }
@@ -167,14 +173,57 @@ impl DiagnosticPhase {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeCertainty {
+    #[default]
     NotStarted,
     StartedUnknown,
     EffectsPossible,
     Committed,
     Terminal,
+}
+
+/// Database-independent evidence emitted before a runtime cap causes terminal
+/// or degraded behavior. Values are bounded and must not contain paths, SQL,
+/// credentials, prompts, or provider payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCapEvidence {
+    pub cap_id: String,
+    pub class: RuntimeCapClass,
+    pub operation: String,
+    pub phase: String,
+    pub configured_value: String,
+    pub outcome: ProgressWaitOutcome,
+    pub outcome_certainty: OutcomeCertainty,
+    pub trace_correlation: String,
+}
+
+impl RuntimeCapEvidence {
+    // The constructor intentionally mirrors the eight mandatory evidence
+    // fields so a caller cannot emit a partial cap-exhaustion record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        cap_id: &'static str,
+        class: RuntimeCapClass,
+        operation: &'static str,
+        phase: &'static str,
+        configured_value: impl AsRef<str>,
+        outcome: ProgressWaitOutcome,
+        outcome_certainty: OutcomeCertainty,
+        trace_correlation: impl AsRef<str>,
+    ) -> Self {
+        Self {
+            cap_id: bounded_text(cap_id, 128),
+            class,
+            operation: bounded_text(operation, 128),
+            phase: bounded_text(phase, 128),
+            configured_value: bounded_text(configured_value.as_ref(), 128),
+            outcome,
+            outcome_certainty,
+            trace_correlation: bounded_text(trace_correlation.as_ref(), 128),
+        }
+    }
 }
 
 /// Stable, non-path database classification. Producers must never attach a
@@ -399,12 +448,6 @@ pub enum SqliteQueryPlanEvidence {
     },
 }
 
-impl Default for OutcomeCertainty {
-    fn default() -> Self {
-        Self::NotStarted
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SqliteFailure {
     pub primary_code: Option<String>,
@@ -449,6 +492,7 @@ pub struct PhaseObservation {
     pub retry_count: Option<u32>,
     pub sqlite_failure: Option<SqliteFailure>,
     pub sqlite: Option<SqlitePhaseEvidence>,
+    pub runtime_cap: Option<RuntimeCapEvidence>,
     pub causes: Vec<String>,
 }
 
@@ -507,6 +551,11 @@ impl PhaseObservation {
 
     pub fn with_sqlite_evidence(mut self, evidence: SqlitePhaseEvidence) -> Self {
         self.sqlite = Some(evidence);
+        self
+    }
+
+    pub fn with_runtime_cap(mut self, evidence: RuntimeCapEvidence) -> Self {
+        self.runtime_cap = Some(evidence);
         self
     }
 
@@ -1796,19 +1845,19 @@ fn read_shard(candidate: &ShardCandidate, byte_budget: u64, report: &mut Inspect
             }
         }
     }
-    if let Ok(metadata) = reader.get_ref().get_ref().metadata() {
-        if metadata.len() > bytes_read {
-            report.coverage.bytes_skipped = report
-                .coverage
-                .bytes_skipped
-                .saturating_add(metadata.len() - bytes_read);
-            if !reported_limit {
-                report.issues.push(InspectionIssue {
-                    source: Some(source(path, line_number.saturating_add(1))),
-                    kind: "inspection_byte_limit".to_string(),
-                    message: "shard growth was skipped at the inspection byte bound".to_string(),
-                });
-            }
+    if let Ok(metadata) = reader.get_ref().get_ref().metadata()
+        && metadata.len() > bytes_read
+    {
+        report.coverage.bytes_skipped = report
+            .coverage
+            .bytes_skipped
+            .saturating_add(metadata.len() - bytes_read);
+        if !reported_limit {
+            report.issues.push(InspectionIssue {
+                source: Some(source(path, line_number.saturating_add(1))),
+                kind: "inspection_byte_limit".to_string(),
+                message: "shard growth was skipped at the inspection byte bound".to_string(),
+            });
         }
     }
 }
@@ -2112,7 +2161,7 @@ fn shard_liveness(pid: i64, starttime: i64, boot_fingerprint: &str) -> ShardLive
     }
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
-        return match crate::pid_identity::read_live_process_identity(pid) {
+        match crate::pid_identity::read_live_process_identity(pid) {
             Ok(Some(identity))
                 if identity.os_pid_starttime_ticks == starttime
                     && fingerprint(&identity.os_boot_id) == boot_fingerprint =>
@@ -2121,7 +2170,7 @@ fn shard_liveness(pid: i64, starttime: i64, boot_fingerprint: &str) -> ShardLive
             }
             Ok(Some(_)) | Ok(None) => ShardLiveness::Inactive,
             Err(_) => ShardLiveness::Uncertain,
-        };
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
@@ -2506,7 +2555,7 @@ fn safe_key(value: &str) -> String {
     let filtered = value
         .chars()
         .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
-        .take(64)
+        .take(SAFE_CORRELATION_KEY_MAX_CHARS)
         .collect::<String>();
     if filtered.is_empty() {
         "correlation".to_string()

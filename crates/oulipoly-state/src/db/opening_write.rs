@@ -408,17 +408,17 @@ impl StateDb {
         Self::open_from_read_only_parts(source, conn, snapshot)
     }
 
-    pub fn open_read_only_with_retry_and_work_timeout_and_cancel(
+    pub fn open_read_only_with_retry_and_stale_progress_and_cancel(
         path: &Path,
         retry_timeout: std::time::Duration,
-        work_timeout: std::time::Duration,
+        stale_progress_after: std::time::Duration,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<Self, ReadOnlyOpenError> {
         let source = Self::validate_read_only_paths(path)?;
-        let (conn, snapshot) = Self::open_read_only_connection_with_retry_and_work_timeout(
+        let (conn, snapshot) = Self::open_read_only_connection_with_retry_and_stale_progress(
             &source,
             retry_timeout,
-            work_timeout,
+            stale_progress_after,
             is_cancelled,
         )?;
         Self::open_from_read_only_parts(source, conn, snapshot)
@@ -719,8 +719,10 @@ impl StateDb {
     }
 }
 
+const STATE_WRITER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub(crate) fn state_writer_busy_timeout() -> std::time::Duration {
-    std::time::Duration::from_secs(5)
+    STATE_WRITER_BUSY_TIMEOUT
 }
 
 #[cfg(any(unix, windows))]
@@ -826,8 +828,6 @@ fn state_identity(identity: crate::filesystem_identity::OpenFileIdentity) -> Sta
 impl StateNamespaceGuard {
     fn acquire(state_path: &Path, exclusive: bool) -> Result<Self, String> {
         const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-        #[cfg(not(test))]
-        const ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         #[cfg(test)]
         const ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -857,7 +857,10 @@ impl StateNamespaceGuard {
                 authority_path.display()
             ));
         }
-        let deadline = std::time::Instant::now() + ACQUISITION_TIMEOUT;
+        #[cfg(test)]
+        let deadline = Some(std::time::Instant::now() + ACQUISITION_TIMEOUT);
+        #[cfg(not(test))]
+        let deadline: Option<std::time::Instant> = None;
         loop {
             let result = if exclusive {
                 <std::fs::File as fs4::FileExt>::try_lock(&file)
@@ -882,15 +885,20 @@ impl StateNamespaceGuard {
                     }
                     return Ok(Self { file });
                 }
-                Err(fs4::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                Err(fs4::TryLockError::WouldBlock)
+                    if deadline.is_none_or(|deadline| std::time::Instant::now() < deadline) =>
+                {
                     std::thread::sleep(RETRY_INTERVAL);
                 }
                 Err(fs4::TryLockError::WouldBlock) => {
+                    #[cfg(test)]
                     return Err(format!(
                         "Timed out after {}ms acquiring State DB namespace authority fence {}",
                         ACQUISITION_TIMEOUT.as_millis(),
                         authority_path.display()
                     ));
+                    #[cfg(not(test))]
+                    unreachable!("production State namespace acquisition has no wall-clock cap");
                 }
                 Err(error) => {
                     return Err(format!(

@@ -60,7 +60,7 @@ fn access_resolved_resume_for_identity(
     let previews = state
         .resume_previews(session_id)
         .map_err(|message| SessionExternalProviderIdentityError::Operational { message })?;
-    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    let cutoff = oulipoly_runtime::session_metadata::recent_resume_preview_cutoff();
     if previews
         .iter()
         .filter(|preview| preview.last_used_at >= cutoff)

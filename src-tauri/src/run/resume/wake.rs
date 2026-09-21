@@ -32,6 +32,7 @@ use crate::zero_turn_orchestration::ZeroTurnAction;
 
 use crate::native_receipt::*;
 const OBSERVATION_MAX_PENDING_ATTEMPTS: usize = 4;
+const OBSERVATION_MAX_INLINE_BODY_BYTES: u64 = 0;
 
 #[derive(Clone, Copy)]
 pub(super) struct ResumeCompletionEvidence<'a> {
@@ -287,7 +288,7 @@ fn capture_pre_delivery_observation_anchor(
         max_turns: OBSERVATION_MAX_TURNS,
         max_response_bytes: OBSERVATION_MAX_RESPONSE_BYTES,
         max_source_bytes: OBSERVATION_MAX_SOURCE_BYTES,
-        max_inline_body_bytes: 0,
+        max_inline_body_bytes: OBSERVATION_MAX_INLINE_BODY_BYTES,
         cancellation: &cancellation,
         timeout: OBSERVATION_TIMEOUT,
     })

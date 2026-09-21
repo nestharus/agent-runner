@@ -8,6 +8,8 @@ use oulipoly_provider::resolver::{ProviderArtifactRef, ProviderResolveOptions};
 use oulipoly_runtime::provider_registry::ProviderClientFactory;
 use std::time::Duration;
 
+const PROVIDER_PROOF_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub(crate) fn prove_provider_artifact(artifact: ProviderArtifactRef) -> Result<(), String> {
     let client = ProviderClientFactory::new(provider_client_options()).client_for(artifact);
     let describe = client
@@ -23,7 +25,7 @@ fn provider_client_options() -> ProviderClientOptions {
                 .into_iter()
                 .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>()),
         ),
-        ..ProviderClientOptions::default().with_timeout(Duration::from_secs(5))
+        ..ProviderClientOptions::default().with_timeout(PROVIDER_PROOF_TIMEOUT)
     }
 }
 

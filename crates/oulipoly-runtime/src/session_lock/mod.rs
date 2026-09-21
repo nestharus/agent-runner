@@ -8,7 +8,6 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const SENTINEL_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const SENTINEL_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,12 +307,22 @@ impl SessionLock {
     }
 
     fn with_lock<T>(&self, f: impl FnOnce() -> Result<T, LockError>) -> Result<T, LockError> {
-        self.with_lock_for(SENTINEL_LOCK_TIMEOUT, SENTINEL_LOCK_POLL_INTERVAL, f)
+        self.with_lock_policy(None, SENTINEL_LOCK_POLL_INTERVAL, f)
     }
 
+    #[cfg(test)]
     fn with_lock_for<T>(
         &self,
         timeout: Duration,
+        poll_interval: Duration,
+        f: impl FnOnce() -> Result<T, LockError>,
+    ) -> Result<T, LockError> {
+        self.with_lock_policy(Some(timeout), poll_interval, f)
+    }
+
+    fn with_lock_policy<T>(
+        &self,
+        timeout: Option<Duration>,
         poll_interval: Duration,
         f: impl FnOnce() -> Result<T, LockError>,
     ) -> Result<T, LockError> {
@@ -321,12 +330,16 @@ impl SessionLock {
         loop {
             match fs4::FileExt::try_lock(&self.sentinel) {
                 Ok(()) => break,
-                Err(fs4::TryLockError::WouldBlock) if started.elapsed() < timeout => {
-                    std::thread::sleep(
-                        poll_interval.min(timeout.saturating_sub(started.elapsed())),
-                    );
+                Err(fs4::TryLockError::WouldBlock)
+                    if timeout.is_none_or(|timeout| started.elapsed() < timeout) =>
+                {
+                    let delay = timeout
+                        .map(|timeout| poll_interval.min(timeout.saturating_sub(started.elapsed())))
+                        .unwrap_or(poll_interval);
+                    std::thread::sleep(delay);
                 }
                 Err(fs4::TryLockError::WouldBlock) => {
+                    let timeout = timeout.expect("bounded sentinel acquisition has a timeout");
                     return Err(LockError::SentinelBusy {
                         timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
                     });

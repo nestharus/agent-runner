@@ -20,6 +20,8 @@
 
 set -euo pipefail
 
+HTTP_TIMEOUT_SECONDS=20
+
 CREDS="${1:?usage: anthropic-usage PATH_TO_CREDENTIALS_JSON}"
 
 if [[ ! -r "$CREDS" ]]; then
@@ -35,7 +37,7 @@ fi
 
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
-HTTP_CODE="$(curl -sS --max-time 20 -o "$TMP" -w '%{http_code}' \
+HTTP_CODE="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" -o "$TMP" -w '%{http_code}' \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "anthropic-beta: oauth-2025-04-20" \
   https://api.anthropic.com/api/oauth/usage)"

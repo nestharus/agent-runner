@@ -85,6 +85,9 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Grace period between SIGTERM and SIGKILL when tearing down a timed-out or
 /// cancelled provider process tree.
 const DEFAULT_KILL_AFTER_GRACE: Duration = Duration::from_millis(100);
+const LAUNCH_KILL_AFTER_GRACE_MIN: Duration = Duration::from_millis(250);
+const DEFAULT_PROVIDER_STDOUT_BYTES: usize = 1024 * 1024;
+const DEFAULT_PROVIDER_STDERR_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderTimeouts {
@@ -112,8 +115,8 @@ pub struct ProviderOutputLimits {
 impl Default for ProviderOutputLimits {
     fn default() -> Self {
         Self {
-            stdout_bytes: 1024 * 1024,
-            stderr_bytes: 128 * 1024,
+            stdout_bytes: DEFAULT_PROVIDER_STDOUT_BYTES,
+            stderr_bytes: DEFAULT_PROVIDER_STDERR_BYTES,
         }
     }
 }
@@ -915,7 +918,7 @@ fn kill_after_grace_for(subcommand: &str, options: &ProviderClientOptions) -> Du
         options
             .timeouts
             .kill_after_grace
-            .max(Duration::from_millis(250))
+            .max(LAUNCH_KILL_AFTER_GRACE_MIN)
     } else {
         options.timeouts.kill_after_grace
     }

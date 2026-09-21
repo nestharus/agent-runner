@@ -19,6 +19,8 @@
 
 set -euo pipefail
 
+HTTP_TIMEOUT_SECONDS=20
+
 CREDS="${1:?usage: chatgpt-usage PATH_TO_AUTH_JSON}"
 
 if [[ ! -r "$CREDS" ]]; then
@@ -35,7 +37,7 @@ fi
 
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
-HTTP_CODE="$(curl -sS --max-time 20 -o "$TMP" -w '%{http_code}' \
+HTTP_CODE="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" -o "$TMP" -w '%{http_code}' \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "ChatGPT-Account-Id: $ACCOUNT_ID" \
   https://chatgpt.com/backend-api/wham/usage)"

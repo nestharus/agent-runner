@@ -4,6 +4,8 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::sync::Mutex;
 
+const EXECUTABLE_DIGEST_BUFFER_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Default)]
 pub(crate) struct IdentityCache(Mutex<Option<(Vec<u8>, String)>>);
 
@@ -46,7 +48,7 @@ impl IdentityCache {
         let mut digest = Sha256::new();
         digest.update(&before);
         let mut offset = 0;
-        let mut bytes = [0u8; 65536];
+        let mut bytes = [0u8; EXECUTABLE_DIGEST_BUFFER_BYTES];
         loop {
             let read = read_at(&file, &mut bytes, offset).map_err(|e| e.to_string())?;
             if read == 0 {

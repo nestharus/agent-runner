@@ -13,6 +13,8 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+const LIVE_MIGRATION_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone)]
 pub(crate) struct ApplyOptions {
     pub(crate) live_state_db_path: PathBuf,
@@ -131,7 +133,7 @@ pub(crate) fn open_live_migration_connection(
 ) -> Result<LiveMigrationConnection, DryRunError> {
     let authority = StateDb::acquire_writer_authority(path).map_err(DryRunError::new)?;
     let conn = Connection::open(authority.path())?;
-    conn.busy_timeout(Duration::from_millis(1000))?;
+    conn.busy_timeout(LIVE_MIGRATION_SQLITE_BUSY_TIMEOUT)?;
     Ok(LiveMigrationConnection {
         connection: conn,
         authority,

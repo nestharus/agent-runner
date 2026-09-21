@@ -66,6 +66,7 @@ use std::sync::Arc;
 
 const DEFAULT_RETAINED_LAUNCH_EVENTS: usize = 1024;
 const DEFAULT_LAUNCH_RETAINED_BYTES: usize = 1024 * 1024;
+const LAUNCH_STREAM_READ_BUFFER_BYTES: usize = 8 * 1024;
 const LAUNCH_ERROR_ENVELOPE_KIND: &str = "launch_error_envelope";
 const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 const PRODUCED_ASSISTANT_RESPONSE_MARKER: &str = "oulipoly.produced_assistant_response";
@@ -320,7 +321,7 @@ impl LaunchJsonlReader {
     pub fn read(&self, mut reader: impl Read) -> Result<LaunchResult, ProviderClientError> {
         let mut parser =
             LaunchStreamParser::new(self.request_id.clone(), self.registry.clone(), self.limits);
-        let mut buffer = [0_u8; 8192];
+        let mut buffer = [0_u8; LAUNCH_STREAM_READ_BUFFER_BYTES];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,

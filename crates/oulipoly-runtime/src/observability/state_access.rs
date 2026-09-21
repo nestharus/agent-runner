@@ -13,8 +13,8 @@ use oulipoly_state::{ReadOnlyOpenError, StateDb};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SIDECAR_SNAPSHOT_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
-const SIDECAR_SNAPSHOT_WORK_TIMEOUT: Duration = Duration::from_secs(5);
+const SIDECAR_SNAPSHOT_CHURN_RETRY_WINDOW: Duration = Duration::from_millis(250);
+const SIDECAR_SNAPSHOT_STALE_PROGRESS_AFTER: Duration = Duration::from_secs(5);
 
 pub(crate) struct SnapshotStores {
     pub(crate) state: Option<StateDb>,
@@ -158,10 +158,10 @@ fn open_sidecar_read_only(
     if path_is_missing(path) {
         return (None, None);
     }
-    match MailboxDb::open_read_only_with_pid_identity_and_work_timeout(
+    match MailboxDb::open_read_only_with_pid_identity_and_stale_progress(
         path,
-        SIDECAR_SNAPSHOT_RETRY_TIMEOUT,
-        SIDECAR_SNAPSHOT_WORK_TIMEOUT,
+        SIDECAR_SNAPSHOT_CHURN_RETRY_WINDOW,
+        SIDECAR_SNAPSHOT_STALE_PROGRESS_AFTER,
         is_cancelled,
     ) {
         Ok((pid, mailbox)) => (Some(pid), Some(mailbox)),

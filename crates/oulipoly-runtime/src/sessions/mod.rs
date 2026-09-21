@@ -24,6 +24,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 
 const SCRIPT_TIMEOUT_SECS: u64 = 90;
+const SCRIPT_STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 pub fn locate_transcript(
     sessions_cfg: &SessionsConfig,
@@ -143,7 +144,7 @@ fn wait_for_session_script(child: &mut Child, script_kind: &str) -> Result<ExitS
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) if start.elapsed() < timeout => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(SCRIPT_STATUS_POLL_INTERVAL);
             }
             Ok(None) => {
                 kill_session_script_process_group(child);

@@ -129,7 +129,7 @@ fn recent_resume_preview_count(previews: &[ChainPreview]) -> usize {
 }
 
 fn recent_resume_preview_cutoff() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() - chrono::Duration::hours(24)
+    crate::session_metadata::recent_resume_preview_cutoff()
 }
 
 fn reject_ambiguous_recent_resume_count(

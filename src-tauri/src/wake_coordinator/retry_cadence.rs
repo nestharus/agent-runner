@@ -11,8 +11,6 @@
 use std::time::Duration;
 
 use super::auto_wake_env::AutoWakeEnv;
-use super::constants::AUTO_WAKE_RETRY_MAX_MS;
-
 pub(super) fn sleep_before_failed_auto_wake_retry(auto_wake: &AutoWakeEnv) {
     std::thread::sleep(auto_wake_retry_delay(auto_wake));
 }
@@ -28,7 +26,7 @@ fn bounded_auto_wake_retry_delay_ms(base_ms: u64, auto_wake_count: i64) -> u64 {
     let exponent = auto_wake_count.saturating_sub(1).clamp(0, 10) as u32;
     base_ms
         .saturating_mul(2_u64.saturating_pow(exponent))
-        .min(AUTO_WAKE_RETRY_MAX_MS)
+        .min(super::constants::AUTO_WAKE_RETRY_MAX_MS)
 }
 
 #[cfg(test)]
@@ -71,11 +69,11 @@ mod tests {
     fn maximum_chronology_keeps_retry_delay_at_ceiling() {
         assert_eq!(
             auto_wake_retry_delay(&retry_env(i64::MAX - 1)),
-            Duration::from_millis(AUTO_WAKE_RETRY_MAX_MS)
+            Duration::from_millis(crate::wake_coordinator::constants::AUTO_WAKE_RETRY_MAX_MS)
         );
         assert_eq!(
             auto_wake_retry_delay(&retry_env(i64::MAX)),
-            Duration::from_millis(AUTO_WAKE_RETRY_MAX_MS)
+            Duration::from_millis(crate::wake_coordinator::constants::AUTO_WAKE_RETRY_MAX_MS)
         );
     }
 }

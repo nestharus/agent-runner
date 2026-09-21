@@ -21,6 +21,7 @@ pub(super) const ROOT_WORKER_ARG: &str = "__completion-root-worker-v1";
 const MAX_CONTROL_FRAME: usize = 64 * 1024;
 const RETAINED_RESULT_BATCH: usize = 256;
 const DATABASE_OBSERVATION_INTERVAL: Duration = Duration::from_millis(250);
+const CONTROL_READ_BUFFER_BYTES: usize = 4 * 1024;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -123,7 +124,7 @@ fn read_frame<T: serde::de::DeserializeOwned>(
         if buffer.len() > MAX_CONTROL_FRAME {
             return Err("root supervisor control frame is too large".into());
         }
-        let mut chunk = [0; 4096];
+        let mut chunk = [0; CONTROL_READ_BUFFER_BYTES];
         let count = socket.read(&mut chunk).map_err(|error| error.to_string())?;
         if count == 0 {
             return Err("root supervisor launch channel closed".into());
@@ -363,7 +364,7 @@ impl RootSupervisor {
 
     fn collect_driver_input(&mut self, owner: &CompletionDomainOwner) -> Result<(), String> {
         loop {
-            let mut chunk = [0; 4096];
+            let mut chunk = [0; CONTROL_READ_BUFFER_BYTES];
             match self.driver.read(&mut chunk) {
                 Ok(0) => return Err("root supervisor driver channel closed".into()),
                 Ok(count) => {

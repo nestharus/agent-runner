@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+const RETAINED_BODY_READ_BUFFER_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Body {
     path: PathBuf,
@@ -70,7 +72,7 @@ fn open_body(body: &Body) -> Result<std::fs::File, String> {
         }
     }
     let mut digest = Sha256::new();
-    let mut buf = [0u8; 65536];
+    let mut buf = [0u8; RETAINED_BODY_READ_BUFFER_BYTES];
     loop {
         let n = file.read(&mut buf).map_err(|e| e.to_string())?;
         if n == 0 {

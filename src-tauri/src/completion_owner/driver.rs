@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 pub(super) const DRIVER_ARG: &str = "__completion-driver-v1";
 const STATE_REPAIR_SUFFIX_BATCH: usize = 64;
 const SOURCE_RECOVERY_BATCH: usize = 16;
+const SOURCE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const DRIVER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(super) fn entry() -> Result<(), String> {
     let path = std::env::args_os()
@@ -171,7 +173,7 @@ fn run_owned(path: &Path, owner: &CompletionDomainOwner) -> Result<(), String> {
             }
             next_retry.insert(
                 source.registration_id,
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + SOURCE_RETRY_BACKOFF,
             );
         }
         drop(state);
@@ -204,6 +206,6 @@ fn run_owned(path: &Path, owner: &CompletionDomainOwner) -> Result<(), String> {
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(DRIVER_POLL_INTERVAL);
     }
 }

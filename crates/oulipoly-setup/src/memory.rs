@@ -3,6 +3,8 @@ use rusqlite::params;
 use serde::Serialize;
 use std::path::Path;
 
+const SETUP_MEMORY_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub struct MemoryGraph {
     connection: rusqlite::Connection,
     _state_authority: StateDb,
@@ -51,7 +53,7 @@ impl MemoryGraph {
             .pragma_update(None, "foreign_keys", true)
             .map_err(|error| format!("Failed to configure setup memory database: {error}"))?;
         connection
-            .busy_timeout(std::time::Duration::from_secs(5))
+            .busy_timeout(SETUP_MEMORY_BUSY_TIMEOUT)
             .map_err(|error| format!("Failed to configure setup memory timeout: {error}"))?;
         Ok(MemoryGraph {
             connection,

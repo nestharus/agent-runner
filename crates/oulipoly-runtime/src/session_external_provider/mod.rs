@@ -1477,12 +1477,14 @@ fn map_provider_lock_error(error: LockError) -> ReplaceError {
     }
 }
 
+const PROVIDER_OWNED_LEASE_TTL_DEFAULT: Duration = Duration::from_secs(300);
+
 fn provider_owned_lease_ttl() -> Result<Duration, ReplaceError> {
     if !cfg!(debug_assertions) {
-        return Ok(Duration::from_secs(300));
+        return Ok(PROVIDER_OWNED_LEASE_TTL_DEFAULT);
     }
     let Some(value) = std::env::var_os(PROVIDER_OWNED_LEASE_TTL_ENV) else {
-        return Ok(Duration::from_secs(300));
+        return Ok(PROVIDER_OWNED_LEASE_TTL_DEFAULT);
     };
     let milliseconds =
         value

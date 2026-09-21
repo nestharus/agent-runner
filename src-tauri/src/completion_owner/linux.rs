@@ -9,6 +9,10 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+const CLIENT_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const GUARDIAN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const OWNER_HELLO_MAX_BYTES: u64 = 8_192;
 #[path = "control.rs"]
 mod control;
 use control::{ControlService, JoinRefusal, JoinRequest, RefusalReason};
@@ -54,18 +58,18 @@ fn hello(endpoint: &Path) -> Result<CompletionDomainOwner, String> {
     let mut socket = UnixStream::connect(endpoint).map_err(|e| e.to_string())?;
     let peer = peer_pid(&socket)?;
     socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(CLIENT_CONTROL_IO_TIMEOUT))
         .map_err(|e| e.to_string())?;
     socket
-        .set_write_timeout(Some(Duration::from_secs(2)))
+        .set_write_timeout(Some(CLIENT_CONTROL_IO_TIMEOUT))
         .map_err(|e| e.to_string())?;
     socket.write_all(b"hello\n").map_err(|e| e.to_string())?;
     let mut response = Vec::new();
     socket
-        .take(8193)
+        .take(OWNER_HELLO_MAX_BYTES + 1)
         .read_to_end(&mut response)
         .map_err(|e| e.to_string())?;
-    if response.len() > 8192 {
+    if response.len() as u64 > OWNER_HELLO_MAX_BYTES {
         return Err("oversized completion owner hello".into());
     }
     let owner: CompletionDomainOwner =
@@ -97,10 +101,10 @@ fn connect_context(
     let mut socket = UnixStream::connect(endpoint).map_err(|e| e.to_string())?;
     let peer = peer_pid(&socket)?;
     socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(CLIENT_CONTROL_IO_TIMEOUT))
         .map_err(|e| e.to_string())?;
     socket
-        .set_write_timeout(Some(Duration::from_secs(2)))
+        .set_write_timeout(Some(CLIENT_CONTROL_IO_TIMEOUT))
         .map_err(|e| e.to_string())?;
     socket.write_all(b"join!\n").map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
@@ -441,7 +445,7 @@ fn guardian(
                 control.resume()?;
             }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(GUARDIAN_POLL_INTERVAL);
     }
 }
 

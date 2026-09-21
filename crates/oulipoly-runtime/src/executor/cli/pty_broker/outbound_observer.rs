@@ -16,9 +16,11 @@ use std::time::{Duration, Instant};
 
 const OBSERVATION_INTERVAL: Duration = Duration::from_millis(250);
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+const IDLE_WAKE_INTERVAL: Duration = Duration::from_secs(60);
 const OBSERVATION_MAX_TURNS: u64 = 64;
 const OBSERVATION_MAX_RESPONSE_BYTES: u64 = 128 * 1024;
 const OBSERVATION_MAX_SOURCE_BYTES: u64 = 512 * 1024;
+const OBSERVATION_MAX_INLINE_BODY_BYTES: u64 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct OutboundObservationIdentity {
@@ -215,7 +217,7 @@ impl ProviderSessionTurnSource {
             max_turns: OBSERVATION_MAX_TURNS,
             max_response_bytes: OBSERVATION_MAX_RESPONSE_BYTES,
             max_source_bytes: OBSERVATION_MAX_SOURCE_BYTES,
-            max_inline_body_bytes: 0,
+            max_inline_body_bytes: OBSERVATION_MAX_INLINE_BODY_BYTES,
             cancellation,
             timeout: OBSERVATION_TIMEOUT,
         })
@@ -592,7 +594,7 @@ fn wait_for_read(shared: &ObserverShared, deadline: Instant) -> Option<(u64, boo
         {
             deadline.saturating_duration_since(Instant::now())
         } else {
-            Duration::from_secs(60)
+            IDLE_WAKE_INTERVAL
         };
         state = match shared.wake.wait_timeout(state, wait) {
             Ok((guard, _)) => guard,

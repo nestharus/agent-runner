@@ -27,6 +27,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
+const DRAIN_BUFFER_BYTES: usize = 8 * 1024;
+
 pub(super) struct ChildDrains {
     pub(super) rx: mpsc::Receiver<(DrainStream, Vec<u8>)>,
     stdout_handle: thread::JoinHandle<()>,
@@ -67,7 +69,7 @@ where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        let mut buffer = [0_u8; 8192];
+        let mut buffer = [0_u8; DRAIN_BUFFER_BYTES];
         while let Some(chunk) = read_drain_chunk(&mut reader, &mut buffer) {
             if send_drain_chunk(&sender, stream, chunk).is_err() {
                 break;

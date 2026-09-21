@@ -1,0 +1,537 @@
+{
+  "schema_version": 1,
+  "exclusions": [
+    {
+      "source": "crates/oulipoly-provider/src/process.rs",
+      "declaration_scope": "module::fn:configure_process_group",
+      "symbol": "CREATE_NEW_PROCESS_GROUP",
+      "value_expression": "0x0000_0200",
+      "reason": "Windows API flag bit pattern used for process/file creation; it carries no elapsed-time, size, retry, or exhaustion policy."
+    },
+    {
+      "source": "crates/oulipoly-provider/src/process_custody.rs",
+      "declaration_scope": "module::fn:install_containment",
+      "symbol": "ALLOW",
+      "value_expression": "0x7fff0000",
+      "reason": "Linux seccomp/BPF ABI opcode or architecture encoding; the number identifies kernel instructions rather than a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-provider/src/process_custody.rs",
+      "declaration_scope": "module::fn:install_containment",
+      "symbol": "DENY",
+      "value_expression": "0x00050000 | libc :: EPERM as u32",
+      "reason": "Linux seccomp/BPF ABI opcode or architecture encoding; the number identifies kernel instructions rather than a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-provider/src/process_custody.rs",
+      "declaration_scope": "module::fn:install_containment",
+      "symbol": "JEQ",
+      "value_expression": "0x15",
+      "reason": "Linux seccomp/BPF ABI opcode or architecture encoding; the number identifies kernel instructions rather than a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-provider/src/process_custody.rs",
+      "declaration_scope": "module::fn:install_containment",
+      "symbol": "JSET",
+      "value_expression": "0x45",
+      "reason": "Linux seccomp/BPF ABI opcode or architecture encoding; the number identifies kernel instructions rather than a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-provider/src/process_custody.rs",
+      "declaration_scope": "module::fn:install_containment",
+      "symbol": "LD",
+      "value_expression": "0x20",
+      "reason": "Linux seccomp/BPF ABI opcode or architecture encoding; the number identifies kernel instructions rather than a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-provider/src/process_custody.rs",
+      "declaration_scope": "module::fn:install_containment",
+      "symbol": "RET",
+      "value_expression": "0x06",
+      "reason": "Linux seccomp/BPF ABI opcode or architecture encoding; the number identifies kernel instructions rather than a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-provider/src/process_custody.rs",
+      "declaration_scope": "module::fn:install_containment::cfg:target_arch=\"aarch64\"",
+      "symbol": "ARCH",
+      "value_expression": "0xc00000b7",
+      "reason": "Linux seccomp/BPF ABI opcode or architecture encoding; the number identifies kernel instructions rather than a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-provider/src/process_custody.rs",
+      "declaration_scope": "module::fn:install_containment::cfg:target_arch=\"x86_64\"",
+      "symbol": "ARCH",
+      "value_expression": "0xc000003e",
+      "reason": "Linux seccomp/BPF ABI opcode or architecture encoding; the number identifies kernel instructions rather than a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-provider/src/resolver.rs",
+      "declaration_scope": "module::fn:open_pinned_executable",
+      "symbol": "FILE_SHARE_READ",
+      "value_expression": "0x00000001",
+      "reason": "Windows API flag bit pattern used for process/file creation; it carries no elapsed-time, size, retry, or exhaustion policy."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/balancer/density.rs",
+      "declaration_scope": "module",
+      "symbol": "FANOUT_SCORE_BAND_RATIO",
+      "value_expression": "2.0",
+      "reason": "Routing/quota statistical decision threshold; it selects or rejects scoring evidence without bounding runtime resources or wait lifetime."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/balancer/eligibility.rs",
+      "declaration_scope": "module",
+      "symbol": "EXHAUSTED_USED_PERCENT",
+      "value_expression": "1.0",
+      "reason": "Routing/quota statistical decision threshold; it selects or rejects scoring evidence without bounding runtime resources or wait lifetime."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/balancer/live_load.rs",
+      "declaration_scope": "module",
+      "symbol": "LIVE_LOAD_WINDOW_MINUTES",
+      "value_expression": "60",
+      "reason": "Routing-evidence lookback semantics for classifying historical rows; it is a business freshness window, not a wait or scan-count budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/balancer/mod.rs",
+      "declaration_scope": "module",
+      "symbol": "EPS_HOURS",
+      "value_expression": "1.0 / 60.0",
+      "reason": "Routing/quota statistical decision threshold; it selects or rejects scoring evidence without bounding runtime resources or wait lifetime."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/balancer/mod.rs",
+      "declaration_scope": "module",
+      "symbol": "ERROR_THRESHOLD",
+      "value_expression": "3",
+      "reason": "Routing/quota statistical decision threshold; it selects or rejects scoring evidence without bounding runtime resources or wait lifetime."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/balancer/mod.rs",
+      "declaration_scope": "module",
+      "symbol": "ERROR_WINDOW_MINUTES",
+      "value_expression": "30",
+      "reason": "Routing-evidence lookback semantics for classifying historical rows; it is a business freshness window, not a wait or scan-count budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/balancer/mod.rs",
+      "declaration_scope": "module",
+      "symbol": "HIDDEN_WINDOW_PENALTY_THRESHOLD",
+      "value_expression": "0.85",
+      "reason": "Routing/quota statistical decision threshold; it selects or rejects scoring evidence without bounding runtime resources or wait lifetime."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/launch/prompt_predicates.rs",
+      "declaration_scope": "module",
+      "symbol": "LARGE_PROMPT_THRESHOLD",
+      "value_expression": "100 * 1024",
+      "reason": "Transport-selection threshold that switches large prompts to a temporary file; larger prompts remain accepted and are separately bounded."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/live_session_binding.rs",
+      "declaration_scope": "module::cfg:unix",
+      "symbol": "PROTOCOL_VERSION",
+      "value_expression": "1",
+      "reason": "Wire-protocol version or opcode identifier compared for equality; it does not bound work, storage, waiting, or retries."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/mod.rs",
+      "declaration_scope": "module",
+      "symbol": "CONTROL_MAGIC",
+      "value_expression": "b\"OPTY\"",
+      "reason": "Fixed wire magic bytes used for protocol identification; the byte sequence is an identifier, not a payload-size or work bound."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/mod.rs",
+      "declaration_scope": "module",
+      "symbol": "CONTROL_OP_HEADLESS_RESUME",
+      "value_expression": "2",
+      "reason": "Wire-protocol version or opcode identifier compared for equality; it does not bound work, storage, waiting, or retries."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/mod.rs",
+      "declaration_scope": "module",
+      "symbol": "CONTROL_OP_INJECT",
+      "value_expression": "1",
+      "reason": "Wire-protocol version or opcode identifier compared for equality; it does not bound work, storage, waiting, or retries."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/mod.rs",
+      "declaration_scope": "module",
+      "symbol": "CONTROL_VERSION",
+      "value_expression": "1",
+      "reason": "Wire-protocol version or opcode identifier compared for equality; it does not bound work, storage, waiting, or retries."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/mod.rs",
+      "declaration_scope": "module",
+      "symbol": "USER_INPUT_IDLE_INJECT_MS",
+      "value_expression": "1500",
+      "reason": "Public millisecond representation feeding the registered USER_INPUT_IDLE_INJECT Duration cadence; it is an alias, not a second policy."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/mod.rs",
+      "declaration_scope": "module::fn:bytes_to_lower_hex",
+      "symbol": "HEX",
+      "value_expression": "b\"0123456789abcdef\"",
+      "reason": "Hexadecimal alphabet lookup table; its bytes encode digits and do not impose a payload, allocation, traversal, or wait limit."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "BRACKETED_PASTE_DISABLE",
+      "value_expression": "b\"\\x1b[?2004l\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "BRACKETED_PASTE_ENABLE",
+      "value_expression": "b\"\\x1b[?2004h\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "BRACKETED_PASTE_END",
+      "value_expression": "b\"\\x1b[201~\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "BRACKETED_PASTE_START",
+      "value_expression": "b\"\\x1b[200~\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "COLLAPSED_MONITOR_ROWS",
+      "value_expression": "STATUS_ROW_ROWS + PSEUDO_INPUT_MIN_ROWS",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "DEFAULT_PSEUDO_INPUT_WIDTH",
+      "value_expression": "80",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "EXPANDED_MIN_ROWS",
+      "value_expression": "9",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "INPUT_SAFE_TOP_PANE_MIN_ROWS",
+      "value_expression": "14",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "KITTY_KEYBOARD_DISAMBIGUATE_PUSH",
+      "value_expression": "b\"\\x1b[>1u\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "KITTY_KEYBOARD_POP",
+      "value_expression": "b\"\\x1b[<u\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MAX_INPUT_ROWS",
+      "value_expression": "10",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MIN_INPUT_ROWS",
+      "value_expression": "1",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MIN_TERMINAL_COLS",
+      "value_expression": "40",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MIN_TERMINAL_ROWS",
+      "value_expression": "10",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MOUSE_ANY_MOTION_DISABLE",
+      "value_expression": "b\"\\x1b[?1003l\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MOUSE_ANY_MOTION_ENABLE",
+      "value_expression": "b\"\\x1b[?1003h\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MOUSE_BUTTON_MOTION_DISABLE",
+      "value_expression": "b\"\\x1b[?1002l\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MOUSE_BUTTON_MOTION_ENABLE",
+      "value_expression": "b\"\\x1b[?1002h\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MOUSE_PRESS_DISABLE",
+      "value_expression": "b\"\\x1b[?9l\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MOUSE_PRESS_ENABLE",
+      "value_expression": "b\"\\x1b[?9h\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MOUSE_PRESS_RELEASE_DISABLE",
+      "value_expression": "b\"\\x1b[?1000l\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MOUSE_PRESS_RELEASE_ENABLE",
+      "value_expression": "b\"\\x1b[?1000h\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MOUSE_SGR_DISABLE",
+      "value_expression": "b\"\\x1b[?1006l\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MOUSE_SGR_ENABLE",
+      "value_expression": "b\"\\x1b[?1006h\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MOUSE_UTF8_DISABLE",
+      "value_expression": "b\"\\x1b[?1005l\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "MOUSE_UTF8_ENABLE",
+      "value_expression": "b\"\\x1b[?1005h\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "PSEUDO_INPUT_HELP_ROWS",
+      "value_expression": "0",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "PSEUDO_INPUT_MIN_ROWS",
+      "value_expression": "MIN_INPUT_ROWS + PSEUDO_INPUT_HELP_ROWS",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "STATUS_ROW_ROWS",
+      "value_expression": "1",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "TOP_PANE_MIN_ROWS",
+      "value_expression": "5",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "TOP_SCROLL_STEP",
+      "value_expression": "3",
+      "reason": "Fixed terminal presentation geometry or scroll increment; it shapes layout but does not bound retained payloads, waits, retries, or protocol work."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "XTERM_MODIFY_OTHER_KEYS_LEVEL_2",
+      "value_expression": "b\"\\x1b[>4;2m\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module",
+      "symbol": "XTERM_MODIFY_OTHER_KEYS_RESET",
+      "value_expression": "b\"\\x1b[>4;0m\"",
+      "reason": "Fixed terminal escape-sequence bytes implementing a negotiated terminal protocol command; they are protocol data, not a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
+      "declaration_scope": "module::fn:input_bytes_hex",
+      "symbol": "HEX",
+      "value_expression": "b\"0123456789abcdef\"",
+      "reason": "Hexadecimal alphabet lookup table; its bytes encode digits and do not impose a payload, allocation, traversal, or wait limit."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui_profile.rs",
+      "declaration_scope": "module",
+      "symbol": "BUCKET_UPPER_NS",
+      "value_expression": "[100_000 , 1_000_000 , 5_000_000 , 16_000_000 , 50_000_000 , 100_000_000 ,]",
+      "reason": "Observability histogram bucket boundaries applied after work completes; they classify timing samples and never interrupt or degrade the operation."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/quota/marker_verification/health.rs",
+      "declaration_scope": "module",
+      "symbol": "EXHAUSTED_USED_PERCENT",
+      "value_expression": "1.0",
+      "reason": "Routing/quota statistical decision threshold; it selects or rejects scoring evidence without bounding runtime resources or wait lifetime."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/session_ingress.rs",
+      "declaration_scope": "module",
+      "symbol": "PERSISTED_MAILBOX_INGRESS_SCHEMA_VERSION",
+      "value_expression": "1",
+      "reason": "Serialized-format version identifier compared for compatibility; it is neither a migration range bound nor a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-runtime/src/session_metadata/ambiguity.rs",
+      "declaration_scope": "module",
+      "symbol": "RECENT_RESUME_PREVIEW_HOURS",
+      "value_expression": "24",
+      "reason": "Session-ambiguity business recency window shared across lookup surfaces; it classifies matches without bounding waiting, memory, or traversal."
+    },
+    {
+      "source": "crates/oulipoly-setup/src/detection.rs",
+      "declaration_scope": "module::mod:base64_decode::fn:simple_b64_decode",
+      "symbol": "TABLE",
+      "value_expression": "b\"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\"",
+      "reason": "Base64 decoding alphabet lookup table; its bytes encode symbols and do not impose a payload, allocation, traversal, or wait limit."
+    },
+    {
+      "source": "crates/oulipoly-state/src/db/provider_quotas.rs",
+      "declaration_scope": "module",
+      "symbol": "MAX_LEARNABLE_BURN_RATE",
+      "value_expression": "0.1",
+      "reason": "Routing/quota statistical decision threshold; it selects or rejects scoring evidence without bounding runtime resources or wait lifetime."
+    },
+    {
+      "source": "crates/oulipoly-state/src/db/provider_quotas.rs",
+      "declaration_scope": "module",
+      "symbol": "MIN_LEARN_SAMPLE_CALLS",
+      "value_expression": "20",
+      "reason": "Routing/quota statistical decision threshold; it selects or rejects scoring evidence without bounding runtime resources or wait lifetime."
+    },
+    {
+      "source": "crates/oulipoly-state/src/db/provider_quotas.rs",
+      "declaration_scope": "module",
+      "symbol": "NEAR_EXHAUSTED_USED_PERCENT",
+      "value_expression": "0.99",
+      "reason": "Routing/quota statistical decision threshold; it selects or rejects scoring evidence without bounding runtime resources or wait lifetime."
+    },
+    {
+      "source": "crates/oulipoly-state/src/deployment/metadata/schema.rs",
+      "declaration_scope": "module",
+      "symbol": "COORDINATOR_SCHEMA_VERSION",
+      "value_expression": "1",
+      "reason": "Serialized-format version identifier compared for compatibility; it is neither a migration range bound nor a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-state/src/diagnostic_recorder.rs",
+      "declaration_scope": "module",
+      "symbol": "DIAGNOSTIC_SCHEMA_VERSION",
+      "value_expression": "1",
+      "reason": "Serialized-format version identifier compared for compatibility; it is neither a migration range bound nor a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-state/src/mailbox.rs",
+      "declaration_scope": "module",
+      "symbol": "COMPACTED_PAYLOAD_SCHEMA_VERSION",
+      "value_expression": "1",
+      "reason": "Serialized-format version identifier compared for compatibility; it is neither a migration range bound nor a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-state/src/mailbox.rs",
+      "declaration_scope": "module",
+      "symbol": "INPUT_IDENTITY_VERSION",
+      "value_expression": "1",
+      "reason": "Serialized-format version identifier compared for compatibility; it is neither a migration range bound nor a runtime budget."
+    },
+    {
+      "source": "crates/oulipoly-state/src/sqlite_observability.rs",
+      "declaration_scope": "module",
+      "symbol": "DEFAULT_SQLITE_SLOW_THRESHOLD",
+      "value_expression": "Duration :: from_millis (100)",
+      "reason": "Observability sampling threshold that labels completed SQLite operations as slow; it neither interrupts nor degrades the operation."
+    },
+    {
+      "source": "src-tauri/src/run/continuation_request.rs",
+      "declaration_scope": "module",
+      "symbol": "SCHEMA_VERSION",
+      "value_expression": "1",
+      "reason": "Serialized-format version identifier compared for compatibility; it is neither a migration range bound nor a runtime budget."
+    },
+    {
+      "source": "src-tauri/src/wake_coordinator/spawn.rs",
+      "declaration_scope": "module::fn:configure_handoff_detached",
+      "symbol": "CREATE_NEW_PROCESS_GROUP",
+      "value_expression": "0x0000_0200",
+      "reason": "Windows API flag bit pattern used for process/file creation; it carries no elapsed-time, size, retry, or exhaustion policy."
+    },
+    {
+      "source": "src-tauri/src/wake_coordinator/spawn.rs",
+      "declaration_scope": "module::fn:configure_handoff_detached",
+      "symbol": "DETACHED_PROCESS",
+      "value_expression": "0x0000_0008",
+      "reason": "Windows API flag bit pattern used for process/file creation; it carries no elapsed-time, size, retry, or exhaustion policy."
+    },
+    {
+      "source": "src-tauri/src/wake_coordinator/sweep/lease.rs",
+      "declaration_scope": "module",
+      "symbol": "WAKE_SWEEP_LEASE_SCHEMA_VERSION",
+      "value_expression": "1",
+      "reason": "Serialized-format version identifier compared for compatibility; it is neither a migration range bound nor a runtime budget."
+    }
+  ]
+}

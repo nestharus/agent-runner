@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 
 pub(crate) const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
 const CHILD_CUSTODY_TEST_FAULT_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_FAULT";
+const CHILD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const STARTING_CUSTODY_TEST_PATIENCE: Duration = Duration::from_secs(10);
+const CHILD_CUSTODY_TEST_READY_PATIENCE: Duration = Duration::from_secs(5);
+const LAUNCH_CUSTODY_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnRuntimeMode {
@@ -310,7 +314,7 @@ impl<'a> ChildGenerationCustody<'a> {
             if let Some(status) = self.try_wait()? {
                 return Ok(status);
             }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(CHILD_WAIT_POLL_INTERVAL);
         }
     }
 
@@ -436,7 +440,7 @@ fn starting_custody_test_barrier(site: &str) -> Result<(), String> {
         return Err("missing custody barrier path".into());
     };
     std::fs::write(path, site).map_err(|e| e.to_string())?;
-    std::thread::sleep(Duration::from_secs(10));
+    std::thread::sleep(STARTING_CUSTODY_TEST_PATIENCE);
     Err(format!("starting custody barrier expired: {site}"))
 }
 
@@ -453,12 +457,12 @@ fn wait_for_child_custody_test_ready() -> Result<(), String> {
         return Ok(());
     };
     let path = PathBuf::from(path);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + CHILD_CUSTODY_TEST_READY_PATIENCE;
     while Instant::now() < deadline {
         if path.is_file() {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(CHILD_WAIT_POLL_INTERVAL);
     }
     Err(format!(
         "timed out waiting for child custody test readiness at {}",
@@ -856,12 +860,12 @@ fn seal_launch_custody(context: &SpawnIdentityContext) -> Result<(), GenerationO
         return Ok(());
     };
     custody.seal();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + LAUNCH_CUSTODY_QUIESCENCE_TIMEOUT;
     while !custody.quiescent() {
         if Instant::now() >= deadline {
             return Err(GenerationOperationError::Unknown);
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(CHILD_WAIT_POLL_INTERVAL);
     }
     Ok(())
 }

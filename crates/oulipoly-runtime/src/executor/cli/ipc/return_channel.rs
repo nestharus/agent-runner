@@ -810,6 +810,15 @@ mod tests {
     }
     #[test]
     fn malformed_truncated_extra_and_unbounded_content_never_looks_empty() {
+        let registered = oulipoly_core::runtime_cap::find(
+            "runtime.executor.cli.ipc.return-channel.max-return-channel-bytes",
+        )
+        .expect("return-channel byte guard must remain registered");
+        assert_eq!(
+            registered.class,
+            oulipoly_core::runtime_cap::RuntimeCapClass::ResourceGuard
+        );
+        assert!(!registered.observability.is_empty());
         for bytes in [
             b"{\n".to_vec(),
             b"{}".to_vec(),

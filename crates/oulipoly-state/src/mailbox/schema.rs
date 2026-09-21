@@ -21,7 +21,6 @@ fn migrate_completion_recovery_working_set(conn: &Connection) -> Result<(), Stri
 pub(super) const CURRENT_VERSION: i64 = 21;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
-const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidecarEntity {
@@ -208,18 +207,17 @@ fn observe_valid_current(conn: &Connection) -> Result<bool, String> {
 }
 
 pub(super) fn ensure(conn: &mut Connection) -> Result<(), String> {
-    ensure_with_timeout(conn, SCHEMA_LOCK_TIMEOUT)
+    ensure_with_deadline(conn, None)
 }
 
 pub(super) fn ensure_without_wait(conn: &mut Connection) -> Result<(), String> {
-    ensure_with_timeout(conn, Duration::ZERO)
+    ensure_with_deadline(conn, Some(Instant::now()))
 }
 
-fn ensure_with_timeout(conn: &mut Connection, timeout: Duration) -> Result<(), String> {
+fn ensure_with_deadline(conn: &mut Connection, deadline: Option<Instant>) -> Result<(), String> {
     if observe_valid_current(conn)? {
         return Ok(());
     }
-    let deadline = Instant::now() + timeout;
     loop {
         // Reobserve on every retry, including after a busy handler used the
         // remaining deadline. Another opener's committed migration is enough.
@@ -237,7 +235,7 @@ fn ensure_with_timeout(conn: &mut Connection, timeout: Duration) -> Result<(), S
                 if observe_valid_current(conn)? {
                     return Ok(());
                 }
-                if Instant::now() >= deadline {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     return Err(format!(
                         "Failed to lock PID mailbox sidecar schema migration: {error}"
                     ));
@@ -847,17 +845,24 @@ mod contention_tests {
                 .unwrap();
         }
         resume_tx.send(()).unwrap();
-        // Completion is required BEFORE releasing this writer, not inferred
-        // from elapsed sleep. The uncommitted migration must exhaust the
-        // existing bounded lock policy rather than observe dirty schema.
+        if case == "uncommitted" {
+            // A live writer with invisible uncommitted schema is not proof of
+            // deadlock. The opener remains pending rather than fabricating a
+            // five-second startup failure; rollback releases SQLite custody.
+            assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+            tx.rollback().unwrap();
+            done_rx
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap()
+                .unwrap();
+            reader.join().unwrap();
+            return;
+        }
+        // Committed unsupported/corrupt schema is readable evidence and can be
+        // rejected without waiting for the unrelated writer to release.
         let result = done_rx.recv_timeout(Duration::from_secs(20)).unwrap();
         match case {
             "current" => result.unwrap(),
-            "uncommitted" => assert!(
-                result
-                    .unwrap_err()
-                    .contains("Failed to lock PID mailbox sidecar schema migration")
-            ),
             "unsupported" => assert!(
                 result
                     .unwrap_err()
