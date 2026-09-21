@@ -199,6 +199,42 @@ pub struct RuntimeCapEvidence {
     pub trace_correlation: String,
 }
 
+/// Stable storage-access classification used by the live/history barrier.
+/// This is attached at the repository boundary; it is never inferred from SQL
+/// text, row age, or the absence of a live record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqliteAccessClass {
+    LiveAuthority,
+    BoundedCrossBoundary,
+    HistoricalDiagnostic,
+}
+
+/// Database-independent evidence for an access that the typed repository
+/// barrier rejected before SQLite was touched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveHistoryBarrierEvidence {
+    pub live_trace: String,
+    pub attempted_access: SqliteAccessClass,
+    pub query_family: String,
+    pub decision: String,
+}
+
+impl LiveHistoryBarrierEvidence {
+    pub fn blocked(
+        live_trace: &'static str,
+        attempted_access: SqliteAccessClass,
+        query_family: &'static str,
+    ) -> Self {
+        Self {
+            live_trace: bounded_text(live_trace, 128),
+            attempted_access,
+            query_family: stable_sqlite_label(query_family),
+            decision: "blocked".to_string(),
+        }
+    }
+}
+
 impl RuntimeCapEvidence {
     // The constructor intentionally mirrors the eight mandatory evidence
     // fields so a caller cannot emit a partial cap-exhaustion record.
@@ -294,6 +330,8 @@ pub struct SqliteEventIdentity {
     pub database_role: SqliteDatabaseRole,
     pub path_class: SqlitePathClass,
     pub query_family: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_class: Option<SqliteAccessClass>,
     #[serde(default)]
     pub transaction_mode: Option<SqliteTransactionMode>,
 }
@@ -308,8 +346,14 @@ impl SqliteEventIdentity {
             database_role,
             path_class,
             query_family: stable_sqlite_label(query_family),
+            access_class: None,
             transaction_mode: None,
         }
+    }
+
+    pub fn with_access_class(mut self, access_class: SqliteAccessClass) -> Self {
+        self.access_class = Some(access_class);
+        self
     }
 
     pub fn with_transaction_mode(mut self, mode: SqliteTransactionMode) -> Self {
@@ -493,6 +537,7 @@ pub struct PhaseObservation {
     pub sqlite_failure: Option<SqliteFailure>,
     pub sqlite: Option<SqlitePhaseEvidence>,
     pub runtime_cap: Option<RuntimeCapEvidence>,
+    pub live_history_barrier: Option<LiveHistoryBarrierEvidence>,
     pub causes: Vec<String>,
 }
 
@@ -556,6 +601,11 @@ impl PhaseObservation {
 
     pub fn with_runtime_cap(mut self, evidence: RuntimeCapEvidence) -> Self {
         self.runtime_cap = Some(evidence);
+        self
+    }
+
+    pub fn with_live_history_barrier(mut self, evidence: LiveHistoryBarrierEvidence) -> Self {
+        self.live_history_barrier = Some(evidence);
         self
     }
 

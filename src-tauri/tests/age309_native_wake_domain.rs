@@ -270,7 +270,7 @@ impl Fixture {
             format!("{}\n", serde_json::to_string(prompt).unwrap()),
         )
         .unwrap();
-        let mut mailbox = MailboxDb::open(&self.sidecar_path()).unwrap();
+        let mut mailbox = MailboxDb::open_historical(&self.sidecar_path()).unwrap();
         let row = mailbox.list_mailbox(SESSION, true).unwrap().remove(0);
         let attempt_id = "b".repeat(64);
         mailbox
@@ -330,7 +330,7 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
     assert!(
         wait_until(|| fixture.marker.exists()),
         "native detached provider turn did not start\nmailbox={:?}\nruntime={:?}\nclaim={:?}\ninvocations={:?}",
-        MailboxDb::open(&fixture.sidecar_path())
+        MailboxDb::open_historical(&fixture.sidecar_path())
             .unwrap()
             .list_mailbox(SESSION, true)
             .unwrap(),
@@ -362,7 +362,7 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
     assert_success(&sweep);
     assert!(
         wait_until(|| {
-            let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+            let mailbox = MailboxDb::open_historical(&fixture.sidecar_path()).unwrap();
             let rows = mailbox.list_mailbox(SESSION, true).unwrap();
             rows.len() == 1
                 && rows[0].delivered_at.is_some()
@@ -373,7 +373,7 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
                     .is_none()
         }),
         "native detached provider turn did not settle\nmailbox={:?}\nruntime={:?}\nclaim={:?}\ninvocations={:?}\nmarker={}",
-        MailboxDb::open(&fixture.sidecar_path())
+        MailboxDb::open_historical(&fixture.sidecar_path())
             .unwrap()
             .list_mailbox(SESSION, true)
             .unwrap(),
@@ -391,7 +391,7 @@ fn native_count_five_startup_sweep_reaches_one_detached_provider_turn() {
         fs::read_to_string(&fixture.marker).unwrap_or_default()
     );
 
-    let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+    let mailbox = MailboxDb::open_historical(&fixture.sidecar_path()).unwrap();
     let row = mailbox.list_mailbox(SESSION, true).unwrap().remove(0);
     assert_eq!(row.delivery_attempts, 1);
     assert!(row.delivery_error.is_none());
@@ -453,7 +453,7 @@ fn startup_recovery_settles_a_persisted_post_anchor_turn_without_relaunching() {
     assert_success(&sweep);
     assert!(
         wait_until(|| {
-            let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+            let mailbox = MailboxDb::open_historical(&fixture.sidecar_path()).unwrap();
             mailbox
                 .list_mailbox(SESSION, true)
                 .unwrap()
@@ -466,7 +466,7 @@ fn startup_recovery_settles_a_persisted_post_anchor_turn_without_relaunching() {
                     .is_none()
         }),
         "persisted post-anchor delivery was not recovered; output={sweep:?}; rows={:?}; confirmation={:?}; invocations={:?}",
-        MailboxDb::open(&fixture.sidecar_path())
+        MailboxDb::open_historical(&fixture.sidecar_path())
             .unwrap()
             .list_mailbox(SESSION, true)
             .unwrap(),

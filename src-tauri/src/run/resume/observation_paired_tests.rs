@@ -484,7 +484,7 @@ fn age347_paired_production_quantum_wrong_nonce_and_duplicate_prose_never_ack() 
 #[ignore = "invoked only by the offline paired parent"]
 fn age347_offline_recovery_subprocess() {
     let root = PathBuf::from(std::env::var("AGE347_OFFLINE_ROOT").unwrap());
-    let mut db = MailboxDb::open(&root.join("pid-identity.db")).unwrap();
+    let mut db = MailboxDb::open_historical(&root.join("pid-identity.db")).unwrap();
     let state = oulipoly_state::StateDb::open(&root.join("state.db")).unwrap();
     let pending = db
         .pending_delivery_observations(SESSION, 4)
@@ -688,7 +688,7 @@ fn age355_paired_periodic_active_partial_restart_receipt_and_failure() {
     // roots. The dedicated process-helper experiment below covers actual polling.
     let guard = crate::native_receipt::start_receipt_polling_with(
         move || {
-            let mut db = MailboxDb::open(&root.join("pid-identity.db"))?;
+            let mut db = MailboxDb::open_historical(&root.join("pid-identity.db"))?;
             crate::native_receipt::poll_headless_receipt_tick_with(&mut db, |_| {
                 Ok(registry(&root, &root.join("offline-page-only.py")))
             })?;

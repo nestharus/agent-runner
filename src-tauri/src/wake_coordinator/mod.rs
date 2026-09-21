@@ -5,7 +5,7 @@
 
 mod admission;
 mod auto_wake_env;
-mod constants;
+pub(crate) mod constants;
 mod diagnostics;
 mod idle;
 #[cfg(test)]

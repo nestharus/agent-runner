@@ -48,7 +48,7 @@ fn terminal_ack_race(point: &'static str, partial: bool, independent: &str, exit
         std::env::set_var("OULIPOLY_DATA_DIR", root.path());
     }
     let path = root.path().join("pid-identity.db");
-    let mut mailbox = MailboxDb::open(&path).unwrap();
+    let mut mailbox = MailboxDb::open_historical(&path).unwrap();
     for handle in if partial {
         vec!["first", "last"]
     } else {

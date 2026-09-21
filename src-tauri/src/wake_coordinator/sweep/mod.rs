@@ -1019,7 +1019,7 @@ mod tests {
                 .unwrap_err()
                 .contains("Failed to open State read-only for wake sweep")
         );
-        let rows = db.list_mailbox("state-unavailable-session", true).unwrap();
+        let rows = db.list_pending("state-unavailable-session").unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].delivered_at.is_none());
         assert!(rows[0].delivery_error.is_none());
@@ -1053,7 +1053,7 @@ mod tests {
 
         let start = plan_wake_sweep(&mut db, vec![candidate], Ok(None)).unwrap();
         assert!(start.is_none());
-        let rows = db.list_mailbox("state-unavailable-session", true).unwrap();
+        let rows = db.list_pending("state-unavailable-session").unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.delivery_error.is_none()));
         assert_eq!(

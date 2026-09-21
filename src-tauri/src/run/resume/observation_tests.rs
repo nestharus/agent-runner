@@ -22,7 +22,7 @@ impl Fixture {
     }
     fn with_legacy(legacy: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
-        let mut db = MailboxDb::open(&root.path().join("pid-identity.db")).unwrap();
+        let mut db = MailboxDb::open_historical(&root.path().join("pid-identity.db")).unwrap();
         let state = oulipoly_state::StateDb::open(&root.path().join("state.db")).unwrap();
         let EnqueueResult::Inserted(row) = db
             .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
@@ -102,7 +102,7 @@ impl Fixture {
         self.submit().unwrap();
     }
     fn restart(&mut self) {
-        self.db = MailboxDb::open(&self.root.path().join("pid-identity.db")).unwrap();
+        self.db = MailboxDb::open_historical(&self.root.path().join("pid-identity.db")).unwrap();
     }
     fn assert_pending_without_replay(&mut self) {
         let stopped = self.db.mailbox_observation_stop(SESSION).unwrap().is_some();

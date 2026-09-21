@@ -12,6 +12,8 @@
 - `crates/oulipoly-state/src/db/provider_launch_lifecycle.rs`
 - `crates/oulipoly-state/src/mailbox.rs`
 - `crates/oulipoly-state/src/mailbox/completion_continuation/attempts.rs`
+- `crates/oulipoly-state/src/mailbox/completion_continuation/mod.rs`
+- `crates/oulipoly-state/src/mailbox/completion_continuation/notification.rs`
 - `crates/oulipoly-state/src/pid_identity.rs`
 - `crates/oulipoly-state/src/lifecycle_log.rs`
 - `crates/oulipoly-runtime/src/lib.rs`
@@ -42,9 +44,13 @@
 - `src-tauri/src/dispatch.rs`
 - `src-tauri/src/mailbox_delivery.rs`
 - `src-tauri/src/completion_owner/root_supervisor.rs`
+- `src-tauri/src/completion_owner/driver.rs`
+- `src-tauri/src/wake_coordinator/constants.rs`
+- `runtime-caps.json`
 - `src-tauri/src/main.rs`
 - `src-tauri/src/usage/cli.rs`
 - `src-tauri/src/wake_coordinator/sweep/mod.rs`
+- `src-tauri/src/wake_coordinator/sweep/candidate.rs`
 
 ## Preconditions
 

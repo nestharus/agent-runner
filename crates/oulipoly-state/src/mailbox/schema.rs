@@ -18,7 +18,34 @@ fn migrate_completion_recovery_working_set(conn: &Connection) -> Result<(), Stri
     .map_err(|error| error.to_string())
 }
 
-pub(super) const CURRENT_VERSION: i64 = 21;
+fn migrate_live_history_barrier(conn: &Connection) -> Result<(), String> {
+    let has_retirement_projection: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('completion_event_listener')
+                WHERE name='retirement_pending')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_retirement_projection {
+        conn.execute_batch(
+            "ALTER TABLE completion_event_listener
+             ADD COLUMN retirement_pending INTEGER NOT NULL DEFAULT 1
+             CHECK (retirement_pending IN (0, 1));",
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    conn.execute_batch(include_str!("migrations/0022_live_history_barrier.sql"))
+        .and_then(|_| {
+            conn.execute_batch(include_str!(
+                "migrations/0022_completion_native_runtime.sql"
+            ))
+        })
+        .map_err(|error| error.to_string())
+}
+
+pub(super) const CURRENT_VERSION: i64 = 22;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -164,6 +191,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 21,
         owner: SidecarEntity::CompletionAuthority,
         apply: migrate_completion_recovery_working_set,
+    },
+    MigrationStep {
+        target_version: 22,
+        owner: SidecarEntity::MailboxDelivery,
+        apply: migrate_live_history_barrier,
     },
 ];
 
@@ -642,7 +674,7 @@ fn attach_promoted_runtime_session(
 fn session_has_nonterminal_generation(conn: &Connection, session_id: &str) -> Result<bool, String> {
     conn.query_row(
         "SELECT EXISTS (
-            SELECT 1 FROM runtime_generation
+            SELECT 1 FROM runtime_generation INDEXED BY idx_runtime_generation_live_session
             WHERE session_id = ?1 AND lifecycle_state != 'exited'
          )",
         params![session_id],
@@ -705,7 +737,19 @@ pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
 #[cfg(test)]
 pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &Connection) {
     conn.execute_batch(
-        "DROP TRIGGER completion_owner_supervisor_authority_insert;
+        "DROP INDEX IF EXISTS idx_mailbox_pending_session_live;
+         DROP INDEX IF EXISTS idx_mailbox_pending_target_live;
+         DROP INDEX IF EXISTS idx_mailbox_deliverable_session_live;
+         DROP INDEX IF EXISTS idx_mailbox_deliverable_target_live;
+         DROP INDEX IF EXISTS idx_mailbox_deliverable_global;
+         DROP INDEX IF EXISTS idx_mailbox_delivery_attempt_unresolved;
+         DROP INDEX IF EXISTS idx_completion_event_listener_session_live;
+         DROP INDEX IF EXISTS idx_completion_event_listener_unacknowledged;
+         DROP INDEX IF EXISTS idx_completion_event_listener_retirement_pending;
+         DROP INDEX IF EXISTS idx_runtime_generation_live_session;
+         DROP INDEX IF EXISTS completion_continuation_attempt_native_runtime;
+         ALTER TABLE completion_event_listener DROP COLUMN retirement_pending;
+         DROP TRIGGER completion_owner_supervisor_authority_insert;
          DROP TRIGGER completion_owner_supervisor_authority_immutable;
          DROP TRIGGER completion_source_supervisor_authority_insert;
          DROP TRIGGER completion_source_supervisor_authority_immutable;
@@ -750,6 +794,31 @@ mod contention_tests {
                 rc: 0,
             })
             .unwrap();
+        mailbox
+            .register_completion_event(super::super::CompletionEventRegistrationInput {
+                event_id: "terminal-history-event",
+                delivery_mode: "async",
+                owner_session_id: Some("terminal-history-session"),
+                owner_invocation_uuid: Some("terminal-history-owner"),
+                state_dir: "/private/state",
+                meta_path: "/private/meta",
+                log_path: "/private/log",
+                rc_path: "/private/rc",
+            })
+            .unwrap();
+        let terminal_seq = mailbox
+            .trigger_completion_event(super::super::CompletionEventTriggerInput {
+                event_id: "terminal-history-event",
+                payload_json: "{}",
+                state_dir: "/private/state",
+                meta_path: "/private/meta",
+                log_path: "/private/log",
+                rc_path: "/private/rc",
+                rc: 0,
+            })
+            .unwrap()
+            .mailbox_rows[0]
+            .seq;
         drop(mailbox);
         let connection = Connection::open(&path).unwrap();
         connection
@@ -761,12 +830,18 @@ mod contention_tests {
             )
             .unwrap();
         remove_completion_recovery_working_set_for_legacy_fixture(&connection);
+        connection
+            .execute(
+                "UPDATE mailbox SET delivery_error='mailbox_ingress_expired' WHERE seq=?1",
+                [terminal_seq],
+            )
+            .unwrap();
         connection.pragma_update(None, "user_version", 19).unwrap();
         drop(connection);
         let migrated = super::super::MailboxDb::open(&path).unwrap();
         assert_eq!(
             migrated
-                .list_mailbox("historical-session", true)
+                .list_mailbox_all("historical-session")
                 .unwrap()
                 .len(),
             1
@@ -775,6 +850,16 @@ mod contention_tests {
             sidecar_version(migrated.connection()).unwrap(),
             CURRENT_VERSION
         );
+        let terminal_listener: (bool, bool) = migrated
+            .connection()
+            .query_row(
+                "SELECT active,retirement_pending FROM completion_event_listener
+                 WHERE event_id='terminal-history-event'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(terminal_listener, (false, false));
         for object in [
             "mailbox_completed_turn_pins",
             "mailbox_completed_turn_tails",

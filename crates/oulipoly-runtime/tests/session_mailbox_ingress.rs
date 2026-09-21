@@ -393,7 +393,7 @@ fn chain_targeted_ingress_failure_is_bound_to_the_resolved_chain() {
             .is_empty()
     );
     assert!(matches!(turns.try_recv(), Err(TryRecvError::Empty)));
-    let failed = MailboxDb::open(&mailbox_path)
+    let failed = MailboxDb::open_historical_read_only(&mailbox_path)
         .unwrap()
         .list_mailbox("chain-a", true)
         .unwrap()
@@ -613,7 +613,7 @@ fn payload_verification_failure_is_retired_without_starving_later_rows() {
             .accepted_sequences,
         vec![valid.seq]
     );
-    let failed = MailboxDb::open(&mailbox_path)
+    let failed = MailboxDb::open_historical_read_only(&mailbox_path)
         .unwrap()
         .list_mailbox("session-a", true)
         .unwrap()
@@ -666,7 +666,7 @@ fn expired_ingress_is_retired_without_starving_a_later_row_at_batch_size_one() {
             .accepted_sequences,
         vec![valid.seq]
     );
-    let retired = MailboxDb::open(&mailbox_path)
+    let retired = MailboxDb::open_historical_read_only(&mailbox_path)
         .unwrap()
         .list_mailbox("session-a", true)
         .unwrap()

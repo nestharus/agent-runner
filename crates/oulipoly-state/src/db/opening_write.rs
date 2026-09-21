@@ -187,6 +187,15 @@ impl StateDb {
         Self::open_with_sink(path, Box::new(NoopLifecycleEventSink))
     }
 
+    /// Explicit writable historical/diagnostic boundary. Historical reads are
+    /// autocommit operations and never retain a live write transaction.
+    pub fn open_historical(path: &Path) -> Result<Self, String> {
+        Self::open(path).map(|mut state| {
+            state.access_scope = crate::live_history::AccessScope::historical();
+            state
+        })
+    }
+
     pub fn open_with_sink(
         path: &Path,
         sink: Box<dyn LifecycleEventSink + Send>,
@@ -269,6 +278,10 @@ impl StateDb {
             db_path,
             completion_authority_state,
             lifecycle_sink: Mutex::new(sink),
+            access_scope: crate::live_history::AccessScope::live(
+                "state.live",
+                crate::diagnostic_recorder::SqliteDatabaseRole::State,
+            ),
             _read_only_snapshot: None,
             _state_namespace_guard: state_namespace_guard,
         };
@@ -378,6 +391,22 @@ impl StateDb {
         Self::open_read_only_with_cancel(path, &|| false)
     }
 
+    /// Explicit read-only historical/diagnostic boundary. Generic read-only
+    /// handles remain live so a future full-ledger regression is still denied.
+    pub fn open_historical_read_only(path: &Path) -> Result<Self, ReadOnlyOpenError> {
+        Self::open_historical_read_only_with_cancel(path, &|| false)
+    }
+
+    pub fn open_historical_read_only_with_cancel(
+        path: &Path,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, ReadOnlyOpenError> {
+        Self::open_read_only_with_cancel(path, is_cancelled).map(|mut state| {
+            state.access_scope = crate::live_history::AccessScope::historical();
+            state
+        })
+    }
+
     pub fn open_read_only_with_cancel(
         path: &Path,
         is_cancelled: &dyn Fn() -> bool,
@@ -451,6 +480,10 @@ impl StateDb {
             db_path: source,
             completion_authority_state: None,
             lifecycle_sink: Mutex::new(Box::new(NoopLifecycleEventSink)),
+            access_scope: crate::live_history::AccessScope::live(
+                "state.read_only.live",
+                crate::diagnostic_recorder::SqliteDatabaseRole::State,
+            ),
             _read_only_snapshot: Some(snapshot),
             _state_namespace_guard: None,
         })

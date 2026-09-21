@@ -135,7 +135,7 @@ pub(in crate::mailbox) fn reconcile_on(
         classify_on(tx, binding)?;
         if event.state == "triggered" {
             tx.execute(
-                "UPDATE completion_event_listener SET active=1
+                "UPDATE completion_event_listener SET active=1,retirement_pending=1
                  WHERE event_id=?1 AND acknowledged_at IS NULL AND EXISTS (
                    SELECT 1 FROM completion_continuation_notification n
                    WHERE n.event_id=completion_event_listener.event_id
@@ -144,6 +144,27 @@ pub(in crate::mailbox) fn reconcile_on(
                 [&event.event_id],
             )
             .map_err(|e| format!("Failed to apply completion presentation policy: {e}"))?;
+            tx.execute(
+                "UPDATE completion_event_listener AS listener
+                 SET retirement_pending=0
+                 WHERE listener.event_id=?1
+                   AND listener.acknowledged_at IS NULL
+                   AND listener.active=0
+                   AND listener.mailbox_seq IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM completion_continuation_notification AS notification
+                       WHERE notification.event_id=listener.event_id
+                         AND notification.listener_id=listener.listener_id
+                         AND notification.policy='response_only'
+                         AND notification.requested_at IS NULL
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM completion_continuation_source AS source
+                       WHERE source.event_id=listener.event_id AND source.phase='accepted'
+                   )",
+                [&event.event_id],
+            )
+            .map_err(|e| format!("Failed to settle response-only listener retirement: {e}"))?;
         }
     }
     materialize_on(tx, event, now)
@@ -240,7 +261,7 @@ impl MailboxDb {
             .map_err(|e| e.to_string())?;
         tx.execute(
             "UPDATE completion_event_listener
-             SET active = 1
+             SET active = 1, retirement_pending = 1
              WHERE event_id = ?1 AND acknowledged_at IS NULL AND (?2 IS NULL OR listener_id=?2)",
             params![event_id, listener_id],
         )
@@ -424,6 +445,7 @@ mod tests {
             db.completion_notification_diagnostics("receipt-event")
                 .unwrap()
         );
+        db.allow_historical_access_for_test();
         let pruned = db.prune_terminal_history_with_keep(256, 0).unwrap();
         assert_eq!(pruned.delivery_attempts_deleted, 1);
         let after = db

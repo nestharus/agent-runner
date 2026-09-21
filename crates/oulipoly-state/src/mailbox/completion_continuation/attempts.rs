@@ -1,7 +1,7 @@
 use super::*;
 use crate::diagnostic_recorder::{
-    OutcomeCertainty, SqliteMeasurementGap, SqlitePhaseEvidence, SqliteQueryPlanEvidence,
-    SqliteTransactionPhase,
+    OutcomeCertainty, SqliteAccessClass, SqliteMeasurementGap, SqlitePhaseEvidence,
+    SqliteQueryPlanEvidence, SqliteTransactionPhase,
 };
 use crate::sqlite_observability::{
     SqliteOperationObserver, capture_query_plan, process_query_plan_node_limit,
@@ -215,6 +215,8 @@ impl MailboxDb {
         limit: usize,
     ) -> Result<Vec<ContinuationAttempt>, String> {
         let limit = i64::try_from(limit).map_err(|_| "continuation attempt limit overflow")?;
+        self.access_scope
+            .authorize(SUPERVISOR_PENDING_ATTEMPTS, usize::try_from(limit).ok())?;
         let mut statement = self
             .conn
             .prepare(
@@ -281,6 +283,8 @@ impl MailboxDb {
                     OR (owner_generation=?2 AND attempt_id>?3))
              ORDER BY owner_generation,attempt_id LIMIT ?4";
         let limit = i64::try_from(limit).map_err(|_| "continuation attempt limit overflow")?;
+        self.access_scope
+            .authorize(SUPERVISOR_PENDING_ATTEMPTS, usize::try_from(limit).ok())?;
         let (after_generation, after_attempt) = after
             .map(|(generation, attempt)| (Some(generation), Some(attempt)))
             .unwrap_or((None, None));
@@ -408,6 +412,7 @@ fn pending_supervisor_attempts_span(supervisor_authority_id: &str) -> SpanStart 
                 SqlitePathClass::ManagedFile,
                 "completion_continuation.pending_for_supervisor",
             )
+            .with_access_class(SqliteAccessClass::BoundedCrossBoundary)
             .with_transaction_mode(SqliteTransactionMode::ReadOnly),
         )
         .with_hashed_correlation("supervisor_authority_id", supervisor_authority_id)
@@ -560,7 +565,7 @@ pub(in crate::mailbox) fn reserve_activation_on(
     if !native_wake_runtime_ready(metadata.as_ref()) {
         return Err("native activation runtime unavailable before reservation".into());
     }
-    let source:Option<String>=tx.query_row("SELECT s.registration_id FROM completion_continuation_source s JOIN completion_event_listener l ON l.event_id=s.event_id WHERE l.session_id=?1 AND l.acknowledged_at IS NULL ORDER BY s.registration_id LIMIT 1",[input.session_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    let source:Option<String>=tx.query_row("SELECT s.registration_id FROM completion_event_listener l INDEXED BY idx_completion_event_listener_session_live JOIN completion_continuation_source s ON s.event_id=l.event_id WHERE l.session_id=?1 AND l.retirement_pending=1 ORDER BY s.registration_id LIMIT 1",[input.session_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
     let request = ContinuationAttempt {
         attempt_id: uuid::Uuid::new_v4().to_string(),
         owner_generation: generation,
@@ -1105,6 +1110,7 @@ impl MailboxDb {
         invocation: &str,
     ) -> Result<bool, String> {
         self.conn.query_row("SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt
+                INDEXED BY completion_continuation_attempt_native_runtime
             WHERE domain_id=?1 AND operation='activation' AND phase='drained' AND integrated=1 AND runtime_generation_uuid=?2 AND spawn_invocation_uuid=?3)",
             params![domain, generation, invocation], |r| r.get(0)).map_err(|e| e.to_string())
     }
@@ -1217,7 +1223,7 @@ impl MailboxDb {
         if self.completion_continuation_domain()?.is_none() {
             return Ok(false);
         }
-        self.conn.query_row("SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE operation='activation' AND domain_id=?1 AND runtime_generation_uuid=?2 AND spawn_invocation_uuid=?3)",
+        self.conn.query_row("SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt INDEXED BY completion_continuation_attempt_native_runtime WHERE operation='activation' AND domain_id=?1 AND runtime_generation_uuid=?2 AND spawn_invocation_uuid=?3)",
             params![domain,generation,invocation], |r|r.get(0)).map_err(|e|e.to_string())
     }
     /// Exact original enclosing boundary already integrated its drain. This is
@@ -1409,7 +1415,7 @@ pub(in crate::mailbox) fn native_original_drain_on(
         return Ok(None);
     }
     let row: Option<(String, String, String, String, String, String)> = conn.query_row(
-            "SELECT attempt_id,result_path,custodian_identity,adopter_identity,drain_receipt,domain_id FROM completion_continuation_attempt WHERE operation='activation' AND phase='drained' AND integrated=1 AND runtime_generation_uuid=?1 AND spawn_invocation_uuid=?2",
+            "SELECT attempt_id,result_path,custodian_identity,adopter_identity,drain_receipt,domain_id FROM completion_continuation_attempt INDEXED BY completion_continuation_attempt_native_runtime WHERE operation='activation' AND phase='drained' AND integrated=1 AND runtime_generation_uuid=?1 AND spawn_invocation_uuid=?2",
             params![generation, invocation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|e|e.to_string())?;
     row.map(|(attempt, path, ac, adopter, receipt, domain)| -> Result<_, String> {
             Ok(serde_json::json!({"attempt_id":attempt, "result_path":path,"domain_id":domain,

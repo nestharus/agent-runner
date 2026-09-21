@@ -1067,23 +1067,79 @@ impl StateDb {
                 &format!("{}/native-channel-duty", owner.attempt_id),
                 &digest(duty)?,
                 duty,
+            )?;
+            let ProviderLaunchChannelSettlement::ContinuingCustody { domain_id, .. } = duty else {
+                return Err("native_channel_duty_requires_continuing_custody".into());
+            };
+            tx.execute(
+                "INSERT OR IGNORE INTO provider_launch_native_channel_duties (
+                    logical_launch_id,attempt_id,domain_id,settlement_json
+                 ) VALUES (?1,?2,?3,?4)",
+                params![
+                    owner.logical_launch_id.to_string(),
+                    owner.attempt_id.to_string(),
+                    domain_id,
+                    serde_json::to_string(duty).map_err(|e| e.to_string())?
+                ],
             )
+            .map_err(sql_error)?;
+            let exact: bool = tx
+                .query_row(
+                    "SELECT settlement_json=?3
+                     FROM provider_launch_native_channel_duties
+                     WHERE logical_launch_id=?1 AND attempt_id=?2",
+                    params![
+                        owner.logical_launch_id.to_string(),
+                        owner.attempt_id.to_string(),
+                        serde_json::to_string(duty).map_err(|e| e.to_string())?
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if exact {
+                Ok(())
+            } else {
+                Err("continuing_native_channel_duty_conflict".into())
+            }
         })
     }
     pub fn pending_native_channel_duties(
         &self,
     ) -> Result<Vec<ProviderLaunchChannelSettlement>, String> {
-        let mut statement = self.conn.prepare("SELECT result_json FROM provider_launch_transition_replays WHERE operation_key LIKE '%/native-channel-duty'").map_err(sql_error)?;
+        let mut statement = self.conn.prepare("SELECT settlement_json FROM provider_launch_native_channel_duties ORDER BY attempt_id").map_err(sql_error)?;
         let rows = statement
             .query_map([], |r| r.get::<_, String>(0))
             .map_err(sql_error)?;
         rows.map(|r| serde_json::from_str(&r.map_err(sql_error)?).map_err(|e| e.to_string()))
             .collect()
     }
+
+    pub(crate) fn has_pending_native_channel_duty_for_domain(
+        &self,
+        domain_id: &str,
+    ) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM provider_launch_native_channel_duties
+                        INDEXED BY provider_launch_native_channel_duty_domain
+                    WHERE domain_id=?1 LIMIT 1
+                 )",
+                [domain_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
     pub fn cancelling_native_attempts(&self) -> Result<Vec<(Uuid, Uuid)>, String> {
-        let mut statement = self.conn.prepare("SELECT a.runtime_generation_uuid,a.invocation_uuid
-            FROM provider_launch_attempts a JOIN provider_logical_launches l ON l.current_attempt_id=a.attempt_id
-            WHERE l.status='cancelling'").map_err(sql_error)?;
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT a.runtime_generation_uuid,a.invocation_uuid
+            FROM provider_logical_launches l INDEXED BY provider_launch_cancelling
+            JOIN provider_launch_attempts a ON l.current_attempt_id=a.attempt_id
+            WHERE l.status='cancelling'",
+            )
+            .map_err(sql_error)?;
         let rows = statement
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .map_err(sql_error)?;

@@ -393,7 +393,7 @@ impl Fixture {
     }
 
     fn mailbox(&self) -> MailboxDb {
-        MailboxDb::open(&self.sidecar_path()).unwrap()
+        MailboxDb::open_historical(&self.sidecar_path()).unwrap()
     }
 
     fn seed_mailbox(&self, handle: &str) -> MailboxRow {

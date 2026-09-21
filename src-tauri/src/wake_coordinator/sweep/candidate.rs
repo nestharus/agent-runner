@@ -24,18 +24,36 @@ pub(super) fn wake_sweep_candidate_action(
             WakeSweepRetentionReason::NotStartable,
         ));
     }
-    if db.list_pending(&candidate.session_id)?.is_empty() {
+    let row_limit = crate::wake_coordinator::constants::WAKE_RECLAIM_SWEEP_SCAN_LIMIT;
+    let pending_rows = db.list_pending_for_delivery_after(
+        &candidate.session_id,
+        None,
+        0,
+        row_limit.saturating_add(1),
+    )?;
+    if pending_rows.is_empty() {
         return Ok(WakeSweepAction::Retain(
             WakeSweepRetentionReason::NotStartable,
         ));
     }
-    if wake_sweep_candidate_is_unclaimed_abandoned_transient(db, &candidate.session_id)? {
+    // Owner liveness is a universal statement over the pending set. Refuse to
+    // classify a larger set instead of scanning an unbounded live backlog.
+    if pending_rows.len() > row_limit {
+        return Ok(WakeSweepAction::Retain(
+            WakeSweepRetentionReason::NotStartable,
+        ));
+    }
+    if wake_sweep_candidate_is_unclaimed_abandoned_transient(
+        db,
+        &candidate.session_id,
+        &pending_rows,
+    )? {
         return abandoned_transient_action(db, state, candidate);
     }
     if wake_sweep_candidate_has_resumable_runtime(db, state, candidate)? {
         return Ok(resumable_wake_sweep_action(candidate));
     }
-    if wake_sweep_candidate_has_live_owner(db, &candidate.session_id)? {
+    if pending_rows_have_live_owner(&pending_rows)? {
         return Ok(WakeSweepAction::Retain(
             WakeSweepRetentionReason::NotStartable,
         ));
@@ -166,10 +184,6 @@ fn resume_evidence(
     }))
 }
 
-fn wake_sweep_candidate_has_live_owner(db: &MailboxDb, session_id: &str) -> Result<bool, String> {
-    pending_rows_have_live_owner(&db.list_pending(session_id)?)
-}
-
 fn pending_rows_have_live_owner(rows: &[MailboxRow]) -> Result<bool, String> {
     let mut has_live_owner = false;
     for row in rows {
@@ -186,11 +200,11 @@ fn pending_rows_have_live_owner(rows: &[MailboxRow]) -> Result<bool, String> {
 fn wake_sweep_candidate_is_unclaimed_abandoned_transient(
     db: &MailboxDb,
     session_id: &str,
+    rows: &[MailboxRow],
 ) -> Result<bool, String> {
     if db.wake_session_reader().wake_claim(session_id)?.is_some() {
         return Ok(false);
     }
-    let rows = db.list_pending(session_id)?;
     if !rows
         .iter()
         .any(|row| mailbox_row_owner_identity(row).is_some())

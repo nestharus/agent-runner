@@ -108,6 +108,14 @@ fn schema_18_migration_installs_the_running_projection_index() {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
+             DROP TRIGGER trg_invocation_completion_v2_identity_append_only_update;
+             DROP TRIGGER trg_invocation_completion_v2_identity_append_only_delete;
+             DROP TABLE invocation_completion_v2_identity;
+             DROP INDEX idx_invocation_completion_obligations_legacy;
+             DROP INDEX idx_invocation_completion_obligations_event;
+             DROP TABLE provider_launch_native_channel_duties;
+             DROP TABLE completed_turns;
+             DROP TABLE completed_turn_selections;
              ALTER TABLE invocation_completion_obligations DROP COLUMN completion_v2_binding;
              DROP TABLE provider_launch_transition_replays;
              DROP TABLE provider_logical_launches;
@@ -311,6 +319,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             21,
             22,
             23,
+            24,
+            25,
             CURRENT_SCHEMA_VERSION,
         ],
         "schema-4 DBs must take every ordered migration through the current schema"
@@ -338,6 +348,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0022_provider_session_authority",
             "0023_provider_launch_lifecycle",
             "0024_completion_continuation_binding",
+            "0025_completed_turns",
+            "0026_live_history_barrier",
         ]
     );
 }

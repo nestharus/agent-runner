@@ -263,6 +263,7 @@ use self::sqlite_adapter::{Connection, RusqliteOptionalExtension, Transaction};
 #[cfg(test)]
 use crate::invocation_marker::CompositeInvocationId;
 use crate::lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
+use crate::live_history::AccessScope;
 #[cfg(test)]
 use crate::schema::CURRENT_SCHEMA_VERSION;
 use chrono::{DateTime, Utc};
@@ -281,6 +282,7 @@ pub struct StateDb {
     // Completion authority rejoins the accepted source path to one canonical local file identity.
     completion_authority_state: Option<CompletionAuthorityStateIdentity>,
     lifecycle_sink: Mutex<Box<dyn LifecycleEventSink + Send>>,
+    access_scope: AccessScope,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
     _state_namespace_guard: Option<StateNamespaceGuard>,
 }

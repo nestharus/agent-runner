@@ -168,7 +168,7 @@ pub(crate) fn run_ack(
 ) -> Result<i32, String> {
     let mut db = MailboxDb::open_default()?;
     let acknowledged_count = db.acknowledge_range(session_id, from_seq, to_seq, delivered_by)?;
-    let remaining_pending = db.list_pending(session_id)?.len();
+    let remaining_pending = db.pending_delivery_count(session_id, None)?;
     let response = MailboxAckResponse {
         session_id: session_id.to_string(),
         from_seq,
@@ -192,7 +192,7 @@ pub(crate) fn run_ack(
 }
 
 fn mailbox_status(session_id: &str) -> Result<MailboxStatusResponse, String> {
-    let Some(db) = MailboxDb::open_default_if_exists()? else {
+    let Some(db) = MailboxDb::open_historical_default_if_exists()? else {
         return Ok(MailboxStatusResponse {
             session_id: session_id.to_string(),
             paused: false,
@@ -319,7 +319,12 @@ fn render_mailbox_list(
 }
 
 fn list_rows(session_id: &str, all: bool) -> Result<Vec<MailboxRow>, String> {
-    let Some(db) = MailboxDb::open_default_if_exists()? else {
+    let db = if all {
+        MailboxDb::open_historical_default_if_exists()?
+    } else {
+        MailboxDb::open_default_if_exists()?
+    };
+    let Some(db) = db else {
         return Ok(Vec::new());
     };
     let mut rows = db.list_mailbox(session_id, all)?;
@@ -330,7 +335,7 @@ fn list_rows(session_id: &str, all: bool) -> Result<Vec<MailboxRow>, String> {
 }
 
 pub(crate) fn run_compact_delivered(limit: usize, apply: bool, json: bool) -> Result<i32, String> {
-    let Some(db) = MailboxDb::open_default_if_exists()? else {
+    let Some(db) = MailboxDb::open_historical_default_if_exists()? else {
         let empty = DeliveredPayloadCompactionStats::default();
         render_compaction(
             MailboxCompactionResponse {
@@ -368,7 +373,7 @@ pub(crate) fn run_prune_terminal(
     vacuum: bool,
     json: bool,
 ) -> Result<i32, String> {
-    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
+    let Some(mut db) = MailboxDb::open_historical_default_if_exists()? else {
         return render_terminal_prune(
             TerminalHistoryPruneResponse {
                 applied: apply,
