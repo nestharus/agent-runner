@@ -2,6 +2,7 @@
 
 ## Source files
 
+- `src-tauri/src/commands/mailbox.rs`
 - `src-tauri/src/mailbox_delivery.rs`
 - `src-tauri/src/wake_coordinator/mod.rs`
 - `src-tauri/src/wake_coordinator/consumed_completion.rs`

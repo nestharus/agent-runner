@@ -695,7 +695,7 @@ mod tests {
         assert_eq!(harness.flush(), b"\r");
         // The child's complete input is observable, but Complete has not been
         // sent to the worker. A provider echo is not a transport-ACK barrier.
-        let db = MailboxDb::open(&path).unwrap();
+        let db = MailboxDb::open_historical(&path).unwrap();
         let rows = db.list_mailbox("session-a", true).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].delivered_at.is_none());

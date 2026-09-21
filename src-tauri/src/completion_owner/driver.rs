@@ -182,7 +182,9 @@ fn run_owned(path: &Path, owner: &CompletionDomainOwner) -> Result<(), String> {
         let mut mailbox = MailboxDb::open(path)?;
         let sessions: BTreeSet<_> = mailbox
             .wake_sessions()
-            .pending_delivery_session_ids(i64::MAX as usize)?
+            .pending_delivery_session_ids(
+                crate::wake_coordinator::constants::WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
+            )?
             .into_iter()
             .collect();
         for session in sessions {

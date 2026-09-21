@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const COMPLETED_TURN_RECOVERY_IDENTITY_LIMIT: usize = 100;
+const COMPLETED_TURN_RECOVERY_SQL: &str =
+    "SELECT c.invocation_uuid,c.settlement_id,c.owner_json,c.effects_json,
+            c.context_json,c.content_sha256,c.committed_at IS NOT NULL,
+            c.tails_json,i.provider_name,i.provider_session_id,i.session_id
+     FROM completed_turns c INDEXED BY completed_turns_recovery_pending
+     JOIN invocations i ON i.id=c.invocation_id
+     WHERE c.recovery_pending=1
+     ORDER BY c.invocation_id";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletedTurnEffects {
@@ -213,14 +221,7 @@ impl StateDb {
     fn completed_turn_recovery_duties(&self) -> Result<Vec<CompletedTurnRecoveryDuty>, String> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT c.invocation_uuid,c.settlement_id,c.owner_json,c.effects_json,
-                       c.context_json,c.content_sha256,c.committed_at IS NOT NULL,
-                       c.tails_json,i.provider_name,i.provider_session_id,i.session_id
-                 FROM completed_turns c
-                 JOIN invocations i ON i.id=c.invocation_id
-                 ORDER BY c.invocation_id",
-            )
+            .prepare(COMPLETED_TURN_RECOVERY_SQL)
             .map_err(custody_error)?;
         let rows = stmt
             .query_map([], |row| {
@@ -992,7 +993,8 @@ impl StateDb {
         settlement: &str,
         tails: &serde_json::Value,
     ) -> Result<(), String> {
-        let changed = self.conn.execute("UPDATE completed_turns SET tails_json=?3 WHERE invocation_uuid=?1 AND settlement_id=?2 AND committed_at IS NOT NULL",params![uuid,settlement,encode(tails)?]).map_err(custody_error)?;
+        let recovery_pending = i64::from(!completed_turn_tails_finished(tails));
+        let changed = self.conn.execute("UPDATE completed_turns SET tails_json=?3,recovery_pending=?4 WHERE invocation_uuid=?1 AND settlement_id=?2 AND committed_at IS NOT NULL",params![uuid,settlement,encode(tails)?,recovery_pending]).map_err(custody_error)?;
         if changed == 1 {
             Ok(())
         } else {
@@ -1513,6 +1515,35 @@ mod tests {
             .execute_batch("ALTER TABLE completed_turns RENAME TO unavailable_completed_turns")
             .unwrap();
         assert!(state.coordinate_manual_resume("session").is_err());
+    }
+
+    #[test]
+    fn completed_turn_recovery_plan_uses_only_the_pending_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&directory.path().join("state.db")).unwrap();
+        let query = format!("EXPLAIN QUERY PLAN {COMPLETED_TURN_RECOVERY_SQL}");
+        let details = state
+            .conn
+            .prepare(&query)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("completed_turns_recovery_pending")),
+            "completed-turn recovery did not use its live projection: {details:?}"
+        );
+        assert!(
+            details.iter().all(|detail| {
+                !detail.contains("SCAN c")
+                    || detail.contains("USING INDEX completed_turns_recovery_pending")
+            }),
+            "completed-turn recovery scanned terminal history: {details:?}"
+        );
+        assert!(state.completed_turn_identities().unwrap().is_empty());
     }
 
     // Independent intent: completed-turn-retention-decisions.md. This fixture

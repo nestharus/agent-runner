@@ -25,6 +25,7 @@
 //! ```
 
 use super::{StateDb, sqlite};
+use crate::live_history::{AccessScope, STATE_LIVE_SUBTREE_CHILDREN};
 use chrono::{DateTime, Utc};
 use oulipoly_core::CancellationToken;
 
@@ -615,6 +616,17 @@ impl StateDb {
         limit: usize,
         _cancellation: &CancellationToken,
     ) -> Result<LiveSubtreeChildIds, String> {
+        if limit == 0 {
+            return Ok(LiveSubtreeChildIds {
+                ids: Vec::new(),
+                coverage_incomplete: false,
+            });
+        }
+        AccessScope::live(
+            "state.invocation_recovery",
+            crate::diagnostic_recorder::SqliteDatabaseRole::State,
+        )
+        .authorize(STATE_LIVE_SUBTREE_CHILDREN, Some(limit))?;
         let query_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let mut statement = self
             .conn

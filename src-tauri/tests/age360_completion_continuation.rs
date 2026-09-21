@@ -259,7 +259,7 @@ impl Fixture {
         .unwrap()
     }
     fn mailbox(&self) -> MailboxDb {
-        MailboxDb::open_read_only(&self.data.join("pid-identity.db")).unwrap()
+        MailboxDb::open_historical_read_only(&self.data.join("pid-identity.db")).unwrap()
     }
     fn gate(&self, name: &str) {
         fs::write(self.root.path().join(name), b"release\n").unwrap();
@@ -274,7 +274,7 @@ impl Fixture {
     }
     fn owner(&self) -> oulipoly_state::mailbox::CompletionDomainOwner {
         wait(|| {
-            MailboxDb::open_read_only(&self.data.join("pid-identity.db"))
+            MailboxDb::open_historical_read_only(&self.data.join("pid-identity.db"))
                 .ok()?
                 .completion_continuation_owner()
                 .ok()?
@@ -282,7 +282,7 @@ impl Fixture {
     }
     fn source(&self) -> oulipoly_state::completion_continuation::AdmittedSourceBinding {
         wait(|| {
-            oulipoly_state::StateDb::open_read_only(&self.data.join("state.db"))
+            oulipoly_state::StateDb::open_historical_read_only(&self.data.join("state.db"))
                 .ok()?
                 .admitted_completion_continuations()
                 .ok()?

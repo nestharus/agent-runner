@@ -180,6 +180,7 @@ fn project_root_reachable_graph(
         mailbox,
         active_session_id.as_deref(),
         agent_bash_owner_seeds,
+        limits.mailbox_cap,
         cancellation,
         &mut projection.diagnostics,
     );
@@ -226,6 +227,7 @@ fn invocation_live_seeds(
     mailbox: Option<&MailboxDb>,
     session_id: Option<&str>,
     agent_bash_owner_seeds: &HashSet<String>,
+    mailbox_cap: usize,
     cancellation: &CancellationToken,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> HashSet<String> {
@@ -246,9 +248,25 @@ fn invocation_live_seeds(
         }
     }
     if let (Some(mailbox), Some(session_id)) = (mailbox, session_id) {
-        match mailbox.list_pending(session_id) {
-            Ok(rows) => seeds.extend(rows.into_iter().filter_map(|row| row.owner_invocation_uuid)),
-            Err(error) => diagnostics.push(storage_diagnostic(
+        let query_limit = mailbox_cap.saturating_add(1);
+        match (query_limit > 0)
+            .then(|| mailbox.list_pending_for_delivery_after(session_id, None, 0, query_limit))
+        {
+            Some(Ok(mut rows)) => {
+                if rows.len() > mailbox_cap {
+                    rows.truncate(mailbox_cap);
+                    diagnostics.push(storage_diagnostic(
+                        "mailbox:pending-owner-seeds-read",
+                        "mailbox live seed coverage reached the snapshot mailbox cap".to_string(),
+                    ));
+                }
+                seeds.extend(rows.into_iter().filter_map(|row| row.owner_invocation_uuid));
+            }
+            None => diagnostics.push(storage_diagnostic(
+                "mailbox:pending-owner-seeds-read",
+                "mailbox live seed coverage disabled by a zero snapshot mailbox cap".to_string(),
+            )),
+            Some(Err(error)) => diagnostics.push(storage_diagnostic(
                 "mailbox:pending-owner-seeds-read",
                 error,
             )),

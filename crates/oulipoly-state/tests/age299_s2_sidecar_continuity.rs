@@ -663,6 +663,14 @@ fn schema_17_upgrade_backfills_only_an_exact_proven_materialization_summary() {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
+             DROP TRIGGER trg_invocation_completion_v2_identity_append_only_update;
+             DROP TRIGGER trg_invocation_completion_v2_identity_append_only_delete;
+             DROP TABLE invocation_completion_v2_identity;
+             DROP INDEX idx_invocation_completion_obligations_legacy;
+             DROP INDEX idx_invocation_completion_obligations_event;
+             DROP TABLE provider_launch_native_channel_duties;
+             DROP TABLE completed_turns;
+             DROP TABLE completed_turn_selections;
              ALTER TABLE invocation_completion_obligations DROP COLUMN completion_v2_binding;
              DROP TABLE provider_launch_transition_replays;
              DROP TABLE provider_logical_launches;

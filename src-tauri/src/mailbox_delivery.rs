@@ -449,7 +449,8 @@ pub(crate) fn prepare_pty_mailbox_delivery(
     if !has_pending_rows(&pending) {
         return Ok(None);
     }
-    let batch = select_batch(&pending);
+    let pending_count = pending_mailbox_row_count(db, session_id, None)?;
+    let batch = select_batch(&pending, pending_count);
     let seqs = batch_seqs(&batch);
     let candidate_attempt_id = new_delivery_nonce();
     let attempt_id = db.register_or_reuse_delivery_attempt(
@@ -628,9 +629,7 @@ fn pty_client_error_may_have_reached_broker(kind: &PtyControlClientErrorKind) ->
 }
 
 fn pending_count(mailbox: &MailboxDb, session_id: &str) -> Option<usize> {
-    pending_mailbox_rows(mailbox, session_id, None)
-        .map(|rows| rows.len())
-        .ok()
+    pending_mailbox_row_count(mailbox, session_id, None).ok()
 }
 
 fn pty_status(
@@ -1171,12 +1170,10 @@ pub(crate) fn prepare_headless_resume_delivery_on(
         if answer.is_some() {
             return Err("explicit resume input cannot also have an inline copy; no launch".into());
         }
-        let row = load_pending_mailbox_rows(db, session_id, Some(chain_id))?
-            .into_iter()
-            .find(|row| {
-                row.seq == seq
-                    && row.kind == SUBMITTED_INPUT_KIND
-                    && mailbox_row_is_deliverable_pending(row)
+        let row = db
+            .pending_for_delivery_seq(session_id, Some(chain_id), seq)?
+            .filter(|row| {
+                row.kind == SUBMITTED_INPUT_KIND && mailbox_row_is_deliverable_pending(row)
             })
             .ok_or_else(|| {
                 format!(
@@ -1222,15 +1219,25 @@ pub(crate) fn deliverable_pending_count_on(
     {
         return Ok(0);
     }
-    pending_mailbox_row_count(db, session_id)
+    // Preserve fail-closed payload validation for the next bounded page before
+    // the count is used to admit live wake work. Later pages are validated when
+    // they become the current delivery head.
+    if pending_mailbox_rows(db, session_id, None)?.is_empty() {
+        return Ok(0);
+    }
+    pending_mailbox_row_count(db, session_id, None)
 }
 
 fn notifications_paused_on(db: &MailboxDb, session_id: &str) -> Result<bool, String> {
     db.notifications_paused(session_id)
 }
 
-fn pending_mailbox_row_count(db: &MailboxDb, session_id: &str) -> Result<usize, String> {
-    pending_mailbox_rows(db, session_id, None).map(|rows| rows.len())
+fn pending_mailbox_row_count(
+    db: &MailboxDb,
+    session_id: &str,
+    chain_id: Option<&str>,
+) -> Result<usize, String> {
+    db.pending_delivery_count(session_id, chain_id)
 }
 
 fn delivery_session_id(resolved: &oulipoly_state::ResolvedResume) -> String {
@@ -1252,7 +1259,12 @@ fn load_pending_mailbox_rows(
     session_id: &str,
     chain_id: Option<&str>,
 ) -> Result<Vec<MailboxRow>, String> {
-    db.list_pending_for_delivery(session_id, chain_id)
+    db.list_pending_for_delivery_after(
+        session_id,
+        chain_id,
+        0,
+        MAILBOX_BATCH_MAX_ROWS.saturating_add(1),
+    )
 }
 
 fn verify_pending_mailbox_payloads(db: &MailboxDb, rows: &[MailboxRow]) -> Result<(), String> {
@@ -1285,7 +1297,8 @@ fn delivery_for_pending(
         return Ok(empty_delivery(answer, session_id));
     }
 
-    let batch = select_batch(&pending);
+    let pending_count = pending_mailbox_row_count(db, &session_id, chain_id)?;
+    let batch = select_batch(&pending, pending_count);
     delivery_for_batch(db, session_id, chain_id, batch, answer, false)
 }
 
@@ -1496,14 +1509,14 @@ fn models_dir_string(path: Option<&Path>) -> Option<String> {
     path.map(|path| path.to_string_lossy().into_owned())
 }
 
-fn select_batch(pending: &[MailboxRow]) -> MailboxBatch {
-    let prefix_lengths = candidate_prefix_lengths(pending);
-    select_batch_by_prefix_lengths(pending, &prefix_lengths)
+fn select_batch(pending: &[MailboxRow], pending_count: usize) -> MailboxBatch {
+    let prefix_lengths = candidate_prefix_lengths(pending, pending_count);
+    select_batch_by_prefix_lengths(pending, pending_count, &prefix_lengths)
 }
 
-fn candidate_prefix_lengths(pending: &[MailboxRow]) -> Vec<usize> {
+fn candidate_prefix_lengths(pending: &[MailboxRow], pending_count: usize) -> Vec<usize> {
     (1..=candidate_count(pending))
-        .map(|row_count| candidate_prefix_len(pending, row_count))
+        .map(|row_count| candidate_prefix_len(pending, pending_count, row_count))
         .collect()
 }
 
@@ -1511,13 +1524,14 @@ fn candidate_count(pending: &[MailboxRow]) -> usize {
     pending.len().min(MAILBOX_BATCH_MAX_ROWS)
 }
 
-fn candidate_prefix_len(pending: &[MailboxRow], row_count: usize) -> usize {
-    let remaining_count = pending.len().saturating_sub(row_count);
+fn candidate_prefix_len(pending: &[MailboxRow], pending_count: usize, row_count: usize) -> usize {
+    let remaining_count = pending_count.saturating_sub(row_count);
     notification_prefix_len(&pending[..row_count], remaining_count)
 }
 
 fn select_batch_by_prefix_lengths(
     pending: &[MailboxRow],
+    pending_count: usize,
     prefix_lengths: &[usize],
 ) -> MailboxBatch {
     let selected_count = selected_batch_len(pending, prefix_lengths);
@@ -1527,7 +1541,7 @@ fn select_batch_by_prefix_lengths(
         .cloned()
         .collect::<Vec<_>>();
     MailboxBatch {
-        remaining_count: pending.len().saturating_sub(rows.len()),
+        remaining_count: pending_count.saturating_sub(rows.len()),
         rows,
     }
 }
@@ -2441,7 +2455,7 @@ mod tests {
         drop(mailbox);
 
         assert!(finalize_pty_mailbox_delivery_handoff(Some(unique.0), unique.1, 0).unwrap());
-        let mailbox = MailboxDb::open_default().unwrap();
+        let mailbox = MailboxDb::open_historical_default().unwrap();
         let unique_attempt = mailbox.delivery_attempt_window(unique.2).unwrap().unwrap();
         assert!(unique_attempt.resolved_at.is_some());
         let unique_rows = mailbox.list_mailbox(unique.0, true).unwrap();

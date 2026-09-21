@@ -153,6 +153,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0025_completed_turns.sql"),
         post_sql_hook: None,
     },
+    Migration {
+        target_version: 26,
+        id: "0026_live_history_barrier",
+        sql: include_str!("../migrations/0026_live_history_barrier.sql"),
+        post_sql_hook: None,
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {

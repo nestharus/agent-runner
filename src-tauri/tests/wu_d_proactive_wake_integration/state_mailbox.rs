@@ -34,7 +34,7 @@ struct SeedMailboxArtifacts {
 
 impl Fixture {
     pub(crate) fn mailbox(&self) -> MailboxDb {
-        MailboxDb::open(&self.sidecar_path()).unwrap()
+        MailboxDb::open_historical(&self.sidecar_path()).unwrap()
     }
 
     pub(crate) fn sidecar_conn(&self) -> Connection {

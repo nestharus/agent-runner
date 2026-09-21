@@ -483,7 +483,11 @@ impl Fixture {
     }
 
     fn mailbox_rows(&self, session_id: &str, all: bool) -> Vec<MailboxRow> {
-        let db = MailboxDb::open(&self.sidecar_path()).unwrap();
+        let db = if all {
+            MailboxDb::open_historical_read_only(&self.sidecar_path()).unwrap()
+        } else {
+            MailboxDb::open_read_only(&self.sidecar_path()).unwrap()
+        };
         db.list_mailbox(session_id, all).unwrap()
     }
 
@@ -1744,7 +1748,7 @@ fn published_payload_without_metadata_commit_is_not_accepted() {
     let error = db.enqueue_agent_bash_complete(&input).unwrap_err();
 
     assert!(error.contains("forced metadata failure"), "{error}");
-    assert!(db.list_mailbox(SESSION_A, true).unwrap().is_empty());
+    assert!(db.list_pending(SESSION_A).unwrap().is_empty());
     assert!(expected_payload_path(&sidecar_path, payload.as_bytes()).exists());
 }
 

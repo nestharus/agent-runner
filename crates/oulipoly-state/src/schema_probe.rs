@@ -81,7 +81,7 @@ pub fn run_schema_probe_with_routing_port(
         return Ok(missing_report(path));
     }
 
-    let db = match StateDb::open_read_only(&path) {
+    let db = match StateDb::open_historical_read_only(&path) {
         Ok(db) => db,
         Err(ReadOnlyOpenError::Missing { .. }) => return Ok(missing_report(path)),
         Err(error) => return Err(ProbeError::Open { error }),

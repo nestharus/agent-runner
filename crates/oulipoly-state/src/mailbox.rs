@@ -29,6 +29,12 @@ use crate::diagnostic_recorder::{
     SqliteDatabaseRole, SqliteEventIdentity, SqlitePathClass, SqliteTransactionMode,
     process_recorder,
 };
+use crate::live_history::{
+    AccessScope, DELIVERED_PAYLOAD_COMPACTION, DELIVERED_PAYLOAD_COMPACTION_STATS,
+    MAILBOX_FULL_HISTORY, MAILBOX_PENDING_COUNT, MAILBOX_PENDING_DELIVERY, MAILBOX_PENDING_EXACT,
+    MAILBOX_PENDING_SESSIONS, SUPERVISOR_PENDING_ATTEMPTS, TERMINAL_RETENTION_PRUNE,
+    TERMINAL_RETENTION_STATS, TERMINAL_RETENTION_VACUUM,
+};
 use crate::pid_identity::{self, ProcessIdentity};
 use crate::sqlite_observability::{
     DeferredObservationTarget, SqliteOperationObserver, connection_open_evidence,
@@ -58,10 +64,6 @@ pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
 pub const TERMINAL_HISTORY_KEEP_ROWS: usize = 1_024;
 const PAYLOAD_DIGEST_BUFFER_BYTES: usize = 8 * 1024;
-const TERMINAL_HISTORY_MAINTENANCE_BATCH: usize = 256;
-const TERMINAL_HISTORY_MAINTENANCE_PROGRESS_OPS: i32 = 1_000;
-const TERMINAL_HISTORY_MAINTENANCE_TIMEOUT: StdDuration = StdDuration::from_millis(100);
-const TERMINAL_HISTORY_MAINTENANCE_BUSY_TIMEOUT: StdDuration = StdDuration::from_millis(50);
 const COMPACTED_PAYLOAD_SCHEMA_VERSION: u8 = 1;
 // Agent-bash registration must not inherit test-support's shortened generic writer wait.
 const COMPLETION_AUTHORITY_SQLITE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
@@ -79,6 +81,13 @@ const PENDING_MAILBOX_TARGET_PREDICATE: &str = "(
     (target_kind IS NULL AND session_id = ?1)
     OR (target_kind = 'session' AND target_id = ?1)
     OR (?2 IS NOT NULL AND target_kind = 'chain' AND target_id = ?2)
+)";
+pub(super) const DELIVERABLE_MAILBOX_ERROR_PREDICATE: &str = "(
+    delivery_error IS NULL OR delivery_error NOT IN (
+        'wake_sweep_abandoned',
+        'mailbox_payload_verification_failed',
+        'mailbox_ingress_expired'
+    )
 )";
 
 enum MailboxConnectionObservation<'a> {
@@ -186,18 +195,41 @@ fn commit_instrumented_transaction(
 
 fn bounded_pending_mailbox_query() -> String {
     format!(
-        "SELECT {MAILBOX_ROW_COLUMNS}
-         FROM mailbox
-         WHERE delivered_at IS NULL
-           AND seq > ?3
-           AND (delivery_error IS NULL OR delivery_error != ?5)
-           AND (delivery_error IS NULL OR delivery_error != ?6)
-           AND (delivery_error IS NULL OR delivery_error != ?7)
-           AND {PENDING_MAILBOX_TARGET_PREDICATE}
-         ORDER BY seq ASC
-         LIMIT ?4"
+        "SELECT * FROM (
+             SELECT {MAILBOX_ROW_COLUMNS}
+             FROM mailbox INDEXED BY idx_mailbox_deliverable_session_live
+             WHERE delivered_at IS NULL AND seq>?3
+               AND target_kind IS NULL AND session_id=?1
+               AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE}
+             UNION ALL
+             SELECT {MAILBOX_ROW_COLUMNS}
+             FROM mailbox INDEXED BY idx_mailbox_deliverable_target_live
+             WHERE delivered_at IS NULL AND seq>?3
+               AND target_kind='session' AND target_id=?1
+               AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE}
+             UNION ALL
+             SELECT {MAILBOX_ROW_COLUMNS}
+             FROM mailbox INDEXED BY idx_mailbox_deliverable_target_live
+             WHERE delivered_at IS NULL AND seq>?3 AND ?2 IS NOT NULL
+               AND target_kind='chain' AND target_id=?2
+               AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE}
+         ) ORDER BY seq ASC LIMIT ?4"
     )
 }
+
+const RESOLVE_COMPLETED_DELIVERY_ATTEMPTS_SQL: &str = "UPDATE mailbox_delivery_attempts AS attempt
+         INDEXED BY idx_mailbox_delivery_attempt_unresolved
+     SET resolved_at = COALESCE(resolved_at, ?2),
+         resolved_by_attempt_id = COALESCE(resolved_by_attempt_id, ?3)
+     WHERE session_id = ?1
+       AND resolved_at IS NULL
+       AND NOT EXISTS (
+             SELECT 1
+             FROM mailbox_delivery_attempt_items AS unresolved
+             JOIN mailbox ON mailbox.seq = unresolved.mailbox_seq
+             WHERE unresolved.attempt_id = attempt.attempt_id
+               AND mailbox.delivered_at IS NULL
+         )";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -642,6 +674,19 @@ pub struct PublishedMailboxPayload {
     pub sha256: String,
     pub byte_len: u64,
     pub retention_policy: String,
+}
+
+/// Cross-process content-addressed payload fence.  It is acquired before file
+/// publication or reclamation and may span a short SQLite transaction, but no
+/// filesystem operation is performed while that transaction is live.
+struct PayloadFileFence {
+    file: File,
+}
+
+impl Drop for PayloadFileFence {
+    fn drop(&mut self) {
+        let _ = <File as fs4::FileExt>::unlock(&self.file);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -1098,6 +1143,7 @@ struct WakeSweepSessionState {
 pub struct MailboxDb {
     conn: Connection,
     path: PathBuf,
+    access_scope: AccessScope,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
     _namespace_authority: Option<MailboxAuthorityFence>,
 }
@@ -1116,12 +1162,14 @@ pub struct RuntimeLifecycleReader<'a> {
 pub struct PayloadRetentionRepository<'a> {
     conn: &'a Connection,
     path: &'a Path,
+    access_scope: AccessScope,
 }
 
 /// Session metadata plus atomic wake-claim admission and lifecycle authority.
 pub struct WakeSessionRepository<'a> {
     conn: &'a mut Connection,
     data_root: &'a Path,
+    access_scope: AccessScope,
 }
 
 /// Durable FIFO admission and in-flight launch reservation authority.
@@ -1555,6 +1603,11 @@ impl MailboxDb {
         Self::open(&path)
     }
 
+    pub fn open_historical_default() -> Result<Self, String> {
+        let path = Self::default_path()?;
+        Self::open_historical(&path)
+    }
+
     pub fn open_default_if_exists() -> Result<Option<Self>, String> {
         let path = Self::default_path()?;
         crate::rebuild_recovery::ensure_writable_open_allowed(&path)?;
@@ -1569,10 +1622,28 @@ impl MailboxDb {
         Self::open_with_owned_authority(authority).map(Some)
     }
 
+    /// Explicit historical/diagnostic boundary. This handle is required for
+    /// terminal retention, compaction, and vacuum operations.
+    pub fn open_historical_default_if_exists() -> Result<Option<Self>, String> {
+        Self::open_default_if_exists().map(|mailbox| {
+            mailbox.map(|mut mailbox| {
+                mailbox.access_scope = AccessScope::historical();
+                mailbox
+            })
+        })
+    }
+
     pub fn open(path: &Path) -> Result<Self, String> {
         let authority = MailboxAuthorityFence::acquire(path).map_err(|error| error.to_string())?;
         crate::rebuild_recovery::ensure_writable_open_allowed(authority.path())?;
         Self::open_with_owned_authority(authority)
+    }
+
+    pub fn open_historical(path: &Path) -> Result<Self, String> {
+        Self::open(path).map(|mut mailbox| {
+            mailbox.access_scope = AccessScope::historical();
+            mailbox
+        })
     }
 
     fn open_with_owned_authority(authority: MailboxAuthorityFence) -> Result<Self, String> {
@@ -1598,6 +1669,7 @@ impl MailboxDb {
         Ok(Self {
             conn,
             path: path.to_path_buf(),
+            access_scope: AccessScope::live("pid_mailbox.live", SqliteDatabaseRole::PidMailbox),
             _read_only_snapshot: None,
             _namespace_authority: None,
         })
@@ -1653,6 +1725,10 @@ impl MailboxDb {
         Ok(Self {
             conn,
             path: path.to_path_buf(),
+            access_scope: AccessScope::live(
+                "state_completion_authority",
+                SqliteDatabaseRole::PidMailbox,
+            ),
             _read_only_snapshot: None,
             _namespace_authority: None,
         })
@@ -1662,6 +1738,15 @@ impl MailboxDb {
     /// bytes can precede live SQLite publication; this is not native authority.
     pub fn open_read_only(path: &Path) -> Result<Self, String> {
         Self::open_read_only_with_cancel(path, &|| false)
+    }
+
+    /// Explicit read-only historical/diagnostic boundary. Generic read-only
+    /// handles remain live so a future full-history regression is still denied.
+    pub fn open_historical_read_only(path: &Path) -> Result<Self, String> {
+        Self::open_read_only(path).map(|mut mailbox| {
+            mailbox.access_scope = AccessScope::historical();
+            mailbox
+        })
     }
 
     pub fn open_read_only_with_cancel(
@@ -1693,6 +1778,24 @@ impl MailboxDb {
         Ok((pid, mailbox))
     }
 
+    pub fn open_historical_read_only_with_pid_identity_and_stale_progress(
+        path: &Path,
+        retry_timeout: StdDuration,
+        stale_progress_after: StdDuration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<(crate::pid_identity::PidIdentityDb, Self), String> {
+        Self::open_read_only_with_pid_identity_and_stale_progress(
+            path,
+            retry_timeout,
+            stale_progress_after,
+            is_cancelled,
+        )
+        .map(|(pid, mut mailbox)| {
+            mailbox.access_scope = AccessScope::historical();
+            (pid, mailbox)
+        })
+    }
+
     fn open_snapshot(
         path: &Path,
         snapshot: crate::read_only_snapshot::ReadOnlySnapshot,
@@ -1708,6 +1811,10 @@ impl MailboxDb {
         Ok(Self {
             conn,
             path: path.to_path_buf(),
+            access_scope: AccessScope::live(
+                "pid_mailbox.read_only.live",
+                SqliteDatabaseRole::PidMailbox,
+            ),
             _read_only_snapshot: Some(snapshot),
             _namespace_authority: None,
         })
@@ -1762,6 +1869,7 @@ impl MailboxDb {
         Ok(Self {
             conn,
             path: path.to_path_buf(),
+            access_scope: AccessScope::live("completion_authority", SqliteDatabaseRole::PidMailbox),
             _read_only_snapshot: None,
             _namespace_authority: None,
         })
@@ -1877,6 +1985,7 @@ impl MailboxDb {
         PayloadRetentionRepository {
             conn: &self.conn,
             path: &self.path,
+            access_scope: self.access_scope,
         }
     }
 
@@ -1884,6 +1993,7 @@ impl MailboxDb {
         WakeSessionRepository {
             conn: &mut self.conn,
             data_root: self.path.parent().unwrap_or(Path::new(".")),
+            access_scope: self.access_scope,
         }
     }
 
@@ -2597,6 +2707,10 @@ impl RuntimeLifecycleRepository<'_> {
                     "record claimed mailbox row delivery failure",
                 ))?;
             validate_claimed_mailbox_row_change(*seq, changed, "failure")?;
+            retire_terminal_completion_listener_for_seq(&tx, *seq, request.delivery_error)
+                .map_err(generation_storage_error(
+                    "retire terminal runtime completion listener",
+                ))?;
         }
         clear_runtime_delivery_claim_on(&tx, request.fence, request.claim_id)?;
         let row =
@@ -2999,9 +3113,9 @@ impl MailboxDb {
         )>,
     ) -> Result<CompletionEventTriggerResult, String> {
         validate_completion_event_trigger(&input)?;
-        let published = self
+        let (published, _payload_fence) = self
             .payloads()
-            .publish_immutable_payload(input.payload_json.as_bytes())?;
+            .publish_immutable_payload_with_fence(input.payload_json.as_bytes())?;
         let payload_json = compacted_payload_json(AGENT_BASH_COMPLETE_KIND, &published)?;
         let now = now_rfc3339();
         let tx = self
@@ -3010,7 +3124,6 @@ impl MailboxDb {
             .map_err(|err| {
                 format!("Failed to start completion event trigger transaction: {err}")
             })?;
-        verify_published_payload(&published)?;
         if let Some((binding, evidence)) = continuation {
             completion_continuation::accept_on(&tx, binding, evidence, &published)?;
         } else {
@@ -3043,7 +3156,6 @@ impl MailboxDb {
         )?;
         tx.commit()
             .map_err(|err| format!("Failed to commit completion event trigger: {err}"))?;
-        self.maintain_terminal_history();
         self.completion_event_trigger_result(input.event_id, triggered)
     }
 
@@ -3080,16 +3192,15 @@ impl MailboxDb {
         &mut self,
         input: &AgentBashCompleteEnqueue<'_>,
     ) -> Result<EnqueueResult, String> {
-        let published = self
+        let (published, _payload_fence) = self
             .payloads()
-            .publish_immutable_payload(input.payload_json.as_bytes())?;
+            .publish_immutable_payload_with_fence(input.payload_json.as_bytes())?;
         let payload_json = compacted_payload_json(AGENT_BASH_COMPLETE_KIND, &published)?;
         let now = now_rfc3339();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| format!("Failed to start mailbox enqueue transaction: {err}"))?;
-        verify_published_payload(&published)?;
         let result =
             enqueue_agent_bash_complete_in_tx(&tx, input, &payload_json, &published, &now)?;
         tx.commit()
@@ -3102,7 +3213,9 @@ impl MailboxDb {
         input: &SubmittedInputEnqueue<'_>,
     ) -> Result<EnqueueResult, String> {
         validate_submitted_input(input)?;
-        let published = self.payloads().publish_immutable_payload(input.input)?;
+        let (published, _payload_fence) = self
+            .payloads()
+            .publish_immutable_payload_with_fence(input.input)?;
         let handle = submitted_input_handle(input.submission_token, input.target)?;
         let payload_json = submitted_input_payload_json(input, &published)?;
         let now = now_rfc3339();
@@ -3110,7 +3223,6 @@ impl MailboxDb {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| format!("Failed to start input enqueue transaction: {err}"))?;
-        verify_published_payload(&published)?;
         let result =
             enqueue_submitted_input_in_tx(&tx, input, &handle, &payload_json, &published, &now)?;
         tx.commit()
@@ -3161,6 +3273,17 @@ impl PayloadRetentionRepository<'_> {
         Ok(payload)
     }
 
+    fn publish_immutable_payload_with_fence(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(PublishedMailboxPayload, PayloadFileFence), String> {
+        let payload = self.payload_reference(bytes)?;
+        let fence = PayloadFileFence::acquire(&payload.file_path, &payload.sha256)?;
+        publish_payload_file(&payload.file_path, bytes)?;
+        verify_published_payload(&payload)?;
+        Ok((payload, fence))
+    }
+
     pub fn verify_published_payload(
         &self,
         payload: &PublishedMailboxPayload,
@@ -3202,6 +3325,8 @@ impl PayloadRetentionRepository<'_> {
     pub fn delivered_payload_compaction_stats(
         &self,
     ) -> Result<DeliveredPayloadCompactionStats, String> {
+        self.access_scope
+            .authorize(DELIVERED_PAYLOAD_COMPACTION_STATS, None)?;
         let (eligible_rows, inline_bytes) = self
             .conn
             .query_row(
@@ -3229,6 +3354,8 @@ impl PayloadRetentionRepository<'_> {
         if limit == 0 {
             return Ok(DeliveredPayloadCompactionReport::default());
         }
+        self.access_scope
+            .authorize(DELIVERED_PAYLOAD_COMPACTION, None)?;
         let candidates = delivered_payload_compaction_candidates(self.conn, limit)?;
         let mut report = DeliveredPayloadCompactionReport {
             scanned_rows: candidates.len(),
@@ -3236,13 +3363,12 @@ impl PayloadRetentionRepository<'_> {
         };
         for candidate in candidates {
             let original_len = candidate.payload_json.len() as u64;
-            let published = self.retained_payload_for_compaction(&candidate)?;
+            let (published, _payload_fence) = self.retained_payload_for_compaction(&candidate)?;
             let compacted_json = compacted_payload_json(&candidate.kind, &published)?;
             let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)
                 .map_err(|err| {
                     format!("Failed to start delivered payload compaction transaction: {err}")
                 })?;
-            verify_published_payload(&published)?;
             let changed = mark_payload_compacted(&tx, &candidate, &published, &compacted_json)?;
             tx.commit()
                 .map_err(|err| format!("Failed to commit delivered payload compaction: {err}"))?;
@@ -3260,13 +3386,14 @@ impl PayloadRetentionRepository<'_> {
     fn retained_payload_for_compaction(
         &self,
         candidate: &DeliveredPayloadCompactionCandidate,
-    ) -> Result<PublishedMailboxPayload, String> {
+    ) -> Result<(PublishedMailboxPayload, PayloadFileFence), String> {
         match candidate.published_payload()? {
             Some(payload) => {
+                let fence = PayloadFileFence::acquire(&payload.file_path, &payload.sha256)?;
                 self.verify_published_payload(&payload)?;
-                Ok(payload)
+                Ok((payload, fence))
             }
-            None => self.publish_immutable_payload(candidate.payload_json.as_bytes()),
+            None => self.publish_immutable_payload_with_fence(candidate.payload_json.as_bytes()),
         }
     }
 }
@@ -3275,6 +3402,8 @@ impl MailboxDb {
     pub fn terminal_history_retention_stats(
         &self,
     ) -> Result<TerminalHistoryRetentionStats, String> {
+        self.access_scope
+            .authorize(TERMINAL_RETENTION_STATS, None)?;
         terminal_history_retention_stats_on(&self.conn, TERMINAL_HISTORY_KEEP_ROWS)
     }
 
@@ -3293,6 +3422,8 @@ impl MailboxDb {
         if limit == 0 {
             return Ok(TerminalHistoryPruneReport::default());
         }
+        self.access_scope
+            .authorize(TERMINAL_RETENTION_PRUNE, None)?;
         let limit = i64::try_from(limit)
             .map_err(|_| "Terminal history prune limit does not fit SQLite INTEGER".to_string())?;
         let keep = i64::try_from(keep)
@@ -3420,6 +3551,8 @@ impl MailboxDb {
     }
 
     pub fn vacuum_terminal_history(&mut self) -> Result<(), String> {
+        self.access_scope
+            .authorize(TERMINAL_RETENTION_VACUUM, None)?;
         truncate_terminal_history_wal(&self.conn, "before VACUUM")?;
         self.conn
             .execute_batch("VACUUM;")
@@ -3438,42 +3571,17 @@ impl MailboxDb {
                 payload.file_path.display()
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|err| format!("Failed to start mailbox payload reclaim transaction: {err}"))?;
-        let live: bool = tx
-            .query_row(
-                "SELECT EXISTS (
-                     SELECT 1 FROM mailbox WHERE payload_sha256 = ?1
-                 ) OR EXISTS (
-                     SELECT 1
-                     FROM completion_event AS event
-                     JOIN completion_event_listener AS listener
-                       ON listener.event_id = event.event_id
-                     WHERE event.payload_sha256 = ?1
-                       AND listener.acknowledged_at IS NULL
-                 )",
-                params![&payload.sha256],
-                |row| row.get(0),
-            )
-            .map_err(|err| format!("Failed to inspect mailbox payload references: {err}"))?;
-        if live || completion_continuation::retained_payload(&tx, &payload.sha256)? {
-            tx.commit()
-                .map_err(|err| format!("Failed to finish mailbox payload inspection: {err}"))?;
+        // Publication and reclamation share this content-addressed fence.  It
+        // is acquired before either the filesystem or SQLite writer work, so a
+        // newly admitted live reference cannot race the final unlink.
+        let _payload_fence = PayloadFileFence::acquire(&payload.file_path, &payload.sha256)?;
+        if payload_has_live_reference(&self.conn, &payload.sha256)?
+            || completion_continuation::retained_payload(&self.conn, &payload.sha256)?
+        {
             return Ok(PayloadReclaimResult::default());
         }
-
         let reclaimed_bytes = match fs::metadata(&payload.file_path) {
-            Ok(metadata) => {
-                fs::remove_file(&payload.file_path).map_err(|err| {
-                    format!(
-                        "Failed to remove terminal mailbox payload {}: {err}",
-                        payload.file_path.display()
-                    )
-                })?;
-                metadata.len()
-            }
+            Ok(metadata) => metadata.len(),
             Err(error) if error.kind() == ErrorKind::NotFound => 0,
             Err(error) => {
                 return Err(format!(
@@ -3482,6 +3590,17 @@ impl MailboxDb {
                 ));
             }
         };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("Failed to start mailbox payload reclaim transaction: {err}"))?;
+        if payload_has_live_reference(&tx, &payload.sha256)?
+            || completion_continuation::retained_payload(&tx, &payload.sha256)?
+        {
+            tx.commit()
+                .map_err(|err| format!("Failed to finish mailbox payload inspection: {err}"))?;
+            return Ok(PayloadReclaimResult::default());
+        }
         tx.execute(
             "UPDATE completion_event
              SET payload_reclaimed_at = COALESCE(payload_reclaimed_at, ?2)
@@ -3497,62 +3616,37 @@ impl MailboxDb {
         .map_err(|err| format!("Failed to record terminal payload reclamation: {err}"))?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox payload reclamation: {err}"))?;
+        if reclaimed_bytes > 0 {
+            fs::remove_file(&payload.file_path).map_err(|err| {
+                format!(
+                    "Failed to remove terminal mailbox payload {}: {err}",
+                    payload.file_path.display()
+                )
+            })?;
+        }
         Ok(PayloadReclaimResult {
             files_deleted: usize::from(reclaimed_bytes > 0),
             bytes_reclaimed: reclaimed_bytes,
         })
     }
+}
 
-    fn maintain_terminal_history(&mut self) {
-        let deadline = Instant::now() + TERMINAL_HISTORY_MAINTENANCE_TIMEOUT;
-        if let Err(error) =
-            self.conn.progress_handler(
-                TERMINAL_HISTORY_MAINTENANCE_PROGRESS_OPS,
-                Some(move || {
-                    #[cfg(test)]
-                    COUNT_COMPLETION_FINALIZATION_VM_STEPS.with(|enabled| {
-                        if enabled.get() {
-                            COMPLETION_FINALIZATION_VM_STEPS.with(|count| {
-                                count.set(count.get().saturating_add(
-                                    TERMINAL_HISTORY_MAINTENANCE_PROGRESS_OPS as usize,
-                                ))
-                            });
-                        }
-                    });
-                    Instant::now() >= deadline
-                }),
-            )
-        {
-            tracing::warn!(error = %error, "failed to bound terminal mailbox maintenance");
-            return;
-        }
-        if let Err(error) = self
-            .conn
-            .busy_timeout(TERMINAL_HISTORY_MAINTENANCE_BUSY_TIMEOUT)
-        {
-            let _ = self.conn.progress_handler(0, None::<fn() -> bool>);
-            #[cfg(test)]
-            install_completion_finalization_vm_counter(&self.conn);
-            tracing::warn!(error = %error, "failed to bound terminal mailbox writer wait");
-            return;
-        }
-
-        let result = self.prune_terminal_history(TERMINAL_HISTORY_MAINTENANCE_BATCH);
-        let progress_reset = self.conn.progress_handler(0, None::<fn() -> bool>);
-        let timeout_reset = self.conn.busy_timeout(mailbox_writer_sqlite_timeout());
-        #[cfg(test)]
-        install_completion_finalization_vm_counter(&self.conn);
-
-        if let Err(error) = result {
-            tracing::warn!(error = %error, "bounded terminal mailbox maintenance failed");
-        }
-        if let Err(error) = progress_reset {
-            tracing::warn!(error = %error, "failed to clear terminal mailbox maintenance budget");
-        }
-        if let Err(error) = timeout_reset {
-            tracing::warn!(error = %error, "failed to restore terminal mailbox writer wait");
-        }
-    }
+fn payload_has_live_reference(conn: &Connection, sha256: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM mailbox WHERE payload_sha256 = ?1
+         ) OR EXISTS (
+             SELECT 1
+             FROM completion_event AS event
+             JOIN completion_event_listener AS listener
+               ON listener.event_id = event.event_id
+             WHERE event.payload_sha256 = ?1
+               AND listener.acknowledged_at IS NULL
+         )",
+        params![sha256],
+        |row| row.get(0),
+    )
+    .map_err(|err| format!("Failed to inspect mailbox payload references: {err}"))
 }
 
 fn truncate_terminal_history_wal(conn: &Connection, phase: &str) -> Result<(), String> {
@@ -3574,6 +3668,11 @@ fn truncate_terminal_history_wal(conn: &Connection, phase: &str) -> Result<(), S
 }
 
 impl MailboxDb {
+    #[cfg(test)]
+    fn allow_historical_access_for_test(&mut self) {
+        self.access_scope = AccessScope::historical();
+    }
+
     pub fn list_pending(&self, session_id: &str) -> Result<Vec<MailboxRow>, String> {
         self.list_pending_for_delivery(session_id, None)
     }
@@ -3583,21 +3682,11 @@ impl MailboxDb {
         session_id: &str,
         chain_id: Option<&str>,
     ) -> Result<Vec<MailboxRow>, String> {
-        let query = format!(
-            "SELECT {MAILBOX_ROW_COLUMNS}
-             FROM mailbox
-             WHERE delivered_at IS NULL
-               AND {PENDING_MAILBOX_TARGET_PREDICATE}
-             ORDER BY seq ASC"
-        );
-        let mut stmt = self
-            .conn
-            .prepare(&query)
-            .map_err(|err| format!("Failed to prepare pending mailbox query: {err}"))?;
-        let rows = stmt
-            .query_map(params![session_id, chain_id], map_mailbox_row)
-            .map_err(|err| format!("Failed to query pending mailbox rows: {err}"))?;
-        collect_rows(rows)
+        // Compatibility enumeration retains its complete-live-set behavior but
+        // routes through the same terminal-excluding, explicitly bounded query
+        // as delivery. Historical diagnostics use `list_mailbox(..., true)`.
+        let complete_live_bound = usize::try_from(i64::MAX).unwrap_or(usize::MAX);
+        self.list_pending_for_delivery_after(session_id, chain_id, 0, complete_live_bound)
     }
 
     pub fn list_pending_for_delivery_after(
@@ -3617,6 +3706,8 @@ impl MailboxDb {
             .ok()
             .filter(|limit| *limit > 0)
             .ok_or_else(|| "Mailbox batch limit must be positive".to_string())?;
+        self.access_scope
+            .authorize(MAILBOX_PENDING_DELIVERY, usize::try_from(limit).ok())?;
         let query = bounded_pending_mailbox_query();
         let mut stmt = self
             .conn
@@ -3624,23 +3715,87 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to prepare bounded pending mailbox query: {err}"))?;
         let rows = stmt
             .query_map(
-                params![
-                    session_id,
-                    chain_id,
-                    after_seq,
-                    limit,
-                    WAKE_SWEEP_ABANDONED_ERROR,
-                    MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
-                    MAILBOX_INGRESS_EXPIRED_ERROR,
-                ],
+                params![session_id, chain_id, after_seq, limit],
                 map_mailbox_row,
             )
             .map_err(|err| format!("Failed to query bounded pending mailbox rows: {err}"))?;
         collect_rows(rows)
     }
 
+    pub fn pending_for_delivery_seq(
+        &self,
+        session_id: &str,
+        chain_id: Option<&str>,
+        seq: i64,
+    ) -> Result<Option<MailboxRow>, String> {
+        if seq <= 0 {
+            return Err("Mailbox sequence must be positive".to_string());
+        }
+        self.access_scope.authorize(MAILBOX_PENDING_EXACT, None)?;
+        let query = format!(
+            "SELECT {MAILBOX_ROW_COLUMNS}
+             FROM mailbox
+             WHERE seq=?3 AND delivered_at IS NULL
+               AND (delivery_error IS NULL OR delivery_error NOT IN (?4,?5,?6))
+               AND {PENDING_MAILBOX_TARGET_PREDICATE}"
+        );
+        self.conn
+            .query_row(
+                &query,
+                params![
+                    session_id,
+                    chain_id,
+                    seq,
+                    WAKE_SWEEP_ABANDONED_ERROR,
+                    MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
+                    MAILBOX_INGRESS_EXPIRED_ERROR,
+                ],
+                map_mailbox_row,
+            )
+            .optional()
+            .map_err(|error| format!("Failed to query exact pending mailbox row: {error}"))
+    }
+
+    pub fn pending_delivery_count(
+        &self,
+        session_id: &str,
+        chain_id: Option<&str>,
+    ) -> Result<usize, String> {
+        if session_id.is_empty() {
+            return Err("Mailbox session id cannot be empty".to_string());
+        }
+        self.access_scope.authorize(MAILBOX_PENDING_COUNT, None)?;
+        let count = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT
+                    (SELECT COUNT(*)
+                     FROM mailbox INDEXED BY idx_mailbox_deliverable_session_live
+                     WHERE delivered_at IS NULL AND target_kind IS NULL
+                       AND session_id=?1
+                       AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE})
+                  + (SELECT COUNT(*)
+                     FROM mailbox INDEXED BY idx_mailbox_deliverable_target_live
+                     WHERE delivered_at IS NULL AND target_kind='session'
+                       AND target_id=?1
+                       AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE})
+                  + (SELECT COUNT(*)
+                     FROM mailbox INDEXED BY idx_mailbox_deliverable_target_live
+                     WHERE delivered_at IS NULL AND ?2 IS NOT NULL
+                       AND target_kind='chain' AND target_id=?2
+                       AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE})"
+                ),
+                params![session_id, chain_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("Failed to count pending mailbox rows: {error}"))?;
+        usize::try_from(count).map_err(|_| "Pending mailbox count does not fit usize".to_string())
+    }
+
     pub fn list_mailbox(&self, session_id: &str, all: bool) -> Result<Vec<MailboxRow>, String> {
         if all {
+            self.access_scope.authorize(MAILBOX_FULL_HISTORY, None)?;
             self.list_mailbox_all(session_id)
         } else {
             self.list_pending(session_id)
@@ -3798,7 +3953,8 @@ impl MailboxDb {
         tx.execute(
             "UPDATE completion_event_listener
              SET acknowledged_at = COALESCE(acknowledged_at, ?4),
-                 acknowledgement_reason = COALESCE(acknowledgement_reason, 'manual_ack')
+                 acknowledgement_reason = COALESCE(acknowledgement_reason, 'manual_ack'),
+                 retirement_pending = 0
              WHERE mailbox_seq IN (
                  SELECT seq FROM mailbox
                  WHERE session_id = ?1 AND seq >= ?2 AND seq <= ?3 AND delivered_at IS NOT NULL
@@ -3810,7 +3966,6 @@ impl MailboxDb {
         tx.commit().map_err(|err| {
             format!("Failed to commit mailbox range acknowledgement transaction: {err}")
         })?;
-        self.maintain_terminal_history();
         Ok(changed)
     }
 
@@ -3962,7 +4117,6 @@ impl MailboxDb {
         resolve_completed_delivery_attempts(&tx, session_id, &now, None)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox delivery transaction: {err}"))?;
-        self.maintain_terminal_history();
         Ok(())
     }
 
@@ -4091,7 +4245,7 @@ impl MailboxDb {
             }
         }
         tx.execute(
-            "UPDATE mailbox_delivery_attempts
+            "UPDATE mailbox_delivery_attempts INDEXED BY idx_mailbox_delivery_attempt_unresolved
              SET resolved_at = ?3
              WHERE session_id = ?1
                 AND delivery_invocation_uuid != ?2
@@ -4159,7 +4313,6 @@ impl MailboxDb {
         resolve_completed_delivery_attempts(&tx, session_id, &now, None)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox delivery attempt: {err}"))?;
-        self.maintain_terminal_history();
         Ok(())
     }
 
@@ -4379,7 +4532,7 @@ impl MailboxDb {
         let mut stmt = self.conn.prepare(
             "SELECT attempt_id, prepared_remaining_count,
                     (SELECT COUNT(*) FROM mailbox_delivery_attempt_items i WHERE i.attempt_id = a.attempt_id)
-             FROM mailbox_delivery_attempts a
+             FROM mailbox_delivery_attempts a INDEXED BY idx_mailbox_delivery_attempt_unresolved
              WHERE session_id = ?1 AND resolved_at IS NULL
                AND headless_submission_state IS NULL AND observation_expected_sha256 IS NULL
              ORDER BY created_at, attempt_id LIMIT ?2"
@@ -4768,7 +4921,8 @@ impl MailboxDb {
         )
         .map_err(|e| e.to_string())?;
         tx.execute("UPDATE completion_event_listener SET acknowledged_at = COALESCE(acknowledged_at, ?2),
-            acknowledgement_reason = COALESCE(acknowledgement_reason, 'native_receipt')
+            acknowledgement_reason = COALESCE(acknowledgement_reason, 'native_receipt'),
+            retirement_pending = 0
             WHERE mailbox_seq IN (SELECT mailbox_seq FROM mailbox_delivery_attempt_items WHERE attempt_id = ?1)",
             params![attempt_id, now]).map_err(|e| e.to_string())?;
         // Retain exact native receipt attribution before attempt/sequence pruning.
@@ -4805,6 +4959,7 @@ impl MailboxDb {
                         attempts.observation_anchor_token,
                         attempts.observation_expected_sha256
                  FROM mailbox_delivery_attempts AS attempts
+                      INDEXED BY idx_mailbox_delivery_attempt_unresolved
                  WHERE attempts.session_id = ?1
                    AND attempts.resolved_at IS NULL
                    AND attempts.observation_expected_sha256 IS NOT NULL
@@ -4912,6 +5067,7 @@ impl MailboxDb {
             .query_row(
                 "SELECT attempt_id, evidence_turn_generation_id
                  FROM mailbox_delivery_attempts
+                      INDEXED BY idx_mailbox_delivery_attempt_unresolved
                  WHERE session_id = ?1
                    AND delivery_invocation_uuid = ?2
                    AND resolved_at IS NULL
@@ -4946,6 +5102,7 @@ impl MailboxDb {
             .query_row(
                 "SELECT attempt_id
                  FROM mailbox_delivery_attempts
+                      INDEXED BY idx_mailbox_delivery_attempt_unresolved
                  WHERE session_id = ?1
                    AND (submission_started_at IS NOT NULL
                      OR observation_error IS NOT NULL
@@ -4964,7 +5121,7 @@ impl MailboxDb {
             ));
         }
         tx.execute(
-            "UPDATE mailbox_delivery_attempts
+            "UPDATE mailbox_delivery_attempts INDEXED BY idx_mailbox_delivery_attempt_unresolved
              SET resolved_at = ?3
              WHERE session_id = ?1
                 AND delivery_invocation_uuid != ?2
@@ -5125,10 +5282,7 @@ impl MailboxDb {
         let remaining_count = if original_count {
             usize::try_from(prepared_remaining_count).map_err(|err| err.to_string())?
         } else {
-            self.list_pending(&session_id)?
-                .into_iter()
-                .filter(mailbox_row_is_deliverable_pending)
-                .count()
+            self.pending_delivery_count(&session_id, None)?
                 .saturating_sub(rows.len())
         };
         Ok(Some(MailboxDeliveryWindow {
@@ -5153,6 +5307,7 @@ impl MailboxDb {
                 .prepare(
                     "SELECT attempts.attempt_id
                      FROM mailbox_delivery_attempts AS attempts
+                          INDEXED BY idx_mailbox_delivery_attempt_unresolved
                      WHERE attempts.session_id = ?1
                        AND attempts.resolved_at IS NULL
                        AND EXISTS (
@@ -5200,9 +5355,9 @@ impl MailboxDb {
         session_id: &str,
     ) -> Result<Vec<MailboxDeliveryWindow>, String> {
         let oldest_deliverable_seq = self
-            .list_pending(session_id)?
+            .list_pending_for_delivery_after(session_id, None, 0, 1)?
             .into_iter()
-            .find(mailbox_row_is_deliverable_pending)
+            .next()
             .map(|row| row.seq);
         let Some(oldest_deliverable_seq) = oldest_deliverable_seq else {
             return Ok(Vec::new());
@@ -5212,6 +5367,7 @@ impl MailboxDb {
             .prepare(
                 "SELECT attempts.attempt_id
                  FROM mailbox_delivery_attempts AS attempts
+                      INDEXED BY idx_mailbox_delivery_attempt_unresolved
                  WHERE attempts.session_id = ?1
                    AND attempts.acknowledged_at IS NOT NULL
                    AND attempts.resolved_at IS NULL
@@ -5363,7 +5519,8 @@ impl MailboxDb {
         tx.execute(
             "UPDATE completion_event_listener
              SET acknowledged_at = COALESCE(acknowledged_at, ?2),
-                 acknowledgement_reason = COALESCE(acknowledgement_reason, 'injected')
+                 acknowledgement_reason = COALESCE(acknowledgement_reason, 'injected'),
+                 retirement_pending = 0
              WHERE mailbox_seq IN (
                  SELECT mailbox_seq FROM mailbox_delivery_attempt_items WHERE attempt_id = ?1
              )",
@@ -5373,7 +5530,6 @@ impl MailboxDb {
         resolve_completed_delivery_attempts(&tx, &session_id, &now, Some(attempt_id))?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox delivery confirmation: {err}"))?;
-        self.maintain_terminal_history();
         Ok(true)
     }
 
@@ -5541,6 +5697,8 @@ impl MailboxDb {
             params![&session_id, attempt_id, delivery_error],
         )
         .map_err(|err| format!("Failed to mark unobserved mailbox delivery rows: {err}"))?;
+        retire_terminal_completion_listeners_for_attempt(&tx, attempt_id, delivery_error)
+            .map_err(|err| format!("Failed to retire terminal completion listeners: {err}"))?;
         tx.execute(
             "UPDATE mailbox_delivery_attempts
              SET resolved_at = ?2
@@ -5597,6 +5755,8 @@ impl MailboxDb {
                 params![seq, delivery_error],
             )
             .map_err(|err| format!("Failed to record exact delivery attempt failure: {err}"))?;
+            retire_terminal_completion_listener_for_seq(&tx, *seq, delivery_error)
+                .map_err(|err| format!("Failed to retire terminal completion listener: {err}"))?;
         }
         tx.commit().map_err(|err| err.to_string())?;
         Ok(pending.is_empty())
@@ -5641,6 +5801,8 @@ impl MailboxDb {
                 params![session_id, chain_id, seq, delivery_error],
             )
             .map_err(|err| format!("Failed to mark mailbox row delivery failed: {err}"))?;
+            retire_terminal_completion_listener_for_seq(&tx, *seq, delivery_error)
+                .map_err(|err| format!("Failed to retire terminal completion listener: {err}"))?;
         }
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox delivery failure transaction: {err}"))
@@ -5676,6 +5838,17 @@ impl MailboxDb {
             )
             .map_err(|err| format!("Failed to mark mailbox rows abandoned: {err}"))?;
         if changed > 0 {
+            tx.execute(
+                "UPDATE completion_event_listener
+                 SET active = 0, retirement_pending = 0
+                 WHERE retirement_pending = 1
+                   AND mailbox_seq IN (
+                       SELECT seq FROM mailbox
+                       WHERE session_id = ?1 AND delivered_at IS NULL AND delivery_error = ?2
+                   )",
+                params![session_id, WAKE_SWEEP_ABANDONED_ERROR],
+            )
+            .map_err(|err| format!("Failed to retire abandoned completion listeners: {err}"))?;
             tx.execute(
                 "DELETE FROM session_wake_claim WHERE session_id = ?1",
                 params![session_id],
@@ -6821,6 +6994,8 @@ impl WakeSessionRepository<'_> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        self.access_scope
+            .authorize(MAILBOX_PENDING_SESSIONS, Some(limit))?;
         let rotating_limit = limit.saturating_sub(limit / 2);
         let newest_limit = limit.saturating_sub(rotating_limit);
         let cursor = self.wake_sweep_cursor()?;
@@ -6844,6 +7019,8 @@ impl WakeSessionRepository<'_> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        self.access_scope
+            .authorize(MAILBOX_PENDING_SESSIONS, Some(limit))?;
         let oldest_limit = limit.saturating_sub(limit / 2);
         let newest_limit = limit.saturating_sub(oldest_limit);
         let oldest = self.oldest_pending_wake_session_ids(oldest_limit)?;
@@ -6870,9 +7047,7 @@ impl WakeSessionRepository<'_> {
             .prepare(&query)
             .map_err(|err| format!("Failed to prepare pending wake session query: {err}"))?;
         let rows = stmt
-            .query_map(params![limit as i64, WAKE_SWEEP_ABANDONED_ERROR], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_map(params![limit as i64], |row| row.get::<_, String>(0))
             .map_err(|err| format!("Failed to query pending wake sessions: {err}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|err| format!("Failed to read pending wake session row: {err}"))
@@ -6892,15 +7067,9 @@ impl WakeSessionRepository<'_> {
             .prepare(pending_wake_sessions_in_seq_range_query())
             .map_err(|err| format!("Failed to prepare rotating wake session query: {err}"))?;
         let rows = stmt
-            .query_map(
-                params![
-                    limit as i64,
-                    WAKE_SWEEP_ABANDONED_ERROR,
-                    after_seq,
-                    through_seq
-                ],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            )
+            .query_map(params![limit as i64, after_seq, through_seq], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(|err| format!("Failed to query rotating wake sessions: {err}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|err| format!("Failed to read rotating wake session row: {err}"))
@@ -7090,7 +7259,15 @@ fn mailbox_writer_sqlite_timeout() -> StdDuration {
 }
 
 pub fn mailbox_row_is_deliverable_pending(row: &MailboxRow) -> bool {
-    row.delivered_at.is_none() && row.delivery_error.as_deref() != Some(WAKE_SWEEP_ABANDONED_ERROR)
+    row.delivered_at.is_none()
+        && row.delivery_error.as_deref().is_none_or(|error| {
+            ![
+                WAKE_SWEEP_ABANDONED_ERROR,
+                MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
+                MAILBOX_INGRESS_EXPIRED_ERROR,
+            ]
+            .contains(&error)
+        })
 }
 
 fn resolve_completed_delivery_attempts(
@@ -7100,18 +7277,7 @@ fn resolve_completed_delivery_attempts(
     resolved_by_attempt_id: Option<&str>,
 ) -> Result<(), String> {
     tx.execute(
-        "UPDATE mailbox_delivery_attempts AS attempt
-         SET resolved_at = COALESCE(resolved_at, ?2),
-             resolved_by_attempt_id = COALESCE(resolved_by_attempt_id, ?3)
-         WHERE session_id = ?1
-           AND resolved_at IS NULL
-           AND NOT EXISTS (
-                 SELECT 1
-                 FROM mailbox_delivery_attempt_items AS unresolved
-                 JOIN mailbox ON mailbox.seq = unresolved.mailbox_seq
-                 WHERE unresolved.attempt_id = attempt.attempt_id
-                   AND mailbox.delivered_at IS NULL
-             )",
+        RESOLVE_COMPLETED_DELIVERY_ATTEMPTS_SQL,
         params![session_id, resolved_at, resolved_by_attempt_id],
     )
     .map(|_| ())
@@ -7120,6 +7286,38 @@ fn resolve_completed_delivery_attempts(
 
 fn payload_address(sha256: &str) -> String {
     format!("{MAILBOX_PAYLOAD_ADDRESS_VERSION}:{MAILBOX_PAYLOAD_ALGORITHM}:{sha256}")
+}
+
+impl PayloadFileFence {
+    fn acquire(file_path: &Path, sha256: &str) -> Result<Self, String> {
+        validate_sha256_hex(sha256)?;
+        let payload_directory = file_path
+            .parent()
+            .ok_or("Mailbox payload has no containing directory")?;
+        let lock_directory = payload_directory.join(".locks");
+        fs::create_dir_all(&lock_directory)
+            .map_err(|error| format!("Failed to create mailbox payload lock directory: {error}"))?;
+        let lock_path = lock_directory.join(sha256);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| {
+                format!(
+                    "Failed to open mailbox payload fence {}: {error}",
+                    lock_path.display()
+                )
+            })?;
+        <File as fs4::FileExt>::lock(&file).map_err(|error| {
+            format!(
+                "Failed to acquire mailbox payload fence {}: {error}",
+                lock_path.display()
+            )
+        })?;
+        Ok(Self { file })
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -7445,23 +7643,27 @@ fn wake_sweep_candidates_at_limit(candidates: &[WakeSweepCandidate], limit: usiz
 fn pending_wake_session_ids_by_oldest_seq_query(direction: &str) -> String {
     format!(
         "SELECT session_id
-                  FROM mailbox
+                  FROM mailbox INDEXED BY idx_mailbox_deliverable_global
                   WHERE delivered_at IS NULL
-                    AND (delivery_error IS NULL OR delivery_error != ?2)
+                    AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE}
                   GROUP BY session_id
                   ORDER BY MIN(seq) {direction}
-                  LIMIT ?1",
+                  LIMIT ?1"
     )
 }
 
 fn pending_wake_sessions_in_seq_range_query() -> &'static str {
     "SELECT session_id, MIN(seq) AS oldest_seq
-     FROM mailbox
+     FROM mailbox INDEXED BY idx_mailbox_deliverable_global
      WHERE delivered_at IS NULL
-       AND (delivery_error IS NULL OR delivery_error != ?2)
+       AND (delivery_error IS NULL OR delivery_error NOT IN (
+           'wake_sweep_abandoned',
+           'mailbox_payload_verification_failed',
+           'mailbox_ingress_expired'
+       ))
      GROUP BY session_id
-     HAVING (?3 IS NULL OR oldest_seq > ?3)
-        AND (?4 IS NULL OR oldest_seq <= ?4)
+     HAVING (?2 IS NULL OR oldest_seq > ?2)
+        AND (?3 IS NULL OR oldest_seq <= ?3)
      ORDER BY oldest_seq ASC
      LIMIT ?1"
 }
@@ -7488,23 +7690,28 @@ fn pending_seq_bounds_for_claim_tx(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
 ) -> Result<Option<(i64, i64)>, String> {
-    let query = format!(
-        "SELECT MIN(seq), MAX(seq)
-         FROM mailbox
-         WHERE delivered_at IS NULL
-           AND {PENDING_MAILBOX_TARGET_PREDICATE}
-           AND (delivery_error IS NULL OR delivery_error != ?3)"
-    );
-    tx.query_row(
-        &query,
-        params![session_id, Option::<&str>::None, WAKE_SWEEP_ABANDONED_ERROR,],
-        |row| {
-            let min_seq: Option<i64> = row.get(0)?;
-            let max_seq: Option<i64> = row.get(1)?;
-            Ok(min_seq.zip(max_seq))
-        },
-    )
+    tx.query_row(&pending_seq_bounds_query(), params![session_id], |row| {
+        let min_seq: Option<i64> = row.get(0)?;
+        let max_seq: Option<i64> = row.get(1)?;
+        Ok(min_seq.zip(max_seq))
+    })
     .map_err(|err| format!("Failed to read deliverable wake-claim bounds: {err}"))
+}
+
+fn pending_seq_bounds_query() -> String {
+    format!(
+        "SELECT MIN(seq), MAX(seq) FROM (
+             SELECT seq
+             FROM mailbox INDEXED BY idx_mailbox_deliverable_session_live
+             WHERE delivered_at IS NULL AND target_kind IS NULL
+               AND session_id=?1 AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE}
+             UNION ALL
+             SELECT seq
+             FROM mailbox INDEXED BY idx_mailbox_deliverable_target_live
+             WHERE delivered_at IS NULL AND target_kind='session'
+               AND target_id=?1 AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE}
+         )"
+    )
 }
 
 fn wake_claim_runtime_is_busy_tx(
@@ -8857,10 +9064,18 @@ fn format_runtime_generations_for_session_sql(nonterminal_only: bool) -> String 
     } else {
         "session_id = ?1"
     };
-    format!(
+    let mut sql = format!(
         "{} ORDER BY created_at ASC, generation_uuid ASC",
         runtime_generation_select_sql(predicate)
-    )
+    );
+    if nonterminal_only {
+        sql = sql.replacen(
+            "FROM runtime_generation",
+            "FROM runtime_generation INDEXED BY idx_runtime_generation_live_session",
+            1,
+        );
+    }
+    sql
 }
 
 fn runtime_generations_for_session_on(
@@ -9099,6 +9314,52 @@ fn reject_unauthorized_terminal_wake_abandonment(delivery_error: &str) -> Result
     Ok(())
 }
 
+fn terminal_mailbox_error(delivery_error: &str) -> bool {
+    matches!(
+        delivery_error,
+        WAKE_SWEEP_ABANDONED_ERROR
+            | MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR
+            | MAILBOX_INGRESS_EXPIRED_ERROR
+    )
+}
+
+fn retire_terminal_completion_listener_for_seq(
+    tx: &Transaction<'_>,
+    seq: i64,
+    delivery_error: &str,
+) -> rusqlite::Result<()> {
+    if !terminal_mailbox_error(delivery_error) {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE completion_event_listener
+         SET active = 0, retirement_pending = 0
+         WHERE mailbox_seq = ?1 AND retirement_pending = 1",
+        [seq],
+    )?;
+    Ok(())
+}
+
+fn retire_terminal_completion_listeners_for_attempt(
+    tx: &Transaction<'_>,
+    attempt_id: &str,
+    delivery_error: &str,
+) -> rusqlite::Result<()> {
+    if !terminal_mailbox_error(delivery_error) {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE completion_event_listener
+         SET active = 0, retirement_pending = 0
+         WHERE retirement_pending = 1
+           AND mailbox_seq IN (
+               SELECT mailbox_seq FROM mailbox_delivery_attempt_items WHERE attempt_id = ?1
+           )",
+        [attempt_id],
+    )?;
+    Ok(())
+}
+
 fn serialize_delivery_seqs(seqs: &[i64]) -> Result<String, GenerationStorageError> {
     serde_json::to_string(seqs).map_err(|err| {
         GenerationStorageError::new(format!(
@@ -9136,14 +9397,10 @@ fn validate_explicit_input_delivery_on(
         "SELECT EXISTS(SELECT 1 FROM mailbox
          WHERE seq = ?3 AND {PENDING_MAILBOX_TARGET_PREDICATE}
            AND kind = 'input' AND delivered_at IS NULL
-           AND (delivery_error IS NULL OR delivery_error != ?4))"
+           AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE})"
     );
     let pending: bool = conn
-        .query_row(
-            &sql,
-            params![session_id, chain_id, seq, WAKE_SWEEP_ABANDONED_ERROR],
-            |row| row.get(0),
-        )
+        .query_row(&sql, params![session_id, chain_id, seq], |row| row.get(0))
         .map_err(|err| format!("Failed to validate explicit input delivery: {err}"))?;
     if !pending {
         return Err(format!(
@@ -10645,7 +10902,8 @@ fn acknowledge_completion_event_listeners_for_seqs(
     let sql = format!(
         "UPDATE completion_event_listener
          SET acknowledged_at = COALESCE(acknowledged_at, ?4),
-             acknowledgement_reason = COALESCE(acknowledgement_reason, 'injected')
+             acknowledgement_reason = COALESCE(acknowledgement_reason, 'injected'),
+             retirement_pending = 0
          WHERE mailbox_seq = ?3
            AND EXISTS (
                SELECT 1 FROM mailbox
@@ -12547,19 +12805,11 @@ fn pending_seq_bounds_on(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Option<(i64, i64)>, String> {
-    conn.query_row(
-        "SELECT MIN(seq), MAX(seq)
-         FROM mailbox
-         WHERE session_id = ?1
-           AND delivered_at IS NULL
-           AND (delivery_error IS NULL OR delivery_error != ?2)",
-        params![session_id, WAKE_SWEEP_ABANDONED_ERROR],
-        |row| {
-            let min_seq: Option<i64> = row.get(0)?;
-            let max_seq: Option<i64> = row.get(1)?;
-            Ok(min_seq.zip(max_seq))
-        },
-    )
+    conn.query_row(&pending_seq_bounds_query(), params![session_id], |row| {
+        let min_seq: Option<i64> = row.get(0)?;
+        let max_seq: Option<i64> = row.get(1)?;
+        Ok(min_seq.zip(max_seq))
+    })
     .map_err(|err| format!("Failed to read pending mailbox seq bounds: {err}"))
 }
 
@@ -12724,9 +12974,46 @@ mod tests {
     use super::*;
     use crate::StateDb;
     use crate::diagnostic_recorder::{
-        DiagnosticPhase, FlightRecorder, FlightRecorderReader, RecorderConfig,
+        DiagnosticPhase, FlightRecorder, FlightRecorderReader, RecorderConfig, SqliteAccessClass,
         SqliteTransactionPhase, with_test_process_recorder,
     };
+
+    #[test]
+    fn live_history_barrier_rejects_before_sqlite_and_records_typed_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let recorder_root = directory.path().join("recorder");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+
+        let error = with_test_process_recorder(recorder.clone(), || {
+            db.terminal_history_retention_stats().unwrap_err()
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        assert!(error.contains("live_history_barrier"), "{error}");
+
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let blocked = report
+            .events
+            .iter()
+            .find(|record| {
+                record.event.operation == "live_history_barrier"
+                    && record.event.phase == DiagnosticPhase::Failed
+            })
+            .expect("blocked historical access retained outside the live database");
+        let evidence = blocked
+            .event
+            .observation
+            .live_history_barrier
+            .as_ref()
+            .unwrap();
+        assert_eq!(evidence.live_trace, "pid_mailbox.live");
+        assert_eq!(
+            evidence.attempted_access,
+            SqliteAccessClass::HistoricalDiagnostic
+        );
+        assert_eq!(evidence.query_family, "terminal_history.retention_stats");
+        assert_eq!(evidence.decision, "blocked");
+    }
 
     #[test]
     fn nested_connection_open_observation_never_waits_for_blocked_recorder() {
@@ -13723,12 +14010,12 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            // Schema 21 includes the root-supervisor tables, unresolved-work
-            // indexes, and authority-fence triggers in the fingerprint
-            // (measured 2703 VM steps). Keep a tight fixed ceiling,
+            // Schema 22 includes the terminal-excluding live indexes in
+            // addition to the root-supervisor fingerprint (measured 2878 VM
+            // steps). Keep a tight fixed ceiling,
             // the no-backfill assertion, and the separate retained-history
             // growth test; this does not grant a data-size-dependent budget.
-            current_open_steps < 2750,
+            current_open_steps < 3000,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
         );
     }
@@ -15485,7 +15772,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err, "forced rollback before commit");
-        assert!(db.list_mailbox("session-a", true).unwrap().is_empty());
+        assert!(db.list_mailbox_all("session-a").unwrap().is_empty());
         assert!(payload.file_path.exists());
         db.payloads().verify_published_payload(&payload).unwrap();
     }
@@ -15669,7 +15956,7 @@ mod tests {
             db.completion_event(event_id).unwrap().unwrap().state,
             "pending"
         );
-        assert!(db.list_mailbox("session-a", true).unwrap().is_empty());
+        assert!(db.list_mailbox_all("session-a").unwrap().is_empty());
     }
 
     #[test]
@@ -16164,10 +16451,10 @@ mod tests {
 
         db.mark_delivered("session-a", None, &[row.seq], "resume-1")
             .unwrap();
-        let first = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let first = db.list_mailbox_all("session-a").unwrap().remove(0);
         db.mark_delivered("session-a", None, &[row.seq], "resume-2")
             .unwrap();
-        let second = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let second = db.list_mailbox_all("session-a").unwrap().remove(0);
 
         assert_eq!(second.delivered_at, first.delivered_at);
         assert_eq!(
@@ -16190,7 +16477,7 @@ mod tests {
 
         assert!(error.contains("missing or foreign-session row"));
         for session_id in ["session-a", "session-b"] {
-            let unchanged = db.list_mailbox(session_id, true).unwrap().remove(0);
+            let unchanged = db.list_mailbox_all(session_id).unwrap().remove(0);
             assert!(unchanged.delivered_at.is_none());
             assert!(unchanged.delivered_by_invocation_uuid.is_none());
             assert_eq!(unchanged.delivery_attempts, 0);
@@ -16242,14 +16529,14 @@ mod tests {
         assert!(db.confirm_delivery_attempt("attempt-1").unwrap());
         assert_eq!(db.list_pending("session-a").unwrap().len(), 3);
         assert!(
-            db.list_mailbox("session-a", true)
+            db.list_mailbox_all("session-a")
                 .unwrap()
                 .iter()
                 .take(3)
                 .all(|row| row.delivery_attempts == 1)
         );
         assert!(
-            db.list_mailbox("session-a", true)
+            db.list_mailbox_all("session-a")
                 .unwrap()
                 .iter()
                 .take(3)
@@ -16363,7 +16650,7 @@ mod tests {
             acknowledged
         );
         assert_eq!(
-            db.list_mailbox("session-a", true).unwrap()[0].delivery_attempts,
+            db.list_mailbox_all("session-a").unwrap()[0].delivery_attempts,
             1
         );
     }
@@ -16598,7 +16885,7 @@ mod tests {
             !db.record_delivery_attempt_transport_ack("attempt-2")
                 .unwrap()
         );
-        let delivered = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let delivered = db.list_mailbox_all("session-a").unwrap().remove(0);
         assert_eq!(delivered.delivery_attempts, 1);
         assert_eq!(
             delivered.delivered_by_invocation_uuid.as_deref(),
@@ -16631,7 +16918,7 @@ mod tests {
         let window = db.delivery_attempt_window("attempt-1").unwrap().unwrap();
         assert_eq!(window.acknowledged_at, first_ack);
         assert_eq!(window.rows, vec![row.clone()]);
-        let persisted = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let persisted = db.list_mailbox_all("session-a").unwrap().remove(0);
         assert!(persisted.delivered_at.is_none());
         assert!(persisted.delivered_by_invocation_uuid.is_none());
         assert_eq!(persisted.delivery_attempts, 0);
@@ -16942,7 +17229,7 @@ mod tests {
 
         assert!(db.confirm_delivery_attempt("attempt-1").unwrap());
         assert!(db.confirm_delivery_attempt("attempt-1").unwrap());
-        let delivered = db.list_mailbox("session-a", true).unwrap();
+        let delivered = db.list_mailbox_all("session-a").unwrap();
         assert_eq!(delivered[0].delivery_attempts, 1);
         assert_eq!(
             delivered[0].delivered_by_invocation_uuid.as_deref(),
@@ -17027,7 +17314,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("dedicated authority-bearing disposition"));
-        let unchanged = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let unchanged = db.list_mailbox_all("session-a").unwrap().remove(0);
         assert_eq!(unchanged.delivery_attempts, 0);
         assert!(unchanged.delivery_error.is_none());
         let resolved_at: Option<String> = db
@@ -17150,7 +17437,7 @@ mod tests {
         assert_eq!(owners[0].rows, vec![unconfirmed]);
         assert_eq!(owners[0].remaining_count, 1);
         let abandoned = db
-            .list_pending("session-a")
+            .list_mailbox_all("session-a")
             .unwrap()
             .into_iter()
             .find(|row| row.seq == abandoned.seq)
@@ -17170,13 +17457,13 @@ mod tests {
         db.record_delivery_attempt_transport_ack("attempt-2")
             .unwrap();
         db.confirm_delivery_attempt("attempt-2").unwrap();
-        let before = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let before = db.list_mailbox_all("session-a").unwrap().remove(0);
 
         assert!(
             !db.record_delivery_attempt_transport_ack("attempt-1")
                 .unwrap()
         );
-        let after = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let after = db.list_mailbox_all("session-a").unwrap().remove(0);
         assert_eq!(after, before);
         let late = db.delivery_attempt_window("attempt-1").unwrap().unwrap();
         assert!(late.acknowledged_at.is_none());
@@ -17194,7 +17481,7 @@ mod tests {
         db.record_delivery_attempt_transport_ack("old-attempt")
             .unwrap();
         db.confirm_delivery_attempt("old-attempt").unwrap();
-        let old_mailbox = db.list_mailbox("session-a", true).unwrap();
+        let old_mailbox = db.list_mailbox_all("session-a").unwrap();
         let old_attempt: (Option<String>, Option<String>, Option<String>) = db
             .connection()
             .query_row(
@@ -17227,7 +17514,7 @@ mod tests {
         assert!(reopened.list_pending("session-a").unwrap().contains(&new));
         assert_eq!(
             reopened
-                .list_mailbox("session-a", true)
+                .list_mailbox_all("session-a")
                 .unwrap()
                 .into_iter()
                 .filter(|row| row.handle == "old-handle")
@@ -17309,6 +17596,7 @@ mod tests {
             .unwrap();
         db.mark_delivered("session-a", None, &[delivered.seq], "resume-1")
             .unwrap();
+        db.allow_historical_access_for_test();
 
         let before = db.payloads().delivered_payload_compaction_stats().unwrap();
         assert_eq!(before.eligible_rows, 1);
@@ -17323,7 +17611,7 @@ mod tests {
         );
         assert!(report.inline_bytes_reclaimed > 0);
 
-        let rows = db.list_mailbox("session-a", true).unwrap();
+        let rows = db.list_mailbox_all("session-a").unwrap();
         let compacted = rows.iter().find(|row| row.seq == delivered.seq).unwrap();
         assert_ne!(compacted.payload_json, delivered_payload);
         assert!(compacted.payload_compacted_at.is_some());
@@ -17387,10 +17675,11 @@ mod tests {
             .unwrap();
         db.mark_delivered("session-a", None, &[row.seq], "resume-1")
             .unwrap();
+        db.allow_historical_access_for_test();
 
         let report = db.payloads().compact_delivered_payloads(1).unwrap();
         assert_eq!(report.compacted_rows, 1);
-        let compacted = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let compacted = db.list_mailbox_all("session-a").unwrap().remove(0);
         assert_eq!(
             fs::read_to_string(compacted.payload_file_path.as_deref().unwrap()).unwrap(),
             payload
@@ -17465,6 +17754,7 @@ mod tests {
         assert_eq!(before.prunable_mailbox_rows, 2);
         assert_eq!(before.prunable_delivery_attempts, 2);
 
+        db.allow_historical_access_for_test();
         let report = db.prune_terminal_history_with_keep(10, 1).unwrap();
 
         assert_eq!(report.mailbox_rows_deleted, 2);
@@ -17476,7 +17766,7 @@ mod tests {
                 .is_some()
         );
         assert!(!event_payload_path.exists());
-        let remaining = db.list_mailbox("session-a", true).unwrap();
+        let remaining = db.list_mailbox_all("session-a").unwrap();
         assert_eq!(
             remaining.iter().map(|row| row.seq).collect::<Vec<_>>(),
             vec![protected.seq, newest.seq, pending.seq]
@@ -17512,7 +17802,14 @@ mod tests {
             ))
             .unwrap();
         assert!(!replay.triggered);
-        assert!(!event_payload_path.exists());
+        assert!(event_payload_path.exists());
+        assert!(
+            db.completion_event("terminal-event")
+                .unwrap()
+                .unwrap()
+                .payload_reclaimed_at
+                .is_none()
+        );
 
         db.vacuum_terminal_history().unwrap();
         let after = inserted_row(db.enqueue_agent_bash_complete(&input("after", "session-a")));
@@ -17528,6 +17825,7 @@ mod tests {
         maintenance
             .mark_delivered("session-a", None, &[old.seq], "delivery")
             .unwrap();
+        maintenance.allow_historical_access_for_test();
 
         let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handler_paused = std::sync::Arc::clone(&paused);
@@ -17713,6 +18011,7 @@ mod tests {
             .unwrap();
 
         begin_completion_finalization_vm_count();
+        db.allow_historical_access_for_test();
         let report = db
             .prune_terminal_history_with_keep(MAILBOX_HISTORY, 0)
             .unwrap();
@@ -17766,6 +18065,7 @@ mod tests {
         db.connection()
             .busy_timeout(StdDuration::from_millis(10))
             .unwrap();
+        db.allow_historical_access_for_test();
 
         let error = db.vacuum_terminal_history().unwrap_err();
 
@@ -17795,6 +18095,7 @@ mod tests {
         };
         db.mark_delivered("session-a", None, &[row.seq], "delivery")
             .unwrap();
+        db.allow_historical_access_for_test();
 
         let report = db.prune_terminal_history_with_keep(10, 0).unwrap();
 
@@ -17807,7 +18108,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_delivery_runs_bounded_terminal_history_maintenance() {
+    fn ordinary_delivery_does_not_enter_terminal_history_maintenance() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let mut seqs = Vec::new();
@@ -17821,14 +18122,15 @@ mod tests {
         db.mark_delivered("session-a", None, &seqs, "delivery")
             .unwrap();
 
-        let rows = db.list_mailbox("session-a", true).unwrap();
-        assert_eq!(rows.len(), TERMINAL_HISTORY_KEEP_ROWS);
-        assert_eq!(rows[0].seq, seqs[2]);
+        let rows = db.list_mailbox_all("session-a").unwrap();
+        assert_eq!(rows.len(), TERMINAL_HISTORY_KEEP_ROWS + 2);
+        assert_eq!(rows[0].seq, seqs[0]);
+        db.allow_historical_access_for_test();
         assert_eq!(
             db.terminal_history_retention_stats()
                 .unwrap()
                 .prunable_mailbox_rows,
-            0
+            2
         );
     }
 
@@ -17852,7 +18154,7 @@ mod tests {
             .unwrap();
         fs::remove_file(row.payload_file_path.as_deref().unwrap()).unwrap();
 
-        let legacy = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let legacy = db.list_mailbox_all("session-a").unwrap().remove(0);
         assert_eq!(legacy.payload_compacted_at, None);
         assert_eq!(
             db.payloads()
@@ -17917,8 +18219,9 @@ mod tests {
             db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
                 .unwrap()
         );
-        assert_eq!(db.list_mailbox("session-a", true).unwrap().len(), 1);
+        assert_eq!(db.list_mailbox_all("session-a").unwrap().len(), 1);
         // Both mailbox and attempt pruning (including keep=0) preserve exact authority.
+        db.allow_historical_access_for_test();
         db.prune_terminal_history_with_keep(2048, 0).unwrap();
         assert!(
             db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
@@ -17939,7 +18242,7 @@ mod tests {
         );
         drop(retained);
         db.prune_terminal_history_with_keep(2048, 0).unwrap();
-        assert!(db.list_mailbox("session-a", true).unwrap().is_empty());
+        assert!(db.list_mailbox_all("session-a").unwrap().is_empty());
         assert!(
             db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
                 .is_err()
@@ -18051,6 +18354,7 @@ mod tests {
                 1,
                 "{fault}"
             );
+            db.allow_historical_access_for_test();
             db.prune_terminal_history_with_keep(2048, 0).unwrap();
             assert!(
                 db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
@@ -18058,7 +18362,7 @@ mod tests {
                 "{fault}"
             );
             assert_eq!(
-                db.list_mailbox("session-a", true).unwrap().len(),
+                db.list_mailbox_all("session-a").unwrap().len(),
                 1,
                 "{fault}"
             );
@@ -18116,8 +18420,9 @@ mod tests {
             .unwrap(),
             0
         );
+        db.allow_historical_access_for_test();
         db.prune_terminal_history_with_keep(2048, 0).unwrap();
-        assert!(db.list_mailbox("session-a", true).unwrap().is_empty());
+        assert!(db.list_mailbox_all("session-a").unwrap().is_empty());
         assert!(
             db.delivery_attempt_fully_settled("exact", "session-a", None, &[old.seq])
                 .is_err()
@@ -18259,7 +18564,7 @@ mod tests {
             !db.mark_delivery_attempt_failed("exact", "session-a", None, &seqs, "unconfirmed")
                 .unwrap()
         );
-        let rows = db.list_mailbox("session-a", true).unwrap();
+        let rows = db.list_mailbox_all("session-a").unwrap();
         assert_eq!(
             rows[0].delivered_by_invocation_uuid.as_deref(),
             Some("consumer")
@@ -18277,7 +18582,7 @@ mod tests {
         );
         db.acknowledge_range("session-a", b.seq, b.seq, "consumer")
             .unwrap();
-        let before = db.list_mailbox("session-a", true).unwrap();
+        let before = db.list_mailbox_all("session-a").unwrap();
         assert!(
             db.delivery_attempt_fully_settled("exact", "session-a", None, &seqs)
                 .unwrap()
@@ -18286,7 +18591,7 @@ mod tests {
             db.mark_delivery_attempt_failed("exact", "session-a", None, &seqs, "late-error")
                 .unwrap()
         );
-        assert_eq!(db.list_mailbox("session-a", true).unwrap(), before);
+        assert_eq!(db.list_mailbox_all("session-a").unwrap(), before);
         assert!(
             db.delivery_attempt_window("exact")
                 .unwrap()
@@ -18320,7 +18625,7 @@ mod tests {
                     .is_err()
             );
         }
-        assert_eq!(db.list_mailbox("session-a", true).unwrap(), before);
+        assert_eq!(db.list_mailbox_all("session-a").unwrap(), before);
         // Generic pending-only API still rejects settled batches.
         assert!(
             db.mark_delivery_failed("session-a", None, &seqs, "error")
@@ -18367,7 +18672,7 @@ mod tests {
             "mailbox_delivery_unconfirmed",
         )
         .unwrap();
-        let failed = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let failed = db.list_mailbox_all("session-a").unwrap().remove(0);
 
         assert!(failed.delivered_at.is_none());
         assert_eq!(failed.delivery_attempts, 1);
@@ -18395,7 +18700,7 @@ mod tests {
 
         assert!(error.contains("missing, settled, or foreign-target row"));
         for session_id in ["session-a", "session-b"] {
-            let unchanged = db.list_mailbox(session_id, true).unwrap().remove(0);
+            let unchanged = db.list_mailbox_all(session_id).unwrap().remove(0);
             assert_eq!(unchanged.delivery_attempts, 0);
             assert!(unchanged.delivery_error.is_none());
         }
@@ -18425,7 +18730,7 @@ mod tests {
         )
         .unwrap();
 
-        let failed = db.list_mailbox("chain-a", true).unwrap().remove(0);
+        let failed = db.list_mailbox_all("chain-a").unwrap().remove(0);
         assert_eq!(failed.delivery_attempts, 1);
         assert_eq!(
             failed.delivery_error.as_deref(),
@@ -18444,9 +18749,48 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("dedicated authority-bearing disposition"));
-        let unchanged = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let unchanged = db.list_mailbox_all("session-a").unwrap().remove(0);
         assert_eq!(unchanged.delivery_attempts, 0);
         assert!(unchanged.delivery_error.is_none());
+    }
+
+    #[test]
+    fn terminal_delivery_error_atomically_retires_linked_completion_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let event_id = "terminal-delivery-error";
+        db.register_completion_event(completion_registration(
+            event_id,
+            "async",
+            "session-a",
+            "11111111-1111-4111-8111-111111111111",
+        ))
+        .unwrap();
+        let row = db
+            .trigger_completion_event(completion_trigger(event_id, "{}"))
+            .unwrap()
+            .mailbox_rows
+            .remove(0);
+
+        db.mark_delivery_failed(
+            "session-a",
+            None,
+            &[row.seq],
+            MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
+        )
+        .unwrap();
+
+        let listener: (bool, bool) = db
+            .connection()
+            .query_row(
+                "SELECT active,retirement_pending FROM completion_event_listener
+                 WHERE event_id=?1",
+                [event_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(listener, (false, false));
+        assert!(db.list_pending("session-a").unwrap().is_empty());
     }
 
     #[test]
@@ -18475,18 +18819,9 @@ mod tests {
             let query = format!("EXPLAIN QUERY PLAN {}", bounded_pending_mailbox_query());
             let mut statement = db.connection().prepare(&query).unwrap();
             let details = statement
-                .query_map(
-                    params![
-                        "session-a",
-                        chain_id,
-                        0,
-                        1,
-                        WAKE_SWEEP_ABANDONED_ERROR,
-                        MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
-                        MAILBOX_INGRESS_EXPIRED_ERROR,
-                    ],
-                    |row| row.get::<_, String>(3),
-                )
+                .query_map(params!["session-a", chain_id, 0, 1], |row| {
+                    row.get::<_, String>(3)
+                })
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
@@ -18494,16 +18829,226 @@ mod tests {
             assert!(
                 details
                     .iter()
-                    .any(|detail| detail.contains("idx_mailbox_pending (")),
+                    .any(|detail| detail.contains("idx_mailbox_deliverable_session_live")),
                 "bounded pending plan did not use the session index: {details:?}"
             );
             assert!(
                 details
                     .iter()
-                    .any(|detail| detail.contains("idx_mailbox_pending_target")),
+                    .any(|detail| detail.contains("idx_mailbox_deliverable_target_live")),
                 "bounded pending plan did not use the target index: {details:?}"
             );
         }
+
+        for direction in ["ASC", "DESC"] {
+            let query = format!(
+                "EXPLAIN QUERY PLAN {}",
+                pending_wake_session_ids_by_oldest_seq_query(direction)
+            );
+            let details = db
+                .connection()
+                .prepare(&query)
+                .unwrap()
+                .query_map(params![2_i64], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("idx_mailbox_deliverable_global")),
+                "pending-session {direction} plan entered terminal history: {details:?}"
+            );
+        }
+
+        let query = format!("EXPLAIN QUERY PLAN {}", pending_seq_bounds_query());
+        let details = db
+            .connection()
+            .prepare(&query)
+            .unwrap()
+            .query_map(["session-a"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for index in [
+            "idx_mailbox_deliverable_session_live",
+            "idx_mailbox_deliverable_target_live",
+        ] {
+            assert!(
+                details.iter().any(|detail| detail.contains(index)),
+                "wake bound plan escaped {index}: {details:?}"
+            );
+        }
+
+        let query = format!("EXPLAIN QUERY PLAN {RESOLVE_COMPLETED_DELIVERY_ATTEMPTS_SQL}");
+        let details = db
+            .connection()
+            .prepare(&query)
+            .unwrap()
+            .query_map(params!["session-a", "now", Option::<&str>::None], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| { detail.contains("idx_mailbox_delivery_attempt_unresolved") }),
+            "delivery-attempt settlement entered resolved history: {details:?}"
+        );
+
+        let query = format!(
+            "EXPLAIN QUERY PLAN {}",
+            format_runtime_generations_for_session_sql(true)
+        );
+        let details = db
+            .connection()
+            .prepare(&query)
+            .unwrap()
+            .query_map(["session-a"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_runtime_generation_live_session")),
+            "runtime session projection entered exited history: {details:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_history_does_not_enter_zero_or_small_pending_delivery_work() {
+        const TERMINAL_ROWS: usize = 512;
+        let directory = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        db.connection()
+            .execute_batch(&format!(
+                "WITH RECURSIVE history(value) AS (
+                     VALUES(1) UNION ALL SELECT value+1 FROM history WHERE value<{TERMINAL_ROWS}
+                 )
+                 INSERT INTO mailbox (
+                     session_id,kind,handle,payload_json,enqueued_at,delivered_at,
+                     state_dir,meta_path,log_path,rc_path,rc
+                 )
+                 SELECT 'terminal-session','agent_bash_complete',
+                        printf('terminal-%d',value),'{{}}','2026-09-01T00:00:00Z',
+                        '2026-09-01T00:00:01Z','/state','/meta','/log','/rc',0
+                 FROM history;"
+            ))
+            .unwrap();
+        db.connection()
+            .execute_batch(&format!(
+                "WITH RECURSIVE retired(value) AS (
+                     VALUES(1) UNION ALL SELECT value+1 FROM retired WHERE value<{TERMINAL_ROWS}
+                 )
+                 INSERT INTO mailbox (
+                     session_id,kind,handle,payload_json,enqueued_at,delivery_error,
+                     state_dir,meta_path,log_path,rc_path,rc
+                 )
+                 SELECT 'session-a','agent_bash_complete',
+                        printf('retired-%d',value),'{{}}','2026-09-01T00:00:00Z',
+                        'mailbox_ingress_expired','/state','/meta','/log','/rc',0
+                 FROM retired;"
+            ))
+            .unwrap();
+
+        begin_completion_finalization_vm_count();
+        assert!(
+            db.list_pending_for_delivery_after("session-a", Some("chain-a"), 0, 2)
+                .unwrap()
+                .is_empty()
+        );
+        let zero_steps = end_completion_finalization_vm_count();
+        begin_completion_finalization_vm_count();
+        assert!(
+            db.wake_sessions()
+                .pending_delivery_session_ids(2)
+                .unwrap()
+                .is_empty()
+        );
+        let zero_session_steps = end_completion_finalization_vm_count();
+        begin_completion_finalization_vm_count();
+        assert_eq!(
+            db.pending_delivery_count("session-a", Some("chain-a"))
+                .unwrap(),
+            0
+        );
+        let zero_count_steps = end_completion_finalization_vm_count();
+        begin_completion_finalization_vm_count();
+        assert!(
+            db.wake_sessions()
+                .wake_sweep_candidates(600, 2)
+                .unwrap()
+                .is_empty()
+        );
+        let zero_candidate_steps = end_completion_finalization_vm_count();
+
+        db.enqueue_agent_bash_complete(&input("live-one", "session-a"))
+            .unwrap();
+        begin_completion_finalization_vm_count();
+        assert_eq!(
+            db.list_pending_for_delivery_after("session-a", Some("chain-a"), 0, 2)
+                .unwrap()
+                .len(),
+            1
+        );
+        let one_steps = end_completion_finalization_vm_count();
+        begin_completion_finalization_vm_count();
+        assert_eq!(
+            db.wake_sessions().pending_delivery_session_ids(2).unwrap(),
+            vec!["session-a"]
+        );
+        let one_session_steps = end_completion_finalization_vm_count();
+        begin_completion_finalization_vm_count();
+        assert_eq!(
+            db.pending_delivery_count("session-a", Some("chain-a"))
+                .unwrap(),
+            1
+        );
+        let one_count_steps = end_completion_finalization_vm_count();
+        begin_completion_finalization_vm_count();
+        assert_eq!(
+            db.wake_sessions()
+                .wake_sweep_candidates(600, 2)
+                .unwrap()
+                .len(),
+            1
+        );
+        let one_candidate_steps = end_completion_finalization_vm_count();
+        assert!(
+            zero_steps < 1_000,
+            "zero-work path used {zero_steps} VM steps"
+        );
+        assert!(
+            one_steps < 1_000,
+            "small-work path used {one_steps} VM steps"
+        );
+        assert!(
+            zero_session_steps < 1_000,
+            "zero-work session discovery used {zero_session_steps} VM steps"
+        );
+        assert!(
+            one_session_steps < 1_000,
+            "small-work session discovery used {one_session_steps} VM steps"
+        );
+        assert!(
+            zero_count_steps < 1_000,
+            "zero-work pending count used {zero_count_steps} VM steps"
+        );
+        assert!(
+            one_count_steps < 1_000,
+            "small-work pending count used {one_count_steps} VM steps"
+        );
+        assert!(
+            zero_candidate_steps < 1_000,
+            "zero-work wake candidate expansion used {zero_candidate_steps} VM steps"
+        );
+        assert!(
+            one_candidate_steps < 2_000,
+            "small-work wake candidate expansion used {one_candidate_steps} VM steps"
+        );
     }
 
     #[test]
@@ -20314,7 +20859,7 @@ mod tests {
             GenerationMutation::Applied(_)
         ));
 
-        let failed = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let failed = db.list_mailbox_all("session-a").unwrap().remove(0);
         assert_eq!(failed.delivery_attempts, 1);
         assert_eq!(
             failed.delivery_error.as_deref(),
@@ -20367,7 +20912,7 @@ mod tests {
                 .to_string()
                 .contains("dedicated authority-bearing disposition")
         );
-        let unchanged = db.list_mailbox("session-a", true).unwrap().remove(0);
+        let unchanged = db.list_mailbox_all("session-a").unwrap().remove(0);
         assert_eq!(unchanged.delivery_attempts, 0);
         assert!(unchanged.delivery_error.is_none());
         let generation = db
@@ -20452,7 +20997,7 @@ mod tests {
             assert!(failure_error.to_string().contains("not owned and pending"));
         }
 
-        let unchanged = db.list_mailbox("session-b", true).unwrap().remove(0);
+        let unchanged = db.list_mailbox_all("session-b").unwrap().remove(0);
         assert!(unchanged.delivered_at.is_none());
         assert_eq!(unchanged.delivery_attempts, 0);
         assert!(unchanged.delivery_error.is_none());

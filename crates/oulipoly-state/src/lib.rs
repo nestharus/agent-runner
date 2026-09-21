@@ -40,6 +40,7 @@ pub mod diagnostic_recorder;
 mod filesystem_identity;
 pub mod invocation_marker;
 mod lifecycle_log;
+pub mod live_history;
 pub mod mailbox;
 pub mod migrations;
 pub mod paths;

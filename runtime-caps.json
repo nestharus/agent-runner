@@ -4969,7 +4969,7 @@
       "observability": "The schema compatibility error names the observed and supported versions before open fails.",
       "configurability": "Fixed by the ordered mailbox migration set and changed only with a new migration.",
       "rationale": "CURRENT_VERSION is the migration target consumed by ensure_with_deadline; it is distinct from protocol version identifiers.",
-      "default_value": "21",
+      "default_value": "22",
       "source": "crates/oulipoly-state/src/mailbox/schema.rs",
       "declaration_scope": "module",
       "symbol": "CURRENT_VERSION",
@@ -5033,82 +5033,6 @@
       "controlling_use": {
         "source": "crates/oulipoly-state/src/mailbox.rs",
         "scope": "module::impl:MailboxDb::fn:prune_terminal_history",
-        "kind": "direct_control"
-      }
-    },
-    {
-      "id": "state.mailbox.terminal-history-maintenance-batch",
-      "owner": "state/mailbox",
-      "class": "resource_guard",
-      "protected_resource": "terminal-history rows considered in one maintenance transaction",
-      "exhaustion_behavior": "maintain_terminal_history processes one bounded batch and leaves further eligible rows for a later maintenance pass.",
-      "observability": "The maintenance result/warning exposes the bounded pass without changing terminal payload custody.",
-      "configurability": "Fixed source declaration TERMINAL_HISTORY_MAINTENANCE_BATCH; no runtime override exists at the bound maintain terminal history use.",
-      "rationale": "TERMINAL_HISTORY_MAINTENANCE_BATCH limits best-effort cleanup work held under one SQLite transaction.",
-      "default_value": "256",
-      "source": "crates/oulipoly-state/src/mailbox.rs",
-      "symbol": "TERMINAL_HISTORY_MAINTENANCE_BATCH",
-      "declaration_scope": "module",
-      "controlling_use": {
-        "source": "crates/oulipoly-state/src/mailbox.rs",
-        "scope": "module::impl:MailboxDb::fn:maintain_terminal_history",
-        "kind": "direct_control"
-      }
-    },
-    {
-      "id": "state.mailbox.terminal-history-maintenance-busy-timeout",
-      "owner": "state/mailbox",
-      "class": "resource_guard",
-      "protected_resource": "best-effort retention maintenance writer occupancy",
-      "exhaustion_behavior": "skip/degrade maintenance without affecting terminal payload custody",
-      "observability": "maintenance outcome and SQLite contention diagnostic",
-      "configurability": "fixed best-effort maintenance policy",
-      "rationale": "Maintenance must yield quickly to foreground durable work.",
-      "default_value": "StdDuration :: from_millis (50)",
-      "source": "crates/oulipoly-state/src/mailbox.rs",
-      "symbol": "TERMINAL_HISTORY_MAINTENANCE_BUSY_TIMEOUT",
-      "declaration_scope": "module",
-      "controlling_use": {
-        "source": "crates/oulipoly-state/src/mailbox.rs",
-        "scope": "module::impl:MailboxDb::fn:maintain_terminal_history",
-        "kind": "direct_control"
-      }
-    },
-    {
-      "id": "state.mailbox.terminal-history-maintenance-progress-ops",
-      "owner": "state/mailbox",
-      "class": "polling_cadence",
-      "protected_resource": "terminal-history maintenance deadline observation latency during SQLite VM execution",
-      "exhaustion_behavior": "No terminal exhaustion action; the progress handler rechecks the separately owned maintenance deadline at this operation cadence.",
-      "observability": "Deadline interruption emits the existing bounded maintenance warning outside the contended database.",
-      "configurability": "Fixed SQLite progress-handler cadence; no runtime override exists.",
-      "rationale": "TERMINAL_HISTORY_MAINTENANCE_PROGRESS_OPS separates deadline observation frequency from terminal policy.",
-      "default_value": "1_000",
-      "source": "crates/oulipoly-state/src/mailbox.rs",
-      "declaration_scope": "module",
-      "symbol": "TERMINAL_HISTORY_MAINTENANCE_PROGRESS_OPS",
-      "controlling_use": {
-        "source": "crates/oulipoly-state/src/mailbox.rs",
-        "scope": "module::impl:MailboxDb::fn:maintain_terminal_history",
-        "kind": "direct_control"
-      }
-    },
-    {
-      "id": "state.mailbox.terminal-history-maintenance-timeout",
-      "owner": "state/mailbox",
-      "class": "resource_guard",
-      "protected_resource": "foreground latency consumed by best-effort terminal-history maintenance",
-      "exhaustion_behavior": "interrupt and defer maintenance while preserving retained rows",
-      "observability": "maintenance result identifies interruption/degradation",
-      "configurability": "fixed best-effort maintenance policy",
-      "rationale": "Maintenance is optional and must not monopolize the State connection.",
-      "default_value": "StdDuration :: from_millis (100)",
-      "source": "crates/oulipoly-state/src/mailbox.rs",
-      "symbol": "TERMINAL_HISTORY_MAINTENANCE_TIMEOUT",
-      "declaration_scope": "module",
-      "controlling_use": {
-        "source": "crates/oulipoly-state/src/mailbox.rs",
-        "scope": "module::impl:MailboxDb::fn:maintain_terminal_history",
         "kind": "direct_control"
       }
     },
@@ -5330,7 +5254,7 @@
       "observability": "SchemaCompatibility reports current, migratable, or future status with the stored version.",
       "configurability": "Fixed by the ordered State database migrations; changes require a new migration and registry update.",
       "rationale": "CURRENT_SCHEMA_VERSION is the migration target used with the minimum supported boundary.",
-      "default_value": "25",
+      "default_value": "26",
       "source": "crates/oulipoly-state/src/schema.rs",
       "declaration_scope": "module",
       "symbol": "CURRENT_SCHEMA_VERSION",

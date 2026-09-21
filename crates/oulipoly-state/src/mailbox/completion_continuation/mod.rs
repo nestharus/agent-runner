@@ -223,16 +223,15 @@ impl MailboxDb {
         {
             return Ok(false);
         }
-        let pending:bool=tx.query_row("WITH RECURSIVE supervisor_scope(authority_id) AS (
+        let pending_sql = format!("WITH RECURSIVE supervisor_scope(authority_id) AS (
 SELECT ?1 UNION SELECT inheritance.predecessor_authority_id
 FROM completion_supervisor_inheritance inheritance JOIN supervisor_scope scope
 ON inheritance.authority_id=scope.authority_id)
-SELECT EXISTS(SELECT 1 FROM completion_continuation_source
-WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND phase='registered') OR EXISTS(SELECT 1 FROM completion_event_listener l WHERE l.acknowledged_at IS NULL AND NOT EXISTS (
-SELECT 1 FROM completion_continuation_notification n JOIN completion_event e ON e.event_id=n.event_id
-WHERE n.event_id=l.event_id AND n.listener_id=l.listener_id AND n.policy='response_only'
-AND n.requested_at IS NULL AND l.active=0 AND l.mailbox_seq IS NULL AND e.state='triggered'
-AND EXISTS(SELECT 1 FROM completion_continuation_source s WHERE s.event_id=l.event_id AND s.phase='accepted'))) OR EXISTS(SELECT 1 FROM mailbox WHERE delivered_at IS NULL) OR EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND phase NOT IN ('drained','never_started'))",[&owner.supervisor_authority_id],|r|r.get(0)).map_err(|e|e.to_string())?;
+SELECT EXISTS(SELECT 1 FROM completion_continuation_source INDEXED BY completion_continuation_source_unaccepted
+WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND phase='registered') OR EXISTS(SELECT 1 FROM completion_event_listener INDEXED BY idx_completion_event_listener_retirement_pending WHERE retirement_pending=1) OR EXISTS(SELECT 1 FROM mailbox INDEXED BY idx_mailbox_deliverable_global WHERE delivered_at IS NULL AND {}) OR EXISTS(SELECT 1 FROM completion_continuation_attempt INDEXED BY completion_continuation_attempt_unresolved WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND phase NOT IN ('drained','never_started'))", super::DELIVERABLE_MAILBOX_ERROR_PREDICATE);
+        let pending: bool = tx
+            .query_row(&pending_sql, [&owner.supervisor_authority_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
         if pending {
             return Ok(false);
         }
@@ -495,6 +494,11 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                     "../migrations/0021_completion_recovery_working_set.sql"
                 ))
                 .map_err(|e| e.to_string())?;
+            expected
+                .execute_batch(include_str!(
+                    "../migrations/0022_completion_native_runtime.sql"
+                ))
+                .map_err(|e| e.to_string())?;
             definitions(&expected)
         })
         .as_ref()
@@ -664,6 +668,31 @@ mod tests {
                 .iter()
                 .any(|detail| detail.contains("completion_continuation_attempt_unresolved")),
             "owner replacement must not scan settled attempts: {unspent:?}"
+        );
+
+        let native_runtime = db
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT EXISTS(
+                    SELECT 1 FROM completion_continuation_attempt
+                        INDEXED BY completion_continuation_attempt_native_runtime
+                    WHERE operation='activation' AND domain_id=?1
+                      AND runtime_generation_uuid=?2 AND spawn_invocation_uuid=?3
+                 )",
+            )
+            .unwrap()
+            .query_map(
+                params![owner.domain_id, "runtime-generation", "invocation"],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            native_runtime.iter().any(|detail| {
+                detail.contains("completion_continuation_attempt_native_runtime")
+            }),
+            "native runtime identity entered attempt history: {native_runtime:?}"
         );
     }
 
@@ -891,6 +920,63 @@ mod tests {
                 .acknowledged_at
                 .is_none()
         );
+    }
+
+    #[test]
+    fn idle_close_ignores_large_explicitly_retired_listener_history() {
+        let (_dir, mut db, owner) = fixture();
+        db.conn
+            .execute(
+                "INSERT INTO completion_event(
+                    event_id,kind,state,delivery_mode,state_dir,meta_path,log_path,rc_path,created_at)
+                 VALUES('retired-history','agent_bash_complete','pending','sync',
+                    '/fixture','/fixture/meta','/fixture/log','/fixture/rc',?1)",
+                [now_rfc3339()],
+            )
+            .unwrap();
+        let tx = db.conn.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO completion_event_listener(
+                        event_id,listener_id,session_id,owner_invocation_uuid,
+                        active,created_at,retirement_pending)
+                     VALUES('retired-history',?1,?2,?1,0,?3,0)",
+                )
+                .unwrap();
+            let created_at = now_rfc3339();
+            for ordinal in 0..5_000 {
+                insert
+                    .execute(params![
+                        format!("retired-listener-{ordinal:05}"),
+                        format!("retired-session-{ordinal:05}"),
+                        created_at
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let plan = db
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT EXISTS(
+                    SELECT 1 FROM completion_event_listener
+                         INDEXED BY idx_completion_event_listener_retirement_pending
+                    WHERE retirement_pending=1)",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("idx_completion_event_listener_retirement_pending")
+            }),
+            "idle-close listener probe escaped its live projection: {plan:?}"
+        );
+        assert!(db.close_idle_continuation_generation(&owner, None).unwrap());
     }
 
     fn reservation(db: &mut MailboxDb, owner: &CompletionDomainOwner) -> ContinuationAttempt {

@@ -1355,7 +1355,8 @@ fn classify_source_reply(attempt: &ContinuationAttempt) -> Result<serde_json::Va
     // This native custody lane already has State writer authority. Admission
     // identity must be published even though the response remains an observation,
     // not acceptance or ACK. Original admitted bindings are immutable.
-    let state = oulipoly_state::StateDb::open_default()?;
+    let state =
+        oulipoly_state::StateDb::open_historical(&oulipoly_state::StateDb::default_path()?)?;
     let binding = state
         .admitted_completion_continuations()?
         .into_iter()

@@ -215,7 +215,7 @@ fn mailbox_open_read_only_preserves_files_and_recovers_claim_and_attempt_history
     );
     let before = physical_snapshot(parent);
 
-    let mailbox = MailboxDb::open_read_only(&fixture.sidecar_path).unwrap();
+    let mailbox = MailboxDb::open_historical_read_only(&fixture.sidecar_path).unwrap();
     let rows = mailbox.list_mailbox(SESSION, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].handle, "h-read-only");
@@ -280,6 +280,43 @@ fn mailbox_open_read_only_preserves_files_and_recovers_claim_and_attempt_history
 }
 
 #[test]
+fn generic_read_only_handles_remain_live_and_historical_handles_are_explicit() {
+    let fixture = Fixture::seeded();
+    let mailbox = MailboxDb::open_read_only(&fixture.sidecar_path).unwrap();
+    assert!(
+        mailbox
+            .list_mailbox(SESSION, true)
+            .unwrap_err()
+            .contains("live_history_barrier")
+    );
+    assert_eq!(
+        MailboxDb::open_historical_read_only(&fixture.sidecar_path)
+            .unwrap()
+            .list_mailbox(SESSION, true)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let state_path = fixture.sidecar_path.with_file_name("state.db");
+    drop(StateDb::open(&state_path).unwrap());
+    assert!(
+        StateDb::open_read_only(&state_path)
+            .unwrap()
+            .admitted_completion_continuations()
+            .unwrap_err()
+            .contains("live_history_barrier")
+    );
+    assert!(
+        StateDb::open_historical_read_only(&state_path)
+            .unwrap()
+            .admitted_completion_continuations()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn mailbox_open_read_only_recovers_committed_wal_state_without_mutating_source() {
     if fixture_process::completed_in_fixture_process() {
         return;
@@ -313,7 +350,7 @@ fn mailbox_open_read_only_recovers_committed_wal_state_without_mutating_source()
     assert!(path_with_suffix(&fixture.sidecar_path, "-wal").exists());
     let before = physical_snapshot(parent);
 
-    let mailbox = MailboxDb::open_read_only(&fixture.sidecar_path).unwrap();
+    let mailbox = MailboxDb::open_historical_read_only(&fixture.sidecar_path).unwrap();
     let rows = mailbox.list_mailbox(SESSION, true).unwrap();
 
     assert_eq!(rows.len(), 2);
@@ -355,7 +392,7 @@ fn mailbox_open_read_only_through_leaf_symlink_recovers_canonical_wal_state() {
     symlink(&fixture.sidecar_path, &alias_path).unwrap();
     let before = physical_snapshot(fixture.sidecar_path.parent().unwrap());
 
-    let mailbox = MailboxDb::open_read_only(&alias_path).unwrap();
+    let mailbox = MailboxDb::open_historical_read_only(&alias_path).unwrap();
     let rows = mailbox.list_mailbox(SESSION, true).unwrap();
 
     assert_eq!(rows.len(), 2);

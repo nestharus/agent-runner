@@ -100,12 +100,213 @@ fn schema_22_migrates_provider_ownership_once_to_current() {
     let path = db.path().to_path_buf();
     drop(db);
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("PRAGMA foreign_keys=OFF; ALTER TABLE invocation_completion_obligations DROP COLUMN completion_v2_binding; DROP TABLE provider_launch_transition_replays; DROP TABLE provider_logical_launches; DROP TABLE provider_launch_attempts; PRAGMA user_version=22;").unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         DROP TRIGGER trg_invocation_completion_v2_identity_append_only_update;
+         DROP TRIGGER trg_invocation_completion_v2_identity_append_only_delete;
+         DROP TABLE invocation_completion_v2_identity;
+         DROP INDEX idx_invocation_completion_obligations_legacy;
+         DROP INDEX idx_invocation_completion_obligations_event;
+         DROP TABLE provider_launch_native_channel_duties;
+         DROP TABLE completed_turns;
+         DROP TABLE completed_turn_selections;
+         ALTER TABLE invocation_completion_obligations DROP COLUMN completion_v2_binding;
+         DROP TABLE provider_launch_transition_replays;
+         DROP TABLE provider_logical_launches;
+         DROP TABLE provider_launch_attempts;
+         PRAGMA user_version=22;",
+    )
+    .unwrap();
     drop(conn);
     let db = StateDb::open(&path).unwrap();
     assert_eq!(count(&db, "provider_logical_launches"), 0);
     drop(db);
     assert!(StateDb::open(&dir.path().join("state.db")).is_ok());
+}
+
+#[test]
+fn schema_25_backfills_all_live_history_projections_from_explicit_evidence() {
+    let (_dir, db, request) = fixture();
+    let lease = db.begin_launch(&request).unwrap();
+    let duty = ProviderLaunchChannelSettlement::ContinuingCustody {
+        domain_id: "migration-domain".into(),
+        original_owner: lease.owner.clone(),
+        disposition: "cleanup_pending".into(),
+        path: "/fixture/quarantine".into(),
+        artifacts: vec![],
+    };
+    let path = db.path().to_path_buf();
+    drop(db);
+
+    let conn = Connection::open(&path).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/age360-paired-wire.json")).unwrap();
+    let mut registration: serde_json::Value =
+        serde_json::from_str(fixture["registration_bytes_utf8"].as_str().unwrap()).unwrap();
+    let invocation_uuid = lease.owner.invocation_uuid.to_string();
+    registration["owner_invocation_uuid"] = invocation_uuid.clone().into();
+    registration["listeners"][0]["listener_id"] = invocation_uuid.clone().into();
+    registration["listeners"][0]["owner_invocation_uuid"] = invocation_uuid.clone().into();
+    let binding = completion_continuation::AdmittedSourceBinding::new(
+        "migration-admission",
+        &serde_json::to_vec(&registration).unwrap(),
+    )
+    .unwrap();
+    let binding_bytes = serde_json::to_vec(&binding).unwrap();
+    let source = binding.registration().unwrap();
+    let generation_trigger: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type='trigger' AND name='trg_invocation_completion_obligations_generation_insert'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute_batch("DROP TRIGGER trg_invocation_completion_obligations_generation_insert")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO invocation_completion_obligations(
+            admission_id,invocation_uuid,event_id,owner_invocation_uuid,
+            owner_session_id,expected_sidecar_generation,admitted_at,completion_v2_binding)
+         VALUES('migration-admission',?1,?2,?1,'fixture-session',
+                'migration-generation','2026-09-20T00:00:00Z',?3)",
+        params![invocation_uuid, source.handle, binding_bytes],
+    )
+    .unwrap();
+    conn.execute_batch(&generation_trigger).unwrap();
+    conn.execute(
+        "INSERT INTO completed_turns(
+            invocation_id,invocation_uuid,settlement_id,owner_json,effects_json,
+            context_json,content_sha256,committed_at,tails_json,recovery_pending)
+         VALUES(?1,?2,'migration-settlement',NULL,'{}','{}',?3,
+                '2026-09-20T00:00:00Z',?4,0)",
+        params![
+            lease.owner.invocation_row_id,
+            lease.owner.invocation_uuid.to_string(),
+            "c".repeat(64),
+            serde_json::json!({
+                "native": "complete_or_standalone",
+                "delivery": "complete",
+                "idle": "no_runtime",
+                "wake": "no_mailbox"
+            })
+            .to_string()
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO provider_launch_transition_replays(
+            logical_launch_id,operation_key,request_sha256,result_json)
+         VALUES(?1,?2,?3,?4)",
+        params![
+            lease.owner.logical_launch_id.to_string(),
+            format!("{}/native-channel-duty", lease.owner.attempt_id),
+            "d".repeat(64),
+            serde_json::to_string(&duty).unwrap()
+        ],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         DROP TRIGGER trg_invocation_completion_v2_identity_append_only_update;
+         DROP TRIGGER trg_invocation_completion_v2_identity_append_only_delete;
+         DROP TABLE invocation_completion_v2_identity;
+         DROP INDEX idx_invocation_completion_obligations_legacy;
+         DROP INDEX idx_invocation_completion_obligations_event;
+         DROP TABLE provider_launch_native_channel_duties;
+         DROP INDEX provider_launch_cancelling;
+         DROP INDEX completed_turns_recovery_pending;
+         ALTER TABLE completed_turns DROP COLUMN recovery_pending;
+         CREATE INDEX completed_turns_pending ON completed_turns(committed_at, invocation_id);
+         PRAGMA user_version=25;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let migrated = StateDb::open(&path).unwrap();
+    assert_eq!(
+        migrated.pending_native_channel_duties().unwrap(),
+        vec![duty]
+    );
+    let verification = Connection::open(&path).unwrap();
+    let identity: (String, String, String, String) = verification
+        .query_row(
+            "SELECT domain_id,source_id,registration_id,handle
+             FROM invocation_completion_v2_identity
+             WHERE admission_id='migration-admission'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        identity,
+        (
+            source.domain_id,
+            source.source_id,
+            source.registration_id,
+            source.handle
+        )
+    );
+    let recovery_pending: i64 = verification
+        .query_row(
+            "SELECT recovery_pending FROM completed_turns
+             WHERE settlement_id='migration-settlement'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recovery_pending, 0);
+    drop(verification);
+    drop(migrated);
+    assert!(
+        StateDb::open(&path).is_ok(),
+        "migration must remain idempotent"
+    );
+}
+
+#[test]
+fn live_provider_duty_and_cancellation_queries_use_current_projections() {
+    let (_dir, db, _) = fixture();
+    let connection = Connection::open(db.path()).unwrap();
+
+    let duty_plan = connection
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT EXISTS(
+                SELECT 1 FROM provider_launch_native_channel_duties
+                     INDEXED BY provider_launch_native_channel_duty_domain
+                WHERE domain_id=?1 LIMIT 1)",
+        )
+        .unwrap()
+        .query_map(["domain"], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        duty_plan
+            .iter()
+            .any(|detail| detail.contains("provider_launch_native_channel_duty_domain")),
+        "native duty probe escaped its live projection: {duty_plan:?}"
+    );
+
+    let cancellation_plan = connection
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT a.runtime_generation_uuid,a.invocation_uuid
+             FROM provider_logical_launches l INDEXED BY provider_launch_cancelling
+             JOIN provider_launch_attempts a ON l.current_attempt_id=a.attempt_id
+             WHERE l.status='cancelling'",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        cancellation_plan
+            .iter()
+            .any(|detail| detail.contains("provider_launch_cancelling")),
+        "cancellation recovery escaped its live projection: {cancellation_plan:?}"
+    );
 }
 #[test]
 fn retained_begin_input_replays_without_storing_secret_changed_or_lost_input_conflicts() {

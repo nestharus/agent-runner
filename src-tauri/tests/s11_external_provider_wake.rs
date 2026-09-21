@@ -236,7 +236,7 @@ turn_script = {}
     }
 
     fn mailbox(&self) -> MailboxDb {
-        MailboxDb::open(&self.sidecar_path()).unwrap()
+        MailboxDb::open_historical(&self.sidecar_path()).unwrap()
     }
 
     fn finalized_invocation_count(&self) -> i64 {

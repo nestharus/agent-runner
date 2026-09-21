@@ -25,6 +25,47 @@ const COMPLETION_OBLIGATION_COLUMNS: &str = concat!(
     "admission_id, invocation_uuid, event_id, owner_invocation_uuid, ",
     "owner_session_id, expected_sidecar_generation, admitted_at"
 );
+const COMPLETION_SOURCE_CONFLICT_SQL: &str = "SELECT EXISTS(
+    SELECT 1 FROM (
+        SELECT 1
+        FROM invocation_completion_v2_identity
+             INDEXED BY idx_invocation_completion_v2_registration
+        WHERE registration_id=?1 AND registration_digest<>?5
+        UNION ALL
+        SELECT 1
+        FROM invocation_completion_v2_identity
+             INDEXED BY idx_invocation_completion_v2_source
+        WHERE domain_id=?2 AND source_id=?3 AND registration_digest<>?5
+        UNION ALL
+        SELECT 1
+        FROM invocation_completion_v2_identity
+             INDEXED BY idx_invocation_completion_v2_handle
+        WHERE domain_id=?2 AND handle=?4 AND registration_digest<>?5
+    ) LIMIT 1
+)";
+const LEGACY_COMPLETION_ADMISSION_SQL: &str = "SELECT EXISTS(
+    SELECT 1 FROM invocation_completion_obligations
+         INDEXED BY idx_invocation_completion_obligations_legacy
+    WHERE completion_v2_binding IS NULL
+)";
+const COMPLETION_CONTINUITY_SUFFIX_SQL: &str = "SELECT
+    o.completion_v2_binding,o.admission_id,o.event_id,
+    o.owner_invocation_uuid,o.owner_session_id
+FROM invocation_completion_continuity c
+JOIN invocation_completion_obligations o ON o.admission_id=c.admission_id
+WHERE c.authority_ordinal>?1 AND o.completion_v2_binding IS NOT NULL
+ORDER BY c.authority_ordinal LIMIT ?2";
+
+fn completion_admission_sql(predicate: &str) -> String {
+    format!(
+        "SELECT o.completion_v2_binding,o.admission_id,o.event_id,
+                o.owner_invocation_uuid,o.owner_session_id
+         FROM invocation_completion_obligations o
+         JOIN invocation_completion_continuity c ON c.admission_id=o.admission_id
+         WHERE ({predicate}) AND o.completion_v2_binding IS NOT NULL
+         ORDER BY c.authority_ordinal LIMIT 1"
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct CompletionObligationAdmission<'a> {
@@ -318,6 +359,9 @@ impl StateDb {
         suffix_limit: usize,
         source_limit: usize,
     ) -> Result<Vec<AdmittedSourceBinding>, String> {
+        if suffix_limit == 0 || source_limit == 0 {
+            return Err("completion repair bounds must be positive".into());
+        }
         let path = self
             .completion_authority_state_path()
             .ok_or("completion repair requires stable State identity")?;
@@ -380,12 +424,7 @@ impl StateDb {
         repair: bool,
         binding: &AdmittedSourceBinding,
     ) -> Result<CompletionEventRegistrationResult, String> {
-        if binding.is_late_listener()
-            && !self
-                .admitted_completion_continuations()?
-                .iter()
-                .any(|existing| !existing.is_late_listener() && existing.same_source(binding))
-        {
+        if binding.is_late_listener() && !self.has_original_admitted_completion_source(binding)? {
             return Err("late listener requires original committed v2 source admission".into());
         }
         self.materialize_bound_completion(mutation_authority, authority, repair, binding)
@@ -426,15 +465,16 @@ impl StateDb {
     /// recovery. This says nothing about pending delivery or whether a legacy
     /// supervisor can still submit its original completion through notify.
     pub fn has_legacy_completion_admissions(&self) -> Result<bool, String> {
-        self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM invocation_completion_obligations WHERE completion_v2_binding IS NULL)",
-            [], |row| row.get(0),
-        ).map_err(|error| error.to_string())
+        self.conn
+            .query_row(LEGACY_COMPLETION_ADMISSION_SQL, [], |row| row.get(0))
+            .map_err(|error| error.to_string())
     }
 
     /// Enumerate authority, not sidecar projections or uncommitted source files.
     /// Continuity ordinal is the required sidecar repair order after rollback.
     pub fn admitted_completion_continuations(&self) -> Result<Vec<AdmittedSourceBinding>, String> {
+        self.access_scope
+            .authorize(crate::live_history::STATE_FULL_ADMISSION_LEDGER, None)?;
         let mut statement = self.conn.prepare(
             "SELECT o.completion_v2_binding,o.admission_id,o.event_id,o.owner_invocation_uuid,o.owner_session_id
              FROM invocation_completion_obligations o
@@ -464,14 +504,7 @@ impl StateDb {
         let limit = i64::try_from(limit).map_err(|_| "completion repair limit overflow")?;
         let mut statement = self
             .conn
-            .prepare(
-                "SELECT o.completion_v2_binding,o.admission_id,o.event_id,
-                    o.owner_invocation_uuid,o.owner_session_id
-             FROM invocation_completion_continuity c
-             JOIN invocation_completion_obligations o ON o.admission_id=c.admission_id
-             WHERE c.authority_ordinal>?1 AND o.completion_v2_binding IS NOT NULL
-             ORDER BY c.authority_ordinal LIMIT ?2",
-            )
+            .prepare(COMPLETION_CONTINUITY_SUFFIX_SQL)
             .map_err(|error| error.to_string())?;
         statement
             .query_map(sqlite::params![authority_ordinal, limit], |row| {
@@ -504,13 +537,8 @@ impl StateDb {
         // read below under State, then revalidated under the sidecar writer.
         let mut mailbox =
             MailboxDb::open_existing_native_authority(&MailboxDb::path_for_state_db(path))?;
-        let tx =
-            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
-                .map_err(|e| e.to_string())?;
-        let state_head = completion_continuity_head_on(&tx).map_err(|error| error.to_string())?;
-        // Physical drain is not logical cancellation or retained-channel release.
-        // Keep the domain steward while its native settlement/cleanup is owed.
-        for (generation, invocation) in self.cancelling_native_attempts()? {
+        let cancelling = self.cancelling_native_attempts()?;
+        for (generation, invocation) in &cancelling {
             if mailbox.native_runtime_in_domain(
                 &owner.domain_id,
                 &generation.to_string(),
@@ -519,8 +547,19 @@ impl StateDb {
                 return Ok(false);
             }
         }
-        if self.pending_native_channel_duties()?.iter().any(|d| matches!(d,
-            crate::ProviderLaunchChannelSettlement::ContinuingCustody { domain_id, .. } if domain_id == &owner.domain_id)) {
+        if self.has_pending_native_channel_duty_for_domain(&owner.domain_id)? {
+            return Ok(false);
+        }
+        let tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        let state_head = completion_continuity_head_on(&tx).map_err(|error| error.to_string())?;
+        // Do not perform sidecar work for a changed cancellation set while the
+        // State writer is held. The guardian retries from a fresh preflight.
+        if self.cancelling_native_attempts()? != cancelling {
+            return Ok(false);
+        }
+        if self.has_pending_native_channel_duty_for_domain(&owner.domain_id)? {
             return Ok(false);
         }
         let closed = mailbox.close_idle_continuation_generation(owner, state_head.as_ref())?;
@@ -535,22 +574,125 @@ impl StateDb {
         requested: &AdmittedSourceBinding,
     ) -> Result<Option<AdmittedSourceBinding>, String> {
         let source = requested.registration()?;
-        for admitted in self.admitted_completion_continuations()? {
-            let existing = admitted.registration()?;
-            if existing.registration_id == source.registration_id
-                || (existing.domain_id == source.domain_id
-                    && (existing.source_id == source.source_id || existing.handle == source.handle))
-            {
-                if admitted == *requested {
-                    return Ok(Some(admitted));
-                }
-                if !admitted.same_source(requested) {
-                    return Err("completion continuation immutable identity conflict".into());
-                }
-                // Same immutable source can have independently admitted listeners.
-            }
+        if self
+            .has_conflicting_admitted_completion_source(&source, requested.registration_digest())?
+        {
+            return Err("completion continuation immutable identity conflict".into());
+        }
+        let paths = source.paths();
+        let listener = requested.admission_listener()?;
+        let registration = CompletionEventRegistrationInput {
+            event_id: &source.handle,
+            delivery_mode: &source.delivery_mode,
+            owner_session_id: Some(&listener.session_id),
+            owner_invocation_uuid: Some(&listener.owner_invocation_uuid),
+            state_dir: &source.handle_dir,
+            meta_path: &paths[0],
+            log_path: &paths[1],
+            rc_path: &paths[2],
+        };
+        let admission_id = completion_bound_admission_id(
+            requested.caller_admission_id(),
+            &registration,
+            Some(requested),
+        );
+        if let Some(admitted) =
+            self.admitted_completion_continuation_by_admission_id(&admission_id)?
+        {
+            return if admitted == *requested {
+                Ok(Some(admitted))
+            } else {
+                Err("completion continuation immutable identity conflict".into())
+            };
         }
         Ok(None)
+    }
+
+    fn admitted_completion_continuation_by_admission_id(
+        &self,
+        admission_id: &str,
+    ) -> Result<Option<AdmittedSourceBinding>, String> {
+        self.admitted_completion_continuation_row("o.admission_id=?1", [admission_id])
+    }
+
+    fn has_conflicting_admitted_completion_source(
+        &self,
+        source: &crate::completion_continuation::SourceRegistration,
+        registration_digest: &str,
+    ) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                COMPLETION_SOURCE_CONFLICT_SQL,
+                sqlite::params![
+                    source.registration_id,
+                    source.domain_id,
+                    source.source_id,
+                    source.handle,
+                    registration_digest
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn admitted_completion_continuation_row<P: rusqlite::Params>(
+        &self,
+        predicate: &str,
+        parameters: P,
+    ) -> Result<Option<AdmittedSourceBinding>, String> {
+        let sql = completion_admission_sql(predicate);
+        self.conn
+            .query_row(&sql, parameters, |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(decode_admitted_completion_row)
+            .transpose()
+    }
+
+    fn has_original_admitted_completion_source(
+        &self,
+        requested: &AdmittedSourceBinding,
+    ) -> Result<bool, String> {
+        let source = requested.registration()?;
+        let original = source
+            .listeners
+            .first()
+            .ok_or("completion source has no original listener")?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT o.completion_v2_binding,o.admission_id,o.event_id,
+                        o.owner_invocation_uuid,o.owner_session_id
+                 FROM invocation_completion_obligations o
+                 JOIN invocation_completion_continuity c ON c.admission_id=o.admission_id
+                 WHERE o.event_id=?1 AND o.owner_invocation_uuid=?2
+                   AND o.completion_v2_binding IS NOT NULL",
+                sqlite::params![source.handle, original.owner_invocation_uuid],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let admitted = decode_admitted_completion_row(row)?;
+        Ok(!admitted.is_late_listener() && admitted.same_source(requested))
     }
 
     pub fn register_completion_event_with_authority(
@@ -1245,6 +1387,10 @@ fn record_completion_obligation_on(
     binding: Option<&[u8]>,
 ) -> Result<CompletionObligationAdmissionResult, OwnershipAuthorityError> {
     validate_completion_obligation(&input)?;
+    let binding_identity = binding
+        .map(AdmittedSourceBinding::decode)
+        .transpose()
+        .map_err(persistence_message)?;
     if let Some(existing) = completion_obligation_by_admission_id(tx, input.admission_id)? {
         let retained: Option<Vec<u8>> = tx.query_row(
             "SELECT completion_v2_binding FROM invocation_completion_obligations WHERE admission_id=?1",
@@ -1288,6 +1434,24 @@ fn record_completion_obligation_on(
         ],
     )
     .map_err(persistence("insert completion obligation"))?;
+    if let Some(binding) = binding_identity {
+        let source = binding.registration().map_err(persistence_message)?;
+        tx.execute(
+            "INSERT INTO invocation_completion_v2_identity (
+                admission_id,domain_id,source_id,registration_id,handle,
+                registration_digest
+             ) VALUES (?1,?2,?3,?4,?5,?6)",
+            sqlite::params![
+                input.admission_id,
+                source.domain_id,
+                source.source_id,
+                source.registration_id,
+                source.handle,
+                binding.registration_digest()
+            ],
+        )
+        .map_err(persistence("insert completion v2 identity"))?;
+    }
     completion_obligation_by_admission_id(tx, input.admission_id)?
         .map(CompletionObligationAdmissionResult::Recorded)
         .ok_or_else(|| persistence_message("completion obligation disappeared after insert"))
@@ -3945,6 +4109,10 @@ mod tests {
 mod completion_continuation_tests {
     use super::*;
     use crate::InvocationStart;
+    use crate::diagnostic_recorder::{
+        DiagnosticPhase, FlightRecorder, FlightRecorderReader, RecorderConfig,
+        with_test_process_recorder,
+    };
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     fn binding() -> AdmittedSourceBinding {
@@ -4038,6 +4206,183 @@ mod completion_continuation_tests {
     }
 
     #[test]
+    fn exact_continuation_conflict_uses_the_indexed_identity_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let binding = binding();
+        let mut state = seed(&path, &binding);
+        admit(&mut state, &binding, false, false);
+
+        let mut changed = serde_json::to_value(binding.registration().unwrap()).unwrap();
+        changed["source_id"] = uuid::Uuid::new_v4().to_string().into();
+        changed["handle"] = "different-handle".into();
+        changed["handle_dir"] = format!(
+            "{}/different-handle",
+            changed["spool_root"].as_str().unwrap()
+        )
+        .into();
+        changed["helper"]["path"] =
+            format!("{}/runner", changed["handle_dir"].as_str().unwrap()).into();
+        changed["recovery"]["path"] =
+            format!("{}/agent-bash", changed["handle_dir"].as_str().unwrap()).into();
+        let conflict = AdmittedSourceBinding::new(
+            "different-caller-admission",
+            &serde_json::to_vec(&changed).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            state
+                .admitted_completion_continuation(&conflict)
+                .unwrap_err()
+                .contains("immutable identity conflict")
+        );
+
+        let source = conflict.registration().unwrap();
+        let explain = format!("EXPLAIN QUERY PLAN {COMPLETION_SOURCE_CONFLICT_SQL}");
+        let details = state
+            .conn
+            .prepare(&explain)
+            .unwrap()
+            .query_map(
+                sqlite::params![
+                    source.registration_id,
+                    source.domain_id,
+                    source.source_id,
+                    source.handle,
+                    conflict.registration_digest()
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for index in [
+            "idx_invocation_completion_v2_registration",
+            "idx_invocation_completion_v2_source",
+            "idx_invocation_completion_v2_handle",
+        ] {
+            assert!(
+                details.iter().any(|detail| detail.contains(index)),
+                "missing {index} from exact conflict plan: {details:?}"
+            );
+        }
+
+        let exact = format!(
+            "EXPLAIN QUERY PLAN {}",
+            completion_admission_sql("o.admission_id=?1")
+        );
+        let exact_details = state
+            .conn
+            .prepare(&exact)
+            .unwrap()
+            .query_map(["fixture-admission"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            exact_details
+                .iter()
+                .all(|detail| !detail.contains("SCAN invocation_completion")),
+            "exact admission readback scanned a ledger: {exact_details:?}"
+        );
+        assert!(
+            exact_details
+                .iter()
+                .any(|detail| detail.contains("admission_id")),
+            "exact admission readback omitted its identity index: {exact_details:?}"
+        );
+
+        let suffix = format!("EXPLAIN QUERY PLAN {COMPLETION_CONTINUITY_SUFFIX_SQL}");
+        let suffix_details = state
+            .conn
+            .prepare(&suffix)
+            .unwrap()
+            .query_map(sqlite::params![0_i64, 1_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            suffix_details
+                .iter()
+                .any(|detail| detail.contains("INTEGER PRIMARY KEY") && detail.contains(">?")),
+            "bounded continuity suffix omitted the ordinal range seek: {suffix_details:?}"
+        );
+        assert!(
+            suffix_details
+                .iter()
+                .any(|detail| detail.contains("admission_id")),
+            "bounded continuity suffix omitted its exact obligation join: {suffix_details:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_admission_startup_probe_uses_only_the_null_binding_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&directory.path().join("state.db")).unwrap();
+        assert!(!state.has_legacy_completion_admissions().unwrap());
+
+        let explain = format!("EXPLAIN QUERY PLAN {LEGACY_COMPLETION_ADMISSION_SQL}");
+        let details = state
+            .conn
+            .prepare(&explain)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| { detail.contains("idx_invocation_completion_obligations_legacy") }),
+            "legacy startup probe escaped its partial projection: {details:?}"
+        );
+    }
+
+    #[test]
+    fn live_state_rejects_full_admission_history_and_records_state_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&directory.path().join("state.db")).unwrap();
+        let recorder_root = directory.path().join("recorder");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+
+        let error = with_test_process_recorder(recorder.clone(), || {
+            state.admitted_completion_continuations().unwrap_err()
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        assert!(error.contains("live_history_barrier"), "{error}");
+
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let blocked = report
+            .events
+            .iter()
+            .find(|record| {
+                record.event.operation == "live_history_barrier"
+                    && record.event.phase == DiagnosticPhase::Failed
+            })
+            .expect("blocked historical access retained outside the live database");
+        assert_eq!(
+            blocked.event.sqlite.as_ref().unwrap().database_role,
+            SqliteDatabaseRole::State
+        );
+        let evidence = blocked
+            .event
+            .observation
+            .live_history_barrier
+            .as_ref()
+            .unwrap();
+        assert_eq!(evidence.live_trace, "state.live");
+        assert_eq!(
+            evidence.attempted_access,
+            crate::diagnostic_recorder::SqliteAccessClass::HistoricalDiagnostic
+        );
+        assert_eq!(
+            evidence.query_family,
+            "completion_continuation.full_admission_ledger"
+        );
+        assert_eq!(evidence.decision, "blocked");
+    }
+
+    #[test]
     fn completion_continuation_sync_acceptance_suppresses_without_ack_and_replay_is_exact() {
         acceptance_presentation_and_replay(false, "sync", false, false, false);
     }
@@ -4091,6 +4436,7 @@ mod completion_continuation_tests {
         };
         let initially_active = mode == "async" || detach_before;
         let mut state = seed(&path, &binding);
+        state.access_scope = crate::live_history::AccessScope::historical();
         admit(&mut state, &binding, false, false);
         // Final-system diagnostic distinguishes exact v2 admissions from legacy
         // authority; no migration-only fixture is needed for this predicate.
@@ -4209,6 +4555,7 @@ mod completion_continuation_tests {
         let mut mailbox = MailboxDb::open(&MailboxDb::path_for_state_db(&path)).unwrap();
         drop(state);
         let mut state = StateDb::open(&path).unwrap();
+        state.access_scope = crate::live_history::AccessScope::historical();
         // Repeated admission and driver repair must not undo sync suppression.
         admit(&mut state, &binding, false, false);
         state
@@ -4617,6 +4964,7 @@ mod completion_continuation_tests {
         let path = directory.path().join("state.db");
         let binding = binding();
         let mut state = seed(&path, &binding);
+        state.access_scope = crate::live_history::AccessScope::historical();
         admit(&mut state, &binding, false, false);
         let source = binding.registration().unwrap();
         let state_writer = sqlite::Connection::open(&path).unwrap();
@@ -4827,6 +5175,7 @@ mod completion_continuation_tests {
         );
         drop(state);
         let mut reopened = StateDb::open(&path).unwrap();
+        reopened.access_scope = crate::live_history::AccessScope::historical();
         let admitted = reopened.admitted_completion_continuations().unwrap();
         assert_eq!(admitted, vec![binding.clone()]);
         let owner = MailboxDb::open(&MailboxDb::path_for_state_db(&path))
@@ -4880,6 +5229,7 @@ mod completion_continuation_tests {
         admit(&mut state, &binding, false, false);
         drop(state);
         let mut reopened = StateDb::open(&path).unwrap();
+        reopened.access_scope = crate::live_history::AccessScope::historical();
         assert_eq!(
             reopened.admitted_completion_continuations().unwrap(),
             vec![binding.clone()]
@@ -4910,6 +5260,7 @@ mod completion_continuation_tests {
         let path = directory.path().join("state.db");
         let binding = binding();
         let mut state = seed(&path, &binding);
+        state.access_scope = crate::live_history::AccessScope::historical();
         assert!(
             catch_unwind(AssertUnwindSafe(|| admit(
                 &mut state, &binding, true, false
@@ -4939,6 +5290,7 @@ mod completion_continuation_tests {
         let path = directory.path().join("state.db");
         let binding = binding();
         let mut state = seed(&path, &binding);
+        state.access_scope = crate::live_history::AccessScope::historical();
         admit(&mut state, &binding, false, false);
         assert!(
             state

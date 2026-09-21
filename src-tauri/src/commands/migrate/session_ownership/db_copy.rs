@@ -113,7 +113,7 @@ fn copy_state_snapshot(src: &Path, dest: &Path) -> Result<(), DryRunError> {
 
 fn verify_state_read_only_open(src: &Path) -> Result<(), DryRunError> {
     drop(
-        StateDb::open_read_only(src).map_err(|err| {
+        StateDb::open_historical_read_only(src).map_err(|err| {
             DryRunError::new(format!("failed to open state DB read-only: {err:?}"))
         })?,
     );

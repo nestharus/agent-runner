@@ -13,7 +13,8 @@ fn load_session_list_rows() -> Result<Vec<ImportedSessionListRow>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let state = StateDb::open_read_only(&path).map_err(format_session_list_open_error)?;
+    let state =
+        StateDb::open_historical_read_only(&path).map_err(format_session_list_open_error)?;
     state
         .imported_session_list()
         .map_err(super::formatter::format_session_list_load_error)

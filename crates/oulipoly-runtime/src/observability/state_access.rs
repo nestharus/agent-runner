@@ -136,7 +136,7 @@ fn open_existing_state_read_only(
     path: &Path,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<StateDb, ReadOnlyOpenError> {
-    StateDb::open_read_only_with_cancel(path, is_cancelled)
+    StateDb::open_historical_read_only_with_cancel(path, is_cancelled)
 }
 
 fn read_existing_state(
@@ -158,7 +158,7 @@ fn open_sidecar_read_only(
     if path_is_missing(path) {
         return (None, None);
     }
-    match MailboxDb::open_read_only_with_pid_identity_and_stale_progress(
+    match MailboxDb::open_historical_read_only_with_pid_identity_and_stale_progress(
         path,
         SIDECAR_SNAPSHOT_CHURN_RETRY_WINDOW,
         SIDECAR_SNAPSHOT_STALE_PROGRESS_AFTER,

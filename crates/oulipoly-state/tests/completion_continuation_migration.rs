@@ -1,4 +1,4 @@
-use oulipoly_state::{StateDb, migrations};
+use oulipoly_state::{StateDb, migrations, schema::CURRENT_SCHEMA_VERSION};
 use rusqlite::Connection;
 
 fn schema_23() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -6,12 +6,26 @@ fn schema_23() -> (tempfile::TempDir, std::path::PathBuf) {
     let path = dir.path().join("state.db");
     drop(StateDb::open(&path).unwrap());
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE invocation_completion_obligations DROP COLUMN completion_v2_binding; PRAGMA user_version=23;").unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         DROP TRIGGER trg_invocation_completion_v2_identity_append_only_update;
+         DROP TRIGGER trg_invocation_completion_v2_identity_append_only_delete;
+         DROP TABLE invocation_completion_v2_identity;
+         DROP INDEX idx_invocation_completion_obligations_legacy;
+         DROP INDEX idx_invocation_completion_obligations_event;
+         DROP TABLE provider_launch_native_channel_duties;
+         DROP INDEX provider_launch_cancelling;
+         DROP TABLE completed_turns;
+         DROP TABLE completed_turn_selections;
+         ALTER TABLE invocation_completion_obligations DROP COLUMN completion_v2_binding;
+         PRAGMA user_version=23;",
+    )
+    .unwrap();
     (dir, path)
 }
 
 #[test]
-fn completion_continuation_migration_extends_existing_ledger_once() {
+fn completion_continuation_migration_extends_existing_ledger_and_live_identity_once() {
     let (_dir, path) = schema_23();
     let original: String = Connection::open(&path).unwrap().query_row(
         "SELECT sql FROM sqlite_master WHERE name='trg_invocation_completion_obligations_append_only_update'", [], |r| r.get(0),
@@ -22,7 +36,7 @@ fn completion_continuation_migration_extends_existing_ledger_once() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, i64::from(CURRENT_SCHEMA_VERSION));
     let columns: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('invocation_completion_obligations') WHERE name='completion_v2_binding' AND type='BLOB'", [], |r| r.get(0)).unwrap();
     assert_eq!(columns, 1);
     let trigger: String = conn.query_row("SELECT sql FROM sqlite_master WHERE name='trg_invocation_completion_obligations_append_only_update'", [], |r| r.get(0)).unwrap();
@@ -35,8 +49,8 @@ fn completion_continuation_migration_extends_existing_ledger_once() {
         )
         .unwrap();
     assert_eq!(
-        competing, 0,
-        "binding must extend authority, not duplicate it"
+        competing, 1,
+        "the indexed identity projection must be the only v2 companion table"
     );
 }
 
@@ -75,7 +89,8 @@ fn completion_continuation_read_only_schema_23_probe_does_not_migrate() {
 fn completion_continuation_current_schema_missing_binding_is_not_repaired() {
     let (_dir, path) = schema_23();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("PRAGMA user_version=24").unwrap();
+    conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
+        .unwrap();
     drop(conn);
     assert!(StateDb::open_read_only(&path).is_err());
     assert!(StateDb::open(&path).is_err());
