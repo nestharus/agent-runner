@@ -5,6 +5,7 @@
 - `crates/oulipoly-provider/src/client.rs`
 - `crates/oulipoly-provider/src/error.rs`
 - `crates/oulipoly-provider/src/process.rs`
+- `crates/oulipoly-provider/src/process_custody.rs`
 - `crates/oulipoly-provider/src/resolver.rs`
 - `crates/oulipoly-provider/src/stream.rs`
 - `crates/oulipoly-provider/src/testkit.rs`
@@ -29,6 +30,7 @@
 | Provider closes stdin early but emits a valid envelope. | Valid success or provider error envelope wins over the stdin transport failure. |
 | Provider closes stdin early without a valid envelope. | Client returns `provider_closed_stdin_early`. |
 | Host timeout or cancellation. | Process tree is terminated and diagnostics record bounded stdout/stderr and cleanup state. |
+| Provider exit has exact whole-tree terminal proof while a local pipe-drain worker is still settling. | The host joins the local worker and preserves the completed output; scheduler latency alone does not become `wait_failed`. |
 | Valid launch JSONL sequence ending in one final exit event. | Stream reader returns ordered decoded events, raw stdout/stderr bytes, and the authoritative launch exit. |
 | Provider process exits nonzero after a valid final launch exit event. | Launch result succeeds and records provider nonzero as diagnostics only. |
 
@@ -45,6 +47,9 @@
   decreasing sequence numbers are rejected.
 - A forced kill during launch with no final exit is host cancellation when the
   host cancellation path caused the kill.
+- Output collection may wait for local workers only after exact custody proves
+  the entire provider tree terminal. Without that proof, incomplete cleanup
+  remains bounded and cannot be promoted to a successful process outcome.
 
 ## Error conditions
 

@@ -2004,7 +2004,7 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[cfg(target_vendor = "apple")]
     #[test]
@@ -2414,6 +2414,36 @@ mod tests {
         assert!(outcome.stdout_text().contains("\"ok\":true"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proven_tree_completion_waits_for_local_output_settlement_without_false_failure() {
+        let fake = FakeProvider::compile(fake_provider_source());
+        let custody = crate::custody::AttemptActorCustody::new(uuid::Uuid::new_v4());
+        let guard = custody.begin("describe");
+        let delay = Duration::from_millis(1_100);
+        let started = Instant::now();
+
+        let outcome = ProcessRunner::new(ProcessLimits {
+            custody: Some(guard.0.clone()),
+            spawn_observer: Some(ProcessSpawnObserver::new(|_| Ok(()))),
+            ..ProcessLimits::default()
+        })
+        .run_without_deadline_and_stdout_processor(
+            ProcessCommand::new(fake.path()).arg("describe"),
+            serde_json::to_vec(&describe_request()).expect("request should serialize"),
+            FakeProviderMode::StdinEof.env(),
+            DelayedFinishStdoutProcessor {
+                accumulator: ByteAccumulator::new(ByteLimit::new(64 * 1024)),
+                delay,
+            },
+        )
+        .expect("proven terminal tree must not fail because a local drain worker was delayed");
+
+        assert!(started.elapsed() >= delay);
+        assert!(outcome.status.exited_successfully());
+        assert!(outcome.stdout_text().contains("\"ok\":true"));
+    }
+
     #[derive(Default)]
     struct CountingWriter {
         write_calls: usize,
@@ -2443,6 +2473,25 @@ mod tests {
 
         fn finish(self, _error: Option<ProviderClientError>) -> Self::Output {
             CapturedBytes::default()
+        }
+    }
+
+    struct DelayedFinishStdoutProcessor {
+        accumulator: ByteAccumulator,
+        delay: Duration,
+    }
+
+    impl StdoutProcessor for DelayedFinishStdoutProcessor {
+        type Output = CapturedBytes;
+
+        fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderClientError> {
+            self.accumulator.push(chunk);
+            Ok(())
+        }
+
+        fn finish(self, _error: Option<ProviderClientError>) -> Self::Output {
+            std::thread::sleep(self.delay);
+            self.accumulator.finish()
         }
     }
 
@@ -2530,6 +2579,12 @@ fn collect_or_retain_process_threads<T: StdoutDrainOutput>(
     threads: ProcessThreads<T>,
     child: Child,
 ) -> JoinedProcessThreads<T> {
+    // Exact whole-tree settlement means no process can retain these pipes.
+    // Join the local workers rather than turning scheduler latency into a
+    // provider failure. Unproven cleanup remains bounded below.
+    if child.is_reaped() && child.tree_termination_proven() {
+        return join_process_threads(threads, &child);
+    }
     let started = Instant::now();
     while !(threads.stdout.is_finished()
         && threads.stderr.is_finished()

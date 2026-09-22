@@ -14,6 +14,7 @@ pub(crate) struct OwnedChild {
     #[cfg(target_os = "linux")]
     published_receipt: Option<std::sync::Arc<oulipoly_core::launch_custody::PublishedTreeReceipt>>,
     remote_force_delivered: bool,
+    tree_termination_proven: bool,
     reaped: bool,
     custody: Option<OperationCustody>,
     confined: bool,
@@ -51,6 +52,7 @@ impl OwnedChild {
             #[cfg(target_os = "linux")]
             published_receipt: None,
             remote_force_delivered: false,
+            tree_termination_proven: false,
             reaped: false,
             confined: custody.as_ref().is_some_and(|c| !c.1) && containment_supported(),
             custody,
@@ -106,6 +108,16 @@ impl OwnedChild {
     }
     pub fn is_reaped(&self) -> bool {
         self.reaped
+    }
+    pub fn tree_termination_proven(&self) -> bool {
+        self.tree_termination_proven
+            || self.custody.as_ref().is_some_and(|custody| {
+                custody
+                    .0
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .process_tree_terminated
+            })
     }
     #[cfg(not(unix))]
     pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
@@ -195,7 +207,9 @@ impl OwnedChild {
         self.reaped |= result.is_ok();
         #[cfg(target_os = "linux")]
         let result = result.and_then(|owner_status| match &self.remote {
-            Some(remote) if owner_status.success() => remote.wait_status(),
+            Some(remote) if owner_status.success() => remote.wait_status().inspect(|_| {
+                self.tree_termination_proven = true;
+            }),
             Some(_) => Err(std::io::Error::other("command custodian failed")),
             None => Ok(owner_status),
         });
@@ -212,7 +226,10 @@ impl OwnedChild {
                     #[cfg(target_os = "linux")]
                     if let Some(receipt) = &self.published_receipt {
                         match receipt.wait() {
-                            Ok(_) => r.process_tree_terminated = true,
+                            Ok(_) => {
+                                r.process_tree_terminated = true;
+                                self.tree_termination_proven = true;
+                            }
                             Err(_) => r.uncertain = true,
                         }
                     }

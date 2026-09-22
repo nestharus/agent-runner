@@ -71,6 +71,25 @@ fn run(custody: Arc<LaunchCustody>, root: PathBuf, script: &'static str) -> Proc
     )
     .unwrap()
 }
+
+struct DelayedFinishProcessor {
+    accumulator: ByteAccumulator,
+    delay: Duration,
+}
+
+impl StdoutProcessor for DelayedFinishProcessor {
+    type Output = CapturedBytes;
+
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderClientError> {
+        self.accumulator.push(chunk);
+        Ok(())
+    }
+
+    fn finish(self, _error: Option<ProviderClientError>) -> Self::Output {
+        thread::sleep(self.delay);
+        self.accumulator.finish()
+    }
+}
 fn process_row(pid: i32) -> (char, i32, i32) {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
     let fields: Vec<_> = stat
@@ -274,6 +293,44 @@ fn helper_tree_wait_completes_independently_of_live_command_in_same_generation()
     );
     custody.seal();
     eventually(|| custody.quiescent());
+}
+
+#[test]
+fn remote_tree_completion_waits_for_local_output_settlement_without_false_failure() {
+    let fixture = Fixture::new();
+    let generation =
+        Arc::new(LaunchCustody::start(fixture.0.join("proof-delayed-output")).unwrap());
+    let scope = LaunchScope::enter(Some(Arc::clone(&generation)));
+    let actor = crate::custody::AttemptActorCustody::new(uuid::Uuid::new_v4());
+    let guard = actor.begin("launch");
+    let delay = Duration::from_millis(1_100);
+    let started = Instant::now();
+
+    let outcome = ProcessRunner::new(ProcessLimits {
+        custody: Some(guard.0.clone()),
+        ..ProcessLimits::default()
+    })
+    .run_without_deadline_and_stdout_processor(
+        ProcessCommand::new("/bin/bash")
+            .arg("-c")
+            .arg("printf 'remote-output'"),
+        Vec::new(),
+        Vec::<(String, String)>::new(),
+        DelayedFinishProcessor {
+            accumulator: ByteAccumulator::new(ByteLimit::new(1024)),
+            delay,
+        },
+    )
+    .expect("remote tree completion must not become a wait failure from drain latency");
+
+    drop(guard);
+    assert!(started.elapsed() >= delay);
+    assert_eq!(outcome.stdout.bytes, b"remote-output");
+    assert_eq!(outcome.status, ProcessStatus::Exited { code: 0 });
+    assert!(actor.receipts()[0].effect_incapable());
+    drop(scope);
+    generation.seal();
+    eventually(|| generation.quiescent());
 }
 
 #[test]
