@@ -295,8 +295,15 @@ Required-durable callers use the same nonwaiting bounded queue admission and,
 once accepted, wait for the real commit/reconciliation outcome only at the
 top-level safe boundary before acquiring a State or PID-mailbox writer. No
 synthetic timeout turns unfinished persistence into a fabricated failure.
-Neither path may hold the State or PID-mailbox SQLite writer while waiting for
-event persistence.
+The process-sink lifecycle owner is used only to take the exact writer once for
+shutdown; a required-durable caller does not hold it, the writer admission
+mutex, or the shared sender slot while waiting for its reply. Consequently,
+other durable callers retain bounded admission/group-commit opportunity and a
+best-effort caller reaches the real queue whenever that queue and admission
+fence permit it. Shutdown first closes the shared admission fence, removes the
+shared sender, drains work accepted before the fence, and closes the taken
+writer exactly once. Neither append path may hold the State or PID-mailbox
+SQLite writer while waiting for event persistence.
 
 Event-store SQLite operations do not recursively emit per-transaction
 `DiagnosticEvent` records into the same sink. They update bounded in-memory
@@ -336,6 +343,16 @@ partitions using catalog filters, queries each local trace index, merges by
 `(recorded_at,event_id)`, and validates parent IDs. Missing parents are reported,
 not fabricated. Current heads are always queried directly because detached
 catalog coverage may lag them.
+
+Ordinary stable-ID, trace, and metric target discovery also performs a bounded
+walk of the discovery archive after pending and active work. That archive walk
+returns only `preserved_dead_head` generations (plus readable gap evidence), but
+every archive entry examined consumes the same caller-supplied node and entry
+budgets. If unrelated terminal records exhaust either budget before all
+preserved heads are examined, coverage is explicitly incomplete; a bounded
+omission is never reported as complete emptiness. Archived work is not returned
+to detached maintenance, and the root supervisor does not enumerate or own the
+historical store.
 
 Each SQLite read transaction is a consistent snapshot of one generation.
 There is deliberately no false global snapshot across independent writers.
@@ -411,7 +428,41 @@ location is authoritative for that classification: a retained staging basename
 cannot make an artifact at the final generation path “incomplete staging.” A
 manifest-less, corrupt, or otherwise unprovable final generation is preserved.
 
+The original acceptance obligation remains interruption discrimination at every
+create, sync, checkpoint, close, and rename boundary in this publication path.
+Current infrastructure proves the following exact visible boundary states; it
+does not convert the remaining obligations into optional work:
+
+| Boundary | Current executable discrimination |
+|---|---|
+| Durable discovery intent before staging creation; invalid intent slot | `supported_pre_head_interruption_states_have_production_recovery_successors` distinguishes both states and their bounded maintenance successor. The individual intent-record temp create, file sync, rename, and directory sync are not separately fault-injected. |
+| Staging-directory creation | The same fixture distinguishes a created empty staging directory from intent-only state. Interruption during `create_dir` and the following permission change is not injectible in the current harness. |
+| Successor database creation/schema commit, `wal_checkpoint(TRUNCATE)`, SQLite-handle close, and database sync | The same fixture constructs the state after a complete checkpoint, closes the handle, syncs the database, and verifies bounded recovery. It does not inject inside SQLite database creation/schema commit, inside checkpoint, at handle close, or inside the sync syscall. No fixture forces the optional surviving-WAL sync boundary. |
+| Prepared-manifest temp create/write/file sync before rename | `interruption_after_prepared_manifest_temp_sync_is_not_generation_publication` proves the synced temp is not a published manifest or generation. The temp-create and partial-write boundaries are not separately injected. |
+| Prepared-manifest rename before staging-directory sync | The pre-head recovery fixture publishes the manifest by rename while deliberately omitting the following directory sync, then verifies bounded cleanup. Interruption during the directory sync itself is not injected. |
+| Final generation-directory rename before parent-directory sync | The pre-head recovery fixture renames staging to the final generation path while deliberately omitting both parent syncs and verifies bounded recovery. The staging-parent and generations-parent sync calls are not individually fault-injected. `recovery_does_not_adopt_prepared_successor_before_old_close` separately proves that a complete unselected generation is not adopted. |
+| Old-head `synchronous=FULL` close transaction and SQLite-handle close before head publication | `recovery_follows_only_exact_successor_after_old_close_before_head` proves recovery follows only the recorded exact successor after the completed close. It does not inject inside the SQLite commit or the handle-close operation. |
+| Stale inactive-head removal and writer-directory sync | The reader fixtures cover an invalid higher inactive slot, but no current fixture injects immediately after removal or during its directory sync. Those boundaries remain unmet. |
+| Inactive head-temp create/write/file sync before rename | `interruption_after_inactive_head_temp_sync_keeps_old_head_selected` proves a synced temp is not selected. Temp creation and partial write are not separately injected. |
+| Inactive head rename before final writer-directory sync | `interruption_after_inactive_head_rename_selects_only_the_complete_successor` proves the renamed, fully validated successor is selected without relying on the temp name. Interruption during the final directory sync remains unmet. |
+
+These are deterministic filesystem/SQLite state fixtures, not a VFS power-loss
+campaign. The explicitly unmet syscall-internal and individual-sync evidence
+above remains part of the every-boundary obligation.
+
 Processes alive across many days rotate their own heads by the same protocol.
+The process-global sink lifecycle distinguishes `never_installed`, `installed`,
+and terminal `shutdown`. Lazy default writer construction and shutdown share
+the lifecycle mutex: installation that wins becomes visible and is taken for
+closure, while shutdown that wins rejects first or replacement installation
+before a writer or head is created. Every ordinary production entrypoint return
+terminalizes this lifecycle, removes any installed process-local event sink from
+admission, and invokes that exact writer's best-effort shutdown path. Repeated
+shutdown is a no-op and cannot reopen installation. Successful shutdown drains
+accepted work and performs the lifecycle rotation above; failure is emitted as
+an event-store evidence gap without changing the command's exit status. Abrupt
+process death cannot run this path: its selected head remains fail-closed and is
+neither finalized nor transferred by detached maintenance.
 Root-supervisor startup does not enumerate writer directories. Event-sink
 initialization reads its own two exact head slots; historical discovery belongs
 to explicit readers and detached maintenance.
@@ -645,6 +696,15 @@ their authority-neutral provenance.
 - Directory/manifests can grow with producer churn. The detached catalog and
   bounded discovery need scale validation; the root supervisor never absorbs
   that work.
+- The retained-history rotation observation is a bounded ignored test fixture,
+  not a benchmark or SLO. It exercises the same exact-head rotation with small
+  and larger retained generation sets and prints raw elapsed samples; broader
+  filesystem, platform, fan-out, and AGE-353 stress behavior remains unmeasured.
+- On Unix, a focused permission oracle makes every retained generation
+  unreadable, proves a deliberately history-dependent neighbor fails, and then
+  proves exact-current rotation succeeds. This discriminates retained-history
+  traversal from the accepted path, but it is not cross-platform latency or
+  scale evidence.
 - `synchronous=FULL` depends on the platform VFS/filesystem honoring sync.
   Hardware lying about durability is outside the application guarantee.
 - Emergency JSONL fallback retains the current best-effort/loss semantics until
@@ -670,7 +730,10 @@ The implementation ticket is executable when it delivers:
    PRAGMAs, append-ticket outcomes, and one process-local writer worker;
 2. generation-directory publication, two-slot `HEAD`, prepared/sealed
    manifests, eligibility metadata, and interruption fixtures/tests at every
-   create/sync/checkpoint/close/rename boundary;
+   create, sync, checkpoint, close, and rename boundary. Deterministic visible-
+   state fixtures are partial evidence only where the current harness cannot
+   interrupt the exact operation; each such boundary remains explicitly unmet
+   until discriminating evidence exists;
 3. bounded readers returning records plus per-partition watermarks and coverage;
 4. stable correlation searches for time, family/kind, trace/span,
    invocation/session digest, process tree, and supervisor authority;

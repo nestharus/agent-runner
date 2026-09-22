@@ -1967,6 +1967,134 @@ mod tests {
     }
 
     #[test]
+    fn interruption_after_inactive_head_temp_sync_keeps_old_head_selected() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = WriterLayout::create(root.path(), [33; 16]).unwrap();
+        let writer = WriterInstanceId::from_bytes([33; 16]);
+        let first_manifest = manifest(33, 34, 0);
+        layout
+            .publish_prepared_generation(
+                &first_manifest,
+                |db| fs::write(db, b"first").map_err(|error| io_error("write test db", error)),
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        let first_head = HeadRecord::new(
+            0,
+            writer,
+            first_manifest.generation_id,
+            first_manifest.sha256().unwrap(),
+        )
+        .unwrap();
+        let first_slot = layout.publish_head(None, &first_head).unwrap();
+
+        let mut successor = manifest(33, 35, 1);
+        successor.predecessor_generation_id = Some(first_manifest.generation_id);
+        layout
+            .publish_prepared_generation(
+                &successor,
+                |db| fs::write(db, b"successor").map_err(|error| io_error("write test db", error)),
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        let successor_head = HeadRecord::new(
+            1,
+            writer,
+            successor.generation_id,
+            successor.sha256().unwrap(),
+        )
+        .unwrap();
+        let interrupted_temp = layout.writer_dir().join("HEAD.1.interrupted.tmp");
+        write_new_synced(
+            &interrupted_temp,
+            &successor_head.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+
+        let selected = layout.read_head(|_, _| Ok(())).unwrap().unwrap();
+        assert_eq!(selected.slot, first_slot);
+        assert_eq!(selected.record, first_head);
+        assert!(interrupted_temp.is_file());
+        assert!(!layout.writer_dir().join("HEAD.1").exists());
+    }
+
+    #[test]
+    fn interruption_after_inactive_head_rename_selects_only_the_complete_successor() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = WriterLayout::create(root.path(), [36; 16]).unwrap();
+        let writer = WriterInstanceId::from_bytes([36; 16]);
+        let first_manifest = manifest(36, 37, 0);
+        layout
+            .publish_prepared_generation(
+                &first_manifest,
+                |db| fs::write(db, b"first").map_err(|error| io_error("write test db", error)),
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        let first_head = HeadRecord::new(
+            0,
+            writer,
+            first_manifest.generation_id,
+            first_manifest.sha256().unwrap(),
+        )
+        .unwrap();
+        let first_slot = layout.publish_head(None, &first_head).unwrap();
+
+        let mut successor = manifest(36, 38, 1);
+        successor.predecessor_generation_id = Some(first_manifest.generation_id);
+        layout
+            .publish_prepared_generation(
+                &successor,
+                |db| fs::write(db, b"successor").map_err(|error| io_error("write test db", error)),
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        let successor_head = HeadRecord::new(
+            1,
+            writer,
+            successor.generation_id,
+            successor.sha256().unwrap(),
+        )
+        .unwrap();
+        let interrupted_temp = layout.writer_dir().join("HEAD.1.interrupted.tmp");
+        let inactive = layout
+            .writer_dir()
+            .join(HeadSlot::other(first_slot).file_name());
+        write_new_synced(
+            &interrupted_temp,
+            &successor_head.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        rename_create_once(&interrupted_temp, &inactive).unwrap();
+        // Deliberately omit the writer-directory sync. The visible recovery
+        // state is the exact post-rename/pre-parent-sync boundary.
+
+        let selected = layout.read_head(|_, _| Ok(())).unwrap().unwrap();
+        assert_eq!(selected.slot, HeadSlot::other(first_slot));
+        assert_eq!(selected.record, successor_head);
+        assert!(!interrupted_temp.exists());
+        assert!(inactive.is_file());
+    }
+
+    #[test]
+    fn interruption_after_prepared_manifest_temp_sync_is_not_generation_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = WriterLayout::create(root.path(), [39; 16]).unwrap();
+        let prepared = manifest(39, 40, 0);
+        let staging = layout.staging_dir.join("prepared-boundary.tmp");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join(DATABASE_FILE_NAME), b"database").unwrap();
+        let manifest_temp = staging.join("prepared.manifest.json.interrupted.tmp");
+        write_new_synced(&manifest_temp, &prepared.canonical_bytes().unwrap()).unwrap();
+
+        assert!(manifest_temp.is_file());
+        assert!(!staging.join(PREPARED_MANIFEST_FILE_NAME).exists());
+        assert!(!layout.generation_dir(prepared.generation_id).exists());
+        assert!(layout.read_head(|_, _| Ok(())).unwrap().is_none());
+        assert!(read_prepared_manifest(&staging).is_err());
+    }
+
+    #[test]
     fn invalid_higher_head_slot_is_explicitly_incomplete() {
         let root = tempfile::tempdir().unwrap();
         let layout = WriterLayout::create(root.path(), [6; 16]).unwrap();

@@ -128,6 +128,7 @@ pub use db::{
     SessionTurnReplacement, SessionTurnRestoreRow, SessionTurnsReplacement, SessionTurnsRestore,
 };
 pub use db::{StateTerminalTimestampRepair, StateTimestampRecordFamily};
+pub use diagnostic_producer::shutdown_process_event_sink;
 pub use invocation_marker::CompositeInvocationId;
 pub use lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
 pub use mailbox::{

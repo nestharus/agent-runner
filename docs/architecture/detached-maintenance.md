@@ -153,6 +153,12 @@ actual path rather than merely to a retained staging name:
 - selected heads are never changed by orphan classification; rotation
   follow-up acquires the exact generation maintenance lease and re-reads the
   authoritative head/state before publishing a dead-head archive disposition;
+- archiving that `preserved_dead_head` disposition removes it from maintenance
+  scheduling but not from event evidence. Ordinary bounded reader discovery
+  separately walks archive records and returns preserved selected heads to
+  stable-ID, trace, and metric reads. Archive entries consume the reader's
+  normal node/entry budgets, and exhausting a budget reports incomplete
+  coverage rather than complete emptiness;
 - a closed, non-head generation routes to retirement; and
 - pending retirement/orphan trash remains independently discoverable.
 

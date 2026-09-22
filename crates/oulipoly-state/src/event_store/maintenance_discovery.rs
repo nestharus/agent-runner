@@ -231,6 +231,7 @@ pub(crate) struct DiscoveryBatch {
     pub(crate) cursor: DiscoveryCursor,
     pub(crate) more: bool,
     pub(crate) nodes_examined: usize,
+    pub(crate) entries_examined: usize,
 }
 
 /// Publish the exact scheduling intent before any staging directory is created.
@@ -482,6 +483,7 @@ pub(crate) fn read_batch(
     cursor.pending_after_node = pending.last_node;
     if pending.more || entries.len() == max_entries {
         return Ok(DiscoveryBatch {
+            entries_examined: entries.len(),
             entries,
             issues,
             cursor,
@@ -492,6 +494,7 @@ pub(crate) fn read_batch(
     cursor.pending_after_node = None;
     if remaining_nodes == 0 {
         return Ok(DiscoveryBatch {
+            entries_examined: entries.len(),
             entries,
             issues,
             cursor,
@@ -515,12 +518,62 @@ pub(crate) fn read_batch(
         cursor.active_after_node = None;
     }
     Ok(DiscoveryBatch {
+        entries_examined: entries.len(),
         entries,
         issues,
         cursor,
         more: active.more,
         nodes_examined: max_nodes - remaining_nodes,
     })
+}
+
+/// Read the ordinary maintenance candidates plus archived selected heads whose
+/// dead producers were preserved fail-closed. Archive traversal shares the
+/// caller's node and entry budgets. If unrelated terminal archive records use
+/// that budget before every preserved head is examined, `more` remains true so
+/// evidence readers report incomplete coverage instead of complete emptiness.
+///
+/// This is deliberately separate from [`read_batch`]: detached maintenance
+/// must not reacquire terminal archived work, while bounded evidence discovery
+/// must continue to account for preserved selected heads.
+pub(crate) fn read_evidence_batch(
+    root: &Path,
+    max_nodes: usize,
+    max_entries: usize,
+) -> Result<DiscoveryBatch, String> {
+    let mut batch = read_batch(root, &DiscoveryCursor::default(), max_nodes, max_entries)?;
+    if batch.more {
+        return Ok(batch);
+    }
+
+    let remaining_nodes = max_nodes.saturating_sub(batch.nodes_examined);
+    let remaining_entries = max_entries.saturating_sub(batch.entries_examined);
+    if remaining_nodes == 0 || remaining_entries == 0 {
+        batch.more = true;
+        return Ok(batch);
+    }
+
+    let archive = walk_class(
+        root,
+        DiscoveryClass::Archive,
+        None,
+        remaining_nodes,
+        remaining_entries,
+    )?;
+    batch.nodes_examined = batch.nodes_examined.saturating_add(archive.nodes_examined);
+    batch.entries_examined = batch.entries_examined.saturating_add(archive.entries.len());
+    batch.issues.extend(archive.issues);
+    batch
+        .entries
+        .extend(archive.entries.into_iter().filter(|entry| {
+            entry.issue.is_some()
+                || entry
+                    .record
+                    .as_ref()
+                    .is_none_or(|record| record.phase == DiscoveryPhase::PreservedDeadHead)
+        }));
+    batch.more = archive.more;
+    Ok(batch)
 }
 
 struct WalkBatch {
@@ -1043,6 +1096,98 @@ mod tests {
             .unwrap();
         assert_eq!(class, DiscoveryClass::Active);
         assert_eq!(active.phase, DiscoveryPhase::Closed);
+    }
+
+    #[test]
+    fn evidence_discovery_includes_only_preserved_dead_heads_from_archive() {
+        let root = tempfile::tempdir().unwrap();
+        record(root.path(), 1, 11);
+        record(root.path(), 2, 12);
+        move_generation_class(
+            root.path(),
+            WriterInstanceId::from_bytes([1; 16]),
+            GenerationId::from_bytes([11; 16]),
+            DiscoveryClass::Active,
+            DiscoveryClass::Archive,
+            DiscoveryPhase::Retired,
+        )
+        .unwrap();
+        move_generation_class(
+            root.path(),
+            WriterInstanceId::from_bytes([2; 16]),
+            GenerationId::from_bytes([12; 16]),
+            DiscoveryClass::Active,
+            DiscoveryClass::Archive,
+            DiscoveryPhase::PreservedDeadHead,
+        )
+        .unwrap();
+
+        let maintenance = read_batch(root.path(), &DiscoveryCursor::default(), 256, 8).unwrap();
+        assert!(maintenance.entries.is_empty());
+        assert!(!maintenance.more);
+
+        let evidence = read_evidence_batch(root.path(), 256, 8).unwrap();
+        assert!(!evidence.more);
+        assert_eq!(evidence.entries_examined, 2);
+        assert_eq!(evidence.entries.len(), 1);
+        assert_eq!(
+            evidence.entries[0].writer,
+            WriterInstanceId::from_bytes([2; 16])
+        );
+        assert_eq!(
+            evidence.entries[0].record.as_ref().unwrap().phase,
+            DiscoveryPhase::PreservedDeadHead
+        );
+    }
+
+    #[test]
+    fn archive_budget_exhaustion_is_incomplete_through_public_metric_query() {
+        let root = tempfile::tempdir().unwrap();
+        record(root.path(), 1, 11);
+        record(root.path(), 2, 12);
+        move_generation_class(
+            root.path(),
+            WriterInstanceId::from_bytes([1; 16]),
+            GenerationId::from_bytes([11; 16]),
+            DiscoveryClass::Active,
+            DiscoveryClass::Archive,
+            DiscoveryPhase::Retired,
+        )
+        .unwrap();
+        move_generation_class(
+            root.path(),
+            WriterInstanceId::from_bytes([2; 16]),
+            GenerationId::from_bytes([12; 16]),
+            DiscoveryClass::Active,
+            DiscoveryClass::Archive,
+            DiscoveryPhase::PreservedDeadHead,
+        )
+        .unwrap();
+
+        let evidence = read_evidence_batch(root.path(), 256, 1).unwrap();
+        assert!(evidence.entries.is_empty());
+        assert_eq!(evidence.entries_examined, 1);
+        assert!(evidence.more);
+
+        let discovery =
+            crate::event_store::discover_generation_read_targets(root.path(), 256, 1).unwrap();
+        assert!(discovery.targets.is_empty());
+        assert!(discovery.more);
+        assert!(matches!(
+            discovery.coverage,
+            crate::event_store::DiscoveryCoverage::Incomplete { .. }
+        ));
+
+        let mut query = crate::longitudinal_metrics::MetricQuery::recent(1).unwrap();
+        query.discovery_max_nodes = 256;
+        query.discovery_max_entries = 1;
+        let report = crate::longitudinal_metrics::query_metrics(root.path(), &query).unwrap();
+        assert!(!report.coverage_complete);
+        assert!(report.discovery_issues.is_empty());
+        assert!(report.read_issues.iter().any(|issue| matches!(
+            issue.kind,
+            crate::event_store::CoverageIssueKind::DiscoveryCoverageIncomplete
+        )));
     }
 
     #[test]

@@ -19,8 +19,10 @@ use rusqlite::{Connection, OpenFlags};
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -38,6 +40,8 @@ pub struct EventWriterConfig {
     pub source: GenerationSource,
     pub queue_capacity: usize,
     pub rotation_soft_bytes: u64,
+    #[cfg(test)]
+    test_now_unix_micros: Option<Arc<AtomicI64>>,
 }
 
 impl EventWriterConfig {
@@ -48,7 +52,17 @@ impl EventWriterConfig {
             source: GenerationSource::NativeProcess,
             queue_capacity: DEFAULT_EVENT_WRITER_QUEUE_CAPACITY,
             rotation_soft_bytes: DEFAULT_GENERATION_ROTATION_SOFT_BYTES,
+            #[cfg(test)]
+            test_now_unix_micros: None,
         }
+    }
+
+    fn now_unix_micros(&self) -> Result<i64, WriterError> {
+        #[cfg(test)]
+        if let Some(now) = &self.test_now_unix_micros {
+            return Ok(now.load(AtomicOrdering::SeqCst));
+        }
+        now_unix_micros()
     }
 
     fn validate(&self) -> Result<(), WriterError> {
@@ -221,9 +235,21 @@ enum Command {
 
 pub struct ProcessEventWriter {
     writer_instance_id: WriterInstanceId,
-    sender: Option<SyncSender<Command>>,
+    sender: Arc<RwLock<Option<SyncSender<Command>>>>,
     admission: Arc<Mutex<AdmissionState>>,
     worker: Option<JoinHandle<()>>,
+}
+
+/// Cloneable access to the exact process writer's bounded admission path.
+///
+/// The owning [`ProcessEventWriter`] remains single-use for lifecycle closure.
+/// Submission handles share its admission fence and sender slot, so shutdown
+/// can stop and disconnect every handle without holding lifecycle ownership
+/// while a durable caller waits for its worker reply.
+#[derive(Clone)]
+pub(crate) struct ProcessEventWriterSubmission {
+    sender: Arc<RwLock<Option<SyncSender<Command>>>>,
+    admission: Arc<Mutex<AdmissionState>>,
 }
 
 impl ProcessEventWriter {
@@ -239,8 +265,9 @@ impl ProcessEventWriter {
             generation_id: initial_generation,
             accepting: true,
         }));
-        let worker_admission = Arc::clone(&admission);
         let (sender, receiver) = mpsc::sync_channel(state.config.queue_capacity);
+        let sender = Arc::new(RwLock::new(Some(sender)));
+        let worker_admission = Arc::clone(&admission);
         let worker = thread::Builder::new()
             .name(format!(
                 "event-writer-{}",
@@ -252,7 +279,7 @@ impl ProcessEventWriter {
             })?;
         Ok(Self {
             writer_instance_id,
-            sender: Some(sender),
+            sender,
             admission,
             worker: Some(worker),
         })
@@ -266,90 +293,26 @@ impl ProcessEventWriter {
         Ok(self.lock_admission()?.generation_id)
     }
 
+    pub(crate) fn submission_handle(&self) -> ProcessEventWriterSubmission {
+        ProcessEventWriterSubmission {
+            sender: Arc::clone(&self.sender),
+            admission: Arc::clone(&self.admission),
+        }
+    }
+
     pub fn try_append(&self, event: EventEnvelopeV1) -> Result<PendingAppend, EnqueueError> {
-        let admission = match self.admission.try_lock() {
-            Ok(admission) => admission,
-            Err(TryLockError::WouldBlock) => {
-                return Err(EnqueueError {
-                    kind: EnqueueErrorKind::Full,
-                    event: Box::new(event),
-                    ticket: None,
-                });
-            }
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(EnqueueError {
-                    kind: EnqueueErrorKind::Disconnected,
-                    event: Box::new(event),
-                    ticket: None,
-                });
-            }
-        };
-        let ticket = AppendTicket::new(admission.generation_id, &event)
-            .expect("a normalized event must yield a ticket");
-        if !admission.accepting {
-            return Err(EnqueueError {
-                kind: EnqueueErrorKind::Disconnected,
-                event: Box::new(event),
-                ticket: Some(ticket),
-            });
-        }
-        let (reply, receiver) = mpsc::sync_channel(EVENT_WRITER_REPLY_CHANNEL_CAPACITY);
-        let command = Command::Append {
-            ticket: ticket.clone(),
-            event: Box::new(event),
-            enqueued_at: Instant::now(),
-            reply,
-        };
-        let sender = match &self.sender {
-            Some(sender) => sender,
-            None => {
-                let Command::Append { event, .. } = command else {
-                    unreachable!()
-                };
-                return Err(EnqueueError {
-                    kind: EnqueueErrorKind::Disconnected,
-                    event,
-                    ticket: Some(ticket),
-                });
-            }
-        };
-        match sender.try_send(command) {
-            Ok(()) => Ok(PendingAppend { ticket, receiver }),
-            Err(TrySendError::Full(Command::Append { event, .. })) => Err(EnqueueError {
-                kind: EnqueueErrorKind::Full,
-                event,
-                ticket: Some(ticket),
-            }),
-            Err(TrySendError::Disconnected(Command::Append { event, .. })) => Err(EnqueueError {
-                kind: EnqueueErrorKind::Disconnected,
-                event,
-                ticket: Some(ticket),
-            }),
-            Err(_) => unreachable!("try_append sends only append commands"),
-        }
+        self.submission_handle().try_append(event)
     }
 
     /// Synchronous only after bounded admission succeeds. A full queue returns
     /// explicit backpressure; this method never waits for queue capacity.
     pub fn append(&self, event: EventEnvelopeV1) -> Result<AppendReceipt, WriterError> {
-        self.try_append(event)
-            .map_err(|error| match error.kind {
-                EnqueueErrorKind::Full => WriterError::QueueFull,
-                EnqueueErrorKind::Disconnected => WriterError::QueueDisconnected,
-            })?
-            .wait()
+        self.submission_handle().append(event)
     }
 
     pub fn request_rotation(&self) -> Result<RotationReceipt, WriterError> {
         let (reply, result) = mpsc::sync_channel(EVENT_WRITER_REPLY_CHANNEL_CAPACITY);
-        self.sender
-            .as_ref()
-            .ok_or(WriterError::QueueDisconnected)?
-            .try_send(Command::Rotate { reply })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => WriterError::QueueFull,
-                TrySendError::Disconnected(_) => WriterError::QueueDisconnected,
-            })?;
+        self.send_control(Command::Rotate { reply })?;
         result
             .recv()
             .map_err(|_| WriterError::ReplyDisconnected { ticket: None })?
@@ -362,17 +325,25 @@ impl ProcessEventWriter {
             });
         }
         let (reply, result) = mpsc::sync_channel(EVENT_WRITER_REPLY_CHANNEL_CAPACITY);
-        self.sender
-            .as_ref()
-            .ok_or(WriterError::QueueDisconnected)?
-            .try_send(Command::Reconcile { ticket, reply })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => WriterError::QueueFull,
-                TrySendError::Disconnected(_) => WriterError::QueueDisconnected,
-            })?;
+        self.send_control(Command::Reconcile { ticket, reply })?;
         result
             .recv()
             .map_err(|_| WriterError::ReplyDisconnected { ticket: None })
+    }
+
+    fn send_control(&self, command: Command) -> Result<(), WriterError> {
+        let sender = self
+            .sender
+            .read()
+            .map_err(|_| WriterError::QueueDisconnected)?;
+        sender
+            .as_ref()
+            .ok_or(WriterError::QueueDisconnected)?
+            .try_send(command)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => WriterError::QueueFull,
+                TrySendError::Disconnected(_) => WriterError::QueueDisconnected,
+            })
     }
 
     pub fn retry_unknown(
@@ -408,19 +379,22 @@ impl ProcessEventWriter {
     }
 
     pub fn shutdown(mut self) -> Result<(), WriterError> {
-        {
+        let sender = {
             let mut admission = self.lock_admission()?;
             admission.accepting = false;
-        }
+            self.sender
+                .write()
+                .map_err(|_| WriterError::QueueDisconnected)?
+                .take()
+                .ok_or(WriterError::QueueDisconnected)?
+        };
         let (reply, result) = mpsc::sync_channel(EVENT_WRITER_REPLY_CHANNEL_CAPACITY);
-        self.sender
-            .take()
-            .ok_or(WriterError::QueueDisconnected)?
-            .try_send(Command::Shutdown { reply })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => WriterError::QueueFull,
-                TrySendError::Disconnected(_) => WriterError::QueueDisconnected,
-            })?;
+        // Admission is fenced and the shared sender slot is empty, so no new
+        // work can enter. Waiting here for one control slot lets the worker
+        // drain every pre-fence command even when the bounded queue was full.
+        sender
+            .send(Command::Shutdown { reply })
+            .map_err(|_| WriterError::QueueDisconnected)?;
         result
             .recv()
             .map_err(|_| WriterError::ReplyDisconnected { ticket: None })??;
@@ -437,14 +411,7 @@ impl ProcessEventWriter {
     #[cfg(test)]
     pub(crate) fn fail_next_append_for_test(&self) -> Result<(), WriterError> {
         let (armed, result) = mpsc::sync_channel(EVENT_WRITER_REPLY_CHANNEL_CAPACITY);
-        self.sender
-            .as_ref()
-            .ok_or(WriterError::QueueDisconnected)?
-            .try_send(Command::FailNextAppend { armed })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => WriterError::QueueFull,
-                TrySendError::Disconnected(_) => WriterError::QueueDisconnected,
-            })?;
+        self.send_control(Command::FailNextAppend { armed })?;
         result
             .recv()
             .map_err(|_| WriterError::ReplyDisconnected { ticket: None })
@@ -454,17 +421,10 @@ impl ProcessEventWriter {
     pub(crate) fn pause_for_test(&self) -> Result<SyncSender<()>, WriterError> {
         let (entered, entered_result) = mpsc::sync_channel(EVENT_WRITER_REPLY_CHANNEL_CAPACITY);
         let (release, release_result) = mpsc::sync_channel(EVENT_WRITER_REPLY_CHANNEL_CAPACITY);
-        self.sender
-            .as_ref()
-            .ok_or(WriterError::QueueDisconnected)?
-            .try_send(Command::Pause {
-                entered,
-                release: release_result,
-            })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => WriterError::QueueFull,
-                TrySendError::Disconnected(_) => WriterError::QueueDisconnected,
-            })?;
+        self.send_control(Command::Pause {
+            entered,
+            release: release_result,
+        })?;
         entered_result
             .recv()
             .map_err(|_| WriterError::ReplyDisconnected { ticket: None })?;
@@ -478,12 +438,107 @@ impl ProcessEventWriter {
     }
 }
 
+impl ProcessEventWriterSubmission {
+    pub(crate) fn try_append(&self, event: EventEnvelopeV1) -> Result<PendingAppend, EnqueueError> {
+        let admission = match self.admission.try_lock() {
+            Ok(admission) => admission,
+            Err(TryLockError::WouldBlock) => {
+                return Err(EnqueueError {
+                    kind: EnqueueErrorKind::Full,
+                    event: Box::new(event),
+                    ticket: None,
+                });
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(EnqueueError {
+                    kind: EnqueueErrorKind::Disconnected,
+                    event: Box::new(event),
+                    ticket: None,
+                });
+            }
+        };
+        let ticket = AppendTicket::new(admission.generation_id, &event)
+            .expect("a normalized event must yield a ticket");
+        if !admission.accepting {
+            return Err(EnqueueError {
+                kind: EnqueueErrorKind::Disconnected,
+                event: Box::new(event),
+                ticket: Some(ticket),
+            });
+        }
+        let (reply, receiver) = mpsc::sync_channel(EVENT_WRITER_REPLY_CHANNEL_CAPACITY);
+        let command = Command::Append {
+            ticket: ticket.clone(),
+            event: Box::new(event),
+            enqueued_at: Instant::now(),
+            reply,
+        };
+        let sender = match self.sender.read() {
+            Ok(sender) => sender,
+            Err(_) => {
+                let Command::Append { event, .. } = command else {
+                    unreachable!()
+                };
+                return Err(EnqueueError {
+                    kind: EnqueueErrorKind::Disconnected,
+                    event,
+                    ticket: Some(ticket),
+                });
+            }
+        };
+        let Some(sender) = sender.as_ref() else {
+            let Command::Append { event, .. } = command else {
+                unreachable!()
+            };
+            return Err(EnqueueError {
+                kind: EnqueueErrorKind::Disconnected,
+                event,
+                ticket: Some(ticket),
+            });
+        };
+        match sender.try_send(command) {
+            Ok(()) => Ok(PendingAppend { ticket, receiver }),
+            Err(TrySendError::Full(Command::Append { event, .. })) => Err(EnqueueError {
+                kind: EnqueueErrorKind::Full,
+                event,
+                ticket: Some(ticket),
+            }),
+            Err(TrySendError::Disconnected(Command::Append { event, .. })) => Err(EnqueueError {
+                kind: EnqueueErrorKind::Disconnected,
+                event,
+                ticket: Some(ticket),
+            }),
+            Err(_) => unreachable!("try_append sends only append commands"),
+        }
+    }
+
+    /// Synchronous only after bounded admission succeeds. A full queue returns
+    /// explicit backpressure; this method never waits for queue capacity.
+    pub(crate) fn append(&self, event: EventEnvelopeV1) -> Result<AppendReceipt, WriterError> {
+        self.try_append(event)
+            .map_err(|error| match error.kind {
+                EnqueueErrorKind::Full => WriterError::QueueFull,
+                EnqueueErrorKind::Disconnected => WriterError::QueueDisconnected,
+            })?
+            .wait()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accepting_for_test(&self) -> bool {
+        self.admission
+            .lock()
+            .is_ok_and(|admission| admission.accepting)
+    }
+}
+
 impl Drop for ProcessEventWriter {
     fn drop(&mut self) {
         if let Ok(mut admission) = self.admission.lock() {
             admission.accepting = false;
         }
-        self.sender.take();
+        if let Ok(mut sender) = self.sender.write() {
+            sender.take();
+        }
         // Do not make a destructor an unbounded disk wait. Receiver disconnect
         // causes the worker to best-effort close its exact current generation.
         self.worker.take();
@@ -521,7 +576,7 @@ impl WriterState {
         owner: WriterOwnershipGuard,
     ) -> Result<Self, WriterError> {
         let generation_id = GenerationId::random();
-        let created_at = now_unix_micros()?;
+        let created_at = config.now_unix_micros()?;
         let manifest = build_manifest(&config, generation_id, None, created_at, 0);
         // Own the exact shared generation lease before the discovery intent
         // becomes visible. Detached classification can therefore never win an
@@ -687,7 +742,7 @@ impl WriterState {
     }
 
     fn should_rotate(&self) -> Result<bool, WriterError> {
-        let now = now_unix_micros()?;
+        let now = self.config.now_unix_micros()?;
         if utc_day(now) != self.generation_day {
             return Ok(true);
         }
@@ -936,7 +991,7 @@ fn rotate_exact_current(
 ) -> Result<RotationReceipt, WriterError> {
     let previous_generation_id = state.generation_id;
     let successor = GenerationId::random();
-    let created_at = now_unix_micros()?;
+    let created_at = state.config.now_unix_micros()?;
     let next_epoch = state.head_epoch + 1;
     let manifest = build_manifest(
         &state.config,
@@ -967,7 +1022,7 @@ fn rotate_exact_current(
     }
     *pending = controls;
 
-    let closed_at = now_unix_micros()?;
+    let closed_at = state.config.now_unix_micros()?;
     close_generation(state.connection_mut()?, closed_at, successor)?;
     drop(state.connection.take());
     let _ = super::maintenance_discovery::record_closed_generation(
@@ -1280,19 +1335,7 @@ mod tests {
     }
 
     fn pause(writer: &ProcessEventWriter) -> SyncSender<()> {
-        let (entered_tx, entered_rx) = mpsc::sync_channel(EVENT_WRITER_REPLY_CHANNEL_CAPACITY);
-        let (release_tx, release_rx) = mpsc::sync_channel(EVENT_WRITER_REPLY_CHANNEL_CAPACITY);
-        writer
-            .sender
-            .as_ref()
-            .unwrap()
-            .try_send(Command::Pause {
-                entered: entered_tx,
-                release: release_rx,
-            })
-            .unwrap();
-        entered_rx.recv().unwrap();
-        release_tx
+        writer.pause_for_test().unwrap()
     }
 
     #[test]
@@ -1341,10 +1384,7 @@ mod tests {
         let before = writer.try_append(event(&identity, 1, 1)).unwrap();
         let (rotation_tx, rotation_rx) = mpsc::sync_channel(EVENT_WRITER_REPLY_CHANNEL_CAPACITY);
         writer
-            .sender
-            .as_ref()
-            .unwrap()
-            .try_send(Command::Rotate { reply: rotation_tx })
+            .send_control(Command::Rotate { reply: rotation_tx })
             .unwrap();
         // This admission happens after the rotate request is queued, but the
         // rotation fence must drain its already-fixed old-head ticket.
@@ -1409,6 +1449,162 @@ mod tests {
         assert_ne!(restart_head, rotation.current_generation_id);
         restarted.append(event(&identity, 3, 3)).unwrap();
         restarted.shutdown().unwrap();
+    }
+
+    #[test]
+    fn active_writer_rotates_after_each_observed_utc_day_change() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = producer(14);
+        let day_micros = 86_400_000_000_i64;
+        let clock = Arc::new(AtomicI64::new(10 * day_micros + 1));
+        let mut config = EventWriterConfig::native(root.path(), identity.clone());
+        config.test_now_unix_micros = Some(Arc::clone(&clock));
+        let writer = ProcessEventWriter::start(config).unwrap();
+        let first = writer.current_generation_id().unwrap();
+
+        writer.append(event(&identity, 1, 1)).unwrap();
+        assert_eq!(writer.current_generation_id().unwrap(), first);
+
+        clock.store(11 * day_micros + 1, AtomicOrdering::SeqCst);
+        writer.append(event(&identity, 2, 2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let second = loop {
+            let observed = writer.current_generation_id().unwrap();
+            if observed != first {
+                break observed;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "first daily rotation did not finish"
+            );
+            thread::yield_now();
+        };
+
+        clock.store(12 * day_micros + 1, AtomicOrdering::SeqCst);
+        writer.append(event(&identity, 3, 3)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let third = loop {
+            let observed = writer.current_generation_id().unwrap();
+            if observed != second {
+                break observed;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "second daily rotation did not finish"
+            );
+            thread::yield_now();
+        };
+
+        assert_ne!(third, first);
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    #[ignore = "bounded timing observation; run explicitly with --ignored --nocapture"]
+    fn observe_rotation_with_small_and_retained_generation_sets() {
+        fn sample(retained_generations: usize, producer_id: u8) -> (usize, Vec<u128>) {
+            let root = tempfile::tempdir().unwrap();
+            let identity = producer(producer_id);
+            let writer =
+                ProcessEventWriter::start(EventWriterConfig::native(root.path(), identity.clone()))
+                    .unwrap();
+            for _ in 0..retained_generations {
+                writer.request_rotation().unwrap();
+            }
+            let writer_dir = root
+                .path()
+                .join("writers")
+                .join(super::super::generation::id_hex(
+                    identity.writer_instance_id.as_bytes(),
+                ));
+            let before = fs::read_dir(writer_dir.join("generations"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .count();
+            let mut elapsed_micros = Vec::new();
+            for _ in 0..3 {
+                let started = Instant::now();
+                writer.request_rotation().unwrap();
+                elapsed_micros.push(started.elapsed().as_micros());
+            }
+            writer.shutdown().unwrap();
+            (before, elapsed_micros)
+        }
+
+        let (small_count, small_samples) = sample(0, 91);
+        let (retained_count, retained_samples) = sample(12, 92);
+        assert_eq!(small_count, 1);
+        assert_eq!(retained_count, 13);
+        eprintln!(
+            "AGE374_ROTATION_OBSERVATION small_generation_count={small_count} small_elapsed_micros={small_samples:?} retained_generation_count={retained_count} retained_elapsed_micros={retained_samples:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_rotation_succeeds_when_a_history_dependent_neighbor_cannot_read_retained_heads() {
+        use std::io;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions(Vec<PathBuf>);
+
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+                }
+            }
+        }
+
+        fn history_dependent_neighbor(generations: &Path, current: &str) -> io::Result<usize> {
+            let mut examined = 0;
+            for entry in fs::read_dir(generations)? {
+                let entry = entry?;
+                if entry.file_name().to_str() == Some(current) {
+                    continue;
+                }
+                fs::read(
+                    entry
+                        .path()
+                        .join(super::super::generation::PREPARED_MANIFEST_FILE_NAME),
+                )?;
+                examined += 1;
+            }
+            Ok(examined)
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let identity = producer(93);
+        let writer =
+            ProcessEventWriter::start(EventWriterConfig::native(root.path(), identity.clone()))
+                .unwrap();
+        for _ in 0..12 {
+            writer.request_rotation().unwrap();
+        }
+        let current = writer.current_generation_id().unwrap();
+        let current_name = super::super::generation::id_hex(current.as_bytes());
+        let layout =
+            WriterLayout::open_existing(root.path(), *identity.writer_instance_id.as_bytes())
+                .unwrap();
+        let mut protected = Vec::new();
+        for entry in fs::read_dir(layout.generations_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().and_then(|name| name.to_str()) != Some(&current_name) {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+                protected.push(path);
+            }
+        }
+        assert_eq!(protected.len(), 12);
+        let restore = RestorePermissions(protected);
+
+        let neighbor_error = history_dependent_neighbor(layout.generations_dir(), &current_name)
+            .expect_err("the history-dependent neighbor unexpectedly read protected history");
+        assert_eq!(neighbor_error.kind(), io::ErrorKind::PermissionDenied);
+
+        let rotation = writer.request_rotation().unwrap();
+        assert_eq!(rotation.previous_generation_id, current);
+        drop(restore);
+        writer.shutdown().unwrap();
     }
 
     #[test]
