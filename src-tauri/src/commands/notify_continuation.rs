@@ -8,6 +8,28 @@ use oulipoly_state::mailbox::{CompletionEventTriggerInput, MailboxDb};
 use oulipoly_state::{InvocationMutationAuthority, StateDb};
 use serde_json::{Value, json};
 use std::path::Path;
+use std::time::Duration;
+
+const COMPLETION_REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// A completion registration coordinates State and the PID mailbox sidecar.
+/// The persistence layer deliberately releases State instead of waiting while
+/// it owns State and finds the sidecar busy. Retry the complete operation here,
+/// after that transaction has unwound, so ordinary concurrent sidecar writers
+/// create backpressure rather than turning a valid launch into a terminal
+/// registration-outcome-unknown failure.
+pub(super) fn register_with_backpressure<T>(
+    mut operation: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    loop {
+        match operation() {
+            Err(error) if error.contains("completion_authority_contention:") => {
+                std::thread::sleep(COMPLETION_REGISTRATION_RETRY_INTERVAL);
+            }
+            result => return result,
+        }
+    }
+}
 
 pub(crate) fn load_binding(path: &Path) -> Result<AdmittedSourceBinding, String> {
     let directory = path.parent().ok_or("registration has no directory")?;
@@ -68,12 +90,14 @@ pub(crate) fn register(
         crate::completion_owner::require_owner(&source.domain_id)?;
         let authority =
             oulipoly_state::CompletionRegistrationAuthority::from_process_environment()?;
-        let mut state = StateDb::open_default()?;
-        let registration = state.register_completion_continuation_with_authority(
-            InvocationMutationAuthority::Standalone,
-            &authority,
-            &binding,
-        )?;
+        let registration = register_with_backpressure(|| {
+            let mut state = StateDb::open_default()?;
+            state.register_completion_continuation_with_authority(
+                InvocationMutationAuthority::Standalone,
+                &authority,
+                &binding,
+            )
+        })?;
         #[cfg(feature = "age360-fault-fixtures")]
         oulipoly_state::completion_continuation::age360_fault_barrier("registration-committed");
         let mut value = response(
@@ -318,12 +342,14 @@ pub(crate) fn listen(path: &Path, session_id: &str, invocation_uuid: &str) -> Re
         crate::completion_owner::require_owner(&binding.registration()?.domain_id)?;
         let authority =
             oulipoly_state::CompletionRegistrationAuthority::from_process_environment()?;
-        let mut state = StateDb::open_default()?;
-        let registered = state.register_completion_continuation_with_authority(
-            InvocationMutationAuthority::Standalone,
-            &authority,
-            &binding,
-        )?;
+        let registered = register_with_backpressure(|| {
+            let mut state = StateDb::open_default()?;
+            state.register_completion_continuation_with_authority(
+                InvocationMutationAuthority::Standalone,
+                &authority,
+                &binding,
+            )
+        })?;
         let mut value = response(&binding, "listener_registered")?;
         value["listener_revision"] = json!(registered.listeners.len());
         value["listeners"] =
@@ -331,6 +357,44 @@ pub(crate) fn listen(path: &Path, session_id: &str, invocation_uuid: &str) -> Re
         Ok(value)
     })();
     emit(&operation_result(&binding, result)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::register_with_backpressure;
+
+    #[test]
+    fn completion_authority_contention_retries_after_the_state_transaction_unwinds() {
+        let mut attempts = 0;
+        let result = register_with_backpressure(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(
+                    "process_integrity: completion_authority_contention: database is locked"
+                        .to_string(),
+                )
+            } else {
+                Ok("registered")
+            }
+        })
+        .unwrap();
+
+        assert_eq!(result, "registered");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn non_contention_registration_failures_are_not_retried() {
+        let mut attempts = 0;
+        let error = register_with_backpressure(|| {
+            attempts += 1;
+            Err::<(), _>("immutable v2 owner binding conflict".to_string())
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "immutable v2 owner binding conflict");
+        assert_eq!(attempts, 1);
+    }
 }
 
 /// Own the complete immutable body before materializing any notification. The

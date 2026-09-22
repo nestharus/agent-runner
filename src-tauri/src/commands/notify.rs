@@ -247,8 +247,6 @@ fn register_completion_event(
     let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc)?;
     let metadata = read_metadata(args.meta)?;
     let owner = parse_owner_binding(&metadata)?;
-    let mut state = StateDb::open_default()?;
-    reconcile_owner_binding(&state, &owner, &metadata)?;
     let admission_id = completion_obligation_admission_id(args.handle, &owner.invocation_uuid);
     let registration = CompletionEventRegistrationInput {
         event_id: args.handle,
@@ -260,22 +258,29 @@ fn register_completion_event(
         log_path: &paths.log_path,
         rc_path: &paths.rc_path,
     };
-    if args.repair_admitted {
-        state.repair_admitted_completion_event(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
-            &admission_id,
-            registration,
-        )
-    } else {
-        let authority =
-            oulipoly_state::CompletionRegistrationAuthority::from_process_environment()?;
-        state.register_completion_event_with_authority(
-            oulipoly_state::InvocationMutationAuthority::Standalone,
-            &authority,
-            &admission_id,
-            registration,
-        )
-    }
+    let authority = (!args.repair_admitted)
+        .then(oulipoly_state::CompletionRegistrationAuthority::from_process_environment)
+        .transpose()?;
+    super::notify_continuation::register_with_backpressure(|| {
+        let mut state = StateDb::open_default()?;
+        reconcile_owner_binding(&state, &owner, &metadata)?;
+        if args.repair_admitted {
+            state.repair_admitted_completion_event(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                &admission_id,
+                registration,
+            )
+        } else {
+            state.register_completion_event_with_authority(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                authority
+                    .as_ref()
+                    .expect("live registration loaded completion authority"),
+                &admission_id,
+                registration,
+            )
+        }
+    })
 }
 
 pub(super) fn validate_continuation_registration_context(

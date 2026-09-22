@@ -1778,16 +1778,13 @@ impl MailboxDb {
         configure_writable_sidecar_connection(&conn)?;
         conn.busy_timeout(StdDuration::ZERO)
             .map_err(|e| e.to_string())?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
-            .map_err(|e| {
-                if sqlite_error_is_contention(&e) {
-                    format!(
-                        "completion_authority_contention: sidecar initialization unavailable: {e}"
-                    )
-                } else {
-                    format!("Failed to initialize PID mailbox sidecar: {e}")
-                }
-            })?;
+        configure_writable_sidecar_durability(&conn).map_err(|e| {
+            if sqlite_error_is_contention(&e) {
+                format!("completion_authority_contention: sidecar initialization unavailable: {e}")
+            } else {
+                format!("Failed to initialize PID mailbox sidecar: {e}")
+            }
+        })?;
         schema::ensure_without_wait(&mut conn)?;
         Ok(Self {
             conn,
@@ -11545,7 +11542,7 @@ pub(crate) fn set_wal_mode(conn: &Connection) -> Result<(), String> {
     const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(10);
 
     loop {
-        match conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;") {
+        match configure_writable_sidecar_durability(conn) {
             Ok(()) => return Ok(()),
             Err(error) if sqlite_error_is_contention(&error) => {
                 std::thread::sleep(RETRY_INTERVAL);
@@ -11557,6 +11554,15 @@ pub(crate) fn set_wal_mode(conn: &Connection) -> Result<(), String> {
             }
         }
     }
+}
+
+fn configure_writable_sidecar_durability(conn: &Connection) -> rusqlite::Result<()> {
+    let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if journal_mode.eq_ignore_ascii_case("wal") {
+        return conn.execute_batch("PRAGMA synchronous=FULL;");
+    }
+
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
 }
 
 pub(crate) fn configure_writable_sidecar_connection(conn: &Connection) -> Result<(), String> {

@@ -154,6 +154,7 @@ impl WritableOpenError {
             self,
             Self::Migration(
                 crate::migrations::MigrationError::Incompatible { .. }
+                    | crate::migrations::MigrationError::InvalidGap { .. }
                     | crate::migrations::MigrationError::UnrecognizedShape { .. }
             )
         )
