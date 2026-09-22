@@ -7116,6 +7116,8 @@ impl WakeSessionRepository<'_> {
         Ok(changed > 0)
     }
 
+    /// Launch-side observation cannot replace or erase an admitted receiver.
+    /// A claim created with an invocation UUID but no PID may still be initialized.
     pub fn record_wake_claim_pid(
         &mut self,
         session_id: &str,
@@ -7130,13 +7132,16 @@ impl WakeSessionRepository<'_> {
                      wake_os_boot_id = NULL,
                      wake_os_pid_starttime_ticks = NULL
                  WHERE session_id = ?1
-                   AND claim_token = ?2",
+                   AND claim_token = ?2
+                   AND (wake_invocation_uuid IS NULL OR wake_pid IS NULL)",
                 params![session_id, claim_token, wake_pid],
             )
             .map_err(|err| format!("Failed to record wake claim PID: {err}"))?;
         Ok(changed > 0)
     }
 
+    /// Child admission owns the identity once it has bound an invocation and PID.
+    /// Fence in the UPDATE, not a preceding read: admission may race this observation.
     pub fn record_wake_claim_pid_identity(
         &mut self,
         session_id: &str,
@@ -7151,7 +7156,8 @@ impl WakeSessionRepository<'_> {
                      wake_os_boot_id = ?4,
                      wake_os_pid_starttime_ticks = ?5
                  WHERE session_id = ?1
-                   AND claim_token = ?2",
+                   AND claim_token = ?2
+                   AND (wake_invocation_uuid IS NULL OR wake_pid IS NULL)",
                 params![
                     session_id,
                     claim_token,
@@ -20999,6 +21005,12 @@ mod tests {
             .unwrap();
         let (attempt, custodian) = prepare_wake_launcher(&mut db);
         let admitted_identity = current_identity();
+        assert!(
+            db.wake_sessions()
+                .record_wake_claim_pid("session-a", "token-a", i64::MAX)
+                .unwrap(),
+            "a pre-admission placeholder may be recorded"
+        );
 
         assert!(
             !db.wake_sessions()
@@ -21033,8 +21045,52 @@ mod tests {
             .wake_sessions()
             .validate_wake_claim_for_child("session-a", "token-a", &foreign_identity)
             .unwrap();
+        let late_live_observation = db
+            .wake_sessions()
+            .record_wake_claim_pid_identity("session-a", "token-a", foreign_identity.os_pid)
+            .unwrap();
+        let late_numeric_observation = db
+            .wake_sessions()
+            .record_wake_claim_pid("session-a", "token-a", foreign_identity.os_pid)
+            .unwrap();
         foreign_child.kill().unwrap();
         foreign_child.wait().unwrap();
+        assert!(
+            !late_live_observation,
+            "a late launch-owner observation must not replace the admitted receiver"
+        );
+        assert!(
+            !late_numeric_observation,
+            "a numeric launch observation must not erase the admitted receiver identity"
+        );
+        let retained = db
+            .wake_session_reader()
+            .wake_claim("session-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.wake_pid, Some(admitted_identity.os_pid));
+        let retained_identity = db
+            .conn
+            .query_row(
+                "SELECT wake_os_boot_id, wake_os_pid_starttime_ticks
+                 FROM session_wake_claim WHERE session_id = ?1 AND claim_token = ?2",
+                params!["session-a", "token-a"],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retained_identity,
+            (
+                admitted_identity.os_boot_id.clone(),
+                admitted_identity.os_pid_starttime_ticks,
+            )
+        );
+        assert!(
+            db.wake_sessions()
+                .validate_wake_claim_for_child("session-a", "token-a", &admitted_identity)
+                .unwrap(),
+            "late observations must not revoke the admitted receiver's replay authority"
+        );
         assert!(
             !foreign_replay,
             "a different process identity must not replay an admitted wake token"
