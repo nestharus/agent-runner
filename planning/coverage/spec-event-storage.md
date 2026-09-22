@@ -62,15 +62,21 @@
 | Evaluator receives an existing root or exceeds smoke guardrails. | It fails without deleting, truncating, or reusing the root. |
 | Concurrent producers append to producer-partitioned SQLite. | Each producer uses a distinct SQLite/WAL database; successful batch return follows a `synchronous=FULL` transaction commit. |
 | Multiple threads emit production events in one process. | They use that process's bounded event-writer worker and group commit; other process partitions do not share its WAL writer. |
+| Concurrent required-durable and best-effort calls overlap before shutdown. | Each call reaches the real bounded writer admission independently of another durable caller's reply wait. Required-durable waits only after enqueue; a best-effort call is rejected only by the writer's actual fence/capacity, not by process-sink lifecycle ownership. |
+| Shutdown overlaps accepted and new submissions. | The shared admission fence rejects post-fence work, pre-fence accepted work drains, the lifecycle owner consumes and closes the exact writer once, and repeated public shutdown is a no-op. |
 | A best-effort append is admitted and later fails in the event-writer worker. | The producer returns without waiting and protected work is unchanged. A bounded recorder-worker handoff retains the exact pre-fanout envelope until completion, then routes unknown write, identity/append failure, or reply loss to emergency JSONL. Handoff/fallback loss is an explicit bounded gap; successful normal-mode completion creates no shadow copy. |
 | Commit result is unknown. | Exact generation/event-ID/digest reconciliation precedes retry; missing/corrupt evidence remains `Unknown`, not absence. |
 | Reader searches time, family/kind, trace/span, invocation/session digest, process tree, or supervisor authority. | Local SQLite indexes answer candidate partitions; response includes partition watermarks, discovery/catalog coverage, and missing/corrupt/limited work. |
+| Detached rotation follow-up preserves a proven-dead selected head and archives its discovery record. | Ordinary bounded stable-ID, trace, and metric discovery still returns that exact generation from the archive. Unrelated archive entries consume the same budgets; if the preserved head is not reached, coverage is explicitly incomplete rather than a complete empty result. Detached maintenance does not reacquire archived work. |
 | Current head reaches the day/size/lifecycle rotation boundary. | Writer syncs and validates the prepared successor manifest/database, renames the complete staging directory, drains already-ticketed batches, closes the old generation, and publishes the successor through the inactive two-slot head record. It does not scan, checkpoint, compact, or retain old history synchronously. |
+| An ordinary production entrypoint returns after installing the process event sink. | It removes the process-local sink from new admission and invokes the exact writer's best-effort shutdown/rotation path after command or GUI work, preserving the original exit status and reporting closure failure as a gap. Successful closure drains accepted work, closes and links the predecessor, and publishes its exact successor once; a repeated public shutdown does not move the head. Abrupt death skips graceful closure and leaves the selected head fail-closed for detached preservation; no worker finalizes, reclaims, or transfers that head. |
+| Ordinary shutdown precedes or races first lazy process-sink initialization. | The process-global lifecycle has distinct never-installed, installed, and terminal shutdown states. The shared lifecycle order either publishes the completed installation and then takes/closes it, or terminalizes first and rejects initialization before writer/head creation. First installation and reinstallation stay rejected after terminal shutdown; repeated shutdown remains a no-op. |
 | Detached catalog is absent/stale. | Reader uses bounded manifest fallback or returns incomplete coverage; it never fabricates an empty complete result. |
 | Closed event partition passes the 30-day cutoff. | AGE-372 approves policy eligibility from AGE-376 prepared/sealed metadata; only an AGE-377 detached leased worker may checkpoint and atomically rename the complete generation directory to pending trash, publish a receipt, and unlink it. |
 | Ordinary GUI/provider startup offers daily maintenance. | Startup spawns the private child and proceeds without waiting; same-day requests converge through durable exact job locks/status. Offline diagnostics and the root-supervisor loop do not run maintenance. |
 | An independent producer's exact discovery shard is unavailable. | That publication fails before its first staging effect; another writer/generation publishes through a disjoint filesystem leaf without a shared maintenance writer or timeout. |
 | Publication stops after intent, staging creation, database preparation, prepared-manifest sync, publishing phase, or final-directory rename. | The exact sharded journal and bounded legacy cursor find the state. A proven-dead unselected empty prepared/incomplete staging artifact is dispositioned safely; an intent with no artifact is archived; a selected/live head is preserved. |
+| Publication is interrupted at a create, sync, checkpoint, close, or rename boundary. | Recovery must discriminate the exact resulting state without historical enumeration. The obligation covers every such boundary; deterministic post-operation fixtures are partial evidence, and boundaries lacking syscall-level fault injection remain explicitly unmet rather than removed from this contract. |
 | A discovery record retains a staging name but the only artifact is at the authoritative final path without a valid exact manifest. | Orphan classification reports preserved evidence and leaves every final-path byte in place; staging metadata does not authorize deletion of final data. |
 | One discovery leaf or legacy entry has invalid semantic content before a healthy candidate. | The global/legacy cursor records a bounded concrete issue, checkpoints past the bad entry, and admits later healthy work. The opportunity terminalizes preserved when concrete gaps remain, while the next daily detached opportunity rewalks legacy state without trusting an irreversible EOF marker. |
 | Operator inspects or cancels maintenance. | Offline status/diagnostics read the exact checkpoint and direct evidence without provider bootstrap. Cancellation requires exact kind, partition, and current epoch and shares the final move transition gate. |
@@ -102,6 +108,15 @@
 - One valid head slot may name an old generation marked closed while the other
   is absent/invalid after interruption; exact successor linkage allows recovery
   to finish publication without historical enumeration.
+- A synced inactive `HEAD.<slot>.tmp` without the final inactive slot leaves the
+  old valid head selected. Recovery validates the exact successor relationship;
+  it does not select the temporary record or enumerate unrelated generations.
+- A fully renamed inactive head that names a synced and validated exact
+  successor is selectable even when the following writer-directory sync has not
+  been exercised; the final sync's power-loss durability remains a distinct
+  unmet fault-injection obligation.
+- A synced prepared-manifest temp file without its create-once rename is not a
+  published manifest and cannot make the staging directory a visible head.
 - A prepared generation directory without a head is an orphan for detached
   audit, not a visible writable generation.
 - A manifest-less/corrupt final generation is preserved even if its discovery
@@ -210,8 +225,8 @@ current/midnight epoch validation, exact operator cancellation and the former
 check-to-rename race, direct evidence through the real offline reader, AGE-372
 cursor/as-of and cross-process/day discovery continuation, selected-head and
 exact-partition refusal, producer lease-before-intent ordering, independent
-producer publication with an unavailable discovery shard, every pre-head
-publication fixture boundary with its exact recovery successor,
+producer publication with an unavailable discovery shard, the supported
+pre-head visible-state fixtures with their exact recovery successors,
 prepared/incomplete-staging orphan discharge, manifest-less final preservation,
 bad-candidate and legacy-error advancement, bounded daily legacy rewalk, orphan
 process death/cancellation after disposition and after individual unlink steps,
@@ -229,6 +244,31 @@ fixture; no GUI integration or provider execution is claimed. Coordination
 retention exercises its production entry and proves that no normal event-head
 namespace is created. Rejected-request evidence failure proves the incumbent
 checkpoint records a diagnostic gap.
+
+AGE-374 tests compose the actual evidence path from a committed trace event,
+through producer death and detached `preserved_dead_head` archival, to the
+public trace query. Discovery fixtures prove archived preserved heads remain
+readable, while `archive_budget_exhaustion_is_incomplete_through_public_metric_query`
+proves both public discovery and a public metric query report incomplete when
+an unrelated archive prefix consumes the budget first. Writer tests cover
+deterministic UTC-day transitions, graceful sink shutdown through the exact
+rotation path, old-close/head-publication recovery, synced prepared-manifest
+and inactive-head temp states, and inactive-head rename before final directory
+sync. Process-sink concurrency tests prove two durable calls and an overlapping
+best-effort call reach real writer admission before replies, then prove shutdown
+fences new work, drains accepted work, and closes once. Isolated lifecycle tests
+prove shutdown before first initialization is terminal, initialization already
+holding lifecycle order is published and then closed by racing shutdown,
+post-shutdown default initialization creates no writer/head, installed closure
+runs once, and repeated shutdown is idempotent. A subprocess test
+crosses the ordinary binary entrypoint, installed global sink, public shutdown,
+and exact predecessor-close/successor-head relationship while preserving the
+original exit result. On Unix, a permission oracle proves a deliberately
+history-dependent neighbor cannot read retained generations while exact-current
+rotation succeeds. The ignored timing observation still only prints raw samples
+for one versus thirteen retained generations; it is not a benchmark, SLO,
+provider run, AGE-353 stress claim, or evidence for the still-unmet individual
+sync/syscall interruption boundaries enumerated in the architecture.
 
 `crates/oulipoly-state/src/retention.rs` additionally proves the inclusive
 30-day boundary, every fail-closed generation prerequisite, exact

@@ -2200,8 +2200,10 @@ fn acquire_resumable(
 mod tests {
     use super::*;
     use crate::event_store::{
-        Digest32, GenerationId, GenerationSource, HeadRecord, NativeProcessIdentity,
-        PreparedManifest, ProcessInstanceId, ProducerIdentity, SupervisorAuthorityId,
+        Digest32, EventCorrelations, EventEnvelopeV1, EventFamily, EventId, EventKind,
+        EventWriterConfig, GenerationId, GenerationSource, HeadRecord, NativeProcessIdentity,
+        NewEventV1, PayloadNormalizationPolicy, PreparedManifest, ProcessEventWriter,
+        ProcessInstanceId, ProducerIdentity, ReadLimits, SupervisorAuthorityId, TraceId,
         WriterInstanceId, close_generation, initialize_generation_schema, mark_generation_writable,
     };
     use crate::retention::RetentionBatchOutcome;
@@ -2245,6 +2247,45 @@ mod tests {
                 }),
             },
         }
+    }
+
+    fn subprocess_producer(writer: u8) -> ProducerIdentity {
+        ProducerIdentity {
+            writer_instance_id: WriterInstanceId::from_bytes([writer; 16]),
+            process_instance_id: ProcessInstanceId::from_bytes([writer + 1; 16]),
+            process_root_id: ProcessInstanceId::from_bytes([writer + 1; 16]),
+            parent_process_instance_id: None,
+            supervisor_authority_id: None,
+            native_process: Some(NativeProcessIdentity {
+                os_pid: i64::from(std::process::id()),
+                os_boot_id_sha256: Digest32::sha256(b"abrupt-writer-fixture-boot"),
+                os_pid_starttime_ticks: 1,
+            }),
+        }
+    }
+
+    fn subprocess_trace_event(producer: &ProducerIdentity) -> EventEnvelopeV1 {
+        EventEnvelopeV1::normalize(
+            NewEventV1 {
+                event_id: EventId::from_bytes([95; 16]),
+                family: EventFamily::Trace,
+                kind: EventKind::registered("trace.abrupt_writer_fixture").unwrap(),
+                recorded_at_unix_micros: 10,
+                producer_sequence: 1,
+                producer: producer.clone(),
+                correlations: EventCorrelations {
+                    trace_id: Some(TraceId::from_bytes([96; 16])),
+                    span_id: Some(crate::event_store::SpanId::from_bytes([97; 16])),
+                    ..EventCorrelations::default()
+                },
+                payload: serde_json::json!({"state": "accepted"}),
+                legacy_provenance: None,
+                retry_of_generation_id: None,
+            },
+            &PayloadNormalizationPolicy::registered(&["state"]).unwrap(),
+            11,
+        )
+        .unwrap()
     }
 
     fn publish_empty_unheaded(event_root: &Path, manifest: &PreparedManifest) -> WriterLayout {
@@ -2361,6 +2402,99 @@ mod tests {
         let status = store.read_status(&key).unwrap().unwrap();
         assert_eq!(status.state, MaintenanceRunState::Succeeded);
         assert_eq!(status.phase, "selected_head_rotated");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archived_dead_selected_head_remains_reachable_to_public_trace_query() {
+        let root = tempfile::tempdir().unwrap();
+        let event_root = root.path().join(EVENT_STORE_RELATIVE_PATH);
+        let ready = root.path().join("abrupt-writer-ready");
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .arg("detached_maintenance::tests::subprocess_abrupt_event_writer_helper")
+            .arg("--exact")
+            .env("OULIPOLY_AGE374_ABRUPT_EVENT_ROOT", &event_root)
+            .env("OULIPOLY_AGE374_ABRUPT_EVENT_READY", &ready)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "abrupt writer fixture did not publish its accepted event"
+            );
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("abrupt writer fixture exited before kill: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert!(!status.success());
+
+        let writer = WriterInstanceId::from_bytes([94; 16]);
+        let candidate = read_batch(&event_root, &DiscoveryCursor::default(), 4096, 8)
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|candidate| candidate.writer == writer)
+            .unwrap();
+        let partition = format!(
+            "{}/{}",
+            id_hex(candidate.writer.as_bytes()),
+            id_hex(candidate.generation.as_bytes())
+        );
+        let store = MaintenanceJobStore::open(root.path()).unwrap();
+        run_rotation_follow_up(&store, &event_root, 44, owner(44), &candidate, &partition).unwrap();
+
+        let (class, record) = crate::event_store::maintenance_discovery::read_exact_record(
+            &event_root,
+            candidate.writer,
+            candidate.generation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(class, DiscoveryClass::Archive);
+        assert_eq!(record.phase, DiscoveryPhase::PreservedDeadHead);
+
+        let report = crate::longitudinal_metrics::query_trace(
+            &event_root,
+            TraceId::from_bytes([96; 16]),
+            &ReadLimits::new(8, 8, 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        assert!(report.discovery_issues.is_empty());
+        assert!(
+            report.read.coverage_complete,
+            "issues: {:?}",
+            report.read.issues
+        );
+        assert_eq!(report.read.records.len(), 1);
+        assert_eq!(
+            report.read.records[0].envelope.event_id,
+            EventId::from_bytes([95; 16])
+        );
+    }
+
+    #[test]
+    fn subprocess_abrupt_event_writer_helper() {
+        let Some(event_root) = std::env::var_os("OULIPOLY_AGE374_ABRUPT_EVENT_ROOT") else {
+            return;
+        };
+        let ready = std::path::PathBuf::from(
+            std::env::var_os("OULIPOLY_AGE374_ABRUPT_EVENT_READY").unwrap(),
+        );
+        let producer = subprocess_producer(94);
+        let writer = ProcessEventWriter::start(EventWriterConfig::native(
+            std::path::PathBuf::from(event_root),
+            producer.clone(),
+        ))
+        .unwrap();
+        writer.append(subprocess_trace_event(&producer)).unwrap();
+        fs::write(ready, b"accepted\n").unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+        drop(writer);
     }
 
     #[test]
@@ -3001,26 +3135,26 @@ mod tests {
     }
 
     #[test]
-    fn every_pre_head_publication_boundary_has_a_production_recovery_successor() {
+    fn supported_pre_head_interruption_states_have_production_recovery_successors() {
         #[derive(Clone, Copy)]
         enum Boundary {
             InvalidIntentSlot,
-            Intent,
-            Staging,
-            Database,
-            Prepared,
-            Publishing,
-            FinalBeforeDerivedAdvance,
+            IntentDurableBeforeStagingCreate,
+            StagingDirectoryCreated,
+            SuccessorCheckpointedSyncedAndClosed,
+            PreparedManifestRenamedBeforeStagingSync,
+            PublishingPhaseDurable,
+            GenerationDirectoryRenamedBeforeParentSync,
         }
 
         for (index, boundary) in [
             Boundary::InvalidIntentSlot,
-            Boundary::Intent,
-            Boundary::Staging,
-            Boundary::Database,
-            Boundary::Prepared,
-            Boundary::Publishing,
-            Boundary::FinalBeforeDerivedAdvance,
+            Boundary::IntentDurableBeforeStagingCreate,
+            Boundary::StagingDirectoryCreated,
+            Boundary::SuccessorCheckpointedSyncedAndClosed,
+            Boundary::PreparedManifestRenamedBeforeStagingSync,
+            Boundary::PublishingPhaseDurable,
+            Boundary::GenerationDirectoryRenamedBeforeParentSync,
         ]
         .into_iter()
         .enumerate()
@@ -3054,7 +3188,10 @@ mod tests {
                 fs::write(leaf.join("status.0"), b"torn initial slot").unwrap();
             }
             let staging = layout.writer_dir().join("staging").join(&staging_name);
-            if !matches!(boundary, Boundary::InvalidIntentSlot | Boundary::Intent) {
+            if !matches!(
+                boundary,
+                Boundary::InvalidIntentSlot | Boundary::IntentDurableBeforeStagingCreate
+            ) {
                 fs::create_dir(&staging).unwrap();
                 crate::event_store::maintenance_discovery::record_generation_phase(
                     &event_root,
@@ -3066,10 +3203,10 @@ mod tests {
             }
             if matches!(
                 boundary,
-                Boundary::Database
-                    | Boundary::Prepared
-                    | Boundary::Publishing
-                    | Boundary::FinalBeforeDerivedAdvance
+                Boundary::SuccessorCheckpointedSyncedAndClosed
+                    | Boundary::PreparedManifestRenamedBeforeStagingSync
+                    | Boundary::PublishingPhaseDurable
+                    | Boundary::GenerationDirectoryRenamedBeforeParentSync
             ) {
                 let mut connection =
                     Connection::open(staging.join(crate::event_store::DATABASE_FILE_NAME)).unwrap();
@@ -3078,23 +3215,46 @@ mod tests {
                     &manifest.generation_metadata().unwrap(),
                 )
                 .unwrap();
+                let checkpoint: (i64, i64, i64) = connection
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+                assert_eq!(checkpoint.0, 0);
+                assert_eq!(checkpoint.1, checkpoint.2);
                 drop(connection);
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(staging.join(crate::event_store::DATABASE_FILE_NAME))
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
             }
             if matches!(
                 boundary,
-                Boundary::Prepared | Boundary::Publishing | Boundary::FinalBeforeDerivedAdvance
+                Boundary::PreparedManifestRenamedBeforeStagingSync
+                    | Boundary::PublishingPhaseDurable
+                    | Boundary::GenerationDirectoryRenamedBeforeParentSync
             ) {
                 let mut bytes = serde_json::to_vec(&manifest).unwrap();
                 bytes.push(b'\n');
-                fs::write(
-                    staging.join(crate::event_store::PREPARED_MANIFEST_FILE_NAME),
-                    bytes,
-                )
-                .unwrap();
+                let prepared = staging.join(crate::event_store::PREPARED_MANIFEST_FILE_NAME);
+                let temp = staging.join("prepared.manifest.json.boundary.tmp");
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&temp)
+                    .unwrap();
+                file.write_all(&bytes).unwrap();
+                file.sync_all().unwrap();
+                drop(file);
+                fs::rename(temp, prepared).unwrap();
             }
             if matches!(
                 boundary,
-                Boundary::Publishing | Boundary::FinalBeforeDerivedAdvance
+                Boundary::PublishingPhaseDurable
+                    | Boundary::GenerationDirectoryRenamedBeforeParentSync
             ) {
                 crate::event_store::maintenance_discovery::record_generation_phase(
                     &event_root,
@@ -3104,7 +3264,10 @@ mod tests {
                 )
                 .unwrap();
             }
-            if matches!(boundary, Boundary::FinalBeforeDerivedAdvance) {
+            if matches!(
+                boundary,
+                Boundary::GenerationDirectoryRenamedBeforeParentSync
+            ) {
                 fs::rename(&staging, layout.generation_dir(manifest.generation_id)).unwrap();
             }
             drop(lease);
@@ -3116,7 +3279,10 @@ mod tests {
                 OpportunityWorkLimits::default(),
             )
             .unwrap();
-            if matches!(boundary, Boundary::InvalidIntentSlot | Boundary::Intent) {
+            if matches!(
+                boundary,
+                Boundary::InvalidIntentSlot | Boundary::IntentDurableBeforeStagingCreate
+            ) {
                 let key = MaintenanceJobKey::new(
                     MaintenanceJobKind::OrphanClassification,
                     format!(

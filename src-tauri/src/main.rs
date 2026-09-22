@@ -56,6 +56,14 @@ mod zero_turn_orchestration;
 use crate::usage::cli::Cli;
 
 fn main() -> ExitCode {
+    ordinary_entrypoint(production_entrypoint)
+}
+
+fn ordinary_entrypoint(run: impl FnOnce() -> ExitCode) -> ExitCode {
+    run_with_event_sink_shutdown(run, oulipoly_state::shutdown_process_event_sink)
+}
+
+fn production_entrypoint() -> ExitCode {
     if maintenance_worker::is_worker_invocation() {
         return match maintenance_worker::run_worker_invocation() {
             Ok(()) => ExitCode::SUCCESS,
@@ -82,6 +90,17 @@ fn main() -> ExitCode {
         };
     }
     process_entrypoint()
+}
+
+fn run_with_event_sink_shutdown(
+    run: impl FnOnce() -> ExitCode,
+    shutdown: impl FnOnce() -> Result<(), String>,
+) -> ExitCode {
+    let exit = run();
+    if let Err(error) = shutdown() {
+        eprintln!("OULIPOLY_EVENT_STORE_GAP=graceful_shutdown_failed:{error}");
+    }
+    exit
 }
 
 fn process_entrypoint() -> ExitCode {
@@ -289,6 +308,99 @@ mod maintenance_entrypoint_tests {
                 Step::Scheduled(maintenance_worker::ScheduleBasis::ProviderStartup),
                 Step::Bootstrap,
             ]
+        );
+    }
+
+    #[test]
+    fn ordinary_entrypoint_runs_event_sink_shutdown_after_work_and_preserves_exit() {
+        use std::cell::RefCell;
+
+        let observed = RefCell::new(Vec::new());
+        let exit = run_with_event_sink_shutdown(
+            || {
+                observed.borrow_mut().push("run");
+                ExitCode::FAILURE
+            },
+            || {
+                observed.borrow_mut().push("shutdown");
+                Ok(())
+            },
+        );
+
+        assert_eq!(observed.into_inner(), ["run", "shutdown"]);
+        assert_eq!(exit, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn ordinary_entrypoint_closes_installed_global_sink_exactly_once() {
+        const CHILD_ROOT: &str = "OULIPOLY_AGE374_ENTRYPOINT_FIXTURE";
+        const TEST_NAME: &str = "maintenance_entrypoint_tests::ordinary_entrypoint_closes_installed_global_sink_exactly_once";
+
+        if let Some(data_root) = std::env::var_os(CHILD_ROOT) {
+            use oulipoly_state::event_store::{
+                GenerationState, WriterLayout, parse_id_hex, read_generation_metadata,
+                read_prepared_manifest,
+            };
+            use rusqlite::{Connection, OpenFlags};
+
+            let data_root = std::path::PathBuf::from(data_root);
+            let exit = ordinary_entrypoint(|| {
+                let _ = oulipoly_state::diagnostic_recorder::process_recorder();
+                ExitCode::FAILURE
+            });
+            assert_eq!(exit, ExitCode::FAILURE);
+
+            let event_root = data_root.join("diagnostics/event-store-v1");
+            let writer_dirs: Vec<_> = std::fs::read_dir(event_root.join("writers"))
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect();
+            assert_eq!(writer_dirs.len(), 1);
+            let writer_bytes = parse_id_hex(writer_dirs[0].file_name().to_str().unwrap()).unwrap();
+            let layout = WriterLayout::open_existing(&event_root, writer_bytes).unwrap();
+            let selected = layout.read_head(|_, _| Ok(())).unwrap().unwrap();
+            let selected_manifest =
+                read_prepared_manifest(&layout.generation_dir(selected.record.generation_id))
+                    .unwrap();
+            let predecessor = selected_manifest
+                .predecessor_generation_id
+                .expect("ordinary entrypoint shutdown must rotate the installed exact writer");
+            let predecessor_connection = Connection::open_with_flags(
+                layout.generation_db(predecessor),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .unwrap();
+            let predecessor_metadata = read_generation_metadata(&predecessor_connection).unwrap();
+            assert_eq!(predecessor_metadata.state, GenerationState::Closed);
+            assert_eq!(
+                predecessor_metadata.successor_generation_id,
+                Some(selected.record.generation_id)
+            );
+
+            let closed_head = selected.record;
+            oulipoly_state::shutdown_process_event_sink().unwrap();
+            assert_eq!(
+                layout.read_head(|_, _| Ok(())).unwrap().unwrap().record,
+                closed_head
+            );
+            assert_eq!(
+                std::fs::read_dir(layout.generations_dir()).unwrap().count(),
+                2
+            );
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ROOT, root.path())
+            .env("OULIPOLY_DATA_DIR", root.path())
+            .env("OULIPOLY_CONFIG_HOME", root.path().join("config"))
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "entrypoint fixture child failed: {status}"
         );
     }
 }

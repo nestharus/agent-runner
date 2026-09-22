@@ -111,15 +111,14 @@ pub fn discover_generation_read_targets(
     max_nodes: usize,
     max_entries: usize,
 ) -> Result<BoundedDiscovery, String> {
-    let batch = super::maintenance_discovery::read_batch(
+    let batch = super::maintenance_discovery::read_evidence_batch(
         event_store_root,
-        &super::maintenance_discovery::DiscoveryCursor::default(),
         max_nodes,
         max_entries,
     )?;
     let mut issues = batch.issues;
-    let entries_examined = batch.entries.len();
-    let mut targets = Vec::with_capacity(entries_examined);
+    let entries_examined = batch.entries_examined;
+    let mut targets = Vec::with_capacity(batch.entries.len());
     let mut watermark = Sha256::new();
     watermark.update(b"oulipoly.event-discovery-read.v1\0");
 

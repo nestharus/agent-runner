@@ -70,6 +70,7 @@ pub use union_reader::{
     BoundedUnionRead, ExactLegacyRead, LegacyUnionCoverage, UnionCoverageIssue,
     UnionCoverageIssueKind, UnionReadRecord, UnionRecordOrigin, union_bounded_read,
 };
+pub(crate) use writer::ProcessEventWriterSubmission;
 pub use writer::{
     AppendReceipt, DEFAULT_EVENT_WRITER_QUEUE_CAPACITY, DEFAULT_GENERATION_ROTATION_SOFT_BYTES,
     EVENT_WRITER_GROUP_MAX_PAYLOAD_BYTES, EVENT_WRITER_GROUP_MAX_RECORDS,
