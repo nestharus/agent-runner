@@ -43,6 +43,7 @@ mod filesystem_identity;
 pub mod invocation_marker;
 mod lifecycle_log;
 pub mod live_history;
+pub mod longitudinal_metrics;
 pub mod mailbox;
 pub mod maintenance;
 pub mod migrations;

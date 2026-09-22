@@ -51,6 +51,8 @@ const PRESERVE_LEGACY_MARKER_BYTES: &[u8] = b"PRESERVE-LEGACY-V1\n";
 static DIAGNOSTIC_GAP_STAGES: AtomicU64 = AtomicU64::new(0);
 static PENDING_DIAGNOSTIC_GAP_STAGES: AtomicU64 = AtomicU64::new(0);
 static GAP_REPORTER: OnceLock<Option<SyncSender<&'static str>>> = OnceLock::new();
+#[cfg(not(test))]
+static PROCESS_RECORDER: OnceLock<Mutex<Option<FlightRecorder>>> = OnceLock::new();
 
 macro_rules! uuid_id {
     ($name:ident) => {
@@ -772,8 +774,6 @@ struct RecorderInner {
     max_shard_bytes: u64,
     writer: Option<SyncSender<WriterCommand>>,
     use_event_sink: bool,
-    #[cfg_attr(test, allow(dead_code))]
-    preservation_active: bool,
 }
 
 struct WriterState {
@@ -1080,8 +1080,6 @@ impl FlightRecorder {
         after_lock();
         let preservation_state = preservation_state(&root);
         let preservation_mode = !matches!(preservation_state, PreservationState::Absent);
-        let preservation_active = preservation_state == PreservationState::Active
-            && read_preservation_manifest(&root).is_ok();
         let active_path = if preservation_mode {
             unique_preserved_shard_path(&root, &shard_prefix)
         } else {
@@ -1138,7 +1136,6 @@ impl FlightRecorder {
                 max_shard_bytes,
                 writer: Some(sender),
                 use_event_sink: false,
-                preservation_active,
             }),
         };
         Ok(recorder)
@@ -1167,7 +1164,6 @@ impl FlightRecorder {
                 max_shard_bytes: RecorderConfig::default().max_shard_bytes,
                 writer: None,
                 use_event_sink: false,
-                preservation_active: false,
             }),
         }
     }
@@ -1208,7 +1204,7 @@ impl FlightRecorder {
     /// Retains one completed observation on an already-selected recorder
     /// without waiting for recorder capacity or file I/O. Callers must select
     /// the recorder before acquiring database authority.
-    pub(crate) fn record_deferred_completed_observation(
+    pub fn record_deferred_completed_observation(
         &self,
         start: SpanStart,
         elapsed: Duration,
@@ -1269,7 +1265,7 @@ impl FlightRecorder {
     /// Emits a child Requested event without waiting for recorder file I/O.
     /// This is for a nested resource span entered while its parent database
     /// transaction is already held.
-    fn with_deferred_requested_span<T>(
+    pub fn with_deferred_requested_span<T>(
         &self,
         start: SpanStart,
         operation: impl FnOnce(&DiagnosticSpan) -> T,
@@ -1333,14 +1329,38 @@ impl FlightRecorder {
     }
 
     fn append(&self, event: &DiagnosticEvent, coordination: AppendCoordination) -> RecordStatus {
-        if self.inner.use_event_sink {
-            return self.append_via_event_store(event, coordination);
-        }
-        let Ok(mut encoded) = serde_json::to_vec(event) else {
-            return coordinated_record_failure(coordination, "serialize");
+        let status = if self.inner.use_event_sink {
+            self.append_via_event_store(event, coordination)
+        } else {
+            let Ok(mut encoded) = serde_json::to_vec(event) else {
+                return coordinated_record_failure(coordination, "serialize");
+            };
+            encoded.push(b'\n');
+            self.append_jsonl_encoded(encoded, coordination)
         };
-        encoded.push(b'\n');
-        self.append_jsonl_encoded(encoded, coordination)
+        if self.inner.use_event_sink {
+            crate::longitudinal_metrics::emit_diagnostic_metrics(self, event);
+        }
+        status
+    }
+
+    pub(crate) fn record_metric_sample(
+        &self,
+        sample: &crate::longitudinal_metrics::MetricSample,
+        recorded_at_unix_micros: i64,
+        correlations: crate::event_store::EventCorrelations,
+    ) -> RecordStatus {
+        match crate::diagnostic_producer::submit_metric_sample(
+            sample,
+            &self.inner.process,
+            recorded_at_unix_micros,
+            correlations,
+        ) {
+            Ok(submission) => {
+                self.finish_event_submission(submission, AppendCoordination::Deferred)
+            }
+            Err(_) => deferred_record_failure("metric_event_store_append"),
+        }
     }
 
     fn append_via_event_store(
@@ -1663,28 +1683,33 @@ pub fn process_recorder() -> FlightRecorder {
     }
     #[cfg(not(test))]
     {
-        static PROCESS_RECORDER: OnceLock<Mutex<Option<FlightRecorder>>> = OnceLock::new();
         cached_or_retry_process_recorder(PROCESS_RECORDER.get_or_init(|| Mutex::new(None)), || {
             let recorder = default_recorder_root()
                 .and_then(|root| FlightRecorder::open(root, RecorderConfig::default()))?;
-            // Event-store initialization is evidence-only. On any failure the
-            // process recorder keeps the emergency JSONL worker. Cutover mode
-            // still builds the immutable envelope once before recording the
-            // explicit initialization-failure fallback.
-            if recorder.inner.preservation_active {
-                if crate::diagnostic_producer::ensure_default_process_event_sink(
-                    &recorder.inner.process,
-                )
-                .is_err()
-                {
-                    emit_gap_once("event_store_append");
-                }
-                Ok(recorder.with_event_sink())
-            } else {
-                Ok(recorder)
+            // Partitioned event storage is the normal evidence sink. On any
+            // initialization or append failure, the recorder preserves the
+            // same immutable envelope through the emergency JSONL worker.
+            if crate::diagnostic_producer::ensure_default_process_event_sink(
+                &recorder.inner.process,
+            )
+            .is_err()
+            {
+                emit_gap_once("event_store_append");
             }
+            Ok(recorder.with_event_sink())
         })
     }
+}
+
+/// Returns the already initialized process recorder without waiting on its
+/// initialization lock or performing any file/event-store setup. Runtime-cap
+/// paths use this to keep telemetry strictly subordinate to the cap itself.
+#[cfg(not(test))]
+pub fn try_process_recorder() -> Option<FlightRecorder> {
+    PROCESS_RECORDER
+        .get()
+        .and_then(|slot| slot.try_lock().ok())
+        .and_then(|recorder| recorder.clone())
 }
 
 fn cached_or_retry_process_recorder(
@@ -2308,14 +2333,14 @@ fn read_shard(candidate: &ShardCandidate, byte_budget: u64, report: &mut Inspect
             reported_limit = true;
             break;
         }
-        match serde_json::from_slice::<DiagnosticEvent>(&line) {
-            Ok(event) if (1..=DIAGNOSTIC_SCHEMA_VERSION).contains(&event.schema_version) => {
+        match parse_flight_record(&line) {
+            Ok(Some(event)) if (1..=DIAGNOSTIC_SCHEMA_VERSION).contains(&event.schema_version) => {
                 report.events.push(RecordedEvent {
                     source: source(path, line_number),
                     event,
                 });
             }
-            Ok(_) => {
+            Ok(Some(_)) => {
                 report.coverage.skipped_records += 1;
                 report.issues.push(InspectionIssue {
                     source: Some(source(path, line_number)),
@@ -2323,6 +2348,10 @@ fn read_shard(candidate: &ShardCandidate, byte_budget: u64, report: &mut Inspect
                     message: "record schema version is not supported".to_string(),
                 });
             }
+            // The emergency fallback can contain Metric/Log/Maintenance
+            // envelopes beside diagnostic envelopes. They are valid records,
+            // but outside this legacy diagnostic-only reader's projection.
+            Ok(None) => {}
             Err(error) => {
                 report.coverage.skipped_records += 1;
                 report.issues.push(InspectionIssue {
@@ -2353,6 +2382,133 @@ fn read_shard(candidate: &ShardCandidate, byte_budget: u64, report: &mut Inspect
             });
         }
     }
+}
+
+fn parse_flight_record(line: &[u8]) -> Result<Option<DiagnosticEvent>, String> {
+    if let Ok(event) = serde_json::from_slice::<DiagnosticEvent>(line) {
+        return Ok(Some(event));
+    }
+    let envelope = serde_json::from_slice::<crate::event_store::EventEnvelopeV1>(line)
+        .map_err(|error| error.to_string())?;
+    envelope.validate().map_err(|error| error.to_string())?;
+    if envelope.family != crate::event_store::EventFamily::Diagnostic
+        || envelope.kind.as_str() != "diagnostic.observation"
+    {
+        return Ok(None);
+    }
+
+    #[derive(Deserialize)]
+    struct DiagnosticPayload {
+        operation: String,
+        resource: String,
+        lifecycle_phase: Option<String>,
+        phase: DiagnosticPhase,
+        elapsed_micros: u64,
+        observation: serde_json::Value,
+        diagnostic_correlations: BTreeMap<String, String>,
+        #[serde(default)]
+        database_identity: Option<SqliteEventIdentity>,
+        #[serde(default)]
+        sqlite: Option<serde_json::Value>,
+    }
+    let payload: DiagnosticPayload =
+        serde_json::from_str(&envelope.payload).map_err(|error| error.to_string())?;
+    let mut observation = payload.observation;
+    if let Some(fields) = observation.as_object_mut() {
+        if let Some(value) = fields.remove("database_failure") {
+            fields.insert("sqlite_failure".to_string(), value);
+        }
+        if let Some(value) = fields.remove("database_evidence") {
+            fields.insert("sqlite".to_string(), value);
+        }
+        for key in ["sqlite_failure", "sqlite"] {
+            if matches!(fields.get(key), Some(serde_json::Value::String(value)) if value == "[REDACTED]")
+            {
+                fields.insert(key.to_string(), serde_json::Value::Null);
+            }
+        }
+    }
+    let observation: PhaseObservation =
+        serde_json::from_value(observation).map_err(|error| error.to_string())?;
+    let sqlite = payload.database_identity.or_else(|| {
+        payload
+            .sqlite
+            .filter(
+                |value| !matches!(value, serde_json::Value::String(text) if text == "[REDACTED]"),
+            )
+            .and_then(|value| serde_json::from_value(value).ok())
+    });
+    let trace_id = envelope
+        .correlations
+        .trace_id
+        .ok_or_else(|| "diagnostic fallback envelope lacks trace ID".to_string())?;
+    let span_id = envelope
+        .correlations
+        .span_id
+        .ok_or_else(|| "diagnostic fallback envelope lacks span ID".to_string())?;
+    let native = envelope.producer.native_process.as_ref();
+    let recorded_at =
+        chrono::DateTime::<Utc>::from_timestamp_micros(envelope.recorded_at_unix_micros)
+            .ok_or_else(|| "diagnostic fallback envelope timestamp is invalid".to_string())?
+            .to_rfc3339_opts(SecondsFormat::Micros, true);
+    let event_id = envelope
+        .event_id
+        .to_string()
+        .parse::<EventId>()
+        .map_err(|error| error.to_string())?;
+    let diagnostic_id = trace_id
+        .to_string()
+        .parse::<DiagnosticId>()
+        .map_err(|error| error.to_string())?;
+    let span_id = span_id
+        .to_string()
+        .parse::<SpanId>()
+        .map_err(|error| error.to_string())?;
+    let parent_span_id = envelope
+        .correlations
+        .parent_span_id
+        .map(|identity| identity.to_string().parse::<SpanId>())
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let producer_instance = envelope
+        .producer
+        .process_instance_id
+        .to_string()
+        .parse::<ProducerInstanceId>()
+        .map_err(|error| error.to_string())?;
+    Ok(Some(DiagnosticEvent {
+        schema_version: DIAGNOSTIC_SCHEMA_VERSION,
+        event_id,
+        diagnostic_id,
+        span_id,
+        parent_span_id,
+        recorded_at: recorded_at.clone(),
+        retention_eligible_at: Some(recorded_at),
+        retention_status: DiagnosticRetentionStatus::Eligible,
+        elapsed_micros: payload.elapsed_micros,
+        process: RecorderProcessIdentity {
+            os_pid: native.map(|identity| identity.os_pid).unwrap_or(0),
+            parent_pid: None,
+            os_boot_id: native.map(|identity| {
+                let mut encoded = String::with_capacity(71);
+                encoded.push_str("sha256:");
+                for byte in identity.os_boot_id_sha256.as_bytes() {
+                    use std::fmt::Write as _;
+                    let _ = write!(encoded, "{byte:02x}");
+                }
+                encoded
+            }),
+            os_pid_starttime_ticks: native.map(|identity| identity.os_pid_starttime_ticks),
+            producer_instance,
+        },
+        operation: payload.operation,
+        resource: payload.resource,
+        lifecycle_phase: payload.lifecycle_phase,
+        phase: payload.phase,
+        observation,
+        correlations: payload.diagnostic_correlations,
+        sqlite,
+    }))
 }
 
 fn source(path: &Path, line: u64) -> SourceCoordinate {
@@ -3530,21 +3686,35 @@ mod tests {
         });
         install_process_event_sink(sink.clone(), EventSinkMode::NormalWithJsonlFallback).unwrap();
 
-        recorder.with_requested_span(SpanStart::new("fallback", "state"), |span| {
-            assert!(matches!(
-                span.requested_status(),
-                Some(RecordStatus::FallbackAppended { event_store_stage })
-                    if event_store_stage == "event_store_failed"
-            ));
-            assert!(matches!(
-                span.record(
-                    DiagnosticPhase::Failed,
-                    PhaseObservation::started_unknown().with_cause("fixture")
-                ),
-                RecordStatus::FallbackQueued { event_store_stage }
-                    if event_store_stage == "event_store_failed"
-            ));
-        });
+        recorder.with_requested_span(
+            SpanStart::new("fallback", "state").with_sqlite_identity(SqliteEventIdentity::new(
+                SqliteDatabaseRole::State,
+                SqlitePathClass::ManagedFile,
+                "fallback_fixture",
+            )),
+            |span| {
+                assert!(matches!(
+                    span.requested_status(),
+                    Some(RecordStatus::FallbackAppended { event_store_stage })
+                        if event_store_stage == "event_store_failed"
+                ));
+                assert!(matches!(
+                    span.record(
+                        DiagnosticPhase::Failed,
+                        PhaseObservation::started_unknown()
+                            .with_cause("fixture")
+                            .with_sqlite_evidence(
+                                SqlitePhaseEvidence::for_phase(
+                                    SqliteTransactionPhase::StatementExecution,
+                                )
+                                .with_statement_total(Duration::from_micros(13)),
+                            )
+                    ),
+                    RecordStatus::FallbackQueued { event_store_stage }
+                        if event_store_stage == "event_store_failed"
+                ));
+            },
+        );
         recorder.drain_deferred_for_test().unwrap();
 
         let mut fallback = Vec::new();
@@ -3566,6 +3736,24 @@ mod tests {
         }
         let captured = sink.events.lock().unwrap();
         assert_eq!(fallback.len(), captured.len());
+        let mut diagnostic_count = 0;
+        for envelope in captured.iter() {
+            let encoded = serde_json::to_vec(envelope).unwrap();
+            let parsed = parse_flight_record(&encoded);
+            if envelope.family == crate::event_store::EventFamily::Diagnostic {
+                diagnostic_count += 1;
+                assert!(
+                    matches!(parsed, Ok(Some(_))),
+                    "diagnostic fallback envelope must remain readable: {parsed:?}",
+                );
+            } else {
+                assert!(
+                    matches!(parsed, Ok(None)),
+                    "non-diagnostic fallback envelope must remain out of projection: {parsed:?}",
+                );
+            }
+        }
+        assert_eq!(diagnostic_count, 2);
         let captured = captured
             .iter()
             .map(|envelope| {
@@ -3578,6 +3766,62 @@ mod tests {
             fallback, captured,
             "emergency JSONL must preserve the exact pre-fanout envelope bytes"
         );
+
+        let report = FlightRecorderReader::new(directory.path()).inspect();
+        assert_eq!(report.events.len(), 2);
+        assert!(
+            report
+                .events
+                .iter()
+                .all(|record| record.event.operation == "fallback")
+        );
+        assert!(
+            report
+                .events
+                .iter()
+                .all(|record| record.event.sqlite.is_some())
+        );
+        assert!(report.events.iter().any(|record| {
+            record
+                .event
+                .observation
+                .sqlite
+                .as_ref()
+                .is_some_and(|sqlite| sqlite.statement_total_micros == Some(13))
+        }));
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|issue| issue.kind != "invalid_record")
+        );
+    }
+
+    #[test]
+    fn diagnostic_reader_ignores_valid_metric_fallback_envelopes() {
+        use crate::diagnostic_producer::{clear_process_event_sink_for_test, submit_metric_sample};
+        use crate::event_store::EventCorrelations;
+        use crate::longitudinal_metrics::{MetricName, MetricOutcome, MetricSample};
+
+        let _event_sink_guard = EVENT_SINK_TEST_LOCK.lock().unwrap();
+        clear_process_event_sink_for_test();
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = recorder(directory.path(), 64 * 1024, 2);
+        let submission = submit_metric_sample(
+            &MetricSample::new(MetricName::QueueDepth, MetricOutcome::Observed, 7),
+            &recorder.inner.process,
+            Utc::now().timestamp_micros().max(0),
+            EventCorrelations::default(),
+        )
+        .unwrap();
+        let mut encoded = serde_json::to_vec(&submission.envelope).unwrap();
+        encoded.push(b'\n');
+        recorder.append_jsonl_encoded(encoded, AppendCoordination::Synchronous);
+
+        let report = FlightRecorderReader::new(directory.path()).inspect();
+        assert!(report.events.is_empty());
+        assert_eq!(report.coverage.skipped_records, 0);
+        assert!(report.issues.is_empty());
     }
 
     #[test]
@@ -4088,7 +4332,6 @@ mod tests {
                 max_shard_bytes: 1,
                 writer: None,
                 use_event_sink: false,
-                preservation_active: false,
             }),
         };
         let handoffs_before = gap_handoff_attempts_for_test().len();

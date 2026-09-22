@@ -103,6 +103,12 @@ pub(crate) fn run_offline_entry(cli: &Cli) -> Result<Option<i32>, String> {
                 diagnostic_id,
                 json,
             } => crate::commands::offline_diagnostics::run_trace(diagnostic_id, *json),
+            DiagnosticsSubcommands::Metrics { minutes, json } => {
+                crate::commands::offline_diagnostics::run_metrics(minutes.get(), *json)
+            }
+            DiagnosticsSubcommands::EventTrace { trace_id, json } => {
+                crate::commands::offline_diagnostics::run_event_trace(trace_id, *json)
+            }
             DiagnosticsSubcommands::Maintenance {
                 kind,
                 partition,

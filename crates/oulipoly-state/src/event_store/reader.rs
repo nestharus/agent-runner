@@ -11,6 +11,7 @@ use super::schema::{
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -89,6 +90,111 @@ pub struct GenerationReadTarget {
     pub prepared_manifest_sha256: Option<Digest32>,
     pub sealed_manifest_sha256: Option<Digest32>,
     pub catalog_watermark: Option<Digest32>,
+}
+
+/// One bounded traversal of the sharded discovery journal. This never opens a
+/// correctness database and never performs an unbounded writer-directory
+/// enumeration. `coverage` is incomplete whenever the supplied node/entry
+/// budget did not cover the journal or any leaf could not be interpreted.
+#[derive(Debug, Clone)]
+pub struct BoundedDiscovery {
+    pub targets: Vec<GenerationReadTarget>,
+    pub coverage: DiscoveryCoverage,
+    pub issues: Vec<String>,
+    pub nodes_examined: usize,
+    pub entries_examined: usize,
+    pub more: bool,
+}
+
+pub fn discover_generation_read_targets(
+    event_store_root: &Path,
+    max_nodes: usize,
+    max_entries: usize,
+) -> Result<BoundedDiscovery, String> {
+    let batch = super::maintenance_discovery::read_batch(
+        event_store_root,
+        &super::maintenance_discovery::DiscoveryCursor::default(),
+        max_nodes,
+        max_entries,
+    )?;
+    let mut issues = batch.issues;
+    let entries_examined = batch.entries.len();
+    let mut targets = Vec::with_capacity(entries_examined);
+    let mut watermark = Sha256::new();
+    watermark.update(b"oulipoly.event-discovery-read.v1\0");
+
+    for entry in batch.entries {
+        watermark.update(entry.writer.as_bytes());
+        watermark.update(entry.generation.as_bytes());
+        let Some(record) = entry.record else {
+            issues.push(
+                entry.issue.unwrap_or_else(|| {
+                    "discovery leaf has no readable selected record".to_string()
+                }),
+            );
+            continue;
+        };
+        if let Some(issue) = entry.issue {
+            issues.push(issue);
+        }
+        if let Some(digest) = record.prepared_manifest_sha256 {
+            watermark.update(digest.as_bytes());
+        }
+        let writer = super::id_hex(entry.writer.as_bytes());
+        let generation = super::id_hex(entry.generation.as_bytes());
+        let writer_dir = event_store_root.join("writers").join(&writer);
+        targets.push(GenerationReadTarget {
+            writer_instance_id: entry.writer,
+            generation_id: entry.generation,
+            database_path: writer_dir
+                .join("generations")
+                .join(&generation)
+                .join(super::DATABASE_FILE_NAME),
+            lease_path: writer_dir.join("leases").join(format!("{generation}.lock")),
+            pending_trash_path: Some(
+                event_store_root
+                    .join("retirement")
+                    .join("trash")
+                    .join(&writer)
+                    .join(format!("{generation}.pending")),
+            ),
+            retirement_receipt_path: Some(
+                event_store_root
+                    .join("retirement")
+                    .join("receipts")
+                    .join(&writer)
+                    .join(format!("{generation}.json")),
+            ),
+            prepared_manifest_sha256: record.prepared_manifest_sha256,
+            sealed_manifest_sha256: None,
+            catalog_watermark: None,
+        });
+    }
+    targets.sort_by_key(|target| (target.writer_instance_id, target.generation_id));
+    let incomplete = batch.more || !issues.is_empty();
+    let coverage = if incomplete {
+        DiscoveryCoverage::Incomplete {
+            reason: format!(
+                "bounded discovery more={} issues={} nodes={} entries={}",
+                batch.more,
+                issues.len(),
+                batch.nodes_examined,
+                entries_examined
+            ),
+        }
+    } else {
+        DiscoveryCoverage::Complete {
+            discovery_watermark: Digest32::from_bytes(watermark.finalize().into()),
+        }
+    };
+    Ok(BoundedDiscovery {
+        targets,
+        coverage,
+        issues,
+        nodes_examined: batch.nodes_examined,
+        entries_examined,
+        more: batch.more,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
