@@ -101,6 +101,67 @@ fn ti_02_ti_23_previous_version_db_migrates_forward_and_preserves_representative
 }
 
 #[test]
+fn stale_migration_plan_skips_steps_committed_by_another_opener() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    let mut first = Connection::open(&db_path).unwrap();
+    let mut second = Connection::open(&db_path).unwrap();
+    let first_plan = migrations::current_plan_from(0).unwrap();
+    let stale_second_plan = migrations::current_plan_from(0).unwrap();
+
+    migrations::run_with_db_path(&mut first, &first_plan, db_path.clone()).unwrap();
+    migrations::run_with_db_path(&mut second, &stale_second_plan, db_path.clone()).unwrap();
+
+    assert_eq!(user_version(&second), CURRENT_SCHEMA_VERSION);
+    assert_eq!(
+        second
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'invocation_completion_authority_summary'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "the stale opener must not replay non-idempotent migration DDL"
+    );
+}
+
+#[test]
+fn stale_step_check_does_not_mask_schema_gap_or_future_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    let mut connection = Connection::open(&db_path).unwrap();
+    connection.pragma_update(None, "user_version", 3).unwrap();
+    let schema4 = &migrations::manifest()[0];
+    let schema5 = &migrations::manifest()[1];
+
+    let gap =
+        migrations::run_with_db_path(&mut connection, &[schema5], db_path.clone()).unwrap_err();
+    assert!(matches!(
+        gap,
+        migrations::MigrationError::InvalidGap {
+            stored: 3,
+            target: 5,
+            ..
+        }
+    ));
+
+    connection
+        .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+        .unwrap();
+    let future = migrations::run_with_db_path(&mut connection, &[schema4], db_path).unwrap_err();
+    assert!(matches!(
+        future,
+        migrations::MigrationError::Incompatible {
+            stored,
+            current: CURRENT_SCHEMA_VERSION,
+            ..
+        } if stored == CURRENT_SCHEMA_VERSION + 1
+    ));
+}
+
+#[test]
 fn schema_18_migration_installs_the_running_projection_index() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");

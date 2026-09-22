@@ -320,7 +320,42 @@ fn run_planned_step_with_path(
     migration: &Migration,
     db_path: PathBuf,
 ) -> Result<(), MigrationError> {
-    run_step_transaction(conn, migration)
+    begin_migration_transaction(conn)
+        .map_err(|source| map_step_failed_error(db_path.clone(), migration, source))?;
+
+    // The plan predates writer acquisition. Once this connection owns the
+    // writer slot, the transactional value is the only authoritative version.
+    let stored = match read_migration_user_version(conn) {
+        Ok(stored) => stored,
+        Err(source) => {
+            rollback_migration_transaction(conn);
+            return Err(map_step_failed_error(db_path, migration, source));
+        }
+    };
+    if stored_version_is_newer_than_current(stored, CURRENT_SCHEMA_VERSION) {
+        rollback_migration_transaction(conn);
+        return Err(map_incompatible_version_error(
+            db_path,
+            stored,
+            CURRENT_SCHEMA_VERSION,
+        ));
+    }
+    if stored >= migration.target_version {
+        let result = commit_migration_transaction(conn);
+        return finalize_migration_transaction(conn, result)
+            .map_err(|source| map_step_failed_error(db_path, migration, source));
+    }
+    if compiled_migration_has_schema_gap(stored, migration) {
+        rollback_migration_transaction(conn);
+        return Err(MigrationError::InvalidGap {
+            db_path,
+            stored,
+            target: migration.target_version,
+        });
+    }
+
+    let result = complete_migration_step(conn, migration);
+    finalize_migration_transaction(conn, result)
         .map_err(|source| map_step_failed_error(db_path, migration, source))
 }
 
@@ -337,17 +372,28 @@ fn map_step_failed_error(
     }
 }
 
-fn run_step_transaction(
-    conn: &mut Connection,
-    migration: &Migration,
-) -> Result<(), rusqlite::Error> {
-    begin_migration_transaction(conn)?;
-    let result = complete_migration_step(conn, migration);
-    finalize_migration_transaction(conn, result)
-}
-
 fn begin_migration_transaction(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     execute_migration_transaction_sql(conn, "BEGIN IMMEDIATE;")
+}
+
+fn read_migration_user_version(conn: &Connection) -> Result<i32, rusqlite::Error> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+}
+
+fn compiled_migration_has_schema_gap(stored: i32, migration: &Migration) -> bool {
+    let Some(index) = manifest().iter().position(|candidate| {
+        candidate.target_version == migration.target_version && candidate.id == migration.id
+    }) else {
+        // Tests and downstream callers may supply a one-off migration. Only the
+        // compiled manifest has a predecessor chain that this module can check.
+        return false;
+    };
+
+    if index == 0 {
+        return stored != 0 && stored != schema::MINIMUM_SUPPORTED_SCHEMA_VERSION;
+    }
+
+    stored != manifest()[index - 1].target_version
 }
 
 fn complete_migration_step(
@@ -522,6 +568,11 @@ pub enum MigrationError {
         stored: i32,
         current: i32,
     },
+    InvalidGap {
+        db_path: PathBuf,
+        stored: i32,
+        target: i32,
+    },
     StepFailed {
         db_path: PathBuf,
         id: &'static str,
@@ -550,6 +601,11 @@ fn format_migration_error(error: &MigrationError) -> String {
             stored,
             current,
         } => format_incompatible_error(db_path, *stored, *current),
+        MigrationError::InvalidGap {
+            db_path,
+            stored,
+            target,
+        } => format_invalid_gap_error(db_path, *stored, *target),
         MigrationError::StepFailed {
             db_path,
             id,
@@ -563,6 +619,13 @@ fn format_migration_error(error: &MigrationError) -> String {
 fn format_incompatible_error(db_path: &Path, stored: i32, current: i32) -> String {
     format!(
         "schema is incompatible (stored={stored}, current={current}); run `agents migrate --rebuild`. db={}",
+        db_path.display()
+    )
+}
+
+fn format_invalid_gap_error(db_path: &Path, stored: i32, target: i32) -> String {
+    format!(
+        "migration plan has a schema gap (stored={stored}, next_target={target}); run `agents migrate --rebuild`. db={}",
         db_path.display()
     )
 }
@@ -598,7 +661,9 @@ fn map_migration_error_source(
     match error {
         MigrationError::PrimitiveRegistrationFailed { source, .. }
         | MigrationError::StepFailed { source, .. } => Some(source),
-        _ => None,
+        MigrationError::Incompatible { .. }
+        | MigrationError::InvalidGap { .. }
+        | MigrationError::UnrecognizedShape { .. } => None,
     }
 }
 

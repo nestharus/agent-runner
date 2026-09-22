@@ -672,6 +672,36 @@ fn writer_open_paths_retain_current_schema_and_wal_behavior() {
 }
 
 #[test]
+fn already_wal_sidecar_reopens_while_an_independent_reader_is_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar_path = dir.path().join("pid-identity.db");
+    drop(MailboxDb::open(&sidecar_path).unwrap());
+
+    let reader = Connection::open(&sidecar_path).unwrap();
+    reader.execute_batch("BEGIN;").unwrap();
+    let table_count_before: i64 = reader
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let reopened = MailboxDb::open(&sidecar_path).unwrap();
+
+    let table_count_after: i64 = reader
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_count_after, table_count_before);
+    reader.execute_batch("COMMIT;").unwrap();
+    drop(reopened);
+}
+
+#[test]
 fn mailbox_open_read_only_missing_path_creates_no_parent_schema_or_sidecars() {
     let dir = tempfile::tempdir().unwrap();
     let parent = dir.path().join("missing-parent");
