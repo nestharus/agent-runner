@@ -196,7 +196,11 @@ impl StateDb {
     }
 
     fn default_backfill_model_name(model_name: Option<String>) -> String {
-        model_name.unwrap_or_else(|| "<unknown>".to_string())
+        model_name
+            .as_deref()
+            .map(Self::resume_chain_model_name)
+            .unwrap_or("<unknown>")
+            .to_string()
     }
 
     fn insert_backfill_chain(

@@ -331,6 +331,206 @@ fn assert_selected_account(
     assert_eq!(row.provider_index, 1);
 }
 
+// Exercise the public default-provider path with stubbed launches, then route the
+// next invocation through the production selector. No CLI or provider process runs.
+struct SelectFirst;
+impl RoutingServicePort for SelectFirst {
+    fn select_route(
+        &self,
+        _request: RoutingServiceRequest<'_>,
+    ) -> Result<RoutingServiceOutput, ServiceError> {
+        Ok(RoutingServiceOutput { provider_index: 0 })
+    }
+}
+
+struct SelectSecond;
+impl RoutingServicePort for SelectSecond {
+    fn select_route(
+        &self,
+        _request: RoutingServiceRequest<'_>,
+    ) -> Result<RoutingServiceOutput, ServiceError> {
+        Ok(RoutingServiceOutput { provider_index: 1 })
+    }
+}
+
+struct FailedLauncher;
+impl InteractiveLauncher for FailedLauncher {
+    fn launch(
+        &self,
+        _provider: &ProviderConfig,
+        _cwd: Option<&Path>,
+        _parent: Option<&str>,
+        _state_path: Option<&Path>,
+        _binding: Option<InteractiveLiveSessionBinding>,
+    ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
+        Ok(crate::executor::cli::InteractiveExecutionResult {
+            exit_code: 17,
+            terminal_reason: Some("offline failure".into()),
+            terminal_signal: None,
+            live_session_id: None,
+            live_session_capture_required: false,
+        })
+    }
+}
+
+#[test]
+fn default_failure_history_changes_next_family_selection_without_cross_account_leakage() {
+    let fixture = Fixture::new();
+    let _env = EnvGuard::set("OULIPOLY_DATA_DIR", fixture.root.path().join("locks"));
+    // Two accounts have the same quota and the third is exhausted. Give #2
+    // enough successful launch history to keep #1 ahead in ordinary fallback
+    // scoring until the recent-error suppression threshold is reached.
+    fs::write(
+        fixture.root.path().join("fixture-quota.json"),
+        r#"{"windows":[{"used_percent":10,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+    )
+    .unwrap();
+    let state = StateDb::open(&fixture.state_path).unwrap();
+    let family = "<provider-family:fixture>";
+    // Successful default launches give fixture2 enough ordinary invocation
+    // history that one or two fixture failures cannot win via count fallback.
+    let prior_successes = RecordingLauncher::default();
+    for _ in 0..35 {
+        assert_eq!(
+            run_repl_with_default_provider_with_launcher(
+                fixture.services(Arc::new(SelectSecond)),
+                &prior_successes,
+            )
+            .unwrap(),
+            0
+        );
+    }
+    let mut carrier = model();
+    carrier.name = family.into();
+    let providers = ProvidersConfig::load(&fixture.root.path().join("providers.toml")).unwrap();
+    let in_flight = InFlight::new();
+    let ctx = BalanceContext {
+        providers_cfg: &providers,
+        in_flight: &in_flight,
+    };
+    assert_eq!(
+        ProductionRoutingService
+            .select_route(RoutingServiceRequest {
+                model: &carrier,
+                state: &state,
+                ctx: Some(&ctx),
+            })
+            .unwrap()
+            .provider_index,
+        0,
+        "fixture must win before its family-keyed failures"
+    );
+    for failures in 1..=3 {
+        assert_eq!(
+            run_repl_with_default_provider_with_launcher(
+                fixture.services(Arc::new(SelectFirst)),
+                &FailedLauncher,
+            )
+            .unwrap(),
+            17
+        );
+        let selected = ProductionRoutingService
+            .select_route(RoutingServiceRequest {
+                model: &carrier,
+                state: &state,
+                ctx: Some(&ctx),
+            })
+            .unwrap()
+            .provider_index;
+        assert_eq!(
+            selected,
+            if failures < 3 { 0 } else { 1 },
+            "selection after {failures} current family failures"
+        );
+    }
+    assert_eq!(state.recent_error_count(family, "fixture", 30).unwrap(), 3);
+    assert_eq!(state.recent_error_count(family, "fixture2", 30).unwrap(), 0);
+    assert_eq!(
+        state
+            .recent_error_count("<unknown>", "fixture", 30)
+            .unwrap(),
+        0
+    );
+    let launcher = RecordingLauncher::default();
+    run_repl_with_default_provider_with_launcher(
+        fixture.services(Arc::new(ProductionRoutingService)),
+        &launcher,
+    )
+    .unwrap();
+    assert_eq!(
+        launcher.calls.borrow()[0].1.identity.provider_name,
+        "fixture2"
+    );
+    let failed = state.get_provider(family, "fixture").unwrap().unwrap();
+    assert_eq!((failed.invocation_count, failed.error_count), (3, 3));
+    let success = state.get_provider(family, "fixture2").unwrap().unwrap();
+    assert_eq!((success.invocation_count, success.error_count), (36, 0));
+    assert!(state.get_provider(family, "fixture3").unwrap().is_none());
+}
+
+#[test]
+fn historical_unknown_failures_are_not_reassigned_to_a_default_family() {
+    let fixture = Fixture::new();
+    let _env = EnvGuard::set("OULIPOLY_DATA_DIR", fixture.root.path().join("locks"));
+    fs::write(
+        fixture.root.path().join("fixture-quota.json"),
+        r#"{"windows":[{"used_percent":10,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+    )
+    .unwrap();
+    let state = StateDb::open(&fixture.state_path).unwrap();
+    for _ in 0..3 {
+        let id = state
+            .start_invocation(&oulipoly_state::InvocationStart {
+                invocation_uuid: uuid::Uuid::new_v4().to_string(),
+                model_name: "<unknown>".into(),
+                provider_name: "fixture".into(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .finalize_invocation(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                id,
+                false,
+                17,
+                None,
+                Some("historical failure"),
+            )
+            .unwrap();
+    }
+    let launcher = RecordingLauncher::default();
+    run_repl_with_default_provider_with_launcher(
+        fixture.services(Arc::new(ProductionRoutingService)),
+        &launcher,
+    )
+    .unwrap();
+    assert_eq!(
+        launcher.calls.borrow()[0].1.identity.provider_name,
+        "fixture"
+    );
+    assert_eq!(
+        state
+            .recent_error_count("<unknown>", "fixture", 30)
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        state
+            .recent_error_count("<provider-family:fixture>", "fixture", 30)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        state
+            .get_provider("<provider-family:fixture>", "fixture")
+            .unwrap()
+            .unwrap()
+            .error_count,
+        0
+    );
+}
+
 #[test]
 fn default_pool_exhaustion_stops_before_launch() {
     let fixture = Fixture::new();

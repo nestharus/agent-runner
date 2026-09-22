@@ -21,7 +21,6 @@ use crate::services::{
 };
 use crate::session_provider::SessionProviderIdentity;
 
-const UNKNOWN_DEFAULT_PROVIDER_MODEL: &str = "<unknown>";
 const DEFAULT_PROVIDER_REPL_CAPTURE_METHOD: &str = "turn_script";
 const LIVE_SESSION_IDENTITY_UNAVAILABLE: &str = "live_session_identity_unavailable";
 
@@ -270,8 +269,12 @@ where
 {
     let lifecycle = ProductionInvocationLifecycleService::new();
     let invocation = default_provider_invocation(input.provider_name);
-    let invocation_start =
-        default_provider_invocation_start(&invocation, input.provider_name, input.provider_index);
+    let invocation_start = default_provider_invocation_start(
+        &invocation,
+        &input.carrier_model.name,
+        input.provider_name,
+        input.provider_index,
+    );
     let invocation_start = lifecycle
         .start_invocation(InvocationLifecycleStartRequest {
             state: input.state,
@@ -390,12 +393,13 @@ fn default_provider_invocation(provider_name: &str) -> CompositeInvocationId {
 
 fn default_provider_invocation_start(
     invocation: &CompositeInvocationId,
+    model_name: &str,
     provider_name: &str,
     provider_index: usize,
 ) -> InvocationStart {
     InvocationStart {
         invocation_uuid: invocation.id.clone(),
-        model_name: UNKNOWN_DEFAULT_PROVIDER_MODEL.to_string(),
+        model_name: model_name.to_string(),
         provider_name: provider_name.to_string(),
         provider_index,
         parent_invocation_id: None,
@@ -1491,7 +1495,7 @@ executable = "{}"
     }
 
     #[test]
-    fn creates_unknown_model_invocation_row() {
+    fn creates_family_keyed_invocation_row() {
         let temp = tempfile::tempdir().unwrap();
         let state_path = temp.path().join("state.db");
         StateDb::open(&state_path).unwrap();
@@ -1509,7 +1513,7 @@ executable = "{}"
         assert_eq!(table_count(&state_path, "invocations"), 1);
         let (model_name, provider_name, status, provider_session_id, capture_method) =
             invocation_row(&state_path);
-        assert_eq!(model_name, "<unknown>");
+        assert_eq!(model_name, "<provider-family:generic>");
         assert_eq!(provider_name, "generic");
         assert_eq!(status, "succeeded");
         assert_eq!(provider_session_id, None);
@@ -1585,7 +1589,7 @@ turn_script = "{}"
         assert_eq!(table_count(&state_path, "session_chain_segments"), 0);
         let (model_name, provider_name, status, provider_session_id, capture_method) =
             invocation_row(&state_path);
-        assert_eq!(model_name, "<unknown>");
+        assert_eq!(model_name, "<provider-family:generic>");
         assert_eq!(provider_name, "generic");
         assert_eq!(status, "succeeded");
         assert_eq!(provider_session_id, None);
@@ -1621,6 +1625,71 @@ turn_script = "{}"
             assert_eq!(provider_session_id.as_deref(), Some(session_id.as_str()));
             assert_eq!(capture_method.as_deref(), Some("provider_live_report"));
         }
+    }
+
+    #[test]
+    fn captured_default_session_resumes_without_a_configured_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        StateDb::open(&state_path).unwrap();
+        write_config(temp.path(), r#"default_provider = "generic""#);
+        write_providers(temp.path(), &provider_fixture("generic"));
+        let launcher = CapturingTerminalLauncher {
+            session_id: "default-session-to-resume".into(),
+            exit_code: 0,
+            terminal_reason: "completed".into(),
+            spawn_error: false,
+        };
+
+        assert_eq!(
+            run_repl_with_default_provider_with_launcher(
+                runtime_services_with_state(temp.path().to_path_buf(), state_path.clone()),
+                &launcher,
+            )
+            .unwrap(),
+            0
+        );
+
+        let state = StateDb::open(&state_path).unwrap();
+        let chain_id = state
+            .chain_id_for_segment("generic", &launcher.session_id)
+            .unwrap()
+            .unwrap();
+        let models = oulipoly_state::ModelStore::new();
+        for input in [&launcher.session_id, &chain_id] {
+            let resolved = state.resolve_resume(&models, input, None).unwrap();
+            assert_eq!(resolved.chain_id, chain_id);
+            assert_eq!(resolved.active_provider, "generic");
+            assert_eq!(resolved.active_session_id, launcher.session_id);
+            assert!(resolved.model_name.is_none());
+            assert!(resolved.model.is_none());
+        }
+        let stored_model: String = Connection::open(&state_path)
+            .unwrap()
+            .query_row(
+                "SELECT model_name FROM session_chains WHERE chain_id = ?1",
+                [&chain_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_model, "<unknown>");
+        assert_eq!(invocation_row(&state_path).0, "<provider-family:generic>");
+
+        let configured = ModelConfig {
+            name: "configured-generic".into(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::model_provider("generic", Vec::new())],
+            inputs: Vec::new(),
+            provider: None,
+        };
+        let mut models = oulipoly_state::ModelStore::new();
+        models.insert(configured.name.clone(), configured);
+        let overridden = state
+            .resolve_resume(&models, &launcher.session_id, Some("configured-generic"))
+            .unwrap();
+        assert_eq!(overridden.model_name.as_deref(), Some("configured-generic"));
+        assert_eq!(overridden.active_provider, "generic");
+        assert!(overridden.model.is_some());
     }
 
     #[test]
