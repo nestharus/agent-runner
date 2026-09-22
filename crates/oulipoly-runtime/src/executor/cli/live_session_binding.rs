@@ -15,8 +15,15 @@ use crate::session_authority::{
 use crate::session_provider::SessionProviderIdentity;
 #[cfg(unix)]
 use crate::session_provider::{SessionProviderLiveCaptureRequest, capture_live_report_with_client};
+#[cfg(all(unix, not(test)))]
+use oulipoly_core::runtime_cap::{ProgressWaitOutcome, RuntimeCapClass};
 #[cfg(unix)]
 use oulipoly_state::StateDb;
+#[cfg(all(unix, not(test)))]
+use oulipoly_state::diagnostic_recorder::{
+    DiagnosticPhase, OutcomeCertainty, PhaseObservation, RuntimeCapEvidence, SpanStart,
+    try_process_recorder,
+};
 #[cfg(unix)]
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -61,6 +68,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(unix)]
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(all(unix, not(test)))]
+const WORKER_JOIN_CAP_ID: &str = "runtime.executor.cli.live-session-binding.worker-join-timeout";
 
 #[derive(Clone)]
 pub struct InteractiveLiveSessionBinding {
@@ -188,13 +197,97 @@ impl Drop for LiveSessionBindingServer {
 
 #[cfg(unix)]
 fn join_worker_bounded(worker: JoinHandle<()>) {
-    let deadline = Instant::now() + WORKER_JOIN_TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + WORKER_JOIN_TIMEOUT;
+    #[cfg(not(test))]
+    let telemetry = try_process_recorder().map(|recorder| {
+        let start = SpanStart::new(
+            "live_session_binding.worker_join",
+            "live_session_binding_worker",
+        )
+        .with_lifecycle_phase("shutdown");
+        let trace = start.diagnostic_id().to_string();
+        let _ = recorder.record_deferred_completed_observation(
+            start.clone(),
+            Duration::ZERO,
+            DiagnosticPhase::Requested,
+            PhaseObservation::started_unknown().with_runtime_cap(RuntimeCapEvidence::new(
+                WORKER_JOIN_CAP_ID,
+                RuntimeCapClass::ProvisionalStopgap,
+                "live_session_binding.worker_join",
+                "precursor",
+                "100ms",
+                ProgressWaitOutcome::Pending,
+                OutcomeCertainty::StartedUnknown,
+                &trace,
+            )),
+        );
+        (recorder, start, trace)
+    });
     while !worker.is_finished() && Instant::now() < deadline {
         thread::sleep(ACCEPT_POLL);
     }
     if worker.is_finished() {
         let _ = worker.join();
+        #[cfg(not(test))]
+        if let Some((recorder, start, trace)) = telemetry {
+            let _ = recorder.record_deferred_completed_observation(
+                start,
+                started.elapsed(),
+                DiagnosticPhase::Released,
+                PhaseObservation::terminal().with_runtime_cap(RuntimeCapEvidence::new(
+                    WORKER_JOIN_CAP_ID,
+                    RuntimeCapClass::ProvisionalStopgap,
+                    "live_session_binding.worker_join",
+                    "terminal",
+                    "100ms",
+                    ProgressWaitOutcome::Complete,
+                    OutcomeCertainty::Terminal,
+                    trace,
+                )),
+            );
+        }
+        #[cfg(test)]
+        worker_join_cap_event("complete");
+    } else {
+        #[cfg(not(test))]
+        if let Some((recorder, start, trace)) = telemetry {
+            let _ = recorder.record_deferred_completed_observation(
+                start,
+                started.elapsed(),
+                DiagnosticPhase::Failed,
+                PhaseObservation::terminal()
+                    .with_cause("worker_join_cap_exhausted")
+                    .with_runtime_cap(RuntimeCapEvidence::new(
+                        WORKER_JOIN_CAP_ID,
+                        RuntimeCapClass::ProvisionalStopgap,
+                        "live_session_binding.worker_join",
+                        "terminal",
+                        "100ms",
+                        ProgressWaitOutcome::Stalled,
+                        OutcomeCertainty::Terminal,
+                        trace,
+                    )),
+            );
+        }
+        #[cfg(test)]
+        worker_join_cap_event("stalled");
     }
+}
+
+#[cfg(test)]
+type WorkerJoinCapEvent = [(&'static str, &'static str); 2];
+
+#[cfg(test)]
+static WORKER_JOIN_CAP_EVENTS: std::sync::LazyLock<Mutex<Vec<WorkerJoinCapEvent>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[cfg(test)]
+fn worker_join_cap_event(outcome: &'static str) {
+    WORKER_JOIN_CAP_EVENTS
+        .lock()
+        .unwrap()
+        .push([("precursor", "pending"), ("terminal", outcome)]);
 }
 
 #[cfg(unix)]
@@ -600,6 +693,22 @@ mod tests {
     const SESSION_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
     const PROVIDER_NAME: &str = "fixture-account";
     const MODEL_NAME: &str = "fixture-model";
+
+    #[test]
+    fn worker_join_cap_emits_precursor_and_terminal_outcomes() {
+        WORKER_JOIN_CAP_EVENTS.lock().unwrap().clear();
+        join_worker_bounded(std::thread::spawn(|| {}));
+
+        let (release, wait) = std::sync::mpsc::channel();
+        join_worker_bounded(std::thread::spawn(move || {
+            let _ = wait.recv();
+        }));
+        release.send(()).unwrap();
+
+        let events = WORKER_JOIN_CAP_EVENTS.lock().unwrap().clone();
+        assert!(events.contains(&[("precursor", "pending"), ("terminal", "complete")]));
+        assert!(events.contains(&[("precursor", "pending"), ("terminal", "stalled")]));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

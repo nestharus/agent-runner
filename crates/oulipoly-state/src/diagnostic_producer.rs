@@ -263,6 +263,61 @@ pub(crate) fn submit_lifecycle_observation(
     })
 }
 
+pub(crate) fn submit_metric_sample(
+    sample: &crate::longitudinal_metrics::MetricSample,
+    process: &RecorderProcessIdentity,
+    recorded_at_unix_micros: i64,
+    correlations: EventCorrelations,
+) -> Result<PreparedEventSubmission, String> {
+    let configured = configured_sink();
+    let producer = configured
+        .as_ref()
+        .map(|configured| configured.sink.producer_identity())
+        .unwrap_or_else(|| producer_identity_from_recorder(process));
+    let policy = PayloadNormalizationPolicy::registered(&[
+        "schema_version",
+        "name",
+        "unit",
+        "outcome",
+        "value",
+        "labels",
+    ])
+    .map_err(|error| error.to_string())?;
+    let envelope = EventEnvelopeV1::normalize(
+        NewEventV1 {
+            event_id: EventId::random(),
+            family: EventFamily::Metric,
+            kind: EventKind::registered("metric.sample").map_err(|error| error.to_string())?,
+            recorded_at_unix_micros,
+            producer_sequence: next_producer_sequence()?,
+            producer,
+            correlations,
+            payload: crate::longitudinal_metrics::metric_payload(sample)?,
+            legacy_provenance: None,
+            retry_of_generation_id: None,
+        },
+        &policy,
+        Utc::now().timestamp_micros().max(0),
+    )
+    .map_err(|error| error.to_string())?;
+    let submitted = configured
+        .as_ref()
+        .map(|configured| {
+            configured
+                .sink
+                .submit(&envelope, EventSubmitDurability::BestEffort)
+        })
+        .unwrap_or_else(|| EventSinkSubmission::finished(EventSubmitStatus::Unavailable));
+    Ok(PreparedEventSubmission {
+        envelope,
+        status: submitted.status,
+        pending: submitted.pending,
+        mode: configured
+            .map(|configured| configured.mode)
+            .unwrap_or(EventSinkMode::NormalWithJsonlFallback),
+    })
+}
+
 fn configured_sink() -> Option<ConfiguredEventSink> {
     EVENT_SINK
         .get_or_init(|| Mutex::new(None))
@@ -297,15 +352,25 @@ fn diagnostic_envelope(
         .timestamp_micros()
         .max(0);
     let ingested_at = Utc::now().timestamp_micros().max(0);
+    let mut observation =
+        serde_json::to_value(&event.observation).map_err(|error| error.to_string())?;
+    if let Some(fields) = observation.as_object_mut() {
+        if let Some(value) = fields.remove("sqlite_failure") {
+            fields.insert("database_failure".to_string(), value);
+        }
+        if let Some(value) = fields.remove("sqlite") {
+            fields.insert("database_evidence".to_string(), value);
+        }
+    }
     let payload = json!({
         "operation": event.operation,
         "resource": event.resource,
         "lifecycle_phase": event.lifecycle_phase,
         "phase": event.phase,
         "elapsed_micros": event.elapsed_micros,
-        "observation": event.observation,
+        "observation": observation,
         "diagnostic_correlations": event.correlations,
-        "sqlite": event.sqlite,
+        "database_identity": event.sqlite,
     });
     let policy = PayloadNormalizationPolicy::registered(&[
         "operation",
@@ -315,7 +380,7 @@ fn diagnostic_envelope(
         "elapsed_micros",
         "observation",
         "diagnostic_correlations",
-        "sqlite",
+        "database_identity",
     ])
     .map_err(|error| error.to_string())?;
     EventEnvelopeV1::normalize(

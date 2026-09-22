@@ -16,7 +16,10 @@ bounded union reads, and non-destructive maintenance interfaces are implemented 
 `crates/oulipoly-state/src/event_store/` and the diagnostic producer modules.
 AGE-372 supplies policy approval and exact receipt inputs. AGE-377 implements
 historical scheduling, singleton maintenance jobs, bounded coordination
-retention/compaction, and exact event retirement. Unsafe repair-copy or
+retention/compaction, and exact event retirement. AGE-378 adds closed-schema,
+bounded-cardinality longitudinal metrics, bounded cross-generation queries,
+and trace exemplars, and activates the partitioned store as the normal
+diagnostic sink with byte-identical JSONL fallback. Unsafe repair-copy or
 quarantine requests remain fail-closed; maintenance never edits a corrupt
 generation in place.
 
@@ -104,8 +107,7 @@ the partitioned event store:
    (`invocation.started`, capture, finalization, and their failure records).
 3. Runtime traces and diagnostic envelopes that are currently logging/tracing
    side effects rather than coordination rows.
-4. Bounded longitudinal metric samples and trace exemplars from the later
-   metrics ticket.
+4. AGE-378 bounded longitudinal metric samples and trace exemplars.
 5. Structured application/maintenance logs whose loss affects diagnosis but
    not live correctness.
 

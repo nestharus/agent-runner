@@ -56,9 +56,10 @@ pub use maintenance::{
     inspect_closed_generation_for_catalog, plan_local_index_rebuild, select_catalog_current_slots,
 };
 pub use reader::{
-    BoundedRead, CoverageIssue, CoverageIssueKind, DiscoveryCoverage, EventFilter,
-    GenerationReadTarget, PartitionWatermark, ReadLimits, ReadRecord, read_discovered_generations,
-    read_generation, read_generations, reconcile_exact_generation,
+    BoundedDiscovery, BoundedRead, CoverageIssue, CoverageIssueKind, DiscoveryCoverage,
+    EventFilter, GenerationReadTarget, PartitionWatermark, ReadLimits, ReadRecord,
+    discover_generation_read_targets, read_discovered_generations, read_generation,
+    read_generations, reconcile_exact_generation,
 };
 pub use schema::{
     AppendDisposition, AppendTicket, EventStoreError, GenerationMetadata, GenerationState,

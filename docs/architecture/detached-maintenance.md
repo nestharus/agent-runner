@@ -75,8 +75,9 @@ sidecar when rejected-request evidence cannot be delivered; status reads expose
 that sidecar instead of erasing the request-level loss behind the incumbent job
 record. Recurring attempts retain the prior terminal owner, schedule basis,
 launch ID, completion time, and terminal result. Evidence never proves or rolls
-back maintenance effects. AGE-378 owns longitudinal aggregation and
-slow-versus-stalled inference.
+back maintenance effects. AGE-378 implements bounded longitudinal aggregation
+and trace exemplars; interpretation of slow-versus-stalled remains conditional
+on the returned coverage and drop evidence.
 
 Local cancellation requires the exact kind, partition, and currently admitted
 epoch:

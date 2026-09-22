@@ -348,6 +348,24 @@ pub(crate) enum DiagnosticsSubcommands {
         #[arg(long)]
         json: bool,
     },
+    /// Query bounded longitudinal metrics across event-store rotations.
+    Metrics {
+        /// Time window ending now, in minutes.
+        #[arg(long, default_value = "60")]
+        minutes: std::num::NonZeroU64,
+
+        /// Emit structured JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read bounded event-store exemplars for one trace UUID.
+    EventTrace {
+        trace_id: String,
+
+        /// Emit structured JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Read the direct evidence and checkpoint for one exact maintenance job.
     Maintenance {
         #[arg(long)]
@@ -854,6 +872,42 @@ mod offline_diagnostics_cli_tests {
                     json: true,
                 },
             }) if diagnostic_id == "diagnostic-17"
+        ));
+    }
+
+    #[test]
+    fn parses_metrics_and_event_trace() {
+        let metrics = Cli::try_parse_from([
+            "runner",
+            "diagnostics",
+            "metrics",
+            "--minutes",
+            "15",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            metrics.command,
+            Some(Subcommands::Diagnostics {
+                command: DiagnosticsSubcommands::Metrics { minutes, json: true },
+            }) if minutes.get() == 15
+        ));
+        assert!(
+            Cli::try_parse_from(["runner", "diagnostics", "metrics", "--minutes", "0",]).is_err()
+        );
+
+        let trace = Cli::try_parse_from([
+            "runner",
+            "diagnostics",
+            "event-trace",
+            "11111111-1111-4111-8111-111111111111",
+        ])
+        .unwrap();
+        assert!(matches!(
+            trace.command,
+            Some(Subcommands::Diagnostics {
+                command: DiagnosticsSubcommands::EventTrace { trace_id, json: false },
+            }) if trace_id == "11111111-1111-4111-8111-111111111111"
         ));
     }
 
