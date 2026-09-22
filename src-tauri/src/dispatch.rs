@@ -66,8 +66,8 @@ use crate::cli::inputs::{
 };
 use crate::resume_cli::format_resume_error;
 use crate::usage::cli::{
-    Cli, DiagnosticsSubcommands, MailboxSubcommands, NotifySubcommands, SessionSubcommands,
-    Subcommands,
+    Cli, DiagnosticsSubcommands, MailboxSubcommands, MaintenanceSubcommands, NotifySubcommands,
+    SessionSubcommands, Subcommands,
 };
 use crate::{commands, run, usage, wiring};
 
@@ -94,17 +94,45 @@ pub(crate) use predicate::{
 /// Dispatch commands whose contract forbids completion-owner bootstrap, recovery,
 /// runtime-service construction, and primary SQLite access.
 pub(crate) fn run_offline_entry(cli: &Cli) -> Result<Option<i32>, String> {
-    let Some(Subcommands::Diagnostics { command }) = &cli.command else {
-        return Ok(None);
-    };
-    let code = match command {
-        DiagnosticsSubcommands::Recent { limit, json } => {
-            crate::commands::offline_diagnostics::run_recent(limit.get(), *json)
-        }
-        DiagnosticsSubcommands::Trace {
-            diagnostic_id,
-            json,
-        } => crate::commands::offline_diagnostics::run_trace(diagnostic_id, *json),
+    let code = match &cli.command {
+        Some(Subcommands::Diagnostics { command }) => match command {
+            DiagnosticsSubcommands::Recent { limit, json } => {
+                crate::commands::offline_diagnostics::run_recent(limit.get(), *json)
+            }
+            DiagnosticsSubcommands::Trace {
+                diagnostic_id,
+                json,
+            } => crate::commands::offline_diagnostics::run_trace(diagnostic_id, *json),
+            DiagnosticsSubcommands::Maintenance {
+                kind,
+                partition,
+                json,
+            } => crate::commands::maintenance_control::run_status(
+                "diagnostics maintenance",
+                kind,
+                partition,
+                *json,
+            ),
+        },
+        Some(Subcommands::Maintenance { command }) => match command {
+            MaintenanceSubcommands::Status {
+                kind,
+                partition,
+                json,
+            } => crate::commands::maintenance_control::run_status(
+                "maintenance status",
+                kind,
+                partition,
+                *json,
+            ),
+            MaintenanceSubcommands::Cancel {
+                kind,
+                partition,
+                epoch,
+                json,
+            } => crate::commands::maintenance_control::run_cancel(kind, partition, *epoch, *json),
+        },
+        _ => return Ok(None),
     }?;
     Ok(Some(code))
 }
@@ -405,8 +433,8 @@ fn dispatch_subcommand(
         }
         Subcommands::Notify { command } => dispatch_notify_subcommand(command),
         Subcommands::Mailbox { command } => dispatch_mailbox_subcommand(command),
-        Subcommands::Diagnostics { .. } => {
-            unreachable!("diagnostics commands must execute through run_offline_entry")
+        Subcommands::Diagnostics { .. } | Subcommands::Maintenance { .. } => {
+            unreachable!("offline commands must execute through run_offline_entry")
         }
         Subcommands::ResumeList { uuid } => crate::commands::resume_list::run_resume_list(&uuid),
         Subcommands::CompletedTurn {

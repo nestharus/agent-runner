@@ -4,6 +4,7 @@ pub(crate) mod diagnostics;
 pub(crate) mod direct_model;
 pub(crate) mod handshake;
 pub(crate) mod mailbox;
+pub(crate) mod maintenance_control;
 pub(crate) mod migrate;
 pub(crate) mod notify;
 pub(crate) mod notify_continuation;

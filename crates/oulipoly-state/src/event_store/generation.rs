@@ -540,6 +540,52 @@ impl WriterLayout {
         })
     }
 
+    /// Open an already-published writer layout without creating a directory,
+    /// lease, head, or database. Detached maintenance uses this path so a
+    /// typo or stale request cannot manufacture historical authority.
+    pub fn open_existing(
+        event_store_root: impl AsRef<Path>,
+        writer_instance_id: [u8; 16],
+    ) -> Result<Self, GenerationError> {
+        let event_store_root = event_store_root.as_ref().to_path_buf();
+        let writer_instance_id = WriterInstanceId::from_bytes(writer_instance_id);
+        let writer_dir = event_store_root
+            .join("writers")
+            .join(id_hex(writer_instance_id.as_bytes()));
+        let generations_dir = writer_dir.join("generations");
+        let staging_dir = writer_dir.join("staging");
+        let leases_dir = writer_dir.join("leases");
+        for path in [
+            &event_store_root,
+            &writer_dir,
+            &generations_dir,
+            &leases_dir,
+        ] {
+            if !path
+                .try_exists()
+                .map_err(|error| io_error("inspect existing writer layout", error))?
+                || !path
+                    .metadata()
+                    .map_err(|error| io_error("inspect existing writer layout", error))?
+                    .is_dir()
+            {
+                return Err(GenerationError::UnsafePath(format!(
+                    "missing existing writer layout component {}",
+                    path.display()
+                )));
+            }
+        }
+        require_same_filesystem(&event_store_root, &writer_dir)?;
+        Ok(Self {
+            event_store_root,
+            writer_instance_id,
+            writer_dir,
+            generations_dir,
+            staging_dir,
+            leases_dir,
+        })
+    }
+
     pub fn event_store_root(&self) -> &Path {
         &self.event_store_root
     }
@@ -677,6 +723,17 @@ impl WriterLayout {
             // A caller may be recovering after the create-once rename became
             // visible but before its parent-directory sync completed.
             sync_dir(&self.generations_dir)?;
+            // Discovery is a derived, per-generation journal. An existing
+            // authoritative generation must never become a failed publication
+            // merely because its scheduling evidence needs repair.
+            let _ = super::maintenance_discovery::register_legacy_generation(
+                &self.event_store_root,
+                self.writer_instance_id,
+                manifest.generation_id,
+                super::maintenance_discovery::DiscoveryPhase::Prepared,
+                None,
+                Some(manifest),
+            );
             return Ok(PublishedGeneration {
                 generation_dir: final_path,
                 database_path: final_db,
@@ -690,9 +747,28 @@ impl WriterLayout {
             id_hex(manifest.generation_id.as_bytes()),
             nonce
         ));
+        let staging_name = staging_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| GenerationError::UnsafePath("invalid staging name".to_owned()))?;
+        // This exact journal is durable before the first staging side effect.
+        // It is isolated by generation identity and cannot contend with an
+        // unrelated producer's publication.
+        super::maintenance_discovery::publish_generation_intent(
+            &self.event_store_root,
+            manifest,
+            staging_name,
+        )
+        .map_err(GenerationError::Validation)?;
         fs::create_dir(&staging_path)
             .map_err(|error| io_error("create unique generation staging directory", error))?;
         set_private_directory(&staging_path)?;
+        let _ = super::maintenance_discovery::record_generation_phase(
+            &self.event_store_root,
+            self.writer_instance_id,
+            manifest.generation_id,
+            super::maintenance_discovery::DiscoveryPhase::Staging,
+        );
         let db_path = staging_path.join(DATABASE_FILE_NAME);
         prepare_database(&db_path)?;
         sync_file(&db_path)?;
@@ -711,6 +787,12 @@ impl WriterLayout {
         sync_dir(&staging_path)?;
         validate_database(&db_path, manifest)?;
 
+        let _ = super::maintenance_discovery::record_generation_phase(
+            &self.event_store_root,
+            self.writer_instance_id,
+            manifest.generation_id,
+            super::maintenance_discovery::DiscoveryPhase::Publishing,
+        );
         rename_create_once(&staging_path, &final_path)?;
         sync_dir(&self.staging_dir)?;
         sync_dir(&self.generations_dir)?;
@@ -720,6 +802,15 @@ impl WriterLayout {
             return Err(GenerationError::PublicationConflict(final_path));
         }
         validate_database(&final_db, manifest)?;
+        // The authoritative publication is already durable. A derived journal
+        // update may lag, but the pre-published intent remains an exact bounded
+        // recovery source and must not turn success into a generic failure.
+        let _ = super::maintenance_discovery::record_generation_phase(
+            &self.event_store_root,
+            self.writer_instance_id,
+            manifest.generation_id,
+            super::maintenance_discovery::DiscoveryPhase::Prepared,
+        );
         Ok(PublishedGeneration {
             generation_dir: final_path,
             database_path: final_db,
@@ -988,97 +1079,13 @@ fn publish_sealed_manifest(
             "sealed manifest identity does not match prepared manifest".to_owned(),
         ));
     }
-    let connection = rusqlite::Connection::open_with_flags(
-        generation_dir.join(DATABASE_FILE_NAME),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )?;
-    let metadata = super::read_generation_metadata(&connection)
-        .map_err(|error| GenerationError::Validation(error.to_string()))?;
-    if metadata.writer_instance_id != manifest.writer_instance_id
-        || metadata.generation_id != manifest.generation_id
-        || metadata.state != super::GenerationState::Closed
-        || metadata.closed_at_unix_micros != Some(manifest.closed_at_unix_micros)
-    {
-        return Err(GenerationError::InvalidManifest(
-            "sealed manifest does not match closed generation metadata".to_owned(),
-        ));
-    }
-    let quick_check: String = connection
-        .query_row("PRAGMA quick_check", [], |row| row.get(0))
-        .map_err(GenerationError::Sqlite)?;
-    if quick_check != "ok" {
-        return Err(GenerationError::Validation(format!(
-            "quick_check failed before seal: {quick_check}"
-        )));
-    }
-    let observed: GenerationAggregateFacts = connection
-        .query_row(
-            "SELECT count(*), max(local_sequence),
-                        min(recorded_at_unix_micros), max(recorded_at_unix_micros),
-                        min(ingested_at_unix_micros), max(ingested_at_unix_micros)
-                   FROM events",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
-        )
-        .map_err(GenerationError::Sqlite)?;
-    if u64::try_from(observed.0).ok() != Some(manifest.row_count)
-        || observed.1.and_then(|value| u64::try_from(value).ok())
-            != manifest.high_water_local_sequence
-        || observed.2 != manifest.min_recorded_at_unix_micros
-        || observed.3 != manifest.max_recorded_at_unix_micros
-        || observed.4 != manifest.min_ingested_at_unix_micros
-        || observed.5 != manifest.max_ingested_at_unix_micros
-    {
-        return Err(GenerationError::InvalidManifest(
-            "sealed row/high-water/time facts do not match SQLite".to_owned(),
-        ));
-    }
-    drop(connection);
-    let wal_name = format!("{DATABASE_FILE_NAME}-wal");
-    let wal_exists = generation_dir
-        .join(&wal_name)
-        .try_exists()
-        .map_err(|error| io_error("inspect sealed WAL", error))?;
-    let manifest_has_wal = manifest
-        .durable_files
-        .iter()
-        .any(|file| file.relative_path == wal_name);
-    let shm_name = format!("{DATABASE_FILE_NAME}-shm");
-    let shm_exists = generation_dir
-        .join(&shm_name)
-        .try_exists()
-        .map_err(|error| io_error("inspect sealed shared-memory sidecar", error))?;
-    let manifest_has_shm = manifest
-        .transient_sidecars_observed
-        .iter()
-        .any(|name| name == &shm_name);
-    if wal_exists != manifest_has_wal || shm_exists != manifest_has_shm {
-        return Err(GenerationError::InvalidManifest(
-            "sealed manifest omits or invents a WAL/SHM sidecar".to_owned(),
-        ));
-    }
-    for identity in &manifest.durable_files {
-        let path = generation_dir.join(&identity.relative_path);
-        let metadata =
-            fs::metadata(&path).map_err(|error| io_error("inspect sealed durable file", error))?;
-        if metadata.len() != identity.bytes || hash_file(&path)? != identity.sha256 {
-            return Err(GenerationError::InvalidManifest(format!(
-                "sealed durable file identity mismatch: {}",
-                identity.relative_path
-            )));
-        }
-    }
+    // The caller has just derived this manifest under the exact exclusive
+    // generation lease: checkpoint_closed_generation_under_lease performed
+    // the single SQLite quick_check, and seal_closed_generation_under_lease
+    // read the aggregate facts and hashed each immutable durable file once.
+    // Repeating those whole-generation traversals here would not strengthen
+    // the same lease-held observation. Retirement independently revalidates
+    // the published identities immediately before destructive eligibility.
     let mut bytes = serde_json::to_vec(manifest)?;
     bytes.push(b'\n');
     publish_create_once_file(generation_dir, SEALED_MANIFEST_FILE_NAME, &bytes)?;
@@ -1112,7 +1119,32 @@ pub fn seal_closed_generation(
         "{}.lock",
         id_hex(prepared.generation_id.as_bytes())
     ));
-    let _maintenance_lease = acquire_generation_maintenance_lease_at(&lease_path)?;
+    let maintenance_lease = acquire_generation_maintenance_lease_at(&lease_path)?;
+    seal_closed_generation_under_lease(generation_dir, hold, &maintenance_lease)
+}
+
+/// Finish the create-once seal while the caller retains the exact exclusive
+/// lease. This prevents a checkpoint/seal worker from dropping ownership
+/// between validation and immutable manifest publication.
+pub fn seal_closed_generation_under_lease(
+    generation_dir: &Path,
+    hold: bool,
+    maintenance_lease: &GenerationMaintenanceLease,
+) -> Result<(SealedManifest, Digest32), GenerationError> {
+    let prepared = read_prepared_manifest(generation_dir)?;
+    let writer_dir = generation_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| GenerationError::UnsafePath(generation_dir.display().to_string()))?;
+    let expected_lease = writer_dir.join("leases").join(format!(
+        "{}.lock",
+        id_hex(prepared.generation_id.as_bytes())
+    ));
+    if maintenance_lease.path() != expected_lease {
+        return Err(GenerationError::Validation(
+            "seal does not hold the exact generation maintenance lease".to_owned(),
+        ));
+    }
     let wal_path = generation_dir.join(format!("{DATABASE_FILE_NAME}-wal"));
     match fs::metadata(&wal_path) {
         Ok(metadata) if metadata.len() > 0 => {
@@ -1212,6 +1244,71 @@ pub fn seal_closed_generation(
     };
     let digest = publish_sealed_manifest(generation_dir, &manifest)?;
     Ok((manifest, digest))
+}
+
+/// Checkpoint one exact closed generation under its exclusive maintenance
+/// lease. No handle escapes this function and no head or writer connection is
+/// opened. A busy or incomplete checkpoint fails closed.
+pub fn checkpoint_closed_generation_under_lease(
+    generation_dir: &Path,
+    maintenance_lease: &GenerationMaintenanceLease,
+) -> Result<(), GenerationError> {
+    let prepared = read_prepared_manifest(generation_dir)?;
+    let writer_dir = generation_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| GenerationError::UnsafePath(generation_dir.display().to_string()))?;
+    let expected_lease = writer_dir.join("leases").join(format!(
+        "{}.lock",
+        id_hex(prepared.generation_id.as_bytes())
+    ));
+    if maintenance_lease.path() != expected_lease {
+        return Err(GenerationError::Validation(
+            "checkpoint does not hold the exact generation maintenance lease".to_owned(),
+        ));
+    }
+    let database = generation_dir.join(DATABASE_FILE_NAME);
+    let connection = rusqlite::Connection::open_with_flags(
+        &database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let metadata = super::read_generation_metadata(&connection)
+        .map_err(|error| GenerationError::Validation(error.to_string()))?;
+    if metadata.state != super::GenerationState::Closed
+        || metadata.writer_instance_id != prepared.writer_instance_id
+        || metadata.generation_id != prepared.generation_id
+    {
+        return Err(GenerationError::Validation(
+            "checkpoint target is not the exact closed generation".to_owned(),
+        ));
+    }
+    let checkpoint: (i64, i64, i64) =
+        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if checkpoint.0 != 0 || checkpoint.1 != checkpoint.2 {
+        return Err(GenerationError::Validation(format!(
+            "closed generation checkpoint incomplete: {checkpoint:?}"
+        )));
+    }
+    let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if quick_check != "ok" {
+        return Err(GenerationError::Validation(format!(
+            "quick_check failed before seal: {quick_check}"
+        )));
+    }
+    drop(connection);
+    sync_file(&database)?;
+    let wal = generation_dir.join(format!("{DATABASE_FILE_NAME}-wal"));
+    if wal
+        .try_exists()
+        .map_err(|error| io_error("inspect checkpointed WAL", error))?
+    {
+        sync_file(&wal)?;
+    }
+    sync_dir(generation_dir)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

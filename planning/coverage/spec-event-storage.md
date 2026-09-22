@@ -3,6 +3,7 @@
 ## Source files
 
 - `crates/oulipoly-state/src/event_store/mod.rs`
+- `crates/oulipoly-state/src/event_store/detached.rs`
 - `crates/oulipoly-state/src/event_store/envelope.rs`
 - `crates/oulipoly-state/src/event_store/schema.rs`
 - `crates/oulipoly-state/src/event_store/generation.rs`
@@ -11,11 +12,18 @@
 - `crates/oulipoly-state/src/event_store/union_reader.rs`
 - `crates/oulipoly-state/src/event_store/importer.rs`
 - `crates/oulipoly-state/src/event_store/maintenance.rs`
+- `crates/oulipoly-state/src/event_store/maintenance_discovery.rs`
 - `crates/oulipoly-state/src/diagnostic_producer.rs`
 - `crates/oulipoly-state/src/diagnostic_recorder.rs`
 - `crates/oulipoly-state/src/lifecycle_log.rs`
 - `crates/oulipoly-state/src/retention.rs`
+- `crates/oulipoly-state/src/maintenance.rs`
+- `crates/oulipoly-state/src/detached_maintenance.rs`
 - `crates/oulipoly-state/src/lib.rs`
+- `src-tauri/src/main.rs`
+- `src-tauri/src/maintenance_worker.rs`
+- `src-tauri/tests/age377_maintenance_child_fallback.rs`
+- `src-tauri/src/commands/maintenance_control.rs`
 - `runtime-caps.json`
 - `runtime-cap-exclusions.json`
 - `tools/event-storage-evaluation/Cargo.toml`
@@ -29,6 +37,7 @@
 - `tools/event-storage-evaluation/src/lsm.rs`
 - `docs/architecture/event-storage-topology.md`
 - `docs/architecture/retention-engine.md`
+- `docs/architecture/detached-maintenance.md`
 - `docs/architecture/live-history-access-inventory.md`
 - `planning/age-375-event-storage-evaluation/report.md`
 - `planning/age-375-event-storage-evaluation/results/batch-1.json`
@@ -59,6 +68,16 @@
 | Current head reaches the day/size/lifecycle rotation boundary. | Writer syncs and validates the prepared successor manifest/database, renames the complete staging directory, drains already-ticketed batches, closes the old generation, and publishes the successor through the inactive two-slot head record. It does not scan, checkpoint, compact, or retain old history synchronously. |
 | Detached catalog is absent/stale. | Reader uses bounded manifest fallback or returns incomplete coverage; it never fabricates an empty complete result. |
 | Closed event partition passes the 30-day cutoff. | AGE-372 approves policy eligibility from AGE-376 prepared/sealed metadata; only an AGE-377 detached leased worker may checkpoint and atomically rename the complete generation directory to pending trash, publish a receipt, and unlink it. |
+| Ordinary GUI/provider startup offers daily maintenance. | Startup spawns the private child and proceeds without waiting; same-day requests converge through durable exact job locks/status. Offline diagnostics and the root-supervisor loop do not run maintenance. |
+| An independent producer's exact discovery shard is unavailable. | That publication fails before its first staging effect; another writer/generation publishes through a disjoint filesystem leaf without a shared maintenance writer or timeout. |
+| Publication stops after intent, staging creation, database preparation, prepared-manifest sync, publishing phase, or final-directory rename. | The exact sharded journal and bounded legacy cursor find the state. A proven-dead unselected empty prepared/incomplete staging artifact is dispositioned safely; an intent with no artifact is archived; a selected/live head is preserved. |
+| A discovery record retains a staging name but the only artifact is at the authoritative final path without a valid exact manifest. | Orphan classification reports preserved evidence and leaves every final-path byte in place; staging metadata does not authorize deletion of final data. |
+| One discovery leaf or legacy entry has invalid semantic content before a healthy candidate. | The global/legacy cursor records a bounded concrete issue, checkpoints past the bad entry, and admits later healthy work. The opportunity terminalizes preserved when concrete gaps remain, while the next daily detached opportunity rewalks legacy state without trusting an irreversible EOF marker. |
+| Operator inspects or cancels maintenance. | Offline status/diagnostics read the exact checkpoint and direct evidence without provider bootstrap. Cancellation requires exact kind, partition, and current epoch and shares the final move transition gate. |
+| A maintenance owner has an old heartbeat but still holds its job lock. | Duplicate workers report live ownership and do not evict it. Kernel release after death allows recovery with the exact cursor and explicit dead-owner evidence. |
+| State or mailbox retention has more work or writer contention. | Before opening or mutation, the detached worker checkpoints a fresh fixed AGE-372 `as_of` and empty cursor. It drops the observation-free historical handle, checkpoints the returned cursor, yields, and resumes with the same snapshot; post-batch/pre-checkpoint crash replay cannot choose a newer `as_of`. |
+| Detached State/mailbox retention records direct progress or outcome evidence. | It does not call the normal process recorder and does not create a normal event writer/head; diagnostic publication failure remains an explicit maintenance evidence gap. |
+| A private child fails while updating its launch-result ledger. | The child publishes the cause to its exact pre-armed checksummed fallback carrier and scheduled stderr; next admission binds the cause to that launch. If all carriers are unavailable, the prior launch is retained with an explicit evidence gap rather than a fabricated abrupt-death cause. |
 | Closed event partition lacks an exact age, row count/watermark, validated manifest, non-head identity, hold/corruption clearance, or classified legacy provenance. | AGE-372 returns typed preservation evidence and does not produce a retirement approval. |
 | AGE-372 approves a closed event partition. | The approval and derived AGE-376 receipt bind the exact writer/generation IDs, prepared/sealed manifest digests, policy version, and cutoff; they grant no move/delete authority without AGE-377's exclusive lease and head revalidation. |
 | A preservation-mode rotated source is considered for retirement. | AGE-372 uses the later of authoritative close, maximum occurrence, and validated import-completion time; active, leased, held, corrupt, torn/unsupported, unimported, recovery-authoritative, or unknown-age sources are preserved. |
@@ -85,11 +104,18 @@
   to finish publication without historical enumeration.
 - A prepared generation directory without a head is an orphan for detached
   audit, not a visible writable generation.
+- A manifest-less/corrupt final generation is preserved even if its discovery
+  record includes an earlier staging basename.
+- Orphan disposition is published before the exact move and is bound to stable
+  immutable operation identity. Missing files after a crash are unlink
+  progress; they do not trigger reclassification.
 - SQLite database, WAL, sidecars, and manifests move only as one generation
   directory; separating them is invalid.
 - A generation moved to deterministic pending trash without a receipt is
   `retirement_in_progress`; a valid receipt is `retired`; conflicting states
   are incomplete/corrupt, not authoritative absence.
+- A pending generation without the exact durable pre-move checkpoint is
+  inconsistent and cannot be converted into a receipt by discovery alone.
 - A generation exactly 30 days old is policy-eligible; one microsecond younger
   is preserved. A mixed generation uses the longest configured event-family
   horizon.
@@ -139,7 +165,9 @@
 - AGE-372 owns retention policy/engine decisions. AGE-376 owns event-store and
   current-head primitives, eligibility metadata, preservation/import/cutover
   contracts, and maintenance fixtures/interfaces. AGE-377 owns detached
-  scheduling, singleton leases, and actual retention/repair/rebuild/compaction.
+  scheduling, singleton leases, event retirement, coordination retention and
+  compaction, plus bounded historical inspection. Unsupported repair-copy and
+  catalog publication remain fail-closed preservation outcomes.
 - The evaluator is not an SLO, endurance, 30-day, external-service, or AGE-353
   stress test.
 - The tool-only Fjall dependency does not select or add Fjall to production.
@@ -164,10 +192,43 @@ reconciliation, bounded readers and isolated partition failures, process-local
 writer rotation/restart, checksummed head publication, preservation-mode JSONL,
 deterministic import provenance, lifecycle normalization that retains the
 AGE-371 source occurrence time without duplicating its record-retention fields,
-and non-destructive
-bounded union reads, catalog/rebuild/eligibility interfaces. AGE-377 tests actual detached catalog
-rebuild, repair, compaction, and retirement execution under singleton leases
-using those fixtures/interfaces.
+and non-destructive bounded union reads plus catalog/rebuild/eligibility
+interfaces. AGE-377 tests durable singleton lifecycle, bounded coordination
+retention/compaction, exact-generation checkpoint/seal/retirement, derived
+catalog retirement publication, raw-node-bounded sharded discovery, legacy
+migration continuation, orphan disposition, and resumable trash unlink. Orphan
+classification and rotation follow-up have production dispatch;
+index and catalog jobs invoke the bounded AGE-376 planners and truthfully
+preserve targets requiring unsupported repair-copy/publication authority.
+Corrupt-source repair/quarantine continues to fail closed rather than editing a
+source in place.
+
+AGE-377 unit tests additionally discriminate a real subprocess live duplicate
+versus abrupt-death recovery, prior retry-cause retention, intentional
+yield/restart, pre-spawn daily deduplication and dead-child relaunch,
+current/midnight epoch validation, exact operator cancellation and the former
+check-to-rename race, direct evidence through the real offline reader, AGE-372
+cursor/as-of and cross-process/day discovery continuation, selected-head and
+exact-partition refusal, producer lease-before-intent ordering, independent
+producer publication with an unavailable discovery shard, every pre-head
+publication fixture boundary with its exact recovery successor,
+prepared/incomplete-staging orphan discharge, manifest-less final preservation,
+bad-candidate and legacy-error advancement, bounded daily legacy rewalk, orphan
+process death/cancellation after disposition and after individual unlink steps,
+new-directory permission and retained source-trie skeleton behavior,
+reader/writer lease exclusion, bounded payload/trash slices without a hard
+payload-size rejection, receipt/catalog idempotency, and returned-error
+recovery after the directory move. The scheduler test observes the actual
+private argv, scheduling basis, admission token, non-waiting return, absence of
+duplicate exec while the first child is live, and dead-child relaunch. A real
+private application child test forces launch-ledger update failure and observes
+the exact fallback and stderr carriers; a unit test proves next-admission
+reconciliation and the explicit carrier-storage gap. Startup placement is
+covered by static production call ordering plus the executed common placement
+fixture; no GUI integration or provider execution is claimed. Coordination
+retention exercises its production entry and proves that no normal event-head
+namespace is created. Rejected-request evidence failure proves the incumbent
+checkpoint records a diagnostic gap.
 
 `crates/oulipoly-state/src/retention.rs` additionally proves the inclusive
 30-day boundary, every fail-closed generation prerequisite, exact
@@ -186,3 +247,36 @@ exclude maintenance and receipt publication is idempotent/create-once.
 - `planning/coverage/spec-state-db.md` — authoritative SQLite schema and
   migrations that remain in place.
 - `AGENTS.md` § “State DB Schema Migrations”.
+
+
+## AGE-377 cycle-4 protection expectations
+
+- Launch admission durably records `intent` before spawn, then `admitted` with
+  exact child identity; reconciliation spans the current and immediately prior
+  epoch and keeps parent failures, child failures, and evidence gaps distinct.
+- Terminal launch outcomes distinguish completed, yielded, cancelled,
+  preserved/gapped, and failed. Bounded cleanup retires only terminal evidence
+  at least 30 days old and resumes deterministic retiring directories.
+- Source discovery never prunes producer-visible trie ancestors. Bad candidates
+  advance the durable raw-node cursor and preserve concrete gaps.
+- Retention checkpoints fresh `as_of` before mutation and resumes that same
+  snapshot after a crash. All maintenance historical State/mailbox opens,
+  including payload compaction, suppress connection observation.
+- Authoritative event retirement terminalizes its maintenance job before the
+  derived discovery archive; an archive failure is independently retryable.
+- Legacy discovery performs a bounded detached rewalk on each daily
+  opportunity. Registration and root enumeration failures terminalize the
+  current opportunity as preserved and retry on the next epoch. No directory
+  EOF is promoted into irreversible authority over a still-live parent-version
+  process that may publish its first legacy writer later.
+- Rejected maintenance-request evidence loss is represented by a checksummed
+  sidecar and exposed by status. Authoritative closure may reactivate an
+  archived derived discovery record.
+
+Focused tests live in `detached_maintenance.rs`, `maintenance_discovery.rs`,
+`maintenance_worker.rs`, `maintenance_control.rs`, and
+`age377_maintenance_child_fallback.rs`; they exercise pre-spawn failure,
+cross-epoch fallback-only reconciliation, bounded terminal/incomplete cleanup,
+outcome distinctions, durable bad-candidate restart, daily legacy rewalk and
+root-enumeration retry, observation-free opens, request-gap readback,
+phase recovery, and post-batch/pre-checkpoint retention crash recovery.

@@ -248,6 +248,11 @@ pub(crate) enum Subcommands {
         #[command(subcommand)]
         command: DiagnosticsSubcommands,
     },
+    /// Inspect or cancel one exact detached-maintenance job locally.
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceSubcommands,
+    },
     /// Hidden normalized form for `resume --list <UUID>`.
     #[command(hide = true, name = "resume-list")]
     ResumeList { uuid: String },
@@ -340,6 +345,47 @@ pub(crate) enum DiagnosticsSubcommands {
         diagnostic_id: String,
 
         /// Emit structured JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read the direct evidence and checkpoint for one exact maintenance job.
+    Maintenance {
+        #[arg(long)]
+        kind: String,
+
+        #[arg(long)]
+        partition: String,
+
+        /// Emit structured JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum MaintenanceSubcommands {
+    /// Inspect one exact maintenance job and its offline evidence.
+    Status {
+        #[arg(long)]
+        kind: String,
+
+        #[arg(long)]
+        partition: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+    /// Request cancellation of one exact admitted opportunity epoch.
+    Cancel {
+        #[arg(long)]
+        kind: String,
+
+        #[arg(long)]
+        partition: String,
+
+        #[arg(long)]
+        epoch: i64,
+
         #[arg(long)]
         json: bool,
     },
@@ -808,6 +854,55 @@ mod offline_diagnostics_cli_tests {
                     json: true,
                 },
             }) if diagnostic_id == "diagnostic-17"
+        ));
+    }
+
+    #[test]
+    fn parses_exact_maintenance_offline_reader_and_epoch_fenced_cancel() {
+        let diagnostics = Cli::try_parse_from([
+            "runner",
+            "diagnostics",
+            "maintenance",
+            "--kind",
+            "event_retirement",
+            "--partition",
+            "aa/bb",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            diagnostics.command,
+            Some(Subcommands::Diagnostics {
+                command: DiagnosticsSubcommands::Maintenance {
+                    kind,
+                    partition,
+                    json: true,
+                },
+            }) if kind == "event_retirement" && partition == "aa/bb"
+        ));
+
+        let cancel = Cli::try_parse_from([
+            "runner",
+            "maintenance",
+            "cancel",
+            "--kind",
+            "event_retirement",
+            "--partition",
+            "aa/bb",
+            "--epoch",
+            "19",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cancel.command,
+            Some(Subcommands::Maintenance {
+                command: MaintenanceSubcommands::Cancel {
+                    kind,
+                    partition,
+                    epoch: 19,
+                    json: false,
+                },
+            }) if kind == "event_retirement" && partition == "aa/bb"
         ));
     }
 }

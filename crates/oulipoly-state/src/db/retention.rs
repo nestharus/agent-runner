@@ -25,10 +25,29 @@ impl StateDb {
         self.run_retention_batch_after_snapshot(request, || {})
     }
 
+    /// Detached maintenance already records the exact job result in its
+    /// independent evidence sink. This variant preserves the AGE-372 decision
+    /// and mutation path while avoiding initialization of a normal event writer.
+    pub(crate) fn run_retention_batch_without_observation(
+        &mut self,
+        request: &RetentionBatchRequest,
+    ) -> Result<RetentionBatchOutcome, String> {
+        self.run_retention_batch_inner(request, || {}, false)
+    }
+
     fn run_retention_batch_after_snapshot(
         &mut self,
         request: &RetentionBatchRequest,
         after_snapshot: impl FnOnce(),
+    ) -> Result<RetentionBatchOutcome, String> {
+        self.run_retention_batch_inner(request, after_snapshot, true)
+    }
+
+    fn run_retention_batch_inner(
+        &mut self,
+        request: &RetentionBatchRequest,
+        after_snapshot: impl FnOnce(),
+        emit_observation: bool,
     ) -> Result<RetentionBatchOutcome, String> {
         self.access_scope
             .authorize(TERMINAL_RETENTION_PRUNE, None)?;
@@ -47,7 +66,9 @@ impl StateDb {
             }
             RetentionFamily::ProviderLaunchAttempt => {
                 outcome.preserve(PreservationReason::Inherited);
-                outcome.emit_independent_observation();
+                if emit_observation {
+                    outcome.emit_independent_observation();
+                }
                 return Ok(outcome);
             }
             _ => {
@@ -83,7 +104,6 @@ impl StateDb {
                 }
                 Err(error) => {
                     outcome.gap("state_delete", typed_sqlite_reason(&error));
-                    break;
                 }
             }
             outcome.next_cursor = Some(RetentionBatchCursor {
@@ -103,7 +123,9 @@ impl StateDb {
         {
             outcome.gap("restore_busy_timeout", typed_sqlite_reason(&error));
         }
-        outcome.emit_independent_observation();
+        if emit_observation {
+            outcome.emit_independent_observation();
+        }
         Ok(outcome)
     }
 }

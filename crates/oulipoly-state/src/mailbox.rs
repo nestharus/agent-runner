@@ -37,7 +37,8 @@ use crate::live_history::{
 };
 use crate::pid_identity::{self, ProcessIdentity};
 use crate::sqlite_observability::{
-    DeferredObservationTarget, SqliteOperationObserver, connection_open_evidence,
+    DeferredObservationTarget, SqliteObservationPolicy, SqliteOperationObserver,
+    connection_open_evidence,
 };
 
 mod completion_continuation;
@@ -93,6 +94,7 @@ pub(super) const DELIVERABLE_MAILBOX_ERROR_PREDICATE: &str = "(
 
 enum MailboxConnectionObservation<'a> {
     Process,
+    Disabled,
     Parent(&'a DiagnosticSpan),
     SelectedRecorder(&'a FlightRecorder),
 }
@@ -104,12 +106,23 @@ fn open_observed_mailbox_connection(
     observation: MailboxConnectionObservation<'_>,
     open: impl FnOnce() -> rusqlite::Result<Connection>,
 ) -> rusqlite::Result<Connection> {
-    let observer = SqliteOperationObserver::process();
+    let observer = match observation {
+        MailboxConnectionObservation::Disabled => {
+            SqliteOperationObserver::with_policy(SqliteObservationPolicy::disabled())
+        }
+        _ => SqliteOperationObserver::process(),
+    };
     match open() {
         Ok(connection) => {
             let span = || mailbox_connection_span(query_family, path_class, transaction_mode);
             let _ = match observation {
                 MailboxConnectionObservation::Process => observer.record_success(
+                    span,
+                    DiagnosticPhase::Released,
+                    OutcomeCertainty::Terminal,
+                    connection_open_evidence,
+                ),
+                MailboxConnectionObservation::Disabled => observer.record_success(
                     span,
                     DiagnosticPhase::Released,
                     OutcomeCertainty::Terminal,
@@ -137,6 +150,12 @@ fn open_observed_mailbox_connection(
             let span = || mailbox_connection_span(query_family, path_class, transaction_mode);
             let _ = match observation {
                 MailboxConnectionObservation::Process => observer.record_failure(
+                    span,
+                    &error,
+                    OutcomeCertainty::StartedUnknown,
+                    connection_open_evidence,
+                ),
+                MailboxConnectionObservation::Disabled => observer.record_failure(
                     span,
                     &error,
                     OutcomeCertainty::StartedUnknown,
@@ -1667,19 +1686,46 @@ impl MailboxDb {
         })
     }
 
+    /// Writable historical boundary for detached maintenance. Connection-open
+    /// diagnostics are deliberately disabled so coordination maintenance never
+    /// creates event-store work while opening its historical database.
+    pub fn open_historical_without_observation(path: &Path) -> Result<Self, String> {
+        let authority = MailboxAuthorityFence::acquire(path).map_err(|error| error.to_string())?;
+        crate::rebuild_recovery::ensure_writable_open_allowed(authority.path())?;
+        Self::open_with_owned_authority_observed(authority, MailboxConnectionObservation::Disabled)
+            .map(|mut mailbox| {
+                mailbox.access_scope = AccessScope::historical();
+                mailbox
+            })
+    }
+
     fn open_with_owned_authority(authority: MailboxAuthorityFence) -> Result<Self, String> {
-        let mut mailbox = Self::open_with_authority(&authority)?;
+        Self::open_with_owned_authority_observed(authority, MailboxConnectionObservation::Process)
+    }
+
+    fn open_with_owned_authority_observed(
+        authority: MailboxAuthorityFence,
+        observation: MailboxConnectionObservation<'_>,
+    ) -> Result<Self, String> {
+        let mut mailbox = Self::open_with_authority_observed(&authority, observation)?;
         mailbox._namespace_authority = Some(authority);
         Ok(mailbox)
     }
 
     pub(crate) fn open_with_authority(authority: &MailboxAuthorityFence) -> Result<Self, String> {
+        Self::open_with_authority_observed(authority, MailboxConnectionObservation::Process)
+    }
+
+    fn open_with_authority_observed(
+        authority: &MailboxAuthorityFence,
+        observation: MailboxConnectionObservation<'_>,
+    ) -> Result<Self, String> {
         let path = authority.path();
         let mut conn = open_observed_mailbox_connection(
             "pid_mailbox.connection.open",
             SqlitePathClass::ManagedFile,
             SqliteTransactionMode::Autocommit,
-            MailboxConnectionObservation::Process,
+            observation,
             || Connection::open(path),
         )
         .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
@@ -13519,6 +13565,26 @@ mod tests {
         DiagnosticPhase, FlightRecorder, FlightRecorderReader, RecorderConfig, SqliteAccessClass,
         SqliteTransactionPhase, with_test_process_recorder,
     };
+
+    #[test]
+    fn historical_maintenance_open_emits_no_sqlite_open_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&path).unwrap());
+        let recorder_root = directory.path().join("recorder-disabled");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+        with_test_process_recorder(recorder.clone(), || {
+            drop(MailboxDb::open_historical_without_observation(&path).unwrap());
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        assert!(
+            report
+                .events
+                .iter()
+                .all(|record| record.event.operation != "pid_mailbox.connection.open")
+        );
+    }
 
     #[test]
     fn live_history_barrier_rejects_before_sqlite_and_records_typed_evidence() {

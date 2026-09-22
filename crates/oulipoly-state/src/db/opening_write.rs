@@ -32,7 +32,9 @@ use crate::diagnostic_recorder::{
     SqlitePathClass, SqliteTransactionMode,
 };
 use crate::migrations;
-use crate::sqlite_observability::{SqliteOperationObserver, connection_open_evidence};
+use crate::sqlite_observability::{
+    SqliteObservationPolicy, SqliteOperationObserver, connection_open_evidence,
+};
 
 pub struct StateReadConnection<'a> {
     conn: &'a sqlite::Connection,
@@ -196,6 +198,23 @@ impl StateDb {
         })
     }
 
+    /// Writable historical boundary for detached maintenance. Unlike the
+    /// ordinary historical open, this cannot recursively publish a SQLite-open
+    /// diagnostic into the event store that maintenance is inspecting.
+    pub fn open_historical_without_observation(path: &Path) -> Result<Self, String> {
+        Self::open_with_sink_and_legacy_provider_names_observed(
+            path,
+            Box::new(NoopLifecycleEventSink),
+            &LegacyProviderNames::new(),
+            SqliteOperationObserver::with_policy(SqliteObservationPolicy::disabled()),
+        )
+        .map(|mut state| {
+            state.access_scope = crate::live_history::AccessScope::historical();
+            state
+        })
+        .map_err(|error| error.to_string())
+    }
+
     pub fn open_with_sink(
         path: &Path,
         sink: Box<dyn LifecycleEventSink + Send>,
@@ -225,6 +244,20 @@ impl StateDb {
         path: &Path,
         sink: Box<dyn LifecycleEventSink + Send>,
         provider_names: &LegacyProviderNames,
+    ) -> Result<Self, WritableOpenError> {
+        Self::open_with_sink_and_legacy_provider_names_observed(
+            path,
+            sink,
+            provider_names,
+            SqliteOperationObserver::process(),
+        )
+    }
+
+    fn open_with_sink_and_legacy_provider_names_observed(
+        path: &Path,
+        sink: Box<dyn LifecycleEventSink + Send>,
+        provider_names: &LegacyProviderNames,
+        observer: SqliteOperationObserver,
     ) -> Result<Self, WritableOpenError> {
         if Self::is_sqlite_uri_path(path) {
             return Err("State DB writable open does not accept SQLite URI paths"
@@ -256,6 +289,7 @@ impl StateDb {
             sink,
             provider_names,
             state_namespace_guard,
+            observer,
         )
     }
 
@@ -265,8 +299,9 @@ impl StateDb {
         sink: Box<dyn LifecycleEventSink + Send>,
         provider_names: &LegacyProviderNames,
         state_namespace_guard: Option<StateNamespaceGuard>,
+        observer: SqliteOperationObserver,
     ) -> Result<Self, WritableOpenError> {
-        let mut conn = Self::open_state_connection(&db_path)?;
+        let mut conn = Self::open_state_connection_observed(&db_path, observer)?;
 
         let ran_open_migrations = Self::run_open_migrations(&db_path, &mut conn, provider_names)?;
         Self::apply_current_schema_repairs(&mut conn, ran_open_migrations, provider_names)?;
@@ -288,10 +323,6 @@ impl StateDb {
         db.complete_open_backfill()?;
 
         Ok(db)
-    }
-
-    fn open_state_connection(path: &Path) -> Result<sqlite::Connection, String> {
-        Self::open_state_connection_observed(path, SqliteOperationObserver::process())
     }
 
     fn open_state_connection_observed(
@@ -561,6 +592,7 @@ impl StateDb {
             Box::new(NoopLifecycleEventSink),
             &LegacyProviderNames::new(),
             None,
+            SqliteOperationObserver::process(),
         )
         .map_err(|error| error.to_string())?;
         drop(db);
@@ -1061,6 +1093,29 @@ mod state_namespace_tests {
         assert_eq!(
             path_classes,
             vec![SqlitePathClass::Memory, SqlitePathClass::ManagedFile]
+        );
+    }
+
+    #[test]
+    fn historical_maintenance_open_emits_no_sqlite_open_observation() {
+        use crate::diagnostic_recorder::{
+            FlightRecorder, FlightRecorderReader, RecorderConfig, with_test_process_recorder,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        drop(StateDb::open(&path).unwrap());
+        let recorder_root = directory.path().join("recorder-disabled");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+        with_test_process_recorder(recorder.clone(), || {
+            drop(StateDb::open_historical_without_observation(&path).unwrap());
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        assert!(
+            report
+                .events
+                .iter()
+                .all(|record| record.event.operation != "state_connection_open")
         );
     }
 
