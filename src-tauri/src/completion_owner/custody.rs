@@ -241,7 +241,7 @@ fn legacy_spawn(
     )?;
     let request_file = std::fs::File::open(&request_path).map_err(|e| e.to_string())?;
     let fork_gate = Path::new(&attempt.result_path).with_file_name("adopter-fork-gate.json");
-    let driver = super::linux::identity(i64::from(std::process::id()))?;
+    let driver = super::linux::current_identity()?;
     let mut gate_file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -589,14 +589,16 @@ impl UnreapedAdopter {
             oulipoly_state::completion_continuation::age360_fault_barrier(
                 "original-adopter-before-identity",
             );
-            self.identity = Some(super::linux::identity(i64::from(self.pid)).inspect_err(
-                |_| {
-                    #[cfg(feature = "age360-fault-fixtures")]
-                    oulipoly_state::completion_continuation::age360_fault_barrier(
-                        "original-adopter-identity-failed",
-                    );
-                },
-            )?);
+            self.identity = Some(
+                super::linux::retained_direct_child_identity(self.pid as u32).inspect_err(
+                    |_| {
+                        #[cfg(feature = "age360-fault-fixtures")]
+                        oulipoly_state::completion_continuation::age360_fault_barrier(
+                            "original-adopter-identity-failed",
+                        );
+                    },
+                )?,
+            );
         }
         Ok(self.identity.as_ref().unwrap())
     }
@@ -635,9 +637,9 @@ pub(super) fn pending_birth_fds() -> Vec<i32> {
     #[cfg(test)]
     {
         independent_waits::discard_fork_copies();
-        let current = i64::from(std::process::id());
+        let current = super::linux::current_identity().map(|identity| identity.pid);
         PENDING_UNRELEASED.with_borrow_mut(|pending| {
-            pending.retain(|p| p.driver.pid == current);
+            pending.retain(|p| current.as_ref().map_or(true, |pid| p.driver.pid == *pid));
             pending
                 .iter()
                 .filter_map(|p| p.socket.as_ref().map(AsRawFd::as_raw_fd))
@@ -860,7 +862,7 @@ pub(super) fn entry() -> Result<(), String> {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    let identity = super::linux::identity(i64::from(std::process::id()))?;
+    let identity = super::linux::current_identity()?;
     let mut byte = [0];
     if gate.read_exact(&mut byte).is_err() || byte != [1] {
         let receipt=serde_json::json!({"attempt_id":attempt.attempt_id,"custodian":identity,"gate":"unreleased_eof","owned_children":"ECHILD"}).to_string();
@@ -1026,7 +1028,7 @@ pub(super) fn root_worker_entry() -> Result<(), String> {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    let identity = super::linux::identity(i64::from(std::process::id()))?;
+    let identity = super::linux::current_identity()?;
     let mut byte = [0];
     if gate.read_exact(&mut byte).is_err() || byte != [1] {
         return Ok(());
@@ -1205,7 +1207,7 @@ fn lineage_setup_failure_prevents_root_worker_launch() {
         claim_token: None,
         result_path: result_path.to_string_lossy().into_owned(),
     };
-    let identity = super::linux::identity(i64::from(std::process::id())).unwrap();
+    let identity = super::linux::current_identity().unwrap();
     persist_root_worker_result(
         &attempt,
         &identity,
@@ -1676,7 +1678,7 @@ fn adopt(
         // A returning identity-read error must not drop the only announcement
         // while this same AC stays alive waiting for its execution gate.
         let packet = loop {
-            if let Ok(identity) = super::linux::identity(i64::from(unsafe { libc::getpid() })) {
+            if let Ok(identity) = super::linux::current_identity() {
                 break encode_birth(&identity)?;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -1702,8 +1704,8 @@ fn adopt(
     #[cfg(feature = "age360-fault-fixtures")]
     oulipoly_state::completion_continuation::age360_fault_barrier("adopter-after-ac-fork");
     drop(ac_gate);
-    let custodian = super::linux::identity(i64::from(pid))?;
-    let adopter = super::linux::identity(i64::from(std::process::id()))?;
+    let custodian = super::linux::retained_direct_child_identity(pid as u32)?;
+    let adopter = super::linux::current_identity()?;
     #[cfg(feature = "age360-fault-fixtures")]
     oulipoly_state::completion_continuation::age360_fault_barrier("adopter-before-ac-announce");
     // Relay only the actual original driver's grant after attachment. EOF or
@@ -1870,7 +1872,7 @@ fn exact_child_terminal(
     if unsafe { info.si_pid() } == 0 {
         return Ok(false);
     }
-    if super::linux::identity(i64::from(pid))? != *expected {
+    if super::linux::retained_direct_child_identity(pid as u32)? != *expected {
         return Err("original terminal child incarnation conflict".into());
     }
     Ok(true)
@@ -1925,7 +1927,7 @@ fn reap_adopted_child(
     }
     #[cfg(feature = "age360-fault-fixtures")]
     oulipoly_state::completion_continuation::age360_fault_barrier("adopted-before-identity");
-    let identity = match super::linux::identity(i64::from(pid)) {
+    let identity = match super::linux::retained_direct_child_identity(pid as u32) {
         Ok(identity) => identity,
         Err(_) => {
             // WNOWAIT left this exact incarnation owned and unreaped. A
@@ -1991,7 +1993,7 @@ pub(super) fn replay_result(path: &Path, attempt: &ContinuationAttempt) -> Resul
         MAX_REGISTRATION_BYTES,
     ) {
         let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        let driver = super::linux::identity(i64::from(std::process::id()))?;
+        let driver = super::linux::current_identity()?;
         if value["attempt_id"] != attempt.attempt_id
             || value["driver"] != serde_json::to_value(driver).map_err(|e| e.to_string())?
             || value["observation"] != "waitid_wnowait"

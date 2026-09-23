@@ -4844,8 +4844,7 @@ impl MailboxDb {
             return Err("ambiguous registered headless submission".into());
         }
         let (attempt, target, anchor) = &attempts[0];
-        let live = pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or("headless submission launcher absent")?;
+        let live = pid_identity::read_current_process_identity()?;
         let registered: bool = tx
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM runtime_generation
@@ -9129,14 +9128,7 @@ fn validate_runtime_generation_create(
 }
 
 fn current_runtime_creator_identity() -> Result<ProcessIdentity, GenerationStorageError> {
-    let os_pid = i64::from(std::process::id());
-    pid_identity::read_live_process_identity(os_pid)
-        .map_err(GenerationStorageError::new)?
-        .ok_or_else(|| {
-            GenerationStorageError::new(format!(
-                "Runtime generation creator process {os_pid} is not live"
-            ))
-        })
+    pid_identity::read_current_process_identity().map_err(GenerationStorageError::new)
 }
 
 fn validate_runtime_mode(mode: &str) -> Result<(), GenerationStorageError> {

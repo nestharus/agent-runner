@@ -111,10 +111,15 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
             }
         }
         crate::completion_owner::verify_kernel_owner_socket(fields[0], &owner, &owner_socket)?;
+        let observer_domain = oulipoly_state::pid_identity::procfs_observer_domain()?;
         unsafe {
             std::env::remove_var(CHILD_FD_ENV);
             std::env::set_var(crate::completion_owner::ENDPOINT_ENV, owner.endpoint);
             std::env::set_var(crate::completion_owner::EXPECTED_KERNEL_ROOT_ENV, fields[0]);
+            std::env::set_var(
+                oulipoly_state::pid_identity::PROCFS_OBSERVER_DOMAIN_ENV,
+                observer_domain,
+            );
         }
         drop(gate);
         Ok(crate::process_entrypoint())

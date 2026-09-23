@@ -44,8 +44,7 @@ impl MailboxDb {
         attempt: &ContinuationAttempt,
     ) -> Result<bool, String> {
         require_exact_attempt(&self.conn, attempt)?;
-        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or("driver process disappeared")?;
+        let live = crate::pid_identity::read_current_process_identity()?;
         let identity = SourceProcessIdentity {
             pid: live.os_pid,
             boot_id: live.os_boot_id,
@@ -553,8 +552,7 @@ pub(in crate::mailbox) fn reserve_activation_on(
     let (generation,driver):(String,String)=tx.query_row("SELECT generation,driver_identity FROM completion_continuation_owner WHERE domain_id=?1 AND phase='running'",[&domain],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?
         .ok_or("completion_owner_unavailable: activation requires an independent owner; schema upgrade grants no actor custody")?;
     let driver: SourceProcessIdentity = serde_json::from_str(&driver).map_err(|e| e.to_string())?;
-    let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-        .ok_or("driver identity unavailable")?;
+    let live = crate::pid_identity::read_current_process_identity()?;
     if driver.pid != live.os_pid
         || driver.boot_id != live.os_boot_id
         || driver.starttime_ticks != live.os_pid_starttime_ticks
@@ -705,8 +703,7 @@ impl MailboxDb {
         adopter: &SourceProcessIdentity,
     ) -> Result<(), String> {
         require_exact_attempt(&self.conn, attempt)?;
-        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or("original driver absent")?;
+        let live = crate::pid_identity::read_current_process_identity()?;
         if driver.pid != live.os_pid
             || driver.boot_id != live.os_boot_id
             || driver.starttime_ticks != live.os_pid_starttime_ticks
@@ -772,8 +769,7 @@ pub(in crate::mailbox) fn cancel_unaccepted_activation_on(
     if domain_on(tx)?.is_none() {
         return Ok(());
     }
-    let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-        .ok_or("driver process disappeared")?;
+    let live = crate::pid_identity::read_current_process_identity()?;
     let driver = serde_json::to_string(&SourceProcessIdentity {
         pid: live.os_pid,
         boot_id: live.os_boot_id,
@@ -801,13 +797,13 @@ pub(in crate::mailbox) fn admit_launcher_on(
         .ok_or("unsupported_legacy_activation_recovery: retained wake claim has no admitted v2 attempt; migration cannot invent launcher custody")?;
     let custodian: SourceProcessIdentity =
         serde_json::from_str(&custodian).map_err(|e| e.to_string())?;
-    if child.os_pid != i64::from(std::process::id()) {
+    let caller = crate::pid_identity::read_current_process_identity()?;
+    if child != &caller {
         return Err("activation launcher must present its own exact process identity".into());
     }
     #[cfg(target_os = "linux")]
     {
-        let parent = unsafe { libc::getppid() };
-        let expected = crate::pid_identity::read_live_process_identity(i64::from(parent))?
+        let expected = crate::pid_identity::read_parent_process_identity()?
             .ok_or("activation custodian disappeared")?;
         if custodian.pid != expected.os_pid
             || custodian.boot_id != expected.os_boot_id
@@ -966,8 +962,7 @@ impl MailboxDb {
         gate: &str,
     ) -> Result<(), String> {
         require_exact_attempt(&self.conn, attempt)?;
-        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or("driver process disappeared")?;
+        let live = crate::pid_identity::read_current_process_identity()?;
         let identity = SourceProcessIdentity {
             pid: live.os_pid,
             boot_id: live.os_boot_id,
@@ -1008,8 +1003,7 @@ impl MailboxDb {
 }
 
 fn require_exact_live_guardian(guardian: &SourceProcessIdentity) -> Result<(), String> {
-    let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-        .ok_or("root supervisor process disappeared")?;
+    let live = crate::pid_identity::read_current_process_identity()?;
     let caller = SourceProcessIdentity {
         pid: live.os_pid,
         boot_id: live.os_boot_id,
@@ -1086,8 +1080,7 @@ impl MailboxDb {
         custodian: &SourceProcessIdentity,
     ) -> Result<(), String> {
         require_exact_attempt(&self.conn, attempt)?;
-        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or("custodian disappeared")?;
+        let live = crate::pid_identity::read_current_process_identity()?;
         if custodian.pid != live.os_pid
             || custodian.boot_id != live.os_boot_id
             || custodian.starttime_ticks != live.os_pid_starttime_ticks

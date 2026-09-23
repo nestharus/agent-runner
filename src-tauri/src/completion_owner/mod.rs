@@ -201,7 +201,7 @@ pub fn defer_wake_to_owner() -> Result<bool, String> {
         .ok_or("native completion owner unavailable")?;
     #[cfg(target_os = "linux")]
     {
-        if owner.driver_identity == linux::identity(i64::from(std::process::id()))? {
+        if owner.driver_identity == linux::current_identity()? {
             return Ok(false);
         }
         // A stored owner row is discovery, not proof of a usable successor.

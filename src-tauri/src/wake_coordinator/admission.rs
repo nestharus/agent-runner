@@ -145,9 +145,7 @@ fn enqueue_target_and_wait_at(
     let config = AdmissionCapacityConfig::from_env()?;
     let admission_id = uuid::Uuid::new_v4().to_string();
     let now = unix_time_ms()?;
-    let launcher =
-        oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or_else(|| "Session admission launcher identity is not live".to_string())?;
+    let launcher = oulipoly_state::pid_identity::read_current_process_identity()?;
     let mut db = MailboxDb::open(mailbox_path)?;
     let admission = db.session_admissions().enqueue(
         &admission_id,

@@ -3,7 +3,7 @@
 //! `mapper`, `orchestration`, `validator`
 
 use oulipoly_state::mailbox::{MailboxDb, WakeClaimAcquireResult, WakeClaimRequest};
-use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
+use oulipoly_state::pid_identity::{ProcessIdentity, read_current_process_identity};
 
 use super::auto_wake_env::{
     AutoWakeEnv, auto_wake_marker_present, current_auto_wake, current_auto_wake_child_marker,
@@ -73,9 +73,7 @@ fn validate_auto_wake_child_claim(
 }
 
 fn current_process_identity() -> Result<ProcessIdentity, String> {
-    let pid = i64::from(std::process::id());
-    read_live_process_identity(pid)?
-        .ok_or_else(|| format!("Auto-wake child process {pid} is not live during claim admission"))
+    read_current_process_identity()
 }
 
 pub(super) fn coordinate_manual_resume_at(

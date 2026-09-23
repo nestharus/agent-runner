@@ -20,6 +20,11 @@ use crate::sqlite_observability::{SqliteOperationObserver, connection_open_evide
 const SIDECAR_DB_NAME: &str = "pid-identity.db";
 const DIRECT_LOOKUP_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A continuity check for a Runner process that has already been admitted by
+/// the broker. This is observer metadata, never an authority token. A future
+/// nested-work launcher must carry its authenticated observer expectation too.
+pub const PROCFS_OBSERVER_DOMAIN_ENV: &str = "OULIPOLY_PROCFS_OBSERVER_DOMAIN_V1";
+
 fn open_observed_pid_identity_connection(
     query_family: &'static str,
     path_class: SqlitePathClass,
@@ -62,6 +67,11 @@ fn pid_identity_connection_span(
         )
 }
 
+/// A process incarnation as seen by the caller's OS process observer. On
+/// Linux, `os_pid` is a numeric key in the caller's mounted `/proc`, not
+/// necessarily the value of getpid() or Child::id(). Persisted readers must
+/// use that same procfs PID namespace; boot/starttime alone do not translate
+/// a PID into another observer's namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProcessIdentity {
     pub os_pid: i64,
@@ -390,8 +400,314 @@ pub fn record_live_process_identity(
     .map(Some)
 }
 
+/// `os_pid` must already be a key in this caller's process observer.
 pub fn read_live_process_identity(os_pid: i64) -> Result<Option<ProcessIdentity>, String> {
     read_live_process_identity_impl(os_pid)
+}
+
+/// Identifies the procfs instance used for numeric `/proc/<pid>` keys. Persist
+/// this alongside an observer PID when another process may later read it. A
+/// procfs mount for a different PID namespace has a different superblock;
+/// the mount root stays visible even when hidepid masks `/proc/1`.
+#[cfg(target_os = "linux")]
+pub fn procfs_observer_domain() -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    let procfs = std::fs::metadata("/proc")
+        .map_err(|error| format!("cannot identify procfs observer: {error}"))?;
+    if !procfs.is_dir() || procfs.ino() == 0 {
+        return Err("invalid procfs observer domain".into());
+    }
+    Ok(format!("procfs:{}:{}", procfs.dev(), procfs.ino()))
+}
+
+#[cfg(target_os = "linux")]
+pub fn require_declared_procfs_observer_domain() -> Result<(), String> {
+    let Some(expected) = std::env::var_os(PROCFS_OBSERVER_DOMAIN_ENV) else {
+        return Ok(());
+    };
+    let expected = expected
+        .to_str()
+        .filter(|value| !value.is_empty())
+        .ok_or("invalid declared procfs observer domain")?;
+    if procfs_observer_domain()? != expected {
+        return Err("procfs observer changed after kernel root admission".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn require_declared_procfs_observer_domain() -> Result<(), String> {
+    Ok(())
+}
+
+/// The PID returned by `getpid` belongs to the caller's PID namespace.  The
+/// numeric keys under `/proc` belong to the namespace of that procfs mount;
+/// these domains can differ in a broker-owned root namespace.  This function
+/// obtains the procfs observer's key from `/proc/self`, then checks the exact
+/// incarnation through the ordinary identity reader.
+#[cfg(target_os = "linux")]
+pub fn read_current_process_identity() -> Result<ProcessIdentity, String> {
+    let observer = procfs_observer_domain()?;
+    let stat = std::fs::read_to_string("/proc/self/stat")
+        .map_err(|error| format!("cannot identify current procfs observer: {error}"))?;
+    let observer_pid = stat
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|pid| *pid > 0)
+        .ok_or("invalid current procfs observer PID")?;
+    let start = parse_proc_stat_starttime_ticks(&stat)
+        .filter(|start| *start > 0)
+        .ok_or("invalid current process starttime")?;
+    let identity = read_live_process_identity(observer_pid)?
+        .ok_or("current process disappeared from procfs observer")?;
+    if identity.os_pid_starttime_ticks != start || procfs_observer_domain()? != observer {
+        return Err("current process incarnation changed during observation".into());
+    }
+    Ok(identity)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_current_process_identity() -> Result<ProcessIdentity, String> {
+    read_live_process_identity(i64::from(std::process::id()))?
+        .ok_or("current process identity disappeared".into())
+}
+
+/// Reads the caller's parent using the same procfs observer as the caller.
+/// The parent's local `getppid()` value is not used as a procfs key.
+#[cfg(target_os = "linux")]
+pub fn read_parent_process_identity() -> Result<Option<ProcessIdentity>, String> {
+    let observer = procfs_observer_domain()?;
+    let stat = std::fs::read_to_string("/proc/self/stat")
+        .map_err(|error| format!("cannot identify current process parent: {error}"))?;
+    let (self_pid, parent_pid, self_start) =
+        parse_proc_stat_relation(&stat).ok_or("invalid current parent relation")?;
+    if parent_pid <= 0 {
+        return Ok(None);
+    }
+    let parent = read_live_process_identity(parent_pid)?;
+    let current = read_current_process_identity()?;
+    let current_relation = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| parse_proc_stat_relation(&stat));
+    if current.os_pid != self_pid || current.os_pid_starttime_ticks != self_start {
+        return Err("current process changed during parent observation".into());
+    }
+    if current_relation != Some((self_pid, parent_pid, self_start))
+        || procfs_observer_domain()? != observer
+    {
+        return Err("parent relation changed during observation".into());
+    }
+    if let Some(parent) = &parent
+        && read_live_process_identity(parent.os_pid)?.as_ref() != Some(parent)
+    {
+        return Err("parent incarnation changed during observation".into());
+    }
+    Ok(parent)
+}
+
+/// Resolve the `Child::id()` returned in the caller's PID namespace into an
+/// exact process identity in the caller's procfs observer.  Only a direct
+/// child in the same PID namespace is eligible.  Ambiguous, missing and
+/// foreign-namespace candidates fail closed.
+#[cfg(target_os = "linux")]
+pub fn read_direct_child_process_identity(local_pid: u32) -> Result<ProcessIdentity, String> {
+    read_direct_child_process_identity_impl(local_pid, false)
+}
+
+/// Resolve an exact direct child while the caller still owns its wait. This
+/// accepts an exited but unreaped child for WNOWAIT custody receipts; it does
+/// not assert that the child can still execute. Provider and maintenance
+/// launch admission must use `read_direct_child_process_identity` instead.
+#[cfg(target_os = "linux")]
+pub fn read_retained_direct_child_process_identity(
+    local_pid: u32,
+) -> Result<ProcessIdentity, String> {
+    read_direct_child_process_identity_impl(local_pid, true)
+}
+
+#[cfg(target_os = "linux")]
+fn read_direct_child_process_identity_impl(
+    local_pid: u32,
+    allow_exited: bool,
+) -> Result<ProcessIdentity, String> {
+    if local_pid == 0 {
+        return Err("invalid child PID".into());
+    }
+    let observer = procfs_observer_domain()?;
+    let parent = read_current_process_identity()?;
+    let child_pin = pin_local_child(local_pid)?;
+    let namespace = std::fs::read_link("/proc/self/ns/pid")
+        .map_err(|error| format!("cannot identify parent PID namespace: {error}"))?;
+    let mut found = None;
+    let mut child_pids = std::collections::BTreeSet::new();
+    let tasks = std::fs::read_dir(format!("/proc/{}/task", parent.os_pid))
+        .map_err(|error| format!("cannot inspect parent task children: {error}"))?;
+    for task in tasks {
+        let task = task.map_err(|error| format!("cannot inspect parent task: {error}"))?;
+        let children = match std::fs::read_to_string(task.path().join("children")) {
+            Ok(children) => children,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot inspect parent task children: {error}")),
+        };
+        for pid in children.split_ascii_whitespace() {
+            child_pids.insert(
+                pid.parse::<i64>()
+                    .map_err(|_| "invalid child observer PID")?,
+            );
+        }
+    }
+    for observer_pid in child_pids {
+        let path = PathBuf::from("/proc").join(observer_pid.to_string());
+        let status = match std::fs::read_to_string(path.join("status")) {
+            Ok(status) => status,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot inspect procfs child candidate: {error}")),
+        };
+        let Some(nspid) = status
+            .lines()
+            .find_map(|line| line.strip_prefix("NSpid:"))
+            .and_then(|line| line.split_ascii_whitespace().last())
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return Err("procfs child candidate has no namespace PID".into());
+        };
+        if nspid != local_pid {
+            continue;
+        }
+        let candidate_namespace = match std::fs::read_link(path.join("ns/pid")) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot inspect child PID namespace: {error}")),
+        };
+        if candidate_namespace != namespace {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(path.join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot inspect child process stat: {error}")),
+        };
+        let Some((stat_pid, parent_pid, start)) = parse_proc_stat_relation(&stat) else {
+            return Err("invalid child process stat".into());
+        };
+        if !allow_exited
+            && matches!(
+                stat.rfind(") ")
+                    .and_then(|close| stat[close + 2..].split_whitespace().next()),
+                Some("Z" | "X" | "x")
+            )
+        {
+            continue;
+        }
+        if stat_pid != observer_pid || parent_pid != parent.os_pid || start <= 0 {
+            continue;
+        }
+        let Some(identity) = read_live_process_identity(observer_pid)? else {
+            continue;
+        };
+        if identity.os_pid_starttime_ticks != start || found.replace(identity).is_some() {
+            return Err("ambiguous or changed child process identity".into());
+        }
+    }
+    let identity = found.ok_or("direct child identity disappeared from procfs observer")?;
+    if procfs_observer_domain()? != observer
+        || read_current_process_identity()? != parent
+        || read_live_process_identity(identity.os_pid)?.as_ref() != Some(&identity)
+    {
+        return Err("parent or child incarnation changed during observation".into());
+    }
+    if allow_exited {
+        require_retained_child_wait(local_pid)?;
+    } else if let Some(child_pin) = &child_pin {
+        require_pinned_child_live(child_pin)?;
+    }
+    Ok(identity)
+}
+
+#[cfg(target_os = "linux")]
+fn require_retained_child_wait(local_pid: u32) -> Result<(), String> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            local_pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "direct child wait custody unavailable: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn pin_local_child(local_pid: u32) -> Result<Option<std::os::fd::OwnedFd>, String> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, local_pid, 0) };
+    if fd < 0 {
+        if matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOSYS | libc::EINVAL | libc::EPERM | libc::EACCES)
+        ) {
+            // Older or restricted kernels retain the procfs relation,
+            // namespace and starttime checks below.
+            return Ok(None);
+        }
+        return Err(format!(
+            "cannot pin direct child PID: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(Some(unsafe {
+        std::os::fd::OwnedFd::from_raw_fd(fd as i32)
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn require_pinned_child_live(fd: &std::os::fd::OwnedFd) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    match unsafe { libc::poll(&mut poll, 1, 0) } {
+        0 => Ok(()),
+        result if result > 0 => Err("direct child exited during identity observation".into()),
+        _ => Err(format!(
+            "cannot inspect pinned direct child: {}",
+            std::io::Error::last_os_error()
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_direct_child_process_identity(local_pid: u32) -> Result<ProcessIdentity, String> {
+    read_live_process_identity(i64::from(local_pid))?
+        .ok_or("direct child identity disappeared".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_retained_direct_child_process_identity(
+    local_pid: u32,
+) -> Result<ProcessIdentity, String> {
+    read_direct_child_process_identity(local_pid)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_relation(stat: &str) -> Option<(i64, i64, i64)> {
+    let pid = stat.split_whitespace().next()?.parse().ok()?;
+    let fields = stat[stat.rfind(") ")? + 2..]
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let parent = fields.get(1)?.parse().ok()?;
+    let start = fields.get(19)?.parse().ok()?;
+    Some((pid, parent, start))
 }
 
 pub fn observe_live_process_identity(os_pid: i64) -> ProcessIdentityObservation {
@@ -679,7 +995,7 @@ fn pid_identity_record_from_live<'a>(
 ) -> PidIdentityRecord<'a> {
     PidIdentityRecord {
         identity,
-        os_pgid: process_group_id(input.os_pid),
+        os_pgid: process_group_id(identity),
         invocation_uuid: input.invocation_uuid,
         session_id: input.session_id,
         provider_name: input.provider_name,
@@ -928,15 +1244,33 @@ fn non_empty_trimmed(value: String) -> Option<String> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-#[cfg(unix)]
-fn process_group_id(os_pid: i64) -> Option<i64> {
-    let pid = libc::pid_t::try_from(os_pid).ok()?;
+#[cfg(target_os = "linux")]
+fn process_group_id(identity: &ProcessIdentity) -> Option<i64> {
+    // getpgid() accepts a PID in the caller's namespace, while an identity
+    // recorded here uses this procfs mount's numeric keys. Read the group in
+    // that same observer and only from the recorded incarnation.
+    let stat = std::fs::read_to_string(proc_stat_path(identity.os_pid)).ok()?;
+    let (pid, _, start) = parse_proc_stat_relation(&stat)?;
+    if pid != identity.os_pid || start != identity.os_pid_starttime_ticks {
+        return None;
+    }
+    stat[stat.rfind(") ")? + 2..]
+        .split_whitespace()
+        .nth(2)?
+        .parse::<i64>()
+        .ok()
+        .filter(|group| *group > 0)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_group_id(identity: &ProcessIdentity) -> Option<i64> {
+    let pid = libc::pid_t::try_from(identity.os_pid).ok()?;
     let pgid = unsafe { libc::getpgid(pid) };
     (pgid >= 0).then_some(i64::from(pgid))
 }
 
 #[cfg(not(unix))]
-fn process_group_id(_os_pid: i64) -> Option<i64> {
+fn process_group_id(_identity: &ProcessIdentity) -> Option<i64> {
     None
 }
 

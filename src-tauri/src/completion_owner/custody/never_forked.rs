@@ -43,9 +43,13 @@ pub(super) fn retain(
 /// Fork copies cannot testify for the original process.
 #[cfg(test)]
 pub(super) fn retry_pending() {
-    let pid = i64::from(std::process::id());
+    let pid = super::super::linux::current_identity().map(|identity| identity.pid);
     PENDING.with_borrow_mut(|pending| {
-        pending.retain(|e| e.driver.pid == pid && e.integrate().is_err())
+        pending.retain(|e| match &pid {
+            Ok(pid) if e.driver.pid != *pid => false,
+            Ok(_) => e.integrate().is_err(),
+            Err(_) => true,
+        })
     });
 }
 
@@ -54,13 +58,17 @@ pub(super) fn retry_pending() {
 /// replacement's inference from its empty child set.
 #[cfg(test)]
 pub(super) fn has_pending() -> bool {
-    let pid = i64::from(std::process::id());
-    PENDING.with_borrow(|pending| pending.iter().any(|e| e.driver.pid == pid))
+    let pid = super::super::linux::current_identity().map(|identity| identity.pid);
+    PENDING.with_borrow(|pending| {
+        pending
+            .iter()
+            .any(|e| pid.as_ref().map_or(true, |pid| e.driver.pid == *pid))
+    })
 }
 
 impl NeverForked {
     fn integrate(&self) -> Result<(), String> {
-        let driver = super::super::linux::identity(i64::from(std::process::id()))?;
+        let driver = super::super::linux::current_identity()?;
         if self.driver != driver || self.reason.is_empty() {
             return Err("never-forked testimony original driver conflict".into());
         }
@@ -149,10 +157,7 @@ mod tests {
                 .into_owned(),
         };
         db.reserve_continuation_attempt(&attempt).unwrap();
-        let live =
-            oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
-                .unwrap()
-                .unwrap();
+        let live = oulipoly_state::pid_identity::read_current_process_identity().unwrap();
         let original_driver = SourceProcessIdentity {
             pid: live.os_pid,
             boot_id: live.os_boot_id,

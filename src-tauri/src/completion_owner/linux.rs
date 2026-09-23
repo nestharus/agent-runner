@@ -5,7 +5,11 @@ use oulipoly_state::diagnostic_recorder::{
     DiagnosticPhase, PhaseObservation, SpanStart, process_recorder,
 };
 use oulipoly_state::mailbox::{CompletionDomainOwner, MailboxDb};
-use oulipoly_state::pid_identity::{PidIdentityDb, read_live_process_identity};
+use oulipoly_state::pid_identity::{
+    PidIdentityDb, ProcessIdentity, read_current_process_identity,
+    read_direct_child_process_identity, read_live_process_identity,
+    read_retained_direct_child_process_identity,
+};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -24,12 +28,32 @@ mod context_leases;
 use context_leases::ContextLeases;
 
 pub(super) fn identity(pid: i64) -> Result<SourceProcessIdentity, String> {
+    // `pid` is a key in this process's procfs observer, never getpid(),
+    // Child::id(), or a PID received from a different namespace.
     let identity = read_live_process_identity(pid)?.ok_or("process identity disappeared")?;
-    Ok(SourceProcessIdentity {
-        pid,
+    Ok(source_identity(identity))
+}
+
+fn source_identity(identity: ProcessIdentity) -> SourceProcessIdentity {
+    SourceProcessIdentity {
+        pid: identity.os_pid,
         boot_id: identity.os_boot_id,
         starttime_ticks: identity.os_pid_starttime_ticks,
-    })
+    }
+}
+
+pub(super) fn current_identity() -> Result<SourceProcessIdentity, String> {
+    read_current_process_identity().map(source_identity)
+}
+
+pub(super) fn direct_child_identity(local_pid: u32) -> Result<SourceProcessIdentity, String> {
+    read_direct_child_process_identity(local_pid).map(source_identity)
+}
+
+pub(super) fn retained_direct_child_identity(
+    local_pid: u32,
+) -> Result<SourceProcessIdentity, String> {
+    read_retained_direct_child_process_identity(local_pid).map(source_identity)
 }
 
 pub(super) fn require_owner(domain_id: &str) -> Result<CompletionDomainOwner, String> {
@@ -447,7 +471,7 @@ pub(crate) fn verify_pinned_owner_ready(
 ) -> Result<(), String> {
     let grant = await_guardian_ready(announce, guardian_pid)?;
     let expected_guardian = identity(i64::from(guardian_pid))?;
-    let expected_entry = identity(i64::from(std::process::id()))?;
+    let expected_entry = current_identity()?;
     if grant.protocol != super::original_work::ROOT_PROTOCOL
         || grant.completion_protocol != PROTOCOL
         || grant.root_id != pin.root_id
@@ -1152,7 +1176,7 @@ fn start_driver(
         }
     }
     drop(gate);
-    let guardian_identity = identity(i64::from(std::process::id()))?;
+    let guardian_identity = current_identity()?;
     // Driver replacement beneath the same living guardian stays in the same
     // process-tree authority. A later independent guardian always mints a new
     // root and publication explicitly adopts only unresolved predecessor debt.
@@ -1171,7 +1195,7 @@ fn start_driver(
         supervisor_authority_id,
         owner_generation: uuid::Uuid::new_v4().to_string(),
         guardian_identity,
-        driver_identity: identity(i64::from(pid))?,
+        driver_identity: direct_child_identity(pid as u32)?,
         endpoint: endpoint.to_string_lossy().into_owned(),
     };
     MailboxDb::open(path)?.publish_completion_owner_with_kernel_root(

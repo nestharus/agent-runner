@@ -140,19 +140,23 @@ pub struct RecorderProcessIdentity {
 
 impl RecorderProcessIdentity {
     fn current(producer_instance: ProducerInstanceId) -> Self {
-        let os_pid = i64::from(std::process::id());
-        let parent_pid = parent_pid();
-        match crate::pid_identity::read_live_process_identity(os_pid) {
-            Ok(Some(identity)) => Self {
-                os_pid,
-                parent_pid,
+        match crate::pid_identity::read_current_process_identity() {
+            Ok(identity) => Self {
+                os_pid: identity.os_pid,
+                #[cfg(target_os = "linux")]
+                parent_pid: crate::pid_identity::read_parent_process_identity()
+                    .ok()
+                    .flatten()
+                    .map(|parent| parent.os_pid),
+                #[cfg(not(target_os = "linux"))]
+                parent_pid: parent_pid(),
                 os_boot_id: Some(identity.os_boot_id),
                 os_pid_starttime_ticks: Some(identity.os_pid_starttime_ticks),
                 producer_instance,
             },
-            Ok(None) | Err(_) => Self {
-                os_pid,
-                parent_pid,
+            Err(_) => Self {
+                os_pid: i64::from(std::process::id()),
+                parent_pid: parent_pid(),
                 os_boot_id: None,
                 os_pid_starttime_ticks: None,
                 producer_instance,

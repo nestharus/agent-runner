@@ -702,19 +702,18 @@ pub(crate) fn record_child_identity(
     };
     starting_custody_test_barrier("before_publication")?;
     child_custody_test_fault("identity_capture")?;
-    let os_pid = i64::from(child_id);
-    let exact_process_identity = match pid_identity::read_live_process_identity(os_pid) {
-        Ok(Some(identity)) => identity,
-        Ok(None) => {
-            let err = format!("Spawned child process {os_pid} is not live during identity binding");
-            warn_child_identity_record_failed(context, child_id, &err);
-            return Err(err);
-        }
+    pid_identity::require_declared_procfs_observer_domain()?;
+    let exact_process_identity = match pid_identity::read_direct_child_process_identity(child_id) {
+        Ok(identity) => identity,
         Err(err) => {
             warn_child_identity_record_failed(context, child_id, &err);
             return Err(err);
         }
     };
+    // `child_id` is local to the spawning process's PID namespace.  The
+    // generation ledger and its independent recovery readers use the PID in
+    // this procfs observer, together with boot and starttime.
+    let os_pid = exact_process_identity.os_pid;
     let mut db = context.open_mailbox()?;
     let mutation = db
         .runtime_lifecycle()

@@ -245,10 +245,16 @@ fn record_wake_pid_or_warn(db: &mut MailboxDb, session_id: &str, claim_token: &s
     if db.completion_continuation_domain().ok().flatten().is_some() {
         return;
     }
-    if let Err(err) =
+    // The legacy spawn result is Child::id() in this caller's PID namespace.
+    // The sidecar and its recovery readers require this procfs observer's key.
+    let observed = u32::try_from(wake_pid)
+        .map_err(|_| "invalid namespace-local wake child PID".to_string())
+        .and_then(oulipoly_state::pid_identity::read_direct_child_process_identity);
+    if let Err(err) = observed.and_then(|identity| {
         db.wake_sessions()
-            .record_wake_claim_pid_identity(session_id, claim_token, wake_pid)
-    {
+            .record_wake_claim_pid_identity(session_id, claim_token, identity.os_pid)
+            .map(|_| ())
+    }) {
         warn_wake_pid_record_failed(session_id, claim_token, err);
     }
 }

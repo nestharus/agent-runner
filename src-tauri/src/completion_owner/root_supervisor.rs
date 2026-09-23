@@ -623,7 +623,7 @@ impl RootSupervisor {
         drop(worker_gate);
         drop(worker_cancellation);
         drop(request_file);
-        let worker_identity = match super::linux::identity(i64::from(worker.id())) {
+        let worker_identity = match super::linux::direct_child_identity(worker.id()) {
             Ok(identity) => identity,
             Err(error) => {
                 // The execution grant is still locally held, so closing it is
