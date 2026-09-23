@@ -112,6 +112,25 @@ that intentionally return terminal rows (mailbox `--all`, notification history,
 trace/history views) are historical/diagnostic and must not be introduced into a
 protected live call graph.
 
+## Non-SQLite original-work artifacts
+
+`original-work-v1` adds no table, query, history scan, or maintenance job. Its
+intent, exclusive acceptance, durable cancellation, terminal/drain result, and
+JSONL diagnostics live inside the exact private agent-bash handle directory.
+The diagnostic JSONL has a handle-local lock, a 1 MiB active generation, one
+rotated generation, and a 128 KiB record bound. The directory is the retention
+unit. The bounded agent-bash startup reaper evaluates terminal state, delivery
+obligation, exact process custody, age, and its existing per-pass directory cap.
+A current-v2 source additionally needs the separate, digest-bound
+`source-retention-release-v1.json` witness; a nested child remains retained
+while its exact parent handle exists. For an accepted root handle, the private
+`root-work-result-v1.json` must also be durable before reaping can safely remove
+the handle; that root result follows its accepted child results. This gate
+belongs to the Bash reaper and requires exact-pair
+verification with the runner's result integration. The guardian does not scan handle history,
+while startup can read bounded per-handle source/reaper evidence. See
+[`root-original-work-v1.md`](root-original-work-v1.md).
+
 ## Maintenance
 
 | Inventory ID | Class | Transaction/external-work rule |

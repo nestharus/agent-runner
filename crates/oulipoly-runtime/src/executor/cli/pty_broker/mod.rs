@@ -177,7 +177,7 @@ pub fn render_mailbox_notification_envelope(
     let mut rendered = String::new();
     rendered.push_str("[OULIPOLY NOTIFICATIONS]\n");
     rendered.push_str(
-        "The following background agent-bash workloads completed while this session was inactive.\n\n",
+        "The following background agent-bash observations are pending delivery. Readiness or root exit does not imply whole-tree completion.\n\n",
     );
     for (index, row) in rows.iter().enumerate() {
         rendered.push_str(&format!(
@@ -2255,8 +2255,11 @@ fn prepare_control_payload(
     let bytes = if window.submission_started_at.is_some() {
         Vec::new()
     } else {
-        render_mailbox_notification_envelope(&window.rows, window.remaining_count, &attempt_id)
-            .into_bytes()
+        // The producer supplied the agent-facing envelope, including any
+        // accepted/ambiguous/cancelled/terminal detail.  The mailbox window is
+        // authority to submit that exact frame, not authority to replace it
+        // with a lossy generic rendering.
+        payload
     };
     Ok(PreparedControlPayload {
         bytes,
@@ -3023,6 +3026,7 @@ mod tests {
         let mut submitted = Vec::new();
         drain_available(child_peer.as_raw_fd(), &mut submitted).unwrap();
         let submitted = String::from_utf8(submitted).unwrap();
+        assert!(submitted.contains("notify\n"), "{submitted}");
         assert_eq!(
             submitted
                 .matches(&format!("[OULIPOLY-DELIVERY {attempt_id}]"))

@@ -1,12 +1,58 @@
 use super::*;
 use fs4::FileExt;
 
+fn write_fresh_join(socket: &mut UnixStream) {
+    socket
+        .write_all(b"join!\n{\"protocol\":\"root-authority-v1\",\"mode\":{\"kind\":\"fresh\"}}\n")
+        .unwrap();
+}
+
+fn fresh_join_request(socket: UnixStream, context: SourceProcessIdentity) -> ControlRequest {
+    ControlRequest::Join(JoinRequest {
+        socket,
+        context,
+        request: super::original_work::RootJoinRequest {
+            protocol: super::original_work::ROOT_PROTOCOL.into(),
+            mode: super::original_work::RootJoinMode::Fresh,
+        },
+    })
+}
+
+fn root_join_response(owner: &CompletionDomainOwner) -> super::original_work::RootJoinResponse {
+    super::original_work::RootJoinResponse {
+        owner: owner.clone(),
+        root_authority: super::original_work::RootAuthorityGrant {
+            protocol: super::original_work::ROOT_PROTOCOL.into(),
+            completion_protocol: owner.protocol.clone(),
+            domain_id: owner.domain_id.clone(),
+            supervisor_authority_id: owner.supervisor_authority_id.clone(),
+            root_id: "test-root".into(),
+            capability: "test-capability".into(),
+            root_identity: owner.guardian_identity.clone(),
+            guardian_identity: owner.guardian_identity.clone(),
+        },
+    }
+}
+
 #[test]
 fn guardian_readiness_is_not_failed_by_the_retired_five_second_cap() {
     let (mut parent, mut guardian) = UnixStream::pair().unwrap();
     let writer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(5_100));
         guardian.write_all(&[1]).unwrap();
+        let identity = identity(i64::from(std::process::id())).unwrap();
+        let grant = super::original_work::RootAuthorityGrant {
+            protocol: super::original_work::ROOT_PROTOCOL.into(),
+            completion_protocol: PROTOCOL.into(),
+            domain_id: "readiness-test".into(),
+            supervisor_authority_id: "readiness-authority".into(),
+            root_id: "readiness-root".into(),
+            capability: "readiness-capability".into(),
+            root_identity: identity.clone(),
+            guardian_identity: identity,
+        };
+        serde_json::to_writer(&mut guardian, &grant).unwrap();
+        guardian.write_all(b"\n").unwrap();
     });
     await_guardian_ready(&mut parent, 42).unwrap();
     writer.join().unwrap();
@@ -82,7 +128,7 @@ fn hello_to_join_gate_prevents_idle_close_and_releases_on_failed_close() {
         let (mut socket, _) = listener.accept().unwrap();
         socket.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"join!\n");
-        serde_json::to_writer(&mut socket, &owner).unwrap();
+        serde_json::to_writer(&mut socket, &root_join_response(&owner)).unwrap();
         socket.write_all(b"\n").unwrap();
         socket
     });
@@ -170,7 +216,7 @@ fn responsive_hello_does_not_ack_pending_join_and_pause_preserves_it() {
     };
     let service = ControlService::start(&listener, &owner).unwrap();
     let mut joining = UnixStream::connect(&endpoint).unwrap();
-    joining.write_all(b"join!\n").unwrap();
+    write_fresh_join(&mut joining);
     assert_eq!(
         hello(&endpoint).unwrap().owner_generation,
         owner.owner_generation
@@ -178,7 +224,7 @@ fn responsive_hello_does_not_ack_pending_join_and_pause_preserves_it() {
     service.pause().unwrap();
     let queued = service.pending();
     assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].context, id);
+    assert!(matches!(&queued[0], ControlRequest::Join(request) if request.context == id));
     joining.set_nonblocking(true).unwrap();
     assert_eq!(
         joining.read(&mut [0]).unwrap_err().kind(),
@@ -186,7 +232,7 @@ fn responsive_hello_does_not_ack_pending_join_and_pause_preserves_it() {
     );
     assert_eq!(hello(&endpoint).unwrap().domain_id, owner.domain_id);
     let mut refused = UnixStream::connect(&endpoint).unwrap();
-    refused.write_all(b"join!\n").unwrap();
+    write_fresh_join(&mut refused);
     assert_eq!(
         hello(&endpoint).unwrap().owner_generation,
         owner.owner_generation
@@ -225,7 +271,7 @@ pub(super) fn test_owner(endpoint: &Path) -> CompletionDomainOwner {
     }
 }
 
-// Root C4: compatible old successes, fixed nonsecret negatives and fail-closed
+// Root C4: versioned successes, fixed nonsecret negatives and fail-closed
 // identity/framing. No negative result proves no prior side effect or replay.
 #[test]
 fn join_refusal_compatibility_and_identity_boundaries() {
@@ -251,8 +297,7 @@ fn join_refusal_compatibility_and_identity_boundaries() {
             socket.read_exact(&mut request).unwrap();
             assert_eq!(&request, b"join!\n");
             if case == "success" {
-                // Existing server response; no new envelope or version gate.
-                serde_json::to_writer(&mut socket, &owner).unwrap();
+                serde_json::to_writer(&mut socket, &root_join_response(&owner)).unwrap();
                 socket.write_all(b"\n").unwrap();
                 return;
             }
@@ -313,7 +358,7 @@ fn saturated_reader_refuses_without_admission_and_bounds_collection() {
     let mut clients = Vec::new();
     for _ in 0..control::PENDING_LIMIT {
         let mut client = UnixStream::connect(&endpoint).unwrap();
-        client.write_all(b"join!\n").unwrap();
+        write_fresh_join(&mut client);
         clients.push(client);
     }
     // Later accepted hello is a barrier through earlier queued connections.
@@ -335,10 +380,7 @@ fn saturated_reader_refuses_without_admission_and_bounds_collection() {
     let (socket, mut client) = UnixStream::pair().unwrap();
     append_pending(
         &mut backlog,
-        vec![JoinRequest {
-            socket,
-            context: owner.guardian_identity.clone(),
-        }],
+        vec![fresh_join_request(socket, owner.guardian_identity.clone())],
         &owner,
     );
     let mut negative = String::new();
@@ -454,7 +496,7 @@ fn failed_release_transfers_to_successor_until_independent_identity_expiry() {
 }
 
 #[test]
-fn committed_join_is_old_client_compatible_and_persistence_refusal_is_not_success() {
+fn committed_join_returns_versioned_root_capability_and_persistence_refusal_is_not_success() {
     for fail in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("pid-identity.db");
@@ -466,13 +508,22 @@ fn committed_join_is_old_client_compatible_and_persistence_refusal_is_not_succes
             db.execute_batch("CREATE TRIGGER deny_context_retain BEFORE INSERT ON completion_continuation_context BEGIN SELECT RAISE(ABORT, 'private_fixture_error_not_public'); END;").unwrap();
         }
         let (server, mut client) = UnixStream::pair().unwrap();
+        let mut authorities = super::original_work::RootAuthorities::default();
+        let (driver, _driver_peer) = UnixStream::pair().unwrap();
+        let supervisor = super::root_supervisor::RootSupervisor::new(&path, driver).unwrap();
         retain_pending_context(
             &path,
             &owner,
             &mut contexts,
+            &mut authorities,
+            &supervisor,
             JoinRequest {
                 socket: server,
                 context: owner.guardian_identity.clone(),
+                request: super::original_work::RootJoinRequest {
+                    protocol: super::original_work::ROOT_PROTOCOL.into(),
+                    mode: super::original_work::RootJoinMode::Fresh,
+                },
             },
         );
         let mut bytes = Vec::new();
@@ -504,11 +555,15 @@ fn committed_join_is_old_client_compatible_and_persistence_refusal_is_not_succes
                     .is_empty()
             );
         } else {
-            // Old client's actual response type, with unchanged successful shape.
-            let response: CompletionDomainOwner = serde_json::from_slice(&bytes).unwrap();
+            let response: super::original_work::RootJoinResponse =
+                serde_json::from_slice(&bytes).unwrap();
             assert_eq!(
-                serde_json::to_value(response).unwrap(),
-                serde_json::to_value(&owner).unwrap()
+                response.owner.supervisor_authority_id,
+                owner.supervisor_authority_id
+            );
+            assert_eq!(
+                response.root_authority.protocol,
+                super::original_work::ROOT_PROTOCOL
             );
             assert_eq!(
                 MailboxDb::open(&path)

@@ -128,7 +128,11 @@ impl Fixture {
         fs::create_dir_all(&data).unwrap();
         fs::create_dir_all(root.path().join("home")).unwrap();
         let script = root.path().join("provider.py");
-        fs::write(&script, include_str!("fixtures/age360/native-provider.py")).unwrap();
+        fs::write(
+            &script,
+            include_str!("fixtures/age319-paired-native-provider.py"),
+        )
+        .unwrap();
         fs::write(
             root.path().join("native-missing-output.py"),
             include_str!("fixtures/age360/native-missing-output.py"),
@@ -139,6 +143,11 @@ impl Fixture {
             include_str!(
                 "../../crates/oulipoly-state/tests/fixtures/age360-missing-output-wire.json"
             ),
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("age319-orphan.py"),
+            include_str!("fixtures/age319-orphan.py"),
         )
         .unwrap();
         let wrapper = root.path().join("provider.sh");
@@ -220,6 +229,23 @@ impl Fixture {
         if self.root.path().join("identity-read-fail.so").exists() {
             cmd.env("LD_PRELOAD", self.root.path().join("identity-read-fail.so"))
                 .env("AGE360_IDENTITY_ROOT", self.root.path());
+        }
+        if self.case == "age319_probe" {
+            let key: serde_json::Value = serde_json::from_slice(
+                &fs::read(self.root.path().join("age319-key.json")).unwrap(),
+            )
+            .unwrap();
+            for name in ["AGE319_OLD_RING", "AGE319_KEY_SERIAL", "AGE319_KEY_NAME"] {
+                cmd.env(name, key[name].as_str().unwrap());
+            }
+            cmd.env(
+                "AGE319_EFFECT",
+                self.root.path().join("unauthorized-effect"),
+            )
+            .env(
+                "AGE319_NESTED_EFFECT",
+                self.root.path().join("nested-effect"),
+            );
         }
         let fault = match self.case {
             "publication_race" => Some("after-terminal-metadata"),
@@ -2498,4 +2524,146 @@ fn native_retiring_owner_admits_first_sequential_fresh_and_resume_after_drain() 
             output.stdout.len()
         );
     }
+}
+
+#[test]
+fn age319_exact_pair_ring_orphan_auth_search_and_independent() {
+    if private_case(true) {
+        return;
+    }
+    use std::ffi::CString;
+    let f = Fixture::new("age319_probe");
+    let old_name = CString::new(format!("age319-preexisting-{}", uuid::Uuid::new_v4())).unwrap();
+    let old = unsafe { libc::syscall(libc::SYS_keyctl, 1, old_name.as_ptr(), 0, 0, 0) };
+    assert!(
+        old > 0,
+        "join private old ring: {}",
+        std::io::Error::last_os_error()
+    );
+    let key_type = CString::new("user").unwrap();
+    let key_name = format!("age319-auth-search-{}", uuid::Uuid::new_v4());
+    let key_name_c = CString::new(key_name.clone()).unwrap();
+    let payload = b"synthetic preexisting provider auth key";
+    let key = unsafe {
+        libc::syscall(
+            libc::SYS_add_key,
+            key_type.as_ptr(),
+            key_name_c.as_ptr(),
+            payload.as_ptr(),
+            payload.len(),
+            old,
+        )
+    };
+    assert!(
+        key > 0,
+        "add private synthetic key: {}",
+        std::io::Error::last_os_error()
+    );
+    fs::write(f.root.path().join("age319-key.json"), serde_json::json!({"AGE319_OLD_RING":old.to_string(),"AGE319_KEY_SERIAL":key.to_string(),"AGE319_KEY_NAME":key_name}).to_string()).unwrap();
+    f.gate("release-resume");
+    f.gate("release-workload");
+    let mut initial = f.start();
+    f.wait_initial(&mut initial);
+    let source = f.source().registration().unwrap();
+    let outer: serde_json::Value = wait(|| {
+        serde_json::from_slice(
+            &fs::read(PathBuf::from(&source.handle_dir).join("root-work-accepted-v1.json")).ok()?,
+        )
+        .ok()
+    });
+    let ring: serde_json::Value = wait(|| {
+        serde_json::from_slice(&fs::read(f.root.path().join("ring-report.json")).ok()?).ok()
+    });
+    let nested: serde_json::Value = wait(|| {
+        serde_json::from_slice(&fs::read(f.root.path().join("nested-report.json")).ok()?).ok()
+    });
+    let nested_runner: serde_json::Value = wait(|| {
+        serde_json::from_slice(&fs::read(f.root.path().join("nested-runner-report.json")).ok()?)
+            .ok()
+    });
+    let orphan: serde_json::Value = wait(|| {
+        serde_json::from_slice(&fs::read(f.root.path().join("orphan-report.json")).ok()?).ok()
+    });
+    println!("AGE319 observed ring={ring} nested={nested} orphan={orphan}");
+    assert_eq!(ring["old_ring"], old);
+    assert_eq!(ring["old_key_found"], key);
+    assert!(
+        ring["name"]
+            .as_str()
+            .unwrap()
+            .starts_with("oulipoly-paired-original-work-v1:")
+    );
+    assert_eq!(ring["had_required"], true);
+    assert_eq!(ring["had_authority"], true);
+    assert_eq!(ring["had_endpoint"], true);
+    assert_eq!(orphan["first_adopter"], ring["worker"]);
+    assert_eq!(orphan["adopted_by"], ring["guardian"]);
+    assert_eq!(orphan["ring"], ring["new_ring"]);
+    assert_ne!(orphan["rc"], 0, "{orphan}");
+    assert!(
+        orphan["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("inherited paired session keyring"),
+        "{orphan}"
+    );
+    assert!(!f.root.path().join("unauthorized-effect").exists());
+    assert_eq!(nested["rc"], 0, "{nested}");
+    assert_eq!(nested_runner["rc"], 0, "{nested_runner}");
+    wait(|| f.root.path().join("nested-effect").exists().then_some(()));
+    assert_eq!(nested["root_id"], outer["root_id"]);
+    let mut rejected = 0;
+    for entry in fs::read_dir(f.root.path().join("spool/agent-bash"))
+        .unwrap()
+        .flatten()
+    {
+        if !entry.file_name().to_string_lossy().starts_with("ab_") {
+            continue;
+        }
+        let Ok(diagnostics) =
+            fs::read_to_string(entry.path().join("root-work-diagnostic-v1.jsonl"))
+        else {
+            continue;
+        };
+        for record in diagnostics
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        {
+            if record["phase"] != "preaccept_failed"
+                || !record["detail"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("inherited paired session keyring")
+            {
+                continue;
+            }
+            let meta: serde_json::Value =
+                serde_json::from_slice(&fs::read(entry.path().join("meta.json")).unwrap()).unwrap();
+            assert_eq!(meta["state"], "ERROR", "{meta}");
+            rejected += 1;
+        }
+    }
+    assert_eq!(rejected, 1, "expected one preaccept diagnostic");
+    let independent = f.root.path().join("independent-effect");
+    let output = Command::new("/usr/bin/python3")
+        .arg("-c")
+        .arg("import os, subprocess, sys; result = subprocess.run([os.environ['AGE360_AGENT_BASH_BIN'], 'run', '--delivery', 'async', '--', '/bin/sh', '-c', 'printf independent > \"$AGE319_EFFECT\"'], capture_output=True); sys.stdout.buffer.write(result.stdout); sys.stderr.buffer.write(result.stderr); sys.exit(result.returncode)")
+        .env_clear().env("PATH", "/usr/bin:/bin")
+        .env("AGE360_AGENT_BASH_BIN", std::env::var("AGE360_AGENT_BASH_BIN").unwrap())
+        .env("XDG_STATE_HOME", f.root.path().join("independent-state"))
+        .env("XDG_CONFIG_HOME", f.root.path().join("independent-config"))
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env("AGE319_EFFECT", &independent)
+        .output().unwrap();
+    assert!(
+        output.status.success(),
+        "independent: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait(|| independent.exists().then_some(()));
+    println!(
+        "AGE319 exact pair ring={ring} orphan={orphan} nested={nested} independent_effect={} outer_root={}",
+        independent.exists(),
+        outer["root_id"]
+    );
 }

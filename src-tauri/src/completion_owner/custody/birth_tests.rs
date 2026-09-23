@@ -226,12 +226,12 @@ fn independent_terminal_wait_progresses_beside_unknown_original() {
             .contains(&independent_attempt)
     );
     let mut status = 0;
-    assert_eq!(reap_unprotected(&mut status), independent_pid);
+    assert_eq!(reap_unprotected(&mut status, &[]), independent_pid);
     assert!(libc::WIFEXITED(status));
     assert_eq!(libc::WEXITSTATUS(status), 70);
     // The unknown child is genuinely terminal too, but no positive independent
     // attribution authorizes consuming its wait. Zero is NOT ECHILD or drain.
-    assert_eq!(reap_unprotected(&mut status), 0);
+    assert_eq!(reap_unprotected(&mut status, &[]), 0);
     assert_eq!(
         super::super::linux::identity(i64::from(unknown_pid)).unwrap(),
         unknown_identity
@@ -259,11 +259,37 @@ fn independent_terminal_wait_progresses_beside_unknown_original() {
     retry_unreleased();
     assert!(db.pending_continuation_attempts().unwrap().is_empty());
     assert_exact_original_receipt(&path, &unknown_attempt, &unknown_identity);
-    assert_eq!(reap_unprotected(&mut status), unknown_pid);
+    assert_eq!(reap_unprotected(&mut status, &[]), unknown_pid);
     assert!(PENDING_UNRELEASED.with_borrow(|pending| pending.is_empty()));
     eprintln!(
         "independent exact wait={independent_pid}; protected unknown={unknown_pid}; both original SQL receipts asserted separately from waits"
     );
+}
+
+#[test]
+fn externally_owned_original_worker_is_never_consumed_by_generic_reaping() {
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        unsafe { libc::_exit(23) }
+    }
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as u32,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        },
+        0
+    );
+    let mut status = 0;
+    assert_eq!(reap_unprotected(&mut status, &[i64::from(pid)]), 0);
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 23);
 }
 
 fn assert_exact_original_receipt(

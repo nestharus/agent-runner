@@ -43,6 +43,9 @@ def launch(request):
     case = os.environ.get("AGE360_CASE")
     if prompt == "synthetic independent listener":
         case = "listener_only"
+    age319_nested = case == "age319_probe" and prompt == "age319 authorized nested"
+    if age319_nested:
+        SESSION = "ses_age319_nested"
     seq = 1
     if known and case != "listener_only":
         marker = pathlib.Path(os.environ["AGE360_NATIVE_WAKE_MARKER"])
@@ -240,6 +243,8 @@ def launch(request):
                     time.sleep(.02)
             mode = "sync" if case in ("sync", "sync-independent") or case.startswith("detach-") else "async"
             env = dict(os.environ, AGENT_BASH_OWNER_SESSION_ID=SESSION, AGENT_BASH_OWNER_INVOCATION_UUID=parent)
+            if age319_nested:
+                env["AGENT_BASH_AGENT_RUNNER_BIN"] = os.environ["AGE360_RUNNER_BIN"]
             workload = "printf paired-source-output"
             if mode == "async" or case in ("detach-before", "detach-race"): workload = 'while [ ! -f "$AGE360_WORKLOAD_GATE" ]; do sleep 0.02; done; printf paired-source-output'
             extra = []
@@ -248,6 +253,8 @@ def launch(request):
                 extra = ["--ready-sentinel", "NEVER-SEEN"]
             elif os.environ["AGE360_CASE"] == "large_output":
                 workload = 'head -c 16777216 /dev/zero'
+            elif os.environ["AGE360_CASE"] == "age319_probe":
+                workload = 'printf nested > "$AGE319_NESTED_EFFECT"' if age319_nested else '/usr/bin/python3 "$AGE360_ROOT/age319-orphan.py" && printf paired-source-output'
             elif os.environ["AGE360_CASE"] == "stripped_nested":
                 workload = '''set +e
 env -u OULIPOLY_ROOT_WORK_ID -u OULIPOLY_ROOT_PARENT_CAPABILITY_V1 \
@@ -281,6 +288,14 @@ printf paired-source-output'''
             (root / "bash-dispatch.stderr").write_bytes(result.stderr)
             allowed = (0, 37) if os.environ["AGE360_CASE"] == "early_exit" else (0,)
             if result.returncode not in allowed: raise RuntimeError("actual paired Bash dispatch failed: " + result.stderr.decode(errors="replace"))
+            if age319_nested:
+                handle = json.loads(result.stdout)["handle"]
+                accepted = pathlib.Path(os.environ["XDG_STATE_HOME"]) / "agent-bash" / handle / "root-work-accepted-v1.json"
+                deadline = time.monotonic() + 15
+                while not accepted.exists() and time.monotonic() < deadline:
+                    time.sleep(.02)
+                root_id = json.loads(accepted.read_text())["root_id"] if accepted.exists() else None
+                (root / "nested-report.json").write_text(json.dumps({"rc": result.returncode, "stderr": result.stderr.decode(errors="replace"), "stdout": result.stdout.decode(errors="replace"), "root_id": root_id}))
             (root / "provider-dispatched").touch()
             if case in ("publication_race", "publication_error", "publication_io_error", "hash_cancel", "missing_selection", "missing_pin", "missing_short"):
                 # Actual original owner issues cancellation through the exact Bash

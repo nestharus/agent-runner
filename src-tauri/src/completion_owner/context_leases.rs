@@ -33,6 +33,10 @@ impl ContextLeases {
         self.0.is_empty()
     }
 
+    pub fn identities(&self) -> Vec<SourceProcessIdentity> {
+        self.0.iter().map(|lease| lease.identity.clone()).collect()
+    }
+
     pub fn admit(&mut self, path: &Path, context: &SourceProcessIdentity) -> Result<(), String> {
         let db = MailboxDb::open(path)?;
         // A previously ambiguous retain can have left a row without a local

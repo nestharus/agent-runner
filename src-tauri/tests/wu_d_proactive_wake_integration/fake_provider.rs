@@ -113,7 +113,7 @@ else
   wait "$writer_pid" || true
   exit "$rc"
 fi
-python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "running", d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"' "$work/agent-bash-dispatch.json"
+python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["dispatch_state"] == "root-accepted", d; assert d["effects_possible"] is True and d["retry_safe"] is False, d; h = d["handle"]; assert isinstance(h, str) and h.strip(), "empty dispatch handle"' "$work/agent-bash-dispatch.json"
 wait "$writer_pid"
 "#,
         ),

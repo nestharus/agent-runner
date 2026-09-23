@@ -25,7 +25,24 @@ const SOURCE_COMMAND_BUFFER_BYTES: usize = 64 * 1024;
 mod birth_tests;
 #[cfg(test)]
 mod independent_waits;
+mod lineage_keyring;
 mod never_forked;
+
+// The first provider runs from the bootstrapped entry process, while later
+// continuation providers run from root_worker_entry. Mark both launch trees.
+pub(super) fn establish_entry_lineage() -> Result<(), String> {
+    lineage_keyring::establish().map(|_| ())
+}
+
+pub(super) fn original_worker_lineage_name() -> Result<std::ffi::CString, String> {
+    lineage_keyring::random_name()
+}
+
+pub(super) fn establish_original_worker_lineage_pre_exec(
+    name: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    lineage_keyring::establish_pre_exec(name)
+}
 
 /// An outer driver failure must not destroy its unique live no-child witness.
 /// Keep this exact process until integration succeeds. No workload, reservation,
@@ -728,23 +745,28 @@ fn retain_unfinished_birth(birth: &mut PendingUnreleased) -> bool {
 /// Shared by CD and its guardian succession: retry original evidence first,
 /// then reap unprotected exact child PIDs. Enumerating candidates is not drain
 /// evidence; only waitpid/waitid supply terminal/ECHILD observations.
-pub(super) fn reap_unprotected(status: &mut i32) -> i32 {
+pub(super) fn reap_unprotected(status: &mut i32, externally_protected: &[i64]) -> i32 {
     #[cfg(not(test))]
-    return unsafe { libc::waitpid(-1, status, libc::WNOHANG) };
+    {
+        if externally_protected.is_empty() {
+            return unsafe { libc::waitpid(-1, status, libc::WNOHANG) };
+        }
+        return reap_unprotected_children(status, externally_protected);
+    }
     #[cfg(test)]
     {
         let independent = independent_waits::reap(status);
         if independent > 0 {
             return independent;
         }
-        let waited = reap_generic_unprotected(status);
+        let waited = reap_generic_unprotected(status, externally_protected);
         independent_waits::observe_wait(waited);
         waited
     }
 }
 
 #[cfg(test)]
-fn reap_generic_unprotected(status: &mut i32) -> i32 {
+fn reap_generic_unprotected(status: &mut i32, externally_protected: &[i64]) -> i32 {
     #[cfg(feature = "age360-fault-fixtures")]
     if PENDING_UNRELEASED.with_borrow(|pending| pending.iter().any(|p| p.announced.is_none())) {
         oulipoly_state::completion_continuation::age360_fault_barrier("birth-unread-before-reap");
@@ -756,7 +778,7 @@ fn reap_generic_unprotected(status: &mut i32) -> i32 {
     if PENDING_UNRELEASED.with_borrow(|pending| pending.iter().any(|p| p.announced.is_none())) {
         return 0;
     }
-    let protected = PENDING_UNRELEASED.with_borrow(|pending| {
+    let mut protected = PENDING_UNRELEASED.with_borrow(|pending| {
         pending
             .iter()
             .flat_map(|p| {
@@ -768,9 +790,18 @@ fn reap_generic_unprotected(status: &mut i32) -> i32 {
             .flatten()
             .collect::<Vec<_>>()
     });
+    protected.extend_from_slice(externally_protected);
     // A consumed PID still names the original unreaped child. If its adopter
     // dies, this original subreaper inherits it; do not consume that incarnation
     // while identity lookup or attachment remains pending.
+    reap_unprotected_children(status, &protected)
+}
+
+/// Wait only children which have no operation-specific wait owner. Reading the
+/// kernel child list is candidate discovery, never terminal evidence; only the
+/// exact wait below consumes status. A protected child is left exclusively to
+/// its retained `Child` owner.
+fn reap_unprotected_children(status: &mut i32, protected: &[i64]) -> i32 {
     if protected.is_empty() {
         return unsafe { libc::waitpid(-1, status, libc::WNOHANG) };
     }
@@ -1012,7 +1043,9 @@ pub(super) fn root_worker_entry() -> Result<(), String> {
     // an observation about the complete launched tree, not only the original
     // launcher. An intermediate executor would break the authenticated edge
     // and make a valid wake child look foreign.
-    let launch = launch_command(&request.recipe, attempt);
+    let launch = launch_after_lineage(lineage_keyring::establish, || {
+        launch_command(&request.recipe, attempt)
+    });
     let (mut child, spawn_error) = match launch {
         Ok(child) => (Some(child), None),
         Err(error) => (None, Some(error)),
@@ -1131,6 +1164,72 @@ pub(super) fn root_worker_entry() -> Result<(), String> {
         classification,
     )?;
     Ok(())
+}
+
+// A failed or ambiguous marker setup is a retained spawn_failed outcome. The
+// launch callback must not run when lineage has not been validated.
+fn launch_after_lineage<T>(
+    setup: impl FnOnce() -> Result<String, String>,
+    launch: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    setup().map_err(|error| {
+        format!("root worker lineage setup failed before provider spawn: {error}")
+    })?;
+    launch()
+}
+
+#[cfg(test)]
+#[test]
+fn lineage_setup_failure_prevents_root_worker_launch() {
+    let mut launched = false;
+    let failure: Result<(), String> = launch_after_lineage(
+        || Err("injected keyctl failure".into()),
+        || {
+            launched = true;
+            Ok(())
+        },
+    );
+    let error = failure.unwrap_err();
+    assert!(error.contains("injected keyctl failure"));
+    assert!(!launched);
+    let directory = tempfile::tempdir().unwrap();
+    let result_path = directory.path().join("result.json");
+    let attempt = ContinuationAttempt {
+        attempt_id: uuid::Uuid::new_v4().to_string(),
+        owner_generation: "test".into(),
+        operation: "activation".into(),
+        request_sha256: "a".repeat(64),
+        source_registration_id: None,
+        source_listener_revision: None,
+        session_id: None,
+        claim_token: None,
+        result_path: result_path.to_string_lossy().into_owned(),
+    };
+    let identity = super::linux::identity(i64::from(std::process::id())).unwrap();
+    persist_root_worker_result(
+        &attempt,
+        &identity,
+        RootLaunchResult {
+            spawn_failed: true,
+            spawn_error: Some(error),
+            root_exit_code: None,
+            root_wait_status: None,
+        },
+        None,
+        serde_json::json!({"classification":"native_wait_result"}),
+    )
+    .unwrap();
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result_path).unwrap()).unwrap();
+    assert_eq!(receipt["spawn_failed"], true);
+    assert_eq!(receipt["owned_children"], "ECHILD");
+    assert_eq!(receipt["result_retained"], true);
+    assert!(
+        receipt["spawn_error"]
+            .as_str()
+            .unwrap()
+            .contains("injected keyctl failure")
+    );
 }
 
 struct RootLaunchResult {
