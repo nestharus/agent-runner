@@ -31,6 +31,8 @@
 - `crates/oulipoly-state/src/mailbox/schema.rs`
 - `crates/oulipoly-state/src/mailbox/migrations/0022_live_history_barrier.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0023_record_timestamp_contract.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0024_completion_mailbox_provenance.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0024_completion_mailbox_provenance_trigger.sql`
 - `crates/oulipoly-state/migrations/0012_session_ingress_evidence.sql`
 - `crates/oulipoly-state/migrations/0026_live_history_barrier.sql`
 - `crates/oulipoly-state/migrations/0027_record_timestamp_contract.sql`
@@ -95,6 +97,7 @@
 | A resident owner accepts one immutable mailbox row. | One transaction verifies the exact supervisor lease, persists ingress, records `accepted_pending`, and advances only that session's cursor. |
 | PTY transport or manual acknowledgement evidence arrives. | Store its explicit evidence kind under the exact delivery/session/generation fence without advancing provider `submitted` or `confirmed`. |
 | A caller reports that one materialized completion mailbox row was consumed in-band. | When the durable completion owner matches the exact listener owner, acknowledge only that mailbox row and listener once as `consumed_in_call`, resolve its delivery attempt, and leave sibling event listeners and unrelated pending rows active. |
+| A v2 completion listener is materialized, or a v23 sidecar is upgraded with pending completion rows. | Materialization stamps durable v2 provenance in the mailbox transaction. Upgrade backfills relational v2 evidence and verifies retained payloads for remaining pending rows. Ambiguous rows retain wake debt and reject generic activation; a later exact-claim retry can classify restored evidence. A verified legacy payload may enter the existing generic lane. |
 | A caller lists direct logical invocation children. | `list_invocation_children` returns only direct children in deterministic chronological `created_at, id` order; consumer-specific projections may reorder their already-loaded copy without changing this history contract. |
 | A selected retained lifecycle reaches terminal state. | Its terminal/closed time and explicit eligibility projection are written atomically with the state transition. Backward wall time is preserved as `clock_anomaly` and is not eligible. |
 | A legacy row lacks strong timestamp evidence. | Migration preserves known bytes, records `legacy_unknown`, and leaves `retention_eligible_at` null rather than inventing migration/epoch/file time. |

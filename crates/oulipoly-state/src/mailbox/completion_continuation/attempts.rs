@@ -660,6 +660,7 @@ fn pending_notification_source_on(
     session: &str,
     token: &str,
 ) -> Result<Option<String>, String> {
+    recover_unclassified_completion_provenance_on(tx, session, token)?;
     // Start at the claimed mailbox rows. An inner join here can erase a v2
     // completion whose source or listener projection is missing, turning it
     // into apparent authority for a source-free activation.
@@ -672,7 +673,8 @@ fn pending_notification_source_on(
                 COALESCE(listener.acknowledged_at IS NULL,0),
                 notification.policy_origin,
                 message.owner_invocation_uuid,
-                COALESCE(source.event_id=listener.event_id,0)
+                COALESCE(source.event_id=listener.event_id,0),
+                message.completion_provenance
          FROM session_wake_claim AS claim
          JOIN mailbox AS message
            ON message.session_id=claim.session_id
@@ -714,6 +716,7 @@ fn pending_notification_source_on(
                 row.get::<_, Option<String>>(12)?,
                 row.get::<_, Option<String>>(13)?,
                 row.get::<_, bool>(14)?,
+                row.get::<_, String>(15)?,
             ))
         })
         .map_err(|error| error.to_string())?;
@@ -735,11 +738,21 @@ fn pending_notification_source_on(
             policy_origin,
             message_owner,
             exact_event,
+            provenance,
         ) = row.map_err(|error| error.to_string())?;
-        // A legacy completion may have a listener and mailbox row, but no v2
-        // source or classified notification. It retains the generic wake lane.
-        if source.is_none() && policy_origin.is_none() {
+        if provenance == "unclassified" {
+            return Err(format!(
+                "pending completion provenance unclassified for session {session}, claim {token}; recover exact source or immutable payload before activation"
+            ));
+        }
+        // The mailbox provenance survives total loss of the relational v2
+        // projections. Only a positively classified legacy row can use the
+        // generic wake lane.
+        if provenance == "legacy" && source.is_none() && policy_origin.is_none() {
             continue;
+        }
+        if provenance != "v2" {
+            return Err("pending completion provenance conflicts with v2 source evidence".into());
         }
         let exact_policy_origin = source
             .as_ref()
@@ -765,6 +778,81 @@ fn pending_notification_source_on(
         }
     }
     Ok(selected)
+}
+
+fn recover_unclassified_completion_provenance_on(
+    tx: &Transaction<'_>,
+    session: &str,
+    token: &str,
+) -> Result<(), String> {
+    let mut statement = tx.prepare(
+        "SELECT message.seq,message.payload_json,message.payload_file_path,
+                message.payload_sha256,message.payload_byte_len,
+                message.payload_retention_policy,message.payload_compacted_at,
+                EXISTS(SELECT 1 FROM completion_event_listener AS listener
+                       JOIN completion_continuation_source AS source
+                         ON source.event_id=listener.event_id
+                       WHERE listener.mailbox_seq=message.seq)
+                OR EXISTS(SELECT 1 FROM completion_continuation_source AS source
+                          WHERE message.handle=source.event_id
+                             OR (message.owner_invocation_uuid IS NOT NULL
+                                 AND message.handle=source.event_id || ':' || message.owner_invocation_uuid))
+                OR EXISTS(SELECT 1 FROM completion_event_listener AS listener
+                          JOIN completion_continuation_notification AS notification
+                            ON notification.event_id=listener.event_id
+                           AND notification.listener_id=listener.listener_id
+                          WHERE listener.mailbox_seq=message.seq
+                            AND notification.policy_origin LIKE 'exact_admitted_binding:%')
+         FROM session_wake_claim AS claim JOIN mailbox AS message
+           ON message.session_id=claim.session_id
+          AND message.seq BETWEEN claim.min_pending_seq_at_claim
+                              AND claim.max_pending_seq_at_claim
+         WHERE claim.session_id=?1 AND claim.claim_token=?2
+           AND message.kind='agent_bash_complete' AND message.delivered_at IS NULL
+           AND message.completion_provenance='unclassified'
+         ORDER BY message.seq",
+    ).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![session, token], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, bool>(7)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    for (seq, envelope, path, digest, len, policy, compacted_at, source_evidence) in rows {
+        let provenance = if source_evidence {
+            Some("v2")
+        } else {
+            super::super::schema::classify_existing_completion_payload(
+                tx,
+                &envelope,
+                path.as_deref(),
+                digest.as_deref(),
+                len,
+                policy.as_deref(),
+                compacted_at.as_deref(),
+            )
+        };
+        if let Some(provenance) = provenance {
+            tx.execute(
+                "UPDATE mailbox SET completion_provenance=?2
+                 WHERE seq=?1 AND completion_provenance='unclassified'",
+                params![seq, provenance],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 impl MailboxDb {
@@ -1603,7 +1691,139 @@ pub(in crate::mailbox) fn native_original_drain_on(
 #[cfg(test)]
 mod notification_activation_tests {
     use super::*;
-    use crate::mailbox::{CompletionEventRegistrationInput, CompletionEventTriggerInput};
+    use crate::mailbox::{
+        AgentBashCompleteEnqueue, CompletionEventRegistrationInput, CompletionEventTriggerInput,
+    };
+
+    #[test]
+    fn unclassified_old_completion_recovers_only_from_verified_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let domain = db.completion_continuation_domain().unwrap().unwrap();
+        for (handle, payload) in [
+            (
+                "template-legacy",
+                r#"{"schema_version":2,"kind":"agent_bash_complete","meta":{}}"#,
+            ),
+            (
+                "template-v2",
+                r#"{"completion_protocol":"completion-continuation-v2"}"#,
+            ),
+        ] {
+            db.enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "receiver",
+                handle,
+                payload_json: payload,
+                owner_invocation_uuid: None,
+                matched_os_pid: None,
+                matched_os_boot_id: None,
+                matched_os_pid_starttime_ticks: None,
+                matched_chain_index: None,
+                state_dir: "/private/source",
+                meta_path: "/private/source/meta.json",
+                log_path: "/private/source/log",
+                rc_path: "/private/source/rc",
+                rc: 0,
+            })
+            .unwrap();
+        }
+        for handle in ["pending-legacy", "pending-v2"] {
+            db.conn
+                .execute(
+                    "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+                    state_dir,meta_path,log_path,rc_path,rc)
+                 VALUES('receiver','agent_bash_complete',?1,'{\"schema_version\":1}',
+                    '2026-09-23T00:00:00Z','/private/source','/private/source/meta.json',
+                    '/private/source/log','/private/source/rc',0)",
+                    [handle],
+                )
+                .unwrap();
+        }
+        let legacy_seq: i64 = db
+            .conn
+            .query_row(
+                "SELECT seq FROM mailbox WHERE handle='pending-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let v2_seq: i64 = db
+            .conn
+            .query_row(
+                "SELECT seq FROM mailbox WHERE handle='pending-v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,
+                auto_wake_count,min_pending_seq_at_claim,max_pending_seq_at_claim)
+             VALUES('receiver','claim','2026-09-23T00:00:00Z','notify_idle',1,?1,?1)",
+                [legacy_seq],
+            )
+            .unwrap();
+        let tx = db.conn.transaction().unwrap();
+        assert!(
+            pending_notification_source_on(&tx, &domain, "receiver", "claim")
+                .unwrap_err()
+                .contains("provenance unclassified")
+        );
+        tx.execute(
+            "UPDATE mailbox SET
+                payload_file_path=(SELECT payload_file_path FROM mailbox WHERE handle='template-legacy'),
+                payload_sha256=(SELECT payload_sha256 FROM mailbox WHERE handle='template-legacy'),
+                payload_byte_len=(SELECT payload_byte_len FROM mailbox WHERE handle='template-legacy'),
+                payload_retention_policy=(SELECT payload_retention_policy FROM mailbox WHERE handle='template-legacy')
+             WHERE handle='pending-legacy'", [],
+        ).unwrap();
+        assert_eq!(
+            pending_notification_source_on(&tx, &domain, "receiver", "claim").unwrap(),
+            None
+        );
+        let legacy_provenance: String = tx
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE handle='pending-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_provenance, "legacy");
+        tx.execute(
+            "UPDATE session_wake_claim SET min_pending_seq_at_claim=?1,
+                max_pending_seq_at_claim=?1 WHERE session_id='receiver'",
+            [v2_seq],
+        )
+        .unwrap();
+        assert!(
+            pending_notification_source_on(&tx, &domain, "receiver", "claim")
+                .unwrap_err()
+                .contains("provenance unclassified")
+        );
+        tx.execute(
+            "UPDATE mailbox SET
+                payload_file_path=(SELECT payload_file_path FROM mailbox WHERE handle='template-v2'),
+                payload_sha256=(SELECT payload_sha256 FROM mailbox WHERE handle='template-v2'),
+                payload_byte_len=(SELECT payload_byte_len FROM mailbox WHERE handle='template-v2'),
+                payload_retention_policy=(SELECT payload_retention_policy FROM mailbox WHERE handle='template-v2')
+             WHERE handle='pending-v2'", [],
+        ).unwrap();
+        assert!(
+            pending_notification_source_on(&tx, &domain, "receiver", "claim")
+                .unwrap_err()
+                .contains("lacks exact accepted source authority")
+        );
+        let v2_provenance: String = tx
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE handle='pending-v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v2_provenance, "v2");
+        assert!(wake_claim_tx(&tx, "receiver").unwrap().is_some());
+        tx.commit().unwrap();
+    }
 
     #[test]
     fn activation_source_is_the_accepted_pending_row_in_the_exact_claim() {
@@ -1641,7 +1861,11 @@ mod notification_activation_tests {
             let triggered = db
                 .trigger_completion_event(CompletionEventTriggerInput {
                     event_id: event,
-                    payload_json: r#"{"kind":"agent_bash_complete"}"#,
+                    payload_json: if event == "d_legacy" {
+                        r#"{"schema_version":2,"kind":"agent_bash_complete","meta":{}}"#
+                    } else {
+                        r#"{"kind":"agent_bash_complete","completion_protocol":"completion-continuation-v2"}"#
+                    },
                     state_dir: "/private/source",
                     meta_path: "/private/source/meta.json",
                     log_path: "/private/source/log",
@@ -1739,6 +1963,47 @@ mod notification_activation_tests {
             claim_token: Some("exact-token".into()),
             result_path: "/private/result.json".into(),
         };
+        // With no earlier activation attempt to trip the one-live fence, the
+        // pre-provenance query returned None and admitted this generic proposal.
+        let total_loss = db.conn.transaction().unwrap();
+        total_loss
+            .execute(
+                "UPDATE session_wake_claim SET min_pending_seq_at_claim=?1,
+                max_pending_seq_at_claim=?1
+             WHERE session_id='receiver' AND claim_token='exact-token'",
+                [accepted[4].1],
+            )
+            .unwrap();
+        total_loss
+            .execute(
+                "DELETE FROM completion_continuation_notification WHERE event_id='e_accepted'",
+                [],
+            )
+            .unwrap();
+        total_loss
+            .execute(
+                "DELETE FROM completion_continuation_source WHERE event_id='e_accepted'",
+                [],
+            )
+            .unwrap();
+        total_loss
+            .execute(
+                "DELETE FROM completion_event_listener WHERE event_id='e_accepted'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            pending_notification_source_on(&total_loss, &domain, "receiver", "exact-token")
+                .unwrap_err()
+                .contains("lacks exact accepted source authority")
+        );
+        assert!(
+            reserve_on(&total_loss, &attempt)
+                .unwrap_err()
+                .contains("lacks exact accepted source authority")
+        );
+        assert!(wake_claim_tx(&total_loss, "receiver").unwrap().is_some());
+        total_loss.rollback().unwrap();
         db.conn.execute(
             "UPDATE session_wake_claim SET min_pending_seq_at_claim=?1,max_pending_seq_at_claim=?1
              WHERE session_id='receiver' AND claim_token='exact-token'",
@@ -1886,5 +2151,52 @@ mod notification_activation_tests {
             "a policy classified for another registration cannot authorize activation"
         );
         assert!(wake_claim_tx(&tx, "receiver").unwrap().is_some());
+        tx.execute(
+            "DELETE FROM completion_continuation_notification WHERE event_id='e_accepted'",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM completion_continuation_source WHERE event_id='e_accepted'",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM completion_event_listener WHERE event_id='e_accepted'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            pending_notification_source_on(&tx, &domain, "receiver", "exact-token")
+                .unwrap_err()
+                .contains("lacks exact accepted source authority"),
+            "total projection loss must not turn a pending v2 row into a generic wake"
+        );
+        assert!(
+            reserve_on(&tx, &forged_generic)
+                .unwrap_err()
+                .contains("lacks exact accepted source authority"),
+            "total projection loss must retain the claim and reject generic activation"
+        );
+        assert!(wake_claim_tx(&tx, "receiver").unwrap().is_some());
+        tx.rollback().unwrap();
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.record_continuation_never_forked(&attempt, "fixture-no-worker")
+            .unwrap();
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("receiver")
+                .unwrap()
+                .is_none()
+        );
+        let provenance_after_drain: String = db
+            .conn
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE seq=?1",
+                [accepted[1].1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provenance_after_drain, "v2");
     }
 }

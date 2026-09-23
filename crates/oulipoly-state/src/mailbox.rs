@@ -3167,6 +3167,15 @@ impl MailboxDb {
         {
             return Err("completion acceptance identity conflict".into());
         }
+        let payload: serde_json::Value =
+            serde_json::from_str(input.payload_json).map_err(|error| error.to_string())?;
+        if payload.get("completion_protocol")
+            != Some(&serde_json::Value::String(
+                crate::completion_continuation::PROTOCOL.into(),
+            ))
+        {
+            return Err("v2 completion payload lacks its protocol discriminator".into());
+        }
         evidence.validate_missing_payload(input.payload_json, input.rc)?;
         self.trigger_completion_event_bound(input, Some((binding, evidence)))
     }
@@ -9068,6 +9077,7 @@ fn insert_agent_bash_complete_tx(
     published: &PublishedMailboxPayload,
     now: &str,
 ) -> Result<usize, String> {
+    let provenance = schema::classify_direct_completion_payload_json(input.payload_json);
     tx.execute(
         "INSERT OR IGNORE INTO mailbox (
             session_id,
@@ -9089,8 +9099,9 @@ fn insert_agent_bash_complete_tx(
             payload_sha256,
             payload_byte_len,
             payload_retention_policy,
-            payload_compacted_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?5)",
+            payload_compacted_at,
+            completion_provenance
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?5, ?20)",
         params![
             input.session_id,
             AGENT_BASH_COMPLETE_KIND,
@@ -9112,6 +9123,7 @@ fn insert_agent_bash_complete_tx(
             i64::try_from(published.byte_len)
                 .map_err(|_| "Mailbox payload length does not fit SQLite INTEGER".to_string())?,
             published.retention_policy,
+            provenance,
         ],
     )
     .map_err(|err| format!("Failed to insert mailbox row: {err}"))
@@ -11444,14 +11456,15 @@ fn insert_completion_listener_mailbox_row(
     listener: &CompletionEventListenerRow,
     handle: &str,
     now: &str,
+    provenance: &str,
 ) -> Result<usize, String> {
     tx.execute(
         "INSERT OR IGNORE INTO mailbox (
             session_id, kind, handle, payload_json, enqueued_at,
             owner_invocation_uuid, state_dir, meta_path, log_path, rc_path, rc,
             payload_file_path, payload_sha256, payload_byte_len,
-            payload_retention_policy, payload_compacted_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            payload_retention_policy, payload_compacted_at, completion_provenance
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             listener.session_id,
             AGENT_BASH_COMPLETE_KIND,
@@ -11479,6 +11492,7 @@ fn insert_completion_listener_mailbox_row(
             event.payload_byte_len,
             event.payload_retention_policy,
             event.triggered_at,
+            provenance,
         ],
     )
     .map_err(|err| format!("Failed to materialize completion event listener: {err}"))
@@ -14700,12 +14714,11 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            // Schema 23 includes the terminal-excluding live indexes and the
-            // timestamp-contract fingerprints (measured 3687 VM steps). Keep
-            // a tight fixed ceiling,
+            // Schema 24 also fingerprints immutable completion provenance
+            // (measured 4179 VM steps). Keep a tight fixed ceiling,
             // the no-backfill assertion, and the separate retained-history
             // growth test; this does not grant a data-size-dependent budget.
-            current_open_steps < 4000,
+            current_open_steps < 4400,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
         );
     }

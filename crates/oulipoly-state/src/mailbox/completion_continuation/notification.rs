@@ -167,12 +167,13 @@ pub(in crate::mailbox) fn reconcile_on(
             .map_err(|e| format!("Failed to settle response-only listener retirement: {e}"))?;
         }
     }
-    materialize_on(tx, event, now)
+    materialize_on(tx, event, binding.is_some(), now)
 }
 
 fn materialize_on(
     tx: &Transaction<'_>,
     event: &CompletionEventRow,
+    accepted_v2_binding: bool,
     now: &str,
 ) -> Result<(), String> {
     if event.state != "triggered" {
@@ -180,11 +181,35 @@ fn materialize_on(
     }
     let listeners = completion_event_listeners_on(tx, &event.event_id)?;
     let listener_count = listeners.len();
-    for listener in listeners.into_iter().filter(|listener| {
-        listener.active && listener.acknowledged_at.is_none() && listener.mailbox_seq.is_none()
-    }) {
+    let pending = listeners
+        .into_iter()
+        .filter(|listener| {
+            listener.active && listener.acknowledged_at.is_none() && listener.mailbox_seq.is_none()
+        })
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let provenance = if accepted_v2_binding {
+        "v2"
+    } else if source::bound_event(tx, &event.event_id)? {
+        "v2"
+    } else {
+        super::super::schema::classify_existing_completion_payload(
+            tx,
+            event.payload_json.as_deref().unwrap_or(""),
+            event.payload_file_path.as_deref(),
+            event.payload_sha256.as_deref(),
+            event.payload_byte_len,
+            event.payload_retention_policy.as_deref(),
+            event.triggered_at.as_deref(),
+        )
+        .unwrap_or("unclassified")
+    };
+    for listener in pending {
         let handle = completion_listener_mailbox_handle(event, &listener, listener_count);
-        let changed = insert_completion_listener_mailbox_row(tx, event, &listener, &handle, now)?;
+        let changed =
+            insert_completion_listener_mailbox_row(tx, event, &listener, &handle, now, provenance)?;
         let row = query_mailbox_by_kind_handle_tx(tx, AGENT_BASH_COMPLETE_KIND, &handle)?
             .ok_or_else(|| "Completion listener mailbox row disappeared".to_string())?;
         if changed == 0
@@ -197,6 +222,18 @@ fn materialize_on(
                 "Completion event {} mailbox identity conflicts with an existing row",
                 event.event_id
             ));
+        }
+        let stored_provenance: String = tx
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE seq=?1",
+                [row.seq],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if stored_provenance != provenance {
+            return Err(
+                "completion listener mailbox provenance conflicts with accepted source".into(),
+            );
         }
         tx.execute(
             "UPDATE completion_event_listener
@@ -267,7 +304,7 @@ impl MailboxDb {
         )
         .map_err(|err| format!("Failed to activate completion event listeners: {err}"))?;
         if event.state == "triggered" {
-            materialize_on(&tx, &event, &now)?;
+            materialize_on(&tx, &event, false, &now)?;
         }
         tx.commit()
             .map_err(|err| format!("Failed to commit completion listener activation: {err}"))?;

@@ -3,8 +3,14 @@
 //! fresh construction and installed-version upgrades are separate paths.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+pub(super) const COMPLETION_PROVENANCE_TRIGGER_SQL: &str =
+    include_str!("migrations/0024_completion_mailbox_provenance_trigger.sql");
 
 fn migrate_completed_turn_retention(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("migrations/0020_completed_turn_retention.sql"))
@@ -52,7 +58,217 @@ fn migrate_record_timestamp_contract(conn: &Connection) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
-pub(super) const CURRENT_VERSION: i64 = 23;
+fn migrate_completion_mailbox_provenance(conn: &Connection) -> Result<(), String> {
+    let present: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mailbox')
+             WHERE name='completion_provenance')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !present {
+        conn.execute_batch(include_str!(
+            "migrations/0024_completion_mailbox_provenance.sql"
+        ))
+        .map_err(|error| error.to_string())?;
+    }
+    // Older test fixtures can carry a newer column while presenting an older
+    // user_version. A normal installed upgrade never enters with this trigger.
+    conn.execute_batch("DROP TRIGGER IF EXISTS mailbox_completion_provenance_immutable;")
+        .map_err(|error| error.to_string())?;
+    // Installed rows predate the atomic mailbox marker. Inspect only pending
+    // completion payloads; the verifier streams each file's digest before the
+    // small protocol summary is parsed. Missing or corrupt evidence remains
+    // unclassified and therefore cannot enter the generic wake lane.
+    let mut statement = conn
+        .prepare(
+            "SELECT seq,payload_json,payload_file_path,payload_sha256,payload_byte_len,
+                    payload_retention_policy,payload_compacted_at
+             FROM mailbox WHERE kind='agent_bash_complete' AND delivered_at IS NULL
+               AND completion_provenance='unclassified' ORDER BY seq",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let (seq, envelope, path, digest, len, policy, compacted_at) =
+            row.map_err(|error| error.to_string())?;
+        if let Some(provenance) = classify_existing_completion_payload(
+            conn,
+            &envelope,
+            path.as_deref(),
+            digest.as_deref(),
+            len,
+            policy.as_deref(),
+            compacted_at.as_deref(),
+        ) {
+            conn.execute(
+                "UPDATE mailbox SET completion_provenance=?2 WHERE seq=?1",
+                params![seq, provenance],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    conn.execute_batch(COMPLETION_PROVENANCE_TRIGGER_SQL)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Deserialize)]
+struct CompletionProtocolSummary {
+    #[serde(default, deserialize_with = "present_string")]
+    completion_protocol: Option<String>,
+    #[serde(default, deserialize_with = "present_u64")]
+    schema_version: Option<u64>,
+    kind: Option<String>,
+    #[serde(default)]
+    meta: ObjectField,
+    #[serde(default)]
+    snapshot: PresentField,
+    #[serde(default)]
+    outcome: PresentField,
+    #[serde(default)]
+    source_id: PresentField,
+    #[serde(default)]
+    registration_id: PresentField,
+}
+
+#[derive(Default)]
+struct PresentField(bool);
+
+#[derive(Default)]
+struct ObjectField(bool);
+
+impl<'de> Deserialize<'de> for ObjectField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectVisitor;
+        impl<'de> Visitor<'de> for ObjectVisitor {
+            type Value = ObjectField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a legacy completion metadata object")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(ObjectField(true))
+            }
+        }
+        deserializer.deserialize_map(ObjectVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for PresentField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        IgnoredAny::deserialize(deserializer)?;
+        Ok(Self(true))
+    }
+}
+
+fn present_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
+}
+
+fn present_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
+}
+
+pub(super) fn classify_existing_completion_payload(
+    conn: &Connection,
+    envelope: &str,
+    file_path: Option<&str>,
+    digest: Option<&str>,
+    byte_len: Option<i64>,
+    policy: Option<&str>,
+    compacted_at: Option<&str>,
+) -> Option<&'static str> {
+    let summary = if let (Some(path), Some(digest), Some(len), Some(policy)) =
+        (file_path, digest, byte_len, policy)
+    {
+        let root = Path::new(conn.path()?).parent()?;
+        let expected = root
+            .join(super::MAILBOX_PAYLOAD_DIRECTORY)
+            .join(super::MAILBOX_PAYLOAD_ADDRESS_VERSION)
+            .join(super::MAILBOX_PAYLOAD_ALGORITHM)
+            .join(digest.get(..2)?)
+            .join(digest);
+        if PathBuf::from(path) != expected {
+            return None;
+        }
+        let published = super::PublishedMailboxPayload {
+            address: super::payload_address(digest),
+            file_path: expected,
+            sha256: digest.to_string(),
+            byte_len: u64::try_from(len).ok()?,
+            retention_policy: policy.to_string(),
+        };
+        super::verify_published_payload(&published).ok()?;
+        let file = std::fs::File::open(&published.file_path).ok()?;
+        serde_json::from_reader::<_, CompletionProtocolSummary>(std::io::BufReader::new(file))
+            .ok()?
+    } else if file_path.is_none()
+        && digest.is_none()
+        && byte_len.is_none()
+        && policy.is_none()
+        && compacted_at.is_none()
+    {
+        serde_json::from_str::<CompletionProtocolSummary>(envelope).ok()?
+    } else {
+        return None;
+    };
+    classify_completion_summary(summary)
+}
+
+pub(super) fn classify_direct_completion_payload_json(payload: &str) -> &'static str {
+    let Ok(summary) = serde_json::from_str::<CompletionProtocolSummary>(payload) else {
+        return "unclassified";
+    };
+    if summary.completion_protocol.as_deref() == Some(crate::completion_continuation::PROTOCOL) {
+        return "v2";
+    }
+    if summary.completion_protocol.is_some()
+        || summary.snapshot.0
+        || summary.outcome.0
+        || summary.source_id.0
+        || summary.registration_id.0
+    {
+        return "unclassified";
+    }
+    // This API is the direct generic enqueue boundary. The route itself is
+    // the positive legacy fact for a newly written row; old rows lack it and
+    // use the stricter retained-payload classifier above.
+    "legacy"
+}
+
+fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'static str> {
+    match summary.completion_protocol.as_deref() {
+        Some(crate::completion_continuation::PROTOCOL) => Some("v2"),
+        None if summary.schema_version == Some(2)
+            && summary.kind.as_deref() == Some(super::AGENT_BASH_COMPLETE_KIND)
+            && summary.meta.0
+            && !summary.snapshot.0
+            && !summary.outcome.0
+            && !summary.source_id.0
+            && !summary.registration_id.0 =>
+        {
+            Some("legacy")
+        }
+        _ => None,
+    }
+}
+
+pub(super) const CURRENT_VERSION: i64 = 24;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -208,6 +424,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 23,
         owner: SidecarEntity::PayloadRetention,
         apply: migrate_record_timestamp_contract,
+    },
+    MigrationStep {
+        target_version: 24,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_completion_mailbox_provenance,
     },
 ];
 
@@ -848,6 +1069,156 @@ fn remove_record_timestamp_contract_for_legacy_fixture(conn: &Connection) {
 mod contention_tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn v23_completion_provenance_backfill_preserves_ambiguity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let mut mailbox = super::super::MailboxDb::open(&path).unwrap();
+        mailbox
+            .register_completion_event(super::super::CompletionEventRegistrationInput {
+                event_id: "old-v2",
+                delivery_mode: "async",
+                owner_session_id: Some("receiver"),
+                owner_invocation_uuid: Some("listener"),
+                state_dir: "/private/source",
+                meta_path: "/private/source/meta.json",
+                log_path: "/private/source/log",
+                rc_path: "/private/source/rc",
+            })
+            .unwrap();
+        let domain = mailbox.completion_continuation_domain().unwrap().unwrap();
+        for (handle, payload) in [
+            (
+                "old-v2",
+                r#"{"completion_protocol":"completion-continuation-v2","source":true}"#,
+            ),
+            (
+                "old-v2-lost-source",
+                r#"{"completion_protocol":"completion-continuation-v2"}"#,
+            ),
+            ("old-null-marker", r#"{"completion_protocol":null}"#),
+            (
+                "old-legacy",
+                r#"{"schema_version":2,"kind":"agent_bash_complete","meta":{}}"#,
+            ),
+            (
+                "old-markerless-v2",
+                r#"{"schema_version":2,"kind":"agent_bash_complete","snapshot":{},"outcome":{}}"#,
+            ),
+        ] {
+            mailbox
+                .enqueue_agent_bash_complete(&super::super::AgentBashCompleteEnqueue {
+                    session_id: "receiver",
+                    handle,
+                    payload_json: payload,
+                    owner_invocation_uuid: None,
+                    matched_os_pid: None,
+                    matched_os_boot_id: None,
+                    matched_os_pid_starttime_ticks: None,
+                    matched_chain_index: None,
+                    state_dir: "/private/source",
+                    meta_path: "/private/source/meta.json",
+                    log_path: "/private/source/log",
+                    rc_path: "/private/source/rc",
+                    rc: 0,
+                })
+                .unwrap();
+        }
+        let direct_markerless: String = mailbox
+            .connection()
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE handle='old-markerless-v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(direct_markerless, "unclassified");
+        let source_payload_path: String = mailbox
+            .connection()
+            .query_row(
+                "SELECT payload_file_path FROM mailbox WHERE handle='old-v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        std::fs::remove_file(source_payload_path).unwrap();
+        mailbox
+            .connection()
+            .execute(
+                "INSERT INTO completion_continuation_source
+                 (registration_id,domain_id,source_id,event_id,registration_digest,binding)
+             VALUES('old-v2',?1,'old-v2','old-v2','digest',x'00')",
+                [domain],
+            )
+            .unwrap();
+        mailbox
+            .connection()
+            .execute(
+                "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+                 state_dir,meta_path,log_path,rc_path,rc)
+             VALUES('receiver','agent_bash_complete','old-ambiguous',
+                 '{\"schema_version\":1}','2026-09-23T00:00:00Z',
+                 '/private/source','/private/source/meta.json',
+                 '/private/source/log','/private/source/rc',0)",
+                [],
+            )
+            .unwrap();
+        mailbox
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER mailbox_completion_provenance_immutable;
+             ALTER TABLE mailbox DROP COLUMN completion_provenance;
+             PRAGMA user_version = 23;",
+            )
+            .unwrap();
+        drop(mailbox);
+
+        let reopened = super::super::MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            sidecar_version(reopened.connection()).unwrap(),
+            CURRENT_VERSION
+        );
+        for (handle, expected) in [
+            ("old-v2", "v2"),
+            ("old-v2-lost-source", "v2"),
+            ("old-null-marker", "unclassified"),
+            ("old-legacy", "legacy"),
+            ("old-markerless-v2", "unclassified"),
+            ("old-ambiguous", "unclassified"),
+        ] {
+            let provenance: String = reopened
+                .connection()
+                .query_row(
+                    "SELECT completion_provenance FROM mailbox WHERE handle=?1",
+                    [handle],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(provenance, expected, "incorrect backfill for {handle}");
+        }
+        assert!(
+            reopened
+                .connection()
+                .execute(
+                    "UPDATE mailbox SET completion_provenance='legacy' WHERE handle='old-v2'",
+                    [],
+                )
+                .is_err(),
+            "classified v2 provenance must be immutable"
+        );
+        reopened
+            .connection()
+            .execute_batch("DROP TRIGGER mailbox_completion_provenance_immutable;")
+            .unwrap();
+        drop(reopened);
+        assert!(
+            super::super::MailboxDb::open(&path)
+                .err()
+                .unwrap()
+                .contains("completion domain schema lineage differs")
+        );
+    }
 
     #[test]
     fn populated_v19_fixture_migrates_without_newer_schema_objects() {

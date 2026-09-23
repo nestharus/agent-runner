@@ -466,12 +466,26 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                     OR name LIKE 'completion_supervisor_%'
                     OR name LIKE 'completion_owner_supervisor_%'
                     OR name LIKE 'completion_source_supervisor_%'
-                    OR name LIKE 'completion_attempt_supervisor_%')
+                    OR name LIKE 'completion_attempt_supervisor_%'
+                    OR name='mailbox'
+                    OR name='mailbox_completion_provenance_immutable')
                  ORDER BY type,name",
             )
             .map_err(|e| e.to_string())?;
         statement
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_map([], |r| {
+                let kind: String = r.get(0)?;
+                let name: String = r.get(1)?;
+                let mut sql: String = r.get(2)?;
+                if name == "mailbox"
+                    && sql.contains("completion_provenance TEXT NOT NULL DEFAULT 'unclassified'")
+                    && sql
+                        .contains("CHECK(completion_provenance IN ('unclassified','legacy','v2'))")
+                {
+                    sql = "mailbox completion provenance v24".into();
+                }
+                Ok((kind, name, sql))
+            })
             .map_err(|e| e.to_string())?
             .map(|r| r.map_err(|e| e.to_string()))
             .collect()
@@ -498,6 +512,12 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                 .execute_batch(include_str!(
                     "../migrations/0022_completion_native_runtime.sql"
                 ))
+                .map_err(|e| e.to_string())?;
+            expected.execute_batch(
+                "CREATE TABLE mailbox(completion_provenance TEXT NOT NULL DEFAULT 'unclassified'
+                 CHECK(completion_provenance IN ('unclassified','legacy','v2')));",
+            ).map_err(|e| e.to_string())?;
+            expected.execute_batch(super::schema::COMPLETION_PROVENANCE_TRIGGER_SQL)
                 .map_err(|e| e.to_string())?;
             definitions(&expected)
         })
