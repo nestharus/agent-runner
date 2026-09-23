@@ -173,6 +173,11 @@ fn connect_context(
     {
         return Err("root authority join response conflict".into());
     }
+    if let Some(root) = std::env::var_os(super::EXPECTED_KERNEL_ROOT_ENV)
+        && response.root_authority.root_id != root.to_string_lossy()
+    {
+        return Err("broker root and completion grant conflict".into());
+    }
     Ok((socket, response.root_authority))
 }
 

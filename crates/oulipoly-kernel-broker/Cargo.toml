@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+age319-private-broker-fixture = []
+
 [[bin]]
 name = "oulipoly-kernel-broker"
 path = "src/main.rs"
@@ -16,3 +19,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+oulipoly-state = { path = "../oulipoly-state" }

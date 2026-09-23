@@ -2,7 +2,7 @@
 //! broker-issued root ID and its direct child's PID for the prepare step;
 //! executable, UID, namespace, and mount choices are absent.
 use std::io::{self, Read};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -14,6 +14,100 @@ pub enum Operation {
     ReserveEntry,
     ReadEntry,
     LaunchFixedRunner,
+}
+
+/// The original entry's invocation, never an executable selection. The broker
+/// always executes its installed Runner image and supplies argv[0] itself.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JoinSpec {
+    pub root_id: String,
+    pub domain_id: String,
+    pub supervisor_id: String,
+    pub guardian_pid: i32,
+    pub args: Vec<String>,
+    pub environment: Vec<(String, String)>,
+}
+
+/// Only CLI surfaces that dispatch without native service bootstrap may enter
+/// the root child until host/local PID handling is explicit throughout the
+/// completion owner and provider launch path.
+pub fn supported_entry_args(args: &[String]) -> bool {
+    matches!(args, [only] if only == "--help" || only == "-h")
+        || args.first().is_some_and(|first| first == "diagnostics")
+}
+
+/// Transfer stdin, stdout, stderr, the working directory, and a one-way
+/// completion receipt socket held by the entry until the child exits.
+/// A single challenged sendmsg keeps credentials, data and descriptors together.
+pub fn join_at(path: &Path, spec: &JoinSpec, descriptors: [RawFd; 5]) -> io::Result<String> {
+    let body = serde_json::to_vec(spec)?;
+    if body.len() > 48 * 1024 {
+        return Err(io::Error::other("join environment too large"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(17 + body.len());
+    request.push(b'J');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: request.as_mut_ptr().cast(),
+        iov_len: request.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as usize;
+        std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast(), 5);
+    }
+    let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+    if sent != request.len() as isize {
+        return Err(io::Error::other("short join request; outcome uncertain"));
+    }
+    read_response(stream)
+}
+
+fn checked_connection(path: &Path) -> io::Result<UnixStream> {
+    let stream = UnixStream::connect(path)?;
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize != std::mem::size_of::<libc::ucred>()
+        || unsafe { credentials.assume_init().uid } != 0
+    {
+        return Err(io::Error::other("broker peer is not host root"));
+    }
+    Ok(stream)
+}
+
+fn read_response(stream: UnixStream) -> io::Result<String> {
+    let mut response = Vec::new();
+    stream.take(257).read_to_end(&mut response)?;
+    if response.len() > 256 || !response.ends_with(b"\n") {
+        return Err(io::Error::other("invalid broker response"));
+    }
+    String::from_utf8(response).map_err(|_| io::Error::other("non-UTF8 broker response"))
 }
 
 pub fn request_at(path: &Path, operation: Operation) -> io::Result<String> {
@@ -80,26 +174,7 @@ pub fn read_entry(root_id: &str) -> io::Result<String> {
 }
 
 fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::Result<String> {
-    let mut stream = UnixStream::connect(path)?;
-    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            credentials.as_mut_ptr().cast(),
-            &mut length,
-        )
-    } < 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    if length as usize != std::mem::size_of::<libc::ucred>()
-        || unsafe { credentials.assume_init().uid } != 0
-    {
-        return Err(io::Error::other("broker peer is not host root"));
-    }
+    let mut stream = checked_connection(path)?;
     let mut challenge = [0u8; 16];
     stream.read_exact(&mut challenge)?;
     let mut request = [0u8; 65];
@@ -142,12 +217,7 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
     if written != length as isize {
         return Err(io::Error::other("short broker request"));
     }
-    let mut response = Vec::new();
-    stream.take(257).read_to_end(&mut response)?;
-    if response.len() > 256 || !response.ends_with(b"\n") {
-        return Err(io::Error::other("invalid broker response"));
-    }
-    String::from_utf8(response).map_err(|_| io::Error::other("non-UTF8 broker response"))
+    read_response(stream)
 }
 
 pub fn request(operation: Operation) -> io::Result<String> {

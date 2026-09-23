@@ -94,6 +94,19 @@ fn serve_one(mut stream: UnixStream, ledger: &mut Ledger, debt: &Path, mode: &st
     if stream.read_exact(&mut rest).is_err() || head[1..] != [23; 16] {
         return;
     }
+    if head[0] == b'J' {
+        stream.set_nonblocking(true).unwrap();
+        let mut buffer = [0u8; 8192];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fixture join drain failed: {error}"),
+            }
+        }
+        stream.set_nonblocking(false).unwrap();
+    }
     let root = if rest.len() >= 16 {
         uuid::Uuid::from_slice(&rest[..16]).unwrap().to_string()
     } else {
@@ -144,6 +157,13 @@ fn serve_one(mut stream: UnixStream, ledger: &mut Ledger, debt: &Path, mode: &st
                 ledger.supervisor,
                 ledger.guardian.unwrap().pid
             )
+        }
+        b'J' if mode == "live" && ledger.phase == 3 && ledger.entry == stamp(peer) => {
+            std::fs::write(debt.with_extension("join-ready"), b"ready").unwrap();
+            while !debt.with_extension("join-release").exists() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            "error fixture has no root child join\n".into()
         }
         _ => "error denied\n".into(),
     };
@@ -230,22 +250,14 @@ fn fixture(mode: &str) {
         assert!(debt.exists());
         return;
     }
-    eventually(|| {
-        std::fs::read_to_string(&log)
-            .unwrap_or_default()
-            .contains("pinned guardian active")
-    });
-    let (root, supervisor, guardian) = {
-        let state = ledger.lock().unwrap();
-        assert_eq!(state.phase, 3);
-        assert_eq!(state.reads, 2);
-        assert_eq!(state.domain, domain);
-        (
-            state.root.clone(),
-            state.supervisor.clone(),
-            state.guardian.unwrap(),
-        )
-    };
+    eventually(|| debt.with_extension("join-ready").exists());
+    let debt_line = std::fs::read_to_string(&debt).unwrap();
+    let parts: Vec<_> = debt_line.split_ascii_whitespace().collect();
+    assert_eq!(parts.len(), 4);
+    assert_eq!(parts[1], "3");
+    assert_eq!(parts[2], domain);
+    let root = parts[0].to_owned();
+    let supervisor = parts[3].to_owned();
     let owner = MailboxDb::open(&mailbox_path)
         .unwrap()
         .completion_continuation_owner()
@@ -260,6 +272,7 @@ fn fixture(mode: &str) {
             .unwrap(),
         Some(root.clone())
     );
+    let guardian = stamp(owner.guardian_identity.pid as i32).unwrap();
     assert_eq!(owner.guardian_identity.pid, i64::from(guardian.pid));
     assert_eq!(stamp(guardian.pid), Some(guardian));
     assert_ne!(owner.driver_identity.pid, owner.guardian_identity.pid);
@@ -290,6 +303,14 @@ fn fixture(mode: &str) {
         Some(root.clone())
     );
     assert_ne!(replacement.driver_identity.pid, owner.driver_identity.pid);
+    std::fs::write(debt.with_extension("join-release"), b"release").unwrap();
+    eventually(|| entry.try_wait().unwrap().is_some());
+    assert!(!entry.wait().unwrap().success());
+    let entry_log = std::fs::read_to_string(&log).unwrap();
+    assert!(entry_log.contains("child join refused"), "{entry_log}");
+    let state = ledger.lock().unwrap();
+    assert_eq!(state.reads, 2);
+    drop(state);
     // A root UUID or sibling process cannot read the live binding or reserve a
     // second entry. The real broker's same tests cover its durable registry.
     assert!(

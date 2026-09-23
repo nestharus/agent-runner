@@ -1,11 +1,14 @@
-//! Opt-in host-root service. No Runner code invokes this binary yet.
+//! Opt-in host-root broker for the pinned guardian and one-use root child join.
+#[path = "root_join.rs"]
+mod root_join;
 use oulipoly_kernel_broker::entry_registry::EntryRegistry;
 use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess};
+use oulipoly_kernel_broker::protocol::JoinSpec;
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -13,6 +16,17 @@ use std::path::Path;
 const SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 const STATE: &str = "/var/lib/oulipoly-kernel-broker";
 const RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_fixture() -> bool {
+    (unsafe { libc::geteuid() }) == 0
+        && fs::read_link("/proc/self/ns/user").ok() != fs::read_link("/proc/1/ns/user").ok()
+        && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some()
+}
+#[cfg(not(feature = "age319-private-broker-fixture"))]
+fn private_fixture() -> bool {
+    false
+}
 
 fn checked_root_path(path: &Path, directory: bool) -> io::Result<()> {
     if !path.is_absolute() {
@@ -58,6 +72,10 @@ enum RequestPayload {
     Read {
         root_id: String,
     },
+    Join {
+        spec: JoinSpec,
+        descriptors: [File; 5],
+    },
 }
 
 fn recv_request(
@@ -101,7 +119,7 @@ fn recv_request(
     // live through classification and dispatch.
     let challenge = *uuid::Uuid::new_v4().as_bytes();
     stream.write_all(&challenge)?;
-    let mut request = [0u8; 65];
+    let mut request = [0u8; 64 * 1024];
     let mut iov = libc::iovec {
         iov_base: request.as_mut_ptr().cast(),
         iov_len: request.len(),
@@ -118,6 +136,7 @@ fn recv_request(
         return Err(io::Error::last_os_error());
     }
     let mut credentials = None;
+    let mut descriptors = Vec::new();
     let mut invalid_ancillary = false;
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     while !cmsg.is_null() {
@@ -132,8 +151,6 @@ fn recv_request(
                 credentials = Some(unsafe { *(libc::CMSG_DATA(cmsg) as *const libc::ucred) });
             }
         } else if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
-            // recvmsg installs SCM_RIGHTS even when the operation does not use
-            // them. A hostile peer could otherwise exhaust the broker's FDs.
             let base = unsafe { libc::CMSG_LEN(0) } as usize;
             let bytes = (header.cmsg_len as usize).saturating_sub(base);
             if (header.cmsg_len as usize) >= base
@@ -141,10 +158,14 @@ fn recv_request(
             {
                 for index in 0..bytes / std::mem::size_of::<i32>() {
                     let received = unsafe { *(libc::CMSG_DATA(cmsg) as *const i32).add(index) };
-                    unsafe { libc::close(received) };
+                    descriptors.push(unsafe { File::from_raw_fd(received) });
                 }
             }
-            invalid_ancillary = true;
+            if (header.cmsg_len as usize) < base
+                || !bytes.is_multiple_of(std::mem::size_of::<i32>())
+            {
+                invalid_ancillary = true;
+            }
         } else {
             invalid_ancillary = true;
         }
@@ -154,6 +175,7 @@ fn recv_request(
         b'G' => 65,
         b'P' => 37,
         b'A' => 33,
+        b'J' => read,
         _ => 17,
     };
     if read != expected_len
@@ -162,7 +184,13 @@ fn recv_request(
     {
         return Err(io::Error::other("invalid challenged request"));
     }
-    if invalid_ancillary {
+    if invalid_ancillary
+        || if request[0] == b'J' {
+            descriptors.len() != 5
+        } else {
+            !descriptors.is_empty()
+        }
+    {
         return Err(io::Error::other("unsupported request ancillary data"));
     }
     let credentials =
@@ -192,6 +220,12 @@ fn recv_request(
         b'A' => RequestPayload::Read {
             root_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
+        b'J' if read > 17 && read <= 48 * 1024 + 17 => RequestPayload::Join {
+            spec: serde_json::from_slice(&request[17..read as usize])?,
+            descriptors: descriptors
+                .try_into()
+                .map_err(|_| io::Error::other("join descriptors"))?,
+        },
         _ => RequestPayload::None,
     };
     Ok((request[0], payload, credentials, process))
@@ -212,7 +246,7 @@ fn peer_from_request(stream: &mut UnixStream) -> io::Result<(u8, RequestPayload,
 
 fn root_launch_admitted(peer: &PeerIdentity, scope: &Scope, host_namespace: &File) -> bool {
     matches!(scope, Scope::Outside)
-        && peer.uid >= 1000
+        && (peer.uid >= 1000 || private_fixture() && peer.uid == 0)
         && matches!(peer.process.in_namespace(host_namespace), Ok(true))
 }
 
@@ -245,9 +279,13 @@ fn dispatch_authenticated(
         ) => Ok(format!("inside-work {root_id} {work_incarnation}\n")),
         (b'C', Scope::Outside) => Ok("outside\n".to_owned()),
         (b'C', Scope::Uncertain) => Ok("uncertain\n".to_owned()),
-        (b'E', Scope::Outside) if admitted && !entries.has_debt() => entries
-            .reserve(peer.uid, &peer.process)
-            .map(|id| format!("reserved {id}\n")),
+        (b'E', Scope::Outside)
+            if admitted && !entries.has_debt() && !entries.has_unsettled_join() =>
+        {
+            entries
+                .reserve(peer.uid, &peer.process)
+                .map(|id| format!("reserved {id}\n"))
+        }
         (b'E', _) => Err(io::Error::other("entry reservation denied")),
         (b'P', Scope::Outside) if admitted => {
             let RequestPayload::Prepare {
@@ -308,59 +346,111 @@ fn serve() -> io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other("host root required"));
     }
-    if fs::read_link("/proc/self/ns/user")? != fs::read_link("/proc/1/ns/user")? {
+    let fixture = private_fixture();
+    if !fixture && fs::read_link("/proc/self/ns/user")? != fs::read_link("/proc/1/ns/user")? {
         return Err(io::Error::other("initial user namespace required"));
     }
-    if fs::read_link("/proc/self/ns/pid")? != fs::read_link("/proc/1/ns/pid")? {
+    if !fixture && fs::read_link("/proc/self/ns/pid")? != fs::read_link("/proc/1/ns/pid")? {
         return Err(io::Error::other("host PID namespace required"));
     }
-    checked_root_path(
-        Path::new("/usr/local/libexec/oulipoly/oulipoly-kernel-broker"),
-        false,
-    )?;
-    checked_root_path(Path::new(STATE), true)?;
-    checked_root_path(Path::new("/run/oulipoly-kernel-broker"), true)?;
-    checked_root_path(Path::new(RUNNER), false)?;
-    let runner_image = File::open(RUNNER)?;
-    let works_path = Path::new(STATE).join("works");
+    if !fixture {
+        checked_root_path(
+            Path::new("/usr/local/libexec/oulipoly/oulipoly-kernel-broker"),
+            false,
+        )?;
+    }
+    let state = if fixture {
+        std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1")
+            .map_err(|_| io::Error::other("missing private state"))?
+    } else {
+        STATE.into()
+    };
+    let socket = if fixture {
+        std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+            .map_err(|_| io::Error::other("missing private socket"))?
+    } else {
+        SOCKET.into()
+    };
+    let runner = if fixture {
+        std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1")
+            .map_err(|_| io::Error::other("missing private Runner"))?
+    } else {
+        RUNNER.into()
+    };
+    if !fixture {
+        checked_root_path(Path::new(&state), true)?;
+        checked_root_path(Path::new("/run/oulipoly-kernel-broker"), true)?;
+        checked_root_path(Path::new(&runner), false)?;
+    }
+    let runner_image = File::open(&runner)?;
+    let works_path = Path::new(&state).join("works");
     if !works_path.exists() {
         use std::os::unix::fs::DirBuilderExt;
         fs::DirBuilder::new().mode(0o700).create(&works_path)?;
     }
-    checked_root_path(&works_path, true)?;
+    if !fixture {
+        checked_root_path(&works_path, true)?;
+    }
     let host_namespace = File::open("/proc/self/ns/pid")?;
-    let registry = RootRegistry::open(STATE)?;
+    let mut registry = RootRegistry::open(&state)?;
     let works = WorkRegistry::open(&works_path, &registry)?;
-    let entries_path = Path::new(STATE).join("entries");
+    let entries_path = Path::new(&state).join("entries");
     if !entries_path.exists() {
         use std::os::unix::fs::DirBuilderExt;
         fs::DirBuilder::new().mode(0o700).create(&entries_path)?;
     }
-    checked_root_path(&entries_path, true)?;
+    if !fixture {
+        checked_root_path(&entries_path, true)?;
+    }
     let mut entries = EntryRegistry::open(&entries_path)?;
-    if let Ok(meta) = fs::symlink_metadata(SOCKET) {
+    if let Ok(meta) = fs::symlink_metadata(&socket) {
         if !meta.file_type().is_socket() || meta.uid() != 0 {
             return Err(io::Error::other("unsafe existing socket"));
         }
-        fs::remove_file(SOCKET)?;
+        fs::remove_file(&socket)?;
     }
-    let listener = UnixListener::bind(SOCKET)?;
-    fs::set_permissions(SOCKET, fs::Permissions::from_mode(0o660))?;
+    let listener = UnixListener::bind(&socket)?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
         let result = peer_from_request(&mut stream).and_then(|(operation, payload, peer)| {
-            dispatch_authenticated(
-                operation,
-                payload,
-                &peer,
-                &host_namespace,
-                &runner_image,
-                &registry,
-                &works,
-                &mut entries,
-            )
+            // Request parsing is bounded. Root launch/recovery readiness is
+            // governed by exact gates and process death, not a 5s cutoff.
+            stream.set_read_timeout(None)?;
+            stream.set_write_timeout(None)?;
+            if operation == b'J' {
+                if !root_launch_admitted(
+                    &peer,
+                    &classify_scope(&peer, &host_namespace, &registry, &works),
+                    &host_namespace,
+                ) {
+                    return Err(io::Error::other("root join outside admission denied"));
+                }
+                let RequestPayload::Join { spec, descriptors } = payload else {
+                    return Err(io::Error::other("invalid root join payload"));
+                };
+                root_join::launch(
+                    spec,
+                    descriptors,
+                    &peer,
+                    &runner_image,
+                    &mut registry,
+                    &mut entries,
+                )
+            } else {
+                dispatch_authenticated(
+                    operation,
+                    payload,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &registry,
+                    &works,
+                    &mut entries,
+                )
+            }
         });
         let response = result.unwrap_or_else(|error| format!("error {error}\n"));
         let _ = stream.write_all(response.as_bytes());

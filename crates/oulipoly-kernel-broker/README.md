@@ -1,111 +1,84 @@
 # Kernel broker source slice (AGE-319)
 
-This Linux-only executable is an **uninstalled, opt-in building block**.
-Runner's `OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1` branch runs before maintenance
-or owner startup. It reads an existing domain through a detached read-only
-snapshot, reserves a root ID, prepares the exact waiting host guardian, and
-binds that guardian, domain, and proposed supervisor ID. The entry reads the
-binding back from the broker while the guardian is live, then exits failure.
-It never opens State or mailbox for writing, elects an owner, starts a driver,
-or releases a root Runner or provider. Ordinary Runner and Bash admission and allocated
-attempt custody remain in force. The paired AGE-319 work is not deployable.
+This Linux-only broker and Runner entry are uninstalled, opt-in source. The
+`OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1` path reads an existing State/mailbox
+domain without mutation, reserves a broker root, pins its exact direct-child
+host guardian, and waits for native owner publication and broker readback before
+releasing the recovery driver. It then requests a single-use root child join
+only for CLI help or offline diagnostics. Provider/recovery CLI, GUI and TTY
+entry refuse before broker reservation because native service identity still
+uses host and namespace-local PIDs interchangeably.
+Ordinary Runner and Bash admission and allocated-attempt custody remain active.
+This source is not a deployable AGE-319 restoration.
 
-## Installed paths and protocol
+## Installed trust roots and protocol
 
-The unit artifact is `packaging/linux/oulipoly-kernel-broker.service`. It is
-source only and must not be enabled before paired integration and privileged
-host validation. The binary requires host root in the initial user and PID
-namespaces, a root-owned installation at
-`/usr/local/libexec/oulipoly/oulipoly-kernel-broker`, a root-owned fixed Runner
-image at `/usr/local/libexec/oulipoly/oulipoly-agent-runner`, the systemd-created
-root-owned `/var/lib/oulipoly-kernel-broker`, and a root-owned runtime directory
-at `/run/oulipoly-kernel-broker`. The unit uses the `oulipoly` group for socket
-access. It is not an installer and creates no group or host configuration.
+The source-only unit is `packaging/linux/oulipoly-kernel-broker.service`. The
+normal binary requires root in the initial user and PID namespaces, the
+root-owned installed broker at `/usr/local/libexec/oulipoly/oulipoly-kernel-broker`,
+a root-owned fixed Runner image at
+`/usr/local/libexec/oulipoly/oulipoly-agent-runner`, and root-owned state and
+runtime directories. It has no installer. `age319-private-broker-fixture`
+permits path overrides only for UID 0 inside a noninitial user namespace.
 
-The Unix stream socket accepts one challenged request per connection:
+Each Unix stream request carries a broker challenge and credentials checked
+against the pinned connector's pidfd, boot ID, starttime and PID namespace.
+`C` classifies; `E` reserves an exact outside entry; `P` prepares its direct
+host child; `G` binds that guardian, native domain, and supervisor incarnation;
+`A` reads back the exact live binding. The old `L` operation stays disabled.
+`J` is the new one-use join: a bounded JSON invocation and exactly five
+`SCM_RIGHTS` descriptors for stdin, stdout, stderr, cwd, and an exit receipt.
+Other operations reject all passed descriptors. A bare UUID or environment
+marker grants nothing.
 
-1. Broker sets `SO_PASSCRED`, reads `SO_PEERCRED`, and pins the connector with
-   pidfd, starttime, boot ID, and PID namespace before sending a 16-byte challenge.
-2. Caller sends one message: 17 bytes for `C` (classify), `E` (reserve entry),
-   or disabled `L`; 37 bytes for `P` (prepare exact guardian PID); 65 bytes for
-   `G` (bind root, domain, and supervisor UUIDs); 33 bytes for `A` (read the
-   exact bound entry). The broker requires per-message
-   `SCM_CREDENTIALS` to match the pinned connector and rejects passed FDs.
-3. Responses include `outside`, `inside`, `uncertain`, `reserved <root_id>`,
-   `prepared <root_id>`, `bound <root_id> <domain_id> <supervisor_id>`,
-   `bound-entry <root_id> <domain_id> <supervisor_id> <guardian_pid>`, and
-   `error <reason>`.
-   Classification is never an authorization grant. `L` always refuses because
-   its former child launch lacked guardian and entry binding.
+`J` authenticates the original entry and exact root/domain/supervisor/guardian
+binding. It validates the help/offline-diagnostics command family, UTF-8
+argv/environment, unique safe environment keys,
+non-TTY regular/pipe/character standard descriptors, a directory cwd, and a
+receipt socket. It rejects provider/recovery and GUI entry, TTY and socket standard streams, dynamic
+loader control variables, and internal authority environment keys. The broker
+executes only its pinned fixed Runner image under the entry's UID/GID/groups,
+with the validated argv and environment; it never accepts a command path.
 
-`E` requires an outside non-system UID in the broker's exact host PID namespace.
-It fsyncs a broker-generated root UUID and pinned entry incarnation. The host
-entry forks a waiting guardian, then `P` pins that exact direct child and fsyncs
-its incarnation before releasing the child gate. `G` accepts only that prepared
-guardian, binds its domain and proposed supervisor ID once, and fsyncs the binding.
-`A` requires the exact still-live reserving entry and guardian; a UUID alone
-cannot read or use it. A sibling, repeated
-bind, dead guardian, wrong entry, or changed incarnation cannot bind. The
-`entries/` records remain as debt across broker restart; there is no timeout
-or automatic retirement. This slice creates **no PID namespace or Runner child**.
-No new `no_new_privs` or seccomp is applied.
+The broker fsyncs `join_consumed` before forking. It creates a root PID
+namespace, fsyncs the identity of its persistent PID1, then permits PID1 to
+fork the Runner. The Runner remains at a pre-exec gate until the broker pins
+that exact child, verifies direct ancestry, namespace, UID/GID and the live
+host guardian, and releases the gate. The child validates its broker socket
+peer, namespace placement, exact durable native owner/root binding and live
+guardian before CLI dispatch. PID1 reaps adopted descendants while the
+original Runner runs, reports its exit through the receipt, and stays live
+afterward. The host guardian stays outside the root namespace. There is no
+arbitrary five-second launch lifetime cutoff and no new `no_new_privs` or
+seccomp on this path.
 
-The proposed supervisor ID is not yet a published completion owner authority.
-The staged guardian exits after readback, leaving conservative debt. A later
-integration must keep that exact guardian alive, bind the actual owner/grant,
-and revalidate the read-only domain under the post-grant writer fence before
-any recovery or migration. The `A` readback does not authorize workload work.
+Entry and root records remain durable debt. Broker restart reattaches only to
+the same live PID1 incarnation; a vanished or changed PID1 remains uncertain.
+A consumed join never replays after an uncertain response, failed fork or
+restart. The current source has no safe retirement or root drain protocol, so
+it conservatively blocks another reservation once a join is consumed.
 
-The challenged request still relies on equality of connect-time
-`SO_PEERCRED` and per-message `SCM_CREDENTIALS`, with the connector pinned by
-pidfd/starttime/namespace. `SCM_CREDENTIALS` is configurable by a sender with
-`CAP_SYS_ADMIN`; equality alone is not a general sender proof. For a socket
-transferred from a host connector into a child PID namespace, Linux resolves an
-explicitly claimed PID in the sender's own PID namespace before reporting it to
-the host receiver. The child cannot name an ancestor-only connector. The
-private adversarial test supplies `CAP_SYS_ADMIN` in a child user namespace,
-tries the outside PID, observes `ESRCH`, and then verifies that a real send is
-rejected by the broker's production request reader. This is a checked exclusion
-for that specific transfer path, not a host-root sudo test or a general proof
-for arbitrary IPC provenance. A host namespace process with host-root authority
-remains outside this trust boundary and must be addressed by installation
-policy and an authenticated host guardian.
+The existing `works/` registry can classify exact nested work namespaces, but
+there is no guardian-authorized socket operation that launches accepted work.
+Allocated attempts retain their existing `no_new_privs`/seccomp. The broker's
+`SO_PEERCRED` plus `SCM_CREDENTIALS` comparison excludes the private tested
+transferred-socket child PID namespace case; installation still needs a
+privileged host-path security review. The private fixture is a source/protocol
+test, not a host-root sudo or deployed continuity proof.
 
-The root registry uses one fsynced file per root and reattaches only to the
-same boot, PID starttime, namespace inode, and live namespace PID1. A missing
-or changed PID1 is retained as unknown debt. Any debt makes classification
-`uncertain` and blocks new reservations. There is deliberately no automatic
-retirement, timeout, or deletion of a root record.
+## Remaining interfaces
 
-The source also has a `works/` registry under that state directory. The broker
-loads it before serving requests. Its in-process `insert_prepared` API requires
-a live, directly nested namespace PID1 and binds a separate broker work
-incarnation to the exact recorded root incarnation, accepted work ID, and
-optional direct parent work incarnation. Trusted broker code must call it
-**after** positive accepted-work authorization by the guardian and **before**
-releasing a gated worker. The current service has no such call site or socket
-operation: it does not create a work namespace or accept work. A peer inside a
-registered work, including an adopted descendant, classifies to the nearest
-registered work namespace. Sibling namespaces remain separate. Vanished work
-PID1s and failed record writes remain uncertainty; there is no drain receipt
-or retirement claim. The service rejects and closes unsolicited passed FDs on
-challenged requests.
-
-## Required next integration
-
-- Bind the published `RootAuthorityGrant` to the broker record including
-  supervisor authority and exact entry/guardian incarnation. Create a gated
-  root PID1 and launch a Runner only after an authenticated one-use join.
-  Validate CLI arguments, TTY descriptors, and GUI environment before release.
-  The current host branch stops before dispatch.
-- Add a broker-authenticated accepted-work handoff from the guardian, then
-  broker-controlled nested PID namespace launch and a PID1/reaper for each
-  accepted work or allocated attempt. Call `insert_prepared` while the worker
-  remains gated. Add physical drain receipts and reconciliation before any
-  record can retire. A bare work opcode or a claimed work ID is insufficient.
-- Migrate shared PID fields, sidecars, signals, and SQLite readers to explicit
-  host/local PID domains. Preserve source/ACK/physical drain distinctions.
-- Replace allocated-attempt `no_new_privs`/seccomp custody only together with
-  per-attempt physical drain proof. Test ordinary host-root sudo/setuid, service
-  restart, long-lived work, and installed host-root behavior in an authorized
-  private host fixture. Unprivileged tests do not prove these outcomes.
+- Migrate native completion and provider custody to explicit host/local PID
+  domains before admitting service-requiring CLI. The private `--model` probe
+  reached the child but failed in current native identity handling; it now
+  refuses before reservation. Add a validated TTY and GUI handoff or keep
+  those modes refusing. Current supported entry is help/offline diagnostics.
+- Add a broker-authenticated positive accepted-work grant from the host
+  guardian, a one-use nested PID namespace/PID1 launch, physical drain and
+  settlement receipts. A work ID or `inside root` classification cannot grant
+  execution. Replace allocated-attempt NNP/seccomp only with that custody.
+- Reconcile host/local PID fields, adopted descendants, result ACK versus
+  physical drain, and registry retirement across broker and WSL restart.
+- Reconcile this branch's sidecar v24 with AGE-353's separate v24 migration
+  before deployment. Run authorized privileged host sudo and paired Bash
+  acceptance; the private userns fixture does not establish either.

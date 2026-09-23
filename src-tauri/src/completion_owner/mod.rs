@@ -20,6 +20,7 @@ pub(crate) mod test_support;
 pub(crate) const ENDPOINT_ENV: &str = "OULIPOLY_COMPLETION_ENDPOINT";
 pub(crate) const ROOT_AUTHORITY_ENV: &str = "OULIPOLY_ROOT_AUTHORITY_V1";
 pub(crate) const ORIGINAL_WORK_REQUIRED_ENV: &str = "OULIPOLY_ORIGINAL_WORK_REQUIRED_V1";
+pub(crate) const EXPECTED_KERNEL_ROOT_ENV: &str = "OULIPOLY_KERNEL_EXPECTED_ROOT_V1";
 
 #[cfg(target_os = "linux")]
 pub(crate) struct PinnedGuardian {

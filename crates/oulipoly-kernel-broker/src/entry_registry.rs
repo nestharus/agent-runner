@@ -51,6 +51,10 @@ pub struct EntryRecord {
     #[serde(default)]
     pub supervisor_authority_id: Option<String>,
     pub guardian: Option<ProcessStamp>,
+    /// Set durably before attempting a root fork. An uncertain response or
+    /// broker restart can never issue a second child for this entry.
+    #[serde(default)]
+    pub join_consumed: bool,
 }
 
 pub struct EntryRegistry {
@@ -77,6 +81,7 @@ impl EntryRegistry {
                 || record.domain_id.is_some() != record.guardian.is_some()
                 || record.supervisor_authority_id.is_some() != record.guardian.is_some()
                 || record.guardian.is_some() && record.prepared_guardian != record.guardian
+                || record.join_consumed && record.guardian.is_none()
                 || record
                     .domain_id
                     .as_ref()
@@ -102,6 +107,7 @@ impl EntryRegistry {
 
     pub fn reserve(&mut self, uid: u32, entry: &PinnedProcess) -> io::Result<String> {
         if self.has_debt()
+            || self.has_unsettled_join()
             || self
                 .records
                 .iter()
@@ -122,6 +128,7 @@ impl EntryRegistry {
             domain_id: None,
             supervisor_authority_id: None,
             guardian: None,
+            join_consumed: false,
         };
         let path = self.directory.join(format!("{root_id}.json"));
         let result = (|| {
@@ -244,6 +251,36 @@ impl EntryRegistry {
         self.replace(index, prepared, entry, guardian)
     }
 
+    pub fn consume_join(
+        &mut self,
+        root_id: &str,
+        domain_id: &str,
+        supervisor_id: &str,
+        guardian_pid: i32,
+        uid: u32,
+        entry: &PinnedProcess,
+    ) -> io::Result<()> {
+        let current = self.bound_entry(root_id, uid, entry)?;
+        if current.join_consumed
+            || current.domain_id.as_deref() != Some(domain_id)
+            || current.supervisor_authority_id.as_deref() != Some(supervisor_id)
+            || current.guardian.as_ref().map(|p| p.host_pid) != Some(guardian_pid)
+        {
+            return Err(io::Error::other(
+                "join grant already consumed or mismatched",
+            ));
+        }
+        let index = self
+            .records
+            .iter()
+            .position(|r| r.root_id == root_id)
+            .unwrap();
+        let guardian = PinnedProcess::open(guardian_pid)?;
+        let mut consumed = current.clone();
+        consumed.join_consumed = true;
+        self.replace(index, consumed, entry, &guardian)
+    }
+
     fn replace(
         &mut self,
         index: usize,
@@ -296,6 +333,10 @@ impl EntryRegistry {
                             != Some(true)
                     })
             })
+    }
+
+    pub fn has_unsettled_join(&self) -> bool {
+        self.records.iter().any(|record| record.join_consumed)
     }
 }
 
