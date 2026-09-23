@@ -1874,6 +1874,39 @@ pub struct RecentFailuresReport {
     pub coalesced: CoalescedReport,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonlPageCursor {
+    pub directory_device: u64,
+    pub directory_inode: u64,
+    pub directory_mtime_seconds: i64,
+    pub directory_mtime_nanos: i64,
+    pub directory_ctime_seconds: i64,
+    pub directory_ctime_nanos: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonlInspectionPage {
+    pub report: InspectionReport,
+    pub next_cursor: Option<JsonlPageCursor>,
+    pub coverage_complete: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn directory_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+unsafe fn directory_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
 pub struct FlightRecorderReader {
     root: PathBuf,
 }
@@ -1891,6 +1924,346 @@ impl FlightRecorderReader {
             MAX_INSPECTION_SHARDS,
             MAX_INSPECTION_BYTES,
         )
+    }
+
+    /// Read one bounded directory page. On Linux/glibc, seekdir uses the
+    /// filesystem cookie as an lseek position, which can be restored on a
+    /// freshly opened stream for an unchanged directory. POSIX only promises
+    /// same-stream cookies; other platforms return explicit partial coverage.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub fn inspect_page(&self, cursor: Option<&JsonlPageCursor>) -> JsonlInspectionPage {
+        use std::ffi::{CStr, CString};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let mut report = InspectionReport::default();
+        let metadata = match fs::metadata(&self.root) {
+            Ok(value) => value,
+            Err(_) => {
+                report.issues.push(InspectionIssue {
+                    source: None,
+                    kind: "missing_or_unreadable_root".to_string(),
+                    message: "diagnostic recorder root is unavailable".to_string(),
+                });
+                return JsonlInspectionPage {
+                    report,
+                    next_cursor: None,
+                    coverage_complete: false,
+                };
+            }
+        };
+        let identity = (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        );
+        read_cleanup_status(&self.root, &mut report);
+        let changed = cursor.is_some_and(|previous| {
+            (
+                previous.directory_device,
+                previous.directory_inode,
+                previous.directory_mtime_seconds,
+                previous.directory_mtime_nanos,
+                previous.directory_ctime_seconds,
+                previous.directory_ctime_nanos,
+            ) != identity
+        });
+        if changed {
+            report.issues.push(InspectionIssue {
+                source: None,
+                kind: "directory_changed_during_continuation".to_string(),
+                message: "directory changed since the preceding page; directory cursor invalidated"
+                    .to_string(),
+            });
+            return JsonlInspectionPage {
+                report,
+                next_cursor: None,
+                coverage_complete: false,
+            };
+        }
+        let Ok(path) = CString::new(self.root.as_os_str().as_bytes()) else {
+            report.issues.push(InspectionIssue {
+                source: None,
+                kind: "invalid_root".to_string(),
+                message: "diagnostic recorder root contains a NUL byte".to_string(),
+            });
+            return JsonlInspectionPage {
+                report,
+                next_cursor: None,
+                coverage_complete: false,
+            };
+        };
+        // SAFETY: path is NUL terminated; Dir closes the owned handle.
+        let dir = unsafe { libc::opendir(path.as_ptr()) };
+        if dir.is_null() {
+            report.issues.push(InspectionIssue {
+                source: None,
+                kind: "unreadable_root".to_string(),
+                message: "diagnostic recorder root could not be opened".to_string(),
+            });
+            return JsonlInspectionPage {
+                report,
+                next_cursor: None,
+                coverage_complete: false,
+            };
+        }
+        struct Dir(*mut libc::DIR);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+        let dir = Dir(dir);
+        if let Some(previous) = cursor {
+            // c_long and off_t can be narrower than i64 on 32-bit Linux.
+            #[allow(clippy::unnecessary_cast)]
+            let cookie = previous.offset as libc::c_long;
+            #[allow(clippy::unnecessary_cast)]
+            let round_trip = cookie as i64;
+            if round_trip != previous.offset {
+                report.issues.push(InspectionIssue {
+                    source: None,
+                    kind: "invalid_cursor".to_string(),
+                    message: "directory offset does not fit this platform".to_string(),
+                });
+                return JsonlInspectionPage {
+                    report,
+                    next_cursor: None,
+                    coverage_complete: false,
+                };
+            };
+            if cookie < 0 {
+                report.issues.push(InspectionIssue {
+                    source: None,
+                    kind: "invalid_cursor".to_string(),
+                    message: "negative directory offset in continuation".to_string(),
+                });
+                return JsonlInspectionPage {
+                    report,
+                    next_cursor: None,
+                    coverage_complete: false,
+                };
+            }
+            // SAFETY: dir remains open and offset was returned by telldir.
+            unsafe {
+                libc::seekdir(dir.0, cookie);
+            }
+            // glibc seekdir discards lseek errors. Confirm the kernel accepted
+            // the cookie before reading from this reopened stream.
+            let actual = unsafe { libc::lseek(libc::dirfd(dir.0), 0, libc::SEEK_CUR) };
+            #[allow(clippy::unnecessary_cast)]
+            let actual_offset = actual as i64;
+            if actual < 0 || actual_offset != previous.offset {
+                report.issues.push(InspectionIssue {
+                    source: None,
+                    kind: "directory_cursor_unavailable".to_string(),
+                    message: "saved directory offset could not be restored".to_string(),
+                });
+                return JsonlInspectionPage {
+                    report,
+                    next_cursor: None,
+                    coverage_complete: false,
+                };
+            }
+        }
+        let mut candidates = Vec::new();
+        let mut selected_bytes = 0_u64;
+        let mut next_offset = None;
+        loop {
+            // SAFETY: the directory handle remains live for this loop.
+            let before = unsafe { libc::telldir(dir.0) };
+            if before < 0 {
+                report.issues.push(InspectionIssue {
+                    source: None,
+                    kind: "directory_cursor_unavailable".to_string(),
+                    message: "directory continuation offset could not be obtained".to_string(),
+                });
+                break;
+            }
+            // SAFETY: readdir returns a pointer valid until the next call.
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
+            unsafe {
+                *directory_errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(dir.0) };
+            if entry.is_null() {
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd"
+                ))]
+                if unsafe { *directory_errno_location() } != 0 {
+                    report.issues.push(InspectionIssue {
+                        source: None,
+                        kind: "directory_read_error".to_string(),
+                        message: "diagnostic recorder directory read failed".to_string(),
+                    });
+                }
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd"
+                )))]
+                report.issues.push(InspectionIssue {
+                    source: None,
+                    kind: "directory_read_status_unknown".to_string(),
+                    message: "directory EOF could not be distinguished from a read error"
+                        .to_string(),
+                });
+                break;
+            }
+            // SAFETY: d_name is NUL terminated by readdir.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if report.coverage.directory_entries_examined == MAX_INSPECTION_DIRECTORY_ENTRIES {
+                next_offset = Some(before);
+                report.coverage.directory_limit_reached = true;
+                break;
+            }
+            report.coverage.directory_entries_examined += 1;
+            if !name.starts_with(b"flight-") || !name.windows(6).any(|part| part == b".jsonl") {
+                continue;
+            }
+            let path = self.root.join(std::ffi::OsStr::from_bytes(name));
+            let metadata = match fs::metadata(&path) {
+                Ok(value) => value,
+                Err(_) => {
+                    report.issues.push(InspectionIssue {
+                        source: Some(source(&path, 1)),
+                        kind: "unreadable_shard".to_string(),
+                        message: "shard metadata could not be read".to_string(),
+                    });
+                    continue;
+                }
+            };
+            if candidates.len() == MAX_INSPECTION_SHARDS
+                || (metadata.len() > MAX_INSPECTION_BYTES - selected_bytes
+                    && !candidates.is_empty())
+            {
+                next_offset = Some(before);
+                break;
+            }
+            report.coverage.files_discovered += 1;
+            if metadata.len() > MAX_INSPECTION_BYTES {
+                report.coverage.files_skipped += 1;
+                report.coverage.bytes_skipped += metadata.len();
+                report.issues.push(InspectionIssue {
+                    source: Some(source(&path, 1)),
+                    kind: "inspection_byte_limit".to_string(),
+                    message: "one shard exceeds the per-page byte bound".to_string(),
+                });
+                continue;
+            }
+            if let Some(identity) = shard_file_identity(&metadata) {
+                selected_bytes += metadata.len();
+                candidates.push(ShardCandidate {
+                    path,
+                    bytes: metadata.len(),
+                    modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    identity,
+                });
+            } else {
+                report.issues.push(InspectionIssue {
+                    source: Some(source(&path, 1)),
+                    kind: "shard_identity_unavailable".to_string(),
+                    message: "shard identity could not be established".to_string(),
+                });
+            }
+        }
+        for candidate in candidates {
+            report.coverage.files_seen += 1;
+            read_shard(
+                &candidate,
+                MAX_INSPECTION_BYTES - report.coverage.bytes_read,
+                &mut report,
+            );
+        }
+        report.coverage.records_seen = report.events.len();
+        report.events.sort_by(|left, right| {
+            left.event
+                .recorded_at
+                .cmp(&right.event.recorded_at)
+                .then_with(|| left.event.event_id.cmp(&right.event.event_id))
+        });
+        report.coverage.first_recorded_at = report
+            .events
+            .first()
+            .map(|record| record.event.recorded_at.clone());
+        report.coverage.last_recorded_at = report
+            .events
+            .last()
+            .map(|record| record.event.recorded_at.clone());
+        // c_long is i32 on 32-bit Unix, where this cast widens the telldir offset.
+        #[allow(clippy::unnecessary_cast)]
+        let mut next_cursor = next_offset.map(|offset| JsonlPageCursor {
+            directory_device: identity.0,
+            directory_inode: identity.1,
+            directory_mtime_seconds: identity.2,
+            directory_mtime_nanos: identity.3,
+            directory_ctime_seconds: identity.4,
+            directory_ctime_nanos: identity.5,
+            offset: offset as i64,
+        });
+        let directory_stable = fs::metadata(&self.root).is_ok_and(|after| {
+            (
+                after.dev(),
+                after.ino(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+            ) == identity
+        });
+        if !directory_stable {
+            report.issues.push(InspectionIssue {
+                source: None,
+                kind: "directory_changed_during_page".to_string(),
+                message: "directory changed while the bounded page was read".to_string(),
+            });
+            next_cursor = None;
+        }
+        let coverage_complete =
+            next_cursor.is_none() && cursor.is_none() && report.issues.is_empty();
+        JsonlInspectionPage {
+            report,
+            next_cursor,
+            coverage_complete,
+        }
+    }
+
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    pub fn inspect_page(&self, _cursor: Option<&JsonlPageCursor>) -> JsonlInspectionPage {
+        let mut report = self.inspect();
+        report.issues.push(InspectionIssue {
+            source: None,
+            kind: "pagination_unavailable".to_string(),
+            message: "bounded JSONL continuation is unavailable on this platform".to_string(),
+        });
+        JsonlInspectionPage {
+            report,
+            next_cursor: None,
+            coverage_complete: false,
+        }
     }
 
     fn inspect_with_limits(
@@ -2509,6 +2882,15 @@ fn parse_flight_record(line: &[u8]) -> Result<Option<DiagnosticEvent>, String> {
         correlations: payload.diagnostic_correlations,
         sqlite,
     }))
+}
+
+/// Decode a validated normal-store envelope through the same projection used
+/// for JSONL fallback envelopes.
+pub fn diagnostic_event_from_envelope(
+    envelope: &crate::event_store::EventEnvelopeV1,
+) -> Result<Option<DiagnosticEvent>, String> {
+    let bytes = serde_json::to_vec(envelope).map_err(|error| error.to_string())?;
+    parse_flight_record(&bytes)
 }
 
 fn source(path: &Path, line: u64) -> SourceCoordinate {
@@ -3411,7 +3793,7 @@ fn gap_stage_index(stage: &str) -> u32 {
         .map_or(63, |index| index as u32)
 }
 
-fn failure_discriminator(event: &DiagnosticEvent) -> String {
+pub fn failure_discriminator(event: &DiagnosticEvent) -> String {
     let (kind, material) = if let Some(sqlite) = event.observation.sqlite_failure.as_ref() {
         (
             "sqlite",
@@ -5218,5 +5600,103 @@ mod tests {
         let released_report = sweeper.cleanup_stale_shards();
         assert!(!foreign.exists());
         assert!(released_report.retired_shards >= 1, "{released_report:?}");
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn paged_jsonl_discovery_reaches_failure_after_more_than_1024_entries() {
+        let seed = tempfile::tempdir().unwrap();
+        let writer = recorder(seed.path(), 1024 * 1024, 4);
+        let target_id = failed_span(&writer, "paged.failure");
+        drop(writer);
+        let shard = fs::read_dir(seed.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with(".jsonl")
+            })
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..1030 {
+            fs::write(
+                root.path().join(format!("flight-decoy-{index:04}.jsonl")),
+                b"",
+            )
+            .unwrap();
+        }
+        fs::copy(&shard, root.path().join("flight-target.jsonl")).unwrap();
+        let independent_count = fs::read_dir(root.path()).unwrap().count();
+        assert_eq!(independent_count, 1031);
+
+        let reader = FlightRecorderReader::new(root.path());
+        let mut cursor = None;
+        let mut pages = 0;
+        let mut files_seen = 0;
+        let mut found = false;
+        loop {
+            let page = reader.inspect_page(cursor.as_ref());
+            pages += 1;
+            assert!(
+                page.report.coverage.directory_entries_examined <= MAX_INSPECTION_DIRECTORY_ENTRIES
+            );
+            assert!(page.report.coverage.files_seen <= MAX_INSPECTION_SHARDS);
+            files_seen += page.report.coverage.files_seen;
+            found |= page.report.events.iter().any(|record| {
+                record.event.diagnostic_id == target_id
+                    && record.event.phase == DiagnosticPhase::Failed
+            });
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+            assert!(pages < 16, "cursor did not advance");
+        }
+        assert!(pages > 1);
+        assert_eq!(files_seen, independent_count);
+        assert!(found, "known failure was omitted from all bounded pages");
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn changed_jsonl_directory_invalidates_saved_cookie_without_reading_from_it() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..1025 {
+            fs::write(
+                root.path().join(format!("flight-decoy-{index:04}.jsonl")),
+                b"",
+            )
+            .unwrap();
+        }
+        let reader = FlightRecorderReader::new(root.path());
+        let first = reader.inspect_page(None);
+        let cookie = first
+            .next_cursor
+            .expect("directory entry cap supplies cursor");
+        fs::write(root.path().join("flight-new.jsonl"), b"").unwrap();
+        fs::File::open(root.path())
+            .unwrap()
+            .set_modified(
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_secs(
+                        u64::try_from(cookie.directory_mtime_seconds).unwrap() + 2,
+                    ),
+            )
+            .unwrap();
+        let changed = reader.inspect_page(Some(&cookie));
+        assert!(changed.next_cursor.is_none());
+        assert!(!changed.coverage_complete);
+        assert!(changed.report.events.is_empty());
+        assert_eq!(changed.report.coverage.directory_entries_examined, 0);
+        assert!(
+            changed
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == "directory_changed_during_continuation")
+        );
     }
 }

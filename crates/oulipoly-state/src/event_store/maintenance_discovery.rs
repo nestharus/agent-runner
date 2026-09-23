@@ -234,6 +234,87 @@ pub(crate) struct DiscoveryBatch {
     pub(crate) entries_examined: usize,
 }
 
+/// Volatile, read-only continuation through the three evidence classes. A
+/// changed trie can duplicate or omit entries; callers must not treat a page
+/// as a durable catalog snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceDiscoveryCursor {
+    class: u8,
+    after_node: Option<String>,
+}
+
+pub(crate) fn read_evidence_page(
+    root: &Path,
+    previous: &EvidenceDiscoveryCursor,
+    max_nodes: usize,
+    max_entries: usize,
+) -> Result<(DiscoveryBatch, Option<EvidenceDiscoveryCursor>), String> {
+    if max_nodes == 0 || max_entries == 0 || previous.class > 2 {
+        return Err("invalid evidence discovery cursor or limits".to_string());
+    }
+    let mut nodes = 0;
+    let mut examined = 0;
+    let mut entries = Vec::new();
+    let mut issues = Vec::new();
+    for class_index in previous.class..=2 {
+        let class = match class_index {
+            0 => DiscoveryClass::Pending,
+            1 => DiscoveryClass::Active,
+            _ => DiscoveryClass::Archive,
+        };
+        let after = (class_index == previous.class)
+            .then_some(previous.after_node.as_deref())
+            .flatten();
+        let batch = walk_class(
+            root,
+            class,
+            after,
+            max_nodes - nodes,
+            max_entries - examined,
+        )?;
+        nodes += batch.nodes_examined;
+        examined += batch.entries.len();
+        issues.extend(batch.issues);
+        entries.extend(batch.entries.into_iter().filter(|entry| {
+            class != DiscoveryClass::Archive
+                || entry.issue.is_some()
+                || entry
+                    .record
+                    .as_ref()
+                    .is_none_or(|record| record.phase == DiscoveryPhase::PreservedDeadHead)
+        }));
+        if batch.more || nodes == max_nodes || examined == max_entries {
+            let next = EvidenceDiscoveryCursor {
+                class: class_index,
+                after_node: batch.last_node.or_else(|| after.map(str::to_string)),
+            };
+            return Ok((
+                DiscoveryBatch {
+                    entries_examined: examined,
+                    entries,
+                    issues,
+                    cursor: DiscoveryCursor::default(),
+                    more: true,
+                    nodes_examined: nodes,
+                },
+                Some(next),
+            ));
+        }
+    }
+    Ok((
+        DiscoveryBatch {
+            entries_examined: examined,
+            entries,
+            issues,
+            cursor: DiscoveryCursor::default(),
+            more: false,
+            nodes_examined: nodes,
+        },
+        None,
+    ))
+}
+
 /// Publish the exact scheduling intent before any staging directory is created.
 /// Failure is safe to return because no generation-side effect has begun.
 pub(crate) fn publish_generation_intent(
@@ -536,6 +617,7 @@ pub(crate) fn read_batch(
 /// This is deliberately separate from [`read_batch`]: detached maintenance
 /// must not reacquire terminal archived work, while bounded evidence discovery
 /// must continue to account for preserved selected heads.
+#[cfg(test)]
 pub(crate) fn read_evidence_batch(
     root: &Path,
     max_nodes: usize,
@@ -1019,6 +1101,172 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn evidence_pages_reach_generation_beyond_256_identity_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 1_u16..=300 {
+            let mut bytes = [0_u8; 16];
+            bytes[..2].copy_from_slice(&index.to_be_bytes());
+            register_legacy_generation(
+                root.path(),
+                WriterInstanceId::from_bytes(bytes),
+                GenerationId::from_bytes([7; 16]),
+                DiscoveryPhase::Prepared,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        use crate::event_store::{
+            EventCorrelations, EventEnvelopeV1, EventFamily, EventFilter, EventId, EventKind,
+            EventWriterConfig, NativeProcessIdentity, NewEventV1, PayloadNormalizationPolicy,
+            ProcessEventWriter, ProcessInstanceId, ProducerIdentity, ReadLimits, TraceId,
+            read_generation,
+        };
+        let target_writer = WriterInstanceId::from_bytes([255; 16]);
+        let process = ProcessInstanceId::from_bytes([254; 16]);
+        let producer = ProducerIdentity {
+            writer_instance_id: target_writer,
+            process_instance_id: process,
+            process_root_id: process,
+            parent_process_instance_id: None,
+            supervisor_authority_id: None,
+            native_process: Some(NativeProcessIdentity {
+                os_pid: 3000,
+                os_boot_id_sha256: Digest32::from_bytes([3; 32]),
+                os_pid_starttime_ticks: 1,
+            }),
+        };
+        let diagnostic_id = TraceId::from_bytes([22; 16]);
+        let known_event = EventId::from_bytes([23; 16]);
+        let now = chrono::Utc::now().timestamp_micros();
+        let event = EventEnvelopeV1::normalize(
+            NewEventV1 {
+                event_id: known_event,
+                family: EventFamily::Diagnostic,
+                kind: EventKind::registered("diagnostic.observation").unwrap(),
+                recorded_at_unix_micros: now,
+                producer_sequence: 1,
+                producer: producer.clone(),
+                correlations: EventCorrelations {
+                    trace_id: Some(diagnostic_id),
+                    span_id: Some(crate::event_store::SpanId::from_bytes([24; 16])),
+                    ..EventCorrelations::default()
+                },
+                payload: serde_json::json!({
+                    "operation": "fixture.beyond_prefix",
+                    "resource": "state",
+                    "lifecycle_phase": null,
+                    "phase": "failed",
+                    "elapsed_micros": 1,
+                    "observation": serde_json::to_value(
+                        crate::diagnostic_recorder::PhaseObservation::started_unknown()
+                    ).unwrap(),
+                    "diagnostic_correlations": {},
+                    "database_identity": null,
+                }),
+                legacy_provenance: None,
+                retry_of_generation_id: None,
+            },
+            &PayloadNormalizationPolicy::registered(&[
+                "operation",
+                "resource",
+                "lifecycle_phase",
+                "phase",
+                "elapsed_micros",
+                "observation",
+                "diagnostic_correlations",
+                "database_identity",
+            ])
+            .unwrap(),
+            now,
+        )
+        .unwrap();
+        let writer =
+            ProcessEventWriter::start(EventWriterConfig::native(root.path(), producer)).unwrap();
+        writer.append(event).unwrap();
+        let mut cursor = EvidenceDiscoveryCursor::default();
+        let mut seen = std::collections::HashSet::new();
+        let mut pages = 0;
+        let mut found_failure = false;
+        loop {
+            let (batch, next) = read_evidence_page(root.path(), &cursor, 16_384, 256).unwrap();
+            pages += 1;
+            assert!(batch.entries_examined <= 256);
+            for entry in batch.entries {
+                assert!(
+                    seen.insert(entry.writer),
+                    "duplicate generation across pages"
+                );
+            }
+            let discovered = crate::event_store::discover_generation_read_targets_page(
+                root.path(),
+                &cursor,
+                16_384,
+                256,
+            )
+            .unwrap();
+            if let Some(target) = discovered
+                .targets
+                .iter()
+                .find(|target| target.writer_instance_id == target_writer)
+            {
+                assert!(
+                    pages > 1,
+                    "known failure must be beyond the first partition prefix"
+                );
+                let read = read_generation(
+                    target,
+                    &EventFilter {
+                        family: Some(EventFamily::Diagnostic),
+                        kind: Some(EventKind::registered("diagnostic.observation").unwrap()),
+                        trace_id: Some(diagnostic_id),
+                        ..EventFilter::default()
+                    },
+                    &ReadLimits::new(1, 10, 1024 * 1024).unwrap(),
+                );
+                assert!(read.coverage_complete, "{:?}", read.issues);
+                assert!(
+                    read.records
+                        .iter()
+                        .any(|record| record.envelope.event_id == known_event)
+                );
+                found_failure = true;
+            }
+            match next {
+                Some(value) => cursor = value,
+                None => break,
+            }
+            assert!(pages < 8, "cursor did not advance");
+        }
+        assert!(pages > 1);
+        assert_eq!(seen.len(), 301);
+        let mut last = [0_u8; 16];
+        last[..2].copy_from_slice(&300_u16.to_be_bytes());
+        assert!(seen.contains(&WriterInstanceId::from_bytes(last)));
+        assert!(found_failure);
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn evidence_page_cursor_advances_when_node_budget_precedes_first_leaf() {
+        let root = tempfile::tempdir().unwrap();
+        record(root.path(), 1, 11);
+        record(root.path(), 2, 12);
+        let mut cursor = EvidenceDiscoveryCursor::default();
+        let mut found = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let (batch, next) = read_evidence_page(root.path(), &cursor, 1, 1).unwrap();
+            assert!(batch.nodes_examined <= 1);
+            found.extend(batch.entries.into_iter().map(|entry| entry.writer));
+            match next {
+                Some(value) => cursor = value,
+                None => break,
+            }
+        }
+        assert_eq!(found.len(), 2);
     }
 
     #[cfg(unix)]

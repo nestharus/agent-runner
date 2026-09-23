@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+pub use super::maintenance_discovery::EvidenceDiscoveryCursor;
+
 const EVENT_SELECT_COLUMNS: &str = "local_sequence, event_id, schema_version, family, kind,
     recorded_at_unix_micros, ingested_at_unix_micros, producer_sequence,
     writer_instance_id, process_instance_id, process_root_id,
@@ -104,6 +106,9 @@ pub struct BoundedDiscovery {
     pub nodes_examined: usize,
     pub entries_examined: usize,
     pub more: bool,
+    /// Present when this bounded page has a successor. It is a volatile
+    /// traversal hint, not a stable snapshot or completeness proof.
+    pub next_cursor: Option<EvidenceDiscoveryCursor>,
 }
 
 pub fn discover_generation_read_targets(
@@ -111,8 +116,23 @@ pub fn discover_generation_read_targets(
     max_nodes: usize,
     max_entries: usize,
 ) -> Result<BoundedDiscovery, String> {
-    let batch = super::maintenance_discovery::read_evidence_batch(
+    discover_generation_read_targets_page(
         event_store_root,
+        &EvidenceDiscoveryCursor::default(),
+        max_nodes,
+        max_entries,
+    )
+}
+
+pub fn discover_generation_read_targets_page(
+    event_store_root: &Path,
+    cursor: &EvidenceDiscoveryCursor,
+    max_nodes: usize,
+    max_entries: usize,
+) -> Result<BoundedDiscovery, String> {
+    let (batch, next_cursor) = super::maintenance_discovery::read_evidence_page(
+        event_store_root,
+        cursor,
         max_nodes,
         max_entries,
     )?;
@@ -193,6 +213,7 @@ pub fn discover_generation_read_targets(
         nodes_examined: batch.nodes_examined,
         entries_examined,
         more: batch.more,
+        next_cursor,
     })
 }
 
@@ -278,6 +299,21 @@ pub struct BoundedRead {
     pub discovery_watermark: Option<Digest32>,
 }
 
+/// A diagnostic-only physical generation slice. The sequence belongs to this
+/// exact generation and must not be applied to another writer or generation.
+pub struct GenerationDiagnosticPage {
+    pub read: BoundedRead,
+    pub next_local_sequence: Option<i64>,
+    pub rows_examined: usize,
+}
+
+#[derive(Default)]
+struct SequencePageProgress {
+    after_local_sequence: Option<i64>,
+    next_local_sequence: Option<i64>,
+    rows_examined: usize,
+}
+
 impl BoundedRead {
     fn empty() -> Self {
         Self {
@@ -312,7 +348,40 @@ pub fn read_generation(
         &DiscoveryCoverage::ExactAddress,
         filter,
         limits,
+        true,
     )
+}
+
+/// Read one bounded diagnostic slice in local-sequence order. This uses the
+/// normal generation lease, manifest, metadata and row digest checks. A later
+/// call gets a new SQLite snapshot, so mutation between calls is not hidden.
+pub fn read_generation_diagnostic_page(
+    target: &GenerationReadTarget,
+    filter: &EventFilter,
+    limits: &ReadLimits,
+    after_local_sequence: Option<i64>,
+) -> GenerationDiagnosticPage {
+    let mut read = BoundedRead::empty();
+    read.partitions_examined = 1;
+    let mut progress = SequencePageProgress {
+        after_local_sequence,
+        ..SequencePageProgress::default()
+    };
+    read_one(
+        target,
+        filter,
+        limits.max_records,
+        limits.max_payload_bytes,
+        &mut read,
+        Some(&mut progress),
+    );
+    read.records_returned = read.records.len();
+    read.payload_bytes_returned = read.payload_bytes_examined;
+    GenerationDiagnosticPage {
+        read,
+        next_local_sequence: progress.next_local_sequence,
+        rows_examined: progress.rows_examined,
+    }
 }
 
 /// Read independent per-generation snapshots under explicit aggregate bounds.
@@ -324,7 +393,7 @@ pub fn read_generations(
     filter: &EventFilter,
     limits: &ReadLimits,
 ) -> BoundedRead {
-    read_with_coverage(targets, &DiscoveryCoverage::Unknown, filter, limits)
+    read_with_coverage(targets, &DiscoveryCoverage::Unknown, filter, limits, true)
 }
 
 pub fn read_discovered_generations(
@@ -333,7 +402,18 @@ pub fn read_discovered_generations(
     filter: &EventFilter,
     limits: &ReadLimits,
 ) -> BoundedRead {
-    read_with_coverage(targets, discovery, filter, limits)
+    read_with_coverage(targets, discovery, filter, limits, true)
+}
+
+/// Keep physical copies so a caller can retain every origin and report
+/// conflicting identities without discarding either record.
+pub fn read_discovered_generations_preserving_duplicates(
+    targets: &[GenerationReadTarget],
+    discovery: &DiscoveryCoverage,
+    filter: &EventFilter,
+    limits: &ReadLimits,
+) -> BoundedRead {
+    read_with_coverage(targets, discovery, filter, limits, false)
 }
 
 fn read_with_coverage(
@@ -341,6 +421,7 @@ fn read_with_coverage(
     discovery: &DiscoveryCoverage,
     filter: &EventFilter,
     limits: &ReadLimits,
+    deduplicate: bool,
 ) -> BoundedRead {
     let mut result = BoundedRead::empty();
     match discovery {
@@ -433,7 +514,14 @@ fn read_with_coverage(
         }
         let record_budget = limits.max_records - result.records.len();
         let byte_budget = limits.max_payload_bytes - result.payload_bytes_examined;
-        read_one(target, filter, record_budget, byte_budget, &mut result);
+        read_one(
+            target,
+            filter,
+            record_budget,
+            byte_budget,
+            &mut result,
+            None,
+        );
     }
 
     result.records.sort_by(|left, right| {
@@ -446,37 +534,39 @@ fn read_with_coverage(
                 right.envelope.event_id,
             ))
     });
-    let mut identities = HashMap::<EventId, (Digest32, usize)>::new();
-    let mut deduplicated = Vec::with_capacity(result.records.len());
-    let records = std::mem::take(&mut result.records);
-    for record in records {
-        if let Some((digest, _)) = identities.get(&record.envelope.event_id) {
-            let equal = *digest == record.immutable_sha256;
-            result.issue(CoverageIssue {
-                kind: if equal {
-                    CoverageIssueKind::DuplicateLogicalEvent
-                } else {
-                    CoverageIssueKind::IdentityConflict
-                },
-                writer_instance_id: Some(record.envelope.producer.writer_instance_id),
-                generation_id: Some(record.generation_id),
-                event_id: Some(record.envelope.event_id),
-                detail: if equal {
-                    "equal logical event appeared in more than one partition".to_string()
-                } else {
-                    "event ID appeared with unequal immutable identities".to_string()
-                },
-                compromises_completeness: !equal,
-            });
-            continue;
+    if deduplicate {
+        let mut identities = HashMap::<EventId, (Digest32, usize)>::new();
+        let mut deduplicated = Vec::with_capacity(result.records.len());
+        let records = std::mem::take(&mut result.records);
+        for record in records {
+            if let Some((digest, _)) = identities.get(&record.envelope.event_id) {
+                let equal = *digest == record.immutable_sha256;
+                result.issue(CoverageIssue {
+                    kind: if equal {
+                        CoverageIssueKind::DuplicateLogicalEvent
+                    } else {
+                        CoverageIssueKind::IdentityConflict
+                    },
+                    writer_instance_id: Some(record.envelope.producer.writer_instance_id),
+                    generation_id: Some(record.generation_id),
+                    event_id: Some(record.envelope.event_id),
+                    detail: if equal {
+                        "equal logical event appeared in more than one partition".to_string()
+                    } else {
+                        "event ID appeared with unequal immutable identities".to_string()
+                    },
+                    compromises_completeness: !equal,
+                });
+                continue;
+            }
+            identities.insert(
+                record.envelope.event_id,
+                (record.immutable_sha256, deduplicated.len()),
+            );
+            deduplicated.push(record);
         }
-        identities.insert(
-            record.envelope.event_id,
-            (record.immutable_sha256, deduplicated.len()),
-        );
-        deduplicated.push(record);
+        result.records = deduplicated;
     }
-    result.records = deduplicated;
 
     if let Some(trace_id) = filter.trace_id {
         let spans = result
@@ -521,7 +611,10 @@ fn read_one(
     record_budget: usize,
     byte_budget: usize,
     result: &mut BoundedRead,
+    mut page: Option<&mut SequencePageProgress>,
 ) {
+    let sequence_page = page.is_some();
+    let after_local_sequence = page.as_ref().and_then(|value| value.after_local_sequence);
     let source_exists = target.database_path.is_file();
     let source_directory_exists = target
         .database_path
@@ -762,7 +855,12 @@ fn read_one(
         catalog_watermark: target.catalog_watermark,
     });
 
-    let (sql, parameters) = build_query(filter, record_budget.saturating_add(1));
+    let (sql, parameters) = build_query(
+        filter,
+        record_budget.saturating_add(1),
+        after_local_sequence,
+        sequence_page,
+    );
     let mut statement = match transaction.prepare(&sql) {
         Ok(statement) => statement,
         Err(error) => {
@@ -789,6 +887,8 @@ fn read_one(
     };
     let mut partition_records = 0usize;
     let mut partition_payload_bytes = 0usize;
+    let mut scanned_rows = 0usize;
+    let mut last_scanned_sequence = after_local_sequence;
     loop {
         let row = match rows.next() {
             Ok(Some(row)) => row,
@@ -803,7 +903,12 @@ fn read_one(
                 break;
             }
         };
-        if partition_records >= record_budget {
+        if (sequence_page && scanned_rows >= record_budget)
+            || (!sequence_page && partition_records >= record_budget)
+        {
+            if sequence_page {
+                page.as_deref_mut().unwrap().next_local_sequence = last_scanned_sequence;
+            }
             result.issue(target_issue(
                 target,
                 CoverageIssueKind::RecordLimitReached,
@@ -812,9 +917,30 @@ fn read_one(
             ));
             break;
         }
+        let local_sequence = if sequence_page {
+            match row.get::<_, i64>(0) {
+                Ok(value) if value > last_scanned_sequence.unwrap_or(0) => Some(value),
+                _ => {
+                    result.issue(target_issue(
+                        target,
+                        CoverageIssueKind::CorruptPartition,
+                        "invalid or non-advancing local sequence in diagnostic page",
+                        true,
+                    ));
+                    break;
+                }
+            }
+        } else {
+            None
+        };
+        scanned_rows += 1;
+        if let Some(progress) = page.as_deref_mut() {
+            progress.rows_examined += 1;
+        }
         let schema_version: i64 = match row.get(2) {
             Ok(value) => value,
             Err(error) => {
+                last_scanned_sequence = local_sequence;
                 result.issue(target_issue(
                     target,
                     CoverageIssueKind::CorruptPartition,
@@ -825,6 +951,7 @@ fn read_one(
             }
         };
         if schema_version != EVENT_SCHEMA_VERSION {
+            last_scanned_sequence = local_sequence;
             let event_id = row
                 .get::<_, Vec<u8>>(1)
                 .ok()
@@ -845,6 +972,9 @@ fn read_one(
             Ok(record) => {
                 let bytes = usize::try_from(record.envelope.payload_bytes).unwrap_or(usize::MAX);
                 if partition_payload_bytes.saturating_add(bytes) > byte_budget {
+                    if sequence_page {
+                        page.as_deref_mut().unwrap().next_local_sequence = last_scanned_sequence;
+                    }
                     result.issue(target_issue(
                         target,
                         CoverageIssueKind::PayloadByteLimitReached,
@@ -857,20 +987,29 @@ fn read_one(
                 result.payload_bytes_examined += bytes;
                 result.records.push(record);
                 partition_records += 1;
+                last_scanned_sequence = local_sequence;
             }
-            Err((kind, event_id, detail)) => result.issue(CoverageIssue {
-                kind,
-                writer_instance_id: Some(target.writer_instance_id),
-                generation_id: Some(target.generation_id),
-                event_id,
-                detail,
-                compromises_completeness: true,
-            }),
+            Err((kind, event_id, detail)) => {
+                last_scanned_sequence = local_sequence;
+                result.issue(CoverageIssue {
+                    kind,
+                    writer_instance_id: Some(target.writer_instance_id),
+                    generation_id: Some(target.generation_id),
+                    event_id,
+                    detail,
+                    compromises_completeness: true,
+                });
+            }
         }
     }
 }
 
-fn build_query(filter: &EventFilter, limit: usize) -> (String, Vec<SqlValue>) {
+fn build_query(
+    filter: &EventFilter,
+    limit: usize,
+    after_local_sequence: Option<i64>,
+    sequence_page: bool,
+) -> (String, Vec<SqlValue>) {
     let mut sql = format!("SELECT {EVENT_SELECT_COLUMNS} FROM events WHERE 1 = 1");
     let mut values = Vec::new();
     macro_rules! scalar {
@@ -913,7 +1052,15 @@ fn build_query(filter: &EventFilter, limit: usize) -> (String, Vec<SqlValue>) {
     blob!(filter.trace_id, "trace_id");
     blob!(filter.span_id, "span_id");
     blob!(filter.event_id, "event_id");
-    sql.push_str(" ORDER BY recorded_at_unix_micros, event_id LIMIT ?");
+    if let Some(sequence) = after_local_sequence {
+        sql.push_str(" AND local_sequence > ?");
+        values.push(SqlValue::Integer(sequence));
+    }
+    if sequence_page {
+        sql.push_str(" ORDER BY local_sequence LIMIT ?");
+    } else {
+        sql.push_str(" ORDER BY recorded_at_unix_micros, event_id LIMIT ?");
+    }
     values.push(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
     (sql, values)
 }
@@ -1469,6 +1616,71 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.kind == CoverageIssueKind::DiscoveryCoverageIncomplete)
+        );
+    }
+
+    #[test]
+    fn diagnostic_page_advances_past_unknown_schema_with_one_row_budget() {
+        let diagnostic_event = |id: u8, sequence: i64| {
+            EventEnvelopeV1::normalize(
+                NewEventV1 {
+                    event_id: EventId::from_bytes([id; 16]),
+                    family: EventFamily::Diagnostic,
+                    kind: EventKind::registered("diagnostic.observation").unwrap(),
+                    recorded_at_unix_micros: 100 + sequence,
+                    producer_sequence: sequence,
+                    producer: producer(5),
+                    correlations: EventCorrelations::default(),
+                    payload: json!({"value": sequence}),
+                    legacy_provenance: None,
+                    retry_of_generation_id: None,
+                },
+                &PayloadNormalizationPolicy::registered(&["value"]).unwrap(),
+                200 + sequence,
+            )
+            .unwrap()
+        };
+        let first = diagnostic_event(30, 0);
+        let second = diagnostic_event(31, 1);
+        let fixture = fixture(5, 11, &[first.clone(), second.clone()]);
+        let connection = Connection::open(&fixture.target.database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE events SET schema_version = 2 WHERE local_sequence = 1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let filter = EventFilter {
+            family: Some(EventFamily::Diagnostic),
+            kind: Some(EventKind::registered("diagnostic.observation").unwrap()),
+            ..EventFilter::default()
+        };
+        let first_page =
+            read_generation_diagnostic_page(&fixture.target, &filter, &limits(1), None);
+        assert_eq!(first_page.rows_examined, 1);
+        assert!(first_page.read.records.is_empty());
+        assert_eq!(first_page.next_local_sequence, Some(1));
+        assert!(first_page.read.issues.iter().any(|issue| {
+            issue.kind == CoverageIssueKind::UnknownSchemaVersion
+                && issue.event_id == Some(first.event_id)
+        }));
+        assert!(!first_page.read.coverage_complete);
+
+        let second_page = read_generation_diagnostic_page(
+            &fixture.target,
+            &filter,
+            &limits(1),
+            first_page.next_local_sequence,
+        );
+        assert_eq!(second_page.rows_examined, 1);
+        assert_eq!(second_page.next_local_sequence, None);
+        assert_eq!(second_page.read.records.len(), 1);
+        assert_eq!(second_page.read.records[0].local_sequence, 2);
+        assert_eq!(
+            second_page.read.records[0].envelope.event_id,
+            second.event_id
         );
     }
 

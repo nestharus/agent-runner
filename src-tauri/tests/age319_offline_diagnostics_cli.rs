@@ -3,9 +3,15 @@
 use oulipoly_state::diagnostic_recorder::{
     DiagnosticId, DiagnosticPhase, FlightRecorder, PhaseObservation, RecorderConfig, SpanStart,
 };
+use oulipoly_state::event_store::{
+    Digest32, EventCorrelations, EventEnvelopeV1, EventFamily, EventId, EventKind,
+    EventWriterConfig, NativeProcessIdentity, NewEventV1, PayloadNormalizationPolicy,
+    ProcessEventWriter, ProcessInstanceId, ProducerIdentity, SpanId, TraceId, WriterInstanceId,
+};
 use oulipoly_state::{StateDb, mailbox::MailboxDb};
 use rusqlite::Connection;
 use serde_json::Value;
+use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -101,6 +107,28 @@ impl Fixture {
                     .is_some_and(|name| name.starts_with("flight-") && name.ends_with(".jsonl"))
             })
             .expect("recorder must create one active shard");
+        // Deferred event append may still be draining after the last handle
+        // drops; append the deliberate torn tail only after both full lines.
+        for _ in 0..100 {
+            if fs::read(&shard)
+                .unwrap()
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count()
+                >= 2
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            fs::read(&shard)
+                .unwrap()
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count()
+                >= 2
+        );
         OpenOptions::new()
             .append(true)
             .open(shard)
@@ -309,6 +337,297 @@ fn human_recent_output_keeps_coverage_and_coalesced_sections() {
     assert!(stdout.contains("coalesced failures:\n"), "{stdout}");
     assert!(stdout.contains("\"coverage\""), "{stdout}");
     fixture.assert_store_paths_remained_unavailable();
+}
+
+fn normal_diagnostic_envelope(writer: WriterInstanceId, event: EventId) -> EventEnvelopeV1 {
+    let process = ProcessInstanceId::from_bytes([21; 16]);
+    let now = chrono::Utc::now().timestamp_micros();
+    EventEnvelopeV1::normalize(
+        NewEventV1 {
+            event_id: event,
+            family: EventFamily::Diagnostic,
+            kind: EventKind::registered("diagnostic.observation").unwrap(),
+            recorded_at_unix_micros: now,
+            producer_sequence: i64::from(event.as_bytes()[0]),
+            producer: ProducerIdentity {
+                writer_instance_id: writer,
+                process_instance_id: process,
+                process_root_id: process,
+                parent_process_instance_id: None,
+                supervisor_authority_id: None,
+                native_process: Some(NativeProcessIdentity {
+                    os_pid: 1234,
+                    os_boot_id_sha256: Digest32::from_bytes([8; 32]),
+                    os_pid_starttime_ticks: 100,
+                }),
+            },
+            correlations: EventCorrelations {
+                trace_id: Some(TraceId::from(uuid::Uuid::parse_str(DIAGNOSTIC_ID).unwrap())),
+                span_id: Some(SpanId::from_bytes([31; 16])),
+                ..EventCorrelations::default()
+            },
+            payload: json!({
+                "operation": "fixture.normal_failure",
+                "resource": "state",
+                "lifecycle_phase": null,
+                "phase": "failed",
+                "elapsed_micros": 50,
+                "observation": serde_json::to_value(PhaseObservation::started_unknown()).unwrap(),
+                "diagnostic_correlations": {},
+                "database_identity": null,
+            }),
+            legacy_provenance: None,
+            retry_of_generation_id: None,
+        },
+        &PayloadNormalizationPolicy::registered(&[
+            "operation",
+            "resource",
+            "lifecycle_phase",
+            "phase",
+            "elapsed_micros",
+            "observation",
+            "diagnostic_correlations",
+            "database_identity",
+        ])
+        .unwrap(),
+        now,
+    )
+    .unwrap()
+}
+
+#[test]
+fn normal_generation_and_shadow_jsonl_deduplicate_during_live_writer_read() {
+    let fixture = Fixture::with_unavailable_stores();
+    let event_root = fixture.data_dir.join("diagnostics/event-store-v1");
+    let writer_id = WriterInstanceId::from_bytes([19; 16]);
+    let event_id = EventId::from_bytes([29; 16]);
+    let envelope = normal_diagnostic_envelope(writer_id, event_id);
+    let writer = ProcessEventWriter::start(EventWriterConfig::native(
+        &event_root,
+        envelope.producer.clone(),
+    ))
+    .unwrap();
+    writer.append(envelope.clone()).unwrap();
+    fs::write(
+        fixture.recorder_root.join("flight-shadow.jsonl"),
+        format!("{}\n", serde_json::to_string(&envelope).unwrap()),
+    )
+    .unwrap();
+
+    let output = fixture
+        .command()
+        .args(["diagnostics", "recent", "--limit", "10", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let json = stdout_json(&output);
+    let records = json["recent"]["events"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{json:#}");
+    assert_eq!(records[0]["event"]["event_id"], event_id.to_string());
+    assert_eq!(records[0]["origins"].as_array().unwrap().len(), 2);
+    assert_eq!(json["coalesced"]["failures"][0]["count"], 1);
+    assert!(
+        json["recent"]["coverage"]["coverage_complete"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(
+        json["recent"]["coverage"]["normal"]["partitions_examined"],
+        1
+    );
+    // The independent producer remains writable after the offline snapshot.
+    let second = normal_diagnostic_envelope(writer_id, EventId::from_bytes([30; 16]));
+    writer.append(second).unwrap();
+    writer.shutdown().unwrap();
+    fixture.assert_store_paths_remained_unavailable();
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn cli_continuation_finds_known_failure_beyond_jsonl_directory_prefix() {
+    let fixture = Fixture::with_unavailable_stores();
+    fixture.seed_failed_trace_with_truncated_tail();
+    let original = fs::read_dir(&fixture.recorder_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".jsonl")
+        })
+        .unwrap();
+    let bytes = fs::read(&original).unwrap();
+    fs::remove_file(&original).unwrap();
+    for index in 0..1030 {
+        fs::write(
+            fixture
+                .recorder_root
+                .join(format!("flight-decoy-{index:04}.jsonl")),
+            b"",
+        )
+        .unwrap();
+    }
+    let entries = fs::read_dir(&fixture.recorder_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    assert!(entries.len() > 1024);
+    let target = fixture.recorder_root.join(&entries[1024]);
+    assert!(
+        target
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("flight-decoy-")
+    );
+    fs::write(&target, bytes).unwrap();
+
+    for command_name in ["recent", "trace"] {
+        let mut cursor: Option<String> = None;
+        let mut found = false;
+        for page_number in 0..16 {
+            let mut command = fixture.command();
+            command.args(["diagnostics", command_name]);
+            if command_name == "recent" {
+                command.args(["--limit", "10"]);
+            } else {
+                command.arg(DIAGNOSTIC_ID);
+            }
+            command.arg("--json");
+            if let Some(value) = &cursor {
+                command.args(["--cursor", value]);
+            }
+            let output = command.output().unwrap();
+            assert_success(&output);
+            let json = stdout_json(&output);
+            let section = if command_name == "recent" {
+                "recent"
+            } else {
+                "trace"
+            };
+            let report = &json[section];
+            assert!(
+                report["coverage"]["directory_entries_examined"]
+                    .as_u64()
+                    .unwrap()
+                    <= 1024
+            );
+            assert!(report["coverage"]["files_seen"].as_u64().unwrap() <= 256);
+            if page_number == 0 {
+                assert_eq!(report["coverage"]["coverage_complete"], false);
+                assert_eq!(report["coverage"]["page_local_results"], true);
+                assert!(
+                    report["issues"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|issue| issue["kind"] == "incomplete_search_no_match")
+                );
+            }
+            found |= report["events"].as_array().unwrap().iter().any(|record| {
+                record["event"]["diagnostic_id"] == DIAGNOSTIC_ID
+                    && record["event"]["phase"] == "failed"
+            });
+            cursor = report["coverage"]["next_cursor"]
+                .as_str()
+                .map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(found, "{command_name} never reached known failure");
+    }
+    fixture.assert_store_paths_remained_unavailable();
+}
+
+#[test]
+fn unequal_duplicate_event_identity_is_reported_as_incomplete() {
+    let fixture = Fixture::with_unavailable_stores();
+    fixture.seed_failed_trace_with_truncated_tail();
+    let shard = fs::read_dir(&fixture.recorder_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".jsonl")
+        })
+        .unwrap();
+    let text = fs::read_to_string(&shard).unwrap();
+    let lines = text.lines().take(2).collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    let mut changed: Value = serde_json::from_str(lines[1]).unwrap();
+    changed["operation"] = Value::String("fixture.conflicting_operation".to_string());
+    fs::write(&shard, format!("{}\n{}\n{}\n", lines[0], lines[1], changed)).unwrap();
+    let output = fixture
+        .command()
+        .args(["diagnostics", "recent", "--limit", "10", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let json = stdout_json(&output);
+    assert_eq!(json["recent"]["events"].as_array().unwrap().len(), 2);
+    assert_eq!(json["recent"]["coverage"]["coverage_complete"], false);
+    assert!(
+        json["recent"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["kind"] == "identity_conflict")
+    );
+}
+
+#[test]
+fn conflicting_normal_generations_keep_both_physical_origins() {
+    let fixture = Fixture::with_unavailable_stores();
+    let event_root = fixture.data_dir.join("diagnostics/event-store-v1");
+    let id = EventId::from_bytes([44; 16]);
+    let mut writers = Vec::new();
+    for writer_byte in [41_u8, 42_u8] {
+        let envelope =
+            normal_diagnostic_envelope(WriterInstanceId::from_bytes([writer_byte; 16]), id);
+        let writer = ProcessEventWriter::start(EventWriterConfig::native(
+            &event_root,
+            envelope.producer.clone(),
+        ))
+        .unwrap();
+        writer.append(envelope).unwrap();
+        writers.push(writer);
+    }
+    let output = fixture
+        .command()
+        .args(["diagnostics", "recent", "--limit", "10", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let json = stdout_json(&output);
+    let records = json["recent"]["events"].as_array().unwrap();
+    assert_eq!(records.len(), 2, "{json:#}");
+    assert!(
+        records
+            .iter()
+            .all(|record| record["origins"].as_array().unwrap().len() == 1)
+    );
+    assert_ne!(
+        records[0]["origins"][0]["writer_instance_id"],
+        records[1]["origins"][0]["writer_instance_id"]
+    );
+    assert_eq!(json["recent"]["coverage"]["coverage_complete"], false);
+    assert!(
+        json["recent"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["kind"] == "identity_conflict")
+    );
+    for writer in writers {
+        writer.shutdown().unwrap();
+    }
 }
 
 fn assert_success(output: &Output) {
