@@ -26,9 +26,10 @@ The Unix stream socket accepts one request per connection:
    `SCM_CREDENTIALS`, rejects a sender different from the pinned connector,
    and rechecks boot ID, process starttime, pidfd liveness, and namespace.
 3. Broker closes the connection after one newline-terminated response:
-   `inside <root_id>`, `outside`, `uncertain`, `released <root_id>`, or `error
-   <reason>`. `protocol::request` is the matching client API. `inside` is a
-   classifier result, never an authorization grant. `released` confirms the
+   `inside <root_id>`, `inside-work <root_id> <work_incarnation>`, `outside`,
+   `uncertain`, `released <root_id>`, or `error <reason>`. `protocol::request`
+   is the matching client API. Classification is never an authorization grant.
+   `released` confirms the
    namespace PID1 gate opened; Runner exec status is not yet reported.
 
 The request has no executable, UID, mount, namespace, root ID, or PID fields.
@@ -48,16 +49,32 @@ or changed PID1 is retained as unknown debt. Any debt makes classification
 `uncertain` and blocks new launches. There is deliberately no automatic
 retirement, timeout, or deletion of a root record.
 
+The source also has a `works/` registry under that state directory. The broker
+loads it before serving requests. Its in-process `insert_prepared` API requires
+a live, directly nested namespace PID1 and binds a separate broker work
+incarnation to the exact recorded root incarnation, accepted work ID, and
+optional direct parent work incarnation. Trusted broker code must call it
+**after** positive accepted-work authorization by the guardian and **before**
+releasing a gated worker. The current service has no such call site or socket
+operation: it does not create a work namespace or accept work. A peer inside a
+registered work, including an adopted descendant, classifies to the nearest
+registered work namespace. Sibling namespaces remain separate. Vanished work
+PID1s and failed record writes remain uncertainty; there is no drain receipt
+or retirement claim. The service rejects and closes unsolicited passed FDs on
+challenged requests.
+
 ## Required next integration
 
 - Move the shared completion guardian outside all root namespaces and gate
   both CLI and GUI entry before their first possible fork. Bind the guardian's
   positive `RootAuthorityGrant.root_id` to this broker's exact root UUID and
   host/local process identities; never use classification as a grant.
-- Add broker-controlled nested PID namespace launch and a PID1/reaper for each
-  accepted work or allocated attempt. Place Bash workers and provider launchers
-  before their first fork and maintain parent work lineage and exact drain
-  receipts. The current `L` operation creates roots only.
+- Add a broker-authenticated acceptance handoff from the guardian, then
+  broker-controlled nested PID namespace launch and a PID1/reaper for each
+  accepted work or allocated attempt. Call `insert_prepared` while the exact
+  worker remains gated; place Bash workers and provider launchers before their
+  first fork. Add clean physical drain receipts and reconciliation before any
+  record can be retired. The current `L` operation creates roots only.
 - Migrate all shared PID fields, sidecars, signals, and SQLite readers to
   explicit host/local PID domains. Add result/notification/ACK settlement and
   deliberate retirement; a live namespace or dead process alone proves none of

@@ -6,6 +6,8 @@
 pub mod identity;
 pub mod protocol;
 pub mod registry;
+pub mod work_registry;
 
 pub use identity::{Classification, PeerIdentity, PinnedProcess, classify_peer};
 pub use registry::{RootRecord, RootRegistry};
+pub use work_registry::{Scope, WorkRecord, WorkRegistry, classify_scope};

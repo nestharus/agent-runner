@@ -1,8 +1,7 @@
 //! Opt-in host-root service. No Runner code invokes this binary yet.
-use oulipoly_kernel_broker::identity::{
-    Classification, PeerIdentity, PinnedProcess, boot_id, classify_peer,
-};
+use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess, boot_id};
 use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
+use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -95,23 +94,51 @@ fn recv_request(stream: &mut UnixStream) -> io::Result<(u8, libc::ucred, PinnedP
     msg.msg_control = control.as_mut_ptr().cast();
     msg.msg_controllen = control.len();
     let read = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    if read < 0 {
+        // A failed recvmsg installed no ancillary descriptors.
+        return Err(io::Error::last_os_error());
+    }
+    let mut credentials = None;
+    let mut invalid_ancillary = false;
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    while !cmsg.is_null() {
+        let header = unsafe { &*cmsg };
+        if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_CREDENTIALS {
+            if credentials.is_some()
+                || header.cmsg_len as usize
+                    != unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::ucred>() as _) } as usize
+            {
+                invalid_ancillary = true;
+            } else {
+                credentials = Some(unsafe { *(libc::CMSG_DATA(cmsg) as *const libc::ucred) });
+            }
+        } else if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
+            // recvmsg installs SCM_RIGHTS even when the operation does not use
+            // them. A hostile peer could otherwise exhaust the broker's FDs.
+            let base = unsafe { libc::CMSG_LEN(0) } as usize;
+            let bytes = (header.cmsg_len as usize).saturating_sub(base);
+            if (header.cmsg_len as usize) >= base
+                && bytes.is_multiple_of(std::mem::size_of::<i32>())
+            {
+                for index in 0..bytes / std::mem::size_of::<i32>() {
+                    let received = unsafe { *(libc::CMSG_DATA(cmsg) as *const i32).add(index) };
+                    unsafe { libc::close(received) };
+                }
+            }
+            invalid_ancillary = true;
+        } else {
+            invalid_ancillary = true;
+        }
+        cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
+    }
     if read != request.len() as isize
         || request[1..] != challenge
         || msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
     {
         return Err(io::Error::other("invalid challenged request"));
     }
-    let mut credentials = None;
-    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-    while !cmsg.is_null() {
-        let header = unsafe { &*cmsg };
-        if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_CREDENTIALS {
-            if credentials.is_some() {
-                return Err(io::Error::other("duplicate credentials"));
-            }
-            credentials = Some(unsafe { *(libc::CMSG_DATA(cmsg) as *const libc::ucred) });
-        }
-        cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
+    if invalid_ancillary {
+        return Err(io::Error::other("unsupported request ancillary data"));
     }
     let credentials =
         credentials.ok_or_else(|| io::Error::other("missing per-request credentials"))?;
@@ -387,8 +414,15 @@ fn serve() -> io::Result<()> {
     checked_root_path(Path::new(STATE), true)?;
     checked_root_path(Path::new("/run/oulipoly-kernel-broker"), true)?;
     checked_root_path(Path::new(RUNNER), false)?;
+    let works_path = Path::new(STATE).join("works");
+    if !works_path.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&works_path)?;
+    }
+    checked_root_path(&works_path, true)?;
     let host_namespace = File::open("/proc/self/ns/pid")?;
     let mut registry = RootRegistry::open(STATE)?;
+    let works = WorkRegistry::open(&works_path, &registry)?;
     if let Ok(meta) = fs::symlink_metadata(SOCKET) {
         if !meta.file_type().is_socket() || meta.uid() != 0 {
             return Err(io::Error::other("unsafe existing socket"));
@@ -403,11 +437,22 @@ fn serve() -> io::Result<()> {
         stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
         let result = (|| {
             let (operation, peer) = peer_from_request(&mut stream)?;
-            match (operation, classify_peer(&peer, &host_namespace, &registry)) {
-                (b'C', Classification::Inside(root)) => Ok(format!("inside {root}\n")),
-                (b'C', Classification::Outside) => Ok("outside\n".to_owned()),
-                (b'C', Classification::Uncertain) => Ok("uncertain\n".to_owned()),
-                (b'L', Classification::Outside) if peer.uid >= 1000 => {
+            match (
+                operation,
+                classify_scope(&peer, &host_namespace, &registry, &works),
+            ) {
+                (b'C', Scope::Root(root)) => Ok(format!("inside {root}\n")),
+                (
+                    b'C',
+                    Scope::Work {
+                        root_id,
+                        work_incarnation,
+                        ..
+                    },
+                ) => Ok(format!("inside-work {root_id} {work_incarnation}\n")),
+                (b'C', Scope::Outside) => Ok("outside\n".to_owned()),
+                (b'C', Scope::Uncertain) => Ok("uncertain\n".to_owned()),
+                (b'L', Scope::Outside) if peer.uid >= 1000 => {
                     launch(&peer, &mut registry).map(|id| format!("released {id}\n"))
                 }
                 (b'L', _) => Err(io::Error::other("root launch denied")),
@@ -503,6 +548,44 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn challenged_request_rejects_passed_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(peer_from_request(&mut stream).is_err());
+        });
+        let mut client = UnixStream::connect(&socket).unwrap();
+        let mut challenge = [0u8; 16];
+        client.read_exact(&mut challenge).unwrap();
+        let mut request = [0u8; 17];
+        request[0] = b'C';
+        request[1..].copy_from_slice(&challenge);
+        let payload = File::open("/dev/null").unwrap();
+        let mut iov = libc::iovec {
+            iov_base: request.as_mut_ptr().cast(),
+            iov_len: request.len(),
+        };
+        let mut control = [0u8; 64];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as _) } as _;
+        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&message) };
+        assert!(!cmsg.is_null());
+        unsafe {
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as _) as _;
+            *(libc::CMSG_DATA(cmsg) as *mut i32) = payload.as_raw_fd();
+            assert_eq!(libc::sendmsg(client.as_raw_fd(), &message, 0), 17);
+        }
         server.join().unwrap();
     }
 }

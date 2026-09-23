@@ -37,6 +37,7 @@ sections. The auditor returns the spec(s) that match.
 | `spec-result-envelope.md` | Result markers, failure identity, pre-invocation failures. |
 | `spec-provider-client.md` | Provider artifact client, resolver, process substrate, launch stream. |
 | `spec-event-storage.md` | Durable diagnostic event store, rotation/readers, retention policy, and detached maintenance lifecycle. |
+| `spec-kernel-broker.md` | Source-only Linux PID namespace broker, root/work identity registries, and challenged classifier. |
 
 ## Spec schema
 

@@ -29,6 +29,7 @@ pub struct RootRegistry {
     directory: PathBuf,
     live: Vec<LiveRoot>,
     debt: Vec<RootRecord>,
+    poisoned: bool,
 }
 
 fn reattach(record: RootRecord) -> Result<LiveRoot, RootRecord> {
@@ -56,11 +57,17 @@ impl RootRegistry {
             directory,
             live: Vec::new(),
             debt: Vec::new(),
+            poisoned: false,
         };
         for entry in fs::read_dir(&registry.directory)? {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
+            // The work registry is opened separately by the broker before it
+            // serves requests. Never silently skip an arbitrary directory.
+            if name == "works" && entry.file_type()?.is_dir() {
+                continue;
+            }
             if !name.ends_with(".json") || !entry.file_type()?.is_file() {
                 return Err(io::Error::other("unrecognized registry entry"));
             }
@@ -98,7 +105,7 @@ impl RootRegistry {
     }
 
     pub fn has_debt(&self) -> bool {
-        !self.debt.is_empty() || self.live.iter().any(|r| r.init.verify().is_err())
+        self.poisoned || !self.debt.is_empty() || self.live.iter().any(|r| r.init.verify().is_err())
     }
 
     pub fn live_roots(&self) -> impl Iterator<Item = &LiveRoot> {
@@ -118,15 +125,23 @@ impl RootRegistry {
             return Err(io::Error::other("duplicate live root"));
         }
         let path = self.directory.join(format!("{}.json", record.root_id));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        serde_json::to_writer(&mut file, &record)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        File::open(&self.directory)?.sync_all()?;
+        let persisted = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+            serde_json::to_writer(&mut file, &record)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            File::open(&self.directory)?.sync_all()
+        })();
+        if let Err(error) = persisted {
+            // A partial or merely unsynced record may be on disk. Do not
+            // continue from the old in-memory view after this ambiguity.
+            self.poisoned = true;
+            return Err(error);
+        }
         self.live.push(root);
         Ok(())
     }
