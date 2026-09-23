@@ -486,7 +486,14 @@ fn guardian(
         // Requests, especially cancellation, are admitted before this pass may
         // issue an execution grant. A cancel already visible to the guardian
         // therefore cannot race behind a same-pass grant.
-        root_supervisor.tick(&owner)?;
+        // A setsid descendant can be adopted directly by this subreaper after
+        // the original worker exits. The old session alone cannot certify its
+        // drain. Unknown direct children conservatively hold original results.
+        let adopted_child_live = guardian_unattributed_child_live(
+            &owner.driver_identity,
+            &root_supervisor.known_direct_child_pids(),
+        );
+        root_supervisor.tick(&owner, adopted_child_live)?;
         // Errors leave the group owned for the next pass; never a release ACK.
         let _ = contexts.release_disconnected(path);
         root_authorities.retain_live(
@@ -512,6 +519,31 @@ fn guardian(
         }
         std::thread::sleep(GUARDIAN_POLL_INTERVAL);
     }
+}
+
+fn guardian_unattributed_child_live(driver: &SourceProcessIdentity, workers: &[i64]) -> bool {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return true;
+    };
+    for task in tasks {
+        let Ok(task) = task else {
+            return true;
+        };
+        let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+            return true;
+        };
+        for value in children.split_whitespace() {
+            let Ok(pid) = value.parse::<i64>() else {
+                return true;
+            };
+            if !(pid == driver.pid && identity(pid).as_ref() == Ok(driver))
+                && !workers.contains(&pid)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn close_idle_owner(
@@ -1003,6 +1035,9 @@ fn validate_independent_entry() -> Result<(), String> {
                 entry.starts_with(b"OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY=")
                     || entry.starts_with(b"AGENT_BASH_OWNER_INVOCATION_UUID=")
             });
+            // This broad veto also catches a markerless paired Bash descendant
+            // that invokes Runner directly. Independent Bash registration needs
+            // a narrower lineage witness before this can be relaxed.
             if image.contains("agent-bash") || marked {
                 return Err(
                     "managed Bash/provider ancestor has no inherited completion owner".into(),

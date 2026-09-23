@@ -241,6 +241,19 @@ impl RootSupervisor {
         self.original.worker_pids()
     }
 
+    pub(super) fn known_direct_child_pids(&self) -> Vec<i64> {
+        let mut children = self.original.live_worker_pids();
+        children.extend(
+            self.active
+                .iter()
+                .filter(|operation| !operation.terminal)
+                .filter_map(|operation| operation.worker_identity.as_ref())
+                .filter(|worker| super::linux::identity(worker.pid).as_ref() == Ok(worker))
+                .map(|worker| worker.pid),
+        );
+        children
+    }
+
     pub(super) fn original_active_root_ids(&self) -> std::collections::BTreeSet<String> {
         self.original.active_root_ids()
     }
@@ -289,7 +302,11 @@ impl RootSupervisor {
         });
     }
 
-    pub(super) fn tick(&mut self, owner: &CompletionDomainOwner) -> Result<(), String> {
+    pub(super) fn tick(
+        &mut self,
+        owner: &CompletionDomainOwner,
+        adopted_child_live: bool,
+    ) -> Result<(), String> {
         if self.driver_error.is_none() {
             let driver_result = self
                 .flush_driver_output()
@@ -300,6 +317,7 @@ impl RootSupervisor {
             }
         }
         self.observe_active(owner);
+        self.original.set_adopted_child_gate(adopted_child_live);
         self.original.tick(owner);
         let now = Instant::now();
         if now >= self.next_reconcile {

@@ -73,6 +73,10 @@ if nearer == 0:
         while os.getppid() == worker and time.monotonic() - start < 5:
             time.sleep(.01)
         adopted = os.getppid()
+        # An ordinary session-key isolation step removes the inherited ring.
+        # The live adopting guardian must still veto a standalone launch.
+        reset_ring = keyctl(1, 0)
+        assert reset_ring != ring
         env = dict(os.environ, AGENT_BASH_AGENT_RUNNER_BIN=os.environ['AGE360_RUNNER_BIN'])
         for key in ('AGENT_BASH_OWNER_SESSION_ID', 'AGENT_BASH_OWNER_INVOCATION_UUID'):
             env.pop(key, None)
@@ -84,6 +88,8 @@ if nearer == 0:
             while not root.joinpath('unauthorized-effect').exists() and time.monotonic() < end:
                 time.sleep(.02)
         root.joinpath('orphan-report.json').write_text(json.dumps({'effect_exists': root.joinpath('unauthorized-effect').exists(), 'first_adopter': first_adopter, 'rc': result.returncode, 'stderr': result.stderr, 'stdout': result.stdout, 'adopted_by': adopted, 'adopted_cmdline': cmdline(adopted), 'nearer_pid': nearer_pid, 'expected_worker': worker, 'ring': keyctl(0, -3, 0), 'sid': os.getsid(0), 'pid': os.getpid()}))
+        while not root.joinpath('release-orphan').exists():
+            time.sleep(.02)
         os._exit(0)
     os._exit(0)
 os.close(ready_read)

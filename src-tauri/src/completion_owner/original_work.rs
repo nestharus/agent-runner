@@ -543,9 +543,13 @@ impl RetrySchedule {
 pub(super) struct OriginalWorkSupervisor {
     active: Vec<OriginalOperation>,
     never_forked: Vec<NeverForkedOperation>,
+    adopted_child_live: bool,
 }
 
 impl OriginalWorkSupervisor {
+    pub fn set_adopted_child_gate(&mut self, live: bool) {
+        self.adopted_child_live = live;
+    }
     pub fn is_empty(&self) -> bool {
         self.active.is_empty() && self.never_forked.is_empty()
     }
@@ -606,6 +610,16 @@ impl OriginalWorkSupervisor {
         self.active
             .iter()
             .map(|operation| operation.worker_session)
+            .collect()
+    }
+
+    pub fn live_worker_pids(&self) -> Vec<i64> {
+        self.active
+            .iter()
+            .filter(|operation| !operation.terminal_observed)
+            .filter_map(|operation| operation.worker_identity.as_ref())
+            .filter(|worker| identity(worker.pid).as_ref() == Ok(worker))
+            .map(|worker| worker.pid)
             .collect()
     }
 
@@ -1262,7 +1276,8 @@ impl OriginalWorkSupervisor {
             .map(|operation| {
                 (
                     operation.submission.work_id.clone(),
-                    operation.terminal_observed
+                    !self.adopted_child_live
+                        && operation.terminal_observed
                         && operation.session_drained
                         && operation.causal_terminal
                         && operation.result_written,
@@ -1425,7 +1440,9 @@ impl OriginalWorkSupervisor {
             }
         }
         for operation in &mut self.active {
-            let drained = operation.terminal_observed && operation.session_drained;
+            let drained = !self.adopted_child_live
+                && operation.terminal_observed
+                && operation.session_drained;
             if drained
                 && operation.causal_terminal
                 && operation.cancellation_pending.is_none()
@@ -1469,7 +1486,9 @@ impl OriginalWorkSupervisor {
             }
         }
         self.active.retain(|operation| {
-            let drained = operation.terminal_observed && operation.session_drained;
+            let drained = !self.adopted_child_live
+                && operation.terminal_observed
+                && operation.session_drained;
             if drained
                 && operation.causal_terminal
                 && operation.cancellation_pending.is_none()
@@ -2454,6 +2473,7 @@ mod tests {
         let mut supervisor = OriginalWorkSupervisor {
             active: vec![parent, child],
             never_forked: Vec::new(),
+            adopted_child_live: false,
         };
         let deadline = Instant::now() + Duration::from_secs(2);
         while !supervisor.active[0].terminal_observed {
@@ -2547,6 +2567,7 @@ mod tests {
         let mut supervisor = OriginalWorkSupervisor {
             active: vec![operation],
             never_forked: Vec::new(),
+            adopted_child_live: false,
         };
         let requester = identity(i64::from(std::process::id())).unwrap();
         let now = Instant::now();
@@ -2609,6 +2630,7 @@ mod tests {
         let mut supervisor = OriginalWorkSupervisor {
             active: vec![operation],
             never_forked: Vec::new(),
+            adopted_child_live: false,
         };
         supervisor.tick_at(&owner, now);
         assert!(supervisor.active[0].cancellation_cause.is_none());
@@ -2647,6 +2669,7 @@ mod tests {
         let mut supervisor = OriginalWorkSupervisor {
             active: vec![operation],
             never_forked: Vec::new(),
+            adopted_child_live: false,
         };
 
         let (bad_socket, mut bad_reply) = UnixStream::pair().unwrap();

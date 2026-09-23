@@ -27,8 +27,14 @@ session keyring named `oulipoly-paired-original-work-v1:<random-v4-uuid>`;
 before exec of each accepted root-owned Bash worker, the guardian installs the
 same kind of ring in that child alone. Both paths link the preceding session
 ring into the new one so inherited provider keys remain searchable. The ring
-survives fork, exec, setsid, and reparenting. It only vetoes standalone
-admission when paired authority is absent; it does not grant paired work.
+survives fork, exec, setsid, and reparenting. For an adopted worker descendant,
+agent-bash also checks its live ancestor chain for the guardian's bound private
+owner socket. That veto survives ordinary session-keyring reset while the
+guardian lives. Neither marker grants paired work. A descendant of the
+entry/provider branch can be adopted outside the guardian's tree; after a
+keyring reset and loss of environment markers, this branch has no durable
+lineage witness in the current topology. Full negative admission under that
+order remains unresolved.
 In a marked tree, agent-bash fails closed if either endpoint or grant is
 missing or invalid. A genuine standalone caller with no paired lineage keeps
 the existing behavior; an endpoint-only legacy caller also keeps the existing
@@ -128,8 +134,13 @@ session drain. If the guardian is lost, EOF makes the worker the last custodian;
 it cancels and drains instead of continuing unowned.
 
 The guardian writes `root-work-result-v1.json` only after it has observed the
-exact worker wait, no process remains in that worker session, and every accepted
-causal child has its own durable terminal root result and physical drain. This
+exact worker wait, no process remains in that worker session, no unattributed
+direct adopted child remains under the guardian, and every accepted causal
+child has its own durable terminal root result and physical drain. The direct
+child gate is conservative across concurrent operations: an unrelated adopted
+child may delay a result, and cancellation cannot safely signal a child whose
+exact work attribution was lost. That debt remains live until the child exits;
+the gate does not claim exact per-work cancellation custody. This
 also applies when the parent worker exits before `T`. The receipt
 contains the causal child ids, physical-drain fact, worker wait status, and the
 agent-bash terminal projection. A private per-operation result nonce makes an

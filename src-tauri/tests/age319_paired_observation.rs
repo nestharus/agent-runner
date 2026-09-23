@@ -2527,7 +2527,7 @@ fn native_retiring_owner_admits_first_sequential_fresh_and_resume_after_drain() 
 }
 
 #[test]
-fn age319_exact_pair_ring_orphan_auth_search_and_independent() {
+fn age319_exact_pair_key_reset_orphan_and_cross_session_drain() {
     if private_case(true) {
         return;
     }
@@ -2598,13 +2598,16 @@ fn age319_exact_pair_ring_orphan_auth_search_and_independent() {
     assert_eq!(ring["had_endpoint"], true);
     assert_eq!(orphan["first_adopter"], ring["worker"]);
     assert_eq!(orphan["adopted_by"], ring["guardian"]);
-    assert_eq!(orphan["ring"], ring["new_ring"]);
+    assert_ne!(
+        orphan["ring"], ring["new_ring"],
+        "ordinary keyctl session reset must replace the ring"
+    );
     assert_ne!(orphan["rc"], 0, "{orphan}");
     assert!(
         orphan["stderr"]
             .as_str()
             .unwrap()
-            .contains("inherited paired session keyring"),
+            .contains("paired worker or guardian ancestor"),
         "{orphan}"
     );
     assert!(!f.root.path().join("unauthorized-effect").exists());
@@ -2633,7 +2636,7 @@ fn age319_exact_pair_ring_orphan_auth_search_and_independent() {
                 || !record["detail"]
                     .as_str()
                     .unwrap_or("")
-                    .contains("inherited paired session keyring")
+                    .contains("paired worker or guardian ancestor")
             {
                 continue;
             }
@@ -2644,6 +2647,28 @@ fn age319_exact_pair_ring_orphan_auth_search_and_independent() {
         }
     }
     assert_eq!(rejected, 1, "expected one preaccept diagnostic");
+    let outer_result = PathBuf::from(&source.handle_dir).join("root-work-result-v1.json");
+    assert!(
+        !outer_result.exists(),
+        "live adopted setsid descendant cannot be certified drained"
+    );
+    f.gate("release-orphan");
+    wait(|| outer_result.exists().then_some(()));
+    let settled: serde_json::Value =
+        serde_json::from_slice(&fs::read(&outer_result).unwrap()).unwrap();
+    assert_eq!(settled["physical_tree_drained"], true, "{settled}");
+    println!(
+        "AGE319 key-reset orphan veto and adopted child drain: outer_root={}",
+        outer["root_id"]
+    );
+}
+
+#[test]
+fn age319_independent_bash_registers_with_real_runner() {
+    if private_case(true) {
+        return;
+    }
+    let f = Fixture::new("independent_control");
     let independent = f.root.path().join("independent-effect");
     let output = Command::new("/usr/bin/python3")
         .arg("-c")
@@ -2652,7 +2677,9 @@ fn age319_exact_pair_ring_orphan_auth_search_and_independent() {
         .env("AGE360_AGENT_BASH_BIN", std::env::var("AGE360_AGENT_BASH_BIN").unwrap())
         .env("XDG_STATE_HOME", f.root.path().join("independent-state"))
         .env("XDG_CONFIG_HOME", f.root.path().join("independent-config"))
-        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env("XDG_DATA_HOME", f.root.path().join("independent-data"))
+        .env("OULIPOLY_DATA_DIR", f.root.path().join("independent-data"))
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", runner())
         .env("AGE319_EFFECT", &independent)
         .output().unwrap();
     assert!(
@@ -2660,10 +2687,16 @@ fn age319_exact_pair_ring_orphan_auth_search_and_independent() {
         "independent: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    wait(|| independent.exists().then_some(()));
-    println!(
-        "AGE319 exact pair ring={ring} orphan={orphan} nested={nested} independent_effect={} outer_root={}",
+    let independent_start: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let independent_meta = PathBuf::from(independent_start["meta"].as_str().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !independent.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
         independent.exists(),
-        outer["root_id"]
+        "real Runner independent registration did not execute: start={independent_start} meta={} stderr={}",
+        fs::read_to_string(independent_meta).unwrap_or_default(),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
