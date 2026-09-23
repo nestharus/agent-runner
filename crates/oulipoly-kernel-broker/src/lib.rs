@@ -1,8 +1,9 @@
-//! Host PID namespace classifier and durable root registry. This crate has no
-//! hooks into Runner admission; the service must be installed and started
-//! explicitly after the paired integration is complete.
+//! Host PID namespace classifier, durable registries, and fail-closed host
+//! entry staging. The service is uninstalled; child and work handoff remain
+//! unavailable pending paired integration.
 #![cfg(target_os = "linux")]
 
+pub mod entry_registry;
 pub mod identity;
 pub mod protocol;
 pub mod registry;

@@ -3049,6 +3049,7 @@ dependencies = [
  "oulipoly-agent-store",
  "oulipoly-config",
  "oulipoly-core",
+ "oulipoly-kernel-broker",
  "oulipoly-provider",
  "oulipoly-runtime",
  "oulipoly-setup",

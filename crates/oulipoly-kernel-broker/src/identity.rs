@@ -53,6 +53,37 @@ fn namespace_identity(file: &File) -> io::Result<(u64, u64)> {
 }
 
 impl PinnedProcess {
+    /// Require an exact live parent at both sides of the proc parent read.
+    /// This binds the host guardian fork to the entry incarnation, rather than
+    /// accepting an inherited root ID from an unrelated sibling process.
+    pub fn direct_child_of(&self, parent: &PinnedProcess) -> io::Result<bool> {
+        self.verify()?;
+        parent.verify()?;
+        let stat = fs::read_to_string(format!("/proc/{}/stat", self.host_pid))?;
+        let tail = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| io::Error::other("malformed proc stat"))?
+            .1;
+        let ppid: i32 = tail
+            .split_ascii_whitespace()
+            .nth(1)
+            .ok_or_else(|| io::Error::other("missing parent PID"))?
+            .parse()
+            .map_err(|_| io::Error::other("bad parent PID"))?;
+        self.verify()?;
+        parent.verify()?;
+        Ok(ppid == parent.host_pid)
+    }
+
+    pub fn same_executable_as(&self, installed: &File) -> io::Result<bool> {
+        self.verify()?;
+        let image = File::open(format!("/proc/{}/exe", self.host_pid))?;
+        let actual = image.metadata()?;
+        let expected = installed.metadata()?;
+        self.verify()?;
+        Ok((actual.dev(), actual.ino()) == (expected.dev(), expected.ino()))
+    }
+
     pub fn open(host_pid: i32) -> io::Result<Self> {
         if host_pid <= 0 {
             return Err(io::Error::other("invalid host PID"));

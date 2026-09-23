@@ -300,6 +300,19 @@ impl RootAuthorities {
         owner: &CompletionDomainOwner,
         context: SourceProcessIdentity,
     ) -> Result<RootAuthorityGrant, String> {
+        self.fresh_with_root_id(owner, context, uuid::Uuid::new_v4().to_string())
+    }
+
+    pub fn fresh_with_root_id(
+        &mut self,
+        owner: &CompletionDomainOwner,
+        context: SourceProcessIdentity,
+        root_id: String,
+    ) -> Result<RootAuthorityGrant, String> {
+        uuid::Uuid::parse_str(&root_id).map_err(|_| "invalid broker root ID")?;
+        if self.scopes.contains_key(&root_id) {
+            return Err("duplicate root authority ID".into());
+        }
         if !self.roots_for_peer(&context).is_empty() {
             return Err("live context is already inside a root authority".into());
         }
@@ -313,7 +326,7 @@ impl RootAuthorities {
             completion_protocol: owner.protocol.clone(),
             domain_id: owner.domain_id.clone(),
             supervisor_authority_id: owner.supervisor_authority_id.clone(),
-            root_id: uuid::Uuid::new_v4().to_string(),
+            root_id,
             capability: capability.clone(),
             root_identity: context.clone(),
             guardian_identity: owner.guardian_identity.clone(),
@@ -2282,6 +2295,25 @@ mod tests {
             driver_identity: identity,
             endpoint: "/tmp/test-owner.sock".into(),
         }
+    }
+
+    #[test]
+    fn broker_reserved_root_id_is_used_exactly_once_in_guardian_grant() {
+        let context = identity(i64::from(std::process::id())).unwrap();
+        let owner = owner(context.clone());
+        let root_id = uuid::Uuid::new_v4().to_string();
+        let mut authorities = RootAuthorities::default();
+        let grant = authorities
+            .fresh_with_root_id(&owner, context.clone(), root_id.clone())
+            .unwrap();
+        assert_eq!(grant.root_id, root_id);
+        assert_eq!(grant.domain_id, owner.domain_id);
+        assert_eq!(grant.guardian_identity, owner.guardian_identity);
+        assert!(
+            authorities
+                .fresh_with_root_id(&owner, context, root_id)
+                .is_err()
+        );
     }
 
     fn open_directory(path: &std::path::Path) -> OwnedFd {

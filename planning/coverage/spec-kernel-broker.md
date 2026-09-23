@@ -3,16 +3,21 @@
 ## Source files
 
 - `crates/oulipoly-kernel-broker/src/identity.rs`
+- `crates/oulipoly-kernel-broker/src/entry_registry.rs`
 - `crates/oulipoly-kernel-broker/src/lib.rs`
 - `crates/oulipoly-kernel-broker/src/linux_main.rs`
 - `crates/oulipoly-kernel-broker/src/main.rs`
 - `crates/oulipoly-kernel-broker/src/protocol.rs`
 - `crates/oulipoly-kernel-broker/src/registry.rs`
 - `crates/oulipoly-kernel-broker/src/work_registry.rs`
+- `src-tauri/src/kernel_entry.rs`
+- `src-tauri/src/completion_owner/linux.rs`
+- `src-tauri/src/completion_owner/original_work.rs`
+- `src-tauri/src/main.rs`
 
 ## Preconditions
 
-- The broker source remains uninstalled and is not a Runner or Bash entry path.
+- The broker source remains uninstalled. The opt-in Runner host-entry staging path is fail-closed before provider dispatch.
 - An installed service would require host root in the initial user/PID namespaces, protected binary and state paths, and a fixed Runner image.
 - Only trusted in-process broker code can call `insert_prepared`, after a separate positive accepted-work check. There is no work-registration socket opcode.
 
@@ -26,7 +31,10 @@
 | Work PID1 with exact live root and direct parent namespace, registered before release. | Fsynced record binding root/work/parent and PID1 incarnation. |
 | Root or work PID1 missing/changed on restart. | Durable unknown debt, never a drain receipt. |
 | Unsolicited descriptor in a challenged socket request. | Descriptor closed and request refused. |
-| Root launch from an unrelated child PID namespace classified `outside`. | Denied because the connector is not in the broker's host PID namespace. |
+| Entry reservation from an unrelated child PID namespace classified `outside`. | Denied because the connector is not in the broker's host PID namespace. |
+| Host entry reserves before guardian fork, then prepares a gated exact child and binds its domain. | Fsynced root/entry/prepared-guardian/domain binding; repeated bind refused. |
+| A sibling child tries to bind a prepared guardian's root ID. | Refused on pinned guardian incarnation mismatch. |
+| Legacy `L` request. | Refused; no ungated Runner is released. |
 | Host-connected socket inherited by a privileged child PID namespace process. | Ancestor PID claim fails in the kernel; a real child send fails the broker's per-request credential equality check. |
 
 ## Edge cases
@@ -41,19 +49,24 @@
 - Unknown, duplicated, malformed, stale, changed, or ambiguous records fail closed.
 - `NS_GET_PARENT`, pidfd, boot/starttime, or namespace errors produce uncertain classification.
 - Wrong root/parent, duplicate accepted work ID, or non-PID1 work target fails registration.
+- Unknown root ID, wrong direct child, mismatched prepared guardian, duplicate prepare/bind, or dead pinned incarnation fails entry binding.
 
 ## Boundaries
 
 - Classification is never positive work authority.
-- The source has no authenticated guardian acceptance handoff, work launch, clean physical drain receipt, or retirement operation.
+- The source has no authenticated Runner join, CLI/GUI descriptor handoff, guardian acceptance handoff, work launch, clean physical drain receipt, or retirement operation.
 - The unprivileged user-namespace fixture cannot establish host-root sudo/setuid behavior.
-- Existing Runner/Bash entry, guardian, allocated-attempt NNP/seccomp, and CLI/GUI paths are unchanged.
+- Ordinary Runner/Bash entry and allocated-attempt NNP/seccomp remain. The opt-in host entry stages a guardian, then refuses dispatch.
 
 ## Declared test patterns
 
 - `crates/oulipoly-kernel-broker/tests/private_pidns.rs` exercises root sibling/nested classification and root debt.
 - `crates/oulipoly-kernel-broker/tests/private_work_pidns.rs` exercises root/work binding, sibling separation, adopted peer classification, persistence poisoning, and restart uncertainty.
-- `crates/oulipoly-kernel-broker/src/linux_main.rs` unit tests exercise challenged credentials, a `CAP_SYS_ADMIN` child namespace socket handoff, exact host namespace launch policy, and descriptor rejection.
+- `crates/oulipoly-kernel-broker/src/linux_main.rs` unit tests exercise challenged credentials, a `CAP_SYS_ADMIN` child namespace socket handoff, exact host namespace policy, descriptor rejection, and production dispatch E/P/G ordering.
+- `crates/oulipoly-kernel-broker/src/entry_registry.rs` exercises persisted exact prepare/bind and sibling/replay denial.
+- `src-tauri/src/kernel_entry.rs` exercises reserve-before-guardian staging and fail-closed root mismatch.
+- `src-tauri/src/completion_owner/linux_admission_tests.rs` exercises prepare-before-release of the guardian gate.
+- `src-tauri/src/completion_owner/original_work.rs` exercises exact broker root ID propagation into a one-use root authority.
 
 ## Cross-references
 

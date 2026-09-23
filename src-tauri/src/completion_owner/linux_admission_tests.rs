@@ -575,3 +575,39 @@ fn committed_join_returns_versioned_root_capability_and_persistence_refusal_is_n
         }
     }
 }
+#[test]
+fn broker_prepare_must_succeed_before_guardian_gate_opens() {
+    use std::cell::RefCell;
+    let events = RefCell::new(Vec::new());
+    let root = uuid::Uuid::new_v4().to_string();
+    super::prepare_kernel_guardian_gate(
+        &root,
+        123,
+        |id, pid| {
+            events.borrow_mut().push("prepare");
+            assert_eq!((id, pid), (root.as_str(), 123));
+            Ok(format!("prepared {id}\n"))
+        },
+        || {
+            events.borrow_mut().push("release");
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(events.into_inner(), ["prepare", "release"]);
+
+    let released = std::cell::Cell::new(false);
+    assert!(
+        super::prepare_kernel_guardian_gate(
+            &root,
+            123,
+            |_, _| Ok("error refused\n".into()),
+            || {
+                released.set(true);
+                Ok(())
+            },
+        )
+        .is_err()
+    );
+    assert!(!released.get());
+}

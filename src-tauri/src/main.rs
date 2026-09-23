@@ -28,6 +28,8 @@ mod dispatch;
 mod error_emit;
 mod invocation;
 mod json_error;
+#[cfg(target_os = "linux")]
+mod kernel_entry;
 mod mailbox_delivery;
 mod maintenance_worker;
 mod migration_providers;
@@ -88,6 +90,10 @@ fn production_entrypoint() -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(result) = kernel_entry::host_entry() {
+        return result;
     }
     process_entrypoint()
 }

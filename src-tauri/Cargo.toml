@@ -23,6 +23,7 @@ clap.workspace = true
 dirs.workspace = true
 fs4.workspace = true
 libc.workspace = true
+oulipoly-kernel-broker = { path = "../crates/oulipoly-kernel-broker" }
 oulipoly-config = { path = "../crates/oulipoly-config" }
 oulipoly-core = { path = "../crates/oulipoly-core" }
 oulipoly-provider = { path = "../crates/oulipoly-provider" }
