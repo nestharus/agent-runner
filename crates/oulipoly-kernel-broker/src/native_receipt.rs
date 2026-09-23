@@ -452,6 +452,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replay, first);
+        // No K transition can be inferred from the prepared broker record.
+        assert!(
+            reopened
+                .consume_native(
+                    &first.grant_id,
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &db,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            reopened.native_record(&attempt.attempt_id).unwrap().state,
+            "prepared"
+        );
         let mut wrong_snapshot = accepted.clone();
         wrong_snapshot.kernel_root_id = uuid::Uuid::new_v4().to_string();
         assert!(
@@ -475,6 +497,147 @@ mod tests {
             Some(bound_row.clone())
         );
         assert!(
+            reopened
+                .consume_native(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &db,
+                )
+                .is_err()
+        );
+        let wrong_peer = PeerIdentity {
+            uid: peer.uid.wrapping_add(1),
+            gid: peer.gid,
+            process: PinnedProcess::open(std::process::id() as i32).unwrap(),
+        };
+        assert!(
+            reopened
+                .consume_native(
+                    &first.grant_id,
+                    &roots,
+                    &entries,
+                    &works,
+                    &wrong_peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &db,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            reopened.native_record(&attempt.attempt_id).unwrap().state,
+            "prepared"
+        );
+        fs::create_dir(dir.path().join("unrelated")).unwrap();
+        let unrelated_state = MailboxDb::open_completion_continuation_domain(
+            &dir.path().join("unrelated/pid-identity.db"),
+        )
+        .unwrap();
+        assert!(
+            reopened
+                .consume_native(
+                    &first.grant_id,
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &unrelated_state,
+                )
+                .is_err()
+        );
+        fs::write(&request_path, b"changed before K").unwrap();
+        assert!(
+            reopened
+                .consume_native(
+                    &first.grant_id,
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &db,
+                )
+                .is_err()
+        );
+        fs::write(&request_path, &request_bytes).unwrap();
+        let spent = reopened
+            .consume_native(
+                &first.grant_id,
+                &roots,
+                &entries,
+                &works,
+                &peer,
+                &host_namespace,
+                &runner_image,
+                &directory,
+                &request,
+                &receipt,
+                &db,
+            )
+            .unwrap();
+        assert_eq!(spent.state, "consumed");
+        assert!(
+            reopened
+                .consume_native(
+                    &first.grant_id,
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &db,
+                )
+                .is_err()
+        );
+        assert!(
+            reopened
+                .prepare_native(
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &root,
+                    &attempt.attempt_id,
+                    &owner.owner_generation,
+                    &receipt_sha,
+                )
+                .is_err()
+        );
+        assert!(
+            db.native_worker_attach(&attempt.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
             db.bind_exact_native_grant(
                 &accepted,
                 &uuid::Uuid::new_v4().to_string(),
@@ -495,8 +658,8 @@ mod tests {
                 .unwrap()
                 .native_record(&attempt.attempt_id)
                 .unwrap()
-                .grant_id,
-            first.grant_id
+                .state,
+            "consumed"
         );
         let duplicate_id = uuid::Uuid::new_v4().to_string();
         let duplicate_path = grants_dir.join(format!("{duplicate_id}.json"));

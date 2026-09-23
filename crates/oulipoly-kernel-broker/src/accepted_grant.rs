@@ -6,6 +6,7 @@ use crate::identity::{PeerIdentity, PinnedProcess, host_proc_file};
 use crate::native_receipt::{BoundNativeAuthority, verify as verify_native_receipt};
 use crate::registry::RootRegistry;
 use crate::work_registry::WorkRegistry;
+use oulipoly_state::mailbox::{MailboxDb, NativeGrantBinding};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -159,7 +160,8 @@ pub struct GrantRecord {
 }
 
 /// A native continuation is a separate protocol from original-work H/K.
-/// Version 4 is prepare debt only; no native K consumer exists yet.
+/// Version 4 can be spent once. A spent record is custody debt, not proof of
+/// worker creation, attach, gate release, or Q.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NativeGrantRecord {
@@ -515,7 +517,7 @@ impl GrantRegistry {
             if version == Some(4) {
                 let record: NativeGrantRecord = serde_json::from_slice(&bytes)?;
                 if record.kind != "native-continuation-v1"
-                    || record.state != "prepared"
+                    || !matches!(record.state.as_str(), "prepared" | "consumed")
                     || uuid::Uuid::parse_str(&record.grant_id).is_err()
                     || format!("{}.json", record.grant_id) != name
                     || uuid::Uuid::parse_str(&record.attempt_id).is_err()
@@ -605,6 +607,149 @@ impl GrantRegistry {
         self.native_records
             .iter()
             .find(|r| r.attempt_id == attempt_id)
+    }
+
+    /// The irreversible native K boundary. The broker supplies a live State
+    /// connection and the same pinned evidence used by N; a caller-supplied
+    /// binding or grant ID alone cannot spend the grant. Call this only once a
+    /// fixed gated worker launch is ready. A consumed record is never reset,
+    /// including after a lost reply or broker restart.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "independent broker, State, process, and file authorities"
+    )]
+    pub fn consume_native(
+        &mut self,
+        grant_id: &str,
+        roots: &RootRegistry,
+        entries: &EntryRegistry,
+        works: &WorkRegistry,
+        caller: &PeerIdentity,
+        host_namespace: &File,
+        runner_image: &File,
+        directory: &File,
+        request: &File,
+        receipt: &File,
+        state: &MailboxDb,
+    ) -> io::Result<NativeGrantRecord> {
+        if self.has_debt() || roots.has_debt() || entries.has_debt() || works.has_debt() {
+            return Err(io::Error::other("native K registry debt"));
+        }
+        let record = self
+            .native_records
+            .iter()
+            .find(|r| r.grant_id == grant_id)
+            .ok_or_else(|| io::Error::other("unknown native grant"))?
+            .clone();
+        if record.state != "prepared" {
+            return Err(io::Error::other("native grant already spent"));
+        }
+        let entry = entries
+            .record(&record.root_id)
+            .ok_or_else(|| io::Error::other("native entry absent"))?;
+        let root = roots
+            .live_roots()
+            .find(|r| r.record.root_id == record.root_id)
+            .ok_or_else(|| io::Error::other("native root absent"))?;
+        if !entry.join_consumed
+            || entry.guardian.as_ref() != Some(&record.guardian)
+            || entry.joined_child.as_ref() != Some(&record.joined_child)
+            || entry.domain_id.as_deref() != Some(record.domain_id.as_str())
+            || entry.supervisor_authority_id.as_deref()
+                != Some(record.supervisor_authority_id.as_str())
+            || entry.owner_uid != record.owner_uid
+            || root.record.owner_uid != record.owner_uid
+            || ProcessStamp::from(&root.init) != record.root_init
+            || ProcessStamp::from(&caller.process) != record.guardian
+            || caller.uid != record.owner_uid
+            || !caller.process.in_namespace(host_namespace)?
+            || !caller.process.same_executable_as(runner_image)?
+        {
+            return Err(io::Error::other("native K owner/root incarnation changed"));
+        }
+        let bound = BoundNativeAuthority {
+            root_id: &record.root_id,
+            domain_id: &record.domain_id,
+            supervisor_authority_id: &record.supervisor_authority_id,
+            owner_generation: &record.owner_generation,
+            owner_uid: record.owner_uid,
+            guardian: &record.guardian,
+            host_namespace,
+            runner_image,
+            receipt_sha256: &record.receipt_sha256,
+        };
+        let verified = verify_native_receipt(caller, &bound, directory, request, receipt)?;
+        if verified.attempt_id != record.attempt_id
+            || verified.accepted_snapshot_sha256 != record.accepted_snapshot_sha256
+            || verified.custodian_request_sha256 != record.custodian_request_sha256
+            || verified.receipt_sha256 != record.receipt_sha256
+            || FileStamp::of(directory)? != record.directory
+            || FileStamp::of(request)? != record.request
+            || FileStamp::of(receipt)? != record.receipt
+            || request.metadata()?.len() != record.request_byte_len
+            || receipt.metadata()?.len() != record.receipt_byte_len
+        {
+            return Err(io::Error::other("native K evidence changed since prepare"));
+        }
+        let binding: NativeGrantBinding = state
+            .native_grant_binding(&record.attempt_id)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("native K State binding absent"))?;
+        if binding.attempt_id != record.attempt_id
+            || binding.grant_id != record.grant_id
+            || binding.protocol != record.kind
+            || binding.accepted_revision != 2
+            || binding.domain_id != record.domain_id
+            || binding.kernel_root_id != record.root_id
+            || binding.supervisor_authority_id != record.supervisor_authority_id
+            || binding.owner_generation != record.owner_generation
+            || binding.guardian_identity.pid != i64::from(record.guardian.host_pid)
+            || binding.guardian_identity.boot_id != record.guardian.boot_id
+            || binding.guardian_identity.starttime_ticks != record.guardian.starttime_ticks as i64
+            || binding.accepted_snapshot_sha256 != record.accepted_snapshot_sha256
+            || binding.custodian_request_sha256 != record.custodian_request_sha256
+        {
+            return Err(io::Error::other("native K State/grant binding conflict"));
+        }
+        root.init.verify()?;
+        caller.process.verify()?;
+        self.consume_native_record(grant_id)
+    }
+
+    fn consume_native_record(&mut self, grant_id: &str) -> io::Result<NativeGrantRecord> {
+        if self.has_debt() {
+            return Err(io::Error::other("uncertain grant registry"));
+        }
+        let index = self
+            .native_records
+            .iter()
+            .position(|r| r.grant_id == grant_id)
+            .ok_or_else(|| io::Error::other("unknown native grant"))?;
+        if self.native_records[index].state != "prepared" {
+            return Err(io::Error::other("native grant already spent"));
+        }
+        let mut consumed = self.native_records[index].clone();
+        consumed.state = "consumed".into();
+        let path = self.directory.join(format!("{grant_id}.json"));
+        let temp = self.directory.join(format!("{grant_id}.tmp"));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp)?;
+            serde_json::to_writer(&mut file, &consumed)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            fs::rename(&temp, &path)?;
+            File::open(&self.directory)?.sync_all()
+        })();
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.native_records[index] = consumed.clone();
+        Ok(consumed)
     }
 
     pub fn has_debt(&self) -> bool {
