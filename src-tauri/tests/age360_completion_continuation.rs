@@ -714,6 +714,85 @@ fn paired_case(mode: &'static str) {
                 .count(),
             1
         );
+        // The selected small body is independently recoverable after the
+        // response and Bash source directory are unavailable. Response-only
+        // policy still has no mailbox row and no ACK.
+        let lost_source = f.root.path().join("removed-bash-source");
+        fs::rename(&source.handle_dir, &lost_source).unwrap();
+        let listed = f
+            .command()
+            .args([
+                "notify",
+                "agent-bash-recovery-list",
+                "--session-id",
+                SESSION,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            listed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+        assert!(
+            listed["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["event_id"] == source.handle)
+        );
+        let all = f
+            .command()
+            .args(["notify", "agent-bash-recovery-list"])
+            .output()
+            .unwrap();
+        assert!(
+            all.status.success(),
+            "{}",
+            String::from_utf8_lossy(&all.stderr)
+        );
+        let all: serde_json::Value = serde_json::from_slice(&all.stdout).unwrap();
+        assert!(
+            all["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["event_id"] == source.handle)
+        );
+        let recovered = f.root.path().join("manual-recovered.bin");
+        let readback = f
+            .command()
+            .args([
+                "notify",
+                "agent-bash-recovery-read",
+                "--event-id",
+                &source.handle,
+                "--output",
+                recovered.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            readback.status.success(),
+            "{}",
+            String::from_utf8_lossy(&readback.stderr)
+        );
+        let readback: serde_json::Value = serde_json::from_slice(&readback.stdout).unwrap();
+        assert_eq!(readback["selected_output"]["kind"], "raw_bytes");
+        assert_eq!(fs::read(&recovered).unwrap(), b"paired-source-output");
+        assert_eq!(
+            readback["presentation_and_ack"][0]["policy"],
+            "response_only"
+        );
+        assert!(f.mailbox().list_pending(SESSION).unwrap().is_empty());
+        assert!(
+            f.mailbox()
+                .completion_event_listeners(&source.handle)
+                .unwrap()[0]
+                .acknowledged_at
+                .is_none()
+        );
         println!(
             "sync output returned; accepted source retained; no notification or ACK; original drain read from source evidence, not suppression"
         );
@@ -2107,6 +2186,27 @@ fn native_missing_output_rejects_transient_then_delivers_original_wait_without_c
             .is_empty()
             .then_some(())
     });
+    let manual = f
+        .command()
+        .args([
+            "notify",
+            "agent-bash-recovery-read",
+            "--event-id",
+            &source.handle,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        manual.status.success(),
+        "{}",
+        String::from_utf8_lossy(&manual.stderr)
+    );
+    let manual: serde_json::Value = serde_json::from_slice(&manual.stdout).unwrap();
+    assert_eq!(manual["selected_output"]["kind"], "selected_missing_output");
+    assert_eq!(
+        manual["selected_output"]["evidence"],
+        receipt["snapshot"]["output"]
+    );
     let attempts = || {
         f.sidecar_connection().query_row("SELECT COUNT(*) FROM completion_continuation_attempt WHERE source_registration_id=?1", [&source.registration_id], |r| r.get::<_,i64>(0)).unwrap()
     };

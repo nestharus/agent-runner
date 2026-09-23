@@ -340,7 +340,7 @@ impl OutputArtifact {
         use std::io::Read;
         if self.representation != "retained-output-v1"
             || self.relative != "completion-output-v2.bin"
-            || self.encoding != "utf8-lossy"
+            || !matches!(self.encoding.as_str(), "raw" | "utf8-lossy")
             || !is_sha256(&self.sha256)
             || self.byte_len > MAX_OUTPUT_BYTES as u64
         {

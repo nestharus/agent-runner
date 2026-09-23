@@ -7,10 +7,217 @@ use oulipoly_state::completion_continuation::{
 use oulipoly_state::mailbox::{CompletionEventTriggerInput, MailboxDb};
 use oulipoly_state::{InvocationMutationAuthority, StateDb};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
 const COMPLETION_REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+pub(crate) fn recovery_list(session_id: Option<&str>, offset: u32) -> Result<i32, String> {
+    let mailbox = MailboxDb::open_read_only(&MailboxDb::default_path()?)?;
+    let events = mailbox.completion_recovery_events(session_id, offset)?;
+    emit(&json!({
+        "status":"ok", "session_id":session_id, "offset":offset,
+        "page_limit":100, "events":events,
+        "next_offset":if events.len()==100 { offset.checked_add(100) } else { None },
+    }))
+}
+
+pub(crate) fn recovery_read(event_id: &str, output: Option<&Path>) -> Result<i32, String> {
+    let mailbox = MailboxDb::open_read_only(&MailboxDb::default_path()?)?;
+    let data_root = oulipoly_state::paths::data_dir()?;
+    let result = recovery_read_from(&mailbox, &data_root, event_id, output)?;
+    emit(&result)
+}
+
+/// This is local manual inspection. No listener activation, notification, ACK,
+/// physical drain, source retry, or workload execution is reachable here.
+fn recovery_read_from(
+    mailbox: &MailboxDb,
+    data_root: &Path,
+    event_id: &str,
+    output: Option<&Path>,
+) -> Result<Value, String> {
+    let record = mailbox
+        .completion_recovery_record(event_id)?
+        .ok_or("no accepted v2 completion with that event ID")?;
+    let bytes = mailbox
+        .completion_recovery_payload(event_id)?
+        .ok_or("accepted completion payload is unavailable")?;
+    let payload: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if payload["schema_version"] != 2
+        || payload["kind"] != "agent_bash_complete"
+        || payload["completion_protocol"] != PROTOCOL
+    {
+        return Err("retained completion payload has an unsupported protocol/kind".into());
+    }
+    for (field, expected) in [
+        ("event_id", event_id),
+        ("handle", event_id),
+        (
+            "registration_id",
+            required_string(&record, "registration_id")?,
+        ),
+        ("source_id", required_string(&record, "source_id")?),
+        (
+            "registration_digest",
+            required_string(&record, "registration_digest")?,
+        ),
+    ] {
+        if payload[field] != expected {
+            return Err(format!("retained completion identity conflict at {field}"));
+        }
+    }
+    for (field, expected) in [
+        ("handle", event_id),
+        (
+            "registration_id",
+            required_string(&record, "registration_id")?,
+        ),
+        ("source_id", required_string(&record, "source_id")?),
+        ("domain_id", required_string(&record, "domain_id")?),
+        (
+            "registration_digest",
+            required_string(&record, "registration_digest")?,
+        ),
+    ] {
+        if payload["snapshot"][field] != expected {
+            return Err(format!(
+                "retained selected snapshot identity conflict at {field}"
+            ));
+        }
+    }
+    let selected = &payload["snapshot"]["output"];
+    let output_info = if selected.is_string() {
+        if !payload["output_artifact"].is_null() {
+            return Err("legacy inline text conflicts with retained raw artifact".into());
+        }
+        if output.is_some() {
+            return Err("legacy inline text has no exact raw bytes; no output file written".into());
+        }
+        let content = selected.as_str().unwrap();
+        json!({"kind":"lossy_inline_legacy", "content":content,
+            "retained_text_byte_len":content.len(),
+            "retained_text_sha256":format!("{:x}", Sha256::digest(content.as_bytes())),
+            "exact_raw_bytes_available":false})
+    } else if selected["representation"] == "missing-original-output-v1" {
+        if output.is_some() {
+            return Err("selected original output is missing; no output file written".into());
+        }
+        if !payload["output_artifact"].is_null() {
+            return Err("missing selected output conflicts with retained artifact".into());
+        }
+        json!({"kind":"selected_missing_output", "evidence":selected,
+            "exact_raw_bytes_available":false})
+    } else if selected["representation"] == "retained-output-v1" {
+        let artifact = &payload["output_artifact"];
+        let digest = required_string(selected, "sha256")?;
+        let len = selected["byte_len"]
+            .as_u64()
+            .ok_or("selected output length missing")?;
+        let domain = required_string(&record, "domain_id")?;
+        if uuid::Uuid::parse_str(domain).is_err()
+            || digest.len() != 64
+            || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+            || selected["relative"] != "completion-output-v2.bin"
+            || !matches!(selected["encoding"].as_str(), Some("raw" | "utf8-lossy"))
+            || len > oulipoly_state::completion_continuation::MAX_OUTPUT_BYTES as u64
+        {
+            return Err("unsupported selected raw output descriptor".into());
+        }
+        let path = data_root
+            .join("completion-continuation")
+            .join(domain)
+            .join("outputs")
+            .join(digest);
+        if artifact["path"] != path.to_string_lossy().as_ref()
+            || artifact["sha256"] != digest
+            || artifact["byte_len"] != len
+            || artifact["encoding"] != selected["encoding"]
+        {
+            return Err("retained raw artifact conflicts with selected output".into());
+        }
+        verify_and_copy_raw(&path, len, digest, output)?;
+        json!({"kind":"raw_bytes", "byte_len":len, "sha256":digest,
+            "verified":true, "output_file":output,
+            "exact_raw_bytes_available":true})
+    } else {
+        return Err("unknown selected output representation".into());
+    };
+    let presentation = mailbox.completion_notification_diagnostics(event_id)?;
+    let attempts =
+        mailbox.completion_recovery_attempts(required_string(&record, "registration_id")?)?;
+    Ok(json!({"status":"verified", "event_id":event_id,
+        "source_acceptance":{"phase":"accepted", "registration_id":record["registration_id"],
+            "snapshot_sha256":record["snapshot_sha256"], "outcome_sha256":record["outcome_sha256"],
+            "payload_sha256":record["payload_sha256"], "payload_byte_len":record["payload_byte_len"]},
+        "selected_output":output_info,
+        "presentation_and_ack":presentation,
+        "physical_drain":{
+            "source_reported_original_tree_drained":payload["outcome"]["original_tree_drained"],
+            "attempts":attempts,
+            "assessment":"per_attempt_receipts_only"
+        },
+    }))
+}
+
+fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
+    value[field]
+        .as_str()
+        .ok_or_else(|| format!("missing {field}"))
+}
+
+fn verify_and_copy_raw(
+    path: &Path,
+    expected_len: u64,
+    expected_digest: &str,
+    destination: Option<&Path>,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() != expected_len {
+        return Err("retained selected output length/type conflict".into());
+    }
+    let mut input = File::open(path).map_err(|e| e.to_string())?;
+    let mut staged = destination
+        .map(|target| {
+            tempfile::NamedTempFile::new_in(
+                target
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new(".")),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .transpose()?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > expected_len {
+            return Err("retained selected output grew during read".into());
+        }
+        hasher.update(&buffer[..count]);
+        if let Some(file) = staged.as_mut() {
+            file.write_all(&buffer[..count])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if total != expected_len || format!("{:x}", hasher.finalize()) != expected_digest {
+        return Err("retained selected output digest/length conflict".into());
+    }
+    if let (Some(file), Some(target)) = (staged, destination) {
+        file.as_file().sync_all().map_err(|e| e.to_string())?;
+        file.persist_noclobber(target).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
 
 /// A completion registration coordinates State and the PID mailbox sidecar.
 /// The persistence layer deliberately releases State instead of waiting while
@@ -361,7 +568,38 @@ pub(crate) fn listen(path: &Path, session_id: &str, invocation_uuid: &str) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::register_with_backpressure;
+    use super::{register_with_backpressure, verify_and_copy_raw};
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn manual_raw_read_rejects_corruption_without_publishing_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("selected");
+        let destination = root.path().join("recovered");
+        let selected = b"a\xff\x00z";
+        std::fs::write(&source, selected).unwrap();
+        let digest = format!("{:x}", Sha256::digest(selected));
+        verify_and_copy_raw(&source, selected.len() as u64, &digest, Some(&destination)).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), selected);
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::write(&source, b"a\xff\x00x").unwrap();
+        assert!(
+            verify_and_copy_raw(&source, selected.len() as u64, &digest, Some(&destination))
+                .is_err()
+        );
+        assert!(!destination.exists());
+        std::fs::write(&source, selected).unwrap();
+        assert!(
+            verify_and_copy_raw(
+                &source,
+                selected.len() as u64 - 1,
+                &digest,
+                Some(&destination)
+            )
+            .is_err()
+        );
+        assert!(!destination.exists());
+    }
 
     #[test]
     fn completion_authority_contention_retries_after_the_state_transaction_unwinds() {

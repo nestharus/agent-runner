@@ -91,6 +91,100 @@ impl CompletionAuthorityFence<'_> {
 }
 
 impl MailboxDb {
+    /// Manual, read-only discovery is anchored in accepted source records, so
+    /// response-only listeners are visible even without a mailbox row.
+    pub fn completion_recovery_events(
+        &self,
+        session_id: Option<&str>,
+        offset: u32,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        if session_id == Some("") {
+            return Err("session ID is required".into());
+        }
+        if domain_on(&self.conn)?.is_none() {
+            return Err("unsupported_transition_required".into());
+        }
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT s.event_id,s.registration_id,s.domain_id,e.triggered_at
+             FROM completion_continuation_source s
+             JOIN completion_event e ON e.event_id=s.event_id
+             WHERE s.phase='accepted' AND e.state='triggered'
+               AND (?1 IS NULL OR EXISTS(SELECT 1 FROM completion_event_listener l
+                   WHERE l.event_id=s.event_id AND l.session_id=?1))
+             ORDER BY e.triggered_at DESC,s.event_id DESC LIMIT 100 OFFSET ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![session_id, offset], |r| {
+                Ok(serde_json::json!({
+                    "event_id":r.get::<_,String>(0)?,
+                    "registration_id":r.get::<_,String>(1)?,
+                    "domain_id":r.get::<_,String>(2)?,
+                    "triggered_at":r.get::<_,Option<String>>(3)?,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.map(|r| r.map_err(|e| e.to_string())).collect()
+    }
+
+    pub fn completion_recovery_record(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        if domain_on(&self.conn)?.is_none() {
+            return Err("unsupported_transition_required".into());
+        }
+        self.conn.query_row(
+            "SELECT s.registration_id,s.domain_id,s.source_id,s.registration_digest,
+                    s.snapshot_sha256,s.outcome_sha256,s.payload_sha256,s.payload_byte_len,
+                    e.payload_file_path,e.state,e.triggered_at
+             FROM completion_continuation_source s
+             JOIN completion_event e ON e.event_id=s.event_id
+             WHERE s.event_id=?1 AND s.phase='accepted' AND e.state='triggered'",
+            [event_id], |r| Ok(serde_json::json!({
+                "event_id":event_id,
+                "registration_id":r.get::<_,String>(0)?, "domain_id":r.get::<_,String>(1)?,
+                "source_id":r.get::<_,String>(2)?, "registration_digest":r.get::<_,String>(3)?,
+                "snapshot_sha256":r.get::<_,String>(4)?, "outcome_sha256":r.get::<_,String>(5)?,
+                "payload_sha256":r.get::<_,String>(6)?, "payload_byte_len":r.get::<_,i64>(7)?,
+                "payload_file_path":r.get::<_,String>(8)?, "event_state":r.get::<_,String>(9)?,
+                "triggered_at":r.get::<_,Option<String>>(10)?,
+            }))
+        ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn completion_recovery_attempts(
+        &self,
+        registration_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT attempt_id,operation,phase,integrated,drain_receipt
+             FROM completion_continuation_attempt WHERE source_registration_id=?1
+             ORDER BY attempt_id LIMIT 1001",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([registration_id], |r| {
+                Ok(serde_json::json!({
+                    "attempt_id":r.get::<_,String>(0)?, "operation":r.get::<_,String>(1)?,
+                    "phase":r.get::<_,String>(2)?, "integrated":r.get::<_,bool>(3)?,
+                    "drain_receipt":r.get::<_,Option<String>>(4)?,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        let attempts: Vec<_> = rows
+            .map(|r| r.map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        if attempts.len() > 1000 {
+            return Err("completion recovery attempt projection exceeds bound".into());
+        }
+        Ok(attempts)
+    }
+
     pub(crate) fn has_original_completion_source(
         &self,
         binding: &AdmittedSourceBinding,
