@@ -3230,6 +3230,41 @@ impl MailboxDb {
         completion_event_by_id_on(&self.conn, event_id)
     }
 
+    /// Read only the immutable JSON belonging to a committed v2 acceptance.
+    /// The path is reconstructed from the sidecar address, never followed from
+    /// the event JSON or a caller-supplied pathname.
+    pub fn completion_recovery_payload(&self, event_id: &str) -> Result<Option<Vec<u8>>, String> {
+        let Some(record) = self.completion_recovery_record(event_id)? else {
+            return Ok(None);
+        };
+        let digest = record["payload_sha256"]
+            .as_str()
+            .ok_or("missing payload digest")?;
+        let len = record["payload_byte_len"]
+            .as_u64()
+            .ok_or("missing payload length")?;
+        if len > 32 * 1024 * 1024 {
+            return Err("completion recovery payload exceeds read bound".into());
+        }
+        let path = self.payloads().payload_path_for_sha256(digest)?;
+        if record["payload_file_path"].as_str() != Some(path.to_string_lossy().as_ref()) {
+            return Err("completion payload path conflicts with accepted address".into());
+        }
+        let payload = PublishedMailboxPayload {
+            address: payload_address(digest),
+            file_path: path.clone(),
+            sha256: digest.into(),
+            byte_len: len,
+            retention_policy: MAILBOX_PAYLOAD_RETENTION_POLICY.into(),
+        };
+        self.payloads().verify_published_payload(&payload)?;
+        let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+        if bytes.len() as u64 != len || sha256_hex(&bytes) != digest {
+            return Err("completion recovery payload changed during read".into());
+        }
+        Ok(Some(bytes))
+    }
+
     pub fn completion_event_listeners(
         &self,
         event_id: &str,
