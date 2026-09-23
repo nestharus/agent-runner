@@ -161,8 +161,9 @@ pub struct GrantRecord {
 }
 
 /// A native continuation is a separate protocol from original-work H/K.
-/// Version 4 can be spent once. A spent record is custody debt, not proof of
-/// worker creation, attach, gate release, or Q.
+/// Version 4 is preparation debt and is ineligible for native K. A legacy
+/// spent record is custody debt, not proof of worker creation, attach, gate
+/// release, or Q.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NativeGrantRecord {
@@ -186,8 +187,10 @@ pub struct NativeGrantRecord {
     pub receipt: FileStamp,
     pub request_byte_len: u64,
     pub receipt_byte_len: u64,
-    /// The sidecar named by the guardian's digest-bound request at N. Older
-    /// v4 records remain readable debt but have no native K preflight.
+    /// The sidecar named by the guardian's digest-bound request at N. This is
+    /// diagnostic evidence only: the name was observed after acceptance and
+    /// cannot identify the connection or WAL that committed acceptance.
+    /// Older v4 records remain readable debt but have no native K preflight.
     #[serde(default)]
     pub state_path: Option<PathBuf>,
     #[serde(default)]
@@ -647,17 +650,55 @@ impl GrantRegistry {
             .find(|r| r.attempt_id == attempt_id)
     }
 
-    /// Read-only native K preflight. The guardian's N request names the State
-    /// path, and N retained that named file's inode. K must send that actual
-    /// descriptor. No caller-supplied MailboxDb or sidecar path is trusted.
-    /// This cannot consume or release a worker until broker-owned attach and
-    /// lost-reply recovery exist. The N pathname/inode observation is not yet
-    /// a State-origin attestation of the guardian's open SQLite connection.
+    /// A v4 N record can prove request/receipt consistency, but cannot prove
+    /// which SQLite connection committed acceptance. Even a successful
+    /// legacy preflight must never be promoted to native K authority. A new
+    /// broker-owned storage protocol needs its own versioned authorization.
     #[expect(
         clippy::too_many_arguments,
         reason = "independent broker, State, process, and file authorities"
     )]
     pub fn verify_native_k(
+        &self,
+        spec: &NativeKSpec,
+        roots: &RootRegistry,
+        entries: &EntryRegistry,
+        works: &WorkRegistry,
+        caller: &PeerIdentity,
+        host_namespace: &File,
+        runner_image: &File,
+        directory: &File,
+        request: &File,
+        receipt: &File,
+        sidecar: &File,
+    ) -> io::Result<NativeGrantRecord> {
+        self.inspect_legacy_native_k_preflight(
+            spec,
+            roots,
+            entries,
+            works,
+            caller,
+            host_namespace,
+            runner_image,
+            directory,
+            request,
+            receipt,
+            sidecar,
+        )?;
+        Err(io::Error::other(
+            "native K requires broker-owned accepted State authority; v4 N is preparation debt",
+        ))
+    }
+
+    /// Diagnostic only: the guardian's N request names a sidecar, and N pins
+    /// its inode after acceptance. This exact-row check is intentionally not
+    /// a release or consumption API. The pathname may already be a copy of
+    /// the database used by the guardian's acceptance connection.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "independent broker, State, process, and file authorities"
+    )]
+    pub(crate) fn inspect_legacy_native_k_preflight(
         &self,
         spec: &NativeKSpec,
         roots: &RootRegistry,

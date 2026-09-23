@@ -498,7 +498,7 @@ mod tests {
         );
         assert!(
             old_registry
-                .verify_native_k(
+                .inspect_legacy_native_k_preflight(
                     &k_spec,
                     &roots,
                     &entries,
@@ -518,7 +518,7 @@ mod tests {
         // No K transition can be inferred from the prepared broker record.
         assert!(
             reopened
-                .verify_native_k(
+                .inspect_legacy_native_k_preflight(
                     &k_spec,
                     &roots,
                     &entries,
@@ -561,7 +561,7 @@ mod tests {
         );
         assert!(
             reopened
-                .verify_native_k(
+                .inspect_legacy_native_k_preflight(
                     &wrong_k_spec,
                     &roots,
                     &entries,
@@ -583,7 +583,7 @@ mod tests {
         };
         assert!(
             reopened
-                .verify_native_k(
+                .inspect_legacy_native_k_preflight(
                     &k_spec,
                     &roots,
                     &entries,
@@ -609,7 +609,7 @@ mod tests {
         let unrelated_sidecar = File::open(&unrelated_path).unwrap();
         assert!(
             reopened
-                .verify_native_k(
+                .inspect_legacy_native_k_preflight(
                     &k_spec,
                     &roots,
                     &entries,
@@ -638,7 +638,7 @@ mod tests {
         let copied_sidecar = File::open(&copied_path).unwrap();
         assert!(
             reopened
-                .verify_native_k(
+                .inspect_legacy_native_k_preflight(
                     &k_spec,
                     &roots,
                     &entries,
@@ -656,7 +656,7 @@ mod tests {
         fs::write(&request_path, b"changed before K").unwrap();
         assert!(
             reopened
-                .verify_native_k(
+                .inspect_legacy_native_k_preflight(
                     &k_spec,
                     &roots,
                     &entries,
@@ -673,7 +673,7 @@ mod tests {
         );
         fs::write(&request_path, &request_bytes).unwrap();
         let verified_k = reopened
-            .verify_native_k(
+            .inspect_legacy_native_k_preflight(
                 &k_spec,
                 &roots,
                 &entries,
@@ -688,6 +688,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(verified_k.state, "prepared");
+        let refused = reopened
+            .verify_native_k(
+                &k_spec,
+                &roots,
+                &entries,
+                &works,
+                &peer,
+                &host_namespace,
+                &runner_image,
+                &directory,
+                &request,
+                &receipt,
+                &sidecar,
+            )
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("requires broker-owned accepted State authority")
+        );
+        assert_eq!(
+            reopened.native_record(&attempt.attempt_id).unwrap().state,
+            "prepared"
+        );
         let foreign_guardian = PeerIdentity {
             uid: peer.uid,
             gid: peer.gid,
@@ -695,7 +719,7 @@ mod tests {
         };
         assert!(
             reopened
-                .verify_native_k(
+                .inspect_legacy_native_k_preflight(
                     &k_spec,
                     &roots,
                     &entries,
@@ -730,7 +754,7 @@ mod tests {
         ] {
             assert!(
                 reopened
-                    .verify_native_k(
+                    .inspect_legacy_native_k_preflight(
                         &conflict,
                         &roots,
                         &entries,
@@ -748,7 +772,7 @@ mod tests {
         }
         assert!(
             reopened
-                .verify_native_k(
+                .inspect_legacy_native_k_preflight(
                     &k_spec,
                     &roots,
                     &entries,
@@ -813,7 +837,7 @@ mod tests {
         );
         assert!(
             restarted_grants
-                .verify_native_k(
+                .inspect_legacy_native_k_preflight(
                     &k_spec,
                     &roots,
                     &entries,
@@ -827,6 +851,25 @@ mod tests {
                     &sidecar,
                 )
                 .is_ok()
+        );
+        assert!(
+            restarted_grants
+                .verify_native_k(
+                    &k_spec,
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &sidecar,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("requires broker-owned accepted State authority")
         );
         assert!(
             restarted_state
@@ -846,7 +889,7 @@ mod tests {
         let mut spent_registry = GrantRegistry::open(&grants_dir).unwrap();
         assert!(
             spent_registry
-                .verify_native_k(
+                .inspect_legacy_native_k_preflight(
                     &k_spec,
                     &roots,
                     &entries,
@@ -933,6 +976,32 @@ mod tests {
                 .is_err()
         );
         fs::write(&request_path, &request_bytes).unwrap();
+        // The copied database contains the exact bound row, but replacing the
+        // pathname after N cannot turn it into N's pinned file. Do not open
+        // this copied file with SQLite under the old WAL name after the swap.
+        let held_state = dir.path().join("held-pid-identity.db");
+        fs::rename(&state_path, &held_state).unwrap();
+        fs::rename(&copied_path, &state_path).unwrap();
+        let replaced = reopened
+            .inspect_legacy_native_k_preflight(
+                &k_spec,
+                &roots,
+                &entries,
+                &works,
+                &peer,
+                &host_namespace,
+                &runner_image,
+                &directory,
+                &request,
+                &receipt,
+                &sidecar,
+            )
+            .unwrap_err();
+        assert!(replaced.to_string().contains("sidecar path/inode conflict"));
+        assert_eq!(
+            reopened.native_record(&attempt.attempt_id).unwrap().state,
+            "prepared"
+        );
         fs::rename(&receipt_path, dir.path().join("moved-receipt")).unwrap();
         assert!(verify(&peer, &bound, &directory, &request, &receipt).is_err());
     }
