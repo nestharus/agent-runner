@@ -1135,6 +1135,193 @@ fn normal_sleeping_recipient() {
     paired_case("async");
 }
 #[test]
+fn paired_two_native_sources_share_one_activation_and_drain() {
+    if private_case(true) {
+        return;
+    }
+    let f = Fixture::new("two_source");
+    f.gate("release-resume");
+    f.gate("test-descendant-enabled");
+    let mut initial = f.start();
+    let sources = wait(|| {
+        let sources = oulipoly_state::StateDb::open_historical_read_only(&f.data.join("state.db"))
+            .ok()?
+            .admitted_completion_continuations()
+            .ok()?;
+        (sources.len() == 2).then_some(sources)
+    });
+    let registrations: Vec<_> = sources
+        .iter()
+        .map(|binding| binding.registration().unwrap())
+        .collect();
+    assert_ne!(
+        registrations[0].registration_id,
+        registrations[1].registration_id
+    );
+    let pause = f
+        .command()
+        .args(["mailbox", "pause", "--session-id", SESSION])
+        .output()
+        .unwrap();
+    assert!(
+        pause.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    f.gate("release-workload");
+    f.wait_initial(&mut initial);
+    wait(|| {
+        let mailbox = f.mailbox_for_poll()?;
+        registrations
+            .iter()
+            .all(|source| {
+                mailbox
+                    .completion_continuation_acceptance(&source.registration_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| row["phase"] == "accepted")
+            })
+            .then_some(())
+    });
+    assert_eq!(f.mailbox().list_pending(SESSION).unwrap().len(), 2);
+    let resume = f
+        .command()
+        .args(["mailbox", "resume", "--session-id", SESSION])
+        .output()
+        .unwrap();
+    assert!(
+        resume.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    let (claim, attempt) = wait(|| {
+        let mailbox = f.mailbox_for_poll()?;
+        let claim = mailbox.wake_session_reader().wake_claim(SESSION).ok()??;
+        let attempt = mailbox
+            .continuation_activation(SESSION, &claim.claim_token)
+            .ok()??;
+        Some((claim, attempt))
+    });
+    let links: i64 = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT COUNT(*) FROM completion_continuation_attempt_source WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(links, 2);
+    for source in &registrations {
+        let mailbox = f.mailbox();
+        assert_eq!(
+            mailbox
+                .continuation_attempt_association_completeness(&source.registration_id)
+                .unwrap(),
+            "known"
+        );
+        assert_eq!(
+            mailbox
+                .pending_continuation_attempt_ids(&source.registration_id)
+                .unwrap(),
+            vec![attempt.attempt_id.clone()]
+        );
+        assert!(
+            mailbox
+                .completion_recovery_attempts(&source.registration_id)
+                .unwrap()
+                .iter()
+                .any(|row| row["attempt_id"] == attempt.attempt_id
+                    && row["association_completeness"] == "known")
+        );
+    }
+    let first_receipt: serde_json::Value = wait(|| {
+        serde_json::from_slice(&fs::read(f.root.path().join("recipient-byte-receipt.json")).ok()?)
+            .ok()
+    });
+    let second_receipt: serde_json::Value = wait(|| {
+        serde_json::from_slice(
+            &fs::read(f.root.path().join("recipient-second-byte-receipt.json")).ok()?,
+        )
+        .ok()
+    });
+    assert_ne!(first_receipt["seq"], second_receipt["seq"]);
+    assert_eq!(first_receipt["artifact"], true);
+    assert_eq!(second_receipt["byte_len"], 20);
+    wait(|| {
+        let mailbox = f.mailbox_for_poll()?;
+        registrations
+            .iter()
+            .all(|source| {
+                mailbox
+                    .completion_event_listeners(&source.handle)
+                    .ok()
+                    .is_some_and(|listeners| {
+                        listeners.len() == 1 && listeners[0].acknowledged_at.is_some()
+                    })
+            })
+            .then_some(())
+    });
+    let descendant: i64 = fs::read_to_string(f.root.path().join("descendant.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(read_live_process_identity(descendant).unwrap().is_some());
+    assert_eq!(
+        f.mailbox()
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .unwrap()
+            .unwrap()
+            .claim_token,
+        claim.claim_token
+    );
+    f.gate("release-descendant");
+    wait(|| {
+        let mailbox = f.mailbox_for_poll()?;
+        (mailbox
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .ok()?
+            .is_none()
+            && registrations.iter().all(|source| {
+                mailbox
+                    .pending_continuation_attempt_ids(&source.registration_id)
+                    .ok()
+                    .is_some_and(|ids| ids.is_empty())
+            }))
+        .then_some(())
+    });
+    for source in &registrations {
+        assert!(
+            f.mailbox()
+                .completion_recovery_attempts(&source.registration_id)
+                .unwrap()
+                .iter()
+                .any(|row| row["attempt_id"] == attempt.attempt_id
+                    && row["phase"] == "drained"
+                    && row["drain_receipt"].is_string())
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(f.root.path().join("source-launches"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.path().join("resume-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    println!(
+        "two native accepted sources, one exact claim={}, one activation={}, two raw receipts and ACKs, retained physical drain",
+        claim.claim_token, attempt.attempt_id
+    );
+}
+#[test]
 fn paired_v2_ack_precedes_physical_activation_drain() {
     if private_case(true) {
         return;

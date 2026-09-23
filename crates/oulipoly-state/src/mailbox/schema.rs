@@ -106,6 +106,23 @@ fn migrate_completion_attempt_sources(conn: &Connection) -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     }
+    let source_present: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('completion_continuation_source')
+             WHERE name='attempt_association_history')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !source_present {
+        // The old source set may have shared activations whose claims are gone.
+        // This metadata-only addition avoids a historical scan under the writer.
+        conn.execute_batch(
+            "ALTER TABLE completion_continuation_source
+             ADD COLUMN attempt_association_history TEXT NOT NULL DEFAULT 'unknown';",
+        )
+        .map_err(|error| error.to_string())?;
+    }
     conn.execute_batch(include_str!(
         "migrations/0025_completion_attempt_sources.sql"
     ))
@@ -981,6 +998,7 @@ pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
         DROP TABLE mailbox_completed_turn_tails;
         DROP TRIGGER completion_continuation_notification_ack;
         DROP TABLE completion_continuation_notification;
+        DROP TABLE completion_continuation_attempt_source;
         DROP TABLE completion_continuation_attempt;
         DROP TABLE completion_continuation_source;
         DROP TABLE completion_continuation_context;
@@ -1101,6 +1119,171 @@ mod contention_tests {
     use std::sync::mpsc;
 
     #[test]
+    fn v25_source_history_guard_is_part_of_schema_invariant() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let db = super::super::MailboxDb::open(&path).unwrap();
+        for guard in [
+            "completion_source_supervisor_authority_insert",
+            "completion_source_supervisor_authority_immutable",
+        ] {
+            let sql: String = db
+                .connection()
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [guard],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(sql.contains("attempt_association_history"));
+        }
+        db.connection()
+            .execute_batch("DROP TRIGGER completion_source_supervisor_authority_immutable;")
+            .unwrap();
+        drop(db);
+        assert!(
+            super::super::MailboxDb::open(&path)
+                .err()
+                .unwrap()
+                .contains("completion domain schema lineage differs")
+        );
+    }
+
+    #[test]
+    fn historical_source_status_is_a_point_read_on_large_attempt_history() {
+        const ROWS: i64 = 20_000;
+        const VM_BUDGET: usize = 5_000;
+        let directory = tempfile::tempdir().unwrap();
+        let mut db =
+            super::super::MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        db.register_completion_event(super::super::CompletionEventRegistrationInput {
+            event_id: "old-source-event",
+            delivery_mode: "async",
+            owner_session_id: Some("old-receiver"),
+            owner_invocation_uuid: Some("old-owner"),
+            state_dir: "/private/old",
+            meta_path: "/private/old/meta",
+            log_path: "/private/old/log",
+            rc_path: "/private/old/rc",
+        })
+        .unwrap();
+        let domain = db.completion_continuation_domain().unwrap().unwrap();
+        let conn = db.connection();
+        conn.execute(
+            "INSERT INTO completion_continuation_source
+             (registration_id,domain_id,source_id,event_id,registration_digest,binding)
+             VALUES('old-source',?1,'old-source','old-source-event','digest',x'00')",
+            [&domain],
+        )
+        .unwrap();
+        // Drained pre-v25 attempts can retain no claim or source-set link.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{ROWS})
+             INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              source_registration_id,session_id,claim_token,phase,result_path,
+              integrated,drain_receipt)
+             SELECT printf('old-attempt-%08d',x),'{domain}','old-owner','activation',
+                    'digest','other-source','other-receiver',printf('old-claim-%08d',x),
+                    'drained','/private/old/result',1,'old-receipt' FROM n;"
+        ))
+        .unwrap();
+        let old_steps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&old_steps);
+        conn.progress_handler(
+            1,
+            Some(move || observed.fetch_add(1, Ordering::Relaxed) >= VM_BUDGET),
+        )
+        .unwrap();
+        let old_query = conn.query_row(
+            "SELECT EXISTS(
+             SELECT 1 FROM completion_continuation_source source
+             JOIN completion_continuation_attempt attempt ON attempt.domain_id=source.domain_id
+             WHERE source.registration_id=?1 AND attempt.operation='activation'
+               AND attempt.association_completeness='unknown'
+               AND (attempt.source_registration_id=source.registration_id
+                 OR EXISTS (SELECT 1 FROM completion_event_listener listener
+                            WHERE listener.event_id=source.event_id
+                              AND listener.session_id=attempt.session_id)
+                 OR NOT EXISTS (SELECT 1 FROM completion_event_listener listener
+                                WHERE listener.event_id=source.event_id)))",
+            ["old-source"],
+            |row| row.get::<_, bool>(0),
+        );
+        assert!(matches!(old_query,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::OperationInterrupted));
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+
+        let new_steps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&new_steps);
+        conn.progress_handler(
+            1,
+            Some(move || observed.fetch_add(1, Ordering::Relaxed) >= VM_BUDGET),
+        )
+        .unwrap();
+        assert_eq!(
+            db.continuation_attempt_association_completeness("old-source")
+                .unwrap(),
+            "unknown"
+        );
+        let used = new_steps.load(Ordering::Relaxed);
+        assert!(used < 500, "historical source status used {used} VM steps");
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        let pending_steps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&pending_steps);
+        conn.progress_handler(
+            1,
+            Some(move || observed.fetch_add(1, Ordering::Relaxed) >= VM_BUDGET),
+        )
+        .unwrap();
+        assert!(
+            db.pending_continuation_attempt_ids("old-source")
+                .unwrap()
+                .is_empty()
+        );
+        let pending_used = pending_steps.load(Ordering::Relaxed);
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        eprintln!(
+            "{ROWS} historical attempts: old status interrupted after {} VM steps; point status used {used}",
+            old_steps.load(Ordering::Relaxed)
+        );
+        eprintln!(
+            "{ROWS} historical attempts: unresolved source status used {pending_used} VM steps"
+        );
+        conn.execute_batch(&format!(
+            "INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              source_registration_id,session_id,claim_token,phase,result_path,
+              integrated,drain_receipt)
+             VALUES('old-positive','{domain}','old-owner','activation','digest',
+                    'old-source','old-receiver','deleted-claim','drained',
+                    '/private/old/result',1,'old-receipt');"
+        ))
+        .unwrap();
+        let recovery_steps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&recovery_steps);
+        conn.progress_handler(
+            1,
+            Some(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        )
+        .unwrap();
+        let recovery = db.completion_recovery_attempts("old-source").unwrap();
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0]["attempt_id"], "old-positive");
+        assert_eq!(recovery[0]["association_completeness"], "unknown");
+        eprintln!(
+            "{ROWS} historical attempts: explicit legacy recovery read used {} VM steps",
+            recovery_steps.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
     fn v25_association_schema_step_does_not_scan_large_attempt_history() {
         const ROWS: i64 = 20_000;
         const VM_BUDGET: usize = 5_000;
@@ -1108,8 +1291,18 @@ mod contention_tests {
             let conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(&format!(
                 "CREATE TABLE completion_continuation_attempt(attempt_id TEXT PRIMARY KEY);
+                 CREATE TABLE completion_continuation_source(
+                     registration_id TEXT PRIMARY KEY, domain_id TEXT,
+                     supervisor_authority_id TEXT);
+                 CREATE TABLE completion_supervisor_authority(authority_id TEXT,domain_id TEXT);
+                 CREATE TRIGGER completion_source_supervisor_authority_insert
+                     BEFORE INSERT ON completion_continuation_source BEGIN SELECT 1; END;
+                 CREATE TRIGGER completion_source_supervisor_authority_immutable
+                     BEFORE UPDATE ON completion_continuation_source BEGIN SELECT 1; END;
                  WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{ROWS})
-                 INSERT INTO completion_continuation_attempt(attempt_id) SELECT printf('attempt-%08d',x) FROM n;"
+                 INSERT INTO completion_continuation_attempt(attempt_id) SELECT printf('attempt-%08d',x) FROM n;
+                 WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{ROWS})
+                 INSERT INTO completion_continuation_source(registration_id) SELECT printf('source-%08d',x) FROM n;"
             )).unwrap();
             conn
         }
@@ -1144,6 +1337,15 @@ mod contention_tests {
             [], |row| Ok((row.get(0)?,row.get(1)?)),
         ).unwrap();
         assert_eq!((count, unknown), (ROWS, ROWS));
+        let (sources, unknown_sources): (i64, i64) = corrected
+            .query_row(
+                "SELECT COUNT(*), SUM(attempt_association_history='unknown')
+             FROM completion_continuation_source",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((sources, unknown_sources), (ROWS, ROWS));
         eprintln!(
             "20,000 historical attempts: indexing history interrupted after {} VM steps; v25 step used {used}",
             old_steps.load(Ordering::Relaxed)

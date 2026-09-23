@@ -492,6 +492,16 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                         sql.push_str("; association_completeness TEXT NOT NULL DEFAULT 'unknown'");
                     }
                 }
+                if name == "completion_continuation_source" {
+                    const HISTORY_COLUMN: &str =
+                        ", attempt_association_history TEXT NOT NULL DEFAULT 'unknown'";
+                    if sql.contains(HISTORY_COLUMN) {
+                        sql = sql.replace(HISTORY_COLUMN, "");
+                        sql.push_str(
+                            "; attempt_association_history TEXT NOT NULL DEFAULT 'unknown'",
+                        );
+                    }
+                }
                 if name == "mailbox" {
                     const COLUMN: &str =
                         "completion_provenance TEXT NOT NULL DEFAULT 'unclassified'";
@@ -549,7 +559,9 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
             expected.execute_batch(super::schema::COMPLETION_PROVENANCE_TRIGGER_SQL)
                 .map_err(|e| e.to_string())?;
             expected.execute_batch("ALTER TABLE completion_continuation_attempt
-            ADD COLUMN association_completeness TEXT NOT NULL DEFAULT 'unknown';")
+            ADD COLUMN association_completeness TEXT NOT NULL DEFAULT 'unknown';
+            ALTER TABLE completion_continuation_source
+            ADD COLUMN attempt_association_history TEXT NOT NULL DEFAULT 'unknown';")
                 .map_err(|e| e.to_string())?;
             expected.execute_batch(include_str!("../migrations/0025_completion_attempt_sources.sql"))
                 .map_err(|e| e.to_string())?;

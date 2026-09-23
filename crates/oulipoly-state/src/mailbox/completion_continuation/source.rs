@@ -111,7 +111,7 @@ impl CompletionAuthorityFence<'_> {
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
-        self.tx.execute("INSERT INTO completion_continuation_source(registration_id,domain_id,source_id,event_id,registration_digest,binding,supervisor_authority_id) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![source.registration_id,source.domain_id,source.source_id,source.handle,binding.registration_digest(),bytes,supervisor_authority_id]).map_err(|e| e.to_string())?;
+        self.tx.execute("INSERT INTO completion_continuation_source(registration_id,domain_id,source_id,event_id,registration_digest,binding,supervisor_authority_id,attempt_association_history) VALUES(?1,?2,?3,?4,?5,?6,?7,'known')", params![source.registration_id,source.domain_id,source.source_id,source.handle,binding.registration_digest(),bytes,supervisor_authority_id]).map_err(|e| e.to_string())?;
         Ok(())
     }
 }

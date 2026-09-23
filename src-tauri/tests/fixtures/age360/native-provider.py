@@ -76,6 +76,21 @@ def launch(request):
             runner = os.environ["AGENT_BASH_AGENT_RUNNER_BIN"]
             listed = subprocess.run([runner,"mailbox","list","--session-id",known,"--all","--json"],capture_output=True,check=True,timeout=10)
             rows = json.loads(listed.stdout)["rows"]
+            if case == "two_source":
+                assert len(rows) == 2, rows
+                second = rows[1]
+                assert second["handle"] in prompt
+                second_payload = json.loads(second["payload_json"])
+                second_output = second_payload["snapshot"]["output"]
+                assert second_output["representation"] == "retained-output-v1"
+                assert second_output["encoding"] == "raw"
+                second_artifact = second_payload["output_artifact"]
+                second_raw = pathlib.Path(second_artifact["path"]).read_bytes()
+                assert second_raw == b"paired-source-output"
+                assert len(second_raw) == second_output["byte_len"] == second_artifact["byte_len"]
+                assert hashlib.sha256(second_raw).hexdigest() == second_output["sha256"] == second_artifact["sha256"]
+                pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-second-byte-receipt.json").write_text(json.dumps({"seq": second["seq"], "handle": second["handle"], "byte_len": len(second_raw), "sha256": hashlib.sha256(second_raw).hexdigest()}))
+                rows = rows[:1]
             assert len(rows) == 1
             received_output = None
             received_artifact = False
@@ -156,6 +171,10 @@ def launch(request):
             sequence = str(rows[0]["seq"])
             ack = subprocess.run([runner,"mailbox","ack","--session-id",known,"--from-seq",sequence,"--to-seq",sequence,"--json"],capture_output=True,check=True,timeout=10)
             pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-exact-ack.json").write_bytes(ack.stdout)
+            if case == "two_source":
+                second_seq = str(second["seq"])
+                second_ack = subprocess.run([runner,"mailbox","ack","--session-id",known,"--from-seq",second_seq,"--to-seq",second_seq,"--json"],capture_output=True,check=True,timeout=10)
+                pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-second-exact-ack.json").write_bytes(second_ack.stdout)
         root = pathlib.Path(os.environ["AGE360_ROOT"])
         if root.joinpath("native-channel-mode").exists():
             channel = os.environ["OULIPOLY_RETURN_CHANNEL"]
@@ -290,6 +309,11 @@ def launch(request):
             (root / "bash-dispatch.stderr").write_bytes(result.stderr)
             allowed = (0, 37) if os.environ["AGE360_CASE"] == "early_exit" else (0,)
             if result.returncode not in allowed: raise RuntimeError("actual paired Bash dispatch failed: " + result.stderr.decode(errors="replace"))
+            if case == "two_source":
+                second = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "run", "--delivery", "async", "--completion-scope", "tree", "--", "/bin/sh", "-c", workload], env=env, capture_output=True, timeout=30)
+                (root / "bash-second-dispatch.stdout").write_bytes(second.stdout)
+                (root / "bash-second-dispatch.stderr").write_bytes(second.stderr)
+                if second.returncode != 0: raise RuntimeError("second native Bash dispatch failed: " + second.stderr.decode(errors="replace"))
             (root / "provider-dispatched").touch()
             if case in ("publication_race", "publication_error", "publication_io_error", "hash_cancel", "missing_selection", "missing_pin", "missing_short"):
                 # Actual original owner issues cancellation through the exact Bash

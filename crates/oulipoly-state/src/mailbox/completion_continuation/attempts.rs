@@ -208,7 +208,10 @@ impl MailboxDb {
         &self,
         registration_id: &str,
     ) -> Result<Vec<String>, String> {
-        let mut statement = self.conn.prepare("SELECT a.attempt_id FROM completion_continuation_attempt a WHERE a.phase NOT IN ('drained','never_started') AND (EXISTS (SELECT 1 FROM completion_continuation_attempt_source link WHERE link.attempt_id=a.attempt_id AND link.registration_id=?1) OR (a.operation!='activation' AND a.source_registration_id=?1) OR (a.association_completeness='unknown' AND a.source_registration_id=?1)) ORDER BY a.attempt_id").map_err(|e| e.to_string())?;
+        // The unresolved partial index is the bounded working set. Without an
+        // explicit index choice SQLite may scan all retained terminal history
+        // to satisfy the per-source OR branches on every status read.
+        let mut statement = self.conn.prepare("SELECT a.attempt_id FROM completion_continuation_attempt AS a INDEXED BY completion_continuation_attempt_unresolved WHERE a.phase NOT IN ('drained','never_started') AND (EXISTS (SELECT 1 FROM completion_continuation_attempt_source link WHERE link.attempt_id=a.attempt_id AND link.registration_id=?1) OR (a.operation!='activation' AND a.source_registration_id=?1) OR (a.association_completeness='unknown' AND a.source_registration_id=?1)) ORDER BY a.attempt_id").map_err(|e| e.to_string())?;
         statement
             .query_map([registration_id], |r| r.get(0))
             .map_err(|e| e.to_string())?
@@ -216,34 +219,26 @@ impl MailboxDb {
             .collect()
     }
 
-    /// Whether the per-source list can be read as exhaustive. A pre-v25
-    /// activation in any session used by this source may have included it,
-    /// even when its original claim was already deleted. This is a read-only
-    /// historical check; schema/open never scans or hashes that history.
+    /// Whether the per-source list can be read as exhaustive. A source that
+    /// predates v25 stays unknown: a deleted old claim cannot be reconstructed.
+    /// New registrations are known because all of their attempts use v25 links.
     pub fn continuation_attempt_association_completeness(
         &self,
         registration_id: &str,
     ) -> Result<&'static str, String> {
-        let uncertain: bool = self
-            .conn
+        self.conn
             .query_row(
-                "SELECT EXISTS(
-                SELECT 1 FROM completion_continuation_source source
-                JOIN completion_continuation_attempt attempt
-                  ON attempt.domain_id=source.domain_id
-                WHERE source.registration_id=?1 AND attempt.operation='activation'
-                  AND attempt.association_completeness='unknown'
-                  AND (attempt.source_registration_id=source.registration_id
-                    OR EXISTS (SELECT 1 FROM completion_event_listener listener
-                               WHERE listener.event_id=source.event_id
-                                 AND listener.session_id=attempt.session_id)
-                    OR NOT EXISTS (SELECT 1 FROM completion_event_listener listener
-                                   WHERE listener.event_id=source.event_id)))",
+                "SELECT attempt_association_history FROM completion_continuation_source
+             WHERE registration_id=?1",
                 [registration_id],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )
-            .map_err(|error| error.to_string())?;
-        Ok(if uncertain { "unknown" } else { "known" })
+            .map_err(|error| error.to_string())
+            .and_then(|value| match value.as_str() {
+                "known" => Ok("known"),
+                "unknown" => Ok("unknown"),
+                _ => Err("invalid completion source attempt history".into()),
+            })
     }
 
     /// Bounded unresolved custody for the current root and its explicitly
@@ -2235,8 +2230,9 @@ mod notification_activation_tests {
                 .execute(
                     "INSERT INTO completion_continuation_source
                  (registration_id,domain_id,source_id,event_id,registration_digest,binding,phase,
-                  snapshot_sha256,outcome_sha256,payload_sha256,payload_byte_len)
-                 VALUES(?1,?2,?1,?1,'digest',x'00','accepted','snapshot','outcome',?3,1)",
+                  snapshot_sha256,outcome_sha256,payload_sha256,payload_byte_len,
+                  attempt_association_history)
+                 VALUES(?1,?2,?1,?1,'digest',x'00','accepted','snapshot','outcome',?3,1,'known')",
                     params![event, domain, digest],
                 )
                 .unwrap();
@@ -2370,34 +2366,6 @@ mod notification_activation_tests {
             assert_eq!(recovery[0]["drain_receipt"], receipt);
             assert_eq!(recovery[0]["association_completeness"], "known");
         }
-
-        // A pre-v25 activation can have lost its claim. The scalar identifies
-        // one source, but cannot prove the second was absent from that claim.
-        db.conn
-            .execute(
-                "INSERT INTO completion_continuation_attempt
-             (attempt_id,domain_id,owner_generation,operation,request_sha256,
-              source_registration_id,session_id,claim_token,phase,result_path,
-              supervisor_authority_id,integrated,drain_receipt)
-             VALUES('historical',?1,?2,'activation',?3,'first','receiver',
-                    'deleted-claim','drained','/private/old-result',?4,1,'old-receipt')",
-                params![
-                    domain,
-                    owner.owner_generation,
-                    "0".repeat(64),
-                    owner.supervisor_authority_id
-                ],
-            )
-            .unwrap();
-        for source in ["first", "second"] {
-            assert_eq!(
-                db.continuation_attempt_association_completeness(source)
-                    .unwrap(),
-                "unknown"
-            );
-        }
-        assert_eq!(db.completion_recovery_attempts("first").unwrap().len(), 2);
-        assert_eq!(db.completion_recovery_attempts("second").unwrap().len(), 1);
     }
 
     #[test]

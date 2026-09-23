@@ -61,7 +61,12 @@ ACK and physical claim deletion leave the attempt/source rows intact. Status
 `association_completeness` (`known` or `unknown`). A pre-v25 activation has
 unknown completeness even if its scalar names this source; a deleted claim
 cannot establish whether another source shared it. An unknown status list can
-therefore omit historical attempts and must not be read as exhaustive.
+therefore omit historical attempts and must not be read as exhaustive. The
+source-level status marker is `unknown` for every source registration inherited
+by the v25 migration and `known` for registrations made afterward. The old
+registration set is conservatively unknown even when no historical activation
+can be found: proving its absence would require a history scan on status read.
+The marker is stored on the source row, so status reads are point lookups.
 
 ## Synchronous presentation policy
 
