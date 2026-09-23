@@ -471,6 +471,25 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
         }
     }
     if request.operation == "activation" {
+        let driver: String = tx
+            .query_row(
+                "SELECT driver_identity FROM completion_continuation_owner
+                 WHERE generation=?1 AND phase='running'",
+                [&request.owner_generation],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
+            .ok_or("driver identity unavailable")?;
+        let actual = serde_json::to_string(&SourceProcessIdentity {
+            pid: live.os_pid,
+            boot_id: live.os_boot_id,
+            starttime_ticks: live.os_pid_starttime_ticks,
+        })
+        .map_err(|error| error.to_string())?;
+        if driver != actual {
+            return Err("completion activation must be admitted by independent driver".into());
+        }
         if super::super::session_admission_intent_on(
             tx,
             request
@@ -483,6 +502,26 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
         let claim: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2)", params![request.session_id,request.claim_token], |r| r.get(0)).map_err(|e| e.to_string())?;
         if !claim {
             return Err("activation requires exact current wake claim".into());
+        }
+        let source = pending_notification_source_on(
+            tx,
+            &domain,
+            request
+                .session_id
+                .as_deref()
+                .expect("validated activation session"),
+            request
+                .claim_token
+                .as_deref()
+                .expect("validated activation claim"),
+        )?;
+        let revision = source
+            .as_ref()
+            .map(|id| notification_source_listener_revision_on(tx, id))
+            .transpose()?;
+        if request.source_registration_id != source || request.source_listener_revision != revision
+        {
+            return Err("activation source differs from exact pending notification".into());
         }
     }
     tx.execute("INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,source_registration_id,source_listener_revision,session_id,claim_token,phase,result_path,supervisor_authority_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved',?10,?11)", params![request.attempt_id,domain,request.owner_generation,request.operation,request.request_sha256,request.source_registration_id,request.source_listener_revision,request.session_id,request.claim_token,request.result_path,supervisor_authority_id]).map_err(|e| e.to_string())?;
@@ -565,7 +604,12 @@ pub(in crate::mailbox) fn reserve_activation_on(
     if !native_wake_runtime_ready(metadata.as_ref()) {
         return Err("native activation runtime unavailable before reservation".into());
     }
-    let source:Option<String>=tx.query_row("SELECT s.registration_id FROM completion_event_listener l INDEXED BY idx_completion_event_listener_session_live JOIN completion_continuation_source s ON s.event_id=l.event_id WHERE l.session_id=?1 AND l.retirement_pending=1 ORDER BY s.registration_id LIMIT 1",[input.session_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    // Attribute a receiver activation only to an accepted notification that
+    // was actually included in this claim. A registered source, a historical
+    // listener, or another session's pending row is not activation authority.
+    // Generic pending input may still use the same single receiver lane with
+    // no completion source attached.
+    let source = pending_notification_source_on(tx, &domain, input.session_id, input.claim_token)?;
     let request = ContinuationAttempt {
         attempt_id: uuid::Uuid::new_v4().to_string(),
         owner_generation: generation,
@@ -577,7 +621,10 @@ pub(in crate::mailbox) fn reserve_activation_on(
             input.auto_wake_count,
         ),
         source_registration_id: source.clone(),
-        source_listener_revision: source.as_ref().map(|id| tx.query_row("SELECT COUNT(*) FROM completion_event_listener l JOIN completion_continuation_source s ON s.event_id=l.event_id WHERE s.registration_id=?1",[id],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())).transpose()?,
+        source_listener_revision: source
+            .as_ref()
+            .map(|id| notification_source_listener_revision_on(tx, id))
+            .transpose()?,
         session_id: Some(input.session_id.into()),
         claim_token: Some(input.claim_token.into()),
         result_path: data_root
@@ -590,6 +637,78 @@ pub(in crate::mailbox) fn reserve_activation_on(
             .into_owned(),
     };
     reserve_on(tx, &request)
+}
+
+fn notification_source_listener_revision_on(
+    tx: &Transaction<'_>,
+    registration_id: &str,
+) -> Result<i64, String> {
+    tx.query_row(
+        "SELECT COUNT(*) FROM completion_event_listener AS listener
+         JOIN completion_continuation_source AS source
+           ON source.event_id=listener.event_id
+         WHERE source.registration_id=?1",
+        [registration_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn pending_notification_source_on(
+    tx: &Transaction<'_>,
+    domain: &str,
+    session: &str,
+    token: &str,
+) -> Result<Option<String>, String> {
+    let candidate: Option<(String, String, String, Option<String>, bool, bool, bool)> = tx
+        .query_row(
+            "SELECT source.registration_id,source.domain_id,source.phase,notification.policy,
+                listener.active,listener.retirement_pending,
+                COALESCE(source.payload_sha256=message.payload_sha256,0)
+         FROM session_wake_claim AS claim
+         JOIN completion_event_listener AS listener
+           ON listener.session_id=claim.session_id
+         JOIN mailbox AS message ON message.seq=listener.mailbox_seq
+         JOIN completion_continuation_source AS source
+           ON source.event_id=listener.event_id
+         LEFT JOIN completion_continuation_notification AS notification
+           ON notification.event_id=listener.event_id
+          AND notification.listener_id=listener.listener_id
+         WHERE claim.session_id=?1 AND claim.claim_token=?2
+           AND message.seq BETWEEN claim.min_pending_seq_at_claim
+                               AND claim.max_pending_seq_at_claim
+           AND message.session_id=?1 AND message.kind='agent_bash_complete'
+           AND message.delivered_at IS NULL AND listener.acknowledged_at IS NULL
+         ORDER BY message.seq LIMIT 1",
+            params![session, token],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    match candidate {
+        None => Ok(None),
+        Some((source, source_domain, phase, policy, active, retirement_pending, exact_payload))
+            if source_domain == domain
+                && phase == "accepted"
+                && policy.as_deref() == Some("notify")
+                && active
+                && retirement_pending
+                && exact_payload =>
+        {
+            Ok(Some(source))
+        }
+        Some(_) => Err("pending v2 notification lacks exact accepted source authority".into()),
+    }
 }
 
 impl MailboxDb {
@@ -1423,4 +1542,172 @@ pub(in crate::mailbox) fn native_original_drain_on(
                 "adopter":serde_json::from_str::<serde_json::Value>(&adopter).map_err(|e|e.to_string())?,
                 "receipt":serde_json::from_str::<serde_json::Value>(&receipt).map_err(|e|e.to_string())?}))
         }).transpose()
+}
+
+#[cfg(test)]
+mod notification_activation_tests {
+    use super::*;
+    use crate::mailbox::{CompletionEventRegistrationInput, CompletionEventTriggerInput};
+
+    #[test]
+    fn activation_source_is_the_accepted_pending_row_in_the_exact_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let domain = db.completion_continuation_domain().unwrap().unwrap();
+        let listener = "11111111-1111-4111-8111-111111111111";
+        for event in ["a_registered", "b_accepted", "c_later"] {
+            db.register_completion_event(CompletionEventRegistrationInput {
+                event_id: event,
+                delivery_mode: "async",
+                owner_session_id: Some("receiver"),
+                owner_invocation_uuid: Some(listener),
+                state_dir: "/private/source",
+                meta_path: "/private/source/meta.json",
+                log_path: "/private/source/log",
+                rc_path: "/private/source/rc",
+            })
+            .unwrap();
+        }
+        let mut accepted = Vec::new();
+        for event in ["a_registered", "b_accepted", "c_later"] {
+            let triggered = db
+                .trigger_completion_event(CompletionEventTriggerInput {
+                    event_id: event,
+                    payload_json: r#"{"kind":"agent_bash_complete"}"#,
+                    state_dir: "/private/source",
+                    meta_path: "/private/source/meta.json",
+                    log_path: "/private/source/log",
+                    rc_path: "/private/source/rc",
+                    rc: 0,
+                })
+                .unwrap();
+            accepted.push((
+                event,
+                triggered.mailbox_rows[0].seq,
+                triggered.event.payload_sha256.unwrap(),
+            ));
+        }
+        for (event, phase, digest) in [
+            ("a_registered", "registered", None),
+            ("b_accepted", "accepted", Some(accepted[1].2.as_str())),
+            ("c_later", "accepted", Some(accepted[2].2.as_str())),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO completion_continuation_source
+                 (registration_id,domain_id,source_id,event_id,registration_digest,binding,phase,
+                  snapshot_sha256,outcome_sha256,payload_sha256,payload_byte_len)
+                 VALUES(?1,?2,?1,?3,'digest',x'00',?4,?5,?5,?6,?7)",
+                    params![
+                        event,
+                        domain,
+                        event,
+                        phase,
+                        digest.map(|_| "snapshot"),
+                        digest,
+                        digest.map(|_| 1)
+                    ],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO completion_continuation_notification
+                 (event_id,listener_id,policy,policy_origin,policy_recorded_at)
+                 VALUES(?1,?2,'notify','exact-source','2026-01-01T00:00:00Z')",
+                    params![event, listener],
+                )
+                .unwrap();
+        }
+        let claimed_seq = accepted[1].1;
+        db.conn
+            .execute(
+                "INSERT INTO session_wake_claim
+             (session_id,claim_token,claimed_at,reason,auto_wake_count,
+              min_pending_seq_at_claim,max_pending_seq_at_claim)
+             VALUES('receiver','exact-token','2026-01-01T00:00:00Z','notify_idle',1,?1,?1)",
+                [claimed_seq],
+            )
+            .unwrap();
+        let tx = db.conn.transaction().unwrap();
+        assert_eq!(
+            pending_notification_source_on(&tx, &domain, "receiver", "exact-token")
+                .unwrap()
+                .as_deref(),
+            Some("b_accepted")
+        );
+        assert_eq!(
+            pending_notification_source_on(&tx, &domain, "receiver", "wrong-token").unwrap(),
+            None
+        );
+        tx.commit().unwrap();
+
+        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+            .unwrap()
+            .unwrap();
+        let identity = SourceProcessIdentity {
+            pid: live.os_pid,
+            boot_id: live.os_boot_id,
+            starttime_ticks: live.os_pid_starttime_ticks,
+        };
+        let owner = CompletionDomainOwner {
+            protocol: PROTOCOL.into(),
+            domain_id: domain.clone(),
+            supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            guardian_identity: identity.clone(),
+            driver_identity: identity,
+            endpoint: "/private/owner".into(),
+        };
+        db.publish_completion_continuation_owner(&owner).unwrap();
+        let mut attempt = ContinuationAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: owner.owner_generation,
+            operation: "activation".into(),
+            request_sha256: "0".repeat(64),
+            source_registration_id: None,
+            source_listener_revision: None,
+            session_id: Some("receiver".into()),
+            claim_token: Some("exact-token".into()),
+            result_path: "/private/result.json".into(),
+        };
+        assert!(
+            db.reserve_continuation_attempt(&attempt)
+                .unwrap_err()
+                .contains("source differs from exact pending notification")
+        );
+        attempt.source_registration_id = Some("b_accepted".into());
+        attempt.source_listener_revision = Some(1);
+        db.reserve_continuation_attempt(&attempt).unwrap();
+
+        db.mark_delivered("receiver", None, &[claimed_seq], "receiver-invocation")
+            .unwrap();
+        let tx = db.conn.transaction().unwrap();
+        assert_eq!(
+            pending_notification_source_on(&tx, &domain, "receiver", "exact-token").unwrap(),
+            None,
+            "recipient acknowledgement cannot authorize another activation"
+        );
+        let phase: String = tx
+            .query_row(
+                "SELECT phase FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&attempt.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "reserved", "ACK cannot settle physical custody");
+        assert!(wake_claim_tx(&tx, "receiver").unwrap().is_some());
+        tx.commit().unwrap();
+        db.conn.execute(
+            "UPDATE session_wake_claim SET min_pending_seq_at_claim=?1,max_pending_seq_at_claim=?1
+             WHERE session_id='receiver' AND claim_token='exact-token'",
+            [accepted[0].1],
+        ).unwrap();
+        let tx = db.conn.transaction().unwrap();
+        assert!(
+            pending_notification_source_on(&tx, &domain, "receiver", "exact-token")
+                .unwrap_err()
+                .contains("lacks exact accepted source authority"),
+            "registered-only source must not be laundered through a generic wake"
+        );
+    }
 }
