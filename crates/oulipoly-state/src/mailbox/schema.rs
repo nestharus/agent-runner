@@ -5,6 +5,8 @@
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -77,50 +79,9 @@ fn migrate_completion_mailbox_provenance(conn: &Connection) -> Result<(), String
     // user_version. A normal installed upgrade never enters with this trigger.
     conn.execute_batch("DROP TRIGGER IF EXISTS mailbox_completion_provenance_immutable;")
         .map_err(|error| error.to_string())?;
-    // Installed rows predate the atomic mailbox marker. Inspect only pending
-    // completion payloads; the verifier streams each file's digest before the
-    // small protocol summary is parsed. Missing or corrupt evidence remains
-    // unclassified and therefore cannot enter the generic wake lane.
-    let mut statement = conn
-        .prepare(
-            "SELECT seq,payload_json,payload_file_path,payload_sha256,payload_byte_len,
-                    payload_retention_policy,payload_compacted_at
-             FROM mailbox WHERE kind='agent_bash_complete' AND delivered_at IS NULL
-               AND completion_provenance='unclassified' ORDER BY seq",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-            ))
-        })
-        .map_err(|error| error.to_string())?;
-    for row in rows {
-        let (seq, envelope, path, digest, len, policy, compacted_at) =
-            row.map_err(|error| error.to_string())?;
-        if let Some(provenance) = classify_existing_completion_payload(
-            conn,
-            &envelope,
-            path.as_deref(),
-            digest.as_deref(),
-            len,
-            policy.as_deref(),
-            compacted_at.as_deref(),
-        ) {
-            conn.execute(
-                "UPDATE mailbox SET completion_provenance=?2 WHERE seq=?1",
-                params![seq, provenance],
-            )
-            .map_err(|error| error.to_string())?;
-        }
-    }
+    // Installed pending rows stay unknown at open. A session-scoped retry
+    // reconciles one row at a time, including relational evidence, without
+    // walking pending history while holding the schema writer.
     conn.execute_batch(COMPLETION_PROVENANCE_TRIGGER_SQL)
         .map_err(|error| error.to_string())
 }
@@ -206,17 +167,36 @@ pub(super) fn classify_existing_completion_payload(
         if PathBuf::from(path) != expected {
             return None;
         }
-        let published = super::PublishedMailboxPayload {
-            address: super::payload_address(digest),
-            file_path: expected,
-            sha256: digest.to_string(),
-            byte_len: u64::try_from(len).ok()?,
-            retention_policy: policy.to_string(),
+        if policy != super::MAILBOX_PAYLOAD_RETENTION_POLICY {
+            return None;
+        }
+        let metadata = std::fs::symlink_metadata(&expected).ok()?;
+        if !metadata.is_file()
+            || metadata.permissions().readonly() == false
+            || metadata.len() != u64::try_from(len).ok()?
+        {
+            return None;
+        }
+        let file = std::fs::File::open(&expected).ok()?;
+        let opened = file.metadata().ok()?;
+        if !opened.is_file()
+            || !opened.permissions().readonly()
+            || opened.len() != u64::try_from(len).ok()?
+        {
+            return None;
+        }
+        let mut reader = DigestReader {
+            inner: std::io::BufReader::new(file),
+            digest: Sha256::new(),
+            bytes: 0,
         };
-        super::verify_published_payload(&published).ok()?;
-        let file = std::fs::File::open(&published.file_path).ok()?;
-        serde_json::from_reader::<_, CompletionProtocolSummary>(std::io::BufReader::new(file))
-            .ok()?
+        let summary = serde_json::from_reader::<_, CompletionProtocolSummary>(&mut reader).ok()?;
+        if reader.bytes != u64::try_from(len).ok()?
+            || format!("{:x}", reader.digest.finalize()) != digest
+        {
+            return None;
+        }
+        summary
     } else if file_path.is_none()
         && digest.is_none()
         && byte_len.is_none()
@@ -228,6 +208,23 @@ pub(super) fn classify_existing_completion_payload(
         return None;
     };
     classify_completion_summary(summary)
+}
+
+// Parse and hash the same descriptor. A rename or replacement between two
+// opens cannot supply a digest from one file and protocol fields from another.
+struct DigestReader<R> {
+    inner: R,
+    digest: Sha256,
+    bytes: u64,
+}
+
+impl<R: Read> Read for DigestReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.digest.update(&buffer[..read]);
+        self.bytes += read as u64;
+        Ok(read)
+    }
 }
 
 pub(super) fn classify_direct_completion_payload_json(payload: &str) -> &'static str {
@@ -1071,7 +1068,7 @@ mod contention_tests {
     use std::sync::mpsc;
 
     #[test]
-    fn v23_completion_provenance_backfill_preserves_ambiguity() {
+    fn v23_upgrade_defers_pending_history_and_reconciles_exact_rows() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pid-identity.db");
         let mut mailbox = super::super::MailboxDb::open(&path).unwrap();
@@ -1109,7 +1106,7 @@ mod contention_tests {
         ] {
             mailbox
                 .enqueue_agent_bash_complete(&super::super::AgentBashCompleteEnqueue {
-                    session_id: "receiver",
+                    session_id: handle,
                     handle,
                     payload_json: payload,
                     owner_invocation_uuid: None,
@@ -1154,10 +1151,22 @@ mod contention_tests {
             .unwrap();
         mailbox
             .connection()
+            .execute_batch(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<256)
+             INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+                 state_dir,meta_path,log_path,rc_path,rc)
+             SELECT 'backlog','agent_bash_complete',printf('pending-%d',x),
+                 '{\"schema_version\":1}','2026-09-23T00:00:00Z',
+                 '/private/source','/private/source/meta.json',
+                 '/private/source/log','/private/source/rc',0 FROM n;",
+            )
+            .unwrap();
+        mailbox
+            .connection()
             .execute(
                 "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
                  state_dir,meta_path,log_path,rc_path,rc)
-             VALUES('receiver','agent_bash_complete','old-ambiguous',
+             VALUES('old-ambiguous','agent_bash_complete','old-ambiguous',
                  '{\"schema_version\":1}','2026-09-23T00:00:00Z',
                  '/private/source','/private/source/meta.json',
                  '/private/source/log','/private/source/rc',0)",
@@ -1174,11 +1183,42 @@ mod contention_tests {
             .unwrap();
         drop(mailbox);
 
-        let reopened = super::super::MailboxDb::open(&path).unwrap();
+        let mut reopened = super::super::MailboxDb::open(&path).unwrap();
         assert_eq!(
             sidecar_version(reopened.connection()).unwrap(),
             CURRENT_VERSION
         );
+        let pending_backlog: i64 = reopened
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM mailbox WHERE session_id='backlog'
+             AND completion_provenance='unclassified'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_backlog, 256);
+        for handle in [
+            "old-v2",
+            "old-v2-lost-source",
+            "old-null-marker",
+            "old-legacy",
+            "old-markerless-v2",
+            "old-ambiguous",
+        ] {
+            let provenance: String = reopened
+                .connection()
+                .query_row(
+                    "SELECT completion_provenance FROM mailbox WHERE handle=?1",
+                    [handle],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                provenance, "unclassified",
+                "upgrade must defer all pending history"
+            );
+        }
         for (handle, expected) in [
             ("old-v2", "v2"),
             ("old-v2-lost-source", "v2"),
@@ -1187,6 +1227,12 @@ mod contention_tests {
             ("old-markerless-v2", "unclassified"),
             ("old-ambiguous", "unclassified"),
         ] {
+            super::super::completion_continuation::classify_one_pending_completion(
+                &mut reopened.conn,
+                handle,
+                None,
+            )
+            .unwrap();
             let provenance: String = reopened
                 .connection()
                 .query_row(

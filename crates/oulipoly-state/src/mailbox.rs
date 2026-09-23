@@ -6896,6 +6896,11 @@ impl WakeSessionRepository<'_> {
         renew_token: Option<&str>,
         selected: Option<Option<&SessionMetadataRow>>,
     ) -> Result<WakeClaimAcquireResult, String> {
+        completion_continuation::classify_one_pending_completion(
+            self.conn,
+            input.session_id,
+            None,
+        )?;
         let now = now_rfc3339();
         let mut start = SpanStart::new("wake_claim_acquire", "pid_mailbox_sqlite")
             .with_lifecycle_phase("wake_claim")

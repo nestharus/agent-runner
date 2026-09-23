@@ -195,16 +195,9 @@ fn materialize_on(
     } else if source::bound_event(tx, &event.event_id)? {
         "v2"
     } else {
-        super::super::schema::classify_existing_completion_payload(
-            tx,
-            event.payload_json.as_deref().unwrap_or(""),
-            event.payload_file_path.as_deref(),
-            event.payload_sha256.as_deref(),
-            event.payload_byte_len,
-            event.payload_retention_policy.as_deref(),
-            event.triggered_at.as_deref(),
-        )
-        .unwrap_or("unclassified")
+        // Unbound historical events have no transactional v2 authority. Their
+        // immutable artifact is classified outside the writer on wake retry.
+        "unclassified"
     };
     for listener in pending {
         let handle = completion_listener_mailbox_handle(event, &listener, listener_count);
@@ -230,7 +223,7 @@ fn materialize_on(
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        if stored_provenance != provenance {
+        if provenance != "unclassified" && stored_provenance != provenance {
             return Err(
                 "completion listener mailbox provenance conflicts with accepted source".into(),
             );

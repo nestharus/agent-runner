@@ -13,6 +13,15 @@ impl MailboxDb {
         &mut self,
         request: &ContinuationAttempt,
     ) -> Result<(), String> {
+        if request.operation == "activation" {
+            if let Some(session) = request.session_id.as_deref() {
+                classify_one_pending_completion(
+                    &mut self.conn,
+                    session,
+                    request.claim_token.as_deref(),
+                )?;
+            }
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -660,7 +669,6 @@ fn pending_notification_source_on(
     session: &str,
     token: &str,
 ) -> Result<Option<String>, String> {
-    recover_unclassified_completion_provenance_on(tx, session, token)?;
     // Start at the claimed mailbox rows. An inner join here can erase a v2
     // completion whose source or listener projection is missing, turning it
     // into apparent authority for a source-free activation.
@@ -780,12 +788,24 @@ fn pending_notification_source_on(
     Ok(selected)
 }
 
-fn recover_unclassified_completion_provenance_on(
-    tx: &Transaction<'_>,
+/// Perform at most one artifact verification per attempt, before taking the
+/// sidecar writer. A short conditional update records the verified result.
+/// A changed row or claim is left unknown for a later retry.
+pub(in crate::mailbox) fn classify_one_pending_completion(
+    conn: &mut rusqlite::Connection,
     session: &str,
-    token: &str,
-) -> Result<(), String> {
-    let mut statement = tx.prepare(
+    token: Option<&str>,
+) -> Result<bool, String> {
+    classify_one_pending_completion_with_hook(conn, session, token, || {})
+}
+
+fn classify_one_pending_completion_with_hook(
+    conn: &mut rusqlite::Connection,
+    session: &str,
+    token: Option<&str>,
+    before_writer: impl FnOnce(),
+) -> Result<bool, String> {
+    let candidate = conn.query_row(
         "SELECT message.seq,message.payload_json,message.payload_file_path,
                 message.payload_sha256,message.payload_byte_len,
                 message.payload_retention_policy,message.payload_compacted_at,
@@ -803,17 +823,17 @@ fn recover_unclassified_completion_provenance_on(
                            AND notification.listener_id=listener.listener_id
                           WHERE listener.mailbox_seq=message.seq
                             AND notification.policy_origin LIKE 'exact_admitted_binding:%')
-         FROM session_wake_claim AS claim JOIN mailbox AS message
-           ON message.session_id=claim.session_id
-          AND message.seq BETWEEN claim.min_pending_seq_at_claim
-                              AND claim.max_pending_seq_at_claim
-         WHERE claim.session_id=?1 AND claim.claim_token=?2
+         FROM mailbox AS message
+         WHERE message.session_id=?1
+           AND (?2 IS NULL OR EXISTS(
+               SELECT 1 FROM session_wake_claim AS claim
+               WHERE claim.session_id=?1 AND claim.claim_token=?2
+                 AND message.seq BETWEEN claim.min_pending_seq_at_claim
+                                     AND claim.max_pending_seq_at_claim))
            AND message.kind='agent_bash_complete' AND message.delivered_at IS NULL
            AND message.completion_provenance='unclassified'
-         ORDER BY message.seq",
-    ).map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map(params![session, token], |row| {
+         ORDER BY message.seq LIMIT 1",
+        params![session, token], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -824,35 +844,82 @@ fn recover_unclassified_completion_provenance_on(
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, bool>(7)?,
             ))
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
+        }).optional().map_err(|error| error.to_string())?;
+    let Some((seq, envelope, path, digest, len, policy, compacted_at, source_evidence)) = candidate
+    else {
+        return Ok(false);
+    };
+    let provenance = if source_evidence {
+        Some("v2")
+    } else {
+        super::super::schema::classify_existing_completion_payload(
+            conn,
+            &envelope,
+            path.as_deref(),
+            digest.as_deref(),
+            len,
+            policy.as_deref(),
+            compacted_at.as_deref(),
+        )
+    };
+    let Some(provenance) = provenance else {
+        return Ok(false);
+    };
+    before_writer();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
-    drop(statement);
-    for (seq, envelope, path, digest, len, policy, compacted_at, source_evidence) in rows {
-        let provenance = if source_evidence {
-            Some("v2")
-        } else {
-            super::super::schema::classify_existing_completion_payload(
-                tx,
-                &envelope,
-                path.as_deref(),
-                digest.as_deref(),
-                len,
-                policy.as_deref(),
-                compacted_at.as_deref(),
-            )
-        };
-        if let Some(provenance) = provenance {
-            tx.execute(
-                "UPDATE mailbox SET completion_provenance=?2
-                 WHERE seq=?1 AND completion_provenance='unclassified'",
-                params![seq, provenance],
-            )
-            .map_err(|error| error.to_string())?;
-        }
+    // A newly materialized exact source must never be relabelled legacy.
+    let current_source: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM completion_event_listener AS listener
+                       JOIN completion_continuation_source AS source
+                         ON source.event_id=listener.event_id
+                       WHERE listener.mailbox_seq=?1)
+             OR EXISTS(SELECT 1 FROM completion_continuation_source AS source
+                       JOIN mailbox AS message ON message.seq=?1
+                       WHERE message.handle=source.event_id
+                          OR (message.owner_invocation_uuid IS NOT NULL
+                              AND message.handle=source.event_id || ':' || message.owner_invocation_uuid))
+             OR EXISTS(SELECT 1 FROM completion_event_listener AS listener
+                       JOIN completion_continuation_notification AS notification
+                         ON notification.event_id=listener.event_id
+                        AND notification.listener_id=listener.listener_id
+                       WHERE listener.mailbox_seq=?1
+                         AND notification.policy_origin LIKE 'exact_admitted_binding:%')",
+        [seq], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if provenance == "legacy" && current_source {
+        return Ok(false);
     }
-    Ok(())
+    let changed = tx
+        .execute(
+            "UPDATE mailbox SET completion_provenance=?3
+         WHERE seq=?1 AND session_id=?2 AND kind='agent_bash_complete'
+           AND delivered_at IS NULL AND completion_provenance='unclassified'
+           AND payload_json IS ?4 AND payload_file_path IS ?5
+           AND payload_sha256 IS ?6 AND payload_byte_len IS ?7
+           AND payload_retention_policy IS ?8 AND payload_compacted_at IS ?9
+           AND (?10 IS NULL OR EXISTS(
+               SELECT 1 FROM session_wake_claim AS claim
+               WHERE claim.session_id=?2 AND claim.claim_token=?10
+                 AND mailbox.seq BETWEEN claim.min_pending_seq_at_claim
+                                     AND claim.max_pending_seq_at_claim))",
+            params![
+                seq,
+                session,
+                provenance,
+                envelope,
+                path,
+                digest,
+                len,
+                policy,
+                compacted_at,
+                token
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(changed == 1)
 }
 
 impl MailboxDb {
@@ -1695,6 +1762,240 @@ mod notification_activation_tests {
         AgentBashCompleteEnqueue, CompletionEventRegistrationInput, CompletionEventTriggerInput,
     };
 
+    fn pending_old_row(db: &MailboxDb, handle: &str, template: &str) {
+        db.conn
+            .execute(
+                "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+                state_dir,meta_path,log_path,rc_path,rc,payload_file_path,
+                payload_sha256,payload_byte_len,payload_retention_policy,payload_compacted_at)
+             SELECT 'receiver',kind,?1,payload_json,enqueued_at,state_dir,meta_path,
+                log_path,rc_path,rc,payload_file_path,payload_sha256,payload_byte_len,
+                payload_retention_policy,payload_compacted_at
+             FROM mailbox WHERE handle=?2",
+                params![handle, template],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn old_payload_verification_releases_writer_and_cas_rejects_changed_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        db.enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            session_id: "receiver",
+            handle: "template",
+            payload_json: r#"{"schema_version":2,"kind":"agent_bash_complete","meta":{}}"#,
+            owner_invocation_uuid: None,
+            matched_os_pid: None,
+            matched_os_boot_id: None,
+            matched_os_pid_starttime_ticks: None,
+            matched_chain_index: None,
+            state_dir: "/private/source",
+            meta_path: "/private/source/meta.json",
+            log_path: "/private/source/log",
+            rc_path: "/private/source/rc",
+            rc: 0,
+        })
+        .unwrap();
+        pending_old_row(&db, "pending", "template");
+        let original_digest: String = db
+            .conn
+            .query_row(
+                "SELECT payload_sha256 FROM mailbox WHERE handle='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let mut conn = rusqlite::Connection::open(path).unwrap();
+            classify_one_pending_completion_with_hook(&mut conn, "receiver", None, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .unwrap()
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        // The classifier is paused after reading the artifact. This unrelated
+        // writer must complete, and its changed identity must defeat the CAS.
+        db.conn
+            .execute(
+                "UPDATE mailbox SET payload_sha256=?1 WHERE handle='pending'",
+                ["0".repeat(64)],
+            )
+            .unwrap();
+        release_tx.send(()).unwrap();
+        assert!(!worker.join().unwrap());
+        let marker: String = db
+            .conn
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE handle='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, "unclassified");
+        db.conn
+            .execute(
+                "UPDATE mailbox SET payload_sha256=?1 WHERE handle='pending'",
+                [original_digest],
+            )
+            .unwrap();
+        assert!(classify_one_pending_completion(&mut db.conn, "receiver", None).unwrap());
+        assert!(!classify_one_pending_completion(&mut db.conn, "receiver", None).unwrap());
+        pending_old_row(&db, "missing", "template");
+        let artifact: String = db
+            .conn
+            .query_row(
+                "SELECT payload_file_path FROM mailbox WHERE handle='template'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        std::fs::remove_file(artifact).unwrap();
+        assert!(!classify_one_pending_completion(&mut db.conn, "receiver", None).unwrap());
+        let missing_marker: String = db
+            .conn
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE handle='missing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing_marker, "unclassified");
+    }
+
+    #[test]
+    fn legacy_proof_loses_to_source_materialized_before_cas() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let domain = db.completion_continuation_domain().unwrap().unwrap();
+        db.register_completion_event(CompletionEventRegistrationInput {
+            event_id: "pending",
+            delivery_mode: "async",
+            owner_session_id: Some("receiver"),
+            owner_invocation_uuid: Some("listener"),
+            state_dir: "/private/source",
+            meta_path: "/private/source/meta.json",
+            log_path: "/private/source/log",
+            rc_path: "/private/source/rc",
+        })
+        .unwrap();
+        db.enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            session_id: "receiver",
+            handle: "template",
+            payload_json: r#"{"schema_version":2,"kind":"agent_bash_complete","meta":{}}"#,
+            owner_invocation_uuid: None,
+            matched_os_pid: None,
+            matched_os_boot_id: None,
+            matched_os_pid_starttime_ticks: None,
+            matched_chain_index: None,
+            state_dir: "/private/source",
+            meta_path: "/private/source/meta.json",
+            log_path: "/private/source/log",
+            rc_path: "/private/source/rc",
+            rc: 0,
+        })
+        .unwrap();
+        pending_old_row(&db, "pending", "template");
+        assert!(
+            !classify_one_pending_completion_with_hook(&mut db.conn, "receiver", None, || {
+                let concurrent = rusqlite::Connection::open(&path).unwrap();
+                concurrent
+                    .execute(
+                        "INSERT INTO completion_continuation_source
+                     (registration_id,domain_id,source_id,event_id,registration_digest,binding)
+                     VALUES('pending',?1,'pending','pending','digest',x'00')",
+                        [&domain],
+                    )
+                    .unwrap();
+            },)
+            .unwrap()
+        );
+        let unknown: String = db
+            .conn
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE handle='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unknown, "unclassified");
+        assert!(classify_one_pending_completion(&mut db.conn, "receiver", None).unwrap());
+        db.conn
+            .execute(
+                "DELETE FROM completion_continuation_source WHERE event_id='pending'",
+                [],
+            )
+            .unwrap();
+        let v2: String = db
+            .conn
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE handle='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v2, "v2");
+        assert!(!classify_one_pending_completion(&mut db.conn, "receiver", None).unwrap());
+    }
+
+    #[test]
+    fn listener_replay_preserves_lazily_classified_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        for (event, payload, expected) in [
+            (
+                "old-legacy",
+                r#"{"schema_version":2,"kind":"agent_bash_complete","meta":{}}"#,
+                "legacy",
+            ),
+            (
+                "old-v2",
+                r#"{"completion_protocol":"completion-continuation-v2"}"#,
+                "v2",
+            ),
+        ] {
+            db.register_completion_event(CompletionEventRegistrationInput {
+                event_id: event,
+                delivery_mode: "async",
+                owner_session_id: Some("receiver"),
+                owner_invocation_uuid: Some("listener"),
+                state_dir: "/private/source",
+                meta_path: "/private/source/meta.json",
+                log_path: "/private/source/log",
+                rc_path: "/private/source/rc",
+            })
+            .unwrap();
+            let input = CompletionEventTriggerInput {
+                event_id: event,
+                payload_json: payload,
+                state_dir: "/private/source",
+                meta_path: "/private/source/meta.json",
+                log_path: "/private/source/log",
+                rc_path: "/private/source/rc",
+                rc: 0,
+            };
+            db.trigger_completion_event(input).unwrap();
+            assert!(classify_one_pending_completion(&mut db.conn, "receiver", None).unwrap());
+            db.trigger_completion_event(input).unwrap();
+            let marker: String = db
+                .conn
+                .query_row(
+                    "SELECT completion_provenance FROM mailbox WHERE handle=?1",
+                    [event],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(marker, expected);
+        }
+    }
+
     #[test]
     fn unclassified_old_completion_recovers_only_from_verified_payload() {
         let directory = tempfile::tempdir().unwrap();
@@ -1777,6 +2078,9 @@ mod notification_activation_tests {
                 payload_retention_policy=(SELECT payload_retention_policy FROM mailbox WHERE handle='template-legacy')
              WHERE handle='pending-legacy'", [],
         ).unwrap();
+        tx.commit().unwrap();
+        assert!(classify_one_pending_completion(&mut db.conn, "receiver", Some("claim")).unwrap());
+        let tx = db.conn.transaction().unwrap();
         assert_eq!(
             pending_notification_source_on(&tx, &domain, "receiver", "claim").unwrap(),
             None
@@ -1808,6 +2112,9 @@ mod notification_activation_tests {
                 payload_retention_policy=(SELECT payload_retention_policy FROM mailbox WHERE handle='template-v2')
              WHERE handle='pending-v2'", [],
         ).unwrap();
+        tx.commit().unwrap();
+        assert!(classify_one_pending_completion(&mut db.conn, "receiver", Some("claim")).unwrap());
+        let tx = db.conn.transaction().unwrap();
         assert!(
             pending_notification_source_on(&tx, &domain, "receiver", "claim")
                 .unwrap_err()
@@ -1910,6 +2217,9 @@ mod notification_activation_tests {
                     params![event, listener, format!("exact_admitted_binding:{event}")],
                 )
                 .unwrap();
+        }
+        for _ in 0..5 {
+            assert!(classify_one_pending_completion(&mut db.conn, "receiver", None).unwrap());
         }
         let claimed_seq = accepted[1].1;
         db.conn

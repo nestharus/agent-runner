@@ -450,7 +450,8 @@ pub fn activation_request_sha256(
     )
 }
 pub(super) use attempts::{
-    admit_launcher_on, bind_generation_on, cancel_unaccepted_activation_on, reserve_activation_on,
+    admit_launcher_on, bind_generation_on, cancel_unaccepted_activation_on,
+    classify_one_pending_completion, reserve_activation_on,
 };
 
 pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
