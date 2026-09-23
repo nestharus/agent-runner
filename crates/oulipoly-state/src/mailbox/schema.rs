@@ -315,7 +315,7 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
     }
 }
 
-pub(super) const CURRENT_VERSION: i64 = 28;
+pub(super) const CURRENT_VERSION: i64 = 29;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -497,7 +497,17 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         owner: SidecarEntity::CompletionAuthority,
         apply: migrate_native_grant_binding,
     },
+    MigrationStep {
+        target_version: 29,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_native_worker_kernel_q,
+    },
 ];
+
+fn migrate_native_worker_kernel_q(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0029_native_worker_kernel_q.sql"))
+        .map_err(|error| error.to_string())
+}
 
 fn migrate_native_grant_binding(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("migrations/0028_native_grant_binding.sql"))
@@ -1116,6 +1126,9 @@ pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
         DROP TABLE mailbox_completed_turn_tails;
         DROP TRIGGER completion_continuation_notification_ack;
         DROP TABLE completion_continuation_notification;
+        DROP TABLE completion_native_kernel_q;
+        DROP TABLE completion_native_worker_attach;
+        DROP TRIGGER completion_native_grant_no_legacy_terminal;
         DROP TABLE completion_native_grant_binding;
         DROP TABLE completion_continuation_attempt_source;
         DROP TABLE completion_continuation_attempt;
@@ -1138,7 +1151,10 @@ pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &C
     remove_record_timestamp_contract_for_legacy_fixture(conn);
     remove_attempt_search_generation_for_legacy_fixture(conn);
     conn.execute_batch(
-        "DROP TABLE completion_native_grant_binding;
+        "DROP TABLE completion_native_kernel_q;
+         DROP TABLE completion_native_worker_attach;
+         DROP TRIGGER completion_native_grant_no_legacy_terminal;
+         DROP TABLE completion_native_grant_binding;
          DROP INDEX IF EXISTS completion_continuation_owner_kernel_root;
          ALTER TABLE completion_continuation_owner DROP COLUMN kernel_root_id;
          DROP INDEX IF EXISTS idx_mailbox_pending_session_live;
@@ -1256,8 +1272,8 @@ mod contention_tests {
     use std::sync::mpsc;
 
     #[test]
-    fn published_v24_to_v27_upgrade_to_native_grant_binding_preserves_attempts() {
-        for version in 24..=27 {
+    fn published_v24_to_v28_upgrade_to_native_worker_ledger_preserves_attempts() {
+        for version in 24..=28 {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("pid-identity.db");
             let conn = Connection::open(&path).unwrap();
@@ -1368,6 +1384,65 @@ mod contention_tests {
             .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn v28_binding_upgrades_to_v29_without_rewriting_accepted_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let conn = Connection::open(&path).unwrap();
+        let steps: Vec<_> = SCHEMA_STEPS
+            .iter()
+            .filter(|step| step.target_version <= 28)
+            .map(|step| MigrationStep {
+                target_version: step.target_version,
+                owner: step.owner,
+                apply: step.apply,
+            })
+            .collect();
+        apply_steps(&conn, &steps).unwrap();
+        let domain: String = conn
+            .query_row(
+                "SELECT domain_id FROM completion_continuation_domain",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute("INSERT INTO completion_supervisor_authority(authority_id,domain_id,phase,created_by_generation,guardian_identity) VALUES('v28-supervisor',?1,'active','v28-owner','{}')", [&domain]).unwrap();
+        conn.execute("INSERT INTO completion_continuation_owner(generation,domain_id,phase,guardian_identity,driver_identity,endpoint,supervisor_authority_id,kernel_root_id) VALUES('v28-owner',?1,'running','{}','{}','/v28','v28-supervisor','v28-root')", [&domain]).unwrap();
+        conn.execute("INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,phase,revision,result_path) VALUES('v28-attempt',?1,'v28-owner','transport','digest','accepted',2,'/v28/result')", [&domain]).unwrap();
+        conn.execute("INSERT INTO completion_native_grant_binding(attempt_id,grant_id,protocol,accepted_revision,domain_id,kernel_root_id,supervisor_authority_id,owner_generation,guardian_identity,accepted_snapshot_sha256,custodian_request_sha256) VALUES('v28-attempt','v28-grant','native-continuation-v1',2,?1,'v28-root','v28-supervisor','v28-owner','{}',?2,?3)", params![domain,"a".repeat(64),"b".repeat(64)]).unwrap();
+        conn.pragma_update(None, "user_version", 28).unwrap();
+        drop(conn);
+        let db = super::super::MailboxDb::open(&path).unwrap();
+        assert_eq!(sidecar_version(db.connection()).unwrap(), 29);
+        let retained: (String, i64, i64) = db.connection().query_row("SELECT a.phase,a.revision,a.integrated FROM completion_continuation_attempt a JOIN completion_native_grant_binding b ON b.attempt_id=a.attempt_id WHERE b.grant_id='v28-grant'", [], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(retained, ("accepted".into(), 2, 0));
+        assert!(db.native_worker_attach("v28-attempt").unwrap().is_none());
+        assert!(db.native_kernel_q("v28-attempt").unwrap().is_none());
+    }
+
+    #[test]
+    fn v29_fingerprint_and_downgrade_refuse_missing_or_older_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        drop(super::super::MailboxDb::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TRIGGER completion_native_kernel_q_exact;")
+            .unwrap();
+        drop(conn);
+        let refused = super::super::MailboxDb::open(&path).err().unwrap();
+        assert!(refused.contains("schema lineage differs"), "{refused}");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 28).unwrap();
+        drop(conn);
+        let refused = super::super::MailboxDb::open(&path).err().unwrap();
+        assert!(
+            refused.contains("migration to version 29 failed"),
+            "{refused}"
+        );
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(sidecar_version(&conn).unwrap(), 28);
     }
 
     #[test]
@@ -1828,7 +1903,9 @@ mod contention_tests {
     #[test]
     fn v25_association_schema_step_does_not_scan_large_attempt_history() {
         const ROWS: i64 = 20_000;
-        const VM_BUDGET: usize = 5_000;
+        // The current v29 fingerprint includes two more bounded ledgers and
+        // their guards. This remains below a fixed ceiling independent of rows.
+        const VM_BUDGET: usize = 8_000;
         fn history() -> Connection {
             let conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(&format!(
@@ -2093,7 +2170,12 @@ mod contention_tests {
         // version is 23. Reapplying the step must keep classified rows intact.
         let fixture = Connection::open(&path).unwrap();
         fixture
-            .execute_batch("DROP TABLE completion_native_grant_binding;")
+            .execute_batch(
+                "DROP TABLE completion_native_kernel_q;
+                DROP TABLE completion_native_worker_attach;
+                DROP TRIGGER completion_native_grant_no_legacy_terminal;
+                DROP TABLE completion_native_grant_binding;",
+            )
             .unwrap();
         fixture.pragma_update(None, "user_version", 23).unwrap();
         drop(fixture);
@@ -2224,7 +2306,10 @@ mod contention_tests {
         mailbox
             .connection()
             .execute_batch(
-                "DROP TABLE completion_native_grant_binding;
+                "DROP TABLE completion_native_kernel_q;
+             DROP TABLE completion_native_worker_attach;
+             DROP TRIGGER completion_native_grant_no_legacy_terminal;
+             DROP TABLE completion_native_grant_binding;
              DROP TRIGGER mailbox_completion_provenance_insert_valid;
              DROP TRIGGER mailbox_completion_provenance_update_valid;
              DROP TRIGGER mailbox_completion_provenance_immutable;

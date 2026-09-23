@@ -5,6 +5,7 @@ use super::*;
 use crate::completion_continuation::{AdmittedSourceBinding, PROTOCOL, SourceProcessIdentity};
 use serde::{Deserialize, Serialize};
 mod attempts;
+mod native_settlement;
 pub(super) use attempts::native_original_drain_on;
 mod notification;
 mod source;
@@ -17,6 +18,10 @@ pub(super) use notification::{
     register_listener_on as register_notification_listener_on,
 };
 pub(super) use source::{accept_on, bound_event, reject_unbound_v2_trigger, retained_payload};
+
+pub const NATIVE_WORKER_ATTACH_PROTOCOL: &str = "native-worker-attach-v1";
+pub const NATIVE_KERNEL_Q_PROTOCOL: &str = "native-kernel-q-v1";
+pub const NATIVE_ROOT_WORKER_ENTRY: &str = "__completion-root-worker-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionDomainOwner {
@@ -76,6 +81,66 @@ pub struct NativeGrantBinding {
     pub guardian_identity: SourceProcessIdentity,
     pub accepted_snapshot_sha256: String,
     pub custodian_request_sha256: String,
+}
+
+/// Broker K attachment evidence, observed with its pre-exec gate still held.
+/// State validates the fields and exact v28 binding, but cannot authenticate
+/// the broker source until the production transport provides that proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerNativeAttachEvidence {
+    pub protocol: String,
+    pub gate_held_before_release: bool,
+    pub attempt_id: String,
+    pub grant_id: String,
+    pub kernel_root_id: String,
+    pub work_id: String,
+    pub work_incarnation_id: String,
+    pub broker_incarnation_id: String,
+    pub worker_entrypoint: String,
+    pub runner_image_sha256: String,
+    /// Host-observed process incarnations; namespace-local PIDs are invalid.
+    pub worker_identity: SourceProcessIdentity,
+    pub pid1_identity: SourceProcessIdentity,
+    pub work_pid_namespace_inode: i64,
+    pub attach_receipt_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWorkerAttach {
+    pub attempt_id: String,
+    pub grant_id: String,
+    pub evidence: BrokerNativeAttachEvidence,
+}
+
+/// Broker Q observation of the exact attached PID1. The receipt must attest
+/// actual terminal/reap and zero remaining work processes; State checks its
+/// shape and binding, not the kernel observation or transport provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerNativeKernelQEvidence {
+    pub protocol: String,
+    pub attempt_id: String,
+    pub grant_id: String,
+    pub kernel_root_id: String,
+    pub work_id: String,
+    pub work_incarnation_id: String,
+    /// A recovered broker may observe Q after the attaching broker exits.
+    pub observing_broker_incarnation_id: String,
+    pub worker_identity: SourceProcessIdentity,
+    pub pid1_identity: SourceProcessIdentity,
+    pub work_pid_namespace_inode: i64,
+    pub pid1_wait_status: i64,
+    pub pid1_reaped: bool,
+    pub remaining_work_processes: i64,
+    pub terminal_receipt_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeKernelQSettlement {
+    pub attempt_id: String,
+    pub grant_id: String,
+    pub work_id: String,
+    pub work_incarnation_id: String,
+    pub evidence: BrokerNativeKernelQEvidence,
 }
 
 impl MailboxDb {
@@ -548,6 +613,8 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                  WHERE sql IS NOT NULL AND (
                     name LIKE 'completion_continuation_%'
                     OR name LIKE 'completion_native_grant_%'
+                    OR name LIKE 'completion_native_worker_%'
+                    OR name LIKE 'completion_native_kernel_%'
                     OR name LIKE 'completion_supervisor_%'
                     OR name LIKE 'completion_owner_supervisor_%'
                     OR name LIKE 'completion_source_supervisor_%'
@@ -654,6 +721,8 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
             expected.execute_batch(include_str!("../migrations/0027_kernel_root_owner.sql"))
                 .map_err(|e| e.to_string())?;
             expected.execute_batch(include_str!("../migrations/0028_native_grant_binding.sql"))
+                .map_err(|e| e.to_string())?;
+            expected.execute_batch(include_str!("../migrations/0029_native_worker_kernel_q.sql"))
                 .map_err(|e| e.to_string())?;
             definitions(&expected)
         })
@@ -894,7 +963,10 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "DROP TABLE completion_native_grant_binding;
+                "DROP TABLE completion_native_kernel_q;
+                 DROP TABLE completion_native_worker_attach;
+                 DROP TRIGGER completion_native_grant_no_legacy_terminal;
+                 DROP TABLE completion_native_grant_binding;
                  DROP INDEX completion_continuation_owner_kernel_root;
                  ALTER TABLE completion_continuation_owner DROP COLUMN kernel_root_id;
                  PRAGMA user_version=23;",
@@ -1566,6 +1638,296 @@ mod tests {
             .execute_batch("DROP TRIGGER completion_native_grant_binding_immutable")
             .unwrap();
         assert!(validate_schema_on(&db.conn).is_err());
+    }
+
+    #[test]
+    fn native_attach_and_q_are_exact_independent_debts() {
+        let (dir, mut db, old_owner) = fixture();
+        let root = uuid::Uuid::new_v4().to_string();
+        let mut owner = old_owner;
+        owner.owner_generation = uuid::Uuid::new_v4().to_string();
+        owner.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&owner, Some(&root))
+            .unwrap();
+        let attempt = reservation(&mut db, &owner);
+        let accepted = db
+            .accept_exact_native_attempt(&attempt, &owner, &root)
+            .unwrap();
+        let bound = db
+            .bind_exact_native_grant(
+                &accepted,
+                &uuid::Uuid::new_v4().to_string(),
+                &"b".repeat(64),
+            )
+            .unwrap();
+        let worker = SourceProcessIdentity {
+            pid: owner.guardian_identity.pid + 1000,
+            boot_id: owner.guardian_identity.boot_id.clone(),
+            starttime_ticks: owner.guardian_identity.starttime_ticks + 1000,
+        };
+        let pid1 = SourceProcessIdentity {
+            pid: worker.pid + 1,
+            boot_id: worker.boot_id.clone(),
+            starttime_ticks: worker.starttime_ticks + 1,
+        };
+        let evidence = BrokerNativeAttachEvidence {
+            protocol: "native-worker-attach-v1".into(),
+            gate_held_before_release: true,
+            attempt_id: attempt.attempt_id.clone(),
+            grant_id: bound.grant_id.clone(),
+            kernel_root_id: root.clone(),
+            work_id: "native-work-a".into(),
+            work_incarnation_id: uuid::Uuid::new_v4().to_string(),
+            broker_incarnation_id: uuid::Uuid::new_v4().to_string(),
+            worker_entrypoint: NATIVE_ROOT_WORKER_ENTRY.into(),
+            runner_image_sha256: "a".repeat(64),
+            worker_identity: worker.clone(),
+            pid1_identity: pid1.clone(),
+            work_pid_namespace_inode: 12345,
+            attach_receipt_sha256: "c".repeat(64),
+        };
+        let unattached = NativeWorkerAttach {
+            attempt_id: attempt.attempt_id.clone(),
+            grant_id: bound.grant_id.clone(),
+            evidence: evidence.clone(),
+        };
+        let q = BrokerNativeKernelQEvidence {
+            protocol: "native-kernel-q-v1".into(),
+            attempt_id: attempt.attempt_id.clone(),
+            grant_id: bound.grant_id.clone(),
+            kernel_root_id: root.clone(),
+            work_id: evidence.work_id.clone(),
+            work_incarnation_id: evidence.work_incarnation_id.clone(),
+            observing_broker_incarnation_id: uuid::Uuid::new_v4().to_string(),
+            worker_identity: worker.clone(),
+            pid1_identity: pid1.clone(),
+            work_pid_namespace_inode: evidence.work_pid_namespace_inode,
+            pid1_wait_status: 0,
+            pid1_reaped: true,
+            remaining_work_processes: 0,
+            terminal_receipt_sha256: "d".repeat(64),
+        };
+        assert!(db.settle_broker_native_kernel_q(&unattached, &q).is_err());
+        assert!(db.native_kernel_q(&attempt.attempt_id).unwrap().is_none());
+        let mut bad_binding = bound.clone();
+        bad_binding.kernel_root_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            db.attach_broker_native_worker(&bad_binding, &evidence)
+                .is_err()
+        );
+        bad_binding = bound.clone();
+        bad_binding.owner_generation = uuid::Uuid::new_v4().to_string();
+        assert!(
+            db.attach_broker_native_worker(&bad_binding, &evidence)
+                .is_err()
+        );
+        for invalid in [
+            BrokerNativeAttachEvidence {
+                gate_held_before_release: false,
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                work_pid_namespace_inode: 0,
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                worker_identity: pid1.clone(),
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                attach_receipt_sha256: "invalid".into(),
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                worker_entrypoint: "arbitrary-worker".into(),
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                runner_image_sha256: "invalid".into(),
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                grant_id: uuid::Uuid::new_v4().to_string(),
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                kernel_root_id: uuid::Uuid::new_v4().to_string(),
+                ..evidence.clone()
+            },
+        ] {
+            assert!(db.attach_broker_native_worker(&bound, &invalid).is_err());
+        }
+        assert!(
+            db.native_worker_attach(&attempt.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+        let attached = db.attach_broker_native_worker(&bound, &evidence).unwrap();
+        assert_eq!(attached, unattached);
+        assert!(db.attach_broker_native_worker(&bound, &evidence).is_err());
+        let mut wrong_attach = attached.clone();
+        wrong_attach.evidence.worker_identity.starttime_ticks += 1; // same PID, reused incarnation
+        assert!(db.settle_broker_native_kernel_q(&wrong_attach, &q).is_err());
+        wrong_attach = attached.clone();
+        wrong_attach.evidence.work_incarnation_id = uuid::Uuid::new_v4().to_string();
+        assert!(db.settle_broker_native_kernel_q(&wrong_attach, &q).is_err());
+        wrong_attach = attached.clone();
+        wrong_attach.grant_id = uuid::Uuid::new_v4().to_string();
+        assert!(db.settle_broker_native_kernel_q(&wrong_attach, &q).is_err());
+        for invalid in [
+            BrokerNativeKernelQEvidence {
+                pid1_reaped: false,
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                remaining_work_processes: 1,
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                pid1_identity: SourceProcessIdentity {
+                    starttime_ticks: pid1.starttime_ticks + 1,
+                    ..pid1.clone()
+                },
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                worker_identity: SourceProcessIdentity {
+                    starttime_ticks: worker.starttime_ticks + 1,
+                    ..worker.clone()
+                },
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                terminal_receipt_sha256: evidence.attach_receipt_sha256.clone(),
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                grant_id: uuid::Uuid::new_v4().to_string(),
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                kernel_root_id: uuid::Uuid::new_v4().to_string(),
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                work_id: "other-work".into(),
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                work_incarnation_id: uuid::Uuid::new_v4().to_string(),
+                ..q.clone()
+            },
+        ] {
+            assert!(
+                db.settle_broker_native_kernel_q(&attached, &invalid)
+                    .is_err()
+            );
+        }
+        assert!(db.native_kernel_q(&attempt.attempt_id).unwrap().is_none());
+        let settled = db.settle_broker_native_kernel_q(&attached, &q).unwrap();
+        assert!(db.settle_broker_native_kernel_q(&attached, &q).is_err());
+        // Q is not worker result, gate release, source ACK, or claim integration.
+        let (phase, revision, integrated): (String, i64, i64) = db.conn.query_row(
+            "SELECT phase,revision,integrated FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!((phase, revision, integrated), ("accepted".into(), 2, 0));
+        let claim: i64 = db.conn.query_row("SELECT count(*) FROM session_wake_claim WHERE session_id='session' AND claim_token='token'", [], |r|r.get(0)).unwrap();
+        assert_eq!(claim, 1);
+        assert!(
+            db.record_continuation_never_forked(&attempt, "guessed gate failure")
+                .is_err()
+        );
+        assert!(db.conn.execute("UPDATE completion_continuation_attempt SET phase='drained',revision=3,integrated=1,drain_receipt='ECHILD' WHERE attempt_id=?1", [&attempt.attempt_id]).is_err());
+        assert!(db.conn.execute("DELETE FROM session_wake_claim WHERE session_id='session' AND claim_token='token'", []).is_err());
+        assert!(db.conn.execute("UPDATE completion_native_worker_attach SET work_id='reused' WHERE attempt_id=?1", [&attempt.attempt_id]).is_err());
+        assert!(
+            db.conn
+                .execute(
+                    "DELETE FROM completion_native_kernel_q WHERE attempt_id=?1",
+                    [&attempt.attempt_id]
+                )
+                .is_err()
+        );
+        let mut sibling = attempt.clone();
+        sibling.attempt_id = uuid::Uuid::new_v4().to_string();
+        sibling.session_id = Some("sibling-session".into());
+        sibling.claim_token = Some("sibling-token".into());
+        db.conn.execute("INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count) VALUES('sibling-session','sibling-token','2026-09-12T00:00:00Z','fixture',1)",[]).unwrap();
+        db.reserve_continuation_attempt(&sibling).unwrap();
+        let sibling_accepted = db
+            .accept_exact_native_attempt(&sibling, &owner, &root)
+            .unwrap();
+        let sibling_bound = db
+            .bind_exact_native_grant(
+                &sibling_accepted,
+                &uuid::Uuid::new_v4().to_string(),
+                &"e".repeat(64),
+            )
+            .unwrap();
+        assert!(
+            db.attach_broker_native_worker(&sibling_bound, &evidence)
+                .is_err()
+        );
+        assert!(
+            db.native_worker_attach(&sibling.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(db.native_kernel_q(&sibling.attempt_id).unwrap().is_none());
+        let mut sibling_evidence = evidence.clone();
+        sibling_evidence.work_id = uuid::Uuid::new_v4().to_string();
+        sibling_evidence.work_incarnation_id = uuid::Uuid::new_v4().to_string();
+        sibling_evidence.attempt_id = sibling.attempt_id.clone();
+        sibling_evidence.grant_id = sibling_bound.grant_id.clone();
+        sibling_evidence.kernel_root_id = root.clone();
+        sibling_evidence.worker_identity.pid += 200;
+        sibling_evidence.worker_identity.starttime_ticks += 200;
+        sibling_evidence.pid1_identity.pid += 200;
+        sibling_evidence.pid1_identity.starttime_ticks += 200;
+        sibling_evidence.attach_receipt_sha256 = "f".repeat(64);
+        db.attach_broker_native_worker(&sibling_bound, &sibling_evidence)
+            .unwrap();
+        let sibling_attach = db
+            .native_worker_attach(&sibling.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            db.settle_broker_native_kernel_q(&sibling_attach, &q)
+                .is_err()
+        );
+        assert!(db.native_kernel_q(&sibling.attempt_id).unwrap().is_none());
+        let path = dir.path().join("pid-identity.db");
+        drop(db); // lost attach/Q replies are recovered by exact indexed reads
+        let reopened = MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            reopened.native_worker_attach(&attempt.attempt_id).unwrap(),
+            Some(attached)
+        );
+        assert_eq!(
+            reopened.native_kernel_q(&attempt.attempt_id).unwrap(),
+            Some(settled)
+        );
+        for table in [
+            "completion_native_worker_attach",
+            "completion_native_kernel_q",
+        ] {
+            let sql =
+                format!("EXPLAIN QUERY PLAN SELECT grant_id FROM {table} WHERE attempt_id=?1");
+            let plan: String = reopened
+                .conn
+                .query_row(&sql, [&attempt.attempt_id], |r| r.get(3))
+                .unwrap();
+            assert!(plan.contains("sqlite_autoindex"), "{plan}");
+        }
     }
     #[test]
     fn original_birth_attachment_retry_closes_current_generation_start_authority() {

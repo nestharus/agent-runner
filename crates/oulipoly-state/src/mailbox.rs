@@ -49,9 +49,11 @@ pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
 mod schema;
 pub use completion_continuation::{
-    AcceptedNativeGrantSnapshot, CompletionDomainOwner, CompletionNotificationRequest,
-    ContinuationAttempt, NativeGrantBinding, NotificationDeliveryEvidence, NotificationDisposition,
-    NotificationPolicy, activation_request_sha256,
+    AcceptedNativeGrantSnapshot, BrokerNativeAttachEvidence, BrokerNativeKernelQEvidence,
+    CompletionDomainOwner, CompletionNotificationRequest, ContinuationAttempt,
+    NATIVE_KERNEL_Q_PROTOCOL, NATIVE_ROOT_WORKER_ENTRY, NATIVE_WORKER_ATTACH_PROTOCOL,
+    NativeGrantBinding, NativeKernelQSettlement, NativeWorkerAttach, NotificationDeliveryEvidence,
+    NotificationDisposition, NotificationPolicy, activation_request_sha256,
 };
 pub use finalization::DeliveryFinalizationGuard;
 #[cfg(test)]
@@ -14711,11 +14713,11 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            // Schema 26 also fingerprints the fixed attempt-search generation
-            // objects (measured 5001 VM steps). Keep a fixed ceiling, the
+            // Schema 29 fingerprints native attach/Q tables and guards
+            // (measured 6552 VM steps). Keep a fixed ceiling, the
             // no-backfill assertion, and the separate retained-history growth
             // test; this does not grant a data-size-dependent budget.
-            current_open_steps < 5500,
+            current_open_steps < 7500,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
         );
     }

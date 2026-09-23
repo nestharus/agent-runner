@@ -1399,7 +1399,7 @@ impl MailboxDb {
     }
 }
 
-fn read_native_grant_binding_on(
+pub(super) fn read_native_grant_binding_on(
     conn: &Connection,
     attempt_id: &str,
 ) -> Result<Option<NativeGrantBinding>, String> {
