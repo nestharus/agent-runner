@@ -13,6 +13,7 @@
 - `crates/oulipoly-kernel-broker/src/root_join.rs`
 - `crates/oulipoly-kernel-broker/src/work_registry.rs`
 - `crates/oulipoly-kernel-broker/tests/private_root_join.rs`
+- `crates/oulipoly-kernel-broker/tests/private_accepted_h_frame.rs`
 - `src-tauri/src/kernel_entry.rs`
 - `src-tauri/src/completion_owner/linux.rs`
 - `src-tauri/src/completion_owner/mod.rs`
@@ -47,6 +48,7 @@
 | P or G is refused, or the guardian dies. | No child Runner is released; debt remains and later readback/admission is denied. |
 | Exact original entry sends J after durable owner readback with help/offline-diagnostics argv/environment and five validated descriptors. | Join consumption is fsynced once, a separate root PID namespace has persistent PID1, and only the fixed Runner child is released after broker pre-exec identity verification. |
 | Exact joined child verifies a connected native-owner socket through challenged V. | Broker checks the fsynced child stamp and root PID1 ancestry, the host guardian and driver boot/starttime, and host-side socket peer credentials before returning a read-only verification receipt. |
+| A sealed Runner helper in a consumed K work verifies the connected owner socket. | A v3 H grant must pin the helper inode, Runner SHA-256, session, invocation and native registration-authority digest from the accepted intent. V must match the exact live work/grant, root, owner generation, authority digest, executable and guardian socket. The same bytes at another inode, altered witness, or missing/unconsumed grant refuse; an unchanged live work reattaches across broker restart. |
 | V carries a changed guardian incarnation or unrelated connected socket. | Refused without changing the one-use join or granting work. |
 | Provider/recovery CLI, GUI or TTY entry. | Refused before broker reservation while host/local PID plumbing and descriptor handoff are incomplete. |
 | Loader-controlled environment, forged completion socket, sibling J, or replay J. | Refused without an arbitrary command launch. |

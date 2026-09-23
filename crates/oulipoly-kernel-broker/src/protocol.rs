@@ -36,7 +36,7 @@ pub struct JoinSpec {
 /// Host PID identities from the durable native owner. A root-namespace client
 /// cannot interpret SO_PEERCRED's PID for its outside guardian; the host broker
 /// checks these against pinned host processes and the connected owner socket.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerWitness {
     pub root_id: String,
@@ -44,6 +44,17 @@ pub struct OwnerWitness {
     pub supervisor_id: String,
     pub guardian: ProcessWitness,
     pub driver: ProcessWitness,
+    /// Used only by the consumed-work sealed-helper branch of V. The joined
+    /// child branch remains compatible with its original witness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_invocation_uuid: Option<String>,
+    /// Digest of the native one-use authority carried by the accepted intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_authority_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

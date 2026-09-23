@@ -10,6 +10,7 @@ use oulipoly_state::pid_identity::{
     read_direct_child_process_identity, read_live_process_identity,
     read_retained_direct_child_process_identity,
 };
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -132,6 +133,13 @@ pub(super) fn verify_kernel_owner_socket(
         supervisor_id: owner.supervisor_authority_id.clone(),
         guardian: process(&owner.guardian_identity)?,
         driver: process(&owner.driver_identity)?,
+        owner_generation: Some(owner.owner_generation.clone()),
+        owner_session_id: std::env::var("AGENT_BASH_OWNER_SESSION_ID").ok(),
+        owner_invocation_uuid: std::env::var("AGENT_BASH_OWNER_INVOCATION_UUID").ok(),
+        registration_authority_sha256: std::env::var_os(
+            oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+        )
+        .map(|value| format!("{:x}", Sha256::digest(value.as_bytes()))),
     };
     protocol::verify_owner_at(&owner_broker_socket(), &witness, socket.as_raw_fd())
         .map_err(|error| error.to_string())

@@ -8,14 +8,15 @@ use oulipoly_kernel_broker::accepted_grant::{
 use oulipoly_kernel_broker::entry_registry::{EntryRecord, ProcessStamp};
 use oulipoly_kernel_broker::identity::PinnedProcess;
 use oulipoly_kernel_broker::protocol::{
-    self, AcceptedWorkSpec, LaunchAcceptedWorkSpec, ProcessWitness, SourceControlUse, SourceScope,
-    SourceSocketWitness,
+    self, AcceptedWorkSpec, LaunchAcceptedWorkSpec, OwnerWitness, ProcessWitness, SourceControlUse,
+    SourceScope, SourceSocketWitness,
 };
 use oulipoly_kernel_broker::{RootRecord, RootRegistry};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -309,7 +310,7 @@ fn send_k_without_reply(path: &Path, spec: &LaunchAcceptedWorkSpec, descriptors:
     drop(stream);
 }
 
-fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool) {
+fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe: bool) {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("broker-state");
     let work_state = temp.path().join("accepted-h");
@@ -353,6 +354,23 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool) {
     let domain = uuid::Uuid::new_v4().to_string();
     let supervisor = uuid::Uuid::new_v4().to_string();
     let generation = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let invocation = uuid::Uuid::new_v4().to_string();
+    let registration_authority = "11".repeat(32);
+    let helper_driver = helper_probe.then(|| {
+        PrivateProcess(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "sealed_helper_from_consumed_work_attests_owner"])
+                .env("AGE319_DRIVER_IDLE", temp.path().join("driver-release"))
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+            false,
+        )
+    });
+    let driver = helper_driver
+        .as_ref()
+        .map(|child| PinnedProcess::open(child.0.id() as i32).unwrap());
     RootRegistry::open(&state)
         .unwrap()
         .insert(RootRecord {
@@ -387,9 +405,30 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool) {
 
     let work_id = "accepted-h";
     let cwd = temp.path();
+    let helper_metadata = if helper_probe {
+        let source = std::env::current_exe().unwrap();
+        let helper = work_state.join("delivery-helper");
+        fs::copy(&source, &helper).unwrap();
+        let fake = work_state.join("fake-helper");
+        fs::copy(&source, &fake).unwrap();
+        Some(serde_json::json!({
+            "path": helper, "device": fs::metadata(&helper).unwrap().dev(),
+            "inode": fs::metadata(&helper).unwrap().ino(),
+            "size": fs::metadata(&helper).unwrap().len(),
+            "sha256": digest(&fs::read(&helper).unwrap())
+        }))
+    } else {
+        None
+    };
     let intent = serde_json::to_vec(&serde_json::json!({
         "protocol": "original-work-v1", "work_id": work_id, "root_id": root_id,
-        "handle": work_id, "state_root": temp.path(), "meta": {"cwd": cwd}
+        "handle": work_id, "state_root": temp.path(),
+        "registration_authority": helper_probe.then(|| registration_authority.as_bytes().to_vec()),
+        "meta": {
+            "cwd": cwd, "owner_session_id": helper_probe.then_some(&session),
+            "owner_invocation_uuid": helper_probe.then_some(&invocation),
+            "delivery_helper": helper_metadata
+        }
     }))
     .unwrap();
     fs::write(work_state.join("root-work-intent-v1.json"), &intent).unwrap();
@@ -398,7 +437,7 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool) {
         work_id: work_id.into(),
         request_sha256: digest(&intent),
         root_id: root_id.clone(),
-        supervisor_authority_id: supervisor,
+        supervisor_authority_id: supervisor.clone(),
         owner_generation: generation.clone(),
         initiator: SourceIdentity {
             pid: source_pid.into(),
@@ -429,6 +468,37 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool) {
         accepted_sha256: digest(&accepted),
         owner_generation: generation,
     };
+    if helper_probe {
+        fs::write(work_state.join("helper-authority"), &registration_authority).unwrap();
+        let witness = OwnerWitness {
+            root_id: spec.root_id.clone(),
+            domain_id: domain.clone(),
+            supervisor_id: supervisor,
+            guardian: ProcessWitness {
+                host_pid: guardian.host_pid,
+                boot_id: guardian.boot_id.clone(),
+                starttime_ticks: guardian.starttime_ticks,
+            },
+            driver: {
+                let driver = driver.unwrap();
+                ProcessWitness {
+                    host_pid: driver.host_pid,
+                    boot_id: driver.boot_id,
+                    starttime_ticks: driver.starttime_ticks,
+                }
+            },
+            owner_generation: Some(spec.owner_generation.clone()),
+            owner_session_id: Some(session),
+            owner_invocation_uuid: Some(invocation),
+            registration_authority_sha256: Some(digest(registration_authority.as_bytes())),
+        };
+        fs::write(
+            work_state.join("helper-witness.json"),
+            serde_json::to_vec(&witness).unwrap(),
+        )
+        .unwrap();
+        fs::write(work_state.join("probe-helper"), b"yes").unwrap();
+    }
     let socket = temp.path().join("broker.sock");
     let log = temp.path().join("broker.log");
     let mut broker = PrivateProcess(
@@ -529,6 +599,23 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool) {
     );
     assert_eq!(fs::read_dir(state.join("grants")).unwrap().count(), 0);
 
+    if helper_probe {
+        let helper = work_state.join("delivery-helper");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&helper)
+            .unwrap();
+        let mut original = [0u8; 1];
+        file.read_exact_at(&mut original, 0).unwrap();
+        file.write_all_at(&[original[0] ^ 1], 0).unwrap();
+        let bad = protocol::prepare_accepted_work_at(&socket, &spec, descriptors).unwrap();
+        assert!(bad.contains("sealed helper image differs"), "{bad}");
+        assert_eq!(fs::read_dir(state.join("grants")).unwrap().count(), 0);
+        file.write_all_at(&original, 0).unwrap();
+        file.sync_all().unwrap();
+    }
+
     let response = protocol::prepare_accepted_work_at(&socket, &spec, descriptors).unwrap();
     let grant_id = response
         .trim()
@@ -544,6 +631,10 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool) {
     assert_eq!(grants.records().len(), 1);
     assert_eq!(grants.records()[0].grant_id, grant_id);
     assert!(!grants.records()[0].consumed);
+    assert_eq!(
+        grants.records()[0].version,
+        if helper_probe { 3 } else { 2 }
+    );
     assert_eq!(fs::read_dir(state.join("works")).unwrap().count(), 0);
     assert!(root.verify().is_ok());
     assert!(source.verify().is_ok());
@@ -818,6 +909,17 @@ if os.fork() == 0:
         os._exit(0)
     os._exit(0)
 os.waitpid(-1, 0)
+if os.path.exists(state + '/probe-helper'):
+    import subprocess
+    for role, image in [('sealed', state + '/delivery-helper'), ('fake', state + '/fake-helper')]:
+        env = dict(os.environ, AGE319_HELPER_PROBE=role, AGE319_HELPER_STATE=state, OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY=open(state + '/helper-authority').read().strip())
+        probe = subprocess.run([image, '--exact', 'sealed_helper_from_consumed_work_attests_owner', '--nocapture'], env=env, capture_output=True, text=True)
+        open(state + '/' + role + '-probe', 'w').write(str(probe.returncode) + '\n' + probe.stdout + '\n' + probe.stderr)
+    open(state + '/first-probe-done', 'w').write('yes')
+    while not os.path.exists(state + '/restart-broker'): time.sleep(.02)
+    env = dict(os.environ, AGE319_HELPER_PROBE='restart', AGE319_HELPER_STATE=state, OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY=open(state + '/helper-authority').read().strip())
+    probe = subprocess.run([state + '/delivery-helper', '--exact', 'sealed_helper_from_consumed_work_attests_owner', '--nocapture'], env=env, capture_output=True, text=True)
+    open(state + '/restart-probe', 'w').write(str(probe.returncode) + '\n' + probe.stdout + '\n' + probe.stderr)
 open(state + '/worker-done', 'w').write('done')
 "#,
     )
@@ -922,7 +1024,46 @@ open(state + '/worker-done', 'w').write('done')
         assert_ne!(worker_pid, source_pid);
     }
     assert!(GrantRegistry::open(state.join("grants")).unwrap().records()[0].consumed);
+    if helper_probe {
+        wait_for(&work_state.join("first-probe-done"));
+        broker.0.kill().unwrap();
+        broker.0.wait().unwrap();
+        broker = PrivateProcess(
+            Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &state)
+                .env(
+                    "OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1",
+                    std::env::current_exe().unwrap(),
+                )
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(
+                    File::create(temp.path().join("broker-helper-restart.log")).unwrap(),
+                ))
+                .spawn()
+                .unwrap(),
+            false,
+        );
+        let until = Instant::now() + Duration::from_secs(20);
+        while protocol::observe_accepted_work_at(&socket, grant_id).ok()
+            != Some(format!("work-live {incarnation}\n"))
+        {
+            assert!(
+                Instant::now() < until,
+                "broker did not reattach consumed helper work"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        fs::write(work_state.join("restart-broker"), b"yes").unwrap();
+    }
     wait_for(&work_state.join("worker-done"));
+    if helper_probe {
+        for role in ["sealed", "fake", "restart"] {
+            let outcome = fs::read_to_string(work_state.join(format!("{role}-probe"))).unwrap();
+            assert!(outcome.starts_with("0\n"), "{role}: {outcome}");
+            assert!(outcome.contains("1 passed"), "{role}: {outcome}");
+        }
+    }
     let live = protocol::observe_accepted_work_at(&socket, grant_id).unwrap();
     assert_eq!(live, format!("work-live {incarnation}\n"));
     if cancel_case {
@@ -1118,7 +1259,7 @@ fn challenged_h_prepares_and_k_launches_one_nested_worker() {
         return;
     }
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
-        inner(false, false, false);
+        inner(false, false, false, false);
         return;
     }
     let output = Command::new("unshare")
@@ -1143,7 +1284,7 @@ fn challenged_h_prepares_and_k_launches_one_nested_worker() {
 #[test]
 fn killed_work_pid1_is_uncertain_without_terminal_receipt() {
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
-        inner(true, false, false);
+        inner(true, false, false, false);
         return;
     }
     let output = Command::new("unshare")
@@ -1168,7 +1309,7 @@ fn killed_work_pid1_is_uncertain_without_terminal_receipt() {
 #[test]
 fn lost_k_response_cannot_replay_accepted_worker() {
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
-        inner(false, true, false);
+        inner(false, true, false, false);
         return;
     }
     let output = Command::new("unshare")
@@ -1193,7 +1334,7 @@ fn lost_k_response_cannot_replay_accepted_worker() {
 #[test]
 fn work_specific_cancel_drains_adopted_setsid_descendant() {
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
-        inner(false, false, true);
+        inner(false, false, true, false);
         return;
     }
     let output = Command::new("unshare")
@@ -1212,4 +1353,85 @@ fn work_specific_cancel_drains_adopted_setsid_descendant() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn sealed_helper_from_consumed_work_attests_owner() {
+    if let Some(path) = std::env::var_os("AGE319_DRIVER_IDLE") {
+        let until = Instant::now() + Duration::from_secs(40);
+        while !Path::new(&path).exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        return;
+    }
+    if let Ok(role) = std::env::var("AGE319_HELPER_PROBE") {
+        let state = std::path::PathBuf::from(std::env::var("AGE319_HELPER_STATE").unwrap());
+        let base = state.parent().unwrap();
+        let socket = UnixStream::connect(base.join("guardian.sock")).unwrap();
+        let witness: OwnerWitness =
+            serde_json::from_slice(&fs::read(state.join("helper-witness.json")).unwrap()).unwrap();
+        let authority = std::env::var("OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY").unwrap();
+        assert_eq!(
+            witness.registration_authority_sha256.as_deref(),
+            Some(digest(authority.as_bytes()).as_str())
+        );
+        let verify = |claim: &OwnerWitness| {
+            protocol::verify_owner_at(&base.join("broker.sock"), claim, socket.as_raw_fd())
+        };
+        if role == "fake" {
+            assert!(
+                verify(&witness).is_err(),
+                "byte-identical but unpinned executable was admitted"
+            );
+            return;
+        }
+        verify(&witness).unwrap();
+        let mut resolved_without_markers = witness.clone();
+        resolved_without_markers.owner_session_id = None;
+        resolved_without_markers.owner_invocation_uuid = None;
+        verify(&resolved_without_markers).unwrap();
+        let mut wrong = witness.clone();
+        wrong.root_id = uuid::Uuid::new_v4().to_string();
+        assert!(verify(&wrong).is_err());
+        let mut wrong = witness.clone();
+        wrong.owner_generation = Some(uuid::Uuid::new_v4().to_string());
+        assert!(verify(&wrong).is_err());
+        let mut wrong = witness.clone();
+        wrong.owner_session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(verify(&wrong).is_err());
+        let mut wrong = witness.clone();
+        wrong.owner_invocation_uuid = Some(uuid::Uuid::new_v4().to_string());
+        assert!(verify(&wrong).is_err());
+        let mut wrong = witness.clone();
+        wrong.registration_authority_sha256 = Some(digest(b"wrong native session capability"));
+        assert!(verify(&wrong).is_err());
+        let mut wrong = witness.clone();
+        wrong.registration_authority_sha256 = None;
+        assert!(verify(&wrong).is_err());
+        let mut wrong = witness.clone();
+        wrong.driver.starttime_ticks += 1;
+        assert!(verify(&wrong).is_err());
+        return;
+    }
+    if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
+        inner(false, false, false, true);
+        return;
+    }
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "sealed_helper_from_consumed_work_attests_owner",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_H_INNER", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
 }

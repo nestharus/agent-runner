@@ -334,18 +334,25 @@ fn witness_matches(witness: &ProcessWitness, process: &PinnedProcess) -> io::Res
         && witness.starttime_ticks == process.starttime_ticks)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "owner verification checks independent root, work, grant, image and socket trust roots"
+)]
 fn verify_owner_socket(
     witness: OwnerWitness,
     socket: File,
     peer: &PeerIdentity,
     runner_image: &File,
+    host_namespace: &File,
     roots: &RootRegistry,
+    works: &WorkRegistry,
     entries: &EntryRegistry,
+    grants: &GrantRegistry,
 ) -> io::Result<String> {
     for id in [&witness.root_id, &witness.domain_id, &witness.supervisor_id] {
         uuid::Uuid::parse_str(id).map_err(|_| io::Error::other("invalid owner witness ID"))?;
     }
-    if roots.has_debt() || entries.has_debt() || !peer.process.same_executable_as(runner_image)? {
+    if roots.has_debt() || entries.has_debt() {
         return Err(io::Error::other("uncertain owner witness caller"));
     }
     let root = roots
@@ -359,11 +366,81 @@ fn verify_owner_socket(
         || entry.owner_uid != peer.uid
         || entry.domain_id.as_deref() != Some(&witness.domain_id)
         || entry.supervisor_authority_id.as_deref() != Some(&witness.supervisor_id)
-        || entry.joined_child.as_ref() != Some(&ProcessStamp::from(&peer.process))
-        || !peer.process.direct_child_of(&root.init)?
-        || !peer.process.in_namespace(root.init.namespace())?
     {
-        return Err(io::Error::other("owner witness is not exact joined child"));
+        return Err(io::Error::other("owner witness root binding changed"));
+    }
+    let joined_child = entry
+        .joined_child
+        .as_ref()
+        .ok_or_else(|| io::Error::other("joined child absent"))?;
+    let original_child = joined_child == &ProcessStamp::from(&peer.process)
+        && peer.process.direct_child_of(&root.init)?
+        && peer.process.in_namespace(root.init.namespace())?
+        && peer.process.same_executable_as(runner_image)?;
+    if !original_child {
+        // A sealed helper is accepted only from the exact live nested work
+        // whose H grant was consumed by K. The work record and grant must
+        // agree on the root, work, PID1 incarnation and original owner. The
+        // accepted intent also pinned this helper inode and Runner digest.
+        if works.has_debt() || grants.has_debt() {
+            return Err(io::Error::other("uncertain sealed helper work"));
+        }
+        let Scope::Work {
+            root_id,
+            work_id,
+            work_incarnation,
+        } = classify_scope(peer, host_namespace, roots, works)
+        else {
+            return Err(io::Error::other("owner witness is outside consumed work"));
+        };
+        if root_id != witness.root_id {
+            return Err(io::Error::other("owner helper root mismatch"));
+        }
+        let work = works
+            .live_works()
+            .find(|work| {
+                work.record.root_id == root_id
+                    && work.record.work_id == work_id
+                    && work.record.work_incarnation == work_incarnation
+            })
+            .ok_or_else(|| io::Error::other("owner helper work absent"))?;
+        let grant = grants
+            .records()
+            .iter()
+            .find(|grant| {
+                grant.grant_id == work.record.accepted_grant_id.as_deref().unwrap_or("")
+                    && grant.root_id == root_id
+                    && grant.work_id == work_id
+                    && grant.consumed
+            })
+            .ok_or_else(|| io::Error::other("owner helper consumed grant absent"))?;
+        let helper = grant
+            .sealed_helper
+            .as_ref()
+            .ok_or_else(|| io::Error::other("owner helper was not pinned at H"))?;
+        if grant.version != 3
+            || grant.owner_uid != peer.uid
+            || grant.root_init != ProcessStamp::from(&root.init)
+            || grant.joined_child != *joined_child
+            || grant.supervisor_authority_id != witness.supervisor_id
+            || witness.owner_generation.as_deref() != Some(&grant.owner_generation)
+            || witness.registration_authority_sha256.as_deref()
+                != Some(&helper.registration_authority_sha256)
+            || witness
+                .owner_session_id
+                .as_ref()
+                .is_some_and(|session| session != &helper.owner_session_id)
+            || witness
+                .owner_invocation_uuid
+                .as_ref()
+                .is_some_and(|invocation| invocation != &helper.owner_invocation_uuid)
+            || !helper.matches_live_executable(&peer.process)?
+        {
+            return Err(io::Error::other(
+                "owner helper grant, session, or image mismatch",
+            ));
+        }
+        work.init.verify()?;
     }
     let guardian_stamp = entry
         .guardian
@@ -1063,7 +1140,17 @@ fn serve() -> io::Result<()> {
                 let RequestPayload::VerifyOwner { witness, socket } = payload else {
                     return Err(io::Error::other("invalid owner witness payload"));
                 };
-                verify_owner_socket(witness, socket, &peer, &runner_image, &registry, &entries)
+                verify_owner_socket(
+                    witness,
+                    socket,
+                    &peer,
+                    &runner_image,
+                    &host_namespace,
+                    &registry,
+                    &works,
+                    &entries,
+                    &grants,
+                )
             } else if operation == b'S' || operation == b's' {
                 let RequestPayload::VerifySourceSocket { witness, socket } = payload else {
                     return Err(io::Error::other("invalid source socket witness payload"));

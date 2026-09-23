@@ -44,6 +44,28 @@ the exact fsynced joined-child incarnation, root PID1 ancestry, root namespace,
 guardian and driver incarnations, and the socket's host-side `SO_PEERCRED`.
 It gives no launch authority and refuses missing older child stamps, changed
 identities, and unrelated sockets. Other operations reject passed descriptors.
+When H receives an `original-work-v1` intent with Bash's handle-bound
+`delivery-helper` provenance, owner session/invocation, and the native one-use
+registration authority, it records a **v3**
+grant. H opens that exact sealed image through the accepted state-directory
+descriptor and requires its inode and SHA-256 to match the intent and the
+broker's fixed Runner image. The existing H and K wire frames are unchanged.
+The existing V frame has optional owner-generation, session, invocation, and
+registration-authority digest claims. A V caller that is not the joined child
+must present the exact authority digest from the accepted intent and is
+admitted only when the
+broker classifies its live PID incarnation inside the exact work namespace,
+finds that work's **consumed** v3 grant, rechecks its root/guardian/joined-child
+bindings, and matches the caller's executable inode and bytes to the pinned
+helper. The normal owner socket and live guardian/driver checks still apply.
+Missing claims, old v2 grants, a different work or image, and incomplete work
+placement refuse. New brokers read v2 and v3 grants; old brokers refuse v3 on
+restart, so upgrading this broker is a versioned on-disk compatibility step.
+The accepted intent binds the session and invocation to that authority.
+Optional ambient session/invocation claims, when present, must agree with the
+grant; their absence is valid when Bash resolved the owner without markers.
+The Runner's native registration authority remains the separate one-use
+session permission.
 The guardian's challenged `B` readback verifies that a new context is the
 exact one-use joined Runner child under the recorded root PID1; ordinary PID
 ancestry cannot establish that across the broker's namespace fork.

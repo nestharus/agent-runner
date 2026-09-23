@@ -2,7 +2,7 @@
 //! its exact positive receipt. A consumed record is durable launch debt, never
 //! by itself proof of execution or physical drain.
 use crate::entry_registry::{EntryRegistry, ProcessStamp};
-use crate::identity::{PeerIdentity, PinnedProcess};
+use crate::identity::{PeerIdentity, PinnedProcess, host_proc_file};
 use crate::registry::RootRegistry;
 use crate::work_registry::WorkRegistry;
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -57,11 +58,50 @@ struct IntentIdentity {
     handle: String,
     state_root: PathBuf,
     meta: IntentMeta,
+    #[serde(default)]
+    registration_authority: Option<Vec<u8>>,
 }
 
 #[derive(Deserialize)]
 struct IntentMeta {
     cwd: PathBuf,
+    #[serde(default)]
+    owner_session_id: Option<String>,
+    #[serde(default)]
+    owner_invocation_uuid: Option<String>,
+    #[serde(default)]
+    delivery_helper: Option<HelperProvenance>,
+}
+
+#[derive(Deserialize)]
+struct HelperProvenance {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    size: u64,
+    sha256: String,
+    interpreter: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealedHelper {
+    pub image: FileStamp,
+    pub sha256: String,
+    pub owner_session_id: String,
+    pub owner_invocation_uuid: String,
+    pub registration_authority_sha256: String,
+}
+
+impl SealedHelper {
+    pub fn matches_live_executable(&self, process: &PinnedProcess) -> io::Result<bool> {
+        process.verify()?;
+        let executable = host_proc_file(&format!("{}/exe", process.host_pid))?;
+        let stamp = FileStamp::of(&executable)?;
+        let matches = stamp == self.image && image_digest(&executable)? == self.sha256;
+        process.verify()?;
+        Ok(matches)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -85,6 +125,10 @@ pub struct GrantRecord {
     pub request_sha256: String,
     pub initiator: SourceIdentity,
     pub artifacts: GrantArtifacts,
+    /// Present only for a v3 grant whose accepted intent pinned the exact
+    /// native Runner helper image and owner session before K was consumed.
+    #[serde(default)]
+    pub sealed_helper: Option<SealedHelper>,
     /// Fsynced before a K namespace fork. Never reset on timeout.
     pub consumed: bool,
 }
@@ -162,6 +206,93 @@ fn valid_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn image_digest(file: &File) -> io::Result<String> {
+    let mut hash = Sha256::new();
+    let mut bytes = [0u8; 64 * 1024];
+    let mut offset = 0;
+    loop {
+        let count = file.read_at(&mut bytes, offset)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&bytes[..count]);
+        offset += count as u64;
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn sealed_helper(
+    state_dir: &File,
+    intent: &IntentIdentity,
+    runner_image: &File,
+) -> io::Result<Option<SealedHelper>> {
+    let meta = &intent.meta;
+    let (Some(provenance), Some(session), Some(invocation), Some(authority)) = (
+        &meta.delivery_helper,
+        &meta.owner_session_id,
+        &meta.owner_invocation_uuid,
+        &intent.registration_authority,
+    ) else {
+        // Standalone Bash work has no native owner/session permission. Keep
+        // its original H/K meaning without inventing helper hello authority.
+        return Ok(None);
+    };
+    if session.is_empty()
+        || uuid::Uuid::parse_str(invocation).is_err()
+        || provenance.interpreter.is_some()
+        || !valid_digest(&provenance.sha256)
+        || fs::canonicalize(&provenance.path)?
+            != fs::canonicalize(
+                intent
+                    .state_root
+                    .join(&intent.handle)
+                    .join("delivery-helper"),
+            )?
+    {
+        return Err(io::Error::other("invalid sealed helper provenance"));
+    }
+    if authority.len() != 64
+        || !authority
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(io::Error::other(
+            "invalid sealed helper registration authority",
+        ));
+    }
+    let name = std::ffi::CString::new("delivery-helper").unwrap();
+    let fd = unsafe {
+        libc::openat(
+            state_dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let image = unsafe { File::from_raw_fd(fd) };
+    let meta = image.metadata()?;
+    if !meta.is_file()
+        || meta.dev() != provenance.device
+        || meta.ino() != provenance.inode
+        || meta.len() != provenance.size
+        || image_digest(&image)? != provenance.sha256
+        || image_digest(runner_image)? != provenance.sha256
+    {
+        return Err(io::Error::other(
+            "sealed helper image differs from accepted Runner",
+        ));
+    }
+    Ok(Some(SealedHelper {
+        image: FileStamp::of(&image)?,
+        sha256: provenance.sha256.clone(),
+        owner_session_id: session.clone(),
+        owner_invocation_uuid: invocation.clone(),
+        registration_authority_sha256: digest(authority),
+    }))
 }
 
 fn valid_stamp(stamp: &ProcessStamp) -> bool {
@@ -316,7 +447,7 @@ impl GrantRegistry {
                 return Err(io::Error::other("unrecognized accepted grant entry"));
             }
             let record: GrantRecord = serde_json::from_slice(&fs::read(entry.path())?)?;
-            if record.version != 2
+            if !matches!(record.version, 2 | 3)
                 || uuid::Uuid::parse_str(&record.grant_id).is_err()
                 || format!("{}.json", record.grant_id) != name
                 || uuid::Uuid::parse_str(&record.root_id).is_err()
@@ -334,6 +465,14 @@ impl GrantRegistry {
                 || !valid_stamp(&record.guardian)
                 || !valid_stamp(&record.joined_child)
                 || !record.artifacts.valid()
+                || (record.version == 3) != record.sealed_helper.is_some()
+                || record.sealed_helper.as_ref().is_some_and(|helper| {
+                    helper.image.inode == 0
+                        || !valid_digest(&helper.sha256)
+                        || helper.owner_session_id.is_empty()
+                        || uuid::Uuid::parse_str(&helper.owner_invocation_uuid).is_err()
+                        || !valid_digest(&helper.registration_authority_sha256)
+                })
                 || record
                     .parent_work_incarnation
                     .as_ref()
@@ -444,6 +583,7 @@ impl GrantRegistry {
             supervisor,
         )?;
         let intent_identity: IntentIdentity = serde_json::from_slice(&intent_bytes)?;
+        let helper = sealed_helper(state_dir, &intent_identity, runner_image)?;
         let expected_state =
             fs::metadata(intent_identity.state_root.join(&intent_identity.handle))?;
         let expected_cwd = fs::metadata(intent_identity.meta.cwd)?;
@@ -515,7 +655,7 @@ impl GrantRegistry {
         root.init.verify()?;
         source.verify()?;
         let record = GrantRecord {
-            version: 2,
+            version: if helper.is_some() { 3 } else { 2 },
             grant_id: uuid::Uuid::new_v4().to_string(),
             root_id: root_id.to_owned(),
             root_init: ProcessStamp::from(&root.init),
@@ -531,6 +671,7 @@ impl GrantRegistry {
             request_sha256: request_sha256.to_owned(),
             initiator: receipt.initiator,
             artifacts: GrantArtifacts::pinned(executable, intent, cwd, state_dir, accepted)?,
+            sealed_helper: helper,
             consumed: false,
         };
         self.create(record.clone())?;
@@ -676,6 +817,40 @@ impl GrantRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_original_work_keeps_v2_grant_without_native_owner() {
+        let intent = IntentIdentity {
+            protocol: "original-work-v1".into(),
+            work_id: "standalone".into(),
+            root_id: uuid::Uuid::new_v4().to_string(),
+            handle: "standalone".into(),
+            state_root: PathBuf::from("/not-opened"),
+            meta: IntentMeta {
+                cwd: PathBuf::from("/"),
+                owner_session_id: None,
+                owner_invocation_uuid: None,
+                delivery_helper: Some(HelperProvenance {
+                    path: PathBuf::from("/not-opened/standalone/delivery-helper"),
+                    device: 1,
+                    inode: 1,
+                    size: 1,
+                    sha256: "11".repeat(32),
+                    interpreter: None,
+                }),
+            },
+            registration_authority: None,
+        };
+        assert!(
+            sealed_helper(
+                &File::open("/").unwrap(),
+                &intent,
+                &File::open("/proc/self/exe").unwrap(),
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
     use serde_json::json;
     use std::os::unix::fs::symlink;
 
@@ -835,6 +1010,7 @@ mod tests {
                 &File::open("/dev/null").unwrap(),
             )
             .unwrap(),
+            sealed_helper: None,
             consumed: false,
         }
     }
