@@ -49,8 +49,8 @@ pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
 mod schema;
 pub use completion_continuation::{
-    CompletionDomainOwner, CompletionNotificationRequest, ContinuationAttempt,
-    NotificationDeliveryEvidence, NotificationDisposition, NotificationPolicy,
+    AcceptedNativeGrantSnapshot, CompletionDomainOwner, CompletionNotificationRequest,
+    ContinuationAttempt, NotificationDeliveryEvidence, NotificationDisposition, NotificationPolicy,
     activation_request_sha256,
 };
 pub use finalization::DeliveryFinalizationGuard;

@@ -350,14 +350,23 @@ pub(super) fn request_path(attempt: &ContinuationAttempt) -> Result<std::path::P
     Ok(directory.join("custodian-request.json"))
 }
 
-pub(super) fn read_request(path: &Path) -> Result<CustodianRequest, String> {
-    let directory = path.parent().ok_or("request directory absent")?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("request filename is not UTF-8")?;
-    let bytes = read_source_file(directory, name, 4 * 1024 * 1024)?;
-    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+/// Publish immutable launch bytes under their final name. A retry must keep
+/// the first request (and fail closed), never rename a new recipe over it.
+pub(super) fn write_request_once(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or("request directory absent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())
 }
 
 /// Birth and grant are small whole records. Packet boundaries prevent a child

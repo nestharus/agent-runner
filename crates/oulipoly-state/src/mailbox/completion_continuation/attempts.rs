@@ -1,4 +1,14 @@
 use super::*;
+
+#[cfg(test)]
+thread_local! {
+    static CRASH_AFTER_NATIVE_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn crash_after_native_update_once() {
+    CRASH_AFTER_NATIVE_UPDATE.with(|flag| flag.set(true));
+}
 use crate::diagnostic_recorder::{
     OutcomeCertainty, SqliteAccessClass, SqliteMeasurementGap, SqlitePhaseEvidence,
     SqliteQueryPlanEvidence, SqliteTransactionPhase,
@@ -976,6 +986,142 @@ fn classify_one_pending_completion_with_hook(
 }
 
 impl MailboxDb {
+    /// Accept and read back the exact PK while holding one immediate write
+    /// transaction. Failed readback rolls the UPDATE back; a committed result
+    /// cannot be inferred from a caller-supplied attempt or a sibling owner.
+    pub fn accept_exact_native_attempt(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        owner: &CompletionDomainOwner,
+        root_id: &str,
+    ) -> Result<AcceptedNativeGrantSnapshot, String> {
+        if owner.protocol != PROTOCOL
+            || attempt.owner_generation != owner.owner_generation
+            || root_id.is_empty()
+        {
+            return Err("native acceptance owner/root conflict".into());
+        }
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE completion_continuation_attempt SET phase='accepted',revision=revision+1
+             WHERE attempt_id=?1 AND owner_generation=?2 AND phase='reserved' AND revision=1
+               AND integrated=0 AND custodian_identity IS NULL AND adopter_identity IS NULL
+               AND EXISTS(SELECT 1 FROM completion_continuation_owner
+                 WHERE generation=?2 AND phase='running' AND domain_id=?3
+                   AND supervisor_authority_id=?4 AND kernel_root_id=?5
+                   AND guardian_identity=?6 AND driver_identity=?7 AND endpoint=?8)",
+                params![
+                    attempt.attempt_id,
+                    attempt.owner_generation,
+                    owner.domain_id,
+                    owner.supervisor_authority_id,
+                    root_id,
+                    serde_json::to_string(&owner.guardian_identity).map_err(|e| e.to_string())?,
+                    serde_json::to_string(&owner.driver_identity).map_err(|e| e.to_string())?,
+                    owner.endpoint
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("native acceptance lost exact running reservation".into());
+        }
+        #[cfg(test)]
+        CRASH_AFTER_NATIVE_UPDATE.with(|flag| {
+            if flag.replace(false) {
+                panic!("injected crash between native UPDATE and readback");
+            }
+        });
+        let row = tx
+            .query_row(
+                "SELECT a.attempt_id,a.owner_generation,a.operation,a.request_sha256,
+                    a.source_registration_id,a.source_listener_revision,a.session_id,a.claim_token,
+                    a.result_path,a.domain_id,o.kernel_root_id,o.supervisor_authority_id,
+                    o.guardian_identity,a.phase,a.revision,a.integrated,a.custodian_identity,
+                    a.adopter_identity,o.phase,o.driver_identity,o.endpoint
+             FROM completion_continuation_attempt a
+             JOIN completion_continuation_owner o ON o.generation=a.owner_generation
+             WHERE a.attempt_id=?1",
+                [&attempt.attempt_id],
+                |r| {
+                    Ok((
+                        ContinuationAttempt {
+                            attempt_id: r.get(0)?,
+                            owner_generation: r.get(1)?,
+                            operation: r.get(2)?,
+                            request_sha256: r.get(3)?,
+                            source_registration_id: r.get(4)?,
+                            source_listener_revision: r.get(5)?,
+                            session_id: r.get(6)?,
+                            claim_token: r.get(7)?,
+                            result_path: r.get(8)?,
+                        },
+                        r.get::<_, String>(9)?,
+                        r.get::<_, Option<String>>(10)?,
+                        r.get::<_, String>(11)?,
+                        r.get::<_, String>(12)?,
+                        r.get::<_, String>(13)?,
+                        r.get::<_, i64>(14)?,
+                        r.get::<_, i64>(15)?,
+                        r.get::<_, Option<String>>(16)?,
+                        r.get::<_, Option<String>>(17)?,
+                        r.get::<_, String>(18)?,
+                        r.get::<_, String>(19)?,
+                        r.get::<_, String>(20)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let (
+            stored,
+            domain,
+            root,
+            supervisor,
+            guardian,
+            phase,
+            revision,
+            integrated,
+            custodian,
+            adopter,
+            owner_phase,
+            driver,
+            endpoint,
+        ) = row;
+        let exact_guardian: SourceProcessIdentity =
+            serde_json::from_str(&guardian).map_err(|e| e.to_string())?;
+        if stored != *attempt
+            || domain != owner.domain_id
+            || root.as_deref() != Some(root_id)
+            || supervisor != owner.supervisor_authority_id
+            || stored.owner_generation != owner.owner_generation
+            || exact_guardian != owner.guardian_identity
+            || driver != serde_json::to_string(&owner.driver_identity).map_err(|e| e.to_string())?
+            || endpoint != owner.endpoint
+            || owner_phase != "running"
+            || phase != "accepted"
+            || revision != 2
+            || integrated != 0
+            || custodian.is_some()
+            || adopter.is_some()
+        {
+            return Err("native acceptance exact readback conflict".into());
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(AcceptedNativeGrantSnapshot {
+            attempt: stored,
+            domain_id: domain,
+            kernel_root_id: root_id.into(),
+            supervisor_authority_id: supervisor,
+            owner_generation: owner.owner_generation.clone(),
+            guardian_identity: exact_guardian,
+            phase,
+            revision,
+            integrated: false,
+            custodian_identity: None,
+            adopter_identity: None,
+        })
+    }
+
     pub fn accept_continuation_attempt(
         &mut self,
         attempt: &ContinuationAttempt,

@@ -44,6 +44,23 @@ pub struct ContinuationAttempt {
     pub result_path: String,
 }
 
+/// A single committed acceptance of an exact native attempt by its running
+/// guardian. This is evidence for a later broker grant, not a launch grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedNativeGrantSnapshot {
+    pub attempt: ContinuationAttempt,
+    pub domain_id: String,
+    pub kernel_root_id: String,
+    pub supervisor_authority_id: String,
+    pub owner_generation: String,
+    pub guardian_identity: SourceProcessIdentity,
+    pub phase: String,
+    pub revision: i64,
+    pub integrated: bool,
+    pub custodian_identity: Option<SourceProcessIdentity>,
+    pub adopter_identity: Option<SourceProcessIdentity>,
+}
+
 impl MailboxDb {
     /// Nonmutating capability lookup. Version integers alone are not lineage.
     pub fn completion_continuation_domain(&self) -> Result<Option<String>, String> {
@@ -1316,6 +1333,90 @@ mod tests {
         };
         db.reserve_continuation_attempt(&attempt).unwrap();
         attempt
+    }
+
+    #[test]
+    fn native_acceptance_reads_exact_running_owner_and_rolls_back_conflicts() {
+        let (_dir, mut db, old_owner) = fixture();
+        let root = uuid::Uuid::new_v4().to_string();
+        let mut owner = old_owner.clone();
+        owner.owner_generation = uuid::Uuid::new_v4().to_string();
+        owner.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&owner, Some(&root))
+            .unwrap();
+        let attempt = reservation(&mut db, &owner);
+        let phase = |db: &MailboxDb| -> (String, i64) {
+            db.conn.query_row(
+                "SELECT phase,revision FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&attempt.attempt_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap()
+        };
+        let mut changed = attempt.clone();
+        changed.request_sha256 = "b".repeat(64);
+        assert!(
+            db.accept_exact_native_attempt(&changed, &owner, &root)
+                .is_err()
+        );
+        changed = attempt.clone();
+        changed.result_path = "/sibling/result.json".into();
+        assert!(
+            db.accept_exact_native_attempt(&changed, &owner, &root)
+                .is_err()
+        );
+        let mut wrong_owner = owner.clone();
+        wrong_owner.owner_generation = old_owner.owner_generation;
+        assert!(
+            db.accept_exact_native_attempt(&attempt, &wrong_owner, &root)
+                .is_err()
+        );
+        wrong_owner = owner.clone();
+        wrong_owner.guardian_identity.starttime_ticks += 1;
+        assert!(
+            db.accept_exact_native_attempt(&attempt, &wrong_owner, &root)
+                .is_err()
+        );
+        assert!(
+            db.accept_exact_native_attempt(&attempt, &owner, &uuid::Uuid::new_v4().to_string())
+                .is_err()
+        );
+        assert_eq!(phase(&db), ("reserved".into(), 1));
+        attempts::crash_after_native_update_once();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = db.accept_exact_native_attempt(&attempt, &owner, &root);
+            }))
+            .is_err()
+        );
+        assert_eq!(phase(&db), ("reserved".into(), 1));
+        let accepted = db
+            .accept_exact_native_attempt(&attempt, &owner, &root)
+            .unwrap();
+        assert_eq!(accepted.attempt, attempt);
+        assert_eq!(accepted.kernel_root_id, root);
+        assert_eq!(accepted.guardian_identity, owner.guardian_identity);
+        assert_eq!(accepted.revision, 2);
+        assert_eq!(accepted.phase, "accepted");
+        assert!(!accepted.integrated);
+        assert!(accepted.custodian_identity.is_none());
+        assert_eq!(phase(&db), ("accepted".into(), 2));
+        assert!(
+            db.accept_exact_native_attempt(&attempt, &owner, &root)
+                .is_err()
+        );
+        assert_eq!(phase(&db), ("accepted".into(), 2));
+        assert!(db.conn.execute(
+            "UPDATE completion_continuation_attempt SET result_path='/replaced',revision=3 WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+        ).is_err());
+        assert!(
+            db.conn
+                .execute(
+                    "DELETE FROM completion_continuation_attempt WHERE attempt_id=?1",
+                    [&attempt.attempt_id],
+                )
+                .is_err()
+        );
+        assert_eq!(phase(&db), ("accepted".into(), 2));
     }
     #[test]
     fn original_birth_attachment_retry_closes_current_generation_start_authority() {
