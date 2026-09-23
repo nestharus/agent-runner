@@ -92,6 +92,9 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
         let owner_socket = UnixStream::connect(&owner.endpoint).map_err(|e| e.to_string())?;
         #[cfg(feature = "age319-private-broker-fixture")]
         if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some() {
+            use oulipoly_kernel_broker::protocol::{
+                ProcessWitness, SourceScope, SourceSocketWitness,
+            };
             let mut changed = owner.clone();
             changed.guardian_identity.starttime_ticks += 1;
             if crate::completion_owner::verify_kernel_owner_socket(
@@ -109,6 +112,87 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
             {
                 return Err("private fixture accepted unrelated owner socket".into());
             }
+            let source = oulipoly_state::pid_identity::read_current_process_identity()?;
+            let mut local_peer = libc::ucred {
+                pid: 0,
+                uid: 0,
+                gid: 0,
+            };
+            let mut local_peer_len = std::mem::size_of_val(&local_peer) as libc::socklen_t;
+            if unsafe {
+                libc::getsockopt(
+                    owner_socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    (&mut local_peer as *mut libc::ucred).cast(),
+                    &mut local_peer_len,
+                )
+            } != 0
+                || local_peer_len as usize != std::mem::size_of_val(&local_peer)
+                || i64::from(local_peer.pid) == owner.guardian_identity.pid
+            {
+                return Err("private fixture did not exercise PID-domain mismatch".into());
+            }
+            let witness = SourceSocketWitness {
+                root_id: fields[0].to_owned(),
+                domain_id: owner.domain_id.clone(),
+                supervisor_id: owner.supervisor_authority_id.clone(),
+                guardian: ProcessWitness {
+                    host_pid: i32::try_from(owner.guardian_identity.pid)
+                        .map_err(|_| "invalid guardian host PID")?,
+                    boot_id: owner.guardian_identity.boot_id.clone(),
+                    starttime_ticks: u64::try_from(owner.guardian_identity.starttime_ticks)
+                        .map_err(|_| "invalid guardian starttime")?,
+                },
+                source: ProcessWitness {
+                    host_pid: i32::try_from(source.os_pid)
+                        .map_err(|_| "invalid source host PID")?,
+                    boot_id: source.os_boot_id,
+                    starttime_ticks: u64::try_from(source.os_pid_starttime_ticks)
+                        .map_err(|_| "invalid source starttime")?,
+                },
+                scope: SourceScope::Root,
+            };
+            let broker = PathBuf::from(
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+                    .ok_or("missing private broker socket")?,
+            );
+            let attest = |witness: &SourceSocketWitness, socket: &UnixStream| {
+                protocol::verify_source_socket_at(&broker, witness, socket.as_raw_fd())
+            };
+            let mut stale = witness.clone();
+            stale.source.starttime_ticks += 1;
+            if attest(&stale, &owner_socket).is_ok() {
+                return Err("private fixture accepted stale source".into());
+            }
+            stale.source.starttime_ticks = witness.source.starttime_ticks;
+            stale.guardian.starttime_ticks += 1;
+            if attest(&stale, &owner_socket).is_ok() {
+                return Err("private fixture accepted stale guardian".into());
+            }
+            if attest(&witness, &wrong_socket).is_ok() {
+                return Err("private fixture accepted wrong guardian socket".into());
+            }
+            stale.guardian.starttime_ticks = witness.guardian.starttime_ticks;
+            stale.scope = SourceScope::Nested {
+                parent_work_id: "sibling-work".into(),
+            };
+            if attest(&stale, &owner_socket).is_ok() {
+                return Err("private fixture accepted unrelated work scope".into());
+            }
+            stale.scope = SourceScope::CancelOutside {
+                work_id: "sibling-work".into(),
+            };
+            if attest(&stale, &owner_socket).is_ok() {
+                return Err("private fixture accepted in-root outside cancellation".into());
+            }
+            stale.scope = SourceScope::Root;
+            stale.root_id = uuid::Uuid::new_v4().to_string();
+            if attest(&stale, &owner_socket).is_ok() {
+                return Err("private fixture accepted sibling root".into());
+            }
+            attest(&witness, &owner_socket).map_err(|e| e.to_string())?;
+            attest(&witness, &owner_socket).map_err(|e| e.to_string())?;
         }
         crate::completion_owner::verify_kernel_owner_socket(fields[0], &owner, &owner_socket)?;
         let observer_domain = oulipoly_state::pid_identity::procfs_observer_domain()?;

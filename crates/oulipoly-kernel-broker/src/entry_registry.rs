@@ -350,6 +350,13 @@ impl EntryRegistry {
         self.records.iter().find(|r| r.root_id == root_id)
     }
 
+    /// A joined child's historical entry may exit while its root PID1 and
+    /// guardian remain live. Read-only source attestation still refuses an
+    /// uncertain registry write without treating that normal exit as debt.
+    pub fn has_uncertain_write(&self) -> bool {
+        self.poisoned
+    }
+
     pub fn has_debt(&self) -> bool {
         self.poisoned
             || self.records.iter().any(|r| {

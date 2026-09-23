@@ -7,13 +7,16 @@ use oulipoly_kernel_broker::accepted_grant::{
 };
 use oulipoly_kernel_broker::entry_registry::{EntryRecord, ProcessStamp};
 use oulipoly_kernel_broker::identity::PinnedProcess;
-use oulipoly_kernel_broker::protocol::{self, AcceptedWorkSpec, LaunchAcceptedWorkSpec};
+use oulipoly_kernel_broker::protocol::{
+    self, AcceptedWorkSpec, LaunchAcceptedWorkSpec, ProcessWitness, SourceScope,
+    SourceSocketWitness,
+};
 use oulipoly_kernel_broker::{RootRecord, RootRegistry};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -222,6 +225,7 @@ fn inner(kill_case: bool, lost_reply_case: bool) {
     assert!(source.in_namespace(root.namespace()).unwrap());
     let guardian = PinnedProcess::open(std::process::id() as i32).unwrap();
     let root_id = uuid::Uuid::new_v4().to_string();
+    let domain = uuid::Uuid::new_v4().to_string();
     let supervisor = uuid::Uuid::new_v4().to_string();
     let generation = uuid::Uuid::new_v4().to_string();
     RootRegistry::open(&state)
@@ -246,7 +250,7 @@ fn inner(kill_case: bool, lost_reply_case: bool) {
             owner_uid: unsafe { libc::getuid() },
             entry: guardian_stamp.clone(),
             prepared_guardian: Some(guardian_stamp.clone()),
-            domain_id: Some(uuid::Uuid::new_v4().to_string()),
+            domain_id: Some(domain.clone()),
             supervisor_authority_id: Some(supervisor.clone()),
             guardian: Some(guardian_stamp),
             join_consumed: true,
@@ -418,6 +422,34 @@ fn inner(kill_case: bool, lost_reply_case: bool) {
     assert_eq!(fs::read_dir(state.join("works")).unwrap().count(), 0);
     assert!(root.verify().is_ok());
     assert!(source.verify().is_ok());
+    let guardian_listener = UnixListener::bind(temp.path().join("guardian.sock")).unwrap();
+    let guardian_socket = UnixStream::connect(temp.path().join("guardian.sock")).unwrap();
+    let (_guardian_server, _) = guardian_listener.accept().unwrap();
+    let stamp = ProcessWitness {
+        host_pid: guardian.host_pid,
+        boot_id: guardian.boot_id.clone(),
+        starttime_ticks: guardian.starttime_ticks,
+    };
+    let cancel_witness = SourceSocketWitness {
+        root_id: spec.root_id.clone(),
+        domain_id: domain.clone(),
+        supervisor_id: grants.records()[0].supervisor_authority_id.clone(),
+        guardian: stamp.clone(),
+        source: stamp,
+        scope: SourceScope::CancelOutside {
+            work_id: spec.work_id.clone(),
+        },
+    };
+    protocol::verify_source_socket_at(&socket, &cancel_witness, guardian_socket.as_raw_fd())
+        .unwrap();
+    let mut sibling_cancel = cancel_witness.clone();
+    sibling_cancel.scope = SourceScope::CancelOutside {
+        work_id: "sibling-work".into(),
+    };
+    assert!(
+        protocol::verify_source_socket_at(&socket, &sibling_cancel, guardian_socket.as_raw_fd())
+            .is_err()
+    );
     let replay = protocol::prepare_accepted_work_at(&socket, &spec, descriptors).unwrap();
     assert!(
         replay.starts_with("error ") && replay.contains("accepted grant preparation denied"),

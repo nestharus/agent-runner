@@ -1,7 +1,9 @@
 //! Source-only private user-namespace exercise of the actual broker launch and
 //! opt-in Runner entry. It never exercises installed host-root sudo authority.
 #![cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
-use oulipoly_kernel_broker::protocol::{self, AcceptedWorkSpec, JoinSpec, Operation};
+use oulipoly_kernel_broker::protocol::{
+    self, AcceptedWorkSpec, JoinSpec, Operation, ProcessWitness, SourceScope, SourceSocketWitness,
+};
 use oulipoly_state::mailbox::MailboxDb;
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
@@ -276,7 +278,32 @@ fn inner() {
             .unwrap()
             .starts_with("error ")
     );
+    let (wrong_socket, _other_end) = UnixStream::pair().unwrap();
+    let replayed = SourceSocketWitness {
+        root_id: root.into(),
+        domain_id: owner.domain_id.clone(),
+        supervisor_id: owner.supervisor_authority_id.clone(),
+        guardian: ProcessWitness {
+            host_pid: guardian_pid,
+            boot_id: owner.guardian_identity.boot_id.clone(),
+            starttime_ticks: u64::try_from(owner.guardian_identity.starttime_ticks).unwrap(),
+        },
+        source: ProcessWitness {
+            host_pid: child_pid,
+            boot_id: record["joined_child"]["boot_id"].as_str().unwrap().into(),
+            starttime_ticks: record["joined_child"]["starttime_ticks"].as_u64().unwrap(),
+        },
+        scope: SourceScope::Root,
+    };
+    // Restart cannot turn the dead joined child's old host identity into the
+    // current caller, even while its root PID1 and grant record remain live.
+    assert!(
+        protocol::verify_source_socket_at(&socket, &replayed, wrong_socket.as_raw_fd()).is_err()
+    );
     stop(&mut restarted);
+    assert!(
+        protocol::verify_source_socket_at(&socket, &replayed, wrong_socket.as_raw_fd()).is_err()
+    );
     // Explicit fixture teardown does not claim a production drain or safe
     // registry retirement protocol.
     unsafe {

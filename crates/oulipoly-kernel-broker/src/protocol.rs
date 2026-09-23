@@ -46,7 +46,7 @@ pub struct OwnerWitness {
     pub driver: ProcessWitness,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessWitness {
     pub host_pid: i32,
@@ -59,6 +59,85 @@ pub struct ProcessWitness {
 pub struct JoinedChildWitness {
     pub root_id: String,
     pub child: ProcessWitness,
+}
+
+/// A source presents its live host incarnation and the exact connected
+/// guardian socket. The broker observes the caller and socket in the host PID
+/// domain; these fields are assertions to compare, not authority by themselves.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSocketWitness {
+    pub root_id: String,
+    pub domain_id: String,
+    pub supervisor_id: String,
+    pub guardian: ProcessWitness,
+    pub source: ProcessWitness,
+    pub scope: SourceScope,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceScope {
+    Root,
+    Nested {
+        parent_work_id: String,
+    },
+    /// A separate controller outside all broker roots can authenticate the
+    /// endpoint for an already accepted work. The guardian still authorizes
+    /// cancellation using the work's independent cancel capability.
+    CancelOutside {
+        work_id: String,
+    },
+}
+
+/// This read-only attestation is valid only for this challenged request and
+/// this connected socket. It does not prepare or consume an H/K work grant.
+pub fn verify_source_socket_at(
+    path: &Path,
+    witness: &SourceSocketWitness,
+    guardian_socket_fd: RawFd,
+) -> io::Result<()> {
+    let body = serde_json::to_vec(witness)?;
+    if body.len() > 2048 {
+        return Err(io::Error::other("source socket witness too large"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(17 + body.len());
+    request.push(b'S');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: request.as_mut_ptr().cast(),
+        iov_len: request.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as usize;
+        *libc::CMSG_DATA(header).cast::<RawFd>() = guardian_socket_fd;
+    }
+    if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+        != request.len() as isize
+    {
+        return Err(io::Error::other("short source socket verification request"));
+    }
+    let response = read_response(stream)?;
+    if response != format!("verified-source {}\n", witness.root_id) {
+        return Err(io::Error::other(format!(
+            "host source socket verification refused: {}",
+            response.trim()
+        )));
+    }
+    Ok(())
 }
 
 /// The outside guardian asks the broker to attest the exact one-use joined

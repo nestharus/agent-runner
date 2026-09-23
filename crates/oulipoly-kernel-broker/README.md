@@ -47,6 +47,20 @@ identities, and unrelated sockets. Other operations reject passed descriptors.
 The guardian's challenged `B` readback verifies that a new context is the
 exact one-use joined Runner child under the recorded root PID1; ordinary PID
 ancestry cannot establish that across the broker's namespace fork.
+The challenged `S` request accepts a source's already-connected guardian
+socket and explicit host PID/boot/starttime witnesses. The broker compares the
+request's actual socket credentials with the source witness, checks the bound
+guardian's live incarnation and the passed socket's host-observed peer, then
+requires the source in the exact root namespace or in a consumed accepted
+parent work namespace matching the declared parent work ID. A source in one
+work cannot claim another's scope. A separate outside controller can use
+`cancel_outside` only for an existing positive H grant; the guardian still
+checks its independent cancellation capability. `S` is a read-only
+per-connection check; it
+does not consume or replace the H/K grant and cannot certify work completion.
+The Bash submit and cancel paths must call it on their actual connected socket
+when they run in a broker-owned PID namespace; the separate Bash repository
+has not yet been changed.
 A bare UUID or environment
 marker grants nothing.
 
@@ -138,6 +152,16 @@ not a host-root sudo or deployed continuity proof.
   spawn; the pinned path still cannot run normal work. A work ID or `inside
   root` classification cannot grant execution. Replace allocated-attempt
   NNP/seccomp only when the complete custody path is paired and verified.
+- Add the Bash-side `S` call before submit and cancel, preserving its local
+  same-PID-domain peer check for legacy entry. Build the witness from the
+  durable root authority and the caller's host-observed incarnation; map root
+  registration to `SourceScope::Root` and nested registration to its exact
+  parent work ID. A separate outside cancel controller uses
+  `SourceScope::CancelOutside` with the accepted work ID after reading the
+  durable root/domain/supervisor/guardian binding; in-root cancellation uses
+  its exact root or causal parent scope. Treat broker absence, refusal, or
+  ambiguous response as a peer authentication failure without sending either
+  request.
 - Reconcile host/local PID fields, adopted descendants, result ACK versus
   physical drain, and registry retirement across broker and WSL restart.
 - Reconcile this branch's sidecar v24 with AGE-353's separate v24 migration

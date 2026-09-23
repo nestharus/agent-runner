@@ -10,7 +10,7 @@ use oulipoly_kernel_broker::identity::{
 };
 use oulipoly_kernel_broker::protocol::{
     AcceptedWorkSpec, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, OwnerWitness,
-    ProcessWitness,
+    ProcessWitness, SourceScope, SourceSocketWitness,
 };
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
@@ -88,6 +88,10 @@ enum RequestPayload {
     },
     VerifyOwner {
         witness: OwnerWitness,
+        socket: File,
+    },
+    VerifySourceSocket {
+        witness: SourceSocketWitness,
         socket: File,
     },
     VerifyJoinedChild {
@@ -205,7 +209,7 @@ fn recv_request(
         b'Q' => read == 33,
         b'A' => read == 33,
         b'J' => (18..=48 * 1024 + 17).contains(&read),
-        b'V' | b'H' | b'K' | b'B' => (18..=2048 + 17).contains(&read),
+        b'V' | b'S' | b'H' | b'K' | b'B' => (18..=2048 + 17).contains(&read),
         _ => read == 17,
     };
     if !valid_length
@@ -218,7 +222,7 @@ fn recv_request(
         || match request[0] {
             b'J' | b'H' => descriptors.len() != 5,
             b'K' => descriptors.len() != 7,
-            b'V' => descriptors.len() != 1,
+            b'V' | b'S' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
         }
     {
@@ -261,6 +265,10 @@ fn recv_request(
                 .map_err(|_| io::Error::other("join descriptors"))?,
         },
         b'V' => RequestPayload::VerifyOwner {
+            witness: serde_json::from_slice(&request[17..read as usize])?,
+            socket: descriptors.remove(0),
+        },
+        b'S' => RequestPayload::VerifySourceSocket {
             witness: serde_json::from_slice(&request[17..read as usize])?,
             socket: descriptors.remove(0),
         },
@@ -408,6 +416,161 @@ fn verify_owner_socket(
     driver.verify()?;
     peer.process.verify()?;
     Ok(format!("verified-owner {}\n", witness.root_id))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "verify one source against all independent broker trust roots"
+)]
+fn verify_source_socket(
+    witness: SourceSocketWitness,
+    socket: File,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    grants: &GrantRegistry,
+) -> io::Result<String> {
+    for id in [&witness.root_id, &witness.domain_id, &witness.supervisor_id] {
+        uuid::Uuid::parse_str(id).map_err(|_| io::Error::other("invalid source witness ID"))?;
+    }
+    if roots.has_debt()
+        || works.has_debt()
+        || entries.has_uncertain_write()
+        || grants.has_debt()
+        || !witness_matches(&witness.source, &peer.process)?
+    {
+        return Err(io::Error::other("uncertain source witness caller"));
+    }
+    let root = roots
+        .live_roots()
+        .find(|root| root.record.root_id == witness.root_id)
+        .ok_or_else(|| io::Error::other("source witness root absent"))?;
+    let entry = entries
+        .record(&witness.root_id)
+        .ok_or_else(|| io::Error::other("source witness entry absent"))?;
+    if !entry.join_consumed
+        || entry.joined_child.is_none()
+        || entry.owner_uid != peer.uid
+        || root.record.owner_uid != peer.uid
+        || entry.domain_id.as_deref() != Some(witness.domain_id.as_str())
+        || entry.supervisor_authority_id.as_deref() != Some(witness.supervisor_id.as_str())
+    {
+        return Err(io::Error::other("source witness root binding mismatch"));
+    }
+    let guardian_stamp = entry
+        .guardian
+        .as_ref()
+        .ok_or_else(|| io::Error::other("source witness guardian absent"))?;
+    let guardian = PinnedProcess::open(guardian_stamp.host_pid)?;
+    if ProcessStamp::from(&guardian) != *guardian_stamp
+        || !witness_matches(&witness.guardian, &guardian)?
+        || !guardian.in_namespace(host_namespace)?
+        || !guardian.same_executable_as(runner_image)?
+    {
+        return Err(io::Error::other(
+            "source witness guardian incarnation mismatch",
+        ));
+    }
+    let scope = classify_scope(peer, host_namespace, roots, works);
+    match (&witness.scope, scope) {
+        (SourceScope::Root, Scope::Root(root_id)) if root_id == witness.root_id => {}
+        (
+            SourceScope::Nested { parent_work_id },
+            Scope::Work {
+                root_id,
+                work_id,
+                work_incarnation,
+            },
+        ) if root_id == witness.root_id && work_id == *parent_work_id => {
+            let work = works
+                .live_works()
+                .find(|work| work.record.work_incarnation == work_incarnation)
+                .ok_or_else(|| io::Error::other("source parent work absent"))?;
+            let grant = grants
+                .records()
+                .iter()
+                .find(|grant| {
+                    grant.grant_id == work.record.accepted_grant_id.as_deref().unwrap_or("")
+                        && grant.root_id == witness.root_id
+                        && grant.work_id == *parent_work_id
+                        && grant.consumed
+                })
+                .ok_or_else(|| io::Error::other("source causal parent grant absent"))?;
+            if grant.root_init != ProcessStamp::from(&root.init)
+                || grant.guardian != *guardian_stamp
+                || grant.supervisor_authority_id != witness.supervisor_id
+            {
+                return Err(io::Error::other("source causal parent changed"));
+            }
+            work.init.verify()?;
+        }
+        (SourceScope::CancelOutside { work_id }, Scope::Outside) => {
+            if !peer.process.in_namespace(host_namespace)? {
+                return Err(io::Error::other(
+                    "outside cancel caller is not in host PID namespace",
+                ));
+            }
+            let grant = grants
+                .records()
+                .iter()
+                .find(|grant| grant.root_id == witness.root_id && grant.work_id == *work_id)
+                .ok_or_else(|| io::Error::other("source cancellation grant absent"))?;
+            if grant.root_init != ProcessStamp::from(&root.init)
+                || grant.guardian != *guardian_stamp
+                || grant.supervisor_authority_id != witness.supervisor_id
+                || grant.owner_uid != peer.uid
+            {
+                return Err(io::Error::other("source cancellation grant changed"));
+            }
+        }
+        _ => return Err(io::Error::other("source root/work scope mismatch")),
+    }
+    let mut kind: libc::c_int = 0;
+    let mut kind_len = std::mem::size_of_val(&kind) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut kind as *mut libc::c_int).cast(),
+            &mut kind_len,
+        )
+    } != 0
+        || kind != libc::SOCK_STREAM
+        || kind_len as usize != std::mem::size_of_val(&kind)
+    {
+        return Err(io::Error::other("source witness is not a stream socket"));
+    }
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of_val(&credentials) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    } != 0
+        || len as usize != std::mem::size_of_val(&credentials)
+        || credentials.pid != guardian.host_pid
+        || credentials.uid != peer.uid
+    {
+        return Err(io::Error::other(
+            "source socket peer is not pinned host guardian",
+        ));
+    }
+    guardian.verify()?;
+    root.init.verify()?;
+    peer.process.verify()?;
+    Ok(format!("verified-source {}\n", witness.root_id))
 }
 
 fn verify_joined_child(
@@ -674,6 +837,21 @@ fn serve() -> io::Result<()> {
                     return Err(io::Error::other("invalid owner witness payload"));
                 };
                 verify_owner_socket(witness, socket, &peer, &runner_image, &registry, &entries)
+            } else if operation == b'S' {
+                let RequestPayload::VerifySourceSocket { witness, socket } = payload else {
+                    return Err(io::Error::other("invalid source socket witness payload"));
+                };
+                verify_source_socket(
+                    witness,
+                    socket,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &registry,
+                    &works,
+                    &entries,
+                    &grants,
+                )
             } else if operation == b'B' {
                 let RequestPayload::VerifyJoinedChild { witness } = payload else {
                     return Err(io::Error::other("invalid joined-child witness payload"));
