@@ -72,6 +72,74 @@ fn run(custody: Arc<LaunchCustody>, root: PathBuf, script: &'static str) -> Proc
     .unwrap()
 }
 
+#[test]
+fn original_tree_provider_preserves_host_privilege_transitions() {
+    // The original-tree owner, unlike the legacy group owner, can wait for a
+    // descendant that starts a new session without restricting its syscalls.
+    // Keep fixture files under this worktree's normal Cargo target directory.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../src-tauri/target")
+        .join(format!("age319-provider-sudo-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let custody = Arc::new(LaunchCustody::start(root.join("proof")).unwrap());
+    let scope = LaunchScope::enter(Some(custody.clone()));
+    let actor = crate::custody::AttemptActorCustody::original_tree(uuid::Uuid::new_v4());
+    let guard = actor.begin("launch");
+    // A passwordless host sudo rule is optional. When present, exercise the
+    // actual setuid transition inside W; otherwise the NNP and setsid checks
+    // still run and the report must call out the untested sudo condition.
+    let sudo_ready = unsafe { libc::geteuid() } != 0
+        && std::process::Command::new("sudo")
+            .args(["-n", "id", "-u"])
+            .output()
+            .is_ok_and(|output| output.status.success() && output.stdout == b"0\n");
+    let script = r#"
+import os, subprocess, sys
+status = open('/proc/self/status').read()
+assert 'NoNewPrivs:\t0' in status, status
+child = os.fork()
+if child == 0:
+    try:
+        os.setsid()
+    except OSError:
+        os._exit(1)
+    os._exit(0)
+assert os.waitpid(child, 0)[1] == 0
+if sys.argv[1] == 'sudo':
+    assert subprocess.check_output(['sudo', '-n', 'id', '-u'], timeout=5).strip() == b'0'
+print('nnp=0;setsid=ok;sudo=' + sys.argv[1])
+"#;
+    let result = ProcessRunner::new(ProcessLimits {
+        timeout: Duration::from_secs(10),
+        custody: Some(guard.0.clone()),
+        ..ProcessLimits::default()
+    })
+    .run(
+        ProcessCommand::new("/usr/bin/python3")
+            .arg("-c")
+            .arg(script)
+            .arg(if sudo_ready { "sudo" } else { "unavailable" }),
+        Vec::new(),
+        Vec::<(String, String)>::new(),
+    )
+    .unwrap();
+    drop(guard);
+    assert_eq!(result.status, ProcessStatus::Exited { code: 0 });
+    assert_eq!(
+        result.stdout.bytes,
+        format!(
+            "nnp=0;setsid=ok;sudo={}\n",
+            if sudo_ready { "sudo" } else { "unavailable" }
+        )
+        .as_bytes()
+    );
+    assert!(actor.receipts()[0].effect_incapable());
+    drop(scope);
+    custody.seal();
+    eventually(|| custody.quiescent());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 struct DelayedFinishProcessor {
     accumulator: ByteAccumulator,
     delay: Duration,
