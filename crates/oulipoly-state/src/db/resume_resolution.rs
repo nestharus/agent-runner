@@ -269,7 +269,20 @@ impl StateDb {
     }
 
     pub(super) fn resume_model_name_is_known(model_name: &str) -> bool {
+        // Default-provider launches use this reserved routing-history carrier,
+        // which is never loaded from a model TOML for model-free resume.
         model_name != "<unknown>"
+            && !model_name
+                .strip_prefix("<provider-family:")
+                .is_some_and(|family| family.len() > 1 && family.ends_with('>'))
+    }
+
+    pub(super) fn resume_chain_model_name(model_name: &str) -> &str {
+        if Self::resume_model_name_is_known(model_name) {
+            model_name
+        } else {
+            "<unknown>"
+        }
     }
 
     pub(super) fn resolve_resume_model_config(

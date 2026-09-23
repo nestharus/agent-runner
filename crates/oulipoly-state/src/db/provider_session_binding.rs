@@ -524,6 +524,7 @@ impl StateDb {
         provider_name: &str,
         session_id: &str,
     ) -> Result<(), DbError> {
+        let model_name = Self::resume_chain_model_name(model_name);
         conn.execute(
             "UPDATE session_chains
                  SET model_name = ?2
@@ -586,7 +587,7 @@ impl StateDb {
         InvocationChainInsert {
             chain_id: Self::new_invocation_chain_id(),
             started_at: Self::invocation_chain_timestamp(ts),
-            model_name: row.model_name.clone(),
+            model_name: Self::resume_chain_model_name(&row.model_name).to_string(),
         }
     }
 
