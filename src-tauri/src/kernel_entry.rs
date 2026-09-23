@@ -229,12 +229,66 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_bash_work() -> Result<ExitCode, String> {
     crate::completion_owner::join_private_accepted_work_fixture()?;
+    use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord};
+    use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
+
+    // The joined Runner child is the actual owner Bash will inspect through
+    // `session of-pid`. Record its procfs-observer incarnation, not getpid():
+    // the latter is local to the broker's root PID namespace.
+    let invocation_uuid = uuid::Uuid::new_v4().to_string();
+    let session_id = format!("age319-paired-{invocation_uuid}");
+    let state = StateDb::open(&StateDb::default_path()?).map_err(|e| format!("State: {e:?}"))?;
+    let started =
+        state.start_invocation_with_completion_registration_authority(&InvocationStart {
+            invocation_uuid: invocation_uuid.clone(),
+            model_name: "age319-private-bash-work".into(),
+            provider_name: "agent-bash".into(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })?;
+    state.bind_invocation_provider_session_start(
+        oulipoly_state::InvocationMutationAuthority::Standalone,
+        started.invocation_row_id,
+        &ProviderSessionBinding {
+            provider_session_id: session_id.clone(),
+            capture_method: "age319-private-joined-runner",
+            resume_input_id: None,
+            provider_session_resolved_account: None,
+        },
+    )?;
+    let identity = oulipoly_state::pid_identity::read_current_process_identity()?;
+    PidIdentityDb::open(&PidIdentityDb::default_path()?)?.record_identity(PidIdentityRecord {
+        identity: &identity,
+        os_pgid: None,
+        invocation_uuid: &invocation_uuid,
+        session_id: Some(&session_id),
+        provider_name: Some("agent-bash"),
+        model_name: Some("age319-private-bash-work"),
+        recorded_at: &chrono::Utc::now().to_rfc3339(),
+    })?;
+    let parent_marker = started
+        .completion_registration_authority
+        .invocation_launch_environment(
+            &oulipoly_state::invocation_marker::CompositeInvocationId {
+                source: "age319-private-joined-runner".into(),
+                id: invocation_uuid.clone(),
+            },
+        )?;
     let bash =
         std::env::var("AGE319_PRIVATE_BASH_IMAGE").map_err(|_| "private Bash image missing")?;
     let script =
         std::env::var("AGE319_PRIVATE_WORK_SCRIPT").map_err(|_| "private work script missing")?;
     let exit = std::process::Command::new(bash)
         .args(["run", "--delivery", "async", "--", "/bin/sh", "-c", &script])
+        .env("OULIPOLY_PARENT_INVOCATION", parent_marker)
+        .env("AGENT_BASH_OWNER_SESSION_ID", session_id)
+        .env("AGENT_BASH_OWNER_INVOCATION_UUID", invocation_uuid)
+        .env(
+            oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+            started
+                .completion_registration_authority
+                .process_environment_value(),
+        )
         .status()
         .map_err(|error| error.to_string())?;
     Ok(ExitCode::from(exit.code().unwrap_or(70) as u8))
