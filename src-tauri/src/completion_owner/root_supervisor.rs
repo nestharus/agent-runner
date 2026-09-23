@@ -68,7 +68,7 @@ fn publish_native_receipt(
     request_file: &std::fs::File,
     request_bytes: &[u8],
     accepted: &oulipoly_state::mailbox::AcceptedNativeGrantSnapshot,
-) -> Result<(), String> {
+) -> Result<String, String> {
     // Recheck the name and all bytes after State commit. Broker will repeat
     // these checks on its descriptor; a renamed/replaced request cannot ride
     // on this guardian's receipt.
@@ -87,6 +87,11 @@ fn publish_native_receipt(
         request_inode: metadata.ino(),
         request_byte_len: metadata.len(),
     };
+    let receipt_bytes = serde_json::to_vec(&receipt).map_err(|error| error.to_string())?;
+    // The original guardian retains this digest from the exact bytes it
+    // fsyncs. A future challenged prepare must carry it from this decision,
+    // never derive positive authority by rereading a caller-selected file.
+    let receipt_sha256 = oulipoly_state::completion_continuation::sha256(&receipt_bytes);
     let path = request_path.with_file_name(NATIVE_ACCEPTED_FILE);
     let temp = request_path.with_file_name(format!(
         ".native-continuation-accepted-{}.tmp",
@@ -99,7 +104,7 @@ fn publish_native_receipt(
             .mode(0o600)
             .open(&temp)
             .map_err(|e| e.to_string())?;
-        file.write_all(&serde_json::to_vec(&receipt).map_err(|e| e.to_string())?)
+        file.write_all(&receipt_bytes)
             .and_then(|()| file.sync_all())
             .map_err(|e| e.to_string())?;
         if exact_request_bytes(request_path, request_file)? != request_bytes {
@@ -111,7 +116,7 @@ fn publish_native_receipt(
             .map_err(|e| e.to_string())
     })();
     let _ = std::fs::remove_file(&temp);
-    result
+    result.map(|()| receipt_sha256)
 }
 
 #[cfg(test)]
@@ -177,7 +182,12 @@ mod native_acceptance_tests {
         assert!(publish_native_receipt(&request, &file, b"request-one", &accepted).is_err());
         assert!(!receipt.exists());
         std::fs::rename(&moved, &request).unwrap();
-        publish_native_receipt(&request, &file, b"request-one", &accepted).unwrap();
+        let receipt_sha =
+            publish_native_receipt(&request, &file, b"request-one", &accepted).unwrap();
+        assert_eq!(
+            receipt_sha,
+            oulipoly_state::completion_continuation::sha256(&std::fs::read(&receipt).unwrap())
+        );
         let parsed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
         assert_eq!(parsed["protocol"], "native-continuation-accepted-v1");
@@ -371,6 +381,8 @@ struct ActiveOperation {
     unreleased_reason: Option<String>,
     never_forked: bool,
     broker_pending: bool,
+    #[allow(dead_code)] // consumed by the future challenged native prepare
+    native_receipt_sha256: Option<String>,
     cancellation: UnixStream,
     cancellation_sent: bool,
     cancellation_output: Vec<u8>,
@@ -527,6 +539,7 @@ impl RootSupervisor {
             unreleased_reason: Some(reason),
             never_forked: true,
             broker_pending: false,
+            native_receipt_sha256: None,
             cancellation,
             cancellation_sent: false,
             cancellation_output: Vec::new(),
@@ -547,6 +560,7 @@ impl RootSupervisor {
         diagnostic_id: DiagnosticId,
         cancellation: UnixStream,
         reason: String,
+        native_receipt_sha256: Option<String>,
     ) {
         self.active.push(ActiveOperation {
             attempt: attempt.clone(),
@@ -556,6 +570,7 @@ impl RootSupervisor {
             unreleased_reason: Some(reason),
             never_forked: false,
             broker_pending: true,
+            native_receipt_sha256,
             cancellation,
             cancellation_sent: false,
             cancellation_output: Vec::new(),
@@ -859,26 +874,39 @@ impl RootSupervisor {
                 .completion_owner_kernel_root_id(&owner.owner_generation)?
                 .ok_or("native acceptance has no pinned kernel root")?;
             let snapshot = mailbox.accept_exact_native_attempt(attempt, owner, &root)?;
-            if let Err(error) =
-                publish_native_receipt(&request_path, &request_file, &request_bytes, &snapshot)
-            {
-                self.retain_native_broker_pending(
-                    attempt,
-                    diagnostic_id,
-                    cancellation,
-                    format!(
-                        "native acceptance committed but receipt publication is uncertain: {error}"
-                    ),
-                );
-                return Err(error);
-            }
+            let receipt_sha256 = match publish_native_receipt(
+                &request_path,
+                &request_file,
+                &request_bytes,
+                &snapshot,
+            ) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    self.retain_native_broker_pending(
+                        attempt,
+                        diagnostic_id,
+                        cancellation,
+                        format!(
+                            "native acceptance committed but receipt publication is uncertain: {error}"
+                        ),
+                        None,
+                    );
+                    return Err(error);
+                }
+            };
             // A tagged broker grant, one-use K and Q settlement are separate
             // authority. Until those are wired, retain the accepted obligation
             // without executing a host-local worker.
             let reason =
                 "native broker grant is not yet wired; accepted attempt retained without launch"
                     .to_owned();
-            self.retain_native_broker_pending(attempt, diagnostic_id, cancellation, reason.clone());
+            self.retain_native_broker_pending(
+                attempt,
+                diagnostic_id,
+                cancellation,
+                reason.clone(),
+                Some(receipt_sha256),
+            );
             return Err(reason);
         }
         mailbox.accept_continuation_attempt(attempt)?;
@@ -941,6 +969,7 @@ impl RootSupervisor {
                     unreleased_reason: Some(reason.clone()),
                     never_forked: false,
                     broker_pending: false,
+                    native_receipt_sha256: None,
                     cancellation,
                     cancellation_sent: false,
                     cancellation_output: Vec::new(),
@@ -964,6 +993,7 @@ impl RootSupervisor {
             unreleased_reason: None,
             never_forked: false,
             broker_pending: false,
+            native_receipt_sha256: None,
             cancellation,
             cancellation_sent: false,
             cancellation_output: Vec::new(),
