@@ -3,6 +3,7 @@
 //! by itself proof of execution or physical drain.
 use crate::entry_registry::{EntryRegistry, ProcessStamp};
 use crate::identity::{PeerIdentity, PinnedProcess, host_proc_file};
+use crate::native_receipt::{BoundNativeAuthority, verify as verify_native_receipt};
 use crate::registry::RootRegistry;
 use crate::work_registry::WorkRegistry;
 use serde::{Deserialize, Serialize};
@@ -133,6 +134,34 @@ pub struct GrantRecord {
     pub consumed: bool,
 }
 
+/// A native continuation is a separate protocol from original-work H/K.
+/// Version 4 is prepare debt only; no native K consumer exists yet.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NativeGrantRecord {
+    pub version: u32,
+    pub kind: String,
+    pub grant_id: String,
+    pub attempt_id: String,
+    pub root_id: String,
+    pub root_init: ProcessStamp,
+    pub domain_id: String,
+    pub supervisor_authority_id: String,
+    pub owner_generation: String,
+    pub owner_uid: u32,
+    pub guardian: ProcessStamp,
+    pub joined_child: ProcessStamp,
+    pub receipt_sha256: String,
+    pub accepted_snapshot_sha256: String,
+    pub custodian_request_sha256: String,
+    pub directory: FileStamp,
+    pub request: FileStamp,
+    pub receipt: FileStamp,
+    pub request_byte_len: u64,
+    pub receipt_byte_len: u64,
+    pub state: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileStamp {
@@ -194,6 +223,7 @@ impl GrantArtifacts {
 pub struct GrantRegistry {
     directory: PathBuf,
     records: Vec<GrantRecord>,
+    native_records: Vec<NativeGrantRecord>,
     poisoned: bool,
 }
 
@@ -445,15 +475,54 @@ impl GrantRegistry {
     pub fn open(directory: impl AsRef<Path>) -> io::Result<Self> {
         let directory = directory.as_ref().to_path_buf();
         let mut records = Vec::new();
+        let mut native_records = Vec::new();
         let mut ids = HashSet::new();
         let mut works = HashSet::new();
+        let mut native_attempts = HashSet::new();
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if !entry.file_type()?.is_file() || !name.ends_with(".json") {
                 return Err(io::Error::other("unrecognized accepted grant entry"));
             }
-            let record: GrantRecord = serde_json::from_slice(&fs::read(entry.path())?)?;
+            let bytes = fs::read(entry.path())?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let version = value.get("version").and_then(|v| v.as_u64());
+            if version == Some(4) {
+                let record: NativeGrantRecord = serde_json::from_slice(&bytes)?;
+                if record.kind != "native-continuation-v1"
+                    || record.state != "prepared"
+                    || uuid::Uuid::parse_str(&record.grant_id).is_err()
+                    || format!("{}.json", record.grant_id) != name
+                    || uuid::Uuid::parse_str(&record.attempt_id).is_err()
+                    || uuid::Uuid::parse_str(&record.root_id).is_err()
+                    || uuid::Uuid::parse_str(&record.domain_id).is_err()
+                    || uuid::Uuid::parse_str(&record.supervisor_authority_id).is_err()
+                    || uuid::Uuid::parse_str(&record.owner_generation).is_err()
+                    || !valid_stamp(&record.root_init)
+                    || !valid_stamp(&record.guardian)
+                    || !valid_stamp(&record.joined_child)
+                    || !valid_digest(&record.receipt_sha256)
+                    || !valid_digest(&record.accepted_snapshot_sha256)
+                    || !valid_digest(&record.custodian_request_sha256)
+                    || record.directory.inode == 0
+                    || record.request.inode == 0
+                    || record.receipt.inode == 0
+                    || record.request_byte_len > 4 * 1024 * 1024
+                    || record.receipt_byte_len > 1024 * 1024
+                    || !ids.insert(record.grant_id.clone())
+                    || !native_attempts.insert(record.attempt_id.clone())
+                    || !works.insert((record.root_id.clone(), record.attempt_id.clone()))
+                {
+                    return Err(io::Error::other("invalid or duplicate native grant"));
+                }
+                native_records.push(record);
+                continue;
+            }
+            if !matches!(version, Some(2 | 3)) {
+                return Err(io::Error::other("unsupported accepted grant version"));
+            }
+            let record: GrantRecord = serde_json::from_slice(&bytes)?;
             if !matches!(record.version, 2 | 3)
                 || uuid::Uuid::parse_str(&record.grant_id).is_err()
                 || format!("{}.json", record.grant_id) != name
@@ -499,6 +568,7 @@ impl GrantRegistry {
         Ok(Self {
             directory,
             records,
+            native_records,
             poisoned: false,
         })
     }
@@ -507,8 +577,151 @@ impl GrantRegistry {
         &self.records
     }
 
+    pub fn native_record(&self, attempt_id: &str) -> Option<&NativeGrantRecord> {
+        self.native_records
+            .iter()
+            .find(|r| r.attempt_id == attempt_id)
+    }
+
     pub fn has_debt(&self) -> bool {
         self.poisoned
+    }
+
+    /// Native prepare is idempotent only for the exact same authenticated
+    /// evidence. A lost reply can be retried after broker restart without
+    /// issuing another grant. This never authorizes K.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "independent authority and descriptor checks"
+    )]
+    pub fn prepare_native(
+        &mut self,
+        roots: &RootRegistry,
+        entries: &EntryRegistry,
+        works: &WorkRegistry,
+        caller: &PeerIdentity,
+        host_namespace: &File,
+        runner_image: &File,
+        directory: &File,
+        request: &File,
+        receipt: &File,
+        root_id: &str,
+        attempt_id: &str,
+        owner_generation: &str,
+        receipt_sha256: &str,
+    ) -> io::Result<NativeGrantRecord> {
+        if self.has_debt()
+            || roots.has_debt()
+            || entries.has_debt()
+            || works.has_debt()
+            || !directory.metadata()?.is_dir()
+            || !valid_digest(receipt_sha256)
+            || uuid::Uuid::parse_str(attempt_id).is_err()
+            || uuid::Uuid::parse_str(owner_generation).is_err()
+        {
+            return Err(io::Error::other(
+                "native grant registry or evidence uncertain",
+            ));
+        }
+        let entry = entries
+            .record(root_id)
+            .ok_or_else(|| io::Error::other("entry absent"))?;
+        let root = roots
+            .live_roots()
+            .find(|r| r.record.root_id == root_id)
+            .ok_or_else(|| io::Error::other("live root absent"))?;
+        let guardian = ProcessStamp::from(&caller.process);
+        if !entry.join_consumed
+            || entry.guardian.as_ref() != Some(&guardian)
+            || entry.owner_uid != caller.uid
+            || root.record.owner_uid != caller.uid
+            || entry.joined_child.is_none()
+            || entry.domain_id.is_none()
+            || entry.supervisor_authority_id.is_none()
+            || !caller.process.in_namespace(host_namespace)?
+            || !caller.process.same_executable_as(runner_image)?
+        {
+            return Err(io::Error::other("caller is not bound host guardian"));
+        }
+        let bound = BoundNativeAuthority {
+            root_id,
+            domain_id: entry.domain_id.as_deref().unwrap(),
+            supervisor_authority_id: entry.supervisor_authority_id.as_deref().unwrap(),
+            owner_generation,
+            owner_uid: entry.owner_uid,
+            guardian: entry.guardian.as_ref().unwrap(),
+            host_namespace,
+            runner_image,
+            receipt_sha256,
+        };
+        let verified = verify_native_receipt(caller, &bound, directory, request, receipt)?;
+        if verified.attempt_id != attempt_id {
+            return Err(io::Error::other(
+                "native attempt ID differs from accepted receipt",
+            ));
+        }
+        root.init.verify()?;
+        caller.process.verify()?;
+        let existing = self.native_record(attempt_id);
+        let record = NativeGrantRecord {
+            version: 4,
+            kind: "native-continuation-v1".into(),
+            grant_id: existing
+                .map_or_else(|| uuid::Uuid::new_v4().to_string(), |r| r.grant_id.clone()),
+            attempt_id: attempt_id.into(),
+            root_id: root_id.into(),
+            root_init: ProcessStamp::from(&root.init),
+            domain_id: entry.domain_id.as_ref().unwrap().clone(),
+            supervisor_authority_id: entry.supervisor_authority_id.as_ref().unwrap().clone(),
+            owner_generation: owner_generation.into(),
+            owner_uid: caller.uid,
+            guardian,
+            joined_child: entry.joined_child.as_ref().unwrap().clone(),
+            receipt_sha256: verified.receipt_sha256,
+            accepted_snapshot_sha256: verified.accepted_snapshot_sha256,
+            custodian_request_sha256: verified.custodian_request_sha256,
+            directory: FileStamp::of(directory)?,
+            request: FileStamp::of(request)?,
+            receipt: FileStamp::of(receipt)?,
+            request_byte_len: request.metadata()?.len(),
+            receipt_byte_len: receipt.metadata()?.len(),
+            state: "prepared".into(),
+        };
+        if let Some(existing) = existing {
+            if existing != &record {
+                return Err(io::Error::other(
+                    "native grant replay conflicts with durable evidence",
+                ));
+            }
+            return Ok(existing.clone());
+        }
+        if self.records.iter().any(|r| {
+            r.grant_id == record.grant_id || r.root_id == root_id && r.work_id == attempt_id
+        }) || self
+            .native_records
+            .iter()
+            .any(|r| r.grant_id == record.grant_id)
+        {
+            return Err(io::Error::other("native grant collides with existing work"));
+        }
+        let path = self.directory.join(format!("{}.json", record.grant_id));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+            serde_json::to_writer(&mut file, &record)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            File::open(&self.directory)?.sync_all()
+        })();
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.native_records.push(record.clone());
+        Ok(record)
     }
 
     /// The caller must be the live, exact host guardian already bound to this
@@ -548,6 +761,10 @@ impl GrantRegistry {
                 .records
                 .iter()
                 .any(|record| record.root_id == root_id && record.work_id == work_id)
+            || self
+                .native_records
+                .iter()
+                .any(|record| record.root_id == root_id && record.attempt_id == work_id)
             || !caller.process.in_namespace(host_namespace)?
             || !caller.process.same_executable_as(runner_image)?
             || !cwd.metadata()?.is_dir()
@@ -824,6 +1041,21 @@ impl GrantRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_or_partial_native_records_refuse_registry_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let path = dir.path().join(format!("{id}.json"));
+        fs::write(&path, format!(r#"{{"version":5,"grant_id":"{id}"}}"#)).unwrap();
+        assert!(GrantRegistry::open(dir.path()).is_err());
+        fs::write(
+            &path,
+            format!(r#"{{"version":4,"grant_id":"{id}","kind":"native-continuation-v1"}}"#),
+        )
+        .unwrap();
+        assert!(GrantRegistry::open(dir.path()).is_err());
+    }
 
     #[test]
     fn standalone_original_work_keeps_v2_grant_without_native_owner() {

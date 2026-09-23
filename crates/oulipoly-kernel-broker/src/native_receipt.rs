@@ -180,12 +180,28 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accepted_grant::GrantRegistry;
+    use crate::entry_registry::{EntryRecord, EntryRegistry};
     use crate::identity::PinnedProcess;
+    use crate::registry::{RootRecord, RootRegistry};
+    use crate::work_registry::WorkRegistry;
     use oulipoly_state::completion_continuation::{PROTOCOL, SourceProcessIdentity};
     use oulipoly_state::mailbox::{CompletionDomainOwner, MailboxDb};
     use serde_json::json;
     use std::fs;
-    use std::io::Write;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+    use std::process::Command;
+
+    struct PrivateInit(std::process::Child);
+
+    impl Drop for PrivateInit {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     #[test]
     fn real_state_acceptance_requires_exact_live_guardian_receipt_and_request() {
@@ -289,6 +305,206 @@ mod tests {
         let verified = verify(&peer, &bound, &directory, &request, &receipt).unwrap();
         assert_eq!(verified.attempt_id, attempt.attempt_id);
         assert_eq!(verified.custodian_request_sha256, digest(&request_bytes));
+        // Exercise the registry with evidence from the actual State CAS and
+        // live guardian PID/image, including fsynced reply loss and restart.
+        let registry_dir = dir.path().join("registry");
+        fs::create_dir(&registry_dir).unwrap();
+        for name in ["entries", "works", "grants"] {
+            fs::create_dir(registry_dir.join(name)).unwrap();
+        }
+        // A real private PID1 supplies live root evidence; host PID1 is not
+        // inspectable by an unprivileged test process on this machine.
+        let init_socket = dir.path().join("init.sock");
+        let listener = UnixListener::bind(&init_socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut init_child = PrivateInit(Command::new("unshare")
+            .args(["--user", "--map-root-user", "--pid", "--fork", "--kill-child", "--mount", "--mount-proc", "python3", "-c",
+                "import os,socket,sys,time\nassert os.getpid()==1\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect(sys.argv[1]);s.send(b'1');time.sleep(30)",
+                init_socket.to_str().unwrap()])
+            .spawn().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (mut init_stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    assert!(
+                        init_child.0.try_wait().unwrap().is_none(),
+                        "private PID1 exited before handshake"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("private PID1 handshake: {error}"),
+            }
+        };
+        let mut signal = [0u8; 1];
+        init_stream.read_exact(&mut signal).unwrap();
+        assert_eq!(signal, [b'1']);
+        let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    init_stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    credentials.as_mut_ptr().cast(),
+                    &mut length,
+                )
+            },
+            0
+        );
+        let init = PinnedProcess::open(unsafe { credentials.assume_init().pid }).unwrap();
+        let root_record = RootRecord {
+            version: 1,
+            boot_id: init.boot_id.clone(),
+            root_id: root.clone(),
+            owner_uid: peer.uid,
+            init_host_pid: init.host_pid,
+            init_starttime_ticks: init.starttime_ticks,
+            pidns_dev: init.pidns_dev,
+            pidns_ino: init.pidns_ino,
+        };
+        fs::write(
+            registry_dir.join(format!("{root}.json")),
+            serde_json::to_vec(&root_record).unwrap(),
+        )
+        .unwrap();
+        let entry = EntryRecord {
+            version: 1,
+            root_id: root.clone(),
+            owner_uid: peer.uid,
+            entry: stamp.clone(),
+            prepared_guardian: Some(stamp.clone()),
+            domain_id: Some(owner.domain_id.clone()),
+            supervisor_authority_id: Some(owner.supervisor_authority_id.clone()),
+            guardian: Some(stamp.clone()),
+            join_consumed: true,
+            joined_child: Some(stamp.clone()),
+        };
+        fs::write(
+            registry_dir.join("entries").join(format!("{root}.json")),
+            serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
+        let roots = RootRegistry::open(&registry_dir).unwrap();
+        let entries = EntryRegistry::open(registry_dir.join("entries")).unwrap();
+        let works = WorkRegistry::open(registry_dir.join("works"), &roots).unwrap();
+        let grants_dir = registry_dir.join("grants");
+        let mut grants = GrantRegistry::open(&grants_dir).unwrap();
+        let first = grants
+            .prepare_native(
+                &roots,
+                &entries,
+                &works,
+                &peer,
+                &host_namespace,
+                &runner_image,
+                &directory,
+                &request,
+                &receipt,
+                &root,
+                &attempt.attempt_id,
+                &owner.owner_generation,
+                &receipt_sha,
+            )
+            .unwrap();
+        assert_eq!(first.version, 4);
+        assert_eq!(first.kind, "native-continuation-v1");
+        assert_eq!(first.state, "prepared");
+        assert!(
+            grants
+                .prepare_native(
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &root,
+                    &uuid::Uuid::new_v4().to_string(),
+                    &owner.owner_generation,
+                    &receipt_sha,
+                )
+                .is_err()
+        );
+        let mut reopened = GrantRegistry::open(&grants_dir).unwrap();
+        let replay = reopened
+            .prepare_native(
+                &roots,
+                &entries,
+                &works,
+                &peer,
+                &host_namespace,
+                &runner_image,
+                &directory,
+                &request,
+                &receipt,
+                &root,
+                &attempt.attempt_id,
+                &owner.owner_generation,
+                &receipt_sha,
+            )
+            .unwrap();
+        assert_eq!(replay, first);
+        let mut wrong_snapshot = accepted.clone();
+        wrong_snapshot.kernel_root_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            db.bind_exact_native_grant(
+                &wrong_snapshot,
+                &first.grant_id,
+                &verified.custodian_request_sha256,
+            )
+            .is_err()
+        );
+        assert_eq!(db.native_grant_binding(&attempt.attempt_id).unwrap(), None);
+        let bound_row = db
+            .bind_exact_native_grant(
+                &accepted,
+                &first.grant_id,
+                &verified.custodian_request_sha256,
+            )
+            .unwrap();
+        assert_eq!(
+            db.native_grant_binding(&attempt.attempt_id).unwrap(),
+            Some(bound_row.clone())
+        );
+        assert!(
+            db.bind_exact_native_grant(
+                &accepted,
+                &uuid::Uuid::new_v4().to_string(),
+                &verified.custodian_request_sha256,
+            )
+            .is_err()
+        );
+        drop(db);
+        let restarted_state = MailboxDb::open_completion_continuation_domain(&state_path).unwrap();
+        assert_eq!(
+            restarted_state
+                .native_grant_binding(&attempt.attempt_id)
+                .unwrap(),
+            Some(bound_row)
+        );
+        assert_eq!(
+            GrantRegistry::open(&grants_dir)
+                .unwrap()
+                .native_record(&attempt.attempt_id)
+                .unwrap()
+                .grant_id,
+            first.grant_id
+        );
+        let duplicate_id = uuid::Uuid::new_v4().to_string();
+        let duplicate_path = grants_dir.join(format!("{duplicate_id}.json"));
+        let mut duplicate = serde_json::to_value(&first).unwrap();
+        duplicate["grant_id"] = duplicate_id.into();
+        fs::write(&duplicate_path, serde_json::to_vec(&duplicate).unwrap()).unwrap();
+        assert!(GrantRegistry::open(&grants_dir).is_err());
+        fs::remove_file(duplicate_path).unwrap();
         let wrong_root = BoundNativeAuthority {
             root_id: "sibling",
             ..bound
@@ -315,6 +531,25 @@ mod tests {
         assert!(verify(&peer, &wrong_sha, &directory, &request, &receipt).is_err());
         fs::write(&request_path, b"replaced bytes").unwrap();
         assert!(verify(&peer, &bound, &directory, &request, &receipt).is_err());
+        assert!(
+            reopened
+                .prepare_native(
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &root,
+                    &attempt.attempt_id,
+                    &owner.owner_generation,
+                    &receipt_sha,
+                )
+                .is_err()
+        );
         fs::write(&request_path, &request_bytes).unwrap();
         fs::rename(&receipt_path, dir.path().join("moved-receipt")).unwrap();
         assert!(verify(&peer, &bound, &directory, &request, &receipt).is_err());

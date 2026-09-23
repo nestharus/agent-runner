@@ -305,6 +305,62 @@ pub struct AcceptedWorkSpec {
     pub owner_generation: String,
 }
 
+/// Native prepare is a separate challenged wire from Bash H. The digest must
+/// come from the original guardian's retained fsynced receipt decision.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePrepareSpec {
+    pub protocol: String,
+    pub root_id: String,
+    pub attempt_id: String,
+    pub owner_generation: String,
+    pub receipt_sha256: String,
+}
+
+/// Descriptor order: exact accepted-work directory, immutable
+/// custodian-request.json, and native-continuation-accepted-v1.json.
+pub fn prepare_native_at(
+    path: &Path,
+    spec: &NativePrepareSpec,
+    descriptors: [RawFd; 3],
+) -> io::Result<String> {
+    let body = serde_json::to_vec(spec)?;
+    if body.len() > 2048 {
+        return Err(io::Error::other("native prepare request too large"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(17 + body.len());
+    request.push(b'N');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: request.as_mut_ptr().cast(),
+        iov_len: request.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as usize;
+        std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast(), 3);
+    }
+    if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+        != request.len() as isize
+    {
+        return Err(io::Error::other("short native prepare; outcome uncertain"));
+    }
+    read_response(stream)
+}
+
 /// A prepared H grant is launched once by its original guardian. The seven
 /// descriptors are the five H artifacts, the worker control socket, and the
 /// read end of the worker capability pipe. The broker chooses the namespace,

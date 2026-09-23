@@ -9,8 +9,9 @@ use oulipoly_kernel_broker::identity::{
     PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
 };
 use oulipoly_kernel_broker::protocol::{
-    AcceptedWorkSpec, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, OwnerWitness,
-    ProcessWitness, SourceControlUse, SourceScope, SourceSocketWitness, SourceTicketUse,
+    AcceptedWorkSpec, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, NativePrepareSpec,
+    OwnerWitness, ProcessWitness, SourceControlUse, SourceScope, SourceSocketWitness,
+    SourceTicketUse,
 };
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
@@ -106,6 +107,10 @@ enum RequestPayload {
     PrepareAcceptedWork {
         spec: AcceptedWorkSpec,
         descriptors: [File; 5],
+    },
+    PrepareNative {
+        spec: NativePrepareSpec,
+        descriptors: [File; 3],
     },
     LaunchAcceptedWork {
         spec: LaunchAcceptedWorkSpec,
@@ -218,7 +223,7 @@ fn recv_request(
         b'Q' | b'Z' => read == 33,
         b'A' => read == 33,
         b'J' => (18..=48 * 1024 + 17).contains(&read),
-        b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' => (18..=2048 + 17).contains(&read),
+        b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' => (18..=2048 + 17).contains(&read),
         _ => read == 17,
     };
     if !valid_length
@@ -230,6 +235,7 @@ fn recv_request(
     if invalid_ancillary
         || match request[0] {
             b'J' | b'H' => descriptors.len() != 5,
+            b'N' => descriptors.len() != 3,
             b'K' => descriptors.len() != 7,
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -296,6 +302,12 @@ fn recv_request(
             descriptors: descriptors
                 .try_into()
                 .map_err(|_| io::Error::other("accepted-work descriptors"))?,
+        },
+        b'N' => RequestPayload::PrepareNative {
+            spec: serde_json::from_slice(&request[17..read as usize])?,
+            descriptors: descriptors
+                .try_into()
+                .map_err(|_| io::Error::other("native prepare descriptors"))?,
         },
         b'K' => RequestPayload::LaunchAcceptedWork {
             spec: serde_json::from_slice(&request[17..read as usize])?,
@@ -1218,6 +1230,30 @@ fn serve() -> io::Result<()> {
                     &spec.owner_generation,
                 )?;
                 Ok(format!("prepared-work {}\n", grant.grant_id))
+            } else if operation == b'N' {
+                let RequestPayload::PrepareNative { spec, descriptors } = payload else {
+                    return Err(io::Error::other("invalid native prepare payload"));
+                };
+                if spec.protocol != "native-continuation-v1" {
+                    return Err(io::Error::other("unsupported native prepare protocol"));
+                }
+                let [directory, request, receipt] = descriptors;
+                let grant = grants.prepare_native(
+                    &registry,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &spec.root_id,
+                    &spec.attempt_id,
+                    &spec.owner_generation,
+                    &spec.receipt_sha256,
+                )?;
+                Ok(format!("prepared-native {}\n", grant.grant_id))
             } else if operation == b'K' {
                 let RequestPayload::LaunchAcceptedWork { spec, descriptors } = payload else {
                     return Err(io::Error::other("invalid accepted launch payload"));
@@ -1706,6 +1742,65 @@ assert s.send(message) == len(message)
             (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as _) as _;
             *(libc::CMSG_DATA(cmsg) as *mut i32) = payload.as_raw_fd();
             assert_eq!(libc::sendmsg(client.as_raw_fd(), &message, 0), 17);
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn native_prepare_frame_is_challenged_and_has_exact_three_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (operation, payload, peer) = peer_from_request(&mut stream).unwrap();
+            assert_eq!(operation, b'N');
+            assert_eq!(peer.process.host_pid, std::process::id() as i32);
+            let RequestPayload::PrepareNative { spec, descriptors } = payload else {
+                panic!("native frame decoded as another operation");
+            };
+            assert_eq!(spec.receipt_sha256, "a".repeat(64));
+            assert_eq!(descriptors.len(), 3);
+        });
+        let mut client = UnixStream::connect(&socket).unwrap();
+        let mut challenge = [0u8; 16];
+        client.read_exact(&mut challenge).unwrap();
+        let spec = NativePrepareSpec {
+            protocol: "native-continuation-v1".into(),
+            root_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            receipt_sha256: "a".repeat(64),
+        };
+        let mut request = vec![b'N'];
+        request.extend_from_slice(&challenge);
+        request.extend_from_slice(&serde_json::to_vec(&spec).unwrap());
+        let files = [
+            File::open("/dev/null").unwrap(),
+            File::open("/dev/null").unwrap(),
+            File::open("/dev/null").unwrap(),
+        ];
+        let fds = files.each_ref().map(|file| file.as_raw_fd());
+        let mut iov = libc::iovec {
+            iov_base: request.as_mut_ptr().cast(),
+            iov_len: request.len(),
+        };
+        let mut control = [0u8; 128];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&fds) as _) } as _;
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&message);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&fds) as _) as _;
+            std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg).cast(), 3);
+            assert_eq!(
+                libc::sendmsg(client.as_raw_fd(), &message, 0),
+                request.len() as isize
+            );
         }
         server.join().unwrap();
     }

@@ -156,6 +156,24 @@ tampering as outside the same-host trust boundary; this source makes no
 adversarial containment claim. The private fixture is a source/protocol test,
 not a host-root sudo or deployed continuity proof.
 
+The distinct challenged `N` request carries the original guardian's retained
+SHA-256 of `native-continuation-accepted-v1.json` and three descriptors: its
+directory, `custodian-request.json`, and that receipt. The broker checks its
+bound live guardian, root, owner UID, host PID namespace and pinned Runner
+image, then verifies both named regular-file inodes and exact receipt/request
+bytes. It writes a version 4 `native-continuation-v1` record into the same
+`grants/` directory; versions 2 and 3 retain their original-work meaning.
+An exact retry returns the same ID after reply loss or restart. A changed
+attempt or evidence is refused. The guardian then binds that ID to accepted
+revision 2 through State v28 and uses indexed exact readback after an
+uncertain CAS. Broker fsync precedes State bind: a crash in between leaves an
+unbound, nonlaunchable broker debt; a crash after State commit leaves the one
+existing bound pair. This source has no native K consumer. The guardian
+retains the prepared/bound attempt and returns an explicit attach-before-K
+contract; it never falls through to host-local `Command::spawn`. A dead
+original guardian cannot recover an unbound grant without a later recovery
+protocol, so that case remains debt rather than a new grant.
+
 ## Remaining interfaces
 
 - The merged State/runtime/Runner PID readers translate namespace-local PIDs

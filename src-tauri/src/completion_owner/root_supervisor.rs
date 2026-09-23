@@ -4,6 +4,7 @@
 //! child-tree draining but hold no SQLite or replay authority.
 
 use super::custody::{CustodianRequest, LaunchRecipe};
+use oulipoly_kernel_broker::protocol::{self, NativePrepareSpec};
 use oulipoly_state::diagnostic_recorder::{
     DiagnosticId, DiagnosticPhase, PhaseObservation, SpanStart, process_recorder,
 };
@@ -119,9 +120,80 @@ fn publish_native_receipt(
     result.map(|()| receipt_sha256)
 }
 
+fn prepare_and_bind_native(
+    mailbox: &mut MailboxDb,
+    accepted: &oulipoly_state::mailbox::AcceptedNativeGrantSnapshot,
+    request_path: &Path,
+    request_file: &std::fs::File,
+    request_bytes: &[u8],
+    receipt_sha256: &str,
+) -> Result<String, String> {
+    let directory = std::fs::File::open(request_path.parent().ok_or("native directory absent")?)
+        .map_err(|e| e.to_string())?;
+    let receipt = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(request_path.with_file_name(NATIVE_ACCEPTED_FILE))
+        .map_err(|e| e.to_string())?;
+    let spec = NativePrepareSpec {
+        protocol: "native-continuation-v1".into(),
+        root_id: accepted.kernel_root_id.clone(),
+        attempt_id: accepted.attempt.attempt_id.clone(),
+        owner_generation: accepted.owner_generation.clone(),
+        receipt_sha256: receipt_sha256.into(),
+    };
+    let send = || {
+        protocol::prepare_native_at(
+            &super::linux::owner_broker_socket(),
+            &spec,
+            [
+                directory.as_raw_fd(),
+                request_file.as_raw_fd(),
+                receipt.as_raw_fd(),
+            ],
+        )
+    };
+    // The broker's exact-evidence replay returns the same durable ID after a
+    // lost reply or restart. A refusal stays debt; it never opens a worker.
+    let response = send().or_else(|_| send()).map_err(|e| e.to_string())?;
+    let grant_id = response
+        .strip_prefix("prepared-native ")
+        .and_then(|s| s.strip_suffix('\n'))
+        .ok_or("native broker did not return a prepared grant")?;
+    uuid::Uuid::parse_str(grant_id).map_err(|_| "invalid native broker grant ID")?;
+    let request_sha256 = oulipoly_state::completion_continuation::sha256(request_bytes);
+    let bind = mailbox.bind_exact_native_grant(accepted, grant_id, &request_sha256);
+    let readback = mailbox
+        .native_grant_binding(&accepted.attempt.attempt_id)?
+        .ok_or("native grant binding absent after prepare")?;
+    let accepted_sha256 = oulipoly_state::completion_continuation::sha256(
+        &serde_json::to_vec(accepted).map_err(|e| e.to_string())?,
+    );
+    if readback.grant_id != grant_id
+        || readback.protocol != "native-continuation-v1"
+        || readback.accepted_revision != 2
+        || readback.attempt_id != accepted.attempt.attempt_id
+        || readback.domain_id != accepted.domain_id
+        || readback.kernel_root_id != accepted.kernel_root_id
+        || readback.supervisor_authority_id != accepted.supervisor_authority_id
+        || readback.owner_generation != accepted.owner_generation
+        || readback.guardian_identity != accepted.guardian_identity
+        || readback.accepted_snapshot_sha256 != accepted_sha256
+        || readback.custodian_request_sha256 != request_sha256
+    {
+        return Err("native grant binding readback conflict".into());
+    }
+    // An uncertain CAS is recovered only by the exact durable row above.
+    let _ = bind;
+    Ok(grant_id.into())
+}
+
 #[cfg(test)]
 mod native_acceptance_tests {
     use super::*;
+    use oulipoly_kernel_broker::entry_registry::ProcessStamp;
+    use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess};
+    use oulipoly_kernel_broker::native_receipt::{BoundNativeAuthority, verify};
     use oulipoly_state::completion_continuation::SourceProcessIdentity;
 
     fn snapshot(result_path: &Path) -> oulipoly_state::mailbox::AcceptedNativeGrantSnapshot {
@@ -204,6 +276,80 @@ mod native_acceptance_tests {
         std::fs::rename(&request, dir.path().join("old-request")).unwrap();
         std::fs::write(&request, b"request-one").unwrap();
         assert!(exact_request_bytes(&request, &file).is_err());
+    }
+
+    #[test]
+    fn guardian_publisher_and_broker_verifier_share_real_state_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open_completion_continuation_domain(&state_path).unwrap();
+        let process = PinnedProcess::open(std::process::id() as i32).unwrap();
+        let identity = SourceProcessIdentity {
+            pid: i64::from(process.host_pid),
+            boot_id: process.boot_id.clone(),
+            starttime_ticks: process.starttime_ticks as i64,
+        };
+        let owner = CompletionDomainOwner {
+            protocol: oulipoly_state::completion_continuation::PROTOCOL.into(),
+            domain_id: db.completion_continuation_domain().unwrap().unwrap(),
+            supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            guardian_identity: identity.clone(),
+            driver_identity: identity,
+            endpoint: dir.path().join("owner.sock").to_string_lossy().into(),
+        };
+        let root = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&owner, Some(&root))
+            .unwrap();
+        let attempt = ContinuationAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: owner.owner_generation.clone(),
+            operation: "transport".into(),
+            request_sha256: "a".repeat(64),
+            source_registration_id: None,
+            source_listener_revision: None,
+            session_id: None,
+            claim_token: None,
+            result_path: dir.path().join("result.json").to_string_lossy().into(),
+        };
+        db.reserve_continuation_attempt(&attempt).unwrap();
+        let accepted = db
+            .accept_exact_native_attempt(&attempt, &owner, &root)
+            .unwrap();
+        let request_path = dir.path().join("custodian-request.json");
+        let request_bytes = serde_json::to_vec(&serde_json::json!({
+            "path": state_path, "attempt": attempt,
+            "recipe": {"Native": {"args": [], "environment": [], "directory": null}}
+        }))
+        .unwrap();
+        super::super::custody::write_request_once(&request_path, &request_bytes).unwrap();
+        let request = std::fs::File::open(&request_path).unwrap();
+        let receipt_sha =
+            publish_native_receipt(&request_path, &request, &request_bytes, &accepted).unwrap();
+        let receipt = std::fs::File::open(dir.path().join(NATIVE_ACCEPTED_FILE)).unwrap();
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        let peer = PeerIdentity {
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            process,
+        };
+        let stamp = ProcessStamp::from(&peer.process);
+        let host_namespace = std::fs::File::open("/proc/self/ns/pid").unwrap();
+        let runner_image = std::fs::File::open("/proc/self/exe").unwrap();
+        let bound = BoundNativeAuthority {
+            root_id: &root,
+            domain_id: &owner.domain_id,
+            supervisor_authority_id: &owner.supervisor_authority_id,
+            owner_generation: &owner.owner_generation,
+            owner_uid: peer.uid,
+            guardian: &stamp,
+            host_namespace: &host_namespace,
+            runner_image: &runner_image,
+            receipt_sha256: &receipt_sha,
+        };
+        let verified = verify(&peer, &bound, &directory, &request, &receipt).unwrap();
+        assert_eq!(verified.attempt_id, attempt.attempt_id);
+        assert_eq!(verified.receipt_sha256, receipt_sha);
     }
 
     #[test]
@@ -894,12 +1040,22 @@ impl RootSupervisor {
                     return Err(error);
                 }
             };
-            // A tagged broker grant, one-use K and Q settlement are separate
-            // authority. Until those are wired, retain the accepted obligation
-            // without executing a host-local worker.
-            let reason =
-                "native broker grant is not yet wired; accepted attempt retained without launch"
-                    .to_owned();
+            let prepared = prepare_and_bind_native(
+                &mut mailbox,
+                &snapshot,
+                &request_path,
+                &request_file,
+                &request_bytes,
+                &receipt_sha256,
+            );
+            // Preparation and v28 binding are durable debt. Native K still
+            // requires attach-before-release and must not use the local spawn.
+            let reason = match prepared {
+                Ok(grant_id) => format!(
+                    "native grant {grant_id} prepared and bound; native K/attach contract remains closed"
+                ),
+                Err(error) => format!("native grant preparation/binding uncertain: {error}"),
+            };
             self.retain_native_broker_pending(
                 attempt,
                 diagnostic_id,
