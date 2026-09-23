@@ -36,20 +36,30 @@ if mode == 'source':
             command = json.load(open(command_path))
             control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             control.connect(command['guardian_socket'])
-            broker = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            broker.connect(command['broker_socket'])
-            challenge = b''
-            while len(challenge) < 16:
-                chunk = broker.recv(16 - len(challenge))
-                if not chunk: raise RuntimeError('broker challenge ended early')
-                challenge += chunk
-            witness = json.dumps(command['witness'], separators=(',', ':')).encode()
-            broker.sendmsg([b's' + challenge + witness], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [control.fileno()]))])
-            response = b''
-            while not response.endswith(b'\n') and len(response) < 256:
-                chunk = broker.recv(256 - len(response))
-                if not chunk: raise RuntimeError('broker response ended early')
-                response += chunk
+            def attest(witness):
+                broker = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                broker.connect(command['broker_socket'])
+                challenge = b''
+                while len(challenge) < 16:
+                    chunk = broker.recv(16 - len(challenge))
+                    if not chunk: raise RuntimeError('broker challenge ended early')
+                    challenge += chunk
+                body = json.dumps(witness, separators=(',', ':')).encode()
+                broker.sendmsg([b's' + challenge + body], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [control.fileno()]))])
+                response = b''
+                while not response.endswith(b'\n') and len(response) < 256:
+                    chunk = broker.recv(256 - len(response))
+                    if not chunk: raise RuntimeError('broker response ended early')
+                    response += chunk
+                broker.close()
+                return response
+            false_nested = dict(command['witness'])
+            false_nested['scope'] = {'kind': 'nested', 'parent_work_id': 'sibling-work'}
+            false_root = dict(command['witness'])
+            false_root['root_id'] = '00000000-0000-4000-8000-000000000000'
+            rejected = [attest(false_nested).decode(), attest(false_root).decode()]
+            open(path + '/source-rejections.json', 'w').write(json.dumps(rejected))
+            response = attest(command['witness'])
             if response != ('verified-source-v2 ' + command['witness']['root_id'] + '\n').encode():
                 open(path + '/source-error', 'w').write(repr(response))
                 break
@@ -230,6 +240,41 @@ fn send_h(path: &Path, body: &[u8], descriptors: &[RawFd], valid_nonce: bool) ->
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     response
+}
+
+fn send_source_without_reading_reply(path: &Path, witness: &SourceSocketWitness, connected: RawFd) {
+    let mut broker = UnixStream::connect(path).unwrap();
+    let mut challenge = [0u8; 16];
+    broker.read_exact(&mut challenge).unwrap();
+    let body = serde_json::to_vec(witness).unwrap();
+    let mut request = Vec::with_capacity(17 + body.len());
+    request.push(b's');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: request.as_mut_ptr().cast(),
+        iov_len: request.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as usize;
+        *libc::CMSG_DATA(header).cast::<RawFd>() = connected;
+    }
+    assert_eq!(
+        unsafe { libc::sendmsg(broker.as_raw_fd(), &message, libc::MSG_NOSIGNAL) },
+        request.len() as isize
+    );
+    // Losing this broker response must not make the caller send work/cancel.
+    // The fixture deliberately sends no source frame after this point.
 }
 
 fn send_k_without_reply(path: &Path, spec: &LaunchAcceptedWorkSpec, descriptors: [RawFd; 7]) {
@@ -675,6 +720,15 @@ fn inner(kill_case: bool, lost_reply_case: bool) {
         )
         .unwrap();
         wait_for(&temp.path().join("source-sent"));
+        let rejections: Vec<String> =
+            serde_json::from_slice(&fs::read(temp.path().join("source-rejections.json")).unwrap())
+                .unwrap();
+        assert_eq!(rejections.len(), 2);
+        assert!(
+            rejections
+                .iter()
+                .all(|response| response.starts_with("error "))
+        );
         read_cross_namespace_frame(&cross_server, source_pid);
         fs::write(temp.path().join("source-release"), b"yes").unwrap();
     }
@@ -688,6 +742,53 @@ fn inner(kill_case: bool, lost_reply_case: bool) {
     );
     assert!(
         protocol::verify_source_socket_v2_at(&socket, &sibling_cancel, guardian_socket.as_raw_fd())
+            .is_err()
+    );
+    let mut stale_source = cancel_witness.clone();
+    stale_source.source.starttime_ticks += 1;
+    assert!(
+        protocol::verify_source_socket_v2_at(&socket, &stale_source, guardian_socket.as_raw_fd())
+            .is_err()
+    );
+    let mut stale_guardian = cancel_witness.clone();
+    stale_guardian.guardian.starttime_ticks += 1;
+    assert!(
+        protocol::verify_source_socket_v2_at(&socket, &stale_guardian, guardian_socket.as_raw_fd())
+            .is_err()
+    );
+    // A connector can die after a successful S. Its frozen SO_PEERCRED PID
+    // must not turn a later T into a live source, including after PID reuse.
+    let stale_child = unsafe { libc::fork() };
+    assert!(stale_child >= 0);
+    if stale_child == 0 {
+        let connected = UnixStream::connect(temp.path().join("guardian.sock")).unwrap();
+        let child = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let mut claim = cancel_witness.clone();
+        claim.source = ProcessWitness {
+            host_pid: child.host_pid,
+            boot_id: child.boot_id,
+            starttime_ticks: child.starttime_ticks,
+        };
+        let passed =
+            protocol::verify_source_socket_v2_at(&socket, &claim, connected.as_raw_fd()).is_ok();
+        unsafe {
+            libc::_exit(if passed { 0 } else { 1 });
+        }
+    }
+    let (mut stale_server, _) = guardian_listener.accept().unwrap();
+    stale_server
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stale_server.read_exact(&mut marker).unwrap();
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(stale_child, &mut status, 0) },
+        stale_child
+    );
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    ticket.copy_from_slice(&marker[1..]);
+    assert!(
+        protocol::consume_source_ticket_at(&socket, ticket, use_cancel(), stale_server.as_raw_fd())
             .is_err()
     );
     let replay = protocol::prepare_accepted_work_at(&socket, &spec, descriptors).unwrap();
@@ -853,10 +954,18 @@ open(state + '/worker-done', 'w').write('done')
         );
         return;
     }
-    protocol::verify_source_socket_v2_at(&socket, &cancel_witness, guardian_socket.as_raw_fd())
-        .unwrap();
+    send_source_without_reading_reply(&socket, &cancel_witness, guardian_socket.as_raw_fd());
     guardian_server.read_exact(&mut marker).unwrap();
     ticket.copy_from_slice(&marker[1..]);
+    assert_eq!(
+        GrantRegistry::open(state.join("grants"))
+            .unwrap()
+            .records()
+            .len(),
+        1
+    );
+    assert_eq!(fs::read_dir(state.join("works")).unwrap().count(), 1);
+    assert!(!work_state.join("root-work-cancel-v1.json").exists());
     // The worker and adopted grandchild remain owned by PID1 when the broker
     // itself exits. Reattach the exact record and keep replay spent.
     broker.0.kill().unwrap();
