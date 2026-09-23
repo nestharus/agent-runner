@@ -1,6 +1,10 @@
-//! Fail-closed host entry staging for the unfinished kernel handoff. This
-//! branch runs before maintenance, CLI parsing, GUI startup, and owner forks.
-use oulipoly_kernel_broker::protocol::{Operation, request};
+//! Host-side staging for the unfinished kernel handoff. The opt-in path never
+//! opens a writable database or starts completion recovery. The only pre-grant
+//! mailbox observation is a detached, physically nonmutating read-only snapshot.
+use oulipoly_kernel_broker::protocol::{self, Operation, request};
+use oulipoly_state::mailbox::MailboxDb;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
 const REQUIRED_ENV: &str = "OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1";
@@ -11,6 +15,16 @@ pub(crate) fn host_entry() -> Option<ExitCode> {
     }
     let result = stage_host_entry(
         || {
+            // Probe before E: a detached snapshot cannot create or migrate the
+            // live mailbox. A missing/old domain is refused without reservation.
+            let path = MailboxDb::default_path()?;
+            let domain = MailboxDb::open_read_only(&path)?
+                .completion_continuation_domain()?
+                .ok_or("native completion domain is absent")?;
+            uuid::Uuid::parse_str(&domain).map_err(|_| "invalid native domain ID")?;
+            Ok(domain)
+        },
+        || {
             let response = request(Operation::ReserveEntry).map_err(|e| e.to_string())?;
             let id = response
                 .strip_prefix("reserved ")
@@ -19,27 +33,7 @@ pub(crate) fn host_entry() -> Option<ExitCode> {
             uuid::Uuid::parse_str(id).map_err(|_| "invalid broker root ID".to_owned())?;
             Ok(id.to_owned())
         },
-        |root_id| {
-            // The reservation is broker-generated. It is never itself a grant.
-            // The guardian must bind its pinned host incarnation and domain
-            // before it can publish a root authority for this ID.
-            unsafe {
-                std::env::set_var(
-                    crate::completion_owner::KERNEL_ROOT_RESERVATION_ENV,
-                    root_id,
-                )
-            };
-            crate::completion_owner::bootstrap_service()?;
-            let raw = std::env::var(crate::completion_owner::ROOT_AUTHORITY_ENV)
-                .map_err(|_| "host guardian did not publish a root authority".to_owned())?;
-            let grant: serde_json::Value = serde_json::from_str(&raw)
-                .map_err(|_| "invalid host guardian root authority".to_owned())?;
-            grant
-                .get("root_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-                .ok_or_else(|| "host guardian root ID absent".to_owned())
-        },
+        bind_host_guardian,
     );
     match result {
         Ok(()) => unreachable!("kernel handoff cannot yet release a child"),
@@ -51,17 +45,96 @@ pub(crate) fn host_entry() -> Option<ExitCode> {
 }
 
 fn stage_host_entry(
+    preflight: impl FnOnce() -> Result<String, String>,
     reserve: impl FnOnce() -> Result<String, String>,
-    bind: impl FnOnce(&str) -> Result<String, String>,
+    bind: impl FnOnce(&str, &str, &str) -> Result<(), String>,
 ) -> Result<(), String> {
+    let domain = preflight()?;
+    uuid::Uuid::parse_str(&domain).map_err(|_| "invalid preflight domain ID")?;
     let root_id = reserve()?;
-    let bound_id = bind(&root_id)?;
-    if bound_id != root_id {
-        return Err("host guardian root ID differs from broker reservation".into());
-    }
-    // No CLI/GUI argv, TTY/FD, environment, authenticated child join or nested
-    // accepted-work gate is available yet. Stop before any provider dispatch.
+    uuid::Uuid::parse_str(&root_id).map_err(|_| "invalid reserved root ID")?;
+    let supervisor = uuid::Uuid::new_v4().to_string();
+    bind(&root_id, &domain, &supervisor)?;
+    // The host grant only authorizes later bootstrap. There is no broker child
+    // join or accepted-work namespace yet, so no service or work starts here.
     Err("root child handoff is not implemented; no Runner was released".into())
+}
+
+fn bind_host_guardian(root: &str, domain: &str, supervisor: &str) -> Result<(), String> {
+    let (mut parent, mut child) = UnixStream::pair().map_err(|e| e.to_string())?;
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if pid == 0 {
+        drop(parent);
+        let mut release = [0u8; 1];
+        let result = (|| {
+            child.read_exact(&mut release).map_err(|e| e.to_string())?;
+            if release != [b'P'] {
+                return Err("guardian gate refused".into());
+            }
+            let response = protocol::bind_guardian(root, domain, supervisor)
+                .map_err(|e| format!("broker guardian binding failed: {e}"))?;
+            child
+                .write_all(response.as_bytes())
+                .map_err(|e| e.to_string())?;
+            // Remain pinned while the entry authenticates durable readback.
+            let mut done = [0u8; 1];
+            child.read_exact(&mut done).map_err(|e| e.to_string())?;
+            if done != [b'X'] {
+                return Err("guardian readback incomplete".into());
+            }
+            Ok::<(), String>(())
+        })();
+        unsafe { libc::_exit(if result.is_ok() { 0 } else { 70 }) }
+    }
+    drop(child);
+    let result = (|| {
+        let prepared = protocol::prepare_guardian(root, pid)
+            .map_err(|e| format!("broker guardian prepare failed: {e}"))?;
+        if prepared != format!("prepared {root}\n") {
+            return Err(format!(
+                "broker guardian prepare refused: {}",
+                prepared.trim()
+            ));
+        }
+        parent.write_all(b"P").map_err(|e| e.to_string())?;
+        let mut bound = Vec::new();
+        // The broker response is short; a child that does not provide one
+        // keeps this entry blocked, never authorized to bootstrap or dispatch.
+        loop {
+            if bound.len() >= 256 {
+                return Err("oversized guardian bind response".into());
+            }
+            let mut byte = [0u8; 1];
+            parent.read_exact(&mut byte).map_err(|e| e.to_string())?;
+            bound.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        if bound != format!("bound {root} {domain} {supervisor}\n").as_bytes() {
+            return Err("broker guardian binding refused or mismatched".into());
+        }
+        let readback =
+            protocol::read_entry(root).map_err(|e| format!("broker entry readback failed: {e}"))?;
+        if readback != format!("bound-entry {root} {domain} {supervisor} {pid}\n") {
+            return Err("broker durable grant readback mismatch".into());
+        }
+        parent.write_all(b"X").map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    drop(parent);
+    let mut status = 0;
+    if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
+        return Err("host guardian wait failed".into());
+    }
+    result?;
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return Err("host guardian exited before grant verification".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -70,29 +143,44 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
-    fn production_staging_orders_broker_reservation_before_guardian_and_never_dispatches() {
-        let steps = RefCell::new(Vec::new());
-        let id = uuid::Uuid::new_v4().to_string();
+    fn pregrant_failure_never_reserves_or_bootstraps() {
         let result = stage_host_entry(
-            || {
-                steps.borrow_mut().push("reserve");
-                Ok(id.clone())
-            },
-            |root| {
-                steps.borrow_mut().push("guardian");
-                Ok(root.to_owned())
-            },
+            || Err("missing native domain".into()),
+            || panic!("reservation after failed preflight"),
+            |_, _, _| panic!("binding after failed preflight"),
         );
-        assert_eq!(steps.into_inner(), ["reserve", "guardian"]);
-        assert!(result.unwrap_err().contains("no Runner was released"));
+        assert!(result.unwrap_err().contains("missing native domain"));
     }
 
     #[test]
-    fn broker_and_guardian_root_mismatch_fails_closed() {
+    fn exact_binding_precedes_any_possible_child_handoff() {
+        let events = RefCell::new(Vec::new());
+        let root = uuid::Uuid::new_v4().to_string();
+        let domain = uuid::Uuid::new_v4().to_string();
         let result = stage_host_entry(
-            || Ok(uuid::Uuid::new_v4().to_string()),
-            |_| Ok(uuid::Uuid::new_v4().to_string()),
+            || {
+                events.borrow_mut().push("read-only preflight");
+                Ok(domain.clone())
+            },
+            || {
+                events.borrow_mut().push("reserve");
+                Ok(root.clone())
+            },
+            |r, d, s| {
+                events.borrow_mut().push("durable bind and readback");
+                assert_eq!((r, d), (root.as_str(), domain.as_str()));
+                uuid::Uuid::parse_str(s).unwrap();
+                Ok(())
+            },
         );
-        assert!(result.unwrap_err().contains("differs"));
+        assert_eq!(
+            events.into_inner(),
+            [
+                "read-only preflight",
+                "reserve",
+                "durable bind and readback"
+            ]
+        );
+        assert!(result.unwrap_err().contains("no Runner was released"));
     }
 }

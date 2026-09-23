@@ -66,6 +66,10 @@ fn ordinary_entrypoint(run: impl FnOnce() -> ExitCode) -> ExitCode {
 }
 
 fn production_entrypoint() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = kernel_entry::host_entry() {
+        return result;
+    }
     if maintenance_worker::is_worker_invocation() {
         return match maintenance_worker::run_worker_invocation() {
             Ok(()) => ExitCode::SUCCESS,
@@ -90,10 +94,6 @@ fn production_entrypoint() -> ExitCode {
                 ExitCode::FAILURE
             }
         };
-    }
-    #[cfg(target_os = "linux")]
-    if let Some(result) = kernel_entry::host_entry() {
-        return result;
     }
     process_entrypoint()
 }

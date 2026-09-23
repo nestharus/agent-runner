@@ -1,11 +1,13 @@
 # Kernel broker source slice (AGE-319)
 
 This Linux-only executable is an **uninstalled, opt-in building block**.
-Runner's `OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1` branch calls the broker
-before maintenance or owner startup. It reserves a root ID, prepares the exact
-host guardian while that child waits on a gate, and binds its domain before
-the guardian starts its driver. The branch then fails closed: no root Runner
-or provider is released. Ordinary Runner and Bash admission and allocated
+Runner's `OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1` branch runs before maintenance
+or owner startup. It reads an existing domain through a detached read-only
+snapshot, reserves a root ID, prepares the exact waiting host guardian, and
+binds that guardian, domain, and proposed supervisor ID. The entry reads the
+binding back from the broker while the guardian is live, then exits failure.
+It never opens State or mailbox for writing, elects an owner, starts a driver,
+or releases a root Runner or provider. Ordinary Runner and Bash admission and allocated
 attempt custody remain in force. The paired AGE-319 work is not deployable.
 
 ## Installed paths and protocol
@@ -25,11 +27,14 @@ The Unix stream socket accepts one challenged request per connection:
 1. Broker sets `SO_PASSCRED`, reads `SO_PEERCRED`, and pins the connector with
    pidfd, starttime, boot ID, and PID namespace before sending a 16-byte challenge.
 2. Caller sends one message: 17 bytes for `C` (classify), `E` (reserve entry),
-   or disabled `L`; 37 bytes for `P` (prepare exact guardian PID); 49 bytes for
-   `G` (bind root and domain UUIDs). The broker requires per-message
+   or disabled `L`; 37 bytes for `P` (prepare exact guardian PID); 65 bytes for
+   `G` (bind root, domain, and supervisor UUIDs); 33 bytes for `A` (read the
+   exact bound entry). The broker requires per-message
    `SCM_CREDENTIALS` to match the pinned connector and rejects passed FDs.
 3. Responses include `outside`, `inside`, `uncertain`, `reserved <root_id>`,
-   `prepared <root_id>`, `bound <root_id> <domain_id>`, and `error <reason>`.
+   `prepared <root_id>`, `bound <root_id> <domain_id> <supervisor_id>`,
+   `bound-entry <root_id> <domain_id> <supervisor_id> <guardian_pid>`, and
+   `error <reason>`.
    Classification is never an authorization grant. `L` always refuses because
    its former child launch lacked guardian and entry binding.
 
@@ -37,11 +42,19 @@ The Unix stream socket accepts one challenged request per connection:
 It fsyncs a broker-generated root UUID and pinned entry incarnation. The host
 entry forks a waiting guardian, then `P` pins that exact direct child and fsyncs
 its incarnation before releasing the child gate. `G` accepts only that prepared
-guardian, binds its domain once, and fsyncs the binding. A sibling, repeated
+guardian, binds its domain and proposed supervisor ID once, and fsyncs the binding.
+`A` requires the exact still-live reserving entry and guardian; a UUID alone
+cannot read or use it. A sibling, repeated
 bind, dead guardian, wrong entry, or changed incarnation cannot bind. The
 `entries/` records remain as debt across broker restart; there is no timeout
 or automatic retirement. This slice creates **no PID namespace or Runner child**.
 No new `no_new_privs` or seccomp is applied.
+
+The proposed supervisor ID is not yet a published completion owner authority.
+The staged guardian exits after readback, leaving conservative debt. A later
+integration must keep that exact guardian alive, bind the actual owner/grant,
+and revalidate the read-only domain under the post-grant writer fence before
+any recovery or migration. The `A` readback does not authorize workload work.
 
 The challenged request still relies on equality of connect-time
 `SO_PEERCRED` and per-message `SCM_CREDENTIALS`, with the connector pinned by

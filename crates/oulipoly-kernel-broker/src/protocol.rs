@@ -12,6 +12,7 @@ pub const INSTALLED_SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 pub enum Operation {
     Classify,
     ReserveEntry,
+    ReadEntry,
     LaunchFixedRunner,
 }
 
@@ -23,7 +24,8 @@ pub fn request_at(path: &Path, operation: Operation) -> io::Result<String> {
 enum Payload {
     None,
     Prepare(uuid::Uuid, i32),
-    Bind(uuid::Uuid, uuid::Uuid),
+    Bind(uuid::Uuid, uuid::Uuid, uuid::Uuid),
+    Read(uuid::Uuid),
 }
 
 pub fn prepare_guardian_at(path: &Path, root_id: &str, guardian_pid: i32) -> io::Result<String> {
@@ -42,14 +44,39 @@ pub fn prepare_guardian(root_id: &str, guardian_pid: i32) -> io::Result<String> 
     prepare_guardian_at(Path::new(INSTALLED_SOCKET), root_id, guardian_pid)
 }
 
-pub fn bind_guardian_at(path: &Path, root_id: &str, domain_id: &str) -> io::Result<String> {
+pub fn bind_guardian_at(
+    path: &Path,
+    root_id: &str,
+    domain_id: &str,
+    supervisor_id: &str,
+) -> io::Result<String> {
     let root = uuid::Uuid::parse_str(root_id).map_err(|_| io::Error::other("bad root ID"))?;
     let domain = uuid::Uuid::parse_str(domain_id).map_err(|_| io::Error::other("bad domain ID"))?;
-    request_frame_at(path, Operation::ReserveEntry, Payload::Bind(root, domain))
+    let supervisor =
+        uuid::Uuid::parse_str(supervisor_id).map_err(|_| io::Error::other("bad supervisor ID"))?;
+    request_frame_at(
+        path,
+        Operation::ReserveEntry,
+        Payload::Bind(root, domain, supervisor),
+    )
 }
 
-pub fn bind_guardian(root_id: &str, domain_id: &str) -> io::Result<String> {
-    bind_guardian_at(Path::new(INSTALLED_SOCKET), root_id, domain_id)
+pub fn bind_guardian(root_id: &str, domain_id: &str, supervisor_id: &str) -> io::Result<String> {
+    bind_guardian_at(
+        Path::new(INSTALLED_SOCKET),
+        root_id,
+        domain_id,
+        supervisor_id,
+    )
+}
+
+pub fn read_entry_at(path: &Path, root_id: &str) -> io::Result<String> {
+    let root = uuid::Uuid::parse_str(root_id).map_err(|_| io::Error::other("bad root ID"))?;
+    request_frame_at(path, Operation::ReadEntry, Payload::Read(root))
+}
+
+pub fn read_entry(root_id: &str) -> io::Result<String> {
+    read_entry_at(Path::new(INSTALLED_SOCKET), root_id)
 }
 
 fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::Result<String> {
@@ -75,12 +102,13 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
     }
     let mut challenge = [0u8; 16];
     stream.read_exact(&mut challenge)?;
-    let mut request = [0u8; 49];
+    let mut request = [0u8; 65];
     request[0] = match operation {
         Operation::Classify => b'C',
         Operation::ReserveEntry if matches!(payload, Payload::Prepare(..)) => b'P',
         Operation::ReserveEntry if matches!(payload, Payload::Bind(..)) => b'G',
         Operation::ReserveEntry => b'E',
+        Operation::ReadEntry => b'A',
         Operation::LaunchFixedRunner => b'L',
     };
     request[1..17].copy_from_slice(&challenge);
@@ -91,10 +119,15 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
             request[33..37].copy_from_slice(&pid.to_ne_bytes());
             37
         }
-        Payload::Bind(root, domain) => {
+        Payload::Bind(root, domain, supervisor) => {
             request[17..33].copy_from_slice(root.as_bytes());
             request[33..49].copy_from_slice(domain.as_bytes());
-            49
+            request[49..65].copy_from_slice(supervisor.as_bytes());
+            65
+        }
+        Payload::Read(root) => {
+            request[17..33].copy_from_slice(root.as_bytes());
+            33
         }
     };
     // One send yields one SCM_CREDENTIALS-bearing request message.

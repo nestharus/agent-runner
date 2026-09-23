@@ -46,6 +46,10 @@ pub struct EntryRecord {
     pub entry: ProcessStamp,
     pub prepared_guardian: Option<ProcessStamp>,
     pub domain_id: Option<String>,
+    // Older unbound reservations remain readable; an older bound record with
+    // no supervisor binding fails validation instead of acquiring authority.
+    #[serde(default)]
+    pub supervisor_authority_id: Option<String>,
     pub guardian: Option<ProcessStamp>,
 }
 
@@ -71,9 +75,14 @@ impl EntryRegistry {
                 || format!("{}.json", record.root_id) != name
                 || uuid::Uuid::parse_str(&record.root_id).is_err()
                 || record.domain_id.is_some() != record.guardian.is_some()
+                || record.supervisor_authority_id.is_some() != record.guardian.is_some()
                 || record.guardian.is_some() && record.prepared_guardian != record.guardian
                 || record
                     .domain_id
+                    .as_ref()
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
+                || record
+                    .supervisor_authority_id
                     .as_ref()
                     .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
                 || records
@@ -111,6 +120,7 @@ impl EntryRegistry {
             entry: entry.into(),
             prepared_guardian: None,
             domain_id: None,
+            supervisor_authority_id: None,
             guardian: None,
         };
         let path = self.directory.join(format!("{root_id}.json"));
@@ -137,10 +147,14 @@ impl EntryRegistry {
         &mut self,
         root_id: &str,
         domain_id: &str,
+        supervisor_authority_id: &str,
         uid: u32,
         guardian: &PinnedProcess,
     ) -> io::Result<()> {
-        if self.has_debt() || uuid::Uuid::parse_str(domain_id).is_err() {
+        if self.has_debt()
+            || uuid::Uuid::parse_str(domain_id).is_err()
+            || uuid::Uuid::parse_str(supervisor_authority_id).is_err()
+        {
             return Err(io::Error::other("invalid or uncertain entry grant"));
         }
         let index = self
@@ -164,8 +178,40 @@ impl EntryRegistry {
         }
         let mut bound = current.clone();
         bound.domain_id = Some(domain_id.to_owned());
+        bound.supervisor_authority_id = Some(supervisor_authority_id.to_owned());
         bound.guardian = Some(guardian.into());
         self.replace(index, bound, &entry, guardian)
+    }
+
+    /// Readback is available only to the exact still-live reserving entry.
+    /// A root UUID by itself never confers authority.
+    pub fn bound_entry(
+        &self,
+        root_id: &str,
+        uid: u32,
+        entry: &PinnedProcess,
+    ) -> io::Result<&EntryRecord> {
+        if self.has_debt() {
+            return Err(io::Error::other("uncertain entry grant debt"));
+        }
+        let record = self
+            .record(root_id)
+            .ok_or_else(|| io::Error::other("unknown entry"))?;
+        if record.owner_uid != uid || !record.entry.matches(entry)? {
+            return Err(io::Error::other("entry identity mismatch"));
+        }
+        let guardian = record
+            .guardian
+            .as_ref()
+            .ok_or_else(|| io::Error::other("unbound entry"))?;
+        let live = PinnedProcess::open(guardian.host_pid)?;
+        if !guardian.matches(&live)?
+            || record.domain_id.is_none()
+            || record.supervisor_authority_id.is_none()
+        {
+            return Err(io::Error::other("guardian grant identity mismatch"));
+        }
+        Ok(record)
     }
 
     pub fn prepare_guardian(
@@ -267,10 +313,21 @@ mod tests {
         let uid = unsafe { libc::getuid() };
         let root = registry.reserve(uid, &entry).unwrap();
         let domain = uuid::Uuid::new_v4().to_string();
-        assert!(registry.bind_guardian(&root, &domain, uid, &entry).is_err());
+        let supervisor = uuid::Uuid::new_v4().to_string();
         assert!(
             registry
-                .bind_guardian(&uuid::Uuid::new_v4().to_string(), &domain, uid, &entry)
+                .bind_guardian(&root, &domain, &supervisor, uid, &entry)
+                .is_err()
+        );
+        assert!(
+            registry
+                .bind_guardian(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &domain,
+                    &supervisor,
+                    uid,
+                    &entry
+                )
                 .is_err()
         );
         let (mut parent_gate, mut child_gate) = UnixStream::pair().unwrap();
@@ -283,14 +340,17 @@ mod tests {
                 let mut restarted = EntryRegistry::open(temp.path())?;
                 assert!(
                     restarted
-                        .bind_guardian(&root, &domain, uid, &guardian)
+                        .bind_guardian(&root, &domain, &supervisor, uid, &guardian)
                         .is_err()
                 );
                 let mut release = [0u8; 1];
                 child_gate.read_exact(&mut release)?;
                 assert_eq!(release, [1]);
                 restarted = EntryRegistry::open(temp.path())?;
-                restarted.bind_guardian(&root, &domain, uid, &guardian)?;
+                restarted.bind_guardian(&root, &domain, &supervisor, uid, &guardian)?;
+                child_gate.write_all(&[2])?;
+                child_gate.read_exact(&mut release)?;
+                assert_eq!(release, [3]);
                 Ok::<(), io::Error>(())
             })();
             unsafe { libc::_exit(if status.is_ok() { 0 } else { 1 }) }
@@ -311,7 +371,7 @@ mod tests {
             let sibling = PinnedProcess::open(std::process::id() as i32).unwrap();
             let mut reopened = EntryRegistry::open(temp.path()).unwrap();
             let denied = reopened
-                .bind_guardian(&root, &domain, uid, &sibling)
+                .bind_guardian(&root, &domain, &supervisor, uid, &sibling)
                 .is_err();
             unsafe { libc::_exit(if denied { 0 } else { 1 }) }
         }
@@ -322,16 +382,32 @@ mod tests {
         );
         assert!(libc::WIFEXITED(sibling_status) && libc::WEXITSTATUS(sibling_status) == 0);
         parent_gate.write_all(&[1]).unwrap();
+        let mut bound = [0u8; 1];
+        parent_gate.read_exact(&mut bound).unwrap();
+        assert_eq!(bound, [2]);
+        let reopened = EntryRegistry::open(temp.path()).unwrap();
+        let bound = reopened.bound_entry(&root, uid, &entry).unwrap();
+        assert_eq!(bound.guardian.as_ref().unwrap().host_pid, child);
+        assert_eq!(
+            bound.supervisor_authority_id.as_deref(),
+            Some(supervisor.as_str())
+        );
+        parent_gate.write_all(&[3]).unwrap();
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         let mut restarted = EntryRegistry::open(temp.path()).unwrap();
         let record = restarted.record(&root).unwrap();
         assert_eq!(record.domain_id.as_deref(), Some(domain.as_str()));
+        assert_eq!(
+            record.supervisor_authority_id.as_deref(),
+            Some(supervisor.as_str())
+        );
         assert_eq!(record.guardian.as_ref().unwrap().host_pid, child);
+        assert!(restarted.bound_entry(&root, uid, &entry).is_err());
         assert!(
             restarted
-                .bind_guardian(&root, &domain, uid, &entry)
+                .bind_guardian(&root, &domain, &supervisor, uid, &entry)
                 .is_err()
         );
         assert!(restarted.reserve(uid, &entry).is_err());

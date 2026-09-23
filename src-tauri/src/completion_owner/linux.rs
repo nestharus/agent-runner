@@ -278,13 +278,6 @@ pub(super) fn bootstrap() -> Result<(), super::BootstrapError> {
     }
     if pid == 0 {
         drop(ready);
-        let mut announce = announce;
-        if std::env::var_os(super::KERNEL_ROOT_RESERVATION_ENV).is_some() {
-            let mut release = [0u8; 1];
-            if announce.read_exact(&mut release).is_err() || release != [b'P'] {
-                unsafe { libc::_exit(70) }
-            }
-        }
         let code = guardian(&path, &endpoint, &domain, election, Some(announce))
             .map(|()| 0)
             .unwrap_or(70);
@@ -292,15 +285,6 @@ pub(super) fn bootstrap() -> Result<(), super::BootstrapError> {
     }
     drop(announce);
     drop(election); // close only; never LOCK_UN the child's open description.
-    if let Some(root_id) = std::env::var_os(super::KERNEL_ROOT_RESERVATION_ENV) {
-        let root_id = root_id.to_str().ok_or("invalid kernel root reservation")?;
-        prepare_kernel_guardian_gate(
-            root_id,
-            pid,
-            oulipoly_kernel_broker::protocol::prepare_guardian,
-            || ready.write_all(b"P").map_err(|e| e.to_string()),
-        )?;
-    }
     // Readiness is a correctness barrier, not a latency policy. Migration and
     // bounded recovery can legitimately exceed five seconds on a large retained
     // store. A hard socket timeout previously surfaced Linux EAGAIN as apparent
@@ -319,23 +303,6 @@ pub(super) fn bootstrap() -> Result<(), super::BootstrapError> {
     require_owner(&domain)?;
     retain_context(ready)?;
     Ok(())
-}
-
-fn prepare_kernel_guardian_gate(
-    root_id: &str,
-    pid: i32,
-    prepare: impl FnOnce(&str, i32) -> Result<String, std::io::Error>,
-    release: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
-    let response =
-        prepare(root_id, pid).map_err(|e| format!("broker guardian prepare failed: {e}"))?;
-    if response != format!("prepared {root_id}\n") {
-        return Err(format!(
-            "broker guardian prepare refused: {}",
-            response.trim()
-        ));
-    }
-    release()
 }
 
 fn await_guardian_ready(
@@ -417,17 +384,6 @@ fn guardian(
     {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    let kernel_root_id = std::env::var(super::KERNEL_ROOT_RESERVATION_ENV).ok();
-    if let Some(root_id) = &kernel_root_id {
-        let response = oulipoly_kernel_broker::protocol::bind_guardian(root_id, domain)
-            .map_err(|e| format!("broker guardian binding failed: {e}"))?;
-        if response != format!("bound {root_id} {domain}\n") {
-            return Err(format!(
-                "broker guardian binding refused: {}",
-                response.trim()
-            ));
-        }
-    }
     let _ = std::fs::remove_file(endpoint); // lifetime election is held; no live peer is replaced.
     let listener = UnixListener::bind(endpoint).map_err(|e| e.to_string())?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -445,12 +401,7 @@ fn guardian(
     if let Some(mut socket) = announce.take() {
         let context = identity(peer_pid(&socket)?)?;
         MailboxDb::open(path)?.retain_completion_context(&context)?;
-        let grant = match &kernel_root_id {
-            Some(root_id) => {
-                root_authorities.fresh_with_root_id(&owner, context.clone(), root_id.clone())?
-            }
-            None => root_authorities.fresh(&owner, context.clone())?,
-        };
+        let grant = root_authorities.fresh(&owner, context.clone())?;
         socket.write_all(&[1]).map_err(|e| e.to_string())?;
         serde_json::to_writer(&mut socket, &grant).map_err(|error| error.to_string())?;
         socket.write_all(b"\n").map_err(|error| error.to_string())?;

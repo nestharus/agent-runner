@@ -46,8 +46,18 @@ fn checked_root_path(path: &Path, directory: bool) -> io::Result<()> {
 #[derive(Debug)]
 enum RequestPayload {
     None,
-    Prepare { root_id: String, guardian_pid: i32 },
-    Bind { root_id: String, domain_id: String },
+    Prepare {
+        root_id: String,
+        guardian_pid: i32,
+    },
+    Bind {
+        root_id: String,
+        domain_id: String,
+        supervisor_id: String,
+    },
+    Read {
+        root_id: String,
+    },
 }
 
 fn recv_request(
@@ -91,7 +101,7 @@ fn recv_request(
     // live through classification and dispatch.
     let challenge = *uuid::Uuid::new_v4().as_bytes();
     stream.write_all(&challenge)?;
-    let mut request = [0u8; 49];
+    let mut request = [0u8; 65];
     let mut iov = libc::iovec {
         iov_base: request.as_mut_ptr().cast(),
         iov_len: request.len(),
@@ -141,8 +151,9 @@ fn recv_request(
         cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
     }
     let expected_len = match request[0] {
-        b'G' => 49,
+        b'G' => 65,
         b'P' => 37,
+        b'A' => 33,
         _ => 17,
     };
     if read != expected_len
@@ -176,6 +187,10 @@ fn recv_request(
         b'G' => RequestPayload::Bind {
             root_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
             domain_id: uuid::Uuid::from_bytes(request[33..49].try_into().unwrap()).to_string(),
+            supervisor_id: uuid::Uuid::from_bytes(request[49..65].try_into().unwrap()).to_string(),
+        },
+        b'A' => RequestPayload::Read {
+            root_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
         _ => RequestPayload::None,
     };
@@ -253,13 +268,37 @@ fn dispatch_authenticated(
         }
         (b'P', _) => Err(io::Error::other("guardian prepare denied")),
         (b'G', Scope::Outside) if admitted => {
-            let RequestPayload::Bind { root_id, domain_id } = payload else {
+            let RequestPayload::Bind {
+                root_id,
+                domain_id,
+                supervisor_id,
+            } = payload
+            else {
                 return Err(io::Error::other("missing guardian binding"));
             };
-            entries.bind_guardian(&root_id, &domain_id, peer.uid, &peer.process)?;
-            Ok(format!("bound {root_id} {domain_id}\n"))
+            entries.bind_guardian(
+                &root_id,
+                &domain_id,
+                &supervisor_id,
+                peer.uid,
+                &peer.process,
+            )?;
+            Ok(format!("bound {root_id} {domain_id} {supervisor_id}\n"))
         }
         (b'G', _) => Err(io::Error::other("guardian binding denied")),
+        (b'A', Scope::Outside) if admitted => {
+            let RequestPayload::Read { root_id } = payload else {
+                return Err(io::Error::other("missing entry readback"));
+            };
+            let bound = entries.bound_entry(&root_id, peer.uid, &peer.process)?;
+            Ok(format!(
+                "bound-entry {root_id} {} {} {}\n",
+                bound.domain_id.as_ref().unwrap(),
+                bound.supervisor_authority_id.as_ref().unwrap(),
+                bound.guardian.as_ref().unwrap().host_pid
+            ))
+        }
+        (b'A', _) => Err(io::Error::other("entry readback denied")),
         (b'L', _) => Err(io::Error::other("ungated root launch disabled")),
         _ => Err(io::Error::other("unknown operation")),
     }
@@ -386,12 +425,29 @@ mod tests {
             .to_owned();
         assert!(entries.record(&root).unwrap().prepared_guardian.is_none());
         let domain = uuid::Uuid::new_v4().to_string();
+        let supervisor = uuid::Uuid::new_v4().to_string();
+        assert!(
+            dispatch_authenticated(
+                b'A',
+                RequestPayload::Read {
+                    root_id: root.clone()
+                },
+                &entry,
+                &host,
+                &image,
+                &registry,
+                &works,
+                &mut entries
+            )
+            .is_err()
+        );
         assert!(
             dispatch_authenticated(
                 b'G',
                 RequestPayload::Bind {
                     root_id: root.clone(),
-                    domain_id: domain.clone()
+                    domain_id: domain.clone(),
+                    supervisor_id: supervisor.clone(),
                 },
                 &entry,
                 &host,
@@ -432,7 +488,8 @@ mod tests {
                 b'G',
                 RequestPayload::Bind {
                     root_id: root.clone(),
-                    domain_id: domain.clone()
+                    domain_id: domain.clone(),
+                    supervisor_id: supervisor.clone(),
                 },
                 &entry,
                 &host,
@@ -453,6 +510,7 @@ mod tests {
             RequestPayload::Bind {
                 root_id: root.clone(),
                 domain_id: domain.clone(),
+                supervisor_id: supervisor.clone(),
             },
             &guardian,
             &host,
@@ -462,13 +520,46 @@ mod tests {
             &mut entries,
         )
         .unwrap();
-        assert_eq!(bound, format!("bound {root} {domain}\n"));
+        assert_eq!(bound, format!("bound {root} {domain} {supervisor}\n"));
+        let readback = dispatch_authenticated(
+            b'A',
+            RequestPayload::Read {
+                root_id: root.clone(),
+            },
+            &entry,
+            &host,
+            &image,
+            &registry,
+            &works,
+            &mut entries,
+        )
+        .unwrap();
+        assert_eq!(
+            readback,
+            format!("bound-entry {root} {domain} {supervisor} {child}\n")
+        );
+        assert!(
+            dispatch_authenticated(
+                b'A',
+                RequestPayload::Read {
+                    root_id: root.clone()
+                },
+                &guardian,
+                &host,
+                &image,
+                &registry,
+                &works,
+                &mut entries
+            )
+            .is_err()
+        );
         assert!(
             dispatch_authenticated(
                 b'G',
                 RequestPayload::Bind {
                     root_id: root.clone(),
-                    domain_id: domain.clone()
+                    domain_id: domain.clone(),
+                    supervisor_id: supervisor.clone(),
                 },
                 &guardian,
                 &host,

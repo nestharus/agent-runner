@@ -431,6 +431,11 @@ fn snapshot_helper_command() -> io::Result<SnapshotHelperCommand> {
         });
     }
     command.arg(crate::snapshot_helper::MODE_ARG);
+    // The helper runs before the Runner's main() via a constructor. Do not
+    // inherit the opt-in entry marker into this physically read-only child:
+    // its parent performs the broker gate and never treats helper output as a
+    // grant. Direct marked helper invocation is refused by the constructor.
+    command.env_remove("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1");
     Ok(SnapshotHelperCommand {
         command,
         _executable: executable,
