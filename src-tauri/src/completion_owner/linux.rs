@@ -134,6 +134,7 @@ pub(super) fn verify_kernel_owner_socket(
         guardian: process(&owner.guardian_identity)?,
         driver: process(&owner.driver_identity)?,
         owner_generation: Some(owner.owner_generation.clone()),
+        work_id: std::env::var("AGENT_BASH_OWNER_WORK_ID_V1").ok(),
         owner_session_id: std::env::var("AGENT_BASH_OWNER_SESSION_ID").ok(),
         owner_invocation_uuid: std::env::var("AGENT_BASH_OWNER_INVOCATION_UUID").ok(),
         registration_authority_sha256: std::env::var_os(

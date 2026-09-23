@@ -48,6 +48,10 @@ pub struct OwnerWitness {
     /// child branch remains compatible with its original witness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_generation: Option<String>,
+    /// Exact accepted work selected by a sealed completion helper. Joined
+    /// root children have no work ID and retain their original V shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -347,6 +347,7 @@ pub(crate) fn register(
     let binding = load_binding(path)?;
     let source = binding.registration()?;
     let result = (|| {
+        super::notify::require_pinned_owner_work_id(&source.handle)?;
         if args.completion_protocol != Some(PROTOCOL) || args.repair_admitted {
             return Err(
                 "v2 requires explicit protocol; registration replay is not recovery authority"
@@ -408,6 +409,7 @@ fn operation_result(
 pub(crate) fn readback(path: &Path, completion: bool) -> Result<i32, String> {
     let binding = load_binding(path)?;
     let result = (|| {
+        super::notify::require_pinned_owner_work_id(&binding.registration()?.handle)?;
         let state =
             StateDb::open_read_only(&StateDb::default_path()?).map_err(|e| format!("{e:?}"))?;
         if state.admitted_completion_continuation(&binding)?.is_none() {
@@ -501,6 +503,8 @@ pub(crate) fn complete(
         || args.rc != Path::new(&paths[2])
     {
         Err("completion CLI fields conflict with immutable registration".into())
+    } else if let Err(error) = super::notify::require_pinned_owner_work_id(&source.handle) {
+        Err(error)
     } else if args.completion_protocol == Some(PROTOCOL) {
         accept(&binding, snapshot)
     } else {

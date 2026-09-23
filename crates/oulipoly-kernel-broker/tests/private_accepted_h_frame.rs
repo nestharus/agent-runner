@@ -494,6 +494,7 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
                 }
             },
             owner_generation: Some(spec.owner_generation.clone()),
+            work_id: Some(spec.work_id.clone()),
             owner_session_id: Some(session),
             owner_invocation_uuid: Some(invocation),
             registration_authority_sha256: Some(digest(registration_authority.as_bytes())),
@@ -1481,6 +1482,15 @@ fn sealed_helper_from_consumed_work_attests_owner() {
             return;
         }
         verify(&witness).unwrap();
+        let mut missing = witness.clone();
+        missing.work_id = None;
+        assert!(verify(&missing).is_err(), "missing work ID was admitted");
+        let mut malformed = witness.clone();
+        malformed.work_id = Some(String::new());
+        assert!(verify(&malformed).is_err(), "empty work ID was admitted");
+        let mut sibling = witness.clone();
+        sibling.work_id = Some("sibling-work".into());
+        assert!(verify(&sibling).is_err(), "sibling work ID was admitted");
         let mut missing = witness.clone();
         missing.owner_session_id = None;
         assert!(

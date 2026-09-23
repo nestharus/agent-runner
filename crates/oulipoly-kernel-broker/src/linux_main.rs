@@ -416,6 +416,9 @@ fn verify_owner_socket(
         if root_id != witness.root_id {
             return Err(io::Error::other("owner helper root mismatch"));
         }
+        if witness.work_id.as_deref() != Some(work_id.as_str()) {
+            return Err(io::Error::other("owner helper work ID mismatch"));
+        }
         let work = works
             .live_works()
             .find(|work| {
@@ -439,6 +442,7 @@ fn verify_owner_socket(
             .as_ref()
             .ok_or_else(|| io::Error::other("owner helper was not pinned at H"))?;
         if grant.version != 3
+            || witness.work_id.as_deref() != Some(grant.work_id.as_str())
             || grant.owner_uid != peer.uid
             || grant.root_init != ProcessStamp::from(&root.init)
             || grant.guardian != *guardian_stamp

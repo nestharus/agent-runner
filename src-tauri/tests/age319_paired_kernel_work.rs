@@ -59,6 +59,34 @@ fn one_file(dir: &Path) -> PathBuf {
     entries[0].clone()
 }
 
+#[test]
+fn pinned_notify_rejects_missing_and_sibling_work_before_bootstrap() {
+    let private = tempfile::tempdir().unwrap();
+    for claim in [None, Some("sibling-work")] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        command
+            .args(["notify", "agent-bash-activate", "--handle", "accepted-work"])
+            .env_clear()
+            .env("HOME", private.path())
+            .env("OULIPOLY_DATA_DIR", private.path().join("data"))
+            .env(
+                "OULIPOLY_KERNEL_EXPECTED_ROOT_V1",
+                "00000000-0000-4000-8000-000000000000",
+            );
+        if let Some(work) = claim {
+            command.env("AGENT_BASH_OWNER_WORK_ID_V1", work);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("pinned owner work ID conflict"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!private.path().join("data").exists());
+    }
+}
+
 fn inner() {
     // The normal Bash image uses the installed pathname. Give it an alias to
     // this fixture's broker only after unshare has created a distinct mount
@@ -337,12 +365,26 @@ fn inner() {
     assert!(handle.join("root-work-broker-drain-v1.json").exists());
     assert_eq!(result["physical_tree_drained"], true);
     assert_eq!(result["outcome"], "terminal");
+    let release = json(handle.join("source-retention-release-v1.json"));
+    assert_eq!(release["release_protocol"], "source-retention-release-v1");
+    let mailbox =
+        oulipoly_state::mailbox::MailboxDb::open_read_only(&data.join("pid-identity.db")).unwrap();
+    let listeners = mailbox
+        .completion_event_listeners(source["handle"].as_str().unwrap())
+        .unwrap();
+    assert!(
+        !listeners.is_empty()
+            && listeners
+                .iter()
+                .all(|listener| listener.acknowledged_at.is_some()),
+        "recipient ACK missing after distinct source release, Runner result and Q: listeners={listeners:?}"
+    );
     stop(&mut entry);
     stop(&mut broker);
 }
 
 #[test]
-#[ignore = "completion helper lacks exact owner witness; source/ACK and paired adversarial controls unproved"]
+#[ignore = "recipient ACK and paired adversarial controls unproved"]
 fn real_bash_source_reaches_guardian_h_k_q() {
     if std::env::var_os("AGE319_PRIVATE_PAIRED_INNER").is_some() {
         inner();
