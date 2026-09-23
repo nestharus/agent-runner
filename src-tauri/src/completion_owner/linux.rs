@@ -1,4 +1,5 @@
 use super::*;
+use oulipoly_kernel_broker::protocol::{self, OwnerWitness, ProcessWitness};
 use oulipoly_state::completion_continuation::{PROTOCOL, SourceProcessIdentity};
 use oulipoly_state::diagnostic_recorder::{
     DiagnosticPhase, PhaseObservation, SpanStart, process_recorder,
@@ -58,10 +59,9 @@ pub(super) fn require_owner(domain_id: &str) -> Result<CompletionDomainOwner, St
 
 fn hello(endpoint: &Path) -> Result<CompletionDomainOwner, String> {
     let mut socket = UnixStream::connect(endpoint).map_err(|e| e.to_string())?;
-    let peer = peer_pid(&socket)?;
     socket.write_all(b"hello\n").map_err(|e| e.to_string())?;
     let mut response = Vec::new();
-    socket
+    (&mut socket)
         .take(OWNER_HELLO_MAX_BYTES + 1)
         .read_to_end(&mut response)
         .map_err(|e| e.to_string())?;
@@ -70,12 +70,59 @@ fn hello(endpoint: &Path) -> Result<CompletionDomainOwner, String> {
     }
     let owner: CompletionDomainOwner =
         serde_json::from_slice(&response).map_err(|e| e.to_string())?;
+    verify_owner_peer(&socket, &owner)
+        .map_err(|_| "completion hello process identity mismatch".to_owned())?;
+    Ok(owner)
+}
+
+fn verify_owner_peer(socket: &UnixStream, owner: &CompletionDomainOwner) -> Result<(), String> {
+    if let Some(root) = std::env::var_os(super::EXPECTED_KERNEL_ROOT_ENV) {
+        let root = root.to_str().ok_or("invalid expected kernel root")?;
+        return verify_kernel_owner_socket(root, owner, socket);
+    }
+    let peer = peer_pid(socket)?;
     if owner.guardian_identity != identity(peer)?
         || owner.driver_identity != identity(owner.driver_identity.pid)?
     {
-        return Err("completion hello process identity mismatch".into());
+        return Err("completion owner process identity mismatch".into());
     }
-    Ok(owner)
+    Ok(())
+}
+
+pub(super) fn verify_kernel_owner_socket(
+    root_id: &str,
+    owner: &CompletionDomainOwner,
+    socket: &UnixStream,
+) -> Result<(), String> {
+    let process = |identity: &SourceProcessIdentity| -> Result<ProcessWitness, String> {
+        Ok(ProcessWitness {
+            host_pid: i32::try_from(identity.pid).map_err(|_| "invalid host PID")?,
+            boot_id: identity.boot_id.clone(),
+            starttime_ticks: u64::try_from(identity.starttime_ticks)
+                .map_err(|_| "invalid host starttime")?,
+        })
+    };
+    let witness = OwnerWitness {
+        root_id: root_id.to_owned(),
+        domain_id: owner.domain_id.clone(),
+        supervisor_id: owner.supervisor_authority_id.clone(),
+        guardian: process(&owner.guardian_identity)?,
+        driver: process(&owner.driver_identity)?,
+    };
+    protocol::verify_owner_at(&owner_broker_socket(), &witness, socket.as_raw_fd())
+        .map_err(|error| error.to_string())
+}
+
+fn owner_broker_socket() -> PathBuf {
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if unsafe { libc::geteuid() } == 0
+        && std::fs::read_link("/proc/self/ns/user").ok()
+            != std::fs::read_link("/proc/1/ns/user").ok()
+        && let Some(path) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+    {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(protocol::INSTALLED_SOCKET)
 }
 
 // A live native context prevents idle retirement before its provider can admit
@@ -103,7 +150,16 @@ fn connect_context(
     expected: &CompletionDomainOwner,
 ) -> Result<(UnixStream, super::original_work::RootAuthorityGrant), String> {
     let mut socket = UnixStream::connect(endpoint).map_err(|e| e.to_string())?;
-    let peer = peer_pid(&socket)?;
+    if std::env::var_os(super::EXPECTED_KERNEL_ROOT_ENV).is_some() {
+        // In the namespace path, authenticate this newly connected socket
+        // before sending the inherited root grant to it. The ordinary host
+        // path retains its existing connect-time UID check and post-reply
+        // incarnation comparison.
+        verify_owner_peer(&socket, expected)
+            .map_err(|_| "completion join peer conflict".to_owned())?;
+    } else {
+        peer_pid(&socket)?;
+    }
     let mode = match std::env::var(ROOT_AUTHORITY_ENV) {
         Ok(value) => super::original_work::RootJoinMode::Inherit {
             grant: serde_json::from_str(&value)
@@ -133,15 +189,12 @@ fn connect_context(
     }
     // Authenticate the peer before interpreting a negative. A refusal is not
     // rollback/no-side-effect proof and never authorizes replay or fresh launch.
-    let peer_identity = identity(peer)?;
-    if peer_identity != expected.guardian_identity {
-        return Err("completion join peer conflict".into());
-    }
+    verify_owner_peer(&socket, expected).map_err(|_| "completion join peer conflict".to_owned())?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     if value.get("completion_join_refusal").is_some() {
         let refusal: JoinRefusal =
             serde_json::from_value(value).map_err(|_| "invalid completion join refusal")?;
-        if refusal.guardian_identity != peer_identity
+        if refusal.guardian_identity != expected.guardian_identity
             || refusal.protocol != PROTOCOL
             || refusal.protocol != expected.protocol
             || refusal.domain_id != expected.domain_id
@@ -163,7 +216,7 @@ fn connect_context(
     let response: super::original_work::RootJoinResponse =
         serde_json::from_value(value).map_err(|e| e.to_string())?;
     let owner = &response.owner;
-    if owner.guardian_identity != identity(peer)? || owner.endpoint != endpoint.to_string_lossy() {
+    if owner != expected || owner.endpoint != endpoint.to_string_lossy() {
         return Err("completion join peer conflict".into());
     }
     if response.root_authority.guardian_identity != owner.guardian_identity

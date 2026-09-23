@@ -75,7 +75,8 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
         let owner = mailbox
             .completion_continuation_owner()?
             .ok_or("missing child owner")?;
-        if owner.domain_id != fields[1]
+        if owner.protocol != oulipoly_state::completion_continuation::PROTOCOL
+            || owner.domain_id != fields[1]
             || owner.supervisor_authority_id != fields[2]
             || owner.guardian_identity.pid != guardian_pid
             || mailbox
@@ -85,13 +86,31 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
         {
             return Err("child join does not match durable owner".into());
         }
-        let live = oulipoly_state::pid_identity::read_live_process_identity(guardian_pid)?
-            .ok_or("guardian disappeared before child entry")?;
-        if live.os_boot_id != owner.guardian_identity.boot_id
-            || live.os_pid_starttime_ticks != owner.guardian_identity.starttime_ticks
-        {
-            return Err("guardian incarnation changed before child entry".into());
+        // The guardian's host PID is not a namespace-local PID. Ask the host
+        // broker to verify the connected socket and both live incarnations.
+        // This happens while the child still holds its one-use gate.
+        let owner_socket = UnixStream::connect(&owner.endpoint).map_err(|e| e.to_string())?;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some() {
+            let mut changed = owner.clone();
+            changed.guardian_identity.starttime_ticks += 1;
+            if crate::completion_owner::verify_kernel_owner_socket(
+                fields[0],
+                &changed,
+                &owner_socket,
+            )
+            .is_ok()
+            {
+                return Err("private fixture accepted changed guardian incarnation".into());
+            }
+            let (wrong_socket, _other_end) = UnixStream::pair().map_err(|e| e.to_string())?;
+            if crate::completion_owner::verify_kernel_owner_socket(fields[0], &owner, &wrong_socket)
+                .is_ok()
+            {
+                return Err("private fixture accepted unrelated owner socket".into());
+            }
         }
+        crate::completion_owner::verify_kernel_owner_socket(fields[0], &owner, &owner_socket)?;
         unsafe {
             std::env::remove_var(CHILD_FD_ENV);
             std::env::set_var(crate::completion_owner::ENDPOINT_ENV, owner.endpoint);

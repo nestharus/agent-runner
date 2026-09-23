@@ -11,6 +11,7 @@
 - `crates/oulipoly-kernel-broker/src/registry.rs`
 - `crates/oulipoly-kernel-broker/src/root_join.rs`
 - `crates/oulipoly-kernel-broker/src/work_registry.rs`
+- `crates/oulipoly-kernel-broker/tests/private_root_join.rs`
 - `src-tauri/src/kernel_entry.rs`
 - `src-tauri/src/completion_owner/linux.rs`
 - `src-tauri/src/completion_owner/mod.rs`
@@ -40,6 +41,8 @@
 | Pinned guardian publishes a completion owner after broker G/A. | The owner row stores the exact root UUID, domain, supervisor UUID, and guardian incarnation; the driver remains gated until a second A and durable row comparison. |
 | P or G is refused, or the guardian dies. | No child Runner is released; debt remains and later readback/admission is denied. |
 | Exact original entry sends J after durable owner readback with help/offline-diagnostics argv/environment and five validated descriptors. | Join consumption is fsynced once, a separate root PID namespace has persistent PID1, and only the fixed Runner child is released after broker pre-exec identity verification. |
+| Exact joined child verifies a connected native-owner socket through challenged V. | Broker checks the fsynced child stamp and root PID1 ancestry, the host guardian and driver boot/starttime, and host-side socket peer credentials before returning a read-only verification receipt. |
+| V carries a changed guardian incarnation or unrelated connected socket. | Refused without changing the one-use join or granting work. |
 | Provider/recovery CLI, GUI or TTY entry. | Refused before broker reservation while host/local PID plumbing and descriptor handoff are incomplete. |
 | Loader-controlled environment, forged completion socket, sibling J, or replay J. | Refused without an arbitrary command launch. |
 | Broker restarts after a spent join. | Exact PID1 reattaches if live; spent join remains debt and no second child is launched. |
@@ -64,7 +67,7 @@
 ## Boundaries
 
 - Classification is never positive work authority.
-- The source has no service-requiring CLI, TTY/GUI handoff, guardian acceptance handoff, work launch, clean physical drain receipt, or retirement operation. Help/offline diagnostics have an authenticated one-use root child join.
+- The source has no service-requiring CLI, TTY/GUI handoff, guardian acceptance handoff, work launch, clean physical drain receipt, or retirement operation. Help/offline diagnostics have an authenticated one-use root child join and host-side owner-socket verification. Maintenance and provider PID transport remain incomplete.
 - The unprivileged user-namespace fixture cannot establish host-root sudo/setuid behavior.
 - Ordinary Runner/Bash entry and allocated-attempt NNP/seccomp remain. The opt-in entry keeps the host guardian outside the root PID namespace and releases only the fixed Runner for help/offline diagnostics.
 
@@ -72,7 +75,7 @@
 
 - `crates/oulipoly-kernel-broker/tests/private_pidns.rs` exercises root sibling/nested classification and root debt.
 - `crates/oulipoly-kernel-broker/tests/private_work_pidns.rs` exercises root/work binding, sibling separation, adopted peer classification, persistence poisoning, and restart uncertainty.
-- `crates/oulipoly-kernel-broker/tests/private_root_join.rs` runs the actual opt-in Runner and broker binaries in a private user namespace, holds the child at the pre-exec gate, and checks exact root/guardian placement, replay denial and broker restart debt.
+- `crates/oulipoly-kernel-broker/tests/private_root_join.rs` runs the actual opt-in Runner and broker binaries in a private user namespace, holds the child at the pre-exec gate, and checks exact root/guardian placement, persisted child stamp, V acceptance and changed-incarnation/socket refusal, replay denial and broker restart debt.
 - `crates/oulipoly-kernel-broker/src/linux_main.rs` unit tests exercise challenged credentials, a `CAP_SYS_ADMIN` child namespace socket handoff, exact host namespace policy, descriptor rejection, and production dispatch E/P/G ordering.
 - `crates/oulipoly-kernel-broker/src/entry_registry.rs` exercises persisted exact prepare/bind and sibling/replay denial.
 - `src-tauri/src/kernel_entry.rs` exercises read-only preflight and reserve-before-guardian ordering.

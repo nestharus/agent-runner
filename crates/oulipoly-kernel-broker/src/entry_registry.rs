@@ -55,6 +55,11 @@ pub struct EntryRecord {
     /// broker restart can never issue a second child for this entry.
     #[serde(default)]
     pub join_consumed: bool,
+    /// Bound after the broker pins the direct child of root PID1 and before
+    /// its pre-exec gate opens. Older spent joins lack this witness and cannot
+    /// use host owner verification after restart.
+    #[serde(default)]
+    pub joined_child: Option<ProcessStamp>,
 }
 
 pub struct EntryRegistry {
@@ -82,6 +87,7 @@ impl EntryRegistry {
                 || record.supervisor_authority_id.is_some() != record.guardian.is_some()
                 || record.guardian.is_some() && record.prepared_guardian != record.guardian
                 || record.join_consumed && record.guardian.is_none()
+                || record.joined_child.is_some() && !record.join_consumed
                 || record
                     .domain_id
                     .as_ref()
@@ -129,6 +135,7 @@ impl EntryRegistry {
             supervisor_authority_id: None,
             guardian: None,
             join_consumed: false,
+            joined_child: None,
         };
         let path = self.directory.join(format!("{root_id}.json"));
         let result = (|| {
@@ -279,6 +286,31 @@ impl EntryRegistry {
         let mut consumed = current.clone();
         consumed.join_consumed = true;
         self.replace(index, consumed, entry, &guardian)
+    }
+
+    pub fn bind_joined_child(
+        &mut self,
+        root_id: &str,
+        uid: u32,
+        entry: &PinnedProcess,
+        child: &PinnedProcess,
+    ) -> io::Result<()> {
+        let current = self.bound_entry(root_id, uid, entry)?;
+        if !current.join_consumed || current.joined_child.is_some() {
+            return Err(io::Error::other(
+                "root join child already bound or not consumed",
+            ));
+        }
+        child.verify()?;
+        let index = self
+            .records
+            .iter()
+            .position(|record| record.root_id == root_id)
+            .ok_or_else(|| io::Error::other("unknown joined root"))?;
+        let guardian = PinnedProcess::open(current.guardian.as_ref().unwrap().host_pid)?;
+        let mut bound = current.clone();
+        bound.joined_child = Some(child.into());
+        self.replace(index, bound, entry, &guardian)
     }
 
     fn replace(

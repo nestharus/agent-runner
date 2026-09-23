@@ -7,7 +7,7 @@ host guardian, and waits for native owner publication and broker readback before
 releasing the recovery driver. It then requests a single-use root child join
 only for CLI help or offline diagnostics. Provider/recovery CLI, GUI and TTY
 entry refuse before broker reservation because native service identity still
-uses host and namespace-local PIDs interchangeably.
+uses host and namespace-local PIDs interchangeably beyond the owner handshake.
 Ordinary Runner and Bash admission and allocated-attempt custody remain active.
 This source is not a deployable AGE-319 restoration.
 
@@ -28,7 +28,13 @@ host child; `G` binds that guardian, native domain, and supervisor incarnation;
 `A` reads back the exact live binding. The old `L` operation stays disabled.
 `J` is the new one-use join: a bounded JSON invocation and exactly five
 `SCM_RIGHTS` descriptors for stdin, stdout, stderr, cwd, and an exit receipt.
-Other operations reject all passed descriptors. A bare UUID or environment
+`V` takes the joined child's connected native-owner socket and an explicit
+host-PID/starttime/boot witness from the durable owner. The host broker checks
+the exact fsynced joined-child incarnation, root PID1 ancestry, root namespace,
+guardian and driver incarnations, and the socket's host-side `SO_PEERCRED`.
+It gives no launch authority and refuses missing older child stamps, changed
+identities, and unrelated sockets. Other operations reject passed descriptors.
+A bare UUID or environment
 marker grants nothing.
 
 `J` authenticates the original entry and exact root/domain/supervisor/guardian
@@ -44,9 +50,10 @@ The broker fsyncs `join_consumed` before forking. It creates a root PID
 namespace, fsyncs the identity of its persistent PID1, then permits PID1 to
 fork the Runner. The Runner remains at a pre-exec gate until the broker pins
 that exact child, verifies direct ancestry, namespace, UID/GID and the live
-host guardian, and releases the gate. The child validates its broker socket
-peer, namespace placement, exact durable native owner/root binding and live
-guardian before CLI dispatch. PID1 reaps adopted descendants while the
+host guardian, fsyncs the child's exact identity, and releases the gate. The
+child validates its broker socket peer, namespace placement, exact durable
+native owner/root binding and connected guardian through `V` before CLI
+dispatch. PID1 reaps adopted descendants while the
 original Runner runs, reports its exit through the receipt, and stays live
 afterward. The host guardian stays outside the root namespace. There is no
 arbitrary five-second launch lifetime cutoff and no new `no_new_privs` or
@@ -68,10 +75,13 @@ test, not a host-root sudo or deployed continuity proof.
 
 ## Remaining interfaces
 
-- Migrate native completion and provider custody to explicit host/local PID
-  domains before admitting service-requiring CLI. The private `--model` probe
-  reached the child but failed in current native identity handling; it now
-  refuses before reservation. Add a validated TTY and GUI handoff or keep
+- Migrate maintenance and provider custody to explicit host/local PID domains
+  before admitting service-requiring CLI. The native owner handshake now uses
+  `V` across that boundary, but `MaintenanceWorkerIdentity::current` and its
+  parent launcher still read namespace-local PIDs through `/proc` mounted for
+  the host PID namespace. The private `--model` probe reached the child but
+  failed with `process identity disappeared` and an early maintenance-worker
+  exit; it now refuses before reservation. Add a validated TTY and GUI handoff or keep
   those modes refusing. Current supported entry is help/offline diagnostics.
 - Add a broker-authenticated positive accepted-work grant from the host
   guardian, a one-use nested PID namespace/PID1 launch, physical drain and

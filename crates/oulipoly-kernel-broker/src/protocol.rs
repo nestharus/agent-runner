@@ -29,6 +29,27 @@ pub struct JoinSpec {
     pub environment: Vec<(String, String)>,
 }
 
+/// Host PID identities from the durable native owner. A root-namespace client
+/// cannot interpret SO_PEERCRED's PID for its outside guardian; the host broker
+/// checks these against pinned host processes and the connected owner socket.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerWitness {
+    pub root_id: String,
+    pub domain_id: String,
+    pub supervisor_id: String,
+    pub guardian: ProcessWitness,
+    pub driver: ProcessWitness,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessWitness {
+    pub host_pid: i32,
+    pub boot_id: String,
+    pub starttime_ticks: u64,
+}
+
 /// Only CLI surfaces that dispatch without native service bootstrap may enter
 /// the root child until host/local PID handling is explicit throughout the
 /// completion owner and provider launch path.
@@ -75,6 +96,53 @@ pub fn join_at(path: &Path, spec: &JoinSpec, descriptors: [RawFd; 5]) -> io::Res
         return Err(io::Error::other("short join request; outcome uncertain"));
     }
     read_response(stream)
+}
+
+/// The descriptor is the already-connected client end of the native owner
+/// socket. It is inspected in the broker's host PID namespace, not trusted as
+/// an authority merely because the caller supplied it.
+pub fn verify_owner_at(path: &Path, witness: &OwnerWitness, owner_fd: RawFd) -> io::Result<()> {
+    let body = serde_json::to_vec(witness)?;
+    if body.len() > 2048 {
+        return Err(io::Error::other("owner witness too large"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(17 + body.len());
+    request.push(b'V');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: request.as_mut_ptr().cast(),
+        iov_len: request.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as usize;
+        *libc::CMSG_DATA(header).cast::<RawFd>() = owner_fd;
+    }
+    if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+        != request.len() as isize
+    {
+        return Err(io::Error::other("short owner verification request"));
+    }
+    let response = read_response(stream)?;
+    if response != format!("verified-owner {}\n", witness.root_id) {
+        return Err(io::Error::other(format!(
+            "host owner verification refused: {}",
+            response.trim()
+        )));
+    }
+    Ok(())
 }
 
 fn checked_connection(path: &Path) -> io::Result<UnixStream> {

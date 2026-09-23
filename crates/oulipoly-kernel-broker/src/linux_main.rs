@@ -1,9 +1,9 @@
 //! Opt-in host-root broker for the pinned guardian and one-use root child join.
 #[path = "root_join.rs"]
 mod root_join;
-use oulipoly_kernel_broker::entry_registry::EntryRegistry;
+use oulipoly_kernel_broker::entry_registry::{EntryRegistry, ProcessStamp};
 use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess};
-use oulipoly_kernel_broker::protocol::JoinSpec;
+use oulipoly_kernel_broker::protocol::{JoinSpec, OwnerWitness, ProcessWitness};
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use std::fs::{self, File};
@@ -75,6 +75,10 @@ enum RequestPayload {
     Join {
         spec: JoinSpec,
         descriptors: [File; 5],
+    },
+    VerifyOwner {
+        witness: OwnerWitness,
+        socket: File,
     },
 }
 
@@ -175,7 +179,7 @@ fn recv_request(
         b'G' => 65,
         b'P' => 37,
         b'A' => 33,
-        b'J' => read,
+        b'J' | b'V' => read,
         _ => 17,
     };
     if read != expected_len
@@ -185,10 +189,10 @@ fn recv_request(
         return Err(io::Error::other("invalid challenged request"));
     }
     if invalid_ancillary
-        || if request[0] == b'J' {
-            descriptors.len() != 5
-        } else {
-            !descriptors.is_empty()
+        || match request[0] {
+            b'J' => descriptors.len() != 5,
+            b'V' => descriptors.len() != 1,
+            _ => !descriptors.is_empty(),
         }
     {
         return Err(io::Error::other("unsupported request ancillary data"));
@@ -226,6 +230,10 @@ fn recv_request(
                 .try_into()
                 .map_err(|_| io::Error::other("join descriptors"))?,
         },
+        b'V' if read > 17 && read <= 2048 + 17 => RequestPayload::VerifyOwner {
+            witness: serde_json::from_slice(&request[17..read as usize])?,
+            socket: descriptors.remove(0),
+        },
         _ => RequestPayload::None,
     };
     Ok((request[0], payload, credentials, process))
@@ -248,6 +256,113 @@ fn root_launch_admitted(peer: &PeerIdentity, scope: &Scope, host_namespace: &Fil
     matches!(scope, Scope::Outside)
         && (peer.uid >= 1000 || private_fixture() && peer.uid == 0)
         && matches!(peer.process.in_namespace(host_namespace), Ok(true))
+}
+
+fn witness_matches(witness: &ProcessWitness, process: &PinnedProcess) -> io::Result<bool> {
+    process.verify()?;
+    Ok(witness.host_pid == process.host_pid
+        && witness.boot_id == process.boot_id
+        && witness.starttime_ticks == process.starttime_ticks)
+}
+
+fn verify_owner_socket(
+    witness: OwnerWitness,
+    socket: File,
+    peer: &PeerIdentity,
+    runner_image: &File,
+    roots: &RootRegistry,
+    entries: &EntryRegistry,
+) -> io::Result<String> {
+    for id in [&witness.root_id, &witness.domain_id, &witness.supervisor_id] {
+        uuid::Uuid::parse_str(id).map_err(|_| io::Error::other("invalid owner witness ID"))?;
+    }
+    if roots.has_debt() || entries.has_debt() || !peer.process.same_executable_as(runner_image)? {
+        return Err(io::Error::other("uncertain owner witness caller"));
+    }
+    let root = roots
+        .live_roots()
+        .find(|root| root.record.root_id == witness.root_id)
+        .ok_or_else(|| io::Error::other("owner witness root absent"))?;
+    let entry = entries
+        .record(&witness.root_id)
+        .ok_or_else(|| io::Error::other("owner witness entry absent"))?;
+    if !entry.join_consumed
+        || entry.owner_uid != peer.uid
+        || entry.domain_id.as_deref() != Some(&witness.domain_id)
+        || entry.supervisor_authority_id.as_deref() != Some(&witness.supervisor_id)
+        || entry.joined_child.as_ref() != Some(&ProcessStamp::from(&peer.process))
+        || !peer.process.direct_child_of(&root.init)?
+        || !peer.process.in_namespace(root.init.namespace())?
+    {
+        return Err(io::Error::other("owner witness is not exact joined child"));
+    }
+    let guardian_stamp = entry
+        .guardian
+        .as_ref()
+        .ok_or_else(|| io::Error::other("owner witness guardian absent"))?;
+    let guardian = PinnedProcess::open(guardian_stamp.host_pid)?;
+    if ProcessStamp::from(&guardian) != *guardian_stamp
+        || !witness_matches(&witness.guardian, &guardian)?
+        || !guardian.same_executable_as(runner_image)?
+    {
+        return Err(io::Error::other(
+            "owner witness guardian incarnation mismatch",
+        ));
+    }
+    let driver = PinnedProcess::open(witness.driver.host_pid)?;
+    if !witness_matches(&witness.driver, &driver)?
+        || !driver.direct_child_of(&guardian)?
+        || !driver.same_executable_as(runner_image)?
+    {
+        return Err(io::Error::other(
+            "owner witness driver incarnation mismatch",
+        ));
+    }
+    // Getsockopt is evaluated by this broker in the host PID namespace. The
+    // child's SO_PEERCRED PID for this outside guardian can be zero/unmapped.
+    let mut kind: libc::c_int = 0;
+    let mut kind_len = std::mem::size_of_val(&kind) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut kind as *mut libc::c_int).cast(),
+            &mut kind_len,
+        )
+    } != 0
+        || kind != libc::SOCK_STREAM
+        || kind_len as usize != std::mem::size_of_val(&kind)
+    {
+        return Err(io::Error::other("owner witness is not a stream socket"));
+    }
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of_val(&credentials) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    } != 0
+        || len as usize != std::mem::size_of_val(&credentials)
+        || credentials.pid != guardian.host_pid
+        || credentials.uid != peer.uid
+    {
+        return Err(io::Error::other(
+            "owner socket peer is not pinned host guardian",
+        ));
+    }
+    guardian.verify()?;
+    driver.verify()?;
+    peer.process.verify()?;
+    Ok(format!("verified-owner {}\n", witness.root_id))
 }
 
 #[expect(
@@ -439,6 +554,11 @@ fn serve() -> io::Result<()> {
                     &mut registry,
                     &mut entries,
                 )
+            } else if operation == b'V' {
+                let RequestPayload::VerifyOwner { witness, socket } = payload else {
+                    return Err(io::Error::other("invalid owner witness payload"));
+                };
+                verify_owner_socket(witness, socket, &peer, &runner_image, &registry, &entries)
             } else {
                 dispatch_authenticated(
                     operation,

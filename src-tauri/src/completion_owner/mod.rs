@@ -46,6 +46,15 @@ pub(crate) fn verify_pinned_owner_ready(
     linux::verify_pinned_owner_ready(announce, pin, guardian_pid)
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_kernel_owner_socket(
+    root_id: &str,
+    owner: &oulipoly_state::mailbox::CompletionDomainOwner,
+    socket: &std::os::unix::net::UnixStream,
+) -> Result<(), String> {
+    linux::verify_kernel_owner_socket(root_id, owner, socket)
+}
+
 /// Preserve the State open source at entry; unrelated owner/path text is operational.
 #[derive(Debug)]
 pub(crate) enum BootstrapError {

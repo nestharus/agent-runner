@@ -157,6 +157,12 @@ fn run_init(context: InitContext) -> io::Result<()> {
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if super::private_fixture() {
+        let path = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+            .ok_or_else(|| io::Error::other("private broker socket absent"))?;
+        command.env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", path);
+    }
     let control_fd = control.as_raw_fd();
     let gate_fd = gate.as_raw_fd();
     let fixture = super::private_fixture();
@@ -368,6 +374,9 @@ pub(super) fn launch(
     {
         return Err(io::Error::other("root child pre-exec identity mismatch"));
     }
+    // Persist the exact child incarnation before the executable can cross the
+    // gate. A failed write leaves consumed-join debt, never a loose UUID grant.
+    entries.bind_joined_child(&root_id, peer.uid, &peer.process, &child)?;
     #[cfg(feature = "age319-private-broker-fixture")]
     if super::private_fixture()
         && let Some(directory) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")

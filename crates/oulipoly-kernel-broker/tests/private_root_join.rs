@@ -148,6 +148,8 @@ fn inner() {
         .unwrap()
         .parse()
         .unwrap();
+    assert_eq!(record["joined_child"]["host_pid"], child_pid);
+    assert!(record["joined_child"]["starttime_ticks"].as_u64().is_some());
     assert_ne!(init_pid, child_pid);
     assert_eq!(
         fs::read_link(format!("/proc/{init_pid}/ns/pid")).unwrap(),
