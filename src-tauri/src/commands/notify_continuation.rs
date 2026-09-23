@@ -51,6 +51,50 @@ pub(crate) fn recovery_read(event_id: &str, output: Option<&Path>) -> Result<i32
     emit(&result)
 }
 
+pub(crate) fn recovery_attempts(event_id: &str, cursor: &str) -> Result<i32, String> {
+    let decoded = decode_attempt_cursor(cursor)?;
+    let mailbox = MailboxDb::open_read_only(&MailboxDb::default_path()?)?;
+    let record = mailbox
+        .completion_recovery_record(event_id)?
+        .ok_or("no accepted v2 completion with that event ID")?;
+    let physical_drain = physical_drain_page(&mailbox, &record, Some(&decoded))?;
+    emit(&json!({"status":"ok", "event_id":event_id, "physical_drain":physical_drain}))
+}
+
+fn decode_attempt_cursor(encoded: &str) -> Result<Value, String> {
+    if encoded.is_empty() || encoded.len() > 32 * 1024 {
+        return Err("invalid recovery attempt cursor length".into());
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| "invalid recovery attempt cursor encoding".to_string())?;
+    serde_json::from_slice(&bytes).map_err(|_| "invalid recovery attempt cursor JSON".to_string())
+}
+
+fn physical_drain_page(
+    mailbox: &MailboxDb,
+    record: &Value,
+    cursor: Option<&Value>,
+) -> Result<Value, String> {
+    let registration_id = required_string(record, "registration_id")?;
+    let (attempts, next) = mailbox.completion_recovery_attempts(registration_id, cursor)?;
+    let next_attempt_cursor = next
+        .map(|value| {
+            serde_json::to_vec(&value)
+                .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+                .map_err(|e| e.to_string())
+        })
+        .transpose()?;
+    Ok(json!({
+        "attempts":attempts,
+        "attempt_page_limit":128,
+        "attempt_search_complete":next_attempt_cursor.is_none(),
+        "next_attempt_cursor":next_attempt_cursor,
+        "association_completeness":mailbox.continuation_attempt_association_completeness(registration_id)?,
+        "assessment":"per_attempt_receipts_only"
+    }))
+}
+
 /// This is local manual inspection. No listener activation, notification, ACK,
 /// physical drain, source retry, or workload execution is reachable here.
 fn recovery_read_from(
@@ -166,19 +210,16 @@ fn recovery_read_from(
         return Err("unknown selected output representation".into());
     };
     let presentation = mailbox.completion_notification_diagnostics(event_id)?;
-    let attempts =
-        mailbox.completion_recovery_attempts(required_string(&record, "registration_id")?)?;
+    let mut physical_drain = physical_drain_page(mailbox, &record, None)?;
+    physical_drain["source_reported_original_tree_drained"] =
+        payload["outcome"]["original_tree_drained"].clone();
     Ok(json!({"status":"verified", "event_id":event_id,
         "source_acceptance":{"phase":"accepted", "registration_id":record["registration_id"],
             "snapshot_sha256":record["snapshot_sha256"], "outcome_sha256":record["outcome_sha256"],
             "payload_sha256":record["payload_sha256"], "payload_byte_len":record["payload_byte_len"]},
         "selected_output":output_info,
         "presentation_and_ack":presentation,
-        "physical_drain":{
-            "source_reported_original_tree_drained":payload["outcome"]["original_tree_drained"],
-            "attempts":attempts,
-            "assessment":"per_attempt_receipts_only"
-        },
+        "physical_drain":physical_drain,
     }))
 }
 
@@ -423,6 +464,8 @@ fn add_completion_projection(
     );
     value["outstanding_attempt_ids"] =
         json!(mailbox.pending_continuation_attempt_ids(&source.registration_id)?);
+    value["association_completeness"] =
+        json!(mailbox.continuation_attempt_association_completeness(&source.registration_id)?);
     Ok(())
 }
 

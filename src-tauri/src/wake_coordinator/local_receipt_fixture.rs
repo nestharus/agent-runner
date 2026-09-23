@@ -136,7 +136,7 @@ fn seed_local_receipt_fixture_mailbox(paths: &LocalReceiptFixturePaths) {
         .unwrap();
     db.trigger_completion_event(CompletionEventTriggerInput {
         event_id: LocalReceiptFixture::EVENT_ID,
-        payload_json: r#"{"schema_version":2,"handle":"ab_late_consumed_fixture"}"#,
+        payload_json: r#"{"schema_version":2,"kind":"agent_bash_complete","meta":{}}"#,
         state_dir: &paths.state_dir_text,
         meta_path: &paths.meta_path,
         log_path: &paths.log_path,

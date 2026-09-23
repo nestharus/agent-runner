@@ -94,6 +94,9 @@ fn private_case(paired: bool) -> bool {
         .env("AGE360_PRIVATE_CASE", &name)
         .env("AGE360_PARENT_NET", &net)
         .env("AGE360_RUNNER_BIN", runner);
+    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+        command.env("TMPDIR", tmpdir);
+    }
     if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
         command.env("LLVM_PROFILE_FILE", profile);
     }
@@ -202,6 +205,9 @@ impl Fixture {
             )
             .env("AGENT_BASH_AGENT_RUNNER_BIN", runner())
             .current_dir(self.root.path());
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            cmd.env("TMPDIR", tmpdir);
+        }
         if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
             cmd.env("LLVM_PROFILE_FILE", profile);
         }
@@ -260,6 +266,19 @@ impl Fixture {
     }
     fn mailbox(&self) -> MailboxDb {
         MailboxDb::open_historical_read_only(&self.data.join("pid-identity.db")).unwrap()
+    }
+    fn mailbox_for_poll(&self) -> Option<MailboxDb> {
+        match MailboxDb::open_historical_read_only(&self.data.join("pid-identity.db")) {
+            Ok(mailbox) => Some(mailbox),
+            Err(error)
+                if error.contains(
+                    "SQLite source continued changing while retrying a read-only snapshot",
+                ) =>
+            {
+                None
+            }
+            Err(error) => panic!("mailbox snapshot failed outside source churn: {error}"),
+        }
     }
     fn gate(&self, name: &str) {
         fs::write(self.root.path().join(name), b"release\n").unwrap();
@@ -465,6 +484,14 @@ fn native_unmarked_nested_entry_cannot_elect_descendant_owner() {
 
 fn paired_case(mode: &'static str) {
     let f = Fixture::new(mode);
+    if matches!(mode, "ack_before_drain" | "manual_overlap") {
+        f.gate("test-descendant-enabled");
+    }
+    #[cfg(feature = "age360-fault-fixtures")]
+    if mode == "manual_overlap" {
+        f.gate("wake-child-before-claim-admission.hold");
+        f.gate("manual-after-claim-coordination-NativeBusy.hold");
+    }
     #[cfg(feature = "age360-fault-fixtures")]
     paired_faults::prepare(&f);
     f.gate("release-resume");
@@ -521,7 +548,7 @@ fn paired_case(mode: &'static str) {
     }
     let acceptance = wait(|| {
         let value = f
-            .mailbox()
+            .mailbox_for_poll()?
             .completion_continuation_acceptance(&source.registration_id)
             .ok()??;
         (value["phase"] == "accepted").then_some(value)
@@ -529,6 +556,141 @@ fn paired_case(mode: &'static str) {
     println!("acceptance={acceptance}");
     #[cfg(feature = "age360-fault-fixtures")]
     paired_faults::after_acceptance(&f);
+    let mut manual_child = None;
+    if mode == "manual_overlap" {
+        let child_pid: i64 = wait(|| {
+            fs::read_to_string(
+                f.root
+                    .path()
+                    .join("wake-child-before-claim-admission.reached"),
+            )
+            .ok()?
+            .parse()
+            .ok()
+        });
+        let child_identity = read_live_process_identity(child_pid).unwrap().unwrap();
+        let (claim, attempt) = wait(|| {
+            let mailbox = f.mailbox_for_poll()?;
+            let claim = mailbox.wake_session_reader().wake_claim(SESSION).ok()??;
+            let attempt = mailbox
+                .continuation_activation(SESSION, &claim.claim_token)
+                .ok()??;
+            Some((claim, attempt))
+        });
+        let (source_id, phase): (Option<String>, String) = f.sidecar_connection()
+            .query_row(
+                "SELECT source_registration_id,phase FROM completion_continuation_attempt WHERE attempt_id=?1 AND claim_token=?2",
+                rusqlite::params![attempt.attempt_id, claim.claim_token],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+        assert_eq!(source_id.as_deref(), Some(source.registration_id.as_str()));
+        assert!(matches!(phase.as_str(), "starting" | "running"));
+        assert!(
+            f.mailbox()
+                .completion_event_listeners(&source.handle)
+                .unwrap()
+                .iter()
+                .all(|listener| listener.acknowledged_at.is_none())
+        );
+        assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+        // The original native turn can leave a committed tail for explicit
+        // recovery. Settle it through the real CLI before testing manual
+        // coordination; otherwise State refuses the resume before the sidecar
+        // claim boundary and this case would only exercise that refusal.
+        let duties = oulipoly_state::StateDb::open_historical_read_only(&f.data.join("state.db"))
+            .unwrap()
+            .completed_turn_identities()
+            .unwrap();
+        for duty in &duties {
+            let settled = f
+                .command()
+                .args([
+                    "completed-turn",
+                    "--invocation",
+                    &duty.invocation_uuid,
+                    "--settle",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                settled.status.success(),
+                "completed turn settlement failed: {}",
+                String::from_utf8_lossy(&settled.stderr)
+            );
+        }
+        assert!(
+            oulipoly_state::StateDb::open_historical_read_only(&f.data.join("state.db"))
+                .unwrap()
+                .completed_turn_identities()
+                .unwrap()
+                .is_empty()
+        );
+        let manual = f
+            .command()
+            .args([
+                "resume",
+                "-m",
+                MODEL,
+                "--session-id",
+                SESSION,
+                "--models-dir",
+            ])
+            .arg(&f.models)
+            .stdout(fs::File::create(f.root.path().join("manual.stdout")).unwrap())
+            .stderr(fs::File::create(f.root.path().join("manual.stderr")).unwrap())
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        manual_child = Some(manual);
+        wait(|| {
+            f.root
+                .path()
+                .join("manual-after-claim-coordination-NativeBusy.reached")
+                .exists()
+                .then_some(())
+        });
+        assert_eq!(
+            read_live_process_identity(child_pid).unwrap(),
+            Some(child_identity)
+        );
+        let retained = f
+            .mailbox()
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.claim_token, claim.claim_token);
+        let retained_attempt = f
+            .mailbox()
+            .continuation_activation(SESSION, &claim.claim_token)
+            .unwrap();
+        assert_eq!(retained_attempt.unwrap().attempt_id, attempt.attempt_id);
+        let retained_source: Option<String> = f.sidecar_connection()
+            .query_row("SELECT source_registration_id FROM completion_continuation_attempt WHERE attempt_id=?1", [&attempt.attempt_id], |row| row.get(0)).unwrap();
+        assert_eq!(
+            retained_source.as_deref(),
+            Some(source.registration_id.as_str())
+        );
+        assert!(
+            f.mailbox()
+                .completion_event_listeners(&source.handle)
+                .unwrap()
+                .iter()
+                .all(|listener| listener.acknowledged_at.is_none())
+        );
+        assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+        println!(
+            "manual coordination overlapped unadmitted child={child_pid} exact claim={} attempt={} source={}",
+            claim.claim_token, attempt.attempt_id, source.registration_id
+        );
+        fs::remove_file(f.root.path().join("wake-child-before-claim-admission.hold")).unwrap();
+        fs::remove_file(
+            f.root
+                .path()
+                .join("manual-after-claim-coordination-NativeBusy.hold"),
+        )
+        .unwrap();
+    }
     if mode == "acceptance_reply_loss" {
         f.wait_initial(&mut initial);
     }
@@ -780,6 +942,41 @@ fn paired_case(mode: &'static str) {
         );
         let readback: serde_json::Value = serde_json::from_slice(&readback.stdout).unwrap();
         assert_eq!(readback["selected_output"]["kind"], "raw_bytes");
+        assert_eq!(readback["physical_drain"]["attempt_search_complete"], false);
+        let attempt_cursor = readback["physical_drain"]["next_attempt_cursor"]
+            .as_str()
+            .unwrap();
+        let attempt_page = f
+            .command()
+            .args([
+                "notify",
+                "agent-bash-recovery-attempts",
+                "--event-id",
+                &source.handle,
+                "--cursor",
+                attempt_cursor,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            attempt_page.status.success(),
+            "{}",
+            String::from_utf8_lossy(&attempt_page.stderr)
+        );
+        let attempt_page: serde_json::Value = serde_json::from_slice(&attempt_page.stdout).unwrap();
+        assert_eq!(
+            attempt_page["physical_drain"]["attempt_search_complete"],
+            true
+        );
+        assert!(
+            attempt_page["physical_drain"]["attempts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|attempt| attempt["operation"] == "source_recovery"
+                    && attempt["phase"] == "drained"
+                    && attempt["drain_receipt"].is_string())
+        );
         assert_eq!(fs::read(&recovered).unwrap(), b"paired-source-output");
         assert_eq!(
             readback["presentation_and_ack"][0]["policy"],
@@ -800,7 +997,7 @@ fn paired_case(mode: &'static str) {
     }
     wait(|| {
         let listeners = f
-            .mailbox()
+            .mailbox_for_poll()?
             .completion_event_listeners(&source.handle)
             .ok()?;
         listeners
@@ -815,7 +1012,57 @@ fn paired_case(mode: &'static str) {
             .ok()
     });
     assert_eq!(byte_receipt["output_checked"], true);
+    if matches!(mode, "async" | "pause" | "ack_before_drain") {
+        assert_eq!(byte_receipt["artifact"], true);
+    }
     println!("actual native adapter byte receipt={byte_receipt}");
+    if matches!(mode, "ack_before_drain" | "manual_overlap") {
+        let descendant: i64 = wait(|| {
+            fs::read_to_string(f.root.path().join("descendant.pid"))
+                .ok()?
+                .parse()
+                .ok()
+        });
+        let descendant_identity = read_live_process_identity(descendant)
+            .unwrap()
+            .expect("recipient's published descendant must still be live");
+        let (claim, attempt) = wait(|| {
+            let mailbox = f.mailbox_for_poll()?;
+            let claim = mailbox.wake_session_reader().wake_claim(SESSION).ok()??;
+            let attempt = mailbox
+                .continuation_activation(SESSION, &claim.claim_token)
+                .ok()??;
+            Some((claim, attempt))
+        });
+        let phase: String = f
+            .sidecar_connection()
+            .query_row(
+                "SELECT phase FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&attempt.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(phase.as_str(), "starting" | "running"));
+        assert_eq!(
+            read_live_process_identity(descendant).unwrap(),
+            Some(descendant_identity),
+            "listener ACK must precede physical descendant drain"
+        );
+        let mut writer = MailboxDb::open(&f.data.join("pid-identity.db")).unwrap();
+        assert_eq!(
+            writer
+                .wake_sessions()
+                .release_wake_claim_for_manual_resume(SESSION, &claim.claim_token),
+            Ok(false),
+            "manual release must retain the live v2 activation claim"
+        );
+        drop(writer);
+        println!(
+            "paired v2 ACK before drain attempt={} phase={phase} descendant={descendant}",
+            attempt.attempt_id
+        );
+        f.gate("release-descendant");
+    }
     // Both modes have completed their mode-specific initial observation above.
     assert!(initial.wait().unwrap().success());
     let prompt = fs::read_to_string(f.root.path().join("resume-prompts.jsonl")).unwrap();
@@ -840,10 +1087,22 @@ fn paired_case(mode: &'static str) {
         "actual workload launches={launch_count} native recipient invocations={}",
         prompt.lines().count()
     );
+    if mode == "manual_overlap" {
+        assert_eq!(
+            prompt.lines().count(),
+            1,
+            "the overlapping manual and automatic entries must deliver to one recipient"
+        );
+    }
     let listeners = f
         .mailbox()
         .completion_event_listeners(&source.handle)
         .unwrap();
+    if mode == "manual_overlap" {
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].mailbox_seq, byte_receipt["seq"].as_i64());
+        assert!(listeners[0].acknowledged_at.is_some());
+    }
     assert!(
         listeners
             .iter()
@@ -857,15 +1116,46 @@ fn paired_case(mode: &'static str) {
             .unwrap()
     );
     wait(|| {
-        f.mailbox()
+        f.mailbox_for_poll()?
             .pending_continuation_attempt_ids(&source.registration_id)
             .ok()?
             .is_empty()
             .then_some(())
     });
+    if let Some(mut manual) = manual_child {
+        let status = wait(|| manual.try_wait().unwrap());
+        println!(
+            "overlapping manual resume status={status} stderr={}",
+            fs::read_to_string(f.root.path().join("manual.stderr")).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.path().join("resume-prompts.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "manual completion must not create a second recipient"
+        );
+        wait(|| {
+            f.mailbox_for_poll()?
+                .wake_session_reader()
+                .wake_claim(SESSION)
+                .ok()?
+                .is_none()
+                .then_some(())
+        });
+        assert!(f.mailbox().list_pending(SESSION).unwrap().is_empty());
+    }
     let (attempts, integrated): (i64, i64) = f.sidecar_connection().query_row(
         "SELECT COUNT(*),COALESCE(SUM(integrated),0) FROM completion_continuation_attempt WHERE source_registration_id=?1",
         [&source.registration_id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    if mode == "manual_overlap" {
+        assert_eq!(
+            (attempts, integrated),
+            (2, 2),
+            "source and exact activation both owe integrated physical outcomes"
+        );
+    }
     let census = live_census::observe(f.root.path()).expect("live resource traversal");
     println!(
         "paired live resource observations source_recovery_attempts={attempts} integrated={integrated} observed_files={} observed_bytes={} disappeared_entries={:?}; non-atomic traversal, unknown sizes for disappeared entries, not a complete snapshot; fixture teardown is not product release authority",
@@ -878,6 +1168,210 @@ fn normal_sleeping_recipient() {
         return;
     }
     paired_case("async");
+}
+#[test]
+fn paired_two_native_sources_share_one_activation_and_drain() {
+    if private_case(true) {
+        return;
+    }
+    let f = Fixture::new("two_source");
+    f.gate("release-resume");
+    f.gate("test-descendant-enabled");
+    let mut initial = f.start();
+    let sources = wait(|| {
+        let sources = oulipoly_state::StateDb::open_historical_read_only(&f.data.join("state.db"))
+            .ok()?
+            .admitted_completion_continuations()
+            .ok()?;
+        (sources.len() == 2).then_some(sources)
+    });
+    let registrations: Vec<_> = sources
+        .iter()
+        .map(|binding| binding.registration().unwrap())
+        .collect();
+    assert_ne!(
+        registrations[0].registration_id,
+        registrations[1].registration_id
+    );
+    let pause = f
+        .command()
+        .args(["mailbox", "pause", "--session-id", SESSION])
+        .output()
+        .unwrap();
+    assert!(
+        pause.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    f.gate("release-workload");
+    f.wait_initial(&mut initial);
+    wait(|| {
+        let mailbox = f.mailbox_for_poll()?;
+        registrations
+            .iter()
+            .all(|source| {
+                mailbox
+                    .completion_continuation_acceptance(&source.registration_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| row["phase"] == "accepted")
+            })
+            .then_some(())
+    });
+    assert_eq!(f.mailbox().list_pending(SESSION).unwrap().len(), 2);
+    let resume = f
+        .command()
+        .args(["mailbox", "resume", "--session-id", SESSION])
+        .output()
+        .unwrap();
+    assert!(
+        resume.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    let (claim, attempt) = wait(|| {
+        let mailbox = f.mailbox_for_poll()?;
+        let claim = mailbox.wake_session_reader().wake_claim(SESSION).ok()??;
+        let attempt = mailbox
+            .continuation_activation(SESSION, &claim.claim_token)
+            .ok()??;
+        Some((claim, attempt))
+    });
+    let links: i64 = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT COUNT(*) FROM completion_continuation_attempt_source WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(links, 2);
+    for source in &registrations {
+        let mailbox = f.mailbox();
+        assert_eq!(
+            mailbox
+                .continuation_attempt_association_completeness(&source.registration_id)
+                .unwrap(),
+            "known"
+        );
+        assert_eq!(
+            mailbox
+                .pending_continuation_attempt_ids(&source.registration_id)
+                .unwrap(),
+            vec![attempt.attempt_id.clone()]
+        );
+        assert!(
+            mailbox
+                .completion_recovery_attempts(&source.registration_id, None)
+                .unwrap()
+                .0
+                .iter()
+                .any(|row| row["attempt_id"] == attempt.attempt_id
+                    && row["association_completeness"] == "known")
+        );
+    }
+    let first_receipt: serde_json::Value = wait(|| {
+        serde_json::from_slice(&fs::read(f.root.path().join("recipient-byte-receipt.json")).ok()?)
+            .ok()
+    });
+    let second_receipt: serde_json::Value = wait(|| {
+        serde_json::from_slice(
+            &fs::read(f.root.path().join("recipient-second-byte-receipt.json")).ok()?,
+        )
+        .ok()
+    });
+    assert_ne!(first_receipt["seq"], second_receipt["seq"]);
+    assert_eq!(first_receipt["artifact"], true);
+    assert_eq!(second_receipt["byte_len"], 20);
+    wait(|| {
+        let mailbox = f.mailbox_for_poll()?;
+        registrations
+            .iter()
+            .all(|source| {
+                mailbox
+                    .completion_event_listeners(&source.handle)
+                    .ok()
+                    .is_some_and(|listeners| {
+                        listeners.len() == 1 && listeners[0].acknowledged_at.is_some()
+                    })
+            })
+            .then_some(())
+    });
+    let descendant: i64 = fs::read_to_string(f.root.path().join("descendant.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(read_live_process_identity(descendant).unwrap().is_some());
+    assert_eq!(
+        f.mailbox()
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .unwrap()
+            .unwrap()
+            .claim_token,
+        claim.claim_token
+    );
+    f.gate("release-descendant");
+    wait(|| {
+        let mailbox = f.mailbox_for_poll()?;
+        (mailbox
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .ok()?
+            .is_none()
+            && registrations.iter().all(|source| {
+                mailbox
+                    .pending_continuation_attempt_ids(&source.registration_id)
+                    .ok()
+                    .is_some_and(|ids| ids.is_empty())
+            }))
+        .then_some(())
+    });
+    for source in &registrations {
+        assert!(
+            f.mailbox()
+                .completion_recovery_attempts(&source.registration_id, None)
+                .unwrap()
+                .0
+                .iter()
+                .any(|row| row["attempt_id"] == attempt.attempt_id
+                    && row["phase"] == "drained"
+                    && row["drain_receipt"].is_string())
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(f.root.path().join("source-launches"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.path().join("resume-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    println!(
+        "two native accepted sources, one exact claim={}, one activation={}, two raw receipts and ACKs, retained physical drain",
+        claim.claim_token, attempt.attempt_id
+    );
+}
+#[test]
+fn paired_v2_ack_precedes_physical_activation_drain() {
+    if private_case(true) {
+        return;
+    }
+    paired_case("ack_before_drain");
+}
+#[cfg(feature = "age360-fault-fixtures")]
+#[test]
+fn paired_manual_resume_overlaps_unadmitted_v2_receiver() {
+    if private_case(true) {
+        return;
+    }
+    paired_case("manual_overlap");
 }
 #[test]
 fn sync_response_without_notification_or_ack() {

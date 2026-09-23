@@ -450,7 +450,8 @@ pub fn activation_request_sha256(
     )
 }
 pub(super) use attempts::{
-    admit_launcher_on, bind_generation_on, cancel_unaccepted_activation_on, reserve_activation_on,
+    admit_launcher_on, bind_generation_on, cancel_unaccepted_activation_on,
+    classify_one_pending_completion, reserve_activation_on,
 };
 
 pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
@@ -466,12 +467,65 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                     OR name LIKE 'completion_supervisor_%'
                     OR name LIKE 'completion_owner_supervisor_%'
                     OR name LIKE 'completion_source_supervisor_%'
-                    OR name LIKE 'completion_attempt_supervisor_%')
+                    OR name LIKE 'completion_attempt_supervisor_%'
+                    OR name='mailbox'
+                    OR name='mailbox_completion_provenance_immutable'
+                    OR name='mailbox_completion_provenance_insert_valid'
+                    OR name='mailbox_completion_provenance_update_valid')
                  ORDER BY type,name",
             )
             .map_err(|e| e.to_string())?;
         statement
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_map([], |r| {
+                let kind: String = r.get(0)?;
+                let name: String = r.get(1)?;
+                let mut sql: String = r.get(2)?;
+                if name == "completion_continuation_attempt" {
+                    // Synthetic older-version fixtures may retain v25's
+                    // additive column while replaying v21's supervisor
+                    // column later. Both exact clauses are fingerprinted;
+                    // their order carries no authority.
+                    const ASSOCIATION_COLUMN: &str =
+                        ", association_completeness TEXT NOT NULL DEFAULT 'unknown'";
+                    if sql.contains(ASSOCIATION_COLUMN) {
+                        sql = sql.replace(ASSOCIATION_COLUMN, "");
+                        sql.push_str("; association_completeness TEXT NOT NULL DEFAULT 'unknown'");
+                    }
+                }
+                if name == "completion_continuation_source" {
+                    const HISTORY_COLUMN: &str =
+                        ", attempt_association_history TEXT NOT NULL DEFAULT 'unknown'";
+                    if sql.contains(HISTORY_COLUMN) {
+                        sql = sql.replace(HISTORY_COLUMN, "");
+                        sql.push_str(
+                            "; attempt_association_history TEXT NOT NULL DEFAULT 'unknown'",
+                        );
+                    }
+                }
+                if name == "mailbox" {
+                    const COLUMN: &str =
+                        "completion_provenance TEXT NOT NULL DEFAULT 'unclassified'";
+                    if let Some((_, suffix)) = sql.rsplit_once(COLUMN) {
+                        let suffix: String = suffix
+                            .chars()
+                            .filter(|character| !character.is_whitespace())
+                            .collect();
+                        // Earlier-version fixtures place this additive column
+                        // before or after later mailbox columns. Validate its
+                        // own clause, then leave the older table shape to the
+                        // existing migration fingerprint policy.
+                        const OLD_CHECK: &str =
+                            "CHECK(completion_provenanceIN('unclassified','legacy','v2'))";
+                        let delimiter = |tail: &str| tail.starts_with(',') || tail.starts_with(')');
+                        if delimiter(&suffix)
+                            || suffix.strip_prefix(OLD_CHECK).is_some_and(delimiter)
+                        {
+                            sql = "mailbox completion provenance v24".into();
+                        }
+                    }
+                }
+                Ok((kind, name, sql))
+            })
             .map_err(|e| e.to_string())?
             .map(|r| r.map_err(|e| e.to_string()))
             .collect()
@@ -498,6 +552,20 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                 .execute_batch(include_str!(
                     "../migrations/0022_completion_native_runtime.sql"
                 ))
+                .map_err(|e| e.to_string())?;
+            expected.execute_batch(
+                "CREATE TABLE mailbox(completion_provenance TEXT NOT NULL DEFAULT 'unclassified');",
+            ).map_err(|e| e.to_string())?;
+            expected.execute_batch(super::schema::COMPLETION_PROVENANCE_TRIGGER_SQL)
+                .map_err(|e| e.to_string())?;
+            expected.execute_batch("ALTER TABLE completion_continuation_attempt
+            ADD COLUMN association_completeness TEXT NOT NULL DEFAULT 'unknown';
+            ALTER TABLE completion_continuation_source
+            ADD COLUMN attempt_association_history TEXT NOT NULL DEFAULT 'unknown';")
+                .map_err(|e| e.to_string())?;
+            expected.execute_batch(include_str!("../migrations/0025_completion_attempt_sources.sql"))
+                .map_err(|e| e.to_string())?;
+            expected.execute_batch(include_str!("../migrations/0026_completion_attempt_search_generation.sql"))
                 .map_err(|e| e.to_string())?;
             definitions(&expected)
         })

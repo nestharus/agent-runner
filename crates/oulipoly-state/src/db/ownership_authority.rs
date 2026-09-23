@@ -4478,6 +4478,7 @@ mod completion_continuation_tests {
         assert_eq!(evidence.original_output_missing(), missing);
         let payload = serde_json::to_string(&serde_json::json!({
             "kind":"agent_bash_complete", "rc":0,
+            "completion_protocol":crate::completion_continuation::PROTOCOL,
             "snapshot":evidence.snapshot, "outcome":evidence.outcome, "output_artifact":null,
         }))
         .unwrap();
@@ -4491,6 +4492,25 @@ mod completion_continuation_tests {
             rc: 0,
         };
         let mut mailbox = MailboxDb::open(&MailboxDb::path_for_state_db(&path)).unwrap();
+        let mut missing_protocol: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        missing_protocol
+            .as_object_mut()
+            .unwrap()
+            .remove("completion_protocol");
+        let missing_protocol = missing_protocol.to_string();
+        assert!(
+            mailbox
+                .trigger_completion_continuation(
+                    CompletionEventTriggerInput {
+                        payload_json: &missing_protocol,
+                        ..input
+                    },
+                    &binding,
+                    &evidence,
+                )
+                .unwrap_err()
+                .contains("lacks its protocol discriminator")
+        );
         assert!(
             mailbox.trigger_completion_event(input).is_err(),
             "legacy trigger must not bypass v2 source evidence"
@@ -4539,6 +4559,20 @@ mod completion_continuation_tests {
             .unwrap();
         assert!(first.triggered);
         assert_eq!(first.mailbox_rows.len(), usize::from(initially_active));
+        for row in &first.mailbox_rows {
+            let provenance: String = mailbox
+                .connection()
+                .query_row(
+                    "SELECT completion_provenance FROM mailbox WHERE seq=?1",
+                    [row.seq],
+                    |record| record.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                provenance, "v2",
+                "acceptance must stamp the mailbox atomically"
+            );
+        }
         assert_eq!(first.listeners[0].active, initially_active);
         assert!(first.listeners[0].acknowledged_at.is_none());
         let replay = mailbox
@@ -4819,6 +4853,18 @@ mod completion_continuation_tests {
         let pending = mailbox.list_pending("late-session").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].payload_sha256, first.event.payload_sha256);
+        let provenance: String = mailbox
+            .connection()
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE seq=?1",
+                [pending[0].seq],
+                |record| record.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance, "v2",
+            "repaired listener materialization retains v2 provenance"
+        );
         assert!(std::path::Path::new(pending[0].payload_file_path.as_deref().unwrap()).is_file());
         assert!(mailbox.notifications_paused("late-session").unwrap());
         assert!(
@@ -4881,6 +4927,18 @@ mod completion_continuation_tests {
                 &source.owner_invocation_uuid,
             )
             .unwrap();
+        let provenance_after_ack: String = mailbox
+            .connection()
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE seq=?1",
+                [seq],
+                |record| record.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance_after_ack, "v2",
+            "recipient ACK cannot erase source provenance"
+        );
         let ack = mailbox.completion_event_listeners(&source.handle).unwrap();
         assert!(
             ack.iter()

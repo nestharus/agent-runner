@@ -3,8 +3,16 @@
 //! fresh construction and installed-version upgrades are separate paths.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+pub(super) const COMPLETION_PROVENANCE_TRIGGER_SQL: &str =
+    include_str!("migrations/0024_completion_mailbox_provenance_trigger.sql");
 
 fn migrate_completed_turn_retention(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("migrations/0020_completed_turn_retention.sql"))
@@ -52,7 +60,262 @@ fn migrate_record_timestamp_contract(conn: &Connection) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
-pub(super) const CURRENT_VERSION: i64 = 23;
+fn migrate_completion_mailbox_provenance(conn: &Connection) -> Result<(), String> {
+    let present: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mailbox')
+             WHERE name='completion_provenance')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !present {
+        conn.execute_batch(include_str!(
+            "migrations/0024_completion_mailbox_provenance.sql"
+        ))
+        .map_err(|error| error.to_string())?;
+    }
+    // Older test fixtures can carry newer schema objects while presenting an
+    // older user_version. Recreate all three triggers without touching rows.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS mailbox_completion_provenance_insert_valid;
+         DROP TRIGGER IF EXISTS mailbox_completion_provenance_update_valid;
+         DROP TRIGGER IF EXISTS mailbox_completion_provenance_immutable;",
+    )
+    .map_err(|error| error.to_string())?;
+    // Installed pending rows stay unknown at open. A session-scoped retry
+    // reconciles one row at a time, including relational evidence, without
+    // walking pending history while holding the schema writer.
+    conn.execute_batch(COMPLETION_PROVENANCE_TRIGGER_SQL)
+        .map_err(|error| error.to_string())
+}
+
+fn migrate_completion_attempt_sources(conn: &Connection) -> Result<(), String> {
+    let present: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('completion_continuation_attempt')
+         WHERE name='association_completeness')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !present {
+        conn.execute_batch(
+            "ALTER TABLE completion_continuation_attempt
+            ADD COLUMN association_completeness TEXT NOT NULL DEFAULT 'unknown';",
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let source_present: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('completion_continuation_source')
+             WHERE name='attempt_association_history')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !source_present {
+        // The old source set may have shared activations whose claims are gone.
+        // This metadata-only addition avoids a historical scan under the writer.
+        conn.execute_batch(
+            "ALTER TABLE completion_continuation_source
+             ADD COLUMN attempt_association_history TEXT NOT NULL DEFAULT 'unknown';",
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    conn.execute_batch(include_str!(
+        "migrations/0025_completion_attempt_sources.sql"
+    ))
+    .map_err(|error| error.to_string())
+}
+
+fn migrate_completion_attempt_search_generation(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!(
+        "migrations/0026_completion_attempt_search_generation.sql"
+    ))
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Deserialize)]
+struct CompletionProtocolSummary {
+    #[serde(default, deserialize_with = "present_string")]
+    completion_protocol: Option<String>,
+    #[serde(default, deserialize_with = "present_u64")]
+    schema_version: Option<u64>,
+    kind: Option<String>,
+    #[serde(default)]
+    meta: ObjectField,
+    #[serde(default)]
+    snapshot: PresentField,
+    #[serde(default)]
+    outcome: PresentField,
+    #[serde(default)]
+    source_id: PresentField,
+    #[serde(default)]
+    registration_id: PresentField,
+}
+
+#[derive(Default)]
+struct PresentField(bool);
+
+#[derive(Default)]
+struct ObjectField(bool);
+
+impl<'de> Deserialize<'de> for ObjectField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectVisitor;
+        impl<'de> Visitor<'de> for ObjectVisitor {
+            type Value = ObjectField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a legacy completion metadata object")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(ObjectField(true))
+            }
+        }
+        deserializer.deserialize_map(ObjectVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for PresentField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        IgnoredAny::deserialize(deserializer)?;
+        Ok(Self(true))
+    }
+}
+
+fn present_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
+}
+
+fn present_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
+}
+
+pub(super) fn classify_existing_completion_payload(
+    conn: &Connection,
+    envelope: &str,
+    file_path: Option<&str>,
+    digest: Option<&str>,
+    byte_len: Option<i64>,
+    policy: Option<&str>,
+    compacted_at: Option<&str>,
+) -> Option<&'static str> {
+    let summary = if let (Some(path), Some(digest), Some(len), Some(policy)) =
+        (file_path, digest, byte_len, policy)
+    {
+        let root = Path::new(conn.path()?).parent()?;
+        let expected = root
+            .join(super::MAILBOX_PAYLOAD_DIRECTORY)
+            .join(super::MAILBOX_PAYLOAD_ADDRESS_VERSION)
+            .join(super::MAILBOX_PAYLOAD_ALGORITHM)
+            .join(digest.get(..2)?)
+            .join(digest);
+        if PathBuf::from(path) != expected {
+            return None;
+        }
+        if policy != super::MAILBOX_PAYLOAD_RETENTION_POLICY {
+            return None;
+        }
+        let metadata = std::fs::symlink_metadata(&expected).ok()?;
+        if !metadata.is_file()
+            || metadata.permissions().readonly() == false
+            || metadata.len() != u64::try_from(len).ok()?
+        {
+            return None;
+        }
+        let file = std::fs::File::open(&expected).ok()?;
+        let opened = file.metadata().ok()?;
+        if !opened.is_file()
+            || !opened.permissions().readonly()
+            || opened.len() != u64::try_from(len).ok()?
+        {
+            return None;
+        }
+        let mut reader = DigestReader {
+            inner: std::io::BufReader::new(file),
+            digest: Sha256::new(),
+            bytes: 0,
+        };
+        let summary = serde_json::from_reader::<_, CompletionProtocolSummary>(&mut reader).ok()?;
+        if reader.bytes != u64::try_from(len).ok()?
+            || format!("{:x}", reader.digest.finalize()) != digest
+        {
+            return None;
+        }
+        summary
+    } else if file_path.is_none()
+        && digest.is_none()
+        && byte_len.is_none()
+        && policy.is_none()
+        && compacted_at.is_none()
+    {
+        serde_json::from_str::<CompletionProtocolSummary>(envelope).ok()?
+    } else {
+        return None;
+    };
+    classify_completion_summary(summary)
+}
+
+// Parse and hash the same descriptor. A rename or replacement between two
+// opens cannot supply a digest from one file and protocol fields from another.
+struct DigestReader<R> {
+    inner: R,
+    digest: Sha256,
+    bytes: u64,
+}
+
+impl<R: Read> Read for DigestReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.digest.update(&buffer[..read]);
+        self.bytes += read as u64;
+        Ok(read)
+    }
+}
+
+pub(super) fn classify_direct_completion_payload_json(payload: &str) -> &'static str {
+    let Ok(summary) = serde_json::from_str::<CompletionProtocolSummary>(payload) else {
+        return "unclassified";
+    };
+    if summary.completion_protocol.as_deref() == Some(crate::completion_continuation::PROTOCOL) {
+        return "v2";
+    }
+    if summary.completion_protocol.is_some()
+        || summary.snapshot.0
+        || summary.outcome.0
+        || summary.source_id.0
+        || summary.registration_id.0
+    {
+        return "unclassified";
+    }
+    // This API is the direct generic enqueue boundary. The route itself is
+    // the positive legacy fact for a newly written row; old rows lack it and
+    // use the stricter retained-payload classifier above.
+    "legacy"
+}
+
+fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'static str> {
+    match summary.completion_protocol.as_deref() {
+        Some(crate::completion_continuation::PROTOCOL) => Some("v2"),
+        None if summary.schema_version == Some(2)
+            && summary.kind.as_deref() == Some(super::AGENT_BASH_COMPLETE_KIND)
+            && summary.meta.0
+            && !summary.snapshot.0
+            && !summary.outcome.0
+            && !summary.source_id.0
+            && !summary.registration_id.0 =>
+        {
+            Some("legacy")
+        }
+        _ => None,
+    }
+}
+
+pub(super) const CURRENT_VERSION: i64 = 26;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -208,6 +471,21 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 23,
         owner: SidecarEntity::PayloadRetention,
         apply: migrate_record_timestamp_contract,
+    },
+    MigrationStep {
+        target_version: 24,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_completion_mailbox_provenance,
+    },
+    MigrationStep {
+        target_version: 25,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_completion_attempt_sources,
+    },
+    MigrationStep {
+        target_version: 26,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_completion_attempt_search_generation,
     },
 ];
 
@@ -725,6 +1003,7 @@ fn migrate_receipt_scan(conn: &Connection) -> Result<(), String> {
 #[cfg(test)]
 pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
     remove_record_timestamp_contract_for_legacy_fixture(conn);
+    remove_attempt_search_generation_for_legacy_fixture(conn);
     conn.execute_batch(
         "DROP VIEW mailbox_retained_delivery_finalizers;
         DROP INDEX mailbox_completed_turn_pins_attempt;
@@ -732,6 +1011,7 @@ pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
         DROP TABLE mailbox_completed_turn_tails;
         DROP TRIGGER completion_continuation_notification_ack;
         DROP TABLE completion_continuation_notification;
+        DROP TABLE completion_continuation_attempt_source;
         DROP TABLE completion_continuation_attempt;
         DROP TABLE completion_continuation_source;
         DROP TABLE completion_continuation_context;
@@ -750,6 +1030,7 @@ pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
 #[cfg(test)]
 pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &Connection) {
     remove_record_timestamp_contract_for_legacy_fixture(conn);
+    remove_attempt_search_generation_for_legacy_fixture(conn);
     conn.execute_batch(
         "DROP INDEX IF EXISTS idx_mailbox_pending_session_live;
          DROP INDEX IF EXISTS idx_mailbox_pending_target_live;
@@ -777,6 +1058,20 @@ pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &C
          ALTER TABLE completion_continuation_owner DROP COLUMN supervisor_authority_id;
          ALTER TABLE completion_continuation_source DROP COLUMN supervisor_authority_id;
          ALTER TABLE completion_continuation_attempt DROP COLUMN supervisor_authority_id;",
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+fn remove_attempt_search_generation_for_legacy_fixture(conn: &Connection) {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS completion_continuation_attempt_search_insert;
+         DROP TRIGGER IF EXISTS completion_continuation_attempt_search_update;
+         DROP TRIGGER IF EXISTS completion_continuation_attempt_search_delete;
+         DROP TRIGGER IF EXISTS completion_continuation_attempt_source_search_insert;
+         DROP TRIGGER IF EXISTS completion_continuation_attempt_source_search_update;
+         DROP TRIGGER IF EXISTS completion_continuation_attempt_source_search_delete;
+         DROP TABLE IF EXISTS completion_continuation_attempt_search_generation;",
     )
     .unwrap();
 }
@@ -847,7 +1142,852 @@ fn remove_record_timestamp_contract_for_legacy_fixture(conn: &Connection) {
 #[cfg(test)]
 mod contention_tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+
+    #[test]
+    fn v25_source_history_guard_is_part_of_schema_invariant() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let db = super::super::MailboxDb::open(&path).unwrap();
+        for guard in [
+            "completion_source_supervisor_authority_insert",
+            "completion_source_supervisor_authority_immutable",
+        ] {
+            let sql: String = db
+                .connection()
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [guard],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(sql.contains("attempt_association_history"));
+        }
+        db.connection()
+            .execute_batch("DROP TRIGGER completion_source_supervisor_authority_immutable;")
+            .unwrap();
+        drop(db);
+        assert!(
+            super::super::MailboxDb::open(&path)
+                .err()
+                .unwrap()
+                .contains("completion domain schema lineage differs")
+        );
+    }
+
+    #[test]
+    fn historical_source_status_is_a_point_read_on_large_attempt_history() {
+        const ROWS: i64 = 20_000;
+        const VM_BUDGET: usize = 5_000;
+        let directory = tempfile::tempdir().unwrap();
+        let mut db =
+            super::super::MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        db.register_completion_event(super::super::CompletionEventRegistrationInput {
+            event_id: "old-source-event",
+            delivery_mode: "async",
+            owner_session_id: Some("old-receiver"),
+            owner_invocation_uuid: Some("old-owner"),
+            state_dir: "/private/old",
+            meta_path: "/private/old/meta",
+            log_path: "/private/old/log",
+            rc_path: "/private/old/rc",
+        })
+        .unwrap();
+        let domain = db.completion_continuation_domain().unwrap().unwrap();
+        let conn = db.connection();
+        conn.execute(
+            "INSERT INTO completion_continuation_source
+             (registration_id,domain_id,source_id,event_id,registration_digest,binding,
+              phase,snapshot_sha256,outcome_sha256,payload_sha256,payload_byte_len)
+             VALUES('old-source',?1,'old-source','old-source-event','digest',x'00',
+                    'accepted','snapshot','outcome','payload',1)",
+            [&domain],
+        )
+        .unwrap();
+        // Drained pre-v25 attempts can retain no claim or source-set link.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{ROWS})
+             INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              source_registration_id,session_id,claim_token,phase,result_path,
+              integrated,drain_receipt)
+             SELECT printf('old-attempt-%08d',x),'{domain}','old-owner','activation',
+                    'digest','other-source','other-receiver',printf('old-claim-%08d',x),
+                    'drained','/private/old/result',1,'old-receipt' FROM n;"
+        ))
+        .unwrap();
+        let old_steps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&old_steps);
+        conn.progress_handler(
+            1,
+            Some(move || observed.fetch_add(1, Ordering::Relaxed) >= VM_BUDGET),
+        )
+        .unwrap();
+        let old_query = conn.query_row(
+            "SELECT EXISTS(
+             SELECT 1 FROM completion_continuation_source source
+             JOIN completion_continuation_attempt attempt ON attempt.domain_id=source.domain_id
+             WHERE source.registration_id=?1 AND attempt.operation='activation'
+               AND attempt.association_completeness='unknown'
+               AND (attempt.source_registration_id=source.registration_id
+                 OR EXISTS (SELECT 1 FROM completion_event_listener listener
+                            WHERE listener.event_id=source.event_id
+                              AND listener.session_id=attempt.session_id)
+                 OR NOT EXISTS (SELECT 1 FROM completion_event_listener listener
+                                WHERE listener.event_id=source.event_id)))",
+            ["old-source"],
+            |row| row.get::<_, bool>(0),
+        );
+        assert!(matches!(old_query,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::OperationInterrupted));
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+
+        let new_steps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&new_steps);
+        conn.progress_handler(
+            1,
+            Some(move || observed.fetch_add(1, Ordering::Relaxed) >= VM_BUDGET),
+        )
+        .unwrap();
+        assert_eq!(
+            db.continuation_attempt_association_completeness("old-source")
+                .unwrap(),
+            "unknown"
+        );
+        let used = new_steps.load(Ordering::Relaxed);
+        assert!(used < 500, "historical source status used {used} VM steps");
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        let pending_steps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&pending_steps);
+        conn.progress_handler(
+            1,
+            Some(move || observed.fetch_add(1, Ordering::Relaxed) >= VM_BUDGET),
+        )
+        .unwrap();
+        assert!(
+            db.pending_continuation_attempt_ids("old-source")
+                .unwrap()
+                .is_empty()
+        );
+        let pending_used = pending_steps.load(Ordering::Relaxed);
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        eprintln!(
+            "{ROWS} historical attempts: old status interrupted after {} VM steps; point status used {used}",
+            old_steps.load(Ordering::Relaxed)
+        );
+        eprintln!(
+            "{ROWS} historical attempts: unresolved source status used {pending_used} VM steps"
+        );
+        conn.execute_batch(&format!(
+            "INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              source_registration_id,session_id,claim_token,phase,result_path,
+              integrated,drain_receipt)
+             VALUES('old-positive','{domain}','old-owner','activation','digest',
+                    'old-source','old-receiver','deleted-claim','drained',
+                    '/private/old/result',1,'old-receipt');"
+        ))
+        .unwrap();
+        // A late positive with a deleted claim remains discoverable; an empty
+        // bounded page cannot be mistaken for an exhaustive negative answer.
+        let claim_retained: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_wake_claim WHERE claim_token='deleted-claim')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!claim_retained);
+        conn.execute_batch(&format!(
+            "INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              source_registration_id,session_id,claim_token,phase,result_path,
+              integrated,drain_receipt)
+             VALUES('old-linked','{domain}','old-owner','activation','digest',
+                    'old-source','old-receiver','also-deleted','drained',
+                    '/private/old/result',1,'linked-receipt');
+             INSERT INTO completion_continuation_attempt_source
+             (attempt_id,registration_id,listener_revision)
+             VALUES('old-linked','old-source',1);"
+        ))
+        .unwrap();
+        let mut next = None;
+        let mut found = Vec::new();
+        let mut pages = 0;
+        let mut max_steps = 0;
+        let mut total_steps = 0;
+        loop {
+            let steps = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&steps);
+            conn.progress_handler(
+                1,
+                Some(move || observed.fetch_add(1, Ordering::Relaxed) >= VM_BUDGET),
+            )
+            .unwrap();
+            let (page, following) = db
+                .completion_recovery_attempts("old-source", next.as_ref())
+                .unwrap();
+            conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+            let used = steps.load(Ordering::Relaxed);
+            max_steps = max_steps.max(used);
+            total_steps += used;
+            assert!(used < VM_BUDGET, "recovery page used {used} VM steps");
+            pages += 1;
+            if pages == 2 {
+                assert!(page.is_empty(), "early history page has no scalar match");
+                assert!(
+                    following.is_some(),
+                    "an empty page must expose incompleteness"
+                );
+            }
+            if pages == 1 {
+                let mut wrong_source_cursor = following.clone().unwrap();
+                wrong_source_cursor["registration_sha256"] = "another-source".into();
+                assert!(
+                    db.completion_recovery_attempts("old-source", Some(&wrong_source_cursor))
+                        .is_err()
+                );
+            }
+            found.extend(page);
+            next = following;
+            if next.is_none() {
+                break;
+            }
+            assert!(pages < 200);
+        }
+        assert!(pages > 100, "late positive must require bounded paging");
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0]["attempt_id"], "old-linked");
+        assert_eq!(found[0]["drain_receipt"], "linked-receipt");
+        assert_eq!(found[1]["attempt_id"], "old-positive");
+        assert_eq!(found[1]["association_completeness"], "unknown");
+        assert_eq!(found[1]["drain_receipt"], "old-receipt");
+        assert_eq!(
+            db.continuation_attempt_association_completeness("old-source")
+                .unwrap(),
+            "unknown"
+        );
+        eprintln!(
+            "{ROWS} historical attempts: {pages} bounded recovery pages, max {max_steps} VM steps/page, {total_steps} VM steps total; late receipt retained after claim deletion"
+        );
+    }
+
+    #[test]
+    fn attempt_search_rejects_inter_page_insert_behind_lexical_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let mut db = super::super::MailboxDb::open(&path).unwrap();
+        db.register_completion_event(super::super::CompletionEventRegistrationInput {
+            event_id: "one-event",
+            delivery_mode: "async",
+            owner_session_id: Some("receiver"),
+            owner_invocation_uuid: Some("owner"),
+            state_dir: "/private/source",
+            meta_path: "/private/source/meta",
+            log_path: "/private/source/log",
+            rc_path: "/private/source/rc",
+        })
+        .unwrap();
+        let domain = db.completion_continuation_domain().unwrap().unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        writer
+            .execute(
+                "INSERT INTO completion_continuation_source
+             (registration_id,domain_id,source_id,event_id,registration_digest,binding,
+              phase,snapshot_sha256,outcome_sha256,payload_sha256,payload_byte_len)
+             VALUES('one-source',?1,'one-source','one-event','digest',x'00',
+                    'accepted','snapshot','outcome','payload',1)",
+                [&domain],
+            )
+            .unwrap();
+        writer
+            .execute_batch(&format!(
+                "BEGIN;
+             WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<128)
+             INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              source_registration_id,phase,result_path,integrated,drain_receipt,
+              association_completeness)
+             SELECT printf('m%03d',x),'{domain}','owner','source_recovery','digest',
+                    'one-source','drained','/private/receipt',1,'initial-receipt','known' FROM n;
+             INSERT INTO completion_continuation_attempt_source
+             (attempt_id,registration_id,listener_revision)
+             SELECT attempt_id,'one-source',1 FROM completion_continuation_attempt;
+             COMMIT;"
+            ))
+            .unwrap();
+
+        let (first, cursor) = db.completion_recovery_attempts("one-source", None).unwrap();
+        assert_eq!(first.len(), 128);
+        let cursor = cursor.expect("129 linked rows require a second page");
+        assert_eq!(cursor["after_attempt_id"], "m127");
+
+        // A later committed attempt is lexically behind the last observed ID.
+        // Its exact link and physical receipt commit in the same transaction.
+        writer
+            .execute_batch(&format!(
+                "BEGIN;
+             INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              source_registration_id,phase,result_path,integrated,drain_receipt,
+              association_completeness)
+             VALUES('a000','{domain}','owner','source_recovery','digest',
+                    'one-source','drained','/private/new-receipt',1,'late-receipt','known');
+             INSERT INTO completion_continuation_attempt_source
+             (attempt_id,registration_id,listener_revision)
+             VALUES('a000','one-source',1);
+             COMMIT;"
+            ))
+            .unwrap();
+        let stale = db.completion_recovery_attempts("one-source", Some(&cursor));
+        assert!(stale.unwrap_err().contains("attempt history changed"));
+
+        let mut cursor = None;
+        let mut found = Vec::new();
+        loop {
+            let (page, next) = db
+                .completion_recovery_attempts("one-source", cursor.as_ref())
+                .unwrap();
+            found.extend(page);
+            cursor = next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(found.len(), 130);
+        assert_eq!(found[0]["attempt_id"], "a000");
+        assert_eq!(found[0]["drain_receipt"], "late-receipt");
+        assert_eq!(found[0]["association_completeness"], "known");
+    }
+
+    #[test]
+    fn v26_attempt_search_generation_migration_does_not_scan_history() {
+        const ROWS: i64 = 20_000;
+        const VM_BUDGET: usize = 5_000;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE completion_continuation_attempt(attempt_id TEXT PRIMARY KEY);
+             CREATE TABLE completion_continuation_attempt_source(
+                 attempt_id TEXT, registration_id TEXT);
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{ROWS})
+             INSERT INTO completion_continuation_attempt(attempt_id)
+             SELECT printf('attempt-%08d',x) FROM n;"
+        ))
+        .unwrap();
+        let steps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&steps);
+        conn.progress_handler(
+            1,
+            Some(move || observed.fetch_add(1, Ordering::Relaxed) >= VM_BUDGET),
+        )
+        .unwrap();
+        migrate_completion_attempt_search_generation(&conn).unwrap();
+        let used = steps.load(Ordering::Relaxed);
+        assert!(used < VM_BUDGET, "v26 schema step used {used} VM steps");
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        let generation: i64 = conn
+            .query_row(
+                "SELECT generation FROM completion_continuation_attempt_search_generation",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 0);
+        eprintln!("20,000 historical attempts: v26 step used {used} VM steps");
+    }
+
+    #[test]
+    fn v25_association_schema_step_does_not_scan_large_attempt_history() {
+        const ROWS: i64 = 20_000;
+        const VM_BUDGET: usize = 5_000;
+        fn history() -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE completion_continuation_attempt(attempt_id TEXT PRIMARY KEY);
+                 CREATE TABLE completion_continuation_source(
+                     registration_id TEXT PRIMARY KEY, domain_id TEXT,
+                     supervisor_authority_id TEXT);
+                 CREATE TABLE completion_supervisor_authority(authority_id TEXT,domain_id TEXT);
+                 CREATE TRIGGER completion_source_supervisor_authority_insert
+                     BEFORE INSERT ON completion_continuation_source BEGIN SELECT 1; END;
+                 CREATE TRIGGER completion_source_supervisor_authority_immutable
+                     BEFORE UPDATE ON completion_continuation_source BEGIN SELECT 1; END;
+                 WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{ROWS})
+                 INSERT INTO completion_continuation_attempt(attempt_id) SELECT printf('attempt-%08d',x) FROM n;
+                 WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{ROWS})
+                 INSERT INTO completion_continuation_source(registration_id) SELECT printf('source-%08d',x) FROM n;"
+            )).unwrap();
+            conn
+        }
+        fn budget(conn: &Connection) -> Arc<AtomicUsize> {
+            let steps = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&steps);
+            conn.progress_handler(
+                1,
+                Some(move || observed.fetch_add(1, Ordering::Relaxed) >= VM_BUDGET),
+            )
+            .unwrap();
+            steps
+        }
+        let old = history();
+        let old_steps = budget(&old);
+        let old_result = old.execute_batch(
+            "CREATE INDEX hypothetical_historical_backfill ON completion_continuation_attempt(attempt_id);"
+        );
+        assert!(matches!(old_result,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::OperationInterrupted));
+        assert!(old_steps.load(Ordering::Relaxed) > VM_BUDGET);
+
+        let corrected = history();
+        let corrected_steps = budget(&corrected);
+        migrate_completion_attempt_sources(&corrected).unwrap();
+        let used = corrected_steps.load(Ordering::Relaxed);
+        assert!(used < VM_BUDGET, "v25 schema step used {used} VM steps");
+        corrected.progress_handler(0, None::<fn() -> bool>).unwrap();
+        let (count, unknown): (i64, i64) = corrected.query_row(
+            "SELECT COUNT(*), SUM(association_completeness='unknown') FROM completion_continuation_attempt",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!((count, unknown), (ROWS, ROWS));
+        let (sources, unknown_sources): (i64, i64) = corrected
+            .query_row(
+                "SELECT COUNT(*), SUM(attempt_association_history='unknown')
+             FROM completion_continuation_source",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((sources, unknown_sources), (ROWS, ROWS));
+        eprintln!(
+            "20,000 historical attempts: indexing history interrupted after {} VM steps; v25 step used {used}",
+            old_steps.load(Ordering::Relaxed)
+        );
+
+        let full = Connection::open_in_memory().unwrap();
+        create_fresh_schema(&full).unwrap();
+        full.pragma_update(None, "user_version", CURRENT_VERSION)
+            .unwrap();
+        let domain: String = full
+            .query_row(
+                "SELECT domain_id FROM completion_continuation_domain",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        full.execute(
+            "INSERT INTO completion_supervisor_authority
+             (authority_id,domain_id,phase,created_by_generation,guardian_identity)
+             VALUES('history-auth',?1,'active','history-owner','{}')",
+            [&domain],
+        )
+        .unwrap();
+        full.execute(
+            "INSERT INTO completion_continuation_owner
+             (generation,domain_id,phase,guardian_identity,driver_identity,endpoint,supervisor_authority_id)
+             VALUES('history-owner',?1,'lost','{}','{}','/private/owner','history-auth')",
+            [&domain],
+        ).unwrap();
+        full.execute_batch(&format!(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{ROWS})
+             INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              phase,result_path,integrated,drain_receipt)
+             SELECT printf('old-%08d',x),'{domain}','history-owner','source_recovery',
+                    'digest','drained','/private/old-result',1,'old-receipt' FROM n;"
+        ))
+        .unwrap();
+        let open_steps = budget(&full);
+        assert!(observe_valid_current(&full).unwrap());
+        let open_used = open_steps.load(Ordering::Relaxed);
+        assert!(
+            open_used < VM_BUDGET,
+            "current-schema ordinary open check used {open_used} VM steps"
+        );
+        eprintln!("20,000-row v25 ordinary-open schema check used {open_used} VM steps");
+    }
+
+    #[test]
+    fn v23_provenance_schema_step_stays_below_large_mailbox_vm_budget() {
+        const ROWS: i64 = 20_000;
+        const VM_BUDGET: usize = 5_000;
+
+        fn populated_v23_mailbox(rows: i64) -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE mailbox(seq INTEGER PRIMARY KEY, payload_json TEXT NOT NULL);
+                 WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{rows})
+                 INSERT INTO mailbox(seq,payload_json) SELECT x,'{{}}' FROM n;"
+            ))
+            .unwrap();
+            conn
+        }
+
+        fn limit_vm_steps(conn: &Connection, budget: usize) -> Arc<AtomicUsize> {
+            let steps = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&steps);
+            conn.progress_handler(
+                1,
+                Some(move || observed.fetch_add(1, Ordering::Relaxed) >= budget),
+            )
+            .unwrap();
+            steps
+        }
+
+        // The former CHECK-bearing statement is the discriminating control:
+        // SQLite must visit preexisting rows and the same budget interrupts it.
+        let old = populated_v23_mailbox(ROWS);
+        let old_steps = limit_vm_steps(&old, VM_BUDGET);
+        let old_result = old.execute_batch(
+            "ALTER TABLE mailbox ADD COLUMN completion_provenance TEXT NOT NULL
+             DEFAULT 'unclassified'
+             CHECK(completion_provenance IN ('unclassified','legacy','v2'));",
+        );
+        assert!(
+            matches!(
+                old_result,
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::OperationInterrupted
+            ),
+            "CHECK-bearing ADD COLUMN was not interrupted by its row scan"
+        );
+        assert!(old_steps.load(Ordering::Relaxed) > VM_BUDGET);
+        old.progress_handler(0, None::<fn() -> bool>).unwrap();
+        let old_column_present: bool = old
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mailbox')
+                 WHERE name='completion_provenance')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !old_column_present,
+            "interrupted CHECK addition changed the schema"
+        );
+
+        let corrected = populated_v23_mailbox(ROWS);
+        let corrected_steps = limit_vm_steps(&corrected, VM_BUDGET);
+        migrate_completion_mailbox_provenance(&corrected).unwrap();
+        let used = corrected_steps.load(Ordering::Relaxed);
+        assert!(used < VM_BUDGET, "v24 schema step used {used} VM steps");
+        eprintln!(
+            "20,000-row v23 mailbox: former CHECK ADD COLUMN interrupted after {} VM steps; corrected v24 step used {used} VM steps",
+            old_steps.load(Ordering::Relaxed)
+        );
+        corrected.progress_handler(0, None::<fn() -> bool>).unwrap();
+        let (count, first, last): (i64, String, String) = corrected
+            .query_row(
+                "SELECT COUNT(*),
+                    (SELECT completion_provenance FROM mailbox WHERE seq=1),
+                    (SELECT completion_provenance FROM mailbox WHERE seq=?1)
+                 FROM mailbox",
+                [ROWS],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (count, first.as_str(), last.as_str()),
+            (ROWS, "unclassified", "unclassified")
+        );
+    }
+
+    #[test]
+    fn fresh_and_same_column_upgrade_enforce_provenance_on_direct_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let mailbox = super::super::MailboxDb::open(&path).unwrap();
+        let insert = "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+            state_dir,meta_path,log_path,rc_path,rc,completion_provenance)
+            VALUES('session','input',?1,'{}','2026-09-23T00:00:00Z',
+                '/state','/meta','/log','/rc',0,?2)";
+        assert!(
+            mailbox
+                .connection()
+                .execute(insert, params!["bad-insert", "unknown"])
+                .is_err()
+        );
+        mailbox
+            .connection()
+            .execute(
+                "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+                    state_dir,meta_path,log_path,rc_path,rc)
+                 VALUES('session','input','default','{}','2026-09-23T00:00:00Z',
+                    '/state','/meta','/log','/rc',0)",
+                [],
+            )
+            .unwrap();
+        let initial: String = mailbox
+            .connection()
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE handle='default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(initial, "unclassified");
+        assert!(
+            mailbox
+                .connection()
+                .execute(
+                    "UPDATE mailbox SET completion_provenance='unknown' WHERE handle='default'",
+                    [],
+                )
+                .is_err()
+        );
+        mailbox
+            .connection()
+            .execute(
+                "UPDATE mailbox SET completion_provenance='legacy' WHERE handle='default'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            mailbox
+                .connection()
+                .execute(
+                    "UPDATE mailbox SET completion_provenance='v2' WHERE handle='default'",
+                    [],
+                )
+                .is_err()
+        );
+        mailbox
+            .connection()
+            .execute(
+                "UPDATE mailbox SET payload_json='[]' WHERE handle='default'",
+                [],
+            )
+            .unwrap();
+        drop(mailbox);
+
+        // A fixture may carry the v24 column and triggers while its recorded
+        // version is 23. Reapplying the step must keep classified rows intact.
+        let fixture = Connection::open(&path).unwrap();
+        fixture.pragma_update(None, "user_version", 23).unwrap();
+        drop(fixture);
+        let reopened = super::super::MailboxDb::open(&path).unwrap();
+        let provenance: String = reopened
+            .connection()
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE handle='default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provenance, "legacy");
+        assert!(
+            reopened
+                .connection()
+                .execute(insert, params!["bad-again", "unknown"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v23_upgrade_defers_pending_history_and_reconciles_exact_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let mut mailbox = super::super::MailboxDb::open(&path).unwrap();
+        mailbox
+            .register_completion_event(super::super::CompletionEventRegistrationInput {
+                event_id: "old-v2",
+                delivery_mode: "async",
+                owner_session_id: Some("receiver"),
+                owner_invocation_uuid: Some("listener"),
+                state_dir: "/private/source",
+                meta_path: "/private/source/meta.json",
+                log_path: "/private/source/log",
+                rc_path: "/private/source/rc",
+            })
+            .unwrap();
+        let domain = mailbox.completion_continuation_domain().unwrap().unwrap();
+        for (handle, payload) in [
+            (
+                "old-v2",
+                r#"{"completion_protocol":"completion-continuation-v2","source":true}"#,
+            ),
+            (
+                "old-v2-lost-source",
+                r#"{"completion_protocol":"completion-continuation-v2"}"#,
+            ),
+            ("old-null-marker", r#"{"completion_protocol":null}"#),
+            (
+                "old-legacy",
+                r#"{"schema_version":2,"kind":"agent_bash_complete","meta":{}}"#,
+            ),
+            (
+                "old-markerless-v2",
+                r#"{"schema_version":2,"kind":"agent_bash_complete","snapshot":{},"outcome":{}}"#,
+            ),
+        ] {
+            mailbox
+                .enqueue_agent_bash_complete(&super::super::AgentBashCompleteEnqueue {
+                    session_id: handle,
+                    handle,
+                    payload_json: payload,
+                    owner_invocation_uuid: None,
+                    matched_os_pid: None,
+                    matched_os_boot_id: None,
+                    matched_os_pid_starttime_ticks: None,
+                    matched_chain_index: None,
+                    state_dir: "/private/source",
+                    meta_path: "/private/source/meta.json",
+                    log_path: "/private/source/log",
+                    rc_path: "/private/source/rc",
+                    rc: 0,
+                })
+                .unwrap();
+        }
+        let direct_markerless: String = mailbox
+            .connection()
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE handle='old-markerless-v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(direct_markerless, "unclassified");
+        let source_payload_path: String = mailbox
+            .connection()
+            .query_row(
+                "SELECT payload_file_path FROM mailbox WHERE handle='old-v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        std::fs::remove_file(source_payload_path).unwrap();
+        mailbox
+            .connection()
+            .execute(
+                "INSERT INTO completion_continuation_source
+                 (registration_id,domain_id,source_id,event_id,registration_digest,binding)
+             VALUES('old-v2',?1,'old-v2','old-v2','digest',x'00')",
+                [domain],
+            )
+            .unwrap();
+        mailbox
+            .connection()
+            .execute_batch(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<256)
+             INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+                 state_dir,meta_path,log_path,rc_path,rc)
+             SELECT 'backlog','agent_bash_complete',printf('pending-%d',x),
+                 '{\"schema_version\":1}','2026-09-23T00:00:00Z',
+                 '/private/source','/private/source/meta.json',
+                 '/private/source/log','/private/source/rc',0 FROM n;",
+            )
+            .unwrap();
+        mailbox
+            .connection()
+            .execute(
+                "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+                 state_dir,meta_path,log_path,rc_path,rc)
+             VALUES('old-ambiguous','agent_bash_complete','old-ambiguous',
+                 '{\"schema_version\":1}','2026-09-23T00:00:00Z',
+                 '/private/source','/private/source/meta.json',
+                 '/private/source/log','/private/source/rc',0)",
+                [],
+            )
+            .unwrap();
+        mailbox
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER mailbox_completion_provenance_insert_valid;
+             DROP TRIGGER mailbox_completion_provenance_update_valid;
+             DROP TRIGGER mailbox_completion_provenance_immutable;
+             ALTER TABLE mailbox DROP COLUMN completion_provenance;
+             PRAGMA user_version = 23;",
+            )
+            .unwrap();
+        drop(mailbox);
+
+        let mut reopened = super::super::MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            sidecar_version(reopened.connection()).unwrap(),
+            CURRENT_VERSION
+        );
+        let pending_backlog: i64 = reopened
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM mailbox WHERE session_id='backlog'
+             AND completion_provenance='unclassified'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_backlog, 256);
+        for handle in [
+            "old-v2",
+            "old-v2-lost-source",
+            "old-null-marker",
+            "old-legacy",
+            "old-markerless-v2",
+            "old-ambiguous",
+        ] {
+            let provenance: String = reopened
+                .connection()
+                .query_row(
+                    "SELECT completion_provenance FROM mailbox WHERE handle=?1",
+                    [handle],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                provenance, "unclassified",
+                "upgrade must defer all pending history"
+            );
+        }
+        for (handle, expected) in [
+            ("old-v2", "v2"),
+            ("old-v2-lost-source", "v2"),
+            ("old-null-marker", "unclassified"),
+            ("old-legacy", "legacy"),
+            ("old-markerless-v2", "unclassified"),
+            ("old-ambiguous", "unclassified"),
+        ] {
+            super::super::completion_continuation::classify_one_pending_completion(
+                &mut reopened.conn,
+                handle,
+                None,
+            )
+            .unwrap();
+            let provenance: String = reopened
+                .connection()
+                .query_row(
+                    "SELECT completion_provenance FROM mailbox WHERE handle=?1",
+                    [handle],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(provenance, expected, "incorrect backfill for {handle}");
+        }
+        assert!(
+            reopened
+                .connection()
+                .execute(
+                    "UPDATE mailbox SET completion_provenance='legacy' WHERE handle='old-v2'",
+                    [],
+                )
+                .is_err(),
+            "classified v2 provenance must be immutable"
+        );
+        reopened
+            .connection()
+            .execute_batch("DROP TRIGGER mailbox_completion_provenance_immutable;")
+            .unwrap();
+        drop(reopened);
+        assert!(
+            super::super::MailboxDb::open(&path)
+                .err()
+                .unwrap()
+                .contains("completion domain schema lineage differs")
+        );
+    }
 
     #[test]
     fn populated_v19_fixture_migrates_without_newer_schema_objects() {

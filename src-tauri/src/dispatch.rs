@@ -105,6 +105,9 @@ pub(crate) fn run_offline_entry(cli: &Cli) -> Result<Option<i32>, String> {
             NotifySubcommands::RecoveryRead { event_id, output } => {
                 crate::commands::notify_continuation::recovery_read(event_id, output.as_deref())
             }
+            NotifySubcommands::RecoveryAttempts { event_id, cursor } => {
+                crate::commands::notify_continuation::recovery_attempts(event_id, cursor)
+            }
             _ => return Ok(None),
         },
         Some(Subcommands::Diagnostics { command }) => match command {
@@ -508,7 +511,9 @@ fn dispatch_subcommand(
 
 fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String> {
     match command {
-        NotifySubcommands::RecoveryList { .. } | NotifySubcommands::RecoveryRead { .. } => {
+        NotifySubcommands::RecoveryList { .. }
+        | NotifySubcommands::RecoveryRead { .. }
+        | NotifySubcommands::RecoveryAttempts { .. } => {
             unreachable!("manual recovery runs before startup recovery")
         }
         NotifySubcommands::Listen {
