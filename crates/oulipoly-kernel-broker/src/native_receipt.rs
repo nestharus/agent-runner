@@ -42,8 +42,11 @@ pub struct BoundNativeAuthority<'a> {
     pub domain_id: &'a str,
     pub supervisor_authority_id: &'a str,
     pub owner_generation: &'a str,
+    pub owner_uid: u32,
     /// From the broker's already bound entry, never from this request.
     pub guardian: &'a ProcessStamp,
+    pub host_namespace: &'a File,
+    pub runner_image: &'a File,
     /// From the guardian's in-memory positive decision, not an on-disk claim.
     pub receipt_sha256: &'a str,
 }
@@ -108,7 +111,10 @@ pub fn verify(
     receipt: &File,
 ) -> io::Result<VerifiedNativeReceipt> {
     peer.process.verify()?;
-    if ProcessStamp::from(&peer.process) != *bound.guardian
+    if peer.uid != bound.owner_uid
+        || ProcessStamp::from(&peer.process) != *bound.guardian
+        || !peer.process.in_namespace(bound.host_namespace)?
+        || !peer.process.same_executable_as(bound.runner_image)?
         || !same_named_regular_file(directory, REQUEST_NAME, request)?
         || !same_named_regular_file(directory, RECEIPT_NAME, receipt)?
     {
@@ -266,13 +272,18 @@ mod tests {
             process,
         };
         let stamp = ProcessStamp::from(&peer.process);
+        let host_namespace = File::open("/proc/self/ns/pid").unwrap();
+        let runner_image = File::open("/proc/self/exe").unwrap();
         let receipt_sha = digest(&receipt_bytes);
         let bound = BoundNativeAuthority {
             root_id: &root,
             domain_id: &owner.domain_id,
             supervisor_authority_id: &owner.supervisor_authority_id,
             owner_generation: &owner.owner_generation,
+            owner_uid: peer.uid,
             guardian: &stamp,
+            host_namespace: &host_namespace,
+            runner_image: &runner_image,
             receipt_sha256: &receipt_sha,
         };
         let verified = verify(&peer, &bound, &directory, &request, &receipt).unwrap();
@@ -292,6 +303,11 @@ mod tests {
             ..bound
         };
         assert!(verify(&peer, &wrong_guardian, &directory, &request, &receipt).is_err());
+        let wrong_uid = BoundNativeAuthority {
+            owner_uid: peer.uid.wrapping_add(1),
+            ..bound
+        };
+        assert!(verify(&peer, &wrong_uid, &directory, &request, &receipt).is_err());
         let wrong_sha = BoundNativeAuthority {
             receipt_sha256: &"0".repeat(64),
             ..bound
