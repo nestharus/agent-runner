@@ -27,6 +27,7 @@
 - `crates/oulipoly-state/src/live_history.rs`
 - `crates/oulipoly-state/src/lifecycle_log.rs`
 - `crates/oulipoly-state/src/mailbox.rs`
+- `crates/oulipoly-state/src/mailbox/broker_authority.rs`
 - `crates/oulipoly-state/src/mailbox/completion_continuation/attempts.rs`
 - `crates/oulipoly-state/src/mailbox/completion_continuation/mod.rs`
 - `crates/oulipoly-state/src/mailbox/completion_continuation/notification.rs`
@@ -99,6 +100,7 @@
 | Pinned kernel guardian publishes a completion owner. | Sidecar v24 stores its root UUID in the same transaction as domain, supervisor, guardian, and driver identity; a replacement driver may reuse the root only beneath that exact guardian and authority. |
 | Existing DB one or more versions behind. | `migrations.rs` runs forward migrations in order; row-version triggers apply per `row_version/triggers_sql/`. |
 | Existing DB at a FUTURE version. | Open fails with `SchemaTooNew` carrying actual and expected versions; do NOT downgrade. |
+| A quiesced complete v29 sidecar copy is placed under broker-controlled root-only storage. | Explicit activation stamps v30 and a broker-minted source generation in one transaction; a retained broker connection reopens the same WAL database after restart. Ordinary v29 sidecar writers refuse v30. This does not authorize native K or cut over the user-side callers. |
 | Existing DB at a known-incompatible past version (no migration path). | Open fails with `MigrationUnsupported`; advise the operator to reset or restore. |
 | Concurrent reader during writer migration. | SQLite WAL + retry handles short waits; long contention surfaces as `DbBusy`. |
 | Repository operation on a row whose `row_version` has advanced. | `repositories/mod.rs` returns a typed conflict error; caller decides retry/replace. |
@@ -201,6 +203,9 @@ table tests, repositories contract.
 - `crates/oulipoly-state/tests/age_62_readonly_schema_probe.rs`
 - `crates/oulipoly-state/tests/age_62_resolver_routing.rs`
 - `crates/oulipoly-state/tests/age371_record_timestamps.rs`
+- `crates/oulipoly-state/tests/sidecar_cutover_refusal.rs`
+- `crates/oulipoly-state/src/mailbox/broker_authority.rs`
+  (root-only path, WAL copy, v29 activation, restart, and direct-writer refusal fixtures)
 - `crates/oulipoly-state/src/retention.rs`
   (policy boundary, fail-closed record/generation facts, cursor and observation contracts)
 - `crates/oulipoly-state/src/db/retention.rs`

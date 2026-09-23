@@ -41,10 +41,12 @@ use crate::sqlite_observability::{
     connection_open_evidence,
 };
 
+mod broker_authority;
 mod completion_continuation;
 mod finalization;
 mod native_publication;
 mod retention;
+pub use broker_authority::BrokerSidecar;
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
 mod schema;
@@ -1933,6 +1935,7 @@ impl MailboxDb {
         .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
+        schema::validate_existing_writer_version(&conn)?;
         conn.busy_timeout(COMPLETION_AUTHORITY_SQLITE_TIMEOUT)
             .map_err(|err| format!("Failed to configure PID mailbox sidecar authority: {err}"))?;
         Ok(Self {
@@ -11627,6 +11630,10 @@ pub(crate) fn configure_writable_sidecar_connection(conn: &Connection) -> Result
 
 pub(crate) fn ensure_shared_sidecar_schema(conn: &mut Connection) -> Result<(), String> {
     schema::ensure(conn)
+}
+
+pub(crate) fn reject_future_sidecar_writer_version(conn: &Connection) -> Result<(), String> {
+    schema::validate_existing_writer_version(conn)
 }
 
 fn mailbox_schema_definition() -> &'static str {

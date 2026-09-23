@@ -603,6 +603,14 @@ pub(super) use attempts::{
 };
 
 pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, super::schema::CURRENT_VERSION)
+}
+
+pub(super) fn validate_broker_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, super::schema::BROKER_OWNED_VERSION)
+}
+
+fn validate_schema_version_on(conn: &Connection, required_version: i64) -> Result<(), String> {
     type Definition = (String, String, String);
     static EXPECTED: std::sync::OnceLock<Result<Vec<Definition>, String>> =
         std::sync::OnceLock::new();
@@ -731,7 +739,7 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    if version != super::schema::CURRENT_VERSION || definitions(conn)? != *expected {
+    if version != required_version || definitions(conn)? != *expected {
         return Err(
             "unsupported_transition_required: completion domain schema lineage differs".into(),
         );

@@ -15,6 +15,7 @@ use oulipoly_kernel_broker::protocol::{
 };
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
+use oulipoly_state::mailbox::BrokerSidecar;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -1046,6 +1047,8 @@ fn serve() -> io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other("host root required"));
     }
+    // Every broker-created SQLite main/WAL/SHM artifact must be owner-only.
+    unsafe { libc::umask(0o077) };
     let fixture = private_fixture();
     // Installation is mandatory for serving, including restart. Failure to
     // create an independent observer is an admission failure, not a reason to
@@ -1091,6 +1094,18 @@ fn serve() -> io::Result<()> {
         checked_root_path(Path::new("/run/oulipoly-kernel-broker"), true)?;
         checked_root_path(Path::new(&runner), false)?;
     }
+    let sidecar_directory = Path::new(&state).join("sidecar");
+    // A staged cutover is all-or-nothing at broker restart. Retain the exact
+    // v30 connection for future broker State operations, while legacy native
+    // N/k remains nonlaunching until the writer protocol is migrated.
+    let broker_sidecar = match fs::symlink_metadata(&sidecar_directory) {
+        Ok(_) => {
+            let path = sidecar_directory.join("pid-identity.db");
+            Some(BrokerSidecar::open_existing(&path, Path::new(&state)).map_err(io::Error::other)?)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
     let runner_image = File::open(&runner)?;
     let works_path = Path::new(&state).join("works");
     if !works_path.exists() {
@@ -1258,6 +1273,11 @@ fn serve() -> io::Result<()> {
                 )?;
                 Ok(format!("prepared-work {}\n", grant.grant_id))
             } else if operation == b'N' {
+                if broker_sidecar.is_some() {
+                    return Err(io::Error::other(
+                        "legacy native prepare is closed after broker sidecar cutover",
+                    ));
+                }
                 let RequestPayload::PrepareNative { spec, descriptors } = payload else {
                     return Err(io::Error::other("invalid native prepare payload"));
                 };
@@ -1282,6 +1302,11 @@ fn serve() -> io::Result<()> {
                 )?;
                 Ok(format!("prepared-native {}\n", grant.grant_id))
             } else if operation == b'k' {
+                if broker_sidecar.is_some() {
+                    return Err(io::Error::other(
+                        "legacy native K is closed after broker sidecar cutover",
+                    ));
+                }
                 let RequestPayload::NativeK { spec, descriptors } = payload else {
                     return Err(io::Error::other("invalid native K payload"));
                 };

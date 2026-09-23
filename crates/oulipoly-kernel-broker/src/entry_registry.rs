@@ -423,6 +423,10 @@ mod tests {
                         .bind_guardian(&root, &domain, &supervisor, uid, &guardian)
                         .is_err()
                 );
+                // Finish the negative reopen before the parent atomically
+                // replaces the record. Reopening during its temporary-file
+                // publication can make this child exit before preparation.
+                child_gate.write_all(&[0])?;
                 let mut release = [0u8; 1];
                 child_gate.read_exact(&mut release)?;
                 assert_eq!(release, [1]);
@@ -436,6 +440,9 @@ mod tests {
             unsafe { libc::_exit(if status.is_ok() { 0 } else { 1 }) }
         }
         drop(child_gate);
+        let mut ready = [0u8; 1];
+        parent_gate.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [0]);
         let guardian = PinnedProcess::open(child).unwrap();
         registry
             .prepare_guardian(&root, uid, &entry, &guardian)

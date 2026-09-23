@@ -316,6 +316,7 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
 }
 
 pub(super) const CURRENT_VERSION: i64 = 29;
+pub(super) const BROKER_OWNED_VERSION: i64 = 30;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -676,6 +677,58 @@ fn validate_supported_version(version: i64) -> Result<(), String> {
         "Unsupported PID mailbox sidecar schema version {version}; expected 0..={MAX_SUPPORTED_VERSION}"
     ))
 }
+
+/// Existing writable authority paths do not run the ordinary migration. They
+/// must still refuse a sidecar written by a newer broker-owned protocol.
+pub(super) fn validate_existing_writer_version(conn: &Connection) -> Result<(), String> {
+    validate_supported_version(sidecar_version(conn)?)
+}
+
+pub(super) fn validate_exact_v29(conn: &Connection) -> Result<(), String> {
+    if observe_valid_current(conn)? {
+        Ok(())
+    } else {
+        Err("broker cutover requires a complete v29 sidecar".into())
+    }
+}
+
+pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("Failed to observe broker sidecar: {error}"))?;
+    if sidecar_version(&tx)? != BROKER_OWNED_VERSION {
+        return Err("broker sidecar requires schema version 30".into());
+    }
+    super::completion_continuation::validate_broker_schema_on(&tx)?;
+    let definition: String = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='broker_sidecar_authority'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("broker authority schema missing: {error}"))?;
+    if definition != BROKER_AUTHORITY_SCHEMA {
+        return Err("broker authority schema changed".into());
+    }
+    let generation: String = tx
+        .query_row(
+            "SELECT source_generation FROM broker_sidecar_authority WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("broker source generation missing: {error}"))?;
+    uuid::Uuid::parse_str(&generation)
+        .map_err(|_| "broker source generation is invalid".to_string())?;
+    tx.commit()
+        .map_err(|error| format!("Failed to finish broker sidecar observation: {error}"))?;
+    Ok(generation)
+}
+
+pub(super) const BROKER_AUTHORITY_SCHEMA: &str = "CREATE TABLE broker_sidecar_authority (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    source_generation TEXT NOT NULL,
+    activated_at TEXT NOT NULL
+)";
 
 fn create_fresh_schema(conn: &Connection) -> Result<(), String> {
     apply_steps(conn, SCHEMA_STEPS)
