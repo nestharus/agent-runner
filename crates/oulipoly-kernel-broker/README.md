@@ -91,14 +91,19 @@ test, not a host-root sudo or deployed continuity proof.
 
 ## Remaining interfaces
 
-- Migrate maintenance and provider custody to explicit host/local PID domains
-  before admitting service-requiring CLI. The native owner handshake now uses
-  `V` across that boundary, but `MaintenanceWorkerIdentity::current` and its
-  parent launcher still read namespace-local PIDs through `/proc` mounted for
-  the host PID namespace. The private `--model` probe reached the child but
-  failed with `process identity disappeared` and an early maintenance-worker
-  exit; it now refuses before reservation. Add a validated TTY and GUI handoff or keep
-  those modes refusing. Current supported entry is help/offline diagnostics.
+- The merged State/runtime/Runner PID readers translate namespace-local PIDs
+  into the caller's procfs observer and fail closed on changed or ambiguous
+  identity. The observer tag in the child environment is a drift check, not
+  broker authority. This root join creates a PID namespace without a separate
+  mount namespace, and broker and guardian identity reads still use `/proc`
+  paths. A workload with host-root `sudo` could replace that mount; the current
+  source does not authenticate the host-procfs invariant against that case.
+  Before service admission, bind broker identity reads to a pinned host procfs
+  observer that the workload cannot replace, and bind the guardian and nested
+  worker's host PID identities to broker-attested incarnations. A private
+  procfs fixture proves translation mechanics only. Keep service-requiring
+  CLI, TTY, and GUI refusing until their remaining bindings exist. Current
+  supported entry is help/offline diagnostics.
 - Extend the positive `H` preparation into a one-use consumed grant and
   broker-owned gated worker launch under a nested PID namespace/PID1. Transfer
   the worker control and capability descriptors as part of that atomic

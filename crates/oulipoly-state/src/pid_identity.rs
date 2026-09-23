@@ -408,7 +408,9 @@ pub fn read_live_process_identity(os_pid: i64) -> Result<Option<ProcessIdentity>
 /// Identifies the procfs instance used for numeric `/proc/<pid>` keys. Persist
 /// this alongside an observer PID when another process may later read it. A
 /// procfs mount for a different PID namespace has a different superblock;
-/// the mount root stays visible even when hidepid masks `/proc/1`.
+/// the mount root stays visible even when hidepid masks `/proc/1`. This value
+/// is metadata, not proof of a host procfs mount: a privileged workload can
+/// replace `/proc` or change its own declared observer environment value.
 #[cfg(target_os = "linux")]
 pub fn procfs_observer_domain() -> Result<String, String> {
     use std::os::unix::fs::MetadataExt;

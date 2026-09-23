@@ -110,8 +110,9 @@ pub fn prepare_accepted_work_at(
 }
 
 /// Only CLI surfaces that dispatch without native service bootstrap may enter
-/// the root child until host/local PID handling is explicit throughout the
-/// completion owner and provider launch path.
+/// the root child. Observer-aware PID reads do not supply broker-owned nested
+/// work launch, control, and physical drain, or authenticate the host procfs
+/// observer against a privileged workload that can replace `/proc`.
 pub fn supported_entry_args(args: &[String]) -> bool {
     matches!(args, [only] if only == "--help" || only == "-h")
         || args.first().is_some_and(|first| first == "diagnostics")
