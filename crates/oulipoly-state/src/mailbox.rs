@@ -14719,11 +14719,11 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            // Schema 24 also fingerprints immutable completion provenance
-            // (measured 4179 VM steps). Keep a tight fixed ceiling,
+            // Schema 24 fingerprints immutable provenance and both value
+            // validation triggers (measured 4679 VM steps). Keep a fixed ceiling,
             // the no-backfill assertion, and the separate retained-history
             // growth test; this does not grant a data-size-dependent budget.
-            current_open_steps < 4400,
+            current_open_steps < 5000,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
         );
     }

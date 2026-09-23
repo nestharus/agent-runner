@@ -469,7 +469,9 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                     OR name LIKE 'completion_source_supervisor_%'
                     OR name LIKE 'completion_attempt_supervisor_%'
                     OR name='mailbox'
-                    OR name='mailbox_completion_provenance_immutable')
+                    OR name='mailbox_completion_provenance_immutable'
+                    OR name='mailbox_completion_provenance_insert_valid'
+                    OR name='mailbox_completion_provenance_update_valid')
                  ORDER BY type,name",
             )
             .map_err(|e| e.to_string())?;
@@ -478,12 +480,27 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                 let kind: String = r.get(0)?;
                 let name: String = r.get(1)?;
                 let mut sql: String = r.get(2)?;
-                if name == "mailbox"
-                    && sql.contains("completion_provenance TEXT NOT NULL DEFAULT 'unclassified'")
-                    && sql
-                        .contains("CHECK(completion_provenance IN ('unclassified','legacy','v2'))")
-                {
-                    sql = "mailbox completion provenance v24".into();
+                if name == "mailbox" {
+                    const COLUMN: &str =
+                        "completion_provenance TEXT NOT NULL DEFAULT 'unclassified'";
+                    if let Some((_, suffix)) = sql.rsplit_once(COLUMN) {
+                        let suffix: String = suffix
+                            .chars()
+                            .filter(|character| !character.is_whitespace())
+                            .collect();
+                        // Earlier-version fixtures place this additive column
+                        // before or after later mailbox columns. Validate its
+                        // own clause, then leave the older table shape to the
+                        // existing migration fingerprint policy.
+                        const OLD_CHECK: &str =
+                            "CHECK(completion_provenanceIN('unclassified','legacy','v2'))";
+                        let delimiter = |tail: &str| tail.starts_with(',') || tail.starts_with(')');
+                        if delimiter(&suffix)
+                            || suffix.strip_prefix(OLD_CHECK).is_some_and(delimiter)
+                        {
+                            sql = "mailbox completion provenance v24".into();
+                        }
+                    }
                 }
                 Ok((kind, name, sql))
             })
@@ -515,8 +532,7 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                 ))
                 .map_err(|e| e.to_string())?;
             expected.execute_batch(
-                "CREATE TABLE mailbox(completion_provenance TEXT NOT NULL DEFAULT 'unclassified'
-                 CHECK(completion_provenance IN ('unclassified','legacy','v2')));",
+                "CREATE TABLE mailbox(completion_provenance TEXT NOT NULL DEFAULT 'unclassified');",
             ).map_err(|e| e.to_string())?;
             expected.execute_batch(super::schema::COMPLETION_PROVENANCE_TRIGGER_SQL)
                 .map_err(|e| e.to_string())?;

@@ -75,10 +75,14 @@ fn migrate_completion_mailbox_provenance(conn: &Connection) -> Result<(), String
         ))
         .map_err(|error| error.to_string())?;
     }
-    // Older test fixtures can carry a newer column while presenting an older
-    // user_version. A normal installed upgrade never enters with this trigger.
-    conn.execute_batch("DROP TRIGGER IF EXISTS mailbox_completion_provenance_immutable;")
-        .map_err(|error| error.to_string())?;
+    // Older test fixtures can carry newer schema objects while presenting an
+    // older user_version. Recreate all three triggers without touching rows.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS mailbox_completion_provenance_insert_valid;
+         DROP TRIGGER IF EXISTS mailbox_completion_provenance_update_valid;
+         DROP TRIGGER IF EXISTS mailbox_completion_provenance_immutable;",
+    )
+    .map_err(|error| error.to_string())?;
     // Installed pending rows stay unknown at open. A session-scoped retry
     // reconciles one row at a time, including relational evidence, without
     // walking pending history while holding the schema writer.
@@ -1065,7 +1069,185 @@ fn remove_record_timestamp_contract_for_legacy_fixture(conn: &Connection) {
 #[cfg(test)]
 mod contention_tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+
+    #[test]
+    fn v23_provenance_schema_step_stays_below_large_mailbox_vm_budget() {
+        const ROWS: i64 = 20_000;
+        const VM_BUDGET: usize = 5_000;
+
+        fn populated_v23_mailbox(rows: i64) -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE mailbox(seq INTEGER PRIMARY KEY, payload_json TEXT NOT NULL);
+                 WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{rows})
+                 INSERT INTO mailbox(seq,payload_json) SELECT x,'{{}}' FROM n;"
+            ))
+            .unwrap();
+            conn
+        }
+
+        fn limit_vm_steps(conn: &Connection, budget: usize) -> Arc<AtomicUsize> {
+            let steps = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&steps);
+            conn.progress_handler(
+                1,
+                Some(move || observed.fetch_add(1, Ordering::Relaxed) >= budget),
+            )
+            .unwrap();
+            steps
+        }
+
+        // The former CHECK-bearing statement is the discriminating control:
+        // SQLite must visit preexisting rows and the same budget interrupts it.
+        let old = populated_v23_mailbox(ROWS);
+        let old_steps = limit_vm_steps(&old, VM_BUDGET);
+        let old_result = old.execute_batch(
+            "ALTER TABLE mailbox ADD COLUMN completion_provenance TEXT NOT NULL
+             DEFAULT 'unclassified'
+             CHECK(completion_provenance IN ('unclassified','legacy','v2'));",
+        );
+        assert!(
+            matches!(
+                old_result,
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::OperationInterrupted
+            ),
+            "CHECK-bearing ADD COLUMN was not interrupted by its row scan"
+        );
+        assert!(old_steps.load(Ordering::Relaxed) > VM_BUDGET);
+        old.progress_handler(0, None::<fn() -> bool>).unwrap();
+        let old_column_present: bool = old
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mailbox')
+                 WHERE name='completion_provenance')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !old_column_present,
+            "interrupted CHECK addition changed the schema"
+        );
+
+        let corrected = populated_v23_mailbox(ROWS);
+        let corrected_steps = limit_vm_steps(&corrected, VM_BUDGET);
+        migrate_completion_mailbox_provenance(&corrected).unwrap();
+        let used = corrected_steps.load(Ordering::Relaxed);
+        assert!(used < VM_BUDGET, "v24 schema step used {used} VM steps");
+        eprintln!(
+            "20,000-row v23 mailbox: former CHECK ADD COLUMN interrupted after {} VM steps; corrected v24 step used {used} VM steps",
+            old_steps.load(Ordering::Relaxed)
+        );
+        corrected.progress_handler(0, None::<fn() -> bool>).unwrap();
+        let (count, first, last): (i64, String, String) = corrected
+            .query_row(
+                "SELECT COUNT(*),
+                    (SELECT completion_provenance FROM mailbox WHERE seq=1),
+                    (SELECT completion_provenance FROM mailbox WHERE seq=?1)
+                 FROM mailbox",
+                [ROWS],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (count, first.as_str(), last.as_str()),
+            (ROWS, "unclassified", "unclassified")
+        );
+    }
+
+    #[test]
+    fn fresh_and_same_column_upgrade_enforce_provenance_on_direct_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let mailbox = super::super::MailboxDb::open(&path).unwrap();
+        let insert = "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+            state_dir,meta_path,log_path,rc_path,rc,completion_provenance)
+            VALUES('session','input',?1,'{}','2026-09-23T00:00:00Z',
+                '/state','/meta','/log','/rc',0,?2)";
+        assert!(
+            mailbox
+                .connection()
+                .execute(insert, params!["bad-insert", "unknown"])
+                .is_err()
+        );
+        mailbox
+            .connection()
+            .execute(
+                "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+                    state_dir,meta_path,log_path,rc_path,rc)
+                 VALUES('session','input','default','{}','2026-09-23T00:00:00Z',
+                    '/state','/meta','/log','/rc',0)",
+                [],
+            )
+            .unwrap();
+        let initial: String = mailbox
+            .connection()
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE handle='default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(initial, "unclassified");
+        assert!(
+            mailbox
+                .connection()
+                .execute(
+                    "UPDATE mailbox SET completion_provenance='unknown' WHERE handle='default'",
+                    [],
+                )
+                .is_err()
+        );
+        mailbox
+            .connection()
+            .execute(
+                "UPDATE mailbox SET completion_provenance='legacy' WHERE handle='default'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            mailbox
+                .connection()
+                .execute(
+                    "UPDATE mailbox SET completion_provenance='v2' WHERE handle='default'",
+                    [],
+                )
+                .is_err()
+        );
+        mailbox
+            .connection()
+            .execute(
+                "UPDATE mailbox SET payload_json='[]' WHERE handle='default'",
+                [],
+            )
+            .unwrap();
+        drop(mailbox);
+
+        // A fixture may carry the v24 column and triggers while its recorded
+        // version is 23. Reapplying the step must keep classified rows intact.
+        let fixture = Connection::open(&path).unwrap();
+        fixture.pragma_update(None, "user_version", 23).unwrap();
+        drop(fixture);
+        let reopened = super::super::MailboxDb::open(&path).unwrap();
+        let provenance: String = reopened
+            .connection()
+            .query_row(
+                "SELECT completion_provenance FROM mailbox WHERE handle='default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provenance, "legacy");
+        assert!(
+            reopened
+                .connection()
+                .execute(insert, params!["bad-again", "unknown"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn v23_upgrade_defers_pending_history_and_reconciles_exact_rows() {
@@ -1176,7 +1358,9 @@ mod contention_tests {
         mailbox
             .connection()
             .execute_batch(
-                "DROP TRIGGER mailbox_completion_provenance_immutable;
+                "DROP TRIGGER mailbox_completion_provenance_insert_valid;
+             DROP TRIGGER mailbox_completion_provenance_update_valid;
+             DROP TRIGGER mailbox_completion_provenance_immutable;
              ALTER TABLE mailbox DROP COLUMN completion_provenance;
              PRAGMA user_version = 23;",
             )
