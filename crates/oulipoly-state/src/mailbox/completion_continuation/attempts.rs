@@ -986,6 +986,113 @@ fn classify_one_pending_completion_with_hook(
 }
 
 impl MailboxDb {
+    /// Bind one broker-prepared grant to the exact revision-2 acceptance. This
+    /// is a one-use association CAS, not permission to open the worker gate.
+    /// The guardian supplies its committed snapshot and the digest of the
+    /// descriptor bytes it kept pinned while publishing the positive receipt.
+    pub fn bind_exact_native_grant(
+        &mut self,
+        accepted: &AcceptedNativeGrantSnapshot,
+        grant_id: &str,
+        custodian_request_sha256: &str,
+    ) -> Result<NativeGrantBinding, String> {
+        fn valid_sha256(value: &str) -> bool {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        }
+        if uuid::Uuid::parse_str(grant_id).is_err()
+            || !valid_sha256(custodian_request_sha256)
+            || accepted.phase != "accepted"
+            || accepted.revision != 2
+            || accepted.integrated
+            || accepted.custodian_identity.is_some()
+            || accepted.adopter_identity.is_some()
+            || accepted.attempt.owner_generation != accepted.owner_generation
+            || accepted.domain_id.is_empty()
+            || accepted.kernel_root_id.is_empty()
+            || accepted.supervisor_authority_id.is_empty()
+        {
+            return Err("invalid native grant binding proposal".into());
+        }
+        require_exact_live_guardian(&accepted.guardian_identity)?;
+        let accepted_snapshot_sha256 = crate::completion_continuation::sha256(
+            &serde_json::to_vec(accepted).map_err(|error| error.to_string())?,
+        );
+        let guardian = serde_json::to_string(&accepted.guardian_identity)
+            .map_err(|error| error.to_string())?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        require_exact_attempt(&tx, &accepted.attempt)?;
+        let changed = tx
+            .execute(
+                "INSERT INTO completion_native_grant_binding(
+                attempt_id,grant_id,protocol,accepted_revision,domain_id,kernel_root_id,
+                supervisor_authority_id,owner_generation,guardian_identity,
+                accepted_snapshot_sha256,custodian_request_sha256)
+             SELECT a.attempt_id,?2,'native-continuation-v1',2,a.domain_id,
+                    o.kernel_root_id,o.supervisor_authority_id,a.owner_generation,
+                    o.guardian_identity,?3,?4
+             FROM completion_continuation_attempt a
+             JOIN completion_continuation_owner o ON o.generation=a.owner_generation
+             WHERE a.attempt_id=?1 AND a.phase='accepted' AND a.revision=2
+               AND a.integrated=0 AND a.custodian_identity IS NULL
+               AND a.adopter_identity IS NULL AND o.phase='running'
+               AND a.domain_id=?5 AND o.domain_id=?5 AND o.kernel_root_id=?6
+               AND o.supervisor_authority_id=?7 AND a.owner_generation=?8
+               AND o.guardian_identity=?9
+               AND NOT EXISTS(SELECT 1 FROM completion_native_grant_binding b
+                              WHERE b.attempt_id=a.attempt_id)",
+                params![
+                    accepted.attempt.attempt_id,
+                    grant_id,
+                    accepted_snapshot_sha256,
+                    custodian_request_sha256,
+                    accepted.domain_id,
+                    accepted.kernel_root_id,
+                    accepted.supervisor_authority_id,
+                    accepted.owner_generation,
+                    guardian,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("native grant binding lost exact accepted row".into());
+        }
+        let readback = read_native_grant_binding_on(&tx, &accepted.attempt.attempt_id)?
+            .ok_or("native grant binding readback missing")?;
+        let expected = NativeGrantBinding {
+            attempt_id: accepted.attempt.attempt_id.clone(),
+            grant_id: grant_id.into(),
+            protocol: "native-continuation-v1".into(),
+            accepted_revision: 2,
+            domain_id: accepted.domain_id.clone(),
+            kernel_root_id: accepted.kernel_root_id.clone(),
+            supervisor_authority_id: accepted.supervisor_authority_id.clone(),
+            owner_generation: accepted.owner_generation.clone(),
+            guardian_identity: accepted.guardian_identity.clone(),
+            accepted_snapshot_sha256,
+            custodian_request_sha256: custodian_request_sha256.into(),
+        };
+        if readback != expected {
+            return Err("native grant binding readback conflict".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(readback)
+    }
+
+    /// Indexed point readback for an uncertain prepare/bind response. This
+    /// does not infer a grant from a historical attempt scan.
+    pub fn native_grant_binding(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<NativeGrantBinding>, String> {
+        read_native_grant_binding_on(&self.conn, attempt_id)
+    }
+
     /// Accept and read back the exact PK while holding one immediate write
     /// transaction. Failed readback rolls the UPDATE back; a committed result
     /// cannot be inferred from a caller-supplied attempt or a sibling owner.
@@ -1290,6 +1397,67 @@ impl MailboxDb {
             attempt_id:r.get(0)?,owner_generation:r.get(1)?,operation:r.get(2)?,request_sha256:r.get(3)?,source_registration_id:r.get(4)?,source_listener_revision:r.get(5)?,session_id:r.get(6)?,claim_token:r.get(7)?,result_path:r.get(8)?,
         })).optional().map_err(|e|e.to_string())
     }
+}
+
+fn read_native_grant_binding_on(
+    conn: &Connection,
+    attempt_id: &str,
+) -> Result<Option<NativeGrantBinding>, String> {
+    conn.query_row(
+        "SELECT attempt_id,grant_id,protocol,accepted_revision,domain_id,kernel_root_id,
+                supervisor_authority_id,owner_generation,guardian_identity,
+                accepted_snapshot_sha256,custodian_request_sha256
+         FROM completion_native_grant_binding WHERE attempt_id=?1",
+        [attempt_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .map(
+        |(
+            attempt_id,
+            grant_id,
+            protocol,
+            accepted_revision,
+            domain_id,
+            kernel_root_id,
+            supervisor_authority_id,
+            owner_generation,
+            guardian,
+            accepted_snapshot_sha256,
+            custodian_request_sha256,
+        )| {
+            Ok(NativeGrantBinding {
+                attempt_id,
+                grant_id,
+                protocol,
+                accepted_revision,
+                domain_id,
+                kernel_root_id,
+                supervisor_authority_id,
+                owner_generation,
+                guardian_identity: serde_json::from_str(&guardian)
+                    .map_err(|error| error.to_string())?,
+                accepted_snapshot_sha256,
+                custodian_request_sha256,
+            })
+        },
+    )
+    .transpose()
 }
 
 pub(in crate::mailbox) fn cancel_unaccepted_activation_on(

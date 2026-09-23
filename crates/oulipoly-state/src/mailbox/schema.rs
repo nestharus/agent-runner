@@ -315,7 +315,7 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
     }
 }
 
-pub(super) const CURRENT_VERSION: i64 = 27;
+pub(super) const CURRENT_VERSION: i64 = 28;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -492,7 +492,17 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         owner: SidecarEntity::CompletionAuthority,
         apply: migrate_kernel_root_owner,
     },
+    MigrationStep {
+        target_version: 28,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_native_grant_binding,
+    },
 ];
+
+fn migrate_native_grant_binding(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0028_native_grant_binding.sql"))
+        .map_err(|error| error.to_string())
+}
 
 fn migrate_kernel_root_owner(conn: &Connection) -> Result<(), String> {
     let has_root_column: bool = conn
@@ -1106,6 +1116,7 @@ pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
         DROP TABLE mailbox_completed_turn_tails;
         DROP TRIGGER completion_continuation_notification_ack;
         DROP TABLE completion_continuation_notification;
+        DROP TABLE completion_native_grant_binding;
         DROP TABLE completion_continuation_attempt_source;
         DROP TABLE completion_continuation_attempt;
         DROP TABLE completion_continuation_source;
@@ -1127,7 +1138,8 @@ pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &C
     remove_record_timestamp_contract_for_legacy_fixture(conn);
     remove_attempt_search_generation_for_legacy_fixture(conn);
     conn.execute_batch(
-        "DROP INDEX IF EXISTS completion_continuation_owner_kernel_root;
+        "DROP TABLE completion_native_grant_binding;
+         DROP INDEX IF EXISTS completion_continuation_owner_kernel_root;
          ALTER TABLE completion_continuation_owner DROP COLUMN kernel_root_id;
          DROP INDEX IF EXISTS idx_mailbox_pending_session_live;
          DROP INDEX IF EXISTS idx_mailbox_pending_target_live;
@@ -1244,8 +1256,8 @@ mod contention_tests {
     use std::sync::mpsc;
 
     #[test]
-    fn published_v24_to_v26_upgrade_to_kernel_owner_without_changing_domain() {
-        for version in 24..=26 {
+    fn published_v24_to_v27_upgrade_to_native_grant_binding_preserves_attempts() {
+        for version in 24..=27 {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("pid-identity.db");
             let conn = Connection::open(&path).unwrap();
@@ -1266,6 +1278,30 @@ mod contention_tests {
                     |row| row.get(0),
                 )
                 .unwrap();
+            conn.execute(
+                "INSERT INTO completion_supervisor_authority
+                 (authority_id,domain_id,phase,created_by_generation,guardian_identity)
+                 VALUES('older-authority',?1,'active','older-owner','{}')",
+                [&domain],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO completion_continuation_owner
+                 (generation,domain_id,phase,guardian_identity,driver_identity,
+                  endpoint,supervisor_authority_id)
+                 VALUES('older-owner',?1,'lost','{}','{}','/older/owner','older-authority')",
+                [&domain],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO completion_continuation_attempt
+                 (attempt_id,domain_id,owner_generation,operation,request_sha256,
+                  phase,revision,result_path)
+                 VALUES('older-attempt',?1,'older-owner','transport','digest',
+                        'accepted',2,'/older/result')",
+                [&domain],
+            )
+            .unwrap();
             conn.pragma_update(None, "user_version", version).unwrap();
             drop(conn);
 
@@ -1280,6 +1316,25 @@ mod contention_tests {
                 )
                 .unwrap();
             assert_eq!(retained, domain);
+            let retained_attempt: (String, i64) = db
+                .connection()
+                .query_row(
+                    "SELECT phase,revision FROM completion_continuation_attempt
+                 WHERE attempt_id='older-attempt'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(retained_attempt, ("accepted".into(), 2));
+            let grants: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM completion_native_grant_binding",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(grants, 0);
             assert!(db.connection().query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('completion_continuation_owner') WHERE name='kernel_root_id')",
                 [], |row| row.get::<_, bool>(0),
@@ -1287,6 +1342,32 @@ mod contention_tests {
             drop(db);
             super::super::MailboxDb::open(&path).unwrap();
         }
+    }
+
+    #[test]
+    fn v28_binding_cannot_be_reopened_as_a_synthetic_v27() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        drop(super::super::MailboxDb::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 27).unwrap();
+        drop(conn);
+        let refused = super::super::MailboxDb::open(&path).err().unwrap();
+        assert!(
+            refused.contains("migration to version 28 failed"),
+            "{refused}"
+        );
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(sidecar_version(&conn).unwrap(), 27);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM completion_native_grant_binding",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -2011,6 +2092,9 @@ mod contention_tests {
         // A fixture may carry the v24 column and triggers while its recorded
         // version is 23. Reapplying the step must keep classified rows intact.
         let fixture = Connection::open(&path).unwrap();
+        fixture
+            .execute_batch("DROP TABLE completion_native_grant_binding;")
+            .unwrap();
         fixture.pragma_update(None, "user_version", 23).unwrap();
         drop(fixture);
         let reopened = super::super::MailboxDb::open(&path).unwrap();
@@ -2140,7 +2224,8 @@ mod contention_tests {
         mailbox
             .connection()
             .execute_batch(
-                "DROP TRIGGER mailbox_completion_provenance_insert_valid;
+                "DROP TABLE completion_native_grant_binding;
+             DROP TRIGGER mailbox_completion_provenance_insert_valid;
              DROP TRIGGER mailbox_completion_provenance_update_valid;
              DROP TRIGGER mailbox_completion_provenance_immutable;
              ALTER TABLE mailbox DROP COLUMN completion_provenance;

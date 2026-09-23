@@ -50,8 +50,8 @@ pub use native_publication::NativePublication;
 mod schema;
 pub use completion_continuation::{
     AcceptedNativeGrantSnapshot, CompletionDomainOwner, CompletionNotificationRequest,
-    ContinuationAttempt, NotificationDeliveryEvidence, NotificationDisposition, NotificationPolicy,
-    activation_request_sha256,
+    ContinuationAttempt, NativeGrantBinding, NotificationDeliveryEvidence, NotificationDisposition,
+    NotificationPolicy, activation_request_sha256,
 };
 pub use finalization::DeliveryFinalizationGuard;
 #[cfg(test)]

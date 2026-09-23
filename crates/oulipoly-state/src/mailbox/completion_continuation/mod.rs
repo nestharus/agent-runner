@@ -61,6 +61,23 @@ pub struct AcceptedNativeGrantSnapshot {
     pub adopter_identity: Option<SourceProcessIdentity>,
 }
 
+/// Durable one-to-one association. A broker grant is still preparation debt;
+/// this record alone neither releases the worker gate nor proves execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeGrantBinding {
+    pub attempt_id: String,
+    pub grant_id: String,
+    pub protocol: String,
+    pub accepted_revision: i64,
+    pub domain_id: String,
+    pub kernel_root_id: String,
+    pub supervisor_authority_id: String,
+    pub owner_generation: String,
+    pub guardian_identity: SourceProcessIdentity,
+    pub accepted_snapshot_sha256: String,
+    pub custodian_request_sha256: String,
+}
+
 impl MailboxDb {
     /// Nonmutating capability lookup. Version integers alone are not lineage.
     pub fn completion_continuation_domain(&self) -> Result<Option<String>, String> {
@@ -530,6 +547,7 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                 "SELECT type,name,sql FROM sqlite_master
                  WHERE sql IS NOT NULL AND (
                     name LIKE 'completion_continuation_%'
+                    OR name LIKE 'completion_native_grant_%'
                     OR name LIKE 'completion_supervisor_%'
                     OR name LIKE 'completion_owner_supervisor_%'
                     OR name LIKE 'completion_source_supervisor_%'
@@ -634,6 +652,8 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
             expected.execute_batch(include_str!("../migrations/0026_completion_attempt_search_generation.sql"))
                 .map_err(|e| e.to_string())?;
             expected.execute_batch(include_str!("../migrations/0027_kernel_root_owner.sql"))
+                .map_err(|e| e.to_string())?;
+            expected.execute_batch(include_str!("../migrations/0028_native_grant_binding.sql"))
                 .map_err(|e| e.to_string())?;
             definitions(&expected)
         })
@@ -874,7 +894,8 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "DROP INDEX completion_continuation_owner_kernel_root;
+                "DROP TABLE completion_native_grant_binding;
+                 DROP INDEX completion_continuation_owner_kernel_root;
                  ALTER TABLE completion_continuation_owner DROP COLUMN kernel_root_id;
                  PRAGMA user_version=23;",
             )
@@ -1417,6 +1438,134 @@ mod tests {
                 .is_err()
         );
         assert_eq!(phase(&db), ("accepted".into(), 2));
+    }
+
+    #[test]
+    fn native_grant_binding_is_exact_one_to_one_and_survives_reply_loss() {
+        let (dir, mut db, old_owner) = fixture();
+        let root = uuid::Uuid::new_v4().to_string();
+        let mut owner = old_owner.clone();
+        owner.owner_generation = uuid::Uuid::new_v4().to_string();
+        owner.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&owner, Some(&root))
+            .unwrap();
+        let attempt = reservation(&mut db, &owner);
+        let accepted = db
+            .accept_exact_native_attempt(&attempt, &owner, &root)
+            .unwrap();
+        let first_grant = uuid::Uuid::new_v4().to_string();
+        let request_digest = "b".repeat(64);
+        let mut wrong = accepted.clone();
+        wrong.kernel_root_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            db.bind_exact_native_grant(&wrong, &first_grant, &request_digest)
+                .is_err()
+        );
+        wrong = accepted.clone();
+        wrong.guardian_identity.starttime_ticks += 1;
+        assert!(
+            db.bind_exact_native_grant(&wrong, &first_grant, &request_digest)
+                .is_err()
+        );
+        wrong = accepted.clone();
+        wrong.attempt.result_path = "/sibling/result.json".into();
+        assert!(
+            db.bind_exact_native_grant(&wrong, &first_grant, &request_digest)
+                .is_err()
+        );
+        assert!(
+            db.bind_exact_native_grant(&accepted, "not-a-grant", &request_digest)
+                .is_err()
+        );
+        assert!(
+            db.bind_exact_native_grant(&accepted, &first_grant, "bad-digest")
+                .is_err()
+        );
+        assert!(
+            db.native_grant_binding(&attempt.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+
+        let bound = db
+            .bind_exact_native_grant(&accepted, &first_grant, &request_digest)
+            .unwrap();
+        assert_eq!(bound.accepted_revision, 2);
+        assert_eq!(bound.kernel_root_id, root);
+        assert_eq!(bound.guardian_identity, owner.guardian_identity);
+        assert_eq!(bound.custodian_request_sha256, request_digest);
+        assert_eq!(
+            db.native_grant_binding(&attempt.attempt_id).unwrap(),
+            Some(bound.clone())
+        );
+        assert!(
+            db.bind_exact_native_grant(&accepted, &first_grant, &request_digest)
+                .is_err()
+        );
+        assert!(
+            db.bind_exact_native_grant(
+                &accepted,
+                &uuid::Uuid::new_v4().to_string(),
+                &request_digest
+            )
+            .is_err()
+        );
+
+        // Another accepted sibling cannot reuse this grant even with the same
+        // live guardian/root. The unique grant index rejects the insertion.
+        let mut sibling = attempt.clone();
+        sibling.attempt_id = uuid::Uuid::new_v4().to_string();
+        sibling.session_id = Some("sibling-session".into());
+        sibling.claim_token = Some("sibling-token".into());
+        db.conn.execute("INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count) VALUES('sibling-session','sibling-token','2026-09-12T00:00:00Z','fixture',1)",[]).unwrap();
+        db.reserve_continuation_attempt(&sibling).unwrap();
+        let sibling_accepted = db
+            .accept_exact_native_attempt(&sibling, &owner, &root)
+            .unwrap();
+        assert!(
+            db.bind_exact_native_grant(&sibling_accepted, &first_grant, &request_digest)
+                .is_err()
+        );
+        assert!(
+            db.native_grant_binding(&sibling.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+
+        let path = dir.path().join("pid-identity.db");
+        drop(db); // the caller lost the response but the one binding committed
+        let reopened = MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            reopened.native_grant_binding(&attempt.attempt_id).unwrap(),
+            Some(bound)
+        );
+        let plan: String = reopened.conn.query_row(
+            "EXPLAIN QUERY PLAN SELECT grant_id FROM completion_native_grant_binding WHERE attempt_id=?1",
+            [&attempt.attempt_id], |row| row.get(3),
+        ).unwrap();
+        assert!(
+            plan.contains("sqlite_autoindex_completion_native_grant_binding_1"),
+            "{plan}"
+        );
+        assert!(reopened.conn.execute("UPDATE completion_native_grant_binding SET grant_id='replacement' WHERE attempt_id=?1", [&attempt.attempt_id]).is_err());
+        assert!(
+            reopened
+                .conn
+                .execute(
+                    "DELETE FROM completion_native_grant_binding WHERE attempt_id=?1",
+                    [&attempt.attempt_id]
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_grant_binding_is_part_of_current_schema_fingerprint() {
+        let (_dir, db, _) = fixture();
+        db.conn
+            .execute_batch("DROP TRIGGER completion_native_grant_binding_immutable")
+            .unwrap();
+        assert!(validate_schema_on(&db.conn).is_err());
     }
     #[test]
     fn original_birth_attachment_retry_closes_current_generation_start_authority() {
