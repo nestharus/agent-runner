@@ -660,55 +660,111 @@ fn pending_notification_source_on(
     session: &str,
     token: &str,
 ) -> Result<Option<String>, String> {
-    let candidate: Option<(String, String, String, Option<String>, bool, bool, bool)> = tx
-        .query_row(
+    // Start at the claimed mailbox rows. An inner join here can erase a v2
+    // completion whose source or listener projection is missing, turning it
+    // into apparent authority for a source-free activation.
+    let mut statement = tx
+        .prepare(
             "SELECT source.registration_id,source.domain_id,source.phase,notification.policy,
-                listener.active,listener.retirement_pending,
-                COALESCE(source.payload_sha256=message.payload_sha256,0)
+                listener.event_id,listener.listener_id,listener.session_id,
+                listener.owner_invocation_uuid,listener.active,listener.retirement_pending,
+                COALESCE(source.payload_sha256=message.payload_sha256,0),
+                COALESCE(listener.acknowledged_at IS NULL,0),
+                notification.policy_origin,
+                message.owner_invocation_uuid,
+                COALESCE(source.event_id=listener.event_id,0)
          FROM session_wake_claim AS claim
-         JOIN completion_event_listener AS listener
-           ON listener.session_id=claim.session_id
-         JOIN mailbox AS message ON message.seq=listener.mailbox_seq
-         JOIN completion_continuation_source AS source
+         JOIN mailbox AS message
+           ON message.session_id=claim.session_id
+          AND message.seq BETWEEN claim.min_pending_seq_at_claim
+                              AND claim.max_pending_seq_at_claim
+         LEFT JOIN completion_event_listener AS listener
+           ON listener.mailbox_seq=message.seq
+         LEFT JOIN completion_continuation_source AS source
            ON source.event_id=listener.event_id
+           OR message.handle=source.event_id
+           OR (message.owner_invocation_uuid IS NOT NULL
+               AND source.event_id=substr(message.handle,1,
+                   length(message.handle)-length(message.owner_invocation_uuid)-1)
+               AND message.handle=source.event_id || ':' || message.owner_invocation_uuid)
          LEFT JOIN completion_continuation_notification AS notification
-           ON notification.event_id=listener.event_id
-          AND notification.listener_id=listener.listener_id
+           ON notification.event_id=COALESCE(listener.event_id,source.event_id)
+          AND notification.listener_id=message.owner_invocation_uuid
          WHERE claim.session_id=?1 AND claim.claim_token=?2
-           AND message.seq BETWEEN claim.min_pending_seq_at_claim
-                               AND claim.max_pending_seq_at_claim
-           AND message.session_id=?1 AND message.kind='agent_bash_complete'
-           AND message.delivered_at IS NULL AND listener.acknowledged_at IS NULL
-         ORDER BY message.seq LIMIT 1",
-            params![session, token],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            },
+           AND message.kind='agent_bash_complete'
+           AND message.delivered_at IS NULL
+         ORDER BY message.seq",
         )
-        .optional()
         .map_err(|error| error.to_string())?;
-    match candidate {
-        None => Ok(None),
-        Some((source, source_domain, phase, policy, active, retirement_pending, exact_payload))
-            if source_domain == domain
-                && phase == "accepted"
-                && policy.as_deref() == Some("notify")
-                && active
-                && retirement_pending
-                && exact_payload =>
-        {
-            Ok(Some(source))
+    let rows = statement
+        .query_map(params![session, token], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<bool>>(8)?,
+                row.get::<_, Option<bool>>(9)?,
+                row.get::<_, bool>(10)?,
+                row.get::<_, bool>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, bool>(14)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut selected = None;
+    for row in rows {
+        let (
+            source,
+            source_domain,
+            phase,
+            policy,
+            event,
+            listener_id,
+            listener_session,
+            listener_owner,
+            active,
+            retirement_pending,
+            exact_payload,
+            unacknowledged,
+            policy_origin,
+            message_owner,
+            exact_event,
+        ) = row.map_err(|error| error.to_string())?;
+        // A legacy completion may have a listener and mailbox row, but no v2
+        // source or classified notification. It retains the generic wake lane.
+        if source.is_none() && policy_origin.is_none() {
+            continue;
         }
-        Some(_) => Err("pending v2 notification lacks exact accepted source authority".into()),
+        let exact_policy_origin = source
+            .as_ref()
+            .map(|registration_id| format!("exact_admitted_binding:{registration_id}"));
+        if source_domain.as_deref() != Some(domain)
+            || phase.as_deref() != Some("accepted")
+            || policy.as_deref() != Some("notify")
+            || policy_origin != exact_policy_origin
+            || event.is_none()
+            || listener_id != message_owner
+            || listener_session.as_deref() != Some(session)
+            || listener_owner != message_owner
+            || active != Some(true)
+            || retirement_pending != Some(true)
+            || !unacknowledged
+            || !exact_payload
+            || !exact_event
+        {
+            return Err("pending v2 notification lacks exact accepted source authority".into());
+        }
+        if selected.is_none() {
+            selected = source;
+        }
     }
+    Ok(selected)
 }
 
 impl MailboxDb {
@@ -1555,7 +1611,13 @@ mod notification_activation_tests {
         let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
         let domain = db.completion_continuation_domain().unwrap().unwrap();
         let listener = "11111111-1111-4111-8111-111111111111";
-        for event in ["a_registered", "b_accepted", "c_later"] {
+        for event in [
+            "a_registered",
+            "b_accepted",
+            "c_later",
+            "d_legacy",
+            "e_accepted",
+        ] {
             db.register_completion_event(CompletionEventRegistrationInput {
                 event_id: event,
                 delivery_mode: "async",
@@ -1569,7 +1631,13 @@ mod notification_activation_tests {
             .unwrap();
         }
         let mut accepted = Vec::new();
-        for event in ["a_registered", "b_accepted", "c_later"] {
+        for event in [
+            "a_registered",
+            "b_accepted",
+            "c_later",
+            "d_legacy",
+            "e_accepted",
+        ] {
             let triggered = db
                 .trigger_completion_event(CompletionEventTriggerInput {
                     event_id: event,
@@ -1591,6 +1659,7 @@ mod notification_activation_tests {
             ("a_registered", "registered", None),
             ("b_accepted", "accepted", Some(accepted[1].2.as_str())),
             ("c_later", "accepted", Some(accepted[2].2.as_str())),
+            ("e_accepted", "accepted", Some(accepted[4].2.as_str())),
         ] {
             db.conn
                 .execute(
@@ -1613,8 +1682,8 @@ mod notification_activation_tests {
                 .execute(
                     "INSERT INTO completion_continuation_notification
                  (event_id,listener_id,policy,policy_origin,policy_recorded_at)
-                 VALUES(?1,?2,'notify','exact-source','2026-01-01T00:00:00Z')",
-                    params![event, listener],
+                 VALUES(?1,?2,'notify',?3,'2026-01-01T00:00:00Z')",
+                    params![event, listener, format!("exact_admitted_binding:{event}")],
                 )
                 .unwrap();
         }
@@ -1670,6 +1739,19 @@ mod notification_activation_tests {
             claim_token: Some("exact-token".into()),
             result_path: "/private/result.json".into(),
         };
+        db.conn.execute(
+            "UPDATE session_wake_claim SET min_pending_seq_at_claim=?1,max_pending_seq_at_claim=?1
+             WHERE session_id='receiver' AND claim_token='exact-token'",
+            [accepted[3].1],
+        ).unwrap();
+        let legacy_tx = db.conn.transaction().unwrap();
+        reserve_on(&legacy_tx, &attempt).unwrap();
+        legacy_tx.rollback().unwrap();
+        db.conn.execute(
+            "UPDATE session_wake_claim SET min_pending_seq_at_claim=?1,max_pending_seq_at_claim=?1
+             WHERE session_id='receiver' AND claim_token='exact-token'",
+            [accepted[1].1],
+        ).unwrap();
         assert!(
             db.reserve_continuation_attempt(&attempt)
                 .unwrap_err()
@@ -1709,5 +1791,100 @@ mod notification_activation_tests {
                 .contains("lacks exact accepted source authority"),
             "registered-only source must not be laundered through a generic wake"
         );
+        tx.execute(
+            "UPDATE session_wake_claim SET min_pending_seq_at_claim=?1,max_pending_seq_at_claim=?1
+             WHERE session_id='receiver' AND claim_token='exact-token'",
+            [accepted[3].1],
+        )
+        .unwrap();
+        assert_eq!(
+            pending_notification_source_on(&tx, &domain, "receiver", "exact-token").unwrap(),
+            None,
+            "a legacy completion with no v2 source or classified policy keeps generic wake"
+        );
+        tx.execute(
+            "UPDATE session_wake_claim SET min_pending_seq_at_claim=?1,max_pending_seq_at_claim=?1
+             WHERE session_id='receiver' AND claim_token='exact-token'",
+            [accepted[2].1],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM completion_continuation_source WHERE event_id='c_later'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            pending_notification_source_on(&tx, &domain, "receiver", "exact-token")
+                .unwrap_err()
+                .contains("lacks exact accepted source authority"),
+            "a classified v2 notification without its source must retain wake debt"
+        );
+        let mut forged_generic = attempt.clone();
+        forged_generic.attempt_id = uuid::Uuid::new_v4().to_string();
+        forged_generic.source_registration_id = None;
+        forged_generic.source_listener_revision = None;
+        assert!(
+            reserve_on(&tx, &forged_generic)
+                .unwrap_err()
+                .contains("lacks exact accepted source authority"),
+            "missing source must reject a source-free reservation"
+        );
+        assert!(wake_claim_tx(&tx, "receiver").unwrap().is_some());
+        tx.execute(
+            "UPDATE session_wake_claim SET min_pending_seq_at_claim=?1,max_pending_seq_at_claim=?1
+             WHERE session_id='receiver' AND claim_token='exact-token'",
+            [accepted[4].1],
+        )
+        .unwrap();
+        tx.execute(
+            "UPDATE completion_event_listener SET mailbox_seq=NULL WHERE event_id='e_accepted'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            pending_notification_source_on(&tx, &domain, "receiver", "exact-token")
+                .unwrap_err()
+                .contains("lacks exact accepted source authority"),
+            "a v2 source without its listener mailbox projection must retain wake debt"
+        );
+        assert!(
+            reserve_on(&tx, &forged_generic)
+                .unwrap_err()
+                .contains("lacks exact accepted source authority"),
+            "missing listener projection must reject a source-free reservation"
+        );
+        assert!(wake_claim_tx(&tx, "receiver").unwrap().is_some());
+        tx.execute(
+            "UPDATE completion_event_listener SET mailbox_seq=?1 WHERE event_id='e_accepted'",
+            [accepted[4].1],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM completion_continuation_notification WHERE event_id='e_accepted'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            reserve_on(&tx, &forged_generic)
+                .unwrap_err()
+                .contains("lacks exact accepted source authority"),
+            "missing notification policy must reject a source-free reservation"
+        );
+        assert!(wake_claim_tx(&tx, "receiver").unwrap().is_some());
+        tx.execute(
+            "INSERT INTO completion_continuation_notification
+             (event_id,listener_id,policy,policy_origin,policy_recorded_at)
+             VALUES('e_accepted',?1,'notify','exact_admitted_binding:wrong',
+                    '2026-01-01T00:00:00Z')",
+            [listener],
+        )
+        .unwrap();
+        assert!(
+            reserve_on(&tx, &forged_generic)
+                .unwrap_err()
+                .contains("lacks exact accepted source authority"),
+            "a policy classified for another registration cannot authorize activation"
+        );
+        assert!(wake_claim_tx(&tx, "receiver").unwrap().is_some());
     }
 }
