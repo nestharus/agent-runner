@@ -129,6 +129,13 @@ fn migrate_completion_attempt_sources(conn: &Connection) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
+fn migrate_completion_attempt_search_generation(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!(
+        "migrations/0026_completion_attempt_search_generation.sql"
+    ))
+    .map_err(|error| error.to_string())
+}
+
 #[derive(Deserialize)]
 struct CompletionProtocolSummary {
     #[serde(default, deserialize_with = "present_string")]
@@ -308,7 +315,7 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
     }
 }
 
-pub(super) const CURRENT_VERSION: i64 = 25;
+pub(super) const CURRENT_VERSION: i64 = 26;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -474,6 +481,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 25,
         owner: SidecarEntity::CompletionAuthority,
         apply: migrate_completion_attempt_sources,
+    },
+    MigrationStep {
+        target_version: 26,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_completion_attempt_search_generation,
     },
 ];
 
@@ -991,6 +1003,7 @@ fn migrate_receipt_scan(conn: &Connection) -> Result<(), String> {
 #[cfg(test)]
 pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
     remove_record_timestamp_contract_for_legacy_fixture(conn);
+    remove_attempt_search_generation_for_legacy_fixture(conn);
     conn.execute_batch(
         "DROP VIEW mailbox_retained_delivery_finalizers;
         DROP INDEX mailbox_completed_turn_pins_attempt;
@@ -1017,6 +1030,7 @@ pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
 #[cfg(test)]
 pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &Connection) {
     remove_record_timestamp_contract_for_legacy_fixture(conn);
+    remove_attempt_search_generation_for_legacy_fixture(conn);
     conn.execute_batch(
         "DROP INDEX IF EXISTS idx_mailbox_pending_session_live;
          DROP INDEX IF EXISTS idx_mailbox_pending_target_live;
@@ -1044,6 +1058,20 @@ pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &C
          ALTER TABLE completion_continuation_owner DROP COLUMN supervisor_authority_id;
          ALTER TABLE completion_continuation_source DROP COLUMN supervisor_authority_id;
          ALTER TABLE completion_continuation_attempt DROP COLUMN supervisor_authority_id;",
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+fn remove_attempt_search_generation_for_legacy_fixture(conn: &Connection) {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS completion_continuation_attempt_search_insert;
+         DROP TRIGGER IF EXISTS completion_continuation_attempt_search_update;
+         DROP TRIGGER IF EXISTS completion_continuation_attempt_search_delete;
+         DROP TRIGGER IF EXISTS completion_continuation_attempt_source_search_insert;
+         DROP TRIGGER IF EXISTS completion_continuation_attempt_source_search_update;
+         DROP TRIGGER IF EXISTS completion_continuation_attempt_source_search_delete;
+         DROP TABLE IF EXISTS completion_continuation_attempt_search_generation;",
     )
     .unwrap();
 }
@@ -1346,6 +1374,131 @@ mod contention_tests {
         eprintln!(
             "{ROWS} historical attempts: {pages} bounded recovery pages, max {max_steps} VM steps/page, {total_steps} VM steps total; late receipt retained after claim deletion"
         );
+    }
+
+    #[test]
+    fn attempt_search_rejects_inter_page_insert_behind_lexical_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pid-identity.db");
+        let mut db = super::super::MailboxDb::open(&path).unwrap();
+        db.register_completion_event(super::super::CompletionEventRegistrationInput {
+            event_id: "one-event",
+            delivery_mode: "async",
+            owner_session_id: Some("receiver"),
+            owner_invocation_uuid: Some("owner"),
+            state_dir: "/private/source",
+            meta_path: "/private/source/meta",
+            log_path: "/private/source/log",
+            rc_path: "/private/source/rc",
+        })
+        .unwrap();
+        let domain = db.completion_continuation_domain().unwrap().unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        writer
+            .execute(
+                "INSERT INTO completion_continuation_source
+             (registration_id,domain_id,source_id,event_id,registration_digest,binding,
+              phase,snapshot_sha256,outcome_sha256,payload_sha256,payload_byte_len)
+             VALUES('one-source',?1,'one-source','one-event','digest',x'00',
+                    'accepted','snapshot','outcome','payload',1)",
+                [&domain],
+            )
+            .unwrap();
+        writer
+            .execute_batch(&format!(
+                "BEGIN;
+             WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<128)
+             INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              source_registration_id,phase,result_path,integrated,drain_receipt,
+              association_completeness)
+             SELECT printf('m%03d',x),'{domain}','owner','source_recovery','digest',
+                    'one-source','drained','/private/receipt',1,'initial-receipt','known' FROM n;
+             INSERT INTO completion_continuation_attempt_source
+             (attempt_id,registration_id,listener_revision)
+             SELECT attempt_id,'one-source',1 FROM completion_continuation_attempt;
+             COMMIT;"
+            ))
+            .unwrap();
+
+        let (first, cursor) = db.completion_recovery_attempts("one-source", None).unwrap();
+        assert_eq!(first.len(), 128);
+        let cursor = cursor.expect("129 linked rows require a second page");
+        assert_eq!(cursor["after_attempt_id"], "m127");
+
+        // A later committed attempt is lexically behind the last observed ID.
+        // Its exact link and physical receipt commit in the same transaction.
+        writer
+            .execute_batch(&format!(
+                "BEGIN;
+             INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              source_registration_id,phase,result_path,integrated,drain_receipt,
+              association_completeness)
+             VALUES('a000','{domain}','owner','source_recovery','digest',
+                    'one-source','drained','/private/new-receipt',1,'late-receipt','known');
+             INSERT INTO completion_continuation_attempt_source
+             (attempt_id,registration_id,listener_revision)
+             VALUES('a000','one-source',1);
+             COMMIT;"
+            ))
+            .unwrap();
+        let stale = db.completion_recovery_attempts("one-source", Some(&cursor));
+        assert!(stale.unwrap_err().contains("attempt history changed"));
+
+        let mut cursor = None;
+        let mut found = Vec::new();
+        loop {
+            let (page, next) = db
+                .completion_recovery_attempts("one-source", cursor.as_ref())
+                .unwrap();
+            found.extend(page);
+            cursor = next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(found.len(), 130);
+        assert_eq!(found[0]["attempt_id"], "a000");
+        assert_eq!(found[0]["drain_receipt"], "late-receipt");
+        assert_eq!(found[0]["association_completeness"], "known");
+    }
+
+    #[test]
+    fn v26_attempt_search_generation_migration_does_not_scan_history() {
+        const ROWS: i64 = 20_000;
+        const VM_BUDGET: usize = 5_000;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE completion_continuation_attempt(attempt_id TEXT PRIMARY KEY);
+             CREATE TABLE completion_continuation_attempt_source(
+                 attempt_id TEXT, registration_id TEXT);
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{ROWS})
+             INSERT INTO completion_continuation_attempt(attempt_id)
+             SELECT printf('attempt-%08d',x) FROM n;"
+        ))
+        .unwrap();
+        let steps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&steps);
+        conn.progress_handler(
+            1,
+            Some(move || observed.fetch_add(1, Ordering::Relaxed) >= VM_BUDGET),
+        )
+        .unwrap();
+        migrate_completion_attempt_search_generation(&conn).unwrap();
+        let used = steps.load(Ordering::Relaxed);
+        assert!(used < VM_BUDGET, "v26 schema step used {used} VM steps");
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        let generation: i64 = conn
+            .query_row(
+                "SELECT generation FROM completion_continuation_attempt_search_generation",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 0);
+        eprintln!("20,000 historical attempts: v26 step used {used} VM steps");
     }
 
     #[test]

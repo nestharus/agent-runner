@@ -20,6 +20,7 @@ struct RecoveryAttemptCursor {
     version: u8,
     domain_id: String,
     registration_sha256: String,
+    generation: i64,
     anchor_attempt_id: String,
     phase: String,
     after_attempt_id: Option<String>,
@@ -294,14 +295,18 @@ impl MailboxDb {
     /// An indexed link page followed by fixed-size pages of the retained
     /// attempt keyspace. Historical scalar associations have no index because
     /// building one during sidecar open would scan the entire live table.
-    /// An empty page with a cursor is therefore not evidence of no attempts.
+    /// Each page is one read snapshot. A change between pages invalidates the
+    /// cursor; an empty page with a cursor is not evidence of no attempts.
     pub fn completion_recovery_attempts(
         &self,
         registration_id: &str,
         cursor: Option<&serde_json::Value>,
     ) -> Result<(Vec<serde_json::Value>, Option<serde_json::Value>), String> {
-        let domain_id: String = self
+        let tx = self
             .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let domain_id: String = tx
             .query_row(
                 "SELECT domain_id FROM completion_continuation_source
              WHERE registration_id=?1 AND phase='accepted'",
@@ -309,12 +314,15 @@ impl MailboxDb {
                 |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
+        let generation: i64 = tx.query_row(
+            "SELECT generation FROM completion_continuation_attempt_search_generation WHERE id=1",
+            [], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
         let cursor: RecoveryAttemptCursor = match cursor {
             Some(value) => serde_json::from_value(value.clone())
                 .map_err(|_| "invalid recovery attempt cursor".to_string())?,
             None => {
-                let anchor_attempt_id: Option<String> = self
-                    .conn
+                let anchor_attempt_id: Option<String> = tx
                     .query_row(
                         "SELECT MAX(attempt_id) FROM completion_continuation_attempt",
                         [],
@@ -322,16 +330,23 @@ impl MailboxDb {
                     )
                     .map_err(|e| e.to_string())?;
                 RecoveryAttemptCursor {
-                    version: 1,
+                    version: 2,
                     domain_id: domain_id.clone(),
                     registration_sha256: recovery_registration_digest(registration_id),
+                    generation,
                     anchor_attempt_id: anchor_attempt_id.unwrap_or_default(),
                     phase: "linked".into(),
                     after_attempt_id: None,
                 }
             }
         };
-        if cursor.version != 1
+        if cursor.generation != generation {
+            return Err(
+                "stale recovery attempt cursor: attempt history changed; restart recovery-read"
+                    .into(),
+            );
+        }
+        if cursor.version != 2
             || cursor.domain_id != domain_id
             || cursor.registration_sha256 != recovery_registration_digest(registration_id)
             || !matches!(cursor.phase.as_str(), "linked" | "history")
@@ -343,7 +358,7 @@ impl MailboxDb {
             return Err("invalid or stale recovery attempt cursor".into());
         }
         if !cursor.anchor_attempt_id.is_empty() {
-            let anchor_exists: bool = self.conn.query_row(
+            let anchor_exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE attempt_id=?1)",
                 [&cursor.anchor_attempt_id], |r| r.get(0),
             ).map_err(|e| e.to_string())?;
@@ -353,16 +368,15 @@ impl MailboxDb {
         }
         if let Some(after) = &cursor.after_attempt_id {
             let boundary_exists: bool = if cursor.phase == "linked" {
-                self.conn
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt_source
+                tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt_source
                      WHERE registration_id=?1 AND attempt_id=?2)",
-                        params![registration_id, after],
-                        |r| r.get(0),
-                    )
-                    .map_err(|e| e.to_string())?
+                    params![registration_id, after],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?
             } else {
-                self.conn.query_row(
+                tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE attempt_id=?1)",
                     [after], |r| r.get(0),
                 ).map_err(|e| e.to_string())?
@@ -373,8 +387,7 @@ impl MailboxDb {
         }
         let mut attempts = Vec::new();
         let next = if cursor.phase == "linked" {
-            let mut statement = self
-                .conn
+            let mut statement = tx
                 .prepare(
                     "SELECT a.attempt_id,a.operation,a.phase,a.integrated,a.drain_receipt,
                         a.association_completeness
@@ -421,8 +434,7 @@ impl MailboxDb {
             // This walks at most 129 primary-key entries, including entries
             // with no scalar match. Filtering before LIMIT would reintroduce
             // an unbounded one-call search for a late historical receipt.
-            let mut statement = self
-                .conn
+            let mut statement = tx
                 .prepare(
                     "SELECT attempt_id,operation,phase,integrated,drain_receipt,
                         association_completeness,source_registration_id
@@ -457,8 +469,7 @@ impl MailboxDb {
                 {
                     continue;
                 }
-                let linked: bool = self
-                    .conn
+                let linked: bool = tx
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt_source
                      WHERE attempt_id=?1 AND registration_id=?2)",
@@ -485,6 +496,7 @@ impl MailboxDb {
                 None
             }
         };
+        tx.commit().map_err(|e| e.to_string())?;
         Ok((
             attempts,
             next.map(|next| serde_json::to_value(next).expect("cursor serializes")),

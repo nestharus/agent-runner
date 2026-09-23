@@ -14719,11 +14719,11 @@ mod tests {
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
         assert!(
-            // Schema 25 also fingerprints retained attempt/source association
-            // (measured 4833 VM steps). Keep a fixed ceiling, the no-backfill
-            // assertion, and the separate retained-history growth test; this
-            // does not grant a data-size-dependent budget.
-            current_open_steps < 5000,
+            // Schema 26 also fingerprints the fixed attempt-search generation
+            // objects (measured 5001 VM steps). Keep a fixed ceiling, the
+            // no-backfill assertion, and the separate retained-history growth
+            // test; this does not grant a data-size-dependent budget.
+            current_open_steps < 5500,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
         );
     }

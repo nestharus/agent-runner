@@ -54,14 +54,20 @@ the whole history. The read and each `agent-bash-recovery-attempts` call scan at
 most 128 retained attempt keys; a linked association page may contain up to
 128 exact rows. If `attempt_search_complete` is false, pass
 `next_attempt_cursor` to the attempts command, even when `attempts` is empty.
-Only a null cursor ends this traversal. The source-level
+Only a null cursor ends this traversal for the observed attempt generation.
+If attempts, receipts, or source links change between pages, the next call
+rejects the cursor as stale; restart with `agent-bash-recovery-read` and follow
+its new cursor. The generation covers the sidecar, so an unrelated attempt
+change can also require a restart. Even an already returned terminal page
+describes its own read snapshot, not changes committed afterward. The
+source-level
 `association_completeness: "unknown"` remains unknown for pre-v25 sources even
 after every retained attempt has been scanned: a deleted old claim cannot prove
 which other sources shared an activation. A scalar source match is positive
 evidence for that source; it is not used to assign the activation to another
-source. Pages use an attempt-ID anchor and keyset walk rather than a frozen
-snapshot. If new attempts arrive during the walk, restart the read to see a
-current view. The attempts command reads only sidecar metadata, so following
+source. Each page is one SQLite read snapshot; the durable generation check
+prevents a changed attempt set from silently completing a multi-page walk.
+The attempts command reads only sidecar metadata, so following
 the cursor does not rehash or recopy the selected output artifact.
 
 Accepted v2 event payloads remain protected from terminal payload reclamation

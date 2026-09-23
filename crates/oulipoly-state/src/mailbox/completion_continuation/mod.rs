@@ -565,6 +565,8 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             expected.execute_batch(include_str!("../migrations/0025_completion_attempt_sources.sql"))
                 .map_err(|e| e.to_string())?;
+            expected.execute_batch(include_str!("../migrations/0026_completion_attempt_search_generation.sql"))
+                .map_err(|e| e.to_string())?;
             definitions(&expected)
         })
         .as_ref()

@@ -2290,8 +2290,8 @@ mod notification_activation_tests {
         db.reserve_continuation_attempt(&attempt).unwrap();
         assert_eq!(
             db.conn.total_changes() - changes_before,
-            3,
-            "one attempt row and one retained association per accepted v2 source"
+            6,
+            "one attempt and two links each advance the durable search generation"
         );
         for source in ["first", "second"] {
             assert_eq!(
