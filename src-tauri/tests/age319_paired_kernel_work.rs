@@ -4,6 +4,8 @@
 
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -90,6 +92,7 @@ fn recipient() {
     let session = std::env::var("AGE319_RECIPIENT_SESSION").unwrap();
     let handle = std::env::var("AGE319_RECIPIENT_HANDLE").unwrap();
     let source_invocation = std::env::var("AGE319_SOURCE_INVOCATION").unwrap();
+    let effect = PathBuf::from(std::env::var_os("AGE319_RECIPIENT_EFFECT").unwrap());
     let receipt_path = PathBuf::from(std::env::var_os("AGE319_RECIPIENT_RECEIPT").unwrap());
     let recipient_invocation = uuid::Uuid::new_v4().to_string();
     assert_ne!(recipient_invocation, source_invocation);
@@ -198,6 +201,7 @@ fn recipient() {
         ],
     );
     assert_eq!(foreign["acknowledged_count"], 0);
+    assert_eq!(fs::read_to_string(&effect).unwrap(), "executed\n");
     let before =
         oulipoly_state::mailbox::MailboxDb::open_read_only(&data.join("pid-identity.db")).unwrap();
     assert_eq!(before.list_pending(&session).unwrap().len(), 1);
@@ -207,6 +211,13 @@ fn recipient() {
             .unwrap()
             .iter()
             .all(|listener| listener.acknowledged_at.is_none())
+    );
+    assert!(
+        before
+            .list_pending(&session)
+            .unwrap()
+            .iter()
+            .all(|row| row.delivered_at.is_none())
     );
     drop(before);
 
@@ -284,6 +295,150 @@ fn recipient() {
         ],
     );
     assert_eq!(replay["acknowledged_count"], 0);
+}
+
+// This process is launched by Bash's actual accepted work script. It is a
+// descendant in the consumed work namespace, but its executable is the test
+// binary rather than the helper image sealed at H.
+fn paired_owner_v_negative_probe() {
+    use oulipoly_kernel_broker::protocol::{self, OwnerWitness, ProcessWitness};
+
+    let data = PathBuf::from(std::env::var_os("AGE319_V_PROBE_DATA").unwrap());
+    let bash_state = PathBuf::from(std::env::var_os("AGE319_V_PROBE_BASH_STATE").unwrap());
+    let broker_state = PathBuf::from(std::env::var_os("AGE319_V_PROBE_BROKER_STATE").unwrap());
+    let broker_socket = PathBuf::from(std::env::var_os("AGE319_V_PROBE_BROKER_SOCKET").unwrap());
+    let ran = PathBuf::from(std::env::var_os("AGE319_V_PROBE_EFFECT").unwrap());
+    eventually(
+        || {
+            fs::read_dir(bash_state.join("agent-bash"))
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry.file_name().to_string_lossy().starts_with("ab_")
+                        && entry.path().join("source-registration-v2.json").exists()
+                })
+        },
+        || "accepted Bash source registration did not appear for V probe".into(),
+    );
+    let handle = fs::read_dir(bash_state.join("agent-bash"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("ab_"))
+        .unwrap()
+        .path();
+    let source = json(handle.join("source-registration-v2.json"));
+    let grant = fs::read_dir(broker_state.join("grants"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| json(entry.path()))
+        .find(|record| record["version"] == 3 && record["consumed"] == true)
+        .expect("consumed H/K grant for the live source");
+    assert_eq!(grant["work_id"], source["handle"]);
+    let mailbox_path = data.join("pid-identity.db");
+    let mailbox = oulipoly_state::mailbox::MailboxDb::open_read_only(&mailbox_path).unwrap();
+    let owner = mailbox.completion_continuation_owner().unwrap().unwrap();
+    drop(mailbox);
+    let stamp = |identity: &oulipoly_state::completion_continuation::SourceProcessIdentity| {
+        ProcessWitness {
+            host_pid: i32::try_from(identity.pid).unwrap(),
+            boot_id: identity.boot_id.clone(),
+            starttime_ticks: u64::try_from(identity.starttime_ticks).unwrap(),
+        }
+    };
+    let witness = OwnerWitness {
+        root_id: grant["root_id"].as_str().unwrap().into(),
+        domain_id: owner.domain_id.clone(),
+        supervisor_id: owner.supervisor_authority_id.clone(),
+        guardian: stamp(&owner.guardian_identity),
+        driver: stamp(&owner.driver_identity),
+        owner_generation: Some(owner.owner_generation.clone()),
+        work_id: Some(grant["work_id"].as_str().unwrap().into()),
+        owner_session_id: Some(source["owner_session_id"].as_str().unwrap().into()),
+        owner_invocation_uuid: Some(source["owner_invocation_uuid"].as_str().unwrap().into()),
+        registration_authority_sha256: Some(
+            grant["sealed_helper"]["registration_authority_sha256"]
+                .as_str()
+                .unwrap()
+                .into(),
+        ),
+    };
+    let session = source["owner_session_id"].as_str().unwrap();
+    let source_handle = source["handle"].as_str().unwrap();
+    let probe = |label: &str, claim: OwnerWitness, expected: &str| {
+        let socket = UnixStream::connect(&owner.endpoint).unwrap();
+        let failure = protocol::verify_owner_at(&broker_socket, &claim, socket.as_raw_fd())
+            .expect_err(label)
+            .to_string();
+        assert!(failure.contains(expected), "{label}: {failure}");
+        assert!(!ran.exists(), "{label} caused work effect before release");
+        let mailbox = oulipoly_state::mailbox::MailboxDb::open_read_only(&mailbox_path).unwrap();
+        let listeners = mailbox.completion_event_listeners(source_handle).unwrap();
+        assert_eq!(
+            listeners.len(),
+            1,
+            "{label} lost the accepted source listener"
+        );
+        assert!(
+            listeners
+                .iter()
+                .all(|listener| listener.acknowledged_at.is_none()),
+            "{label} produced an ACK"
+        );
+        let historical =
+            oulipoly_state::mailbox::MailboxDb::open_historical(&mailbox_path).unwrap();
+        assert!(
+            historical
+                .list_mailbox(session, true)
+                .unwrap()
+                .iter()
+                .all(|row| row.delivered_at.is_none()),
+            "{label} delivered a mailbox row"
+        );
+    };
+    let mut missing = witness.clone();
+    missing.owner_session_id = None;
+    probe(
+        "missing owner session",
+        missing,
+        "registration witness mismatch",
+    );
+    let mut missing = witness.clone();
+    missing.owner_invocation_uuid = None;
+    probe(
+        "missing owner invocation",
+        missing,
+        "registration witness mismatch",
+    );
+    let mut wrong = witness.clone();
+    wrong.owner_session_id = Some(uuid::Uuid::new_v4().to_string());
+    probe(
+        "wrong owner session",
+        wrong,
+        "registration witness mismatch",
+    );
+    let mut wrong = witness.clone();
+    wrong.owner_invocation_uuid = Some(uuid::Uuid::new_v4().to_string());
+    probe(
+        "wrong owner invocation",
+        wrong,
+        "registration witness mismatch",
+    );
+    let mut stale = witness.clone();
+    stale.owner_generation = Some(uuid::Uuid::new_v4().to_string());
+    probe(
+        "stale owner generation",
+        stale,
+        "grant incarnation mismatch",
+    );
+    let mut sibling = witness.clone();
+    sibling.work_id = Some("sibling-work".into());
+    probe("sibling work", sibling, "work ID mismatch");
+    let mut foreign = witness.clone();
+    foreign.root_id = uuid::Uuid::new_v4().to_string();
+    probe("cross-root", foreign, "root absent");
+    probe("wrong helper image", witness, "pinned image mismatch");
 }
 
 #[test]
@@ -402,7 +557,62 @@ fn inner() {
         fs::read_to_string(&broker_log).unwrap()
     );
     let ran = temp_path.join("ran");
-    let script = format!("printf 'executed\\n' >> {}", ran.display());
+    // Preaccept gate in the very same private broker/State domain: an
+    // unsupported direct notify entry cannot reserve or launch work.
+    let preaccept = Command::new(&runner)
+        .args([
+            "notify",
+            "agent-bash-activate",
+            "--handle",
+            "unaccepted-work",
+        ])
+        .env_clear()
+        .env("HOME", &home)
+        .env("OULIPOLY_DATA_DIR", &data)
+        .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .output()
+        .unwrap();
+    assert!(!preaccept.status.success());
+    assert!(
+        String::from_utf8_lossy(&preaccept.stderr)
+            .contains("OULIPOLY_KERNEL_ENTRY_GAP=unsupported kernel CLI mode")
+    );
+    assert_eq!(fs::read_dir(broker_state.join("works")).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(broker_state.join("grants")).unwrap().count(),
+        0
+    );
+    assert!(!ran.exists());
+    let preaccept_mailbox =
+        oulipoly_state::mailbox::MailboxDb::open_read_only(&data.join("pid-identity.db")).unwrap();
+    assert!(
+        preaccept_mailbox
+            .completion_event_listeners("unaccepted-work")
+            .unwrap()
+            .is_empty()
+    );
+    let preaccept_history =
+        oulipoly_state::mailbox::MailboxDb::open_historical(&data.join("pid-identity.db")).unwrap();
+    assert!(
+        preaccept_history
+            .list_mailbox("unaccepted-work", true)
+            .unwrap()
+            .is_empty()
+    );
+    drop(preaccept_mailbox);
+
+    let test_image = std::env::current_exe().unwrap();
+    let script = format!(
+        "AGE319_V_PROBE_INNER=1 AGE319_V_PROBE_DATA={} AGE319_V_PROBE_BASH_STATE={} AGE319_V_PROBE_BROKER_STATE={} AGE319_V_PROBE_BROKER_SOCKET={} AGE319_V_PROBE_EFFECT={} {} --exact paired_owner_v_negative_probe_node --ignored --nocapture && printf 'executed\\n' >> {}",
+        data.display(),
+        bash_state.display(),
+        broker_state.display(),
+        socket.display(),
+        ran.display(),
+        test_image.display(),
+        ran.display(),
+    );
     let out = temp_path.join("entry.out");
     let err = temp_path.join("entry.err");
     let mut entry = Command::new(&runner)
@@ -425,7 +635,7 @@ fn inner() {
         .spawn()
         .unwrap();
     eventually(
-        || ran.exists() || entry.try_wait().unwrap().is_some(),
+        || ran.exists(),
         || {
             let handles = fs::read_dir(bash_state.join("agent-bash"))
                 .ok()
@@ -465,6 +675,7 @@ fn inner() {
                         .and_then(|bytes| serde_json::from_str::<serde_json::Value>(&bytes).ok())
                         .and_then(|meta| meta["error"].as_str().map(str::to_owned)),
                     fs::read_to_string(path.join("root-work-diagnostic-v1.jsonl")).ok(),
+                    fs::read_to_string(path.join("log")).ok(),
                 )
             })
             .collect::<Vec<_>>();
@@ -628,6 +839,21 @@ fn inner() {
         let output = probe.output().unwrap();
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("pinned owner work ID conflict"));
+        assert_eq!(fs::read_to_string(&ran).unwrap(), "executed\n");
+        let unchanged =
+            oulipoly_state::mailbox::MailboxDb::open_read_only(&data.join("pid-identity.db"))
+                .unwrap();
+        let listeners = unchanged.completion_event_listeners(source_handle).unwrap();
+        assert_eq!(listeners.len(), 1);
+        assert!(
+            listeners
+                .iter()
+                .all(|listener| listener.acknowledged_at.is_none())
+        );
+        let pending = unchanged.list_pending(session).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].seq, seq);
+        assert!(pending[0].delivered_at.is_none());
     }
     assert_eq!(fs::read_to_string(&ran).unwrap(), "executed\n");
 
@@ -646,6 +872,7 @@ fn inner() {
         .env("AGE319_RECIPIENT_SESSION", session)
         .env("AGE319_RECIPIENT_HANDLE", source_handle)
         .env("AGE319_SOURCE_INVOCATION", invocation)
+        .env("AGE319_RECIPIENT_EFFECT", &ran)
         .env("AGE319_RECIPIENT_RECEIPT", &consumption_receipt)
         .output()
         .unwrap();
@@ -687,12 +914,13 @@ fn inner() {
                 .all(|listener| listener.acknowledged_at.is_some()),
         "recipient ACK missing after consumption: listeners={listeners:?}"
     );
+    assert_eq!(fs::read_to_string(&ran).unwrap(), "executed\n");
     stop(&mut entry);
     stop(&mut broker);
 }
 
 #[test]
-#[ignore = "paired preaccept and sealed-helper V adversarial controls remain unproved"]
+#[ignore = "private Bash/Runner positive with in-work V negative controls; provider turn and host sudo remain open"]
 fn real_bash_source_reaches_guardian_h_k_q() {
     if std::env::var_os("AGE319_PRIVATE_RECIPIENT_INNER").is_some() {
         recipient();
@@ -733,4 +961,11 @@ fn real_bash_source_reaches_guardian_h_k_q() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+#[ignore = "launched only inside the accepted Bash work by the paired fixture"]
+fn paired_owner_v_negative_probe_node() {
+    assert!(std::env::var_os("AGE319_V_PROBE_INNER").is_some());
+    paired_owner_v_negative_probe();
 }
