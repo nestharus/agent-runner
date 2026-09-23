@@ -77,6 +77,8 @@ fn inner() {
     let err = temp.path().join("runner.err");
     let args: &[&str] = if mode == "diagnostics" {
         &["diagnostics", "metrics", "--minutes", "1", "--json"]
+    } else if mode == "join_only" {
+        &["__age319-private-join-only-v1"]
     } else {
         &["--help"]
     };
@@ -171,6 +173,8 @@ fn inner() {
     let output = fs::read_to_string(&out).unwrap();
     if mode == "diagnostics" {
         assert!(output.trim_start().starts_with('{'), "{output}");
+    } else if mode == "join_only" {
+        assert!(output.is_empty(), "{output}");
     } else {
         assert!(output.contains("Usage:"));
     }
@@ -229,6 +233,7 @@ fn inner() {
         domain_id: domain,
         supervisor_id: record["supervisor_authority_id"].as_str().unwrap().into(),
         guardian_pid: record["guardian"]["host_pid"].as_i64().unwrap() as i32,
+        root_authority: "{}".into(),
         args: vec!["--help".into()],
         environment: vec![],
     };
@@ -288,7 +293,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
     if std::env::var_os("OULIPOLY_AGE319_RUNNER_IMAGE").is_none() {
         return;
     }
-    for mode in ["help", "diagnostics"] {
+    for mode in ["help", "diagnostics", "join_only"] {
         let output = Command::new("unshare")
             .args(["-Urpfm", "--mount-proc"])
             .arg(std::env::current_exe().unwrap())

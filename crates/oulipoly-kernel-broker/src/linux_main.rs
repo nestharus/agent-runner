@@ -9,7 +9,8 @@ use oulipoly_kernel_broker::identity::{
     PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
 };
 use oulipoly_kernel_broker::protocol::{
-    AcceptedWorkSpec, JoinSpec, LaunchAcceptedWorkSpec, OwnerWitness, ProcessWitness,
+    AcceptedWorkSpec, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, OwnerWitness,
+    ProcessWitness,
 };
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
@@ -88,6 +89,9 @@ enum RequestPayload {
     VerifyOwner {
         witness: OwnerWitness,
         socket: File,
+    },
+    VerifyJoinedChild {
+        witness: JoinedChildWitness,
     },
     PrepareAcceptedWork {
         spec: AcceptedWorkSpec,
@@ -201,7 +205,7 @@ fn recv_request(
         b'Q' => read == 33,
         b'A' => read == 33,
         b'J' => (18..=48 * 1024 + 17).contains(&read),
-        b'V' | b'H' | b'K' => (18..=2048 + 17).contains(&read),
+        b'V' | b'H' | b'K' | b'B' => (18..=2048 + 17).contains(&read),
         _ => read == 17,
     };
     if !valid_length
@@ -259,6 +263,9 @@ fn recv_request(
         b'V' => RequestPayload::VerifyOwner {
             witness: serde_json::from_slice(&request[17..read as usize])?,
             socket: descriptors.remove(0),
+        },
+        b'B' => RequestPayload::VerifyJoinedChild {
+            witness: serde_json::from_slice(&request[17..read as usize])?,
         },
         b'H' => RequestPayload::PrepareAcceptedWork {
             spec: serde_json::from_slice(&request[17..read as usize])?,
@@ -401,6 +408,48 @@ fn verify_owner_socket(
     driver.verify()?;
     peer.process.verify()?;
     Ok(format!("verified-owner {}\n", witness.root_id))
+}
+
+fn verify_joined_child(
+    witness: JoinedChildWitness,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    entries: &EntryRegistry,
+) -> io::Result<String> {
+    let entry = entries
+        .record(&witness.root_id)
+        .ok_or_else(|| io::Error::other("joined-child root entry absent"))?;
+    let child_stamp = entry
+        .joined_child
+        .as_ref()
+        .ok_or_else(|| io::Error::other("joined child was not durably pinned"))?;
+    if !entry.join_consumed
+        || entry.guardian.as_ref() != Some(&ProcessStamp::from(&peer.process))
+        || entry.owner_uid != peer.uid
+        || !peer.process.in_namespace(host_namespace)?
+        || !peer.process.same_executable_as(runner_image)?
+        || child_stamp.host_pid != witness.child.host_pid
+        || child_stamp.boot_id != witness.child.boot_id
+        || child_stamp.starttime_ticks != witness.child.starttime_ticks
+    {
+        return Err(io::Error::other(
+            "joined-child guardian or identity mismatch",
+        ));
+    }
+    let root = roots
+        .live_roots()
+        .find(|root| root.record.root_id == witness.root_id)
+        .ok_or_else(|| io::Error::other("joined-child root namespace absent"))?;
+    let child = PinnedProcess::open(witness.child.host_pid)?;
+    if ProcessStamp::from(&child) != *child_stamp
+        || !child.direct_child_of(&root.init)?
+        || !child.in_namespace(root.init.namespace())?
+    {
+        return Err(io::Error::other("joined child no longer matches root PID1"));
+    }
+    Ok(format!("verified-joined-child {}\n", witness.root_id))
 }
 
 #[expect(
@@ -625,6 +674,18 @@ fn serve() -> io::Result<()> {
                     return Err(io::Error::other("invalid owner witness payload"));
                 };
                 verify_owner_socket(witness, socket, &peer, &runner_image, &registry, &entries)
+            } else if operation == b'B' {
+                let RequestPayload::VerifyJoinedChild { witness } = payload else {
+                    return Err(io::Error::other("invalid joined-child witness payload"));
+                };
+                verify_joined_child(
+                    witness,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &registry,
+                    &entries,
+                )
             } else if operation == b'H' {
                 let RequestPayload::PrepareAcceptedWork { spec, descriptors } = payload else {
                     return Err(io::Error::other("invalid accepted-work payload"));

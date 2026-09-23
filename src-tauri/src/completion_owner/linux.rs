@@ -1,5 +1,5 @@
 use super::*;
-use oulipoly_kernel_broker::protocol::{self, OwnerWitness, ProcessWitness};
+use oulipoly_kernel_broker::protocol::{self, JoinedChildWitness, OwnerWitness, ProcessWitness};
 use oulipoly_state::completion_continuation::{PROTOCOL, SourceProcessIdentity};
 use oulipoly_state::diagnostic_recorder::{
     DiagnosticPhase, PhaseObservation, SpanStart, process_recorder,
@@ -469,7 +469,7 @@ pub(crate) fn verify_pinned_owner_ready(
     announce: &mut UnixStream,
     pin: &super::PinnedGuardian,
     guardian_pid: i32,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let grant = await_guardian_ready(announce, guardian_pid)?;
     let expected_guardian = identity(i64::from(guardian_pid))?;
     let expected_entry = current_identity()?;
@@ -497,7 +497,7 @@ pub(crate) fn verify_pinned_owner_ready(
     {
         return Err("durable completion owner does not match broker identities".into());
     }
-    Ok(())
+    serde_json::to_string(&grant).map_err(|error| error.to_string())
 }
 
 fn await_guardian_ready(
@@ -944,6 +944,23 @@ fn retain_pending_context(
                 false
             } else if root_authorities.authorize_capability(owner, grant).is_ok()
                 && root_supervisor.original_peer_in_root(&grant.root_id, &request.context)
+            {
+                true
+            } else if root_authorities.authorize_capability(owner, grant).is_ok()
+                && i32::try_from(request.context.pid).is_ok_and(|pid| pid > 0)
+                && u64::try_from(request.context.starttime_ticks).is_ok()
+                && protocol::verify_joined_child_at(
+                    &owner_broker_socket(),
+                    &JoinedChildWitness {
+                        root_id: grant.root_id.clone(),
+                        child: ProcessWitness {
+                            host_pid: request.context.pid as i32,
+                            boot_id: request.context.boot_id.clone(),
+                            starttime_ticks: request.context.starttime_ticks as u64,
+                        },
+                    },
+                )
+                .is_ok()
             {
                 true
             } else {

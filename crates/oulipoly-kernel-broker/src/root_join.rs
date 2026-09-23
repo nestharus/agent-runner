@@ -26,6 +26,18 @@ struct InitContext {
 }
 
 fn validate(spec: &JoinSpec, descriptors: &[File; 5]) -> io::Result<()> {
+    let authority: serde_json::Value = serde_json::from_str(&spec.root_authority)?;
+    if authority["protocol"] != "root-authority-v1"
+        || authority["root_id"] != spec.root_id
+        || authority["domain_id"] != spec.domain_id
+        || authority["supervisor_authority_id"] != spec.supervisor_id
+        || authority["guardian_identity"]["pid"] != spec.guardian_pid
+        || !authority["capability"].as_str().is_some_and(|capability| {
+            capability.len() == 64 && capability.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+    {
+        return Err(io::Error::other("root join capability binding conflict"));
+    }
     for id in [&spec.root_id, &spec.domain_id, &spec.supervisor_id] {
         uuid::Uuid::parse_str(id).map_err(|_| io::Error::other("invalid join identity"))?;
     }
@@ -153,6 +165,7 @@ fn run_init(context: InitContext) -> io::Result<()> {
         .args(&spec.args)
         .env_clear()
         .envs(spec.environment.iter().map(|(key, value)| (key, value)))
+        .env("OULIPOLY_ROOT_AUTHORITY_V1", &spec.root_authority)
         .env(GATE_ENV, gate.as_raw_fd().to_string())
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
@@ -413,10 +426,22 @@ mod tests {
     }
 
     fn spec() -> JoinSpec {
+        let root_id = uuid::Uuid::new_v4().to_string();
+        let domain_id = uuid::Uuid::new_v4().to_string();
+        let supervisor_id = uuid::Uuid::new_v4().to_string();
         JoinSpec {
-            root_id: uuid::Uuid::new_v4().to_string(),
-            domain_id: uuid::Uuid::new_v4().to_string(),
-            supervisor_id: uuid::Uuid::new_v4().to_string(),
+            root_authority: serde_json::json!({
+                "protocol": "root-authority-v1",
+                "root_id": root_id,
+                "domain_id": domain_id,
+                "supervisor_authority_id": supervisor_id,
+                "guardian_identity": {"pid": 42},
+                "capability": "a".repeat(64),
+            })
+            .to_string(),
+            root_id,
+            domain_id,
+            supervisor_id,
             guardian_pid: 42,
             args: vec!["--help".into()],
             environment: vec![("HOME".into(), "/tmp".into())],

@@ -42,7 +42,7 @@ pub(crate) fn verify_pinned_owner_ready(
     announce: &mut std::os::unix::net::UnixStream,
     pin: &PinnedGuardian,
     guardian_pid: i32,
-) -> Result<(), String> {
+) -> Result<String, String> {
     linux::verify_pinned_owner_ready(announce, pin, guardian_pid)
 }
 
@@ -53,6 +53,11 @@ pub(crate) fn verify_kernel_owner_socket(
     socket: &std::os::unix::net::UnixStream,
 ) -> Result<(), String> {
     linux::verify_kernel_owner_socket(root_id, owner, socket)
+}
+
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+pub(crate) fn join_private_accepted_work_fixture() -> Result<(), String> {
+    linux::bootstrap().map_err(|error| error.to_string())
 }
 
 /// Preserve the State open source at entry; unrelated owner/path text is operational.

@@ -25,6 +25,10 @@ pub struct JoinSpec {
     pub domain_id: String,
     pub supervisor_id: String,
     pub guardian_pid: i32,
+    /// Exact root capability read back from the pinned guardian by the host
+    /// entry. The broker transports it only with the consumed one-use join;
+    /// the child must still prove it to the guardian before work admission.
+    pub root_authority: String,
     pub args: Vec<String>,
     pub environment: Vec<(String, String)>,
 }
@@ -48,6 +52,38 @@ pub struct ProcessWitness {
     pub host_pid: i32,
     pub boot_id: String,
     pub starttime_ticks: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JoinedChildWitness {
+    pub root_id: String,
+    pub child: ProcessWitness,
+}
+
+/// The outside guardian asks the broker to attest the exact one-use joined
+/// Runner child. PID ancestry cannot cross the broker-created namespace fork.
+pub fn verify_joined_child_at(path: &Path, witness: &JoinedChildWitness) -> io::Result<()> {
+    let body = serde_json::to_vec(witness)?;
+    if body.len() > 2048 {
+        return Err(io::Error::other("joined-child witness too large"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(17 + body.len());
+    request.push(b'B');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(&body);
+    stream.write_all(&request)?;
+    let response = read_response(stream)?;
+    if response != format!("verified-joined-child {}\n", witness.root_id) {
+        return Err(io::Error::other(format!(
+            "broker joined-child attestation refused: {}",
+            response.trim()
+        )));
+    }
+    Ok(())
 }
 
 /// A host guardian's positive acceptance. The broker reads the receipt and
@@ -178,6 +214,15 @@ pub fn prepare_accepted_work_at(
 /// work launch, control, and physical drain, or authenticate the host procfs
 /// observer against a privileged workload that can replace `/proc`.
 pub fn supported_entry_args(args: &[String]) -> bool {
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if matches!(args, [only] if only == "__age319-private-join-only-v1")
+        && unsafe { libc::geteuid() } == 0
+        && std::fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+    {
+        return true;
+    }
     matches!(args, [only] if only == "--help" || only == "-h")
         || args.first().is_some_and(|first| first == "diagnostics")
 }

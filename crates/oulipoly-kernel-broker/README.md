@@ -34,12 +34,19 @@ host child; `G` binds that guardian, native domain, and supervisor incarnation;
 `A` reads back the exact live binding. The old `L` operation stays disabled.
 `J` is the new one-use join: a bounded JSON invocation and exactly five
 `SCM_RIGHTS` descriptors for stdin, stdout, stderr, cwd, and an exit receipt.
+The host entry includes the exact root capability it read back from its pinned
+guardian as a separate J field. The broker checks its root/domain/supervisor
+binding and supplies it to the joined child outside the caller-selected
+environment. The child must still prove that capability to the guardian.
 `V` takes the joined child's connected native-owner socket and an explicit
 host-PID/starttime/boot witness from the durable owner. The host broker checks
 the exact fsynced joined-child incarnation, root PID1 ancestry, root namespace,
 guardian and driver incarnations, and the socket's host-side `SO_PEERCRED`.
 It gives no launch authority and refuses missing older child stamps, changed
 identities, and unrelated sockets. Other operations reject passed descriptors.
+The guardian's challenged `B` readback verifies that a new context is the
+exact one-use joined Runner child under the recorded root PID1; ordinary PID
+ancestry cannot establish that across the broker's namespace fork.
 A bare UUID or environment
 marker grants nothing.
 

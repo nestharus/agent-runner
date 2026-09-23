@@ -122,6 +122,11 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
             );
         }
         drop(gate);
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::args().nth(1).as_deref() == Some("__age319-private-join-only-v1") {
+            crate::completion_owner::join_private_accepted_work_fixture()?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Ok(crate::process_entrypoint())
     })();
     Some(match result {
@@ -308,14 +313,15 @@ fn bind_host_guardian(root: &str, domain: &str, supervisor: &str) -> Result<Exit
             domain_id: domain.into(),
             supervisor_authority_id: supervisor.into(),
         };
-        crate::completion_owner::verify_pinned_owner_ready(&mut parent, &pin, pid)?;
+        let root_authority =
+            crate::completion_owner::verify_pinned_owner_ready(&mut parent, &pin, pid)?;
         let readback = protocol::read_entry_at(&broker, root)
             .map_err(|e| format!("broker final owner readback failed: {e}"))?;
         if readback != format!("bound-entry {root} {domain} {supervisor} {pid}\n") {
             return Err("broker final owner readback mismatch".into());
         }
         parent.write_all(b"R").map_err(|e| e.to_string())?;
-        join_child(&broker, root, domain, supervisor, pid)
+        join_child(&broker, root, domain, supervisor, pid, root_authority)
     })();
     if result.is_err() {
         let _ = parent.shutdown(std::net::Shutdown::Both);
@@ -330,6 +336,7 @@ fn join_child(
     domain: &str,
     supervisor: &str,
     guardian_pid: i32,
+    root_authority: String,
 ) -> Result<ExitCode, String> {
     let args = std::env::args_os()
         .skip(1)
@@ -362,6 +369,7 @@ fn join_child(
         domain_id: domain.into(),
         supervisor_id: supervisor.into(),
         guardian_pid,
+        root_authority,
         args,
         environment,
     };
