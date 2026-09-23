@@ -96,13 +96,24 @@ pub(crate) use predicate::{
 pub(crate) fn run_offline_entry(cli: &Cli) -> Result<Option<i32>, String> {
     let code = match &cli.command {
         Some(Subcommands::Diagnostics { command }) => match command {
-            DiagnosticsSubcommands::Recent { limit, json } => {
-                crate::commands::offline_diagnostics::run_recent(limit.get(), *json)
-            }
+            DiagnosticsSubcommands::Recent {
+                limit,
+                json,
+                cursor,
+            } => crate::commands::offline_diagnostics::run_recent(
+                limit.get(),
+                *json,
+                cursor.as_deref(),
+            ),
             DiagnosticsSubcommands::Trace {
                 diagnostic_id,
                 json,
-            } => crate::commands::offline_diagnostics::run_trace(diagnostic_id, *json),
+                cursor,
+            } => crate::commands::offline_diagnostics::run_trace(
+                diagnostic_id,
+                *json,
+                cursor.as_deref(),
+            ),
             DiagnosticsSubcommands::Metrics { minutes, json } => {
                 crate::commands::offline_diagnostics::run_metrics(minutes.get(), *json)
             }

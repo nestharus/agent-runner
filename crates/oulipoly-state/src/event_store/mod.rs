@@ -57,9 +57,11 @@ pub use maintenance::{
 };
 pub use reader::{
     BoundedDiscovery, BoundedRead, CoverageIssue, CoverageIssueKind, DiscoveryCoverage,
-    EventFilter, GenerationReadTarget, PartitionWatermark, ReadLimits, ReadRecord,
-    discover_generation_read_targets, read_discovered_generations, read_generation,
-    read_generations, reconcile_exact_generation,
+    EventFilter, EvidenceDiscoveryCursor, GenerationDiagnosticPage, GenerationReadTarget,
+    PartitionWatermark, ReadLimits, ReadRecord, discover_generation_read_targets,
+    discover_generation_read_targets_page, read_discovered_generations,
+    read_discovered_generations_preserving_duplicates, read_generation,
+    read_generation_diagnostic_page, read_generations, reconcile_exact_generation,
 };
 pub use schema::{
     AppendDisposition, AppendTicket, EventStoreError, GenerationMetadata, GenerationState,

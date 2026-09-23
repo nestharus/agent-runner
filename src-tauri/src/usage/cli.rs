@@ -339,6 +339,10 @@ pub(crate) enum DiagnosticsSubcommands {
         /// Emit structured JSON instead of a human-readable report.
         #[arg(long)]
         json: bool,
+
+        /// Opaque continuation from the previous diagnostics recent page.
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Trace all retained recorder events for one diagnostic ID.
     Trace {
@@ -347,6 +351,10 @@ pub(crate) enum DiagnosticsSubcommands {
         /// Emit structured JSON instead of a human-readable report.
         #[arg(long)]
         json: bool,
+
+        /// Opaque continuation from the previous diagnostics trace page.
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Query bounded longitudinal metrics across event-store rotations.
     Metrics {
@@ -848,6 +856,7 @@ mod offline_diagnostics_cli_tests {
                 command: DiagnosticsSubcommands::Recent {
                     limit,
                     json: true,
+                    cursor: None,
                 },
             }) if limit.get() == 17
         ));
@@ -870,6 +879,7 @@ mod offline_diagnostics_cli_tests {
                 command: DiagnosticsSubcommands::Trace {
                     diagnostic_id,
                     json: true,
+                    cursor: None,
                 },
             }) if diagnostic_id == "diagnostic-17"
         ));
