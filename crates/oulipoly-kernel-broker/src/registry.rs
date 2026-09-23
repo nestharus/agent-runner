@@ -71,6 +71,9 @@ impl RootRegistry {
             if name == "entries" && entry.file_type()?.is_dir() {
                 continue;
             }
+            if name == "grants" && entry.file_type()?.is_dir() {
+                continue;
+            }
             if !name.ends_with(".json") || !entry.file_type()?.is_file() {
                 return Err(io::Error::other("unrecognized registry entry"));
             }

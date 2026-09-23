@@ -3,6 +3,7 @@
 ## Source files
 
 - `crates/oulipoly-kernel-broker/src/identity.rs`
+- `crates/oulipoly-kernel-broker/src/accepted_grant.rs`
 - `crates/oulipoly-kernel-broker/src/entry_registry.rs`
 - `crates/oulipoly-kernel-broker/src/lib.rs`
 - `crates/oulipoly-kernel-broker/src/linux_main.rs`
@@ -25,6 +26,7 @@
 - State and mailbox domains are initialized separately before this opt-in entry; preflight is read-only.
 - An installed service would require host root in the initial user/PID namespaces, protected binary and state paths, and a fixed Runner image.
 - Only trusted in-process broker code can call `insert_prepared`, after a separate positive accepted-work check. There is no work-registration socket opcode.
+- The dormant grant ledger is recovery-validated at broker startup but has no socket opcode or launch path. A prepared/consumed record remains debt until an exact physical settlement exists.
 
 ## Input → Expected output
 
@@ -34,6 +36,8 @@
 | Live peer in a registered direct or deeper work PID namespace. | Nearest exact work incarnation and its root ID. |
 | Peer in an unrelated host branch, with no registry debt. | Outside classification. |
 | Work PID1 with exact live root and direct parent namespace, registered before release. | Fsynced record binding root/work/parent and PID1 incarnation. |
+| Broker-internal grant preparation from the exact bound host guardian with pinned accepted and intent descriptors. | Exact owner generation, request digest, supervisor, root PID1, work ID, and consumed parent grant/live namespace bind to a fsynced prepared record. No worker executes. |
+| Prepared grant consumed before a future namespace fork, then broker restart. | Fsynced consumed record remains and replay is refused. |
 | Root or work PID1 missing/changed on restart. | Durable unknown debt, never a drain receipt. |
 | Unsolicited descriptor in a challenged socket request. | Descriptor closed and request refused. |
 | Entry reservation from an unrelated child PID namespace classified `outside`. | Denied because the connector is not in the broker's host PID namespace. |
@@ -56,6 +60,7 @@
 - A double-forked, session-detached process with no inherited environment or socket still classifies by PID namespace membership.
 - Registry read order does not matter for nested parent reattachment.
 - A write or fsync failure poisons the running registry until restart/reconciliation.
+- A grant ID may bind only one work namespace record; old classifier records have no grant authority.
 
 ## Error conditions
 
@@ -67,7 +72,7 @@
 ## Boundaries
 
 - Classification is never positive work authority.
-- The source has no service-requiring CLI, TTY/GUI handoff, guardian acceptance handoff, work launch, clean physical drain receipt, or retirement operation. Help/offline diagnostics have an authenticated one-use root child join and host-side owner-socket verification. Maintenance and provider PID transport remain incomplete.
+- The source has no service-requiring CLI, TTY/GUI handoff, guardian acceptance handoff, work launch, clean physical drain receipt, or retirement operation. The grant ledger is intentionally unreachable from socket traffic. Help/offline diagnostics have an authenticated one-use root child join and host-side owner-socket verification. Maintenance and provider PID transport remain incomplete.
 - The unprivileged user-namespace fixture cannot establish host-root sudo/setuid behavior.
 - Ordinary Runner/Bash entry and allocated-attempt NNP/seccomp remain. The opt-in entry keeps the host guardian outside the root PID namespace and releases only the fixed Runner for help/offline diagnostics.
 
@@ -78,6 +83,7 @@
 - `crates/oulipoly-kernel-broker/tests/private_root_join.rs` runs the actual opt-in Runner and broker binaries in a private user namespace, holds the child at the pre-exec gate, and checks exact root/guardian placement, persisted child stamp, V acceptance and changed-incarnation/socket refusal, replay denial and broker restart debt.
 - `crates/oulipoly-kernel-broker/src/linux_main.rs` unit tests exercise challenged credentials, a `CAP_SYS_ADMIN` child namespace socket handoff, exact host namespace policy, descriptor rejection, and production dispatch E/P/G ordering.
 - `crates/oulipoly-kernel-broker/src/entry_registry.rs` exercises persisted exact prepare/bind and sibling/replay denial.
+- `crates/oulipoly-kernel-broker/src/accepted_grant.rs` exercises receipt/intent binding, consumed replay refusal across reopen, and malformed recovery refusal.
 - `src-tauri/src/kernel_entry.rs` exercises read-only preflight and reserve-before-guardian ordering.
 - `src-tauri/tests/age319_persistent_guardian.rs` uses an opt-in private user-namespace broker-like endpoint and the production Runner binary to verify refusal before grant, exact durable owner/root identity, sibling/replay denial, and dead guardian debt.
 - `src-tauri/src/completion_owner/linux_admission_tests.rs` exercises prepare-before-release of the guardian gate.

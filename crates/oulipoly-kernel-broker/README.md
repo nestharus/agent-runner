@@ -65,8 +65,16 @@ A consumed join never replays after an uncertain response, failed fork or
 restart. The current source has no safe retirement or root drain protocol, so
 it conservatively blocks another reservation once a join is consumed.
 
-The existing `works/` registry can classify exact nested work namespaces, but
-there is no guardian-authorized socket operation that launches accepted work.
+The `works/` registry classifies exact nested work namespaces. A dormant
+`grants/` ledger now validates strict `root-work-accepted-v1.json` and intent
+bytes through pinned descriptors from the exact bound host guardian, requires
+the guardian's original acceptance digest, and binds
+root PID1, owner generation, supervisor, work ID, request digest, and a
+consumed causal parent's grant and live namespace. It fsyncs prepared and
+one-use consumed records; malformed recovery stops the broker. A work record
+can carry its exact accepted grant ID. There is still **no socket operation or
+worker launch** for these helpers, and no source/ACK or physical-drain receipt.
+The broker does not treat a prepared record as execution or drain authority.
 Allocated attempts retain their existing `no_new_privs`/seccomp. The broker's
 `SO_PEERCRED` plus `SCM_CREDENTIALS` comparison excludes the private tested
 transferred-socket child PID namespace case; installation still needs a
@@ -83,10 +91,14 @@ test, not a host-root sudo or deployed continuity proof.
   failed with `process identity disappeared` and an early maintenance-worker
   exit; it now refuses before reservation. Add a validated TTY and GUI handoff or keep
   those modes refusing. Current supported entry is help/offline diagnostics.
-- Add a broker-authenticated positive accepted-work grant from the host
-  guardian, a one-use nested PID namespace/PID1 launch, physical drain and
-  settlement receipts. A work ID or `inside root` classification cannot grant
-  execution. Replace allocated-attempt NNP/seccomp only with that custody.
+- Connect the positive accepted-work grant to the actual host guardian after
+  its fsynced acceptance. Transfer the already validated executable, intent,
+  cwd, state and control descriptors into a broker-owned gated worker launch
+  under a nested PID namespace/PID1. The guardian currently directly spawns a
+  `Child` outside the root and uses session liveness for drain; this must be
+  replaced together with ACK/source and physical namespace-drain receipts.
+  A work ID or `inside root` classification cannot grant execution. Replace
+  allocated-attempt NNP/seccomp only with that custody.
 - Reconcile host/local PID fields, adopted descendants, result ACK versus
   physical drain, and registry retirement across broker and WSL restart.
 - Reconcile this branch's sidecar v24 with AGE-353's separate v24 migration

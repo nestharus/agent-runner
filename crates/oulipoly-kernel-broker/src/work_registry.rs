@@ -24,6 +24,10 @@ pub struct WorkRecord {
     pub root_pidns_dev: u64,
     pub root_pidns_ino: u64,
     pub work_id: String,
+    /// Binder for a future broker launch's consumed positive grant. This field
+    /// alone is not authority; private classifier fixtures may synthesize it.
+    #[serde(default)]
+    pub accepted_grant_id: Option<String>,
     pub parent_work_incarnation: Option<String>,
     pub init_host_pid: i32,
     pub init_starttime_ticks: u64,
@@ -169,10 +173,15 @@ impl WorkRegistry {
     fn check_unique(&self) -> io::Result<()> {
         let mut incarnations = HashSet::new();
         let mut work_ids = HashSet::new();
+        let mut grants = HashSet::new();
         let mut namespaces = HashSet::new();
         for record in self.live.iter().map(|work| &work.record).chain(&self.debt) {
             if !incarnations.insert(&record.work_incarnation)
                 || !work_ids.insert((&record.root_id, &record.work_id))
+                || record
+                    .accepted_grant_id
+                    .as_ref()
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_err() || !grants.insert(id))
             {
                 return Err(io::Error::other(
                     "duplicate work incarnation or root/work ID",
@@ -214,6 +223,49 @@ impl WorkRegistry {
         parent_work_incarnation: Option<&str>,
         init_host_pid: i32,
     ) -> io::Result<WorkRecord> {
+        self.insert_inner(
+            roots,
+            root_id,
+            work_id,
+            None,
+            parent_work_incarnation,
+            init_host_pid,
+        )
+    }
+
+    /// Future gated launch uses this form to couple the PID1 to its fsynced,
+    /// consumed accepted-work grant. This method itself does not authenticate
+    /// the caller or release the pre-exec gate.
+    pub fn insert_prepared_granted(
+        &mut self,
+        roots: &RootRegistry,
+        root_id: &str,
+        work_id: &str,
+        accepted_grant_id: &str,
+        parent_work_incarnation: Option<&str>,
+        init_host_pid: i32,
+    ) -> io::Result<WorkRecord> {
+        uuid::Uuid::parse_str(accepted_grant_id)
+            .map_err(|_| io::Error::other("invalid accepted grant ID"))?;
+        self.insert_inner(
+            roots,
+            root_id,
+            work_id,
+            Some(accepted_grant_id),
+            parent_work_incarnation,
+            init_host_pid,
+        )
+    }
+
+    fn insert_inner(
+        &mut self,
+        roots: &RootRegistry,
+        root_id: &str,
+        work_id: &str,
+        accepted_grant_id: Option<&str>,
+        parent_work_incarnation: Option<&str>,
+        init_host_pid: i32,
+    ) -> io::Result<WorkRecord> {
         if roots.has_debt() || self.has_debt() {
             return Err(io::Error::other("uncertain root or work debt"));
         }
@@ -224,8 +276,15 @@ impl WorkRegistry {
             .live
             .iter()
             .any(|work| work.record.root_id == root_id && work.record.work_id == work_id)
+            || accepted_grant_id.is_some_and(|grant| {
+                self.live
+                    .iter()
+                    .any(|work| work.record.accepted_grant_id.as_deref() == Some(grant))
+            })
         {
-            return Err(io::Error::other("accepted work ID already registered"));
+            return Err(io::Error::other(
+                "accepted work or grant already registered",
+            ));
         }
         let root = roots
             .live_roots()
@@ -266,6 +325,7 @@ impl WorkRegistry {
             root_pidns_dev: root.record.pidns_dev,
             root_pidns_ino: root.record.pidns_ino,
             work_id: work_id.to_owned(),
+            accepted_grant_id: accepted_grant_id.map(str::to_owned),
             parent_work_incarnation: parent_work_incarnation.map(str::to_owned),
             init_host_pid,
             init_starttime_ticks: init.starttime_ticks,

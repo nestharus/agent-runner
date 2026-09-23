@@ -1,6 +1,7 @@
 //! Opt-in host-root broker for the pinned guardian and one-use root child join.
 #[path = "root_join.rs"]
 mod root_join;
+use oulipoly_kernel_broker::accepted_grant::GrantRegistry;
 use oulipoly_kernel_broker::entry_registry::{EntryRegistry, ProcessStamp};
 use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess};
 use oulipoly_kernel_broker::protocol::{JoinSpec, OwnerWitness, ProcessWitness};
@@ -518,6 +519,17 @@ fn serve() -> io::Result<()> {
         checked_root_path(&entries_path, true)?;
     }
     let mut entries = EntryRegistry::open(&entries_path)?;
+    // This ledger is recovery-validated now, but no socket operation prepares
+    // or consumes it until the guardian's gated worker handoff is integrated.
+    let grants_path = Path::new(&state).join("grants");
+    if !grants_path.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&grants_path)?;
+    }
+    if !fixture {
+        checked_root_path(&grants_path, true)?;
+    }
+    let _grants = GrantRegistry::open(&grants_path)?;
     if let Ok(meta) = fs::symlink_metadata(&socket) {
         if !meta.file_type().is_socket() || meta.uid() != 0 {
             return Err(io::Error::other("unsafe existing socket"));

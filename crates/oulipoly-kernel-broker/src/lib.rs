@@ -3,6 +3,7 @@
 //! unavailable pending paired integration.
 #![cfg(target_os = "linux")]
 
+pub mod accepted_grant;
 pub mod entry_registry;
 pub mod identity;
 pub mod protocol;

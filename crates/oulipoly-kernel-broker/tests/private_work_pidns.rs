@@ -170,15 +170,31 @@ fn exact_sibling_and_nested_work_survives_ambient_loss_and_restart_keeps_debt() 
     roots.insert(root_a.clone()).unwrap();
     roots.insert(root_b.clone()).unwrap();
     let mut works = WorkRegistry::open(&work_state, &roots).unwrap();
+    // Fixture-only grant IDs exercise persistence and sibling uniqueness;
+    // this test does not authenticate a guardian or launch accepted work.
+    let c_grant = uuid::Uuid::new_v4().to_string();
     let c = works
-        .insert_prepared(
+        .insert_prepared_granted(
             &roots,
             &root_a.root_id,
             "accepted-c",
+            &c_grant,
             None,
             peers[&b'C'].1.host_pid,
         )
         .unwrap();
+    assert!(
+        works
+            .insert_prepared_granted(
+                &roots,
+                &root_a.root_id,
+                "reused-grant",
+                &c_grant,
+                None,
+                peers[&b'D'].1.host_pid
+            )
+            .is_err()
+    );
     assert!(
         works
             .insert_prepared(
@@ -268,6 +284,16 @@ fn exact_sibling_and_nested_work_survives_ambient_loss_and_restart_keeps_debt() 
     let live_roots = RootRegistry::open(&state).unwrap();
     let live_works = WorkRegistry::open(&work_state, &live_roots).unwrap();
     assert!(live_works.debt_records().is_empty());
+    assert_eq!(
+        live_works
+            .live_works()
+            .find(|work| work.record.work_id == "accepted-c")
+            .unwrap()
+            .record
+            .accepted_grant_id
+            .as_deref(),
+        Some(c_grant.as_str())
+    );
     assert_eq!(
         classify_scope(&peer(&peers[&b'G'].1), &host, &live_roots, &live_works),
         Scope::Work {
