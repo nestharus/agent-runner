@@ -96,8 +96,11 @@ pub(crate) use predicate::{
 pub(crate) fn run_offline_entry(cli: &Cli) -> Result<Option<i32>, String> {
     let code = match &cli.command {
         Some(Subcommands::Notify { command }) => match command {
-            NotifySubcommands::RecoveryList { session_id, offset } => {
-                crate::commands::notify_continuation::recovery_list(session_id.as_deref(), *offset)
+            NotifySubcommands::RecoveryList { session_id, cursor } => {
+                crate::commands::notify_continuation::recovery_list(
+                    session_id.as_deref(),
+                    cursor.as_deref(),
+                )
             }
             NotifySubcommands::RecoveryRead { event_id, output } => {
                 crate::commands::notify_continuation::recovery_read(event_id, output.as_deref())

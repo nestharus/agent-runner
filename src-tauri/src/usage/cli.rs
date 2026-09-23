@@ -424,8 +424,9 @@ pub(crate) enum NotifySubcommands {
     RecoveryList {
         #[arg(long)]
         session_id: Option<String>,
-        #[arg(long, default_value_t = 0)]
-        offset: u32,
+        /// Opaque next_cursor from the preceding list page.
+        #[arg(long)]
+        cursor: Option<String>,
     },
 
     /// Verify one accepted selected output and optionally copy exact raw bytes.

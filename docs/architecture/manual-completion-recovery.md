@@ -9,11 +9,22 @@ rerun a workload, or record physical drain.
 ```sh
 oulipoly-agent-runner notify agent-bash-recovery-list --session-id SESSION_ID
 oulipoly-agent-runner notify agent-bash-recovery-list
-oulipoly-agent-runner notify agent-bash-recovery-list --session-id SESSION_ID --offset 100
+oulipoly-agent-runner notify agent-bash-recovery-list --session-id SESSION_ID --cursor NEXT_CURSOR
 oulipoly-agent-runner notify agent-bash-recovery-read --event-id EVENT_ID --output /private/recovered.bin
 ```
 
-List pages contain up to 100 **accepted** event identities, newest first.
+List pages contain up to 100 **accepted** event identities, newest triggered
+first. Pass the opaque `next_cursor` returned by a page to fetch the next page;
+when it is null, that traversal is complete. A cursor is bound to the same
+session filter and sidecar domain. A malformed, mismatched, or stale boundary
+cursor fails explicitly; restart without `--cursor`. Each page is bounded to
+101 rows and emits at most 100 identities. New acceptances at the head cannot
+shift previously returned pages or skip records already accepted when the walk
+started, provided their trigger sort keys remain unchanged. This is a keyset
+walk, not a frozen SQLite snapshot: a later acceptance with a sort key above
+the current cursor, or an administrator's timestamp repair, may require a
+fresh walk. The direct `--event-id` read remains available when the event ID is
+known.
 Omitting `--session-id` searches all locally retained accepted events under
 the same OS permissions. An event ID from a lost response may be used directly.
 Read verifies the committed

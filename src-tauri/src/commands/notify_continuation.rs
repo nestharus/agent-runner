@@ -1,5 +1,6 @@
 //! Exact v2 notification operations. Original work is never launched or replayed.
 //! Declared roles: accessor, parser, validator, mapper, orchestration.
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use oulipoly_state::completion_continuation::{
     AdmittedSourceBinding, MAX_REGISTRATION_BYTES, PROTOCOL, SourceRegistration,
     VerifiedCompletion, read_source_file,
@@ -15,13 +16,31 @@ use std::time::Duration;
 
 const COMPLETION_REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
-pub(crate) fn recovery_list(session_id: Option<&str>, offset: u32) -> Result<i32, String> {
+pub(crate) fn recovery_list(session_id: Option<&str>, cursor: Option<&str>) -> Result<i32, String> {
+    let decoded = cursor
+        .map(|encoded| {
+            if encoded.len() > 32 * 1024 || encoded.is_empty() {
+                return Err("invalid recovery cursor length".to_string());
+            }
+            let bytes = URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|_| "invalid recovery cursor encoding".to_string())?;
+            serde_json::from_slice::<Value>(&bytes)
+                .map_err(|_| "invalid recovery cursor JSON".to_string())
+        })
+        .transpose()?;
     let mailbox = MailboxDb::open_read_only(&MailboxDb::default_path()?)?;
-    let events = mailbox.completion_recovery_events(session_id, offset)?;
+    let (events, next) = mailbox.completion_recovery_events(session_id, decoded.as_ref())?;
+    let next_cursor = next
+        .map(|value| {
+            serde_json::to_vec(&value)
+                .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+                .map_err(|e| e.to_string())
+        })
+        .transpose()?;
     emit(&json!({
-        "status":"ok", "session_id":session_id, "offset":offset,
-        "page_limit":100, "events":events,
-        "next_offset":if events.len()==100 { offset.checked_add(100) } else { None },
+        "status":"ok", "session_id":session_id,
+        "page_limit":100, "events":events, "next_cursor":next_cursor,
     }))
 }
 
@@ -568,8 +587,22 @@ pub(crate) fn listen(path: &Path, session_id: &str, invocation_uuid: &str) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::{register_with_backpressure, verify_and_copy_raw};
+    use super::{recovery_list, register_with_backpressure, verify_and_copy_raw};
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn malformed_manual_recovery_cursor_is_rejected_before_database_open() {
+        assert!(
+            recovery_list(None, Some("invalid!"))
+                .unwrap_err()
+                .contains("cursor encoding")
+        );
+        assert!(
+            recovery_list(None, Some(&"a".repeat(32 * 1024 + 1)))
+                .unwrap_err()
+                .contains("cursor length")
+        );
+    }
 
     #[test]
     fn manual_raw_read_rejects_corruption_without_publishing_destination() {

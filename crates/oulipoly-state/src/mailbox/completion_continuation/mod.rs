@@ -528,6 +528,132 @@ pub(super) fn mark_activation_running_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn accepted_recovery_fixture(
+        db: &MailboxDb,
+        owner: &CompletionDomainOwner,
+        event_id: &str,
+        session_id: &str,
+    ) {
+        db.conn.execute(
+            "INSERT INTO completion_event(event_id,kind,state,delivery_mode,state_dir,meta_path,
+                log_path,rc_path,rc,payload_json,payload_file_path,payload_sha256,
+                payload_byte_len,payload_retention_policy,created_at,triggered_at)
+             VALUES(?1,'agent_bash_complete','triggered','sync','/fixture','/fixture/meta',
+                '/fixture/log','/fixture/rc',0,'{}','/fixture/payload',?2,2,'immutable',
+                '2026-09-23T00:00:00Z','2026-09-23T00:00:00Z')",
+            params![event_id, "a".repeat(64)],
+        ).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO completion_continuation_source(registration_id,domain_id,source_id,
+                event_id,registration_digest,binding,phase,snapshot_sha256,outcome_sha256,
+                payload_sha256,payload_byte_len,supervisor_authority_id)
+             VALUES(?1,?2,?3,?3,?4,x'01','accepted',?4,?4,?4,2,?5)",
+                params![
+                    format!("registration-{event_id}"),
+                    owner.domain_id,
+                    event_id,
+                    "a".repeat(64),
+                    owner.supervisor_authority_id
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO completion_event_listener(event_id,listener_id,session_id,
+                owner_invocation_uuid,active,created_at)
+             VALUES(?1,?2,?3,?2,0,'2026-09-23T00:00:00Z')",
+                params![event_id, format!("listener-{event_id}"), session_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn manual_recovery_cursor_walk_keeps_accepted_response_only_events_when_head_is_appended() {
+        let (_dir, db, owner) = fixture();
+        for ordinal in 0..205 {
+            accepted_recovery_fixture(&db, &owner, &format!("event-{ordinal:03}"), "session-a");
+        }
+        let (first, mut cursor) = db
+            .completion_recovery_events(Some("session-a"), None)
+            .unwrap();
+        assert_eq!(first.len(), 100);
+        assert_eq!(first[0]["event_id"], "event-204");
+        assert!(cursor.is_some());
+
+        // This newly accepted head would shift OFFSET 100 and duplicate event-105.
+        accepted_recovery_fixture(&db, &owner, "event-999", "session-a");
+        // A later acceptance above the cursor needs a fresh bounded walk.
+        accepted_recovery_fixture(&db, &owner, "event-150a", "session-a");
+        accepted_recovery_fixture(&db, &owner, "event-998", "session-b");
+        let mut ids: Vec<String> = first
+            .iter()
+            .map(|event| event["event_id"].as_str().unwrap().into())
+            .collect();
+        while let Some(current) = cursor {
+            let (page, next) = db
+                .completion_recovery_events(Some("session-a"), Some(&current))
+                .unwrap();
+            assert!(page.len() <= 100);
+            ids.extend(
+                page.iter()
+                    .map(|event| event["event_id"].as_str().unwrap().into()),
+            );
+            cursor = next;
+        }
+        assert_eq!(ids.len(), 205);
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            205
+        );
+        assert!(!ids.contains(&"event-999".to_string()));
+        assert!(!ids.contains(&"event-150a".to_string()));
+        let (fresh, _) = db
+            .completion_recovery_events(Some("session-a"), None)
+            .unwrap();
+        assert_eq!(fresh[0]["event_id"], "event-999");
+        assert!(fresh.iter().any(|event| event["event_id"] == "event-150a"));
+        assert_eq!(
+            db.completion_recovery_record("event-999").unwrap().unwrap()["event_id"],
+            "event-999"
+        );
+    }
+
+    #[test]
+    fn manual_recovery_cursor_rejects_changed_filter_domain_and_boundary() {
+        let (_dir, db, owner) = fixture();
+        for ordinal in 0..101 {
+            accepted_recovery_fixture(&db, &owner, &format!("event-{ordinal:03}"), "session-a");
+        }
+        let (_, cursor) = db
+            .completion_recovery_events(Some("session-a"), None)
+            .unwrap();
+        let cursor = cursor.unwrap();
+        assert!(
+            db.completion_recovery_events(Some("session-b"), Some(&cursor))
+                .is_err()
+        );
+        let mut malformed = cursor.clone();
+        malformed["version"] = 99.into();
+        assert!(
+            db.completion_recovery_events(Some("session-a"), Some(&malformed))
+                .is_err()
+        );
+        malformed = cursor.clone();
+        malformed["domain_id"] = "another-domain".into();
+        assert!(
+            db.completion_recovery_events(Some("session-a"), Some(&malformed))
+                .is_err()
+        );
+        let mut stale = cursor.clone();
+        stale["after_triggered_at"] = "2026-09-22T00:00:00Z".into();
+        assert!(
+            db.completion_recovery_events(Some("session-a"), Some(&stale))
+                .unwrap_err()
+                .contains("stale")
+        );
+    }
     fn fixture() -> (tempfile::TempDir, MailboxDb, CompletionDomainOwner) {
         let dir = tempfile::tempdir().unwrap();
         let mut db =
