@@ -9,7 +9,7 @@ import sqlite3
 import time
 
 CONTRACT = "oulipoly.provider/v1"
-SESSION = "ses_age360_native_wake"
+SESSION = os.environ.get("AGE319_INDEPENDENT_SESSION", "ses_age360_native_wake")
 
 def envelope(request, result):
     return {"contract": CONTRACT, "request_id": request["request_id"], "ok": True, "result": result}
@@ -41,6 +41,8 @@ def launch(request):
         SESSION = "ses_age360_founder"
         os.environ.update(AGE360_CASE="owner_only", AGE360_HOLD_INITIAL="1", AGE360_FOUNDER="1")
     case = os.environ.get("AGE360_CASE")
+    if case == "independent_root":
+        SESSION = known or os.environ["AGE319_INDEPENDENT_SESSION"]
     if prompt == "synthetic independent listener":
         case = "listener_only"
     age319_nested = case == "age319_probe" and prompt == "age319 authorized nested"
@@ -48,7 +50,7 @@ def launch(request):
         SESSION = "ses_age319_nested"
     seq = 1
     if known and case != "listener_only":
-        marker = pathlib.Path(os.environ["AGE360_NATIVE_WAKE_MARKER"])
+        marker = (pathlib.Path(os.environ["AGE360_ROOT"]) / ("resume-prompts-" + known + ".jsonl")) if case == "independent_root" else pathlib.Path(os.environ["AGE360_NATIVE_WAKE_MARKER"])
         with marker.open("a") as stream:
             stream.write(json.dumps(prompt, separators=(",", ":")) + "\n")
         gate = pathlib.Path(os.environ["AGE360_NATIVE_WAKE_GATE"])
@@ -255,6 +257,9 @@ def launch(request):
                 workload = 'head -c 16777216 /dev/zero'
             elif os.environ["AGE360_CASE"] == "age319_probe":
                 workload = 'printf nested > "$AGE319_NESTED_EFFECT"' if age319_nested else '/usr/bin/python3 "$AGE360_ROOT/age319-orphan.py" && printf paired-source-output'
+            elif case == "independent_root":
+                label = "A" if SESSION == "ses_age319_root_a" else "B"
+                workload = f'while [ ! -f "$AGE360_WORKLOAD_GATE" ]; do sleep 0.02; done; printf independent-{label} > "$AGE360_ROOT/independent-effect-{label}"; printf paired-source-output'
             elif os.environ["AGE360_CASE"] == "stripped_nested":
                 workload = '''set +e
 env -u OULIPOLY_ROOT_WORK_ID -u OULIPOLY_ROOT_PARENT_CAPABILITY_V1 \
@@ -284,8 +289,9 @@ printf paired-source-output'''
                 result = dispatch(root, mode, workload, env)
             else:
                 result = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "run", "--delivery", mode, "--completion-scope", scope, *extra, "--", "/bin/sh", "-c", workload], env=env, capture_output=True, timeout=30)
-            (root / "bash-dispatch.stdout").write_bytes(result.stdout)
-            (root / "bash-dispatch.stderr").write_bytes(result.stderr)
+            suffix = ("-A" if SESSION == "ses_age319_root_a" else "-B") if case == "independent_root" else ""
+            (root / ("bash-dispatch" + suffix + ".stdout")).write_bytes(result.stdout)
+            (root / ("bash-dispatch" + suffix + ".stderr")).write_bytes(result.stderr)
             allowed = (0, 37) if os.environ["AGE360_CASE"] == "early_exit" else (0,)
             if result.returncode not in allowed: raise RuntimeError("actual paired Bash dispatch failed: " + result.stderr.decode(errors="replace"))
             if age319_nested:
@@ -356,7 +362,8 @@ printf paired-source-output'''
 
 def session_turn_page(request):
     params = request.get("params", {})
-    marker = pathlib.Path(os.environ["AGE360_NATIVE_WAKE_MARKER"])
+    session = params.get("session_id", SESSION)
+    marker = (pathlib.Path(os.environ["AGE360_ROOT"]) / ("resume-prompts-" + session + ".jsonl")) if os.environ.get("AGE360_CASE") == "independent_root" else pathlib.Path(os.environ["AGE360_NATIVE_WAKE_MARKER"])
     prompts = []
     if marker.exists():
         prompts = [json.loads(line) for line in marker.read_text().splitlines() if line]
@@ -372,7 +379,7 @@ def session_turn_page(request):
     for offset, prompt in enumerate(selected[:params.get("max_turns", 1)]):
         normalized = prompt.replace("\r\n", "\n").replace("\r", "\n").strip()
         turns.append({
-            "session_id": SESSION,
+            "session_id": session,
             "turn_id": "age360-observed-user-" + str(offset + 1),
             "snapshot_sequence": offset,
             "timestamp": "2026-08-30T12:00:00Z",
@@ -391,7 +398,7 @@ def session_turn_page(request):
         "read_protocol": "oulipoly.session_turn_pages/v1",
         "provider_instance_id": request.get("provider_instance_id"),
         "settings_id": params.get("settings_id"),
-        "session_id": SESSION,
+        "session_id": session,
         "turn_projection": projection,
         "snapshot_id": "age360-observation:" + str(count),
         "page_index": 0,
@@ -464,7 +471,9 @@ elif method == "launch":
         pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("provider-error.txt").write_text(traceback.format_exc())
         raise
 elif method == "session.capture":
-    print(json.dumps(envelope(request, {"provider_session_id": SESSION, "state": {"captured": True}, "artifacts": []})))
+    markers = request.get("params", {}).get("markers", [])
+    captured = next((marker["value"] for marker in markers if marker.get("name") == "provider_session_id"), SESSION)
+    print(json.dumps(envelope(request, {"provider_session_id": captured, "state": {"captured": True}, "artifacts": []})))
 elif method == "session.read_turns":
     print(json.dumps(session_turn_page(request)))
 else:

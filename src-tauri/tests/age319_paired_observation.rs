@@ -100,6 +100,11 @@ fn private_case(paired: bool) -> bool {
     if let Some(bash) = bash {
         command.env("AGE360_AGENT_BASH_BIN", bash);
     }
+    if name == "age319_independent_runner_roots_have_exact_bash_completion" {
+        // The outer controller retains this directory until unshare exits;
+        // even a hard harness timeout kills the PID namespace first.
+        command.env("TMPDIR", homes.path());
+    }
     let output = command.output().expect("private namespace execution");
     println!("{}", String::from_utf8_lossy(&output.stdout));
     assert!(
@@ -2664,39 +2669,256 @@ fn age319_exact_pair_key_reset_orphan_and_cross_session_drain() {
 }
 
 #[test]
-fn age319_independent_bash_registers_with_real_runner() {
+fn age319_independent_runner_roots_have_exact_bash_completion() {
     if private_case(true) {
         return;
     }
-    let f = Fixture::new("independent_control");
-    let independent = f.root.path().join("independent-effect");
-    let output = Command::new("/usr/bin/python3")
-        .arg("-c")
-        .arg("import os, subprocess, sys; result = subprocess.run([os.environ['AGE360_AGENT_BASH_BIN'], 'run', '--delivery', 'async', '--', '/bin/sh', '-c', 'printf independent > \"$AGE319_EFFECT\"'], capture_output=True); sys.stdout.buffer.write(result.stdout); sys.stderr.buffer.write(result.stderr); sys.exit(result.returncode)")
-        .env_clear().env("PATH", "/usr/bin:/bin")
-        .env("AGE360_AGENT_BASH_BIN", std::env::var("AGE360_AGENT_BASH_BIN").unwrap())
-        .env("XDG_STATE_HOME", f.root.path().join("independent-state"))
-        .env("XDG_CONFIG_HOME", f.root.path().join("independent-config"))
-        .env("XDG_DATA_HOME", f.root.path().join("independent-data"))
-        .env("OULIPOLY_DATA_DIR", f.root.path().join("independent-data"))
-        .env("AGENT_BASH_AGENT_RUNNER_BIN", runner())
-        .env("AGE319_EFFECT", &independent)
-        .output().unwrap();
-    assert!(
-        output.status.success(),
-        "independent: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let independent_start: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let independent_meta = PathBuf::from(independent_start["meta"].as_str().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !independent.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(25));
+    // This test process is PID 1 of its private namespace. Drop runs before
+    // Fixture/TempDir on success or unwind, so no detached fixture process can
+    // retain a now-deleted spool. Every other PID here descends from this test.
+    struct NamespaceReaper;
+    impl Drop for NamespaceReaper {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-1, libc::SIGKILL) };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let mut status = 0;
+                let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+                if pid < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
-    assert!(
-        independent.exists(),
-        "real Runner independent registration did not execute: start={independent_start} meta={} stderr={}",
-        fs::read_to_string(independent_meta).unwrap_or_default(),
-        String::from_utf8_lossy(&output.stderr)
+    let f = Fixture::new("independent_root");
+    assert_eq!(std::process::id(), 1, "private PID namespace required");
+    let _reaper = NamespaceReaper;
+    let mut children = Vec::new();
+    for label in ["A", "B"] {
+        let child = f
+            .command()
+            .env(
+                "AGE319_INDEPENDENT_SESSION",
+                format!("ses_age319_root_{}", label.to_lowercase()),
+            )
+            .env("AGE360_HOLD_INITIAL", "1")
+            .args(["-m", MODEL, "--models-dir"])
+            .arg(&f.models)
+            .arg(format!("age319 independent root {label}"))
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(f.root.path().join(format!("root-{label}.stdout"))).unwrap())
+            .stderr(fs::File::create(f.root.path().join(format!("root-{label}.stderr"))).unwrap())
+            .spawn()
+            .unwrap();
+        children.push((label, child));
+    }
+    let sources: Vec<_> = wait(|| {
+        let db =
+            oulipoly_state::StateDb::open_historical_read_only(&f.data.join("state.db")).ok()?;
+        let entries: Vec<_> = db
+            .admitted_completion_continuations()
+            .ok()?
+            .into_iter()
+            .filter_map(|binding| binding.registration().ok())
+            .collect();
+        (entries.len() == 2).then_some(entries)
+    });
+    assert_ne!(sources[0].handle, sources[1].handle);
+    assert_ne!(
+        sources[0].owner_invocation_uuid,
+        sources[1].owner_invocation_uuid
+    );
+    let owner = f.owner();
+    let mut roots = Vec::new();
+    for (label, session) in [("A", "ses_age319_root_a"), ("B", "ses_age319_root_b")] {
+        let source = sources
+            .iter()
+            .find(|source| source.owner_session_id == session)
+            .unwrap();
+        let handle_dir = PathBuf::from(&source.handle_dir);
+        let accepted: serde_json::Value = wait(|| {
+            serde_json::from_slice(&fs::read(handle_dir.join("root-work-accepted-v1.json")).ok()?)
+                .ok()
+        });
+        let dispatch: serde_json::Value = wait(|| {
+            serde_json::from_slice(
+                &fs::read(f.root.path().join(format!("bash-dispatch-{label}.stdout"))).ok()?,
+            )
+            .ok()
+        });
+        assert_eq!(dispatch["dispatch_state"], "root-accepted", "{dispatch}");
+        assert_eq!(dispatch["handle"], source.handle);
+        assert_eq!(accepted["registration"]["kind"], "root", "{accepted}");
+        let state = rusqlite::Connection::open_with_flags(
+            f.data.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let (invocation_session, invocation_status): (String, String) = state
+            .query_row(
+                "SELECT provider_session_id,status FROM invocations WHERE invocation_uuid=?1",
+                [&source.owner_invocation_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(invocation_session, session);
+        assert_eq!(invocation_status, "running");
+        let runtime_session: String = f
+            .sidecar_connection()
+            .query_row(
+                "SELECT session_id FROM runtime_generation WHERE spawn_invocation_uuid=?1",
+                [&source.owner_invocation_uuid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runtime_session, session);
+        roots.push(accepted["root_id"].as_str().unwrap().to_owned());
+        assert!(
+            !f.root
+                .path()
+                .join(format!("independent-effect-{label}"))
+                .exists()
+        );
+    }
+    assert_ne!(
+        roots[0], roots[1],
+        "two controller-launched Runner roots must remain independent"
+    );
+    f.gate("release-workload");
+    f.gate("release-initial-provider");
+    for (label, child) in &mut children {
+        let status = wait(|| child.try_wait().unwrap());
+        assert!(
+            status.success(),
+            "root {label}: {}",
+            fs::read_to_string(f.root.path().join(format!("root-{label}.stderr"))).unwrap()
+        );
+    }
+    for (label, session) in [("A", "ses_age319_root_a"), ("B", "ses_age319_root_b")] {
+        let source = sources
+            .iter()
+            .find(|source| source.owner_session_id == session)
+            .unwrap();
+        let handle_dir = PathBuf::from(&source.handle_dir);
+        let meta: serde_json::Value = wait(|| {
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(handle_dir.join("meta.json")).ok()?).ok()?;
+            (value["state"] == "DONE"
+                && value["delivery"]["attempted"] == true
+                && value["delivery"]["exit_code"] == 0)
+                .then_some(value)
+        });
+        assert_eq!(meta["delivery"]["exit_code"], 0, "{meta}");
+        assert_eq!(meta["owner_session_id"], session);
+        assert_eq!(meta["owner_invocation_uuid"], source.owner_invocation_uuid);
+        let result: serde_json::Value = wait(|| {
+            serde_json::from_slice(&fs::read(handle_dir.join("root-work-result-v1.json")).ok()?)
+                .ok()
+        });
+        assert_eq!(result["physical_tree_drained"], true, "{result}");
+        wait(|| {
+            let listeners = f
+                .mailbox()
+                .completion_event_listeners(&source.handle)
+                .ok()?;
+            (!listeners.is_empty()
+                && listeners
+                    .iter()
+                    .all(|entry| entry.acknowledged_at.is_some()))
+            .then_some(())
+        });
+        wait(|| {
+            f.mailbox()
+                .pending_continuation_attempt_ids(&source.registration_id)
+                .ok()?
+                .is_empty()
+                .then_some(())
+        });
+        assert!(f.mailbox().list_pending(session).unwrap().is_empty());
+        let prompt = fs::read_to_string(
+            f.root
+                .path()
+                .join(format!("resume-prompts-{session}.jsonl")),
+        )
+        .unwrap();
+        assert!(
+            prompt.contains(&source.handle),
+            "exact session did not receive its own handle"
+        );
+        assert!(
+            !prompt.contains(
+                &sources
+                    .iter()
+                    .find(|other| other.handle != source.handle)
+                    .unwrap()
+                    .handle
+            ),
+            "cross-root completion appeared in another session"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.path().join(format!("independent-effect-{label}"))).unwrap(),
+            format!("independent-{label}")
+        );
+        let pid = meta["workload_pid"].as_i64().unwrap();
+        let start = meta["workload_pid_starttime_ticks"].as_i64().unwrap();
+        wait(|| {
+            (read_live_process_identity(pid)
+                .ok()
+                .flatten()
+                .is_none_or(|identity| identity.os_pid_starttime_ticks != start))
+            .then_some(())
+        });
+        wait(|| (!current_identity_matches(&source.registering_caller)).then_some(()));
+        let supervisor_pid = meta["supervisor_pid"].as_i64().unwrap();
+        let supervisor_start = meta["supervisor_pid_starttime_ticks"].as_i64().unwrap();
+        wait(|| {
+            read_live_process_identity(supervisor_pid)
+                .ok()
+                .flatten()
+                .is_none_or(|identity| identity.os_pid_starttime_ticks != supervisor_start)
+                .then_some(())
+        });
+    }
+    wait(|| {
+        f.mailbox()
+            .completion_continuation_owner()
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
+    wait(|| {
+        if !current_identity_matches(&owner.guardian_identity) {
+            return Some(());
+        }
+        let mut status = 0;
+        (unsafe {
+            libc::waitpid(
+                owner.guardian_identity.pid as i32,
+                &mut status,
+                libc::WNOHANG,
+            )
+        } == owner.guardian_identity.pid as i32)
+            .then_some(())
+    });
+    wait(|| {
+        loop {
+            let mut status = 0;
+            if unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) } <= 0 {
+                break;
+            }
+        }
+        let others = fs::read_dir("/proc").ok()?.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .parse::<u32>()
+                .ok()
+                .is_some_and(|pid| pid != 1)
+        });
+        (!others).then_some(())
+    });
+    println!(
+        "AGE319 independent Runner roots={roots:?} sessions=ses_age319_root_a,ses_age319_root_b exact ACK and physical drain"
     );
 }
