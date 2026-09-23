@@ -49,6 +49,20 @@ unreleased gate; CD loss before attachment can also leave that genuine original
 AC receipt. AC exec failure or loss of both receipt producers is not covered by
 that counterexample. Retained accepted uncertainty is not completed recovery.
 
+## Activation source association
+
+An activation claim can batch legacy completion rows and several accepted v2
+sources for one receiver. The v25 sidecar records one retained attempt/source
+row for every accepted v2 source in the claim, in the reservation transaction.
+The attempt's older `source_registration_id` field names only the first source
+and is kept for identity compatibility; it is not the complete source set.
+ACK and physical claim deletion leave the attempt/source rows intact. Status
+`outstanding_attempt_ids` and recovery `physical_drain.attempts` carry
+`association_completeness` (`known` or `unknown`). A pre-v25 activation has
+unknown completeness even if its scalar names this source; a deleted claim
+cannot establish whether another source shared it. An unknown status list can
+therefore omit historical attempts and must not be read as exhaustive.
+
 ## Synchronous presentation policy
 
 Synchronous completion is presented through the command/tool response, not a

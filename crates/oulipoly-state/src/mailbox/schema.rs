@@ -90,6 +90,28 @@ fn migrate_completion_mailbox_provenance(conn: &Connection) -> Result<(), String
         .map_err(|error| error.to_string())
 }
 
+fn migrate_completion_attempt_sources(conn: &Connection) -> Result<(), String> {
+    let present: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('completion_continuation_attempt')
+         WHERE name='association_completeness')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !present {
+        conn.execute_batch(
+            "ALTER TABLE completion_continuation_attempt
+            ADD COLUMN association_completeness TEXT NOT NULL DEFAULT 'unknown';",
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    conn.execute_batch(include_str!(
+        "migrations/0025_completion_attempt_sources.sql"
+    ))
+    .map_err(|error| error.to_string())
+}
+
 #[derive(Deserialize)]
 struct CompletionProtocolSummary {
     #[serde(default, deserialize_with = "present_string")]
@@ -269,7 +291,7 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
     }
 }
 
-pub(super) const CURRENT_VERSION: i64 = 24;
+pub(super) const CURRENT_VERSION: i64 = 25;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -430,6 +452,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 24,
         owner: SidecarEntity::CompletionAuthority,
         apply: migrate_completion_mailbox_provenance,
+    },
+    MigrationStep {
+        target_version: 25,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_completion_attempt_sources,
     },
 ];
 
@@ -1072,6 +1099,98 @@ mod contention_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+
+    #[test]
+    fn v25_association_schema_step_does_not_scan_large_attempt_history() {
+        const ROWS: i64 = 20_000;
+        const VM_BUDGET: usize = 5_000;
+        fn history() -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE completion_continuation_attempt(attempt_id TEXT PRIMARY KEY);
+                 WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{ROWS})
+                 INSERT INTO completion_continuation_attempt(attempt_id) SELECT printf('attempt-%08d',x) FROM n;"
+            )).unwrap();
+            conn
+        }
+        fn budget(conn: &Connection) -> Arc<AtomicUsize> {
+            let steps = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&steps);
+            conn.progress_handler(
+                1,
+                Some(move || observed.fetch_add(1, Ordering::Relaxed) >= VM_BUDGET),
+            )
+            .unwrap();
+            steps
+        }
+        let old = history();
+        let old_steps = budget(&old);
+        let old_result = old.execute_batch(
+            "CREATE INDEX hypothetical_historical_backfill ON completion_continuation_attempt(attempt_id);"
+        );
+        assert!(matches!(old_result,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::OperationInterrupted));
+        assert!(old_steps.load(Ordering::Relaxed) > VM_BUDGET);
+
+        let corrected = history();
+        let corrected_steps = budget(&corrected);
+        migrate_completion_attempt_sources(&corrected).unwrap();
+        let used = corrected_steps.load(Ordering::Relaxed);
+        assert!(used < VM_BUDGET, "v25 schema step used {used} VM steps");
+        corrected.progress_handler(0, None::<fn() -> bool>).unwrap();
+        let (count, unknown): (i64, i64) = corrected.query_row(
+            "SELECT COUNT(*), SUM(association_completeness='unknown') FROM completion_continuation_attempt",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!((count, unknown), (ROWS, ROWS));
+        eprintln!(
+            "20,000 historical attempts: indexing history interrupted after {} VM steps; v25 step used {used}",
+            old_steps.load(Ordering::Relaxed)
+        );
+
+        let full = Connection::open_in_memory().unwrap();
+        create_fresh_schema(&full).unwrap();
+        full.pragma_update(None, "user_version", CURRENT_VERSION)
+            .unwrap();
+        let domain: String = full
+            .query_row(
+                "SELECT domain_id FROM completion_continuation_domain",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        full.execute(
+            "INSERT INTO completion_supervisor_authority
+             (authority_id,domain_id,phase,created_by_generation,guardian_identity)
+             VALUES('history-auth',?1,'active','history-owner','{}')",
+            [&domain],
+        )
+        .unwrap();
+        full.execute(
+            "INSERT INTO completion_continuation_owner
+             (generation,domain_id,phase,guardian_identity,driver_identity,endpoint,supervisor_authority_id)
+             VALUES('history-owner',?1,'lost','{}','{}','/private/owner','history-auth')",
+            [&domain],
+        ).unwrap();
+        full.execute_batch(&format!(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{ROWS})
+             INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              phase,result_path,integrated,drain_receipt)
+             SELECT printf('old-%08d',x),'{domain}','history-owner','source_recovery',
+                    'digest','drained','/private/old-result',1,'old-receipt' FROM n;"
+        ))
+        .unwrap();
+        let open_steps = budget(&full);
+        assert!(observe_valid_current(&full).unwrap());
+        let open_used = open_steps.load(Ordering::Relaxed);
+        assert!(
+            open_used < VM_BUDGET,
+            "current-schema ordinary open check used {open_used} VM steps"
+        );
+        eprintln!("20,000-row v25 ordinary-open schema check used {open_used} VM steps");
+    }
 
     #[test]
     fn v23_provenance_schema_step_stays_below_large_mailbox_vm_budget() {

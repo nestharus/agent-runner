@@ -208,12 +208,42 @@ impl MailboxDb {
         &self,
         registration_id: &str,
     ) -> Result<Vec<String>, String> {
-        let mut statement = self.conn.prepare("SELECT attempt_id FROM completion_continuation_attempt WHERE source_registration_id=?1 AND phase NOT IN ('drained','never_started') ORDER BY attempt_id").map_err(|e| e.to_string())?;
+        let mut statement = self.conn.prepare("SELECT a.attempt_id FROM completion_continuation_attempt a WHERE a.phase NOT IN ('drained','never_started') AND (EXISTS (SELECT 1 FROM completion_continuation_attempt_source link WHERE link.attempt_id=a.attempt_id AND link.registration_id=?1) OR (a.operation!='activation' AND a.source_registration_id=?1) OR (a.association_completeness='unknown' AND a.source_registration_id=?1)) ORDER BY a.attempt_id").map_err(|e| e.to_string())?;
         statement
             .query_map([registration_id], |r| r.get(0))
             .map_err(|e| e.to_string())?
             .map(|r| r.map_err(|e| e.to_string()))
             .collect()
+    }
+
+    /// Whether the per-source list can be read as exhaustive. A pre-v25
+    /// activation in any session used by this source may have included it,
+    /// even when its original claim was already deleted. This is a read-only
+    /// historical check; schema/open never scans or hashes that history.
+    pub fn continuation_attempt_association_completeness(
+        &self,
+        registration_id: &str,
+    ) -> Result<&'static str, String> {
+        let uncertain: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1 FROM completion_continuation_source source
+                JOIN completion_continuation_attempt attempt
+                  ON attempt.domain_id=source.domain_id
+                WHERE source.registration_id=?1 AND attempt.operation='activation'
+                  AND attempt.association_completeness='unknown'
+                  AND (attempt.source_registration_id=source.registration_id
+                    OR EXISTS (SELECT 1 FROM completion_event_listener listener
+                               WHERE listener.event_id=source.event_id
+                                 AND listener.session_id=attempt.session_id)
+                    OR NOT EXISTS (SELECT 1 FROM completion_event_listener listener
+                                   WHERE listener.event_id=source.event_id)))",
+                [registration_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(if uncertain { "unknown" } else { "known" })
     }
 
     /// Bounded unresolved custody for the current root and its explicitly
@@ -479,6 +509,7 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
             return Err("source recovery retained custody bound".into());
         }
     }
+    let mut association_sources = Vec::new();
     if request.operation == "activation" {
         let driver: String = tx
             .query_row(
@@ -512,7 +543,7 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
         if !claim {
             return Err("activation requires exact current wake claim".into());
         }
-        let source = pending_notification_source_on(
+        association_sources = pending_notification_sources_on(
             tx,
             &domain,
             request
@@ -524,6 +555,7 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
                 .as_deref()
                 .expect("validated activation claim"),
         )?;
+        let source = association_sources.first().cloned();
         let revision = source
             .as_ref()
             .map(|id| notification_source_listener_revision_on(tx, id))
@@ -533,7 +565,21 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
             return Err("activation source differs from exact pending notification".into());
         }
     }
-    tx.execute("INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,source_registration_id,source_listener_revision,session_id,claim_token,phase,result_path,supervisor_authority_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved',?10,?11)", params![request.attempt_id,domain,request.owner_generation,request.operation,request.request_sha256,request.source_registration_id,request.source_listener_revision,request.session_id,request.claim_token,request.result_path,supervisor_authority_id]).map_err(|e| e.to_string())?;
+    tx.execute("INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,source_registration_id,source_listener_revision,session_id,claim_token,phase,result_path,supervisor_authority_id,association_completeness) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved',?10,?11,'known')", params![request.attempt_id,domain,request.owner_generation,request.operation,request.request_sha256,request.source_registration_id,request.source_listener_revision,request.session_id,request.claim_token,request.result_path,supervisor_authority_id]).map_err(|e| e.to_string())?;
+    // The scalar remains the first accepted source for the v24 wire and
+    // attempt identity. It is never an exhaustive association. The join is
+    // committed with the reservation and survives ACK and claim deletion.
+    for registration_id in association_sources {
+        let same_domain: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM completion_continuation_source WHERE registration_id=?1 AND domain_id=?2)",
+            params![registration_id,domain], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !same_domain {
+            return Err("activation source domain changed before reservation".into());
+        }
+        let listener_revision = notification_source_listener_revision_on(tx, &registration_id)?;
+        tx.execute("INSERT INTO completion_continuation_attempt_source(attempt_id,registration_id,listener_revision) VALUES(?1,?2,?3)", params![request.attempt_id,registration_id,listener_revision]).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -669,6 +715,17 @@ fn pending_notification_source_on(
     session: &str,
     token: &str,
 ) -> Result<Option<String>, String> {
+    Ok(pending_notification_sources_on(tx, domain, session, token)?
+        .into_iter()
+        .next())
+}
+
+fn pending_notification_sources_on(
+    tx: &Transaction<'_>,
+    domain: &str,
+    session: &str,
+    token: &str,
+) -> Result<Vec<String>, String> {
     // Start at the claimed mailbox rows. An inner join here can erase a v2
     // completion whose source or listener projection is missing, turning it
     // into apparent authority for a source-free activation.
@@ -728,7 +785,8 @@ fn pending_notification_source_on(
             ))
         })
         .map_err(|error| error.to_string())?;
-    let mut selected = None;
+    let mut selected = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for row in rows {
         let (
             source,
@@ -781,8 +839,10 @@ fn pending_notification_source_on(
         {
             return Err("pending v2 notification lacks exact accepted source authority".into());
         }
-        if selected.is_none() {
-            selected = source;
+        if let Some(source) = source {
+            if seen.insert(source.clone()) {
+                selected.push(source);
+            }
         }
     }
     Ok(selected)
@@ -2130,6 +2190,214 @@ mod notification_activation_tests {
         assert_eq!(v2_provenance, "v2");
         assert!(wake_claim_tx(&tx, "receiver").unwrap().is_some());
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn one_claim_retains_every_accepted_source_through_ack_and_drain() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let domain = db.completion_continuation_domain().unwrap().unwrap();
+        let listener = "11111111-1111-4111-8111-111111111111";
+        let mut seqs = Vec::new();
+        for event in ["first", "legacy", "second"] {
+            db.register_completion_event(CompletionEventRegistrationInput {
+                event_id: event,
+                delivery_mode: "async",
+                owner_session_id: Some("receiver"),
+                owner_invocation_uuid: Some(listener),
+                state_dir: "/private/source",
+                meta_path: "/private/source/meta.json",
+                log_path: "/private/source/log",
+                rc_path: "/private/source/rc",
+            })
+            .unwrap();
+            let triggered = db.trigger_completion_event(CompletionEventTriggerInput {
+                event_id: event,
+                payload_json: if event == "legacy" {
+                    r#"{"schema_version":2,"kind":"agent_bash_complete","meta":{}}"#
+                } else {
+                    r#"{"kind":"agent_bash_complete","completion_protocol":"completion-continuation-v2"}"#
+                },
+                state_dir: "/private/source",
+                meta_path: "/private/source/meta.json",
+                log_path: "/private/source/log",
+                rc_path: "/private/source/rc",
+                rc: 0,
+            }).unwrap();
+            seqs.push((
+                event,
+                triggered.mailbox_rows[0].seq,
+                triggered.event.payload_sha256.unwrap(),
+            ));
+        }
+        for (event, _, digest) in [&seqs[0], &seqs[2]] {
+            db.conn
+                .execute(
+                    "INSERT INTO completion_continuation_source
+                 (registration_id,domain_id,source_id,event_id,registration_digest,binding,phase,
+                  snapshot_sha256,outcome_sha256,payload_sha256,payload_byte_len)
+                 VALUES(?1,?2,?1,?1,'digest',x'00','accepted','snapshot','outcome',?3,1)",
+                    params![event, domain, digest],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO completion_continuation_notification
+                 (event_id,listener_id,policy,policy_origin,policy_recorded_at)
+                 VALUES(?1,?2,'notify',?3,'2026-01-01T00:00:00Z')",
+                    params![event, listener, format!("exact_admitted_binding:{event}")],
+                )
+                .unwrap();
+        }
+        for _ in 0..3 {
+            assert!(classify_one_pending_completion(&mut db.conn, "receiver", None).unwrap());
+        }
+        db.conn
+            .execute(
+                "INSERT INTO session_wake_claim
+             (session_id,claim_token,claimed_at,reason,auto_wake_count,
+              min_pending_seq_at_claim,max_pending_seq_at_claim)
+             VALUES('receiver','shared-token','2026-01-01T00:00:00Z','notify_idle',1,?1,?2)",
+                params![seqs[0].1, seqs[2].1],
+            )
+            .unwrap();
+        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+            .unwrap()
+            .unwrap();
+        let identity = SourceProcessIdentity {
+            pid: live.os_pid,
+            boot_id: live.os_boot_id,
+            starttime_ticks: live.os_pid_starttime_ticks,
+        };
+        let owner = CompletionDomainOwner {
+            protocol: PROTOCOL.into(),
+            domain_id: domain.clone(),
+            supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            guardian_identity: identity.clone(),
+            driver_identity: identity.clone(),
+            endpoint: "/private/owner".into(),
+        };
+        db.publish_completion_continuation_owner(&owner).unwrap();
+        let attempt = ContinuationAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: owner.owner_generation.clone(),
+            operation: "activation".into(),
+            request_sha256: "0".repeat(64),
+            source_registration_id: Some("first".into()),
+            source_listener_revision: Some(1),
+            session_id: Some("receiver".into()),
+            claim_token: Some("shared-token".into()),
+            result_path: "/private/result.json".into(),
+        };
+        let changes_before = db.conn.total_changes();
+        db.reserve_continuation_attempt(&attempt).unwrap();
+        assert_eq!(
+            db.conn.total_changes() - changes_before,
+            3,
+            "one attempt row and one retained association per accepted v2 source"
+        );
+        for source in ["first", "second"] {
+            assert_eq!(
+                db.pending_continuation_attempt_ids(source).unwrap(),
+                vec![attempt.attempt_id.clone()]
+            );
+            assert_eq!(
+                db.continuation_attempt_association_completeness(source)
+                    .unwrap(),
+                "known"
+            );
+            let recovery = db.completion_recovery_attempts(source).unwrap();
+            assert_eq!(recovery.len(), 1);
+            assert_eq!(recovery[0]["phase"], "reserved");
+            assert_eq!(recovery[0]["association_completeness"], "known");
+        }
+        assert_eq!(
+            db.pending_continuation_attempts_for_supervisor(&owner.supervisor_authority_id, 8)
+                .unwrap()
+                .len(),
+            1
+        );
+        db.mark_delivered(
+            "receiver",
+            None,
+            &[seqs[0].1, seqs[1].1, seqs[2].1],
+            "receiver-invocation",
+        )
+        .unwrap();
+        for source in ["first", "second"] {
+            assert_eq!(
+                db.pending_continuation_attempt_ids(source).unwrap(),
+                vec![attempt.attempt_id.clone()]
+            );
+        }
+        assert!(wake_claim(&db.conn, "receiver").unwrap().is_some());
+        let other_retirement_debt: (i64, i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT
+                (SELECT COUNT(*) FROM completion_continuation_source WHERE phase='registered'),
+                (SELECT COUNT(*) FROM completion_event_listener WHERE retirement_pending=1),
+                (SELECT COUNT(*) FROM mailbox WHERE delivered_at IS NULL)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(other_retirement_debt, (0, 0, 0));
+        assert!(
+            !db.close_idle_continuation_generation(&owner, None).unwrap(),
+            "ACK of the whole mixed claim cannot retire unresolved physical custody"
+        );
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.attach_continuation_custodian(&attempt, &identity)
+            .unwrap();
+        db.advance_continuation_attempt(&attempt, 3, "accepted", "starting", &identity)
+            .unwrap();
+        let receipt = "private fixture original custodian drain";
+        db.discharge_continuation_attempt(&attempt, &identity, receipt)
+            .unwrap();
+        assert!(wake_claim(&db.conn, "receiver").unwrap().is_none());
+        assert!(db.close_idle_continuation_generation(&owner, None).unwrap());
+        for source in ["first", "second"] {
+            assert!(
+                db.pending_continuation_attempt_ids(source)
+                    .unwrap()
+                    .is_empty()
+            );
+            let recovery = db.completion_recovery_attempts(source).unwrap();
+            assert_eq!(recovery.len(), 1);
+            assert_eq!(recovery[0]["phase"], "drained");
+            assert_eq!(recovery[0]["drain_receipt"], receipt);
+            assert_eq!(recovery[0]["association_completeness"], "known");
+        }
+
+        // A pre-v25 activation can have lost its claim. The scalar identifies
+        // one source, but cannot prove the second was absent from that claim.
+        db.conn
+            .execute(
+                "INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              source_registration_id,session_id,claim_token,phase,result_path,
+              supervisor_authority_id,integrated,drain_receipt)
+             VALUES('historical',?1,?2,'activation',?3,'first','receiver',
+                    'deleted-claim','drained','/private/old-result',?4,1,'old-receipt')",
+                params![
+                    domain,
+                    owner.owner_generation,
+                    "0".repeat(64),
+                    owner.supervisor_authority_id
+                ],
+            )
+            .unwrap();
+        for source in ["first", "second"] {
+            assert_eq!(
+                db.continuation_attempt_association_completeness(source)
+                    .unwrap(),
+                "unknown"
+            );
+        }
+        assert_eq!(db.completion_recovery_attempts("first").unwrap().len(), 2);
+        assert_eq!(db.completion_recovery_attempts("second").unwrap().len(), 1);
     }
 
     #[test]

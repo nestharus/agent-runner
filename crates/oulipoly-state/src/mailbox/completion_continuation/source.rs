@@ -277,8 +277,13 @@ impl MailboxDb {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT attempt_id,operation,phase,integrated,drain_receipt
-             FROM completion_continuation_attempt WHERE source_registration_id=?1
+                "SELECT attempt_id,operation,phase,integrated,drain_receipt,
+                    association_completeness
+             FROM completion_continuation_attempt AS attempt
+             WHERE EXISTS(SELECT 1 FROM completion_continuation_attempt_source AS link
+                          WHERE link.attempt_id=attempt.attempt_id AND link.registration_id=?1)
+                OR (operation!='activation' AND source_registration_id=?1)
+                OR (association_completeness='unknown' AND source_registration_id=?1)
              ORDER BY attempt_id LIMIT 1001",
             )
             .map_err(|e| e.to_string())?;
@@ -288,6 +293,7 @@ impl MailboxDb {
                     "attempt_id":r.get::<_,String>(0)?, "operation":r.get::<_,String>(1)?,
                     "phase":r.get::<_,String>(2)?, "integrated":r.get::<_,bool>(3)?,
                     "drain_receipt":r.get::<_,Option<String>>(4)?,
+                    "association_completeness":r.get::<_,String>(5)?,
                 }))
             })
             .map_err(|e| e.to_string())?;

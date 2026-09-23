@@ -177,6 +177,7 @@ fn recovery_read_from(
         "physical_drain":{
             "source_reported_original_tree_drained":payload["outcome"]["original_tree_drained"],
             "attempts":attempts,
+            "association_completeness":mailbox.continuation_attempt_association_completeness(required_string(&record, "registration_id")?)?,
             "assessment":"per_attempt_receipts_only"
         },
     }))
@@ -423,6 +424,8 @@ fn add_completion_projection(
     );
     value["outstanding_attempt_ids"] =
         json!(mailbox.pending_continuation_attempt_ids(&source.registration_id)?);
+    value["association_completeness"] =
+        json!(mailbox.continuation_attempt_association_completeness(&source.registration_id)?);
     Ok(())
 }
 

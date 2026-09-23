@@ -480,6 +480,18 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                 let kind: String = r.get(0)?;
                 let name: String = r.get(1)?;
                 let mut sql: String = r.get(2)?;
+                if name == "completion_continuation_attempt" {
+                    // Synthetic older-version fixtures may retain v25's
+                    // additive column while replaying v21's supervisor
+                    // column later. Both exact clauses are fingerprinted;
+                    // their order carries no authority.
+                    const ASSOCIATION_COLUMN: &str =
+                        ", association_completeness TEXT NOT NULL DEFAULT 'unknown'";
+                    if sql.contains(ASSOCIATION_COLUMN) {
+                        sql = sql.replace(ASSOCIATION_COLUMN, "");
+                        sql.push_str("; association_completeness TEXT NOT NULL DEFAULT 'unknown'");
+                    }
+                }
                 if name == "mailbox" {
                     const COLUMN: &str =
                         "completion_provenance TEXT NOT NULL DEFAULT 'unclassified'";
@@ -535,6 +547,11 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                 "CREATE TABLE mailbox(completion_provenance TEXT NOT NULL DEFAULT 'unclassified');",
             ).map_err(|e| e.to_string())?;
             expected.execute_batch(super::schema::COMPLETION_PROVENANCE_TRIGGER_SQL)
+                .map_err(|e| e.to_string())?;
+            expected.execute_batch("ALTER TABLE completion_continuation_attempt
+            ADD COLUMN association_completeness TEXT NOT NULL DEFAULT 'unknown';")
+                .map_err(|e| e.to_string())?;
+            expected.execute_batch(include_str!("../migrations/0025_completion_attempt_sources.sql"))
                 .map_err(|e| e.to_string())?;
             definitions(&expected)
         })
