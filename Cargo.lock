@@ -3132,6 +3132,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "oulipoly-state",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

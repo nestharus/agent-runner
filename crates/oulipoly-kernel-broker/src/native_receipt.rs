@@ -54,6 +54,8 @@ pub struct BoundNativeAuthority<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct VerifiedNativeReceipt {
     pub attempt_id: String,
+    /// Path in the guardian's immutable, digest-bound request, never a K claim.
+    pub state_path: PathBuf,
     pub accepted_snapshot_sha256: String,
     pub custodian_request_sha256: String,
     pub receipt_sha256: String,
@@ -159,7 +161,7 @@ pub fn verify(
     }
     let request_identity: RequestIdentity = serde_json::from_slice(&request_bytes)?;
     if request_identity.attempt != accepted.attempt
-        || request_identity.path.as_os_str().is_empty()
+        || !request_identity.path.is_absolute()
         || request_identity.recipe.is_null()
         || !same_named_regular_file(directory, REQUEST_NAME, request)?
         || !same_named_regular_file(directory, RECEIPT_NAME, receipt)?
@@ -171,6 +173,7 @@ pub fn verify(
     }
     Ok(VerifiedNativeReceipt {
         attempt_id: accepted.attempt.attempt_id.clone(),
+        state_path: request_identity.path,
         accepted_snapshot_sha256: evidence.accepted_sha256,
         custodian_request_sha256: evidence.custodian_request_sha256,
         receipt_sha256: bound.receipt_sha256.into(),
@@ -183,6 +186,7 @@ mod tests {
     use crate::accepted_grant::GrantRegistry;
     use crate::entry_registry::{EntryRecord, EntryRegistry};
     use crate::identity::PinnedProcess;
+    use crate::protocol::NativeKSpec;
     use crate::registry::{RootRecord, RootRegistry};
     use crate::work_registry::WorkRegistry;
     use oulipoly_state::completion_continuation::{PROTOCOL, SourceProcessIdentity};
@@ -291,6 +295,7 @@ mod tests {
         let host_namespace = File::open("/proc/self/ns/pid").unwrap();
         let runner_image = File::open("/proc/self/exe").unwrap();
         let receipt_sha = digest(&receipt_bytes);
+        let sidecar = File::open(&state_path).unwrap();
         let bound = BoundNativeAuthority {
             root_id: &root,
             domain_id: &owner.domain_id,
@@ -452,11 +457,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replay, first);
-        // No K transition can be inferred from the prepared broker record.
-        assert!(
-            reopened
-                .consume_native(
-                    &first.grant_id,
+        let k_spec = NativeKSpec {
+            protocol: "native-continuation-v1".into(),
+            grant_id: first.grant_id.clone(),
+            root_id: root.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            owner_generation: owner.owner_generation.clone(),
+            receipt_sha256: receipt_sha.clone(),
+        };
+        let wrong_k_spec = NativeKSpec {
+            grant_id: uuid::Uuid::new_v4().to_string(),
+            ..k_spec.clone()
+        };
+        let grant_path = grants_dir.join(format!("{}.json", first.grant_id));
+        let mut old_v4 = serde_json::to_value(&first).unwrap();
+        old_v4.as_object_mut().unwrap().remove("state_path");
+        old_v4.as_object_mut().unwrap().remove("state_file");
+        fs::write(&grant_path, serde_json::to_vec(&old_v4).unwrap()).unwrap();
+        let mut old_registry = GrantRegistry::open(&grants_dir).unwrap();
+        assert_eq!(
+            old_registry
+                .prepare_native(
                     &roots,
                     &entries,
                     &works,
@@ -466,7 +487,49 @@ mod tests {
                     &directory,
                     &request,
                     &receipt,
-                    &db,
+                    &root,
+                    &attempt.attempt_id,
+                    &owner.owner_generation,
+                    &receipt_sha,
+                )
+                .unwrap()
+                .grant_id,
+            first.grant_id
+        );
+        assert!(
+            old_registry
+                .verify_native_k(
+                    &k_spec,
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &sidecar,
+                )
+                .is_err()
+        );
+        fs::write(&grant_path, serde_json::to_vec(&first).unwrap()).unwrap();
+        reopened = GrantRegistry::open(&grants_dir).unwrap();
+        // No K transition can be inferred from the prepared broker record.
+        assert!(
+            reopened
+                .verify_native_k(
+                    &k_spec,
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &sidecar
                 )
                 .is_err()
         );
@@ -498,8 +561,8 @@ mod tests {
         );
         assert!(
             reopened
-                .consume_native(
-                    &uuid::Uuid::new_v4().to_string(),
+                .verify_native_k(
+                    &wrong_k_spec,
                     &roots,
                     &entries,
                     &works,
@@ -509,7 +572,7 @@ mod tests {
                     &directory,
                     &request,
                     &receipt,
-                    &db,
+                    &sidecar
                 )
                 .is_err()
         );
@@ -520,8 +583,8 @@ mod tests {
         };
         assert!(
             reopened
-                .consume_native(
-                    &first.grant_id,
+                .verify_native_k(
+                    &k_spec,
                     &roots,
                     &entries,
                     &works,
@@ -531,7 +594,7 @@ mod tests {
                     &directory,
                     &request,
                     &receipt,
-                    &db,
+                    &sidecar
                 )
                 .is_err()
         );
@@ -540,14 +603,14 @@ mod tests {
             "prepared"
         );
         fs::create_dir(dir.path().join("unrelated")).unwrap();
-        let unrelated_state = MailboxDb::open_completion_continuation_domain(
-            &dir.path().join("unrelated/pid-identity.db"),
-        )
-        .unwrap();
+        let unrelated_path = dir.path().join("unrelated/pid-identity.db");
+        let _unrelated_state =
+            MailboxDb::open_completion_continuation_domain(&unrelated_path).unwrap();
+        let unrelated_sidecar = File::open(&unrelated_path).unwrap();
         assert!(
             reopened
-                .consume_native(
-                    &first.grant_id,
+                .verify_native_k(
+                    &k_spec,
                     &roots,
                     &entries,
                     &works,
@@ -557,15 +620,44 @@ mod tests {
                     &directory,
                     &request,
                     &receipt,
-                    &unrelated_state,
+                    &unrelated_sidecar
+                )
+                .is_err()
+        );
+        // A copied sidecar has the exact same v28 row but a different inode.
+        let copied_path = dir.path().join("unrelated/copied.db");
+        rusqlite::Connection::open(&state_path)
+            .unwrap()
+            .execute("VACUUM INTO ?1", [copied_path.to_str().unwrap()])
+            .unwrap();
+        let copied_db = MailboxDb::open_read_only(&copied_path).unwrap();
+        assert_eq!(
+            copied_db.native_grant_binding(&attempt.attempt_id).unwrap(),
+            Some(bound_row.clone())
+        );
+        let copied_sidecar = File::open(&copied_path).unwrap();
+        assert!(
+            reopened
+                .verify_native_k(
+                    &k_spec,
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &copied_sidecar
                 )
                 .is_err()
         );
         fs::write(&request_path, b"changed before K").unwrap();
         assert!(
             reopened
-                .consume_native(
-                    &first.grant_id,
+                .verify_native_k(
+                    &k_spec,
                     &roots,
                     &entries,
                     &works,
@@ -575,14 +667,14 @@ mod tests {
                     &directory,
                     &request,
                     &receipt,
-                    &db,
+                    &sidecar
                 )
                 .is_err()
         );
         fs::write(&request_path, &request_bytes).unwrap();
-        let spent = reopened
-            .consume_native(
-                &first.grant_id,
+        let verified_k = reopened
+            .verify_native_k(
+                &k_spec,
                 &roots,
                 &entries,
                 &works,
@@ -592,14 +684,72 @@ mod tests {
                 &directory,
                 &request,
                 &receipt,
-                &db,
+                &sidecar,
             )
             .unwrap();
-        assert_eq!(spent.state, "consumed");
+        assert_eq!(verified_k.state, "prepared");
+        let foreign_guardian = PeerIdentity {
+            uid: peer.uid,
+            gid: peer.gid,
+            process: PinnedProcess::open(roots.live_roots().next().unwrap().init.host_pid).unwrap(),
+        };
         assert!(
             reopened
-                .consume_native(
-                    &first.grant_id,
+                .verify_native_k(
+                    &k_spec,
+                    &roots,
+                    &entries,
+                    &works,
+                    &foreign_guardian,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &sidecar,
+                )
+                .is_err()
+        );
+        for conflict in [
+            NativeKSpec {
+                root_id: uuid::Uuid::new_v4().to_string(),
+                ..k_spec.clone()
+            },
+            NativeKSpec {
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+                ..k_spec.clone()
+            },
+            NativeKSpec {
+                owner_generation: uuid::Uuid::new_v4().to_string(),
+                ..k_spec.clone()
+            },
+            NativeKSpec {
+                receipt_sha256: "b".repeat(64),
+                ..k_spec.clone()
+            },
+        ] {
+            assert!(
+                reopened
+                    .verify_native_k(
+                        &conflict,
+                        &roots,
+                        &entries,
+                        &works,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &directory,
+                        &request,
+                        &receipt,
+                        &sidecar,
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            reopened
+                .verify_native_k(
+                    &k_spec,
                     &roots,
                     &entries,
                     &works,
@@ -609,9 +759,9 @@ mod tests {
                     &directory,
                     &request,
                     &receipt,
-                    &db,
+                    &sidecar
                 )
-                .is_err()
+                .is_ok()
         );
         assert!(
             reopened
@@ -630,7 +780,7 @@ mod tests {
                     &owner.owner_generation,
                     &receipt_sha,
                 )
-                .is_err()
+                .is_ok()
         );
         assert!(
             db.native_worker_attach(&attempt.attempt_id)
@@ -653,13 +803,82 @@ mod tests {
                 .unwrap(),
             Some(bound_row)
         );
+        let restarted_grants = GrantRegistry::open(&grants_dir).unwrap();
         assert_eq!(
-            GrantRegistry::open(&grants_dir)
-                .unwrap()
+            restarted_grants
                 .native_record(&attempt.attempt_id)
                 .unwrap()
                 .state,
-            "consumed"
+            "prepared"
+        );
+        assert!(
+            restarted_grants
+                .verify_native_k(
+                    &k_spec,
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &sidecar,
+                )
+                .is_ok()
+        );
+        assert!(
+            restarted_state
+                .native_worker_attach(&attempt.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+        // A legacy spent v4 record remains spent on restart; this test does
+        // not create one through the now-closed native K transport.
+        let mut spent = first.clone();
+        spent.state = "consumed".into();
+        fs::write(
+            grants_dir.join(format!("{}.json", first.grant_id)),
+            serde_json::to_vec(&spent).unwrap(),
+        )
+        .unwrap();
+        let mut spent_registry = GrantRegistry::open(&grants_dir).unwrap();
+        assert!(
+            spent_registry
+                .verify_native_k(
+                    &k_spec,
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &sidecar,
+                )
+                .is_err()
+        );
+        assert!(
+            spent_registry
+                .prepare_native(
+                    &roots,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    &root,
+                    &attempt.attempt_id,
+                    &owner.owner_generation,
+                    &receipt_sha,
+                )
+                .is_err()
         );
         let duplicate_id = uuid::Uuid::new_v4().to_string();
         let duplicate_path = grants_dir.join(format!("{duplicate_id}.json"));

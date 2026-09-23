@@ -21,3 +21,4 @@ oulipoly-state = { path = "../oulipoly-state" }
 
 [dev-dependencies]
 tempfile.workspace = true
+rusqlite.workspace = true

@@ -321,12 +321,49 @@ pub struct NativePrepareSpec {
     pub receipt_sha256: String,
 }
 
+/// The lowercase k frame is reserved for native continuation. It cannot be
+/// decoded as Bash original-work K and supplies no command or argv. The only
+/// eventual executable/entry is the broker's pinned Runner image at
+/// `__completion-root-worker-v1`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeKSpec {
+    pub protocol: String,
+    pub grant_id: String,
+    pub root_id: String,
+    pub attempt_id: String,
+    pub owner_generation: String,
+    pub receipt_sha256: String,
+}
+
+/// Descriptor order: accepted-work directory, immutable request, accepted
+/// receipt, and the actual sidecar named by that request. This preflight wire
+/// is deliberately closed before grant consumption or worker launch.
+pub fn native_k_at(path: &Path, spec: &NativeKSpec, descriptors: [RawFd; 4]) -> io::Result<()> {
+    let response = send_native_descriptors(path, b'k', spec, descriptors)?;
+    // Until an authenticated attach/release protocol exists, even an
+    // unexpected positive broker response cannot be treated as launch.
+    Err(io::Error::other(format!(
+        "native K closed: {}",
+        response.trim_end()
+    )))
+}
+
 /// Descriptor order: exact accepted-work directory, immutable
 /// custodian-request.json, and native-continuation-accepted-v1.json.
 pub fn prepare_native_at(
     path: &Path,
     spec: &NativePrepareSpec,
     descriptors: [RawFd; 3],
+) -> io::Result<String> {
+    send_native_descriptors(path, b'N', spec, descriptors)
+}
+
+fn send_native_descriptors<T: serde::Serialize, const N: usize>(
+    path: &Path,
+    operation: u8,
+    spec: &T,
+    descriptors: [RawFd; N],
 ) -> io::Result<String> {
     let body = serde_json::to_vec(spec)?;
     if body.len() > 2048 {
@@ -336,7 +373,7 @@ pub fn prepare_native_at(
     let mut challenge = [0u8; 16];
     stream.read_exact(&mut challenge)?;
     let mut request = Vec::with_capacity(17 + body.len());
-    request.push(b'N');
+    request.push(operation);
     request.extend_from_slice(&challenge);
     request.extend_from_slice(&body);
     let mut iov = libc::iovec {
@@ -355,7 +392,7 @@ pub fn prepare_native_at(
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
         (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as usize;
-        std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast(), 3);
+        std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast(), N);
     }
     if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
         != request.len() as isize

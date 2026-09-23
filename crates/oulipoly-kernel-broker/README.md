@@ -168,16 +168,30 @@ attempt or evidence is refused. The guardian then binds that ID to accepted
 revision 2 through State v28 and uses indexed exact readback after an
 uncertain CAS. Broker fsync precedes State bind: a crash in between leaves an
 unbound, nonlaunchable broker debt; a crash after State commit leaves the one
-existing bound pair. The registry now has an uncalled native consume boundary:
-it rechecks the live guardian/root, the same named request and receipt bytes,
-and the exact v28 State binding before fsyncing `state = "consumed"`. A spent
-record remains spent after restart and cannot be replayed by `N` or consumed
-again. This is a one-use K prerequisite, not a native K wire or worker launch;
-the broker has no authenticated State path/attach transport yet. The guardian
-retains the prepared/bound attempt and returns an explicit attach-before-K
-contract; it never falls through to host-local `Command::spawn`. A dead
+existing bound pair. N also pins the actual sidecar pathname and inode named
+by the guardian's digest-bound request. A distinct challenged lowercase `k`
+frame carries the exact grant/root/attempt/owner generation and receipt digest
+plus four descriptors: accepted directory, request, receipt, and that sidecar.
+Its read-only preflight rechecks the live guardian/root, named bytes and
+inodes, and the exact v28 binding at the retained path. A different sidecar
+with copied rows refuses. Original-work uppercase K and its seven descriptors
+remain unchanged. The native frame has no argv or command; the only planned
+entry is the broker's pinned Runner image at `__completion-root-worker-v1`.
+
+Native k always returns `native K fixed Runner attach/release closed`. It does
+not consume v4, fork, attach v29, or release a pre-exec gate. Exact retries and
+broker restart repeat the same read-only decision; a lost reply cannot create
+an unaccounted worker. The old uncalled `consume_native` transition was
+removed because it accepted an arbitrary MailboxDb and permanently spent a
+grant without a worker recovery protocol. The guardian still retains the
+prepared/bound attempt and refuses host-local `Command::spawn`. A dead
 original guardian cannot recover an unbound grant without a later recovery
 protocol, so that case remains debt rather than a new grant.
+The N pathname/inode pin does not prove it was the inode of the guardian's
+already-open SQLite connection; State or the guardian must supply that exact
+connection provenance before a future K may have effects.
+Older prepared v4 records without the new sidecar pin can still replay the
+same N grant ID, but native k refuses them as retained debt.
 
 ## Remaining interfaces
 

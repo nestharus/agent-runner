@@ -4,6 +4,7 @@
 use crate::entry_registry::{EntryRegistry, ProcessStamp};
 use crate::identity::{PeerIdentity, PinnedProcess, host_proc_file};
 use crate::native_receipt::{BoundNativeAuthority, verify as verify_native_receipt};
+use crate::protocol::NativeKSpec;
 use crate::registry::RootRegistry;
 use crate::work_registry::WorkRegistry;
 use oulipoly_state::mailbox::{MailboxDb, NativeGrantBinding};
@@ -185,6 +186,12 @@ pub struct NativeGrantRecord {
     pub receipt: FileStamp,
     pub request_byte_len: u64,
     pub receipt_byte_len: u64,
+    /// The sidecar named by the guardian's digest-bound request at N. Older
+    /// v4 records remain readable debt but have no native K preflight.
+    #[serde(default)]
+    pub state_path: Option<PathBuf>,
+    #[serde(default)]
+    pub state_file: Option<FileStamp>,
     pub state: String,
 }
 
@@ -203,6 +210,28 @@ impl FileStamp {
             inode: metadata.ino(),
         })
     }
+}
+
+fn open_named_sidecar(path: &Path) -> io::Result<File> {
+    if !path.is_absolute() || !fs::symlink_metadata(path)?.is_file() {
+        return Err(io::Error::other(
+            "native sidecar is not an absolute regular file",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let named = fs::symlink_metadata(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file()
+        || !named.is_file()
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+    {
+        return Err(io::Error::other("native sidecar name changed"));
+    }
+    Ok(file)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -534,6 +563,15 @@ impl GrantRegistry {
                     || record.directory.inode == 0
                     || record.request.inode == 0
                     || record.receipt.inode == 0
+                    || record.state_path.is_some() != record.state_file.is_some()
+                    || record
+                        .state_path
+                        .as_ref()
+                        .is_some_and(|path| !path.is_absolute())
+                    || record
+                        .state_file
+                        .as_ref()
+                        .is_some_and(|stamp| stamp.inode == 0)
                     || record.request_byte_len > 4 * 1024 * 1024
                     || record.receipt_byte_len > 1024 * 1024
                     || !ids.insert(record.grant_id.clone())
@@ -609,18 +647,19 @@ impl GrantRegistry {
             .find(|r| r.attempt_id == attempt_id)
     }
 
-    /// The irreversible native K boundary. The broker supplies a live State
-    /// connection and the same pinned evidence used by N; a caller-supplied
-    /// binding or grant ID alone cannot spend the grant. Call this only once a
-    /// fixed gated worker launch is ready. A consumed record is never reset,
-    /// including after a lost reply or broker restart.
+    /// Read-only native K preflight. The guardian's N request names the State
+    /// path, and N retained that named file's inode. K must send that actual
+    /// descriptor. No caller-supplied MailboxDb or sidecar path is trusted.
+    /// This cannot consume or release a worker until broker-owned attach and
+    /// lost-reply recovery exist. The N pathname/inode observation is not yet
+    /// a State-origin attestation of the guardian's open SQLite connection.
     #[expect(
         clippy::too_many_arguments,
         reason = "independent broker, State, process, and file authorities"
     )]
-    pub fn consume_native(
-        &mut self,
-        grant_id: &str,
+    pub fn verify_native_k(
+        &self,
+        spec: &NativeKSpec,
         roots: &RootRegistry,
         entries: &EntryRegistry,
         works: &WorkRegistry,
@@ -630,7 +669,7 @@ impl GrantRegistry {
         directory: &File,
         request: &File,
         receipt: &File,
-        state: &MailboxDb,
+        sidecar: &File,
     ) -> io::Result<NativeGrantRecord> {
         if self.has_debt() || roots.has_debt() || entries.has_debt() || works.has_debt() {
             return Err(io::Error::other("native K registry debt"));
@@ -638,11 +677,19 @@ impl GrantRegistry {
         let record = self
             .native_records
             .iter()
-            .find(|r| r.grant_id == grant_id)
+            .find(|r| r.grant_id == spec.grant_id)
             .ok_or_else(|| io::Error::other("unknown native grant"))?
             .clone();
         if record.state != "prepared" {
             return Err(io::Error::other("native grant already spent"));
+        }
+        if spec.protocol != record.kind
+            || spec.root_id != record.root_id
+            || spec.attempt_id != record.attempt_id
+            || spec.owner_generation != record.owner_generation
+            || spec.receipt_sha256 != record.receipt_sha256
+        {
+            return Err(io::Error::other("native K identity/capability conflict"));
         }
         let entry = entries
             .record(&record.root_id)
@@ -680,6 +727,11 @@ impl GrantRegistry {
         };
         let verified = verify_native_receipt(caller, &bound, directory, request, receipt)?;
         if verified.attempt_id != record.attempt_id
+            || verified.state_path
+                != record
+                    .state_path
+                    .as_deref()
+                    .ok_or_else(|| io::Error::other("native K grant lacks sidecar provenance"))?
             || verified.accepted_snapshot_sha256 != record.accepted_snapshot_sha256
             || verified.custodian_request_sha256 != record.custodian_request_sha256
             || verified.receipt_sha256 != record.receipt_sha256
@@ -691,10 +743,20 @@ impl GrantRegistry {
         {
             return Err(io::Error::other("native K evidence changed since prepare"));
         }
+        let state_path = record.state_path.as_ref().unwrap();
+        let state_stamp = record.state_file.as_ref().unwrap();
+        let named = open_named_sidecar(state_path)?;
+        if FileStamp::of(&named)? != *state_stamp || FileStamp::of(sidecar)? != *state_stamp {
+            return Err(io::Error::other("native K sidecar path/inode conflict"));
+        }
+        let state = MailboxDb::open_read_only(state_path).map_err(io::Error::other)?;
         let binding: NativeGrantBinding = state
             .native_grant_binding(&record.attempt_id)
             .map_err(io::Error::other)?
             .ok_or_else(|| io::Error::other("native K State binding absent"))?;
+        if FileStamp::of(&open_named_sidecar(state_path)?)? != *state_stamp {
+            return Err(io::Error::other("native K sidecar changed during read"));
+        }
         if binding.attempt_id != record.attempt_id
             || binding.grant_id != record.grant_id
             || binding.protocol != record.kind
@@ -713,43 +775,7 @@ impl GrantRegistry {
         }
         root.init.verify()?;
         caller.process.verify()?;
-        self.consume_native_record(grant_id)
-    }
-
-    fn consume_native_record(&mut self, grant_id: &str) -> io::Result<NativeGrantRecord> {
-        if self.has_debt() {
-            return Err(io::Error::other("uncertain grant registry"));
-        }
-        let index = self
-            .native_records
-            .iter()
-            .position(|r| r.grant_id == grant_id)
-            .ok_or_else(|| io::Error::other("unknown native grant"))?;
-        if self.native_records[index].state != "prepared" {
-            return Err(io::Error::other("native grant already spent"));
-        }
-        let mut consumed = self.native_records[index].clone();
-        consumed.state = "consumed".into();
-        let path = self.directory.join(format!("{grant_id}.json"));
-        let temp = self.directory.join(format!("{grant_id}.tmp"));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temp)?;
-            serde_json::to_writer(&mut file, &consumed)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            fs::rename(&temp, &path)?;
-            File::open(&self.directory)?.sync_all()
-        })();
-        if let Err(error) = result {
-            self.poisoned = true;
-            return Err(error);
-        }
-        self.native_records[index] = consumed.clone();
-        Ok(consumed)
+        Ok(record)
     }
 
     pub fn has_debt(&self) -> bool {
@@ -831,6 +857,7 @@ impl GrantRegistry {
         }
         root.init.verify()?;
         caller.process.verify()?;
+        let state_file = open_named_sidecar(&verified.state_path)?;
         let existing = self.native_record(attempt_id);
         let record = NativeGrantRecord {
             version: 4,
@@ -854,10 +881,20 @@ impl GrantRegistry {
             receipt: FileStamp::of(receipt)?,
             request_byte_len: request.metadata()?.len(),
             receipt_byte_len: receipt.metadata()?.len(),
+            state_path: Some(verified.state_path),
+            state_file: Some(FileStamp::of(&state_file)?),
             state: "prepared".into(),
         };
         if let Some(existing) = existing {
-            if existing != &record {
+            // A source-only older v4 prepare may lack the sidecar pin. Keep
+            // its exact N lost-reply replay but never upgrade it in place to
+            // K provenance: only a fresh N record can carry that authority.
+            let mut comparable = record.clone();
+            if existing.state_path.is_none() && existing.state_file.is_none() {
+                comparable.state_path = None;
+                comparable.state_file = None;
+            }
+            if existing != &comparable {
                 return Err(io::Error::other(
                     "native grant replay conflicts with durable evidence",
                 ));
