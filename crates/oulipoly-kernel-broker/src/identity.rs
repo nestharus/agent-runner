@@ -132,6 +132,34 @@ pub fn boot_id() -> io::Result<String> {
         .to_owned())
 }
 
+/// Recovery can prove the recorded incarnation is gone when its numeric PID
+/// is absent, is a zombie, or now names a different boot/starttime/namespace.
+/// Observer errors other than absence remain uncertainty.
+pub fn observed_incarnation_gone(
+    host_pid: i32,
+    recorded_boot: &str,
+    recorded_starttime: u64,
+    recorded_namespace: (u64, u64),
+) -> io::Result<bool> {
+    if boot_id()? != recorded_boot {
+        return Ok(true);
+    }
+    let (starttime, state) = match proc_starttime(host_pid) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if starttime != recorded_starttime || state == b'Z' || state == b'X' {
+        return Ok(true);
+    }
+    let namespace = match host_proc_file(&format!("{host_pid}/ns/pid")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    Ok(namespace_identity(&namespace)? != recorded_namespace)
+}
+
 fn namespace_identity(file: &File) -> io::Result<(u64, u64)> {
     let stat = file.metadata()?;
     Ok((stat.dev(), stat.ino()))
@@ -220,6 +248,23 @@ impl PinnedProcess {
             return Err(io::Error::other("pidfd exited or poll failed"));
         }
         Ok(())
+    }
+
+    /// A pidfd pinned during this broker lifetime can prove that its exact
+    /// process exited without consulting a possibly reused numeric PID.
+    pub fn exited(&self) -> io::Result<bool> {
+        let mut pollfd = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        match rc {
+            0 => Ok(false),
+            1 if pollfd.revents & libc::POLLIN != 0 => Ok(true),
+            -1 => Err(io::Error::last_os_error()),
+            _ => Err(io::Error::other("pidfd state uncertain")),
+        }
     }
 
     pub fn namespace(&self) -> &File {

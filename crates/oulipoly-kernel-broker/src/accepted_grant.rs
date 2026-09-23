@@ -1,6 +1,6 @@
 //! Durable, one-use accepted-work preparation. The host guardian can submit
-//! its exact positive receipt, but no worker launch consumes this grant yet.
-//! A record here is debt, never proof of execution or physical drain.
+//! its exact positive receipt. A consumed record is durable launch debt, never
+//! by itself proof of execution or physical drain.
 use crate::entry_registry::{EntryRegistry, ProcessStamp};
 use crate::identity::{PeerIdentity, PinnedProcess};
 use crate::registry::RootRegistry;
@@ -85,11 +85,11 @@ pub struct GrantRecord {
     pub request_sha256: String,
     pub initiator: SourceIdentity,
     pub artifacts: GrantArtifacts,
-    /// Fsynced before any future namespace fork. Never reset on timeout.
+    /// Fsynced before a K namespace fork. Never reset on timeout.
     pub consumed: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileStamp {
     pub device: u64,
@@ -254,6 +254,56 @@ fn validate_artifacts(
 }
 
 impl GrantRegistry {
+    /// Revalidate every descriptor immediately before consuming a prepared H
+    /// grant. A caller cannot switch the accepted executable or receipt between
+    /// preparation and the irreversible launch transition.
+    pub fn validate_launch_artifacts(
+        &self,
+        grant_id: &str,
+        executable: &File,
+        intent: &File,
+        cwd: &File,
+        state_dir: &File,
+        accepted: &File,
+    ) -> io::Result<GrantRecord> {
+        let record = self
+            .records
+            .iter()
+            .find(|record| record.grant_id == grant_id && !record.consumed)
+            .ok_or_else(|| io::Error::other("unavailable one-use accepted grant"))?;
+        if record.artifacts.executable != FileStamp::of(executable)?
+            || record.artifacts.intent != FileStamp::of(intent)?
+            || record.artifacts.cwd != FileStamp::of(cwd)?
+            || record.artifacts.state_dir != FileStamp::of(state_dir)?
+            || record.artifacts.accepted != FileStamp::of(accepted)?
+            || !executable.metadata()?.is_file()
+            || !cwd.metadata()?.is_dir()
+            || !state_dir.metadata()?.is_dir()
+            || !same_file_in_directory(state_dir, ACCEPTED, accepted)?
+            || !same_file_in_directory(state_dir, INTENT, intent)?
+        {
+            return Err(io::Error::other(
+                "accepted launch descriptor identity changed",
+            ));
+        }
+        let accepted_bytes = read_bounded(accepted)?;
+        let intent_bytes = read_bounded(intent)?;
+        let receipt = validate_artifacts(
+            &accepted_bytes,
+            &intent_bytes,
+            &record.root_id,
+            &record.work_id,
+            &record.request_sha256,
+            &record.accepted_sha256,
+            &record.owner_generation,
+            &record.supervisor_authority_id,
+        )?;
+        if receipt.initiator != record.initiator {
+            return Err(io::Error::other("accepted source identity changed"));
+        }
+        Ok(record.clone())
+    }
+
     pub fn open(directory: impl AsRef<Path>) -> io::Result<Self> {
         let directory = directory.as_ref().to_path_buf();
         let mut records = Vec::new();
@@ -319,8 +369,8 @@ impl GrantRegistry {
     /// root. The positive receipt and intent are read through pinned descriptors
     /// from the guardian's accepted state directory. The caller supplies the
     /// digest of its in-memory positive receipt so a mutable file cannot alter
-    /// registration or initiator identity after acceptance. This prepares debt only;
-    /// no worker can execute through this method.
+    /// registration or initiator identity after acceptance. This prepares debt
+    /// only; execution requires the separate one-use K operation.
     #[expect(
         clippy::too_many_arguments,
         reason = "all acceptance bindings must be explicit"

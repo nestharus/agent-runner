@@ -1,7 +1,8 @@
 //! Durable identity for accepted work namespaces. Only trusted broker code may
 //! call `insert_prepared`, after the Runner guardian has positively accepted
 //! the exact work. No socket operation exposes registration to a workload.
-//! This module does not launch a worker or certify completion.
+//! The launch module uses this registry before worker pre-exec release; a
+//! work record alone does not certify execution or completion.
 use crate::identity::{PeerIdentity, PinnedProcess, boot_id};
 use crate::registry::{LiveRoot, RootRegistry};
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ pub struct WorkRecord {
     pub root_pidns_dev: u64,
     pub root_pidns_ino: u64,
     pub work_id: String,
-    /// Binder for a future broker launch's consumed positive grant. This field
+    /// Binder for a broker launch's consumed positive grant. This field
     /// alone is not authority; private classifier fixtures may synthesize it.
     #[serde(default)]
     pub accepted_grant_id: Option<String>,
@@ -233,7 +234,7 @@ impl WorkRegistry {
         )
     }
 
-    /// Future gated launch uses this form to couple the PID1 to its fsynced,
+    /// The gated launch uses this form to couple PID1 to its fsynced,
     /// consumed accepted-work grant. This method itself does not authenticate
     /// the caller or release the pre-exec gate.
     pub fn insert_prepared_granted(

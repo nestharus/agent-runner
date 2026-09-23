@@ -1,7 +1,7 @@
 //! One connection, one challenged request. Entry operations cannot select an
 //! executable, UID, namespace, or mount. The accepted-work guardian operation
 //! carries the initiator's already pinned executable and accepted descriptors.
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -61,6 +61,70 @@ pub struct AcceptedWorkSpec {
     pub request_sha256: String,
     pub accepted_sha256: String,
     pub owner_generation: String,
+}
+
+/// A prepared H grant is launched once by its original guardian. The seven
+/// descriptors are the five H artifacts, the worker control socket, and the
+/// read end of the worker capability pipe. The broker chooses the namespace,
+/// executable argument vector, and process credentials from the grant.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchAcceptedWorkSpec {
+    pub grant_id: String,
+}
+
+/// Read the exact broker work state. A response is only a drain certificate
+/// when the recorded PID1 is dead and its terminal receipt is valid.
+pub fn observe_accepted_work_at(path: &Path, grant_id: &str) -> io::Result<String> {
+    let id = uuid::Uuid::parse_str(grant_id).map_err(|_| io::Error::other("bad grant ID"))?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(33);
+    request.push(b'Q');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(id.as_bytes());
+    stream.write_all(&request)?;
+    read_response(stream)
+}
+
+pub fn launch_accepted_work_at(
+    path: &Path,
+    spec: &LaunchAcceptedWorkSpec,
+    descriptors: [RawFd; 7],
+) -> io::Result<String> {
+    let body = serde_json::to_vec(spec)?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(17 + body.len());
+    request.push(b'K');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: request.as_mut_ptr().cast(),
+        iov_len: request.len(),
+    };
+    let mut control = [0u8; 128];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as usize;
+        std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast(), 7);
+    }
+    if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+        != request.len() as isize
+    {
+        return Err(io::Error::other("short launch request; outcome uncertain"));
+    }
+    read_response(stream)
 }
 
 /// Descriptor order: accepted initiator executable, intent, cwd, state directory,

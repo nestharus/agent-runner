@@ -84,16 +84,31 @@ root PID1, the historical exact joined Runner child, owner generation,
 supervisor, work ID, request digest, and a
 consumed causal parent's grant and live namespace. It fsyncs prepared and
 one-use consumed records; malformed recovery stops the broker. A work record
-can carry its exact accepted grant ID. `H` only prepares durable debt. A pinned
-guardian records the accepted request as never forked after `H`; it does not
-enter the legacy direct `Command::spawn` path. There is still **no nested
-launch, worker gate, source/ACK or physical-drain receipt**. The broker does
-not treat a prepared record as execution or drain authority.
+can carry its exact accepted grant ID. `H` only prepares durable debt. The
+challenged `K` operation rechecks those five descriptors and the live accepted
+source, fsyncs one-use consumption, enters the exact root or causal parent
+namespace, creates one nested PID1, fsyncs its work record, and releases the
+fixed worker behind a pre-exec gate. PID1 remains the reaper and writes a
+terminal receipt after its last child has been reaped. The challenged `Q`
+operation reports `work-drained` only when that receipt matches and the exact
+PID1 is observed dead; a missing receipt or failed observer remains uncertain.
+Broker restarts can reattach live work or read the retained terminal receipt.
+No workload lifetime cutoff, NNP, sandbox, capability reduction, or user
+namespace substitution is imposed by `K`.
+
+The pinned guardian still records `H` as never-forked debt; it does **not yet
+call `K`**, adopt a broker worker handle, route cancellation, use `Q` for its
+result, or settle source/ACK and retirement. Thus the broker's positive launch
+is privately exercised through its protocol fixture, not normal paired work
+service. A consumed grant or work record alone is never reported as execution
+or drain authority. Terminal receipts do not themselves retire grants or work.
 Allocated attempts retain their existing `no_new_privs`/seccomp. The broker's
 `SO_PEERCRED` plus `SCM_CREDENTIALS` comparison excludes the private tested
 transferred-socket child PID namespace case; installation still needs a
-privileged host-path security review. The private fixture is a source/protocol
-test, not a host-root sudo or deployed continuity proof.
+privileged host-path proof. The user accepts deliberate malicious host-root
+tampering as outside the same-host trust boundary; this source makes no
+adversarial containment claim. The private fixture is a source/protocol test,
+not a host-root sudo or deployed continuity proof.
 
 ## Remaining interfaces
 
@@ -104,20 +119,18 @@ test, not a host-root sudo or deployed continuity proof.
   descriptor and a private fixture verifies that visible `/proc` replacement
   does not change those reads. A private adversarial probe also showed that
   root with `CAP_SYS_PTRACE` can reopen that descriptor through
-  `/proc/<broker>/fd` even after the broker sets nondumpable. Workload access
-  to broker FDs/memory and the host guardian/nested worker's independent host
-  identity bindings remain unresolved. Keep service-requiring
-  CLI, TTY, and GUI refusing until their remaining bindings exist. Current
-  supported entry is help/offline diagnostics.
-- Extend the positive `H` preparation into a one-use consumed grant and
-  broker-owned gated worker launch under a nested PID namespace/PID1. Transfer
-  the worker control and capability descriptors as part of that atomic
-  interface. Replace the guardian's local `Child`, session cancellation, and
-  session liveness drain model with a broker/PID1 control handle and physical
-  namespace-drain receipt, tied to source/ACK obligations. The unpinned
-  guardian still uses the legacy direct spawn; the pinned path cannot run work.
-  A work ID or `inside root` classification cannot grant execution. Replace
-  allocated-attempt NNP/seccomp only with that custody.
+  `/proc/<broker>/fd` even after the broker sets nondumpable. That deliberate
+  host-root tampering is outside the accepted trust boundary. Keep
+  service-requiring CLI, TTY, and GUI refusing until the guardian's positive
+  work handoff and identity bindings are integrated. Current supported entry
+  is help/offline diagnostics.
+- Replace the pinned guardian's local `Child`, session cancellation, and
+  session liveness drain model with the broker `K`/`Q` worker handle. Add
+  durable cancellation and worker terminal/result forwarding tied to exact
+  source/ACK obligations. The unpinned guardian still uses legacy direct
+  spawn; the pinned path still cannot run normal work. A work ID or `inside
+  root` classification cannot grant execution. Replace allocated-attempt
+  NNP/seccomp only when the complete custody path is paired and verified.
 - Reconcile host/local PID fields, adopted descendants, result ACK versus
   physical drain, and registry retirement across broker and WSL restart.
 - Reconcile this branch's sidecar v24 with AGE-353's separate v24 migration

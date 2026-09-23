@@ -1,12 +1,16 @@
 //! Opt-in host-root broker for the pinned guardian and one-use root child join.
 #[path = "root_join.rs"]
 mod root_join;
+#[path = "work_launch.rs"]
+mod work_launch;
 use oulipoly_kernel_broker::accepted_grant::GrantRegistry;
 use oulipoly_kernel_broker::entry_registry::{EntryRegistry, ProcessStamp};
 use oulipoly_kernel_broker::identity::{
     PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
 };
-use oulipoly_kernel_broker::protocol::{AcceptedWorkSpec, JoinSpec, OwnerWitness, ProcessWitness};
+use oulipoly_kernel_broker::protocol::{
+    AcceptedWorkSpec, JoinSpec, LaunchAcceptedWorkSpec, OwnerWitness, ProcessWitness,
+};
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use std::fs::{self, File};
@@ -88,6 +92,13 @@ enum RequestPayload {
     PrepareAcceptedWork {
         spec: AcceptedWorkSpec,
         descriptors: [File; 5],
+    },
+    LaunchAcceptedWork {
+        spec: LaunchAcceptedWorkSpec,
+        descriptors: [File; 7],
+    },
+    ObserveAcceptedWork {
+        grant_id: String,
     },
 }
 
@@ -187,9 +198,10 @@ fn recv_request(
     let valid_length = match request[0] {
         b'G' => read == 65,
         b'P' => read == 37,
+        b'Q' => read == 33,
         b'A' => read == 33,
         b'J' => (18..=48 * 1024 + 17).contains(&read),
-        b'V' | b'H' => (18..=2048 + 17).contains(&read),
+        b'V' | b'H' | b'K' => (18..=2048 + 17).contains(&read),
         _ => read == 17,
     };
     if !valid_length
@@ -201,6 +213,7 @@ fn recv_request(
     if invalid_ancillary
         || match request[0] {
             b'J' | b'H' => descriptors.len() != 5,
+            b'K' => descriptors.len() != 7,
             b'V' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
         }
@@ -234,6 +247,9 @@ fn recv_request(
         b'A' => RequestPayload::Read {
             root_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
+        b'Q' => RequestPayload::ObserveAcceptedWork {
+            grant_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+        },
         b'J' => RequestPayload::Join {
             spec: serde_json::from_slice(&request[17..read as usize])?,
             descriptors: descriptors
@@ -249,6 +265,12 @@ fn recv_request(
             descriptors: descriptors
                 .try_into()
                 .map_err(|_| io::Error::other("accepted-work descriptors"))?,
+        },
+        b'K' => RequestPayload::LaunchAcceptedWork {
+            spec: serde_json::from_slice(&request[17..read as usize])?,
+            descriptors: descriptors
+                .try_into()
+                .map_err(|_| io::Error::other("accepted launch descriptors"))?,
         },
         _ => RequestPayload::None,
     };
@@ -533,7 +555,7 @@ fn serve() -> io::Result<()> {
     }
     let host_namespace = host_proc_file("self/ns/pid")?;
     let mut registry = RootRegistry::open(&state)?;
-    let works = WorkRegistry::open(&works_path, &registry)?;
+    let mut works = WorkRegistry::open(&works_path, &registry)?;
     let entries_path = Path::new(&state).join("entries");
     if !entries_path.exists() {
         use std::os::unix::fs::DirBuilderExt;
@@ -543,8 +565,8 @@ fn serve() -> io::Result<()> {
         checked_root_path(&entries_path, true)?;
     }
     let mut entries = EntryRegistry::open(&entries_path)?;
-    // Prepared grants remain durable debt. No socket operation can consume a
-    // grant or launch a worker until the nested gate/drain handoff is complete.
+    // A prepared grant can only be consumed by the exact K launch. Its work
+    // record and terminal receipt remain separate durable obligations.
     let grants_path = Path::new(&state).join("grants");
     if !grants_path.exists() {
         use std::os::unix::fs::DirBuilderExt;
@@ -554,6 +576,14 @@ fn serve() -> io::Result<()> {
         checked_root_path(&grants_path, true)?;
     }
     let mut grants = GrantRegistry::open(&grants_path)?;
+    let terminal_path = Path::new(&state).join("terminals");
+    if !terminal_path.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&terminal_path)?;
+    }
+    if !fixture {
+        checked_root_path(&terminal_path, true)?;
+    }
     if let Ok(meta) = fs::symlink_metadata(&socket) {
         if !meta.file_type().is_socket() || meta.uid() != 0 {
             return Err(io::Error::other("unsafe existing socket"));
@@ -619,6 +649,35 @@ fn serve() -> io::Result<()> {
                     &spec.owner_generation,
                 )?;
                 Ok(format!("prepared-work {}\n", grant.grant_id))
+            } else if operation == b'K' {
+                let RequestPayload::LaunchAcceptedWork { spec, descriptors } = payload else {
+                    return Err(io::Error::other("invalid accepted launch payload"));
+                };
+                work_launch::launch(
+                    &spec.grant_id,
+                    descriptors,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &registry,
+                    &mut works,
+                    &entries,
+                    &mut grants,
+                    &terminal_path,
+                )
+            } else if operation == b'Q' {
+                let RequestPayload::ObserveAcceptedWork { grant_id } = payload else {
+                    return Err(io::Error::other("invalid accepted observation payload"));
+                };
+                work_launch::observe(
+                    &grant_id,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &works,
+                    &grants,
+                    &terminal_path,
+                )
             } else {
                 dispatch_authenticated(
                     operation,
