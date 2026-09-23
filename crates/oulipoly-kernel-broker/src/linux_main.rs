@@ -184,15 +184,16 @@ fn recv_request(
         }
         cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
     }
-    let expected_len = match request[0] {
-        b'G' => 65,
-        b'P' => 37,
-        b'A' => 33,
-        b'J' | b'V' => read,
-        _ => 17,
+    let valid_length = match request[0] {
+        b'G' => read == 65,
+        b'P' => read == 37,
+        b'A' => read == 33,
+        b'J' => (18..=48 * 1024 + 17).contains(&read),
+        b'V' | b'H' => (18..=2048 + 17).contains(&read),
+        _ => read == 17,
     };
-    if read != expected_len
-        || request[1..17] != challenge
+    if !valid_length
+        || request.get(1..17) != Some(challenge.as_slice())
         || msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
     {
         return Err(io::Error::other("invalid challenged request"));
@@ -233,17 +234,17 @@ fn recv_request(
         b'A' => RequestPayload::Read {
             root_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
-        b'J' if read > 17 && read <= 48 * 1024 + 17 => RequestPayload::Join {
+        b'J' => RequestPayload::Join {
             spec: serde_json::from_slice(&request[17..read as usize])?,
             descriptors: descriptors
                 .try_into()
                 .map_err(|_| io::Error::other("join descriptors"))?,
         },
-        b'V' if read > 17 && read <= 2048 + 17 => RequestPayload::VerifyOwner {
+        b'V' => RequestPayload::VerifyOwner {
             witness: serde_json::from_slice(&request[17..read as usize])?,
             socket: descriptors.remove(0),
         },
-        b'H' if read > 17 && read <= 2048 + 17 => RequestPayload::PrepareAcceptedWork {
+        b'H' => RequestPayload::PrepareAcceptedWork {
             spec: serde_json::from_slice(&request[17..read as usize])?,
             descriptors: descriptors
                 .try_into()
