@@ -436,16 +436,21 @@ fn verify_owner_socket(
             || grant.joined_child != *joined_child
             || grant.supervisor_authority_id != witness.supervisor_id
             || witness.owner_generation.as_deref() != Some(&grant.owner_generation)
-            || witness.registration_authority_sha256.as_deref()
-                != Some(&helper.registration_authority_sha256)
+        {
+            return Err(io::Error::other("owner helper grant incarnation mismatch"));
+        }
+        if witness.registration_authority_sha256.as_deref()
+            != Some(&helper.registration_authority_sha256)
             || witness.owner_session_id.as_deref() != Some(helper.owner_session_id.as_str())
             || witness.owner_invocation_uuid.as_deref()
                 != Some(helper.owner_invocation_uuid.as_str())
-            || !helper.matches_live_executable(&peer.process)?
         {
             return Err(io::Error::other(
-                "owner helper grant, session, or image mismatch",
+                "owner helper registration witness mismatch",
             ));
+        }
+        if !helper.matches_live_executable(&peer.process)? {
+            return Err(io::Error::other("owner helper pinned image mismatch"));
         }
         work.init.verify()?;
     }

@@ -96,7 +96,7 @@ fn hello(endpoint: &Path) -> Result<CompletionDomainOwner, String> {
     let owner: CompletionDomainOwner =
         serde_json::from_slice(&response).map_err(|e| e.to_string())?;
     verify_owner_peer(&socket, &owner)
-        .map_err(|_| "completion hello process identity mismatch".to_owned())?;
+        .map_err(|error| format!("completion hello process identity mismatch: {error}"))?;
     Ok(owner)
 }
 

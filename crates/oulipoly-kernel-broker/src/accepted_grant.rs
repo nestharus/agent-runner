@@ -98,11 +98,35 @@ impl SealedHelper {
     pub fn matches_live_executable(&self, process: &PinnedProcess) -> io::Result<bool> {
         process.verify()?;
         let executable = host_proc_file(&format!("{}/exe", process.host_pid))?;
-        let stamp = FileStamp::of(&executable)?;
-        let matches = stamp == self.image && image_digest(&executable)? == self.sha256;
+        let matches = matches_pinned_image(&executable, &self.image, &self.sha256)?;
         process.verify()?;
         Ok(matches)
     }
+}
+
+fn matches_pinned_image(file: &File, pinned: &FileStamp, sha256: &str) -> io::Result<bool> {
+    let stamp = FileStamp::of(file)?;
+    // Bash executes its handle-bound helper from a sealed memfd. Its inode
+    // differs from the on-disk H snapshot, but the executable must still
+    // have those exact bytes and be unable to change after V.
+    if stamp != *pinned && !sealed_executable(file)? {
+        return Ok(false);
+    }
+    Ok(image_digest(file)? == sha256)
+}
+
+fn sealed_executable(file: &File) -> io::Result<bool> {
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EINVAL) {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    const REQUIRED: i32 =
+        libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    Ok(seals & REQUIRED == REQUIRED)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1055,6 +1079,27 @@ mod tests {
         )
         .unwrap();
         assert!(GrantRegistry::open(dir.path()).is_err());
+    }
+
+    #[test]
+    fn sealed_helper_image_requires_exact_bytes_and_immutable_memfd() {
+        let name = c"age319-sealed-helper-test";
+        let raw = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
+        assert!(raw >= 0);
+        let mut memfd = unsafe { File::from_raw_fd(raw) };
+        memfd.write_all(b"pinned-runner-image").unwrap();
+        let source = tempfile::tempfile().unwrap();
+        let different_stamp = FileStamp::of(&source).unwrap();
+        let digest = image_digest(&memfd).unwrap();
+        assert!(!matches_pinned_image(&memfd, &different_stamp, &digest).unwrap());
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seals) }, 0);
+        assert!(matches_pinned_image(&memfd, &different_stamp, &digest).unwrap());
+        assert!(!matches_pinned_image(&memfd, &different_stamp, &"00".repeat(32)).unwrap());
+        assert!(matches_pinned_image(&memfd, &FileStamp::of(&memfd).unwrap(), &digest).unwrap());
     }
 
     #[test]
