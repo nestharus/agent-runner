@@ -426,14 +426,9 @@ fn verify_owner_socket(
             || witness.owner_generation.as_deref() != Some(&grant.owner_generation)
             || witness.registration_authority_sha256.as_deref()
                 != Some(&helper.registration_authority_sha256)
-            || witness
-                .owner_session_id
-                .as_ref()
-                .is_some_and(|session| session != &helper.owner_session_id)
-            || witness
-                .owner_invocation_uuid
-                .as_ref()
-                .is_some_and(|invocation| invocation != &helper.owner_invocation_uuid)
+            || witness.owner_session_id.as_deref() != Some(helper.owner_session_id.as_str())
+            || witness.owner_invocation_uuid.as_deref()
+                != Some(helper.owner_invocation_uuid.as_str())
             || !helper.matches_live_executable(&peer.process)?
         {
             return Err(io::Error::other(

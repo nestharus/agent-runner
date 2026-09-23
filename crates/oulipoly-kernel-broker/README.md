@@ -61,9 +61,12 @@ helper. The normal owner socket and live guardian/driver checks still apply.
 Missing claims, old v2 grants, a different work or image, and incomplete work
 placement refuse. New brokers read v2 and v3 grants; old brokers refuse v3 on
 restart, so upgrading this broker is a versioned on-disk compatibility step.
-The accepted intent binds the session and invocation to that authority.
-Optional ambient session/invocation claims, when present, must agree with the
-grant; their absence is valid when Bash resolved the owner without markers.
+The accepted intent binds the session and invocation to that authority. The
+helper must present both exact owner claims, including after broker restart.
+An intent with any native owner field but an incomplete helper, session,
+invocation, or authority set refuses H instead of receiving a v2 grant.
+Standalone work with no native owner fields retains the v2 H/K path, including
+when it has a delivery-helper snapshot.
 The Runner's native registration authority remains the separate one-use
 session permission.
 The guardian's challenged `B` readback verifies that a new context is the

@@ -405,21 +405,19 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
 
     let work_id = "accepted-h";
     let cwd = temp.path();
-    let helper_metadata = if helper_probe {
-        let source = std::env::current_exe().unwrap();
-        let helper = work_state.join("delivery-helper");
-        fs::copy(&source, &helper).unwrap();
+    let source_image = std::env::current_exe().unwrap();
+    let helper = work_state.join("delivery-helper");
+    fs::copy(&source_image, &helper).unwrap();
+    if helper_probe {
         let fake = work_state.join("fake-helper");
-        fs::copy(&source, &fake).unwrap();
-        Some(serde_json::json!({
-            "path": helper, "device": fs::metadata(&helper).unwrap().dev(),
-            "inode": fs::metadata(&helper).unwrap().ino(),
-            "size": fs::metadata(&helper).unwrap().len(),
-            "sha256": digest(&fs::read(&helper).unwrap())
-        }))
-    } else {
-        None
-    };
+        fs::copy(&source_image, &fake).unwrap();
+    }
+    let helper_metadata = serde_json::json!({
+        "path": helper, "device": fs::metadata(&helper).unwrap().dev(),
+        "inode": fs::metadata(&helper).unwrap().ino(),
+        "size": fs::metadata(&helper).unwrap().len(),
+        "sha256": digest(&fs::read(&helper).unwrap())
+    });
     let intent = serde_json::to_vec(&serde_json::json!({
         "protocol": "original-work-v1", "work_id": work_id, "root_id": root_id,
         "handle": work_id, "state_root": temp.path(),
@@ -600,6 +598,84 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
     assert_eq!(fs::read_dir(state.join("grants")).unwrap().count(), 0);
 
     if helper_probe {
+        // Rebind each partial intent to a matching positive acceptance. H
+        // must refuse the incomplete native owner set itself, before it can
+        // persist a v2 grant that K would be able to launch.
+        for fields in 2..15_u8 {
+            let mut partial: serde_json::Value = serde_json::from_slice(&intent).unwrap();
+            let meta = partial["meta"].as_object_mut().unwrap();
+            for (bit, key) in [
+                (1, "delivery_helper"),
+                (2, "owner_session_id"),
+                (4, "owner_invocation_uuid"),
+            ] {
+                if fields & bit == 0 {
+                    meta.remove(key);
+                }
+            }
+            if fields & 8 == 0 {
+                partial
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("registration_authority");
+            }
+            let partial_intent = serde_json::to_vec(&partial).unwrap();
+            let mut partial_receipt: serde_json::Value = serde_json::from_slice(&accepted).unwrap();
+            partial_receipt["request_sha256"] = digest(&partial_intent).into();
+            let partial_accepted = serde_json::to_vec(&partial_receipt).unwrap();
+            fs::write(work_state.join("root-work-intent-v1.json"), &partial_intent).unwrap();
+            fs::write(
+                work_state.join("root-work-accepted-v1.json"),
+                &partial_accepted,
+            )
+            .unwrap();
+            let partial_spec = AcceptedWorkSpec {
+                root_id: spec.root_id.clone(),
+                work_id: spec.work_id.clone(),
+                request_sha256: digest(&partial_intent),
+                accepted_sha256: digest(&partial_accepted),
+                owner_generation: spec.owner_generation.clone(),
+            };
+            let refused =
+                protocol::prepare_accepted_work_at(&socket, &partial_spec, descriptors).unwrap();
+            assert!(
+                refused.contains("incomplete sealed helper owner binding"),
+                "fields {fields:04b}: {refused}"
+            );
+            assert_eq!(fs::read_dir(state.join("grants")).unwrap().count(), 0);
+            assert_eq!(fs::read_dir(state.join("works")).unwrap().count(), 0);
+        }
+        let (_guardian_control, worker_control) = UnixStream::pair().unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let capability = unsafe { File::from_raw_fd(pipe[0]) };
+        drop(unsafe { File::from_raw_fd(pipe[1]) });
+        let launch = protocol::launch_accepted_work_at(
+            &socket,
+            &LaunchAcceptedWorkSpec {
+                grant_id: uuid::Uuid::new_v4().to_string(),
+            },
+            [
+                descriptors[0],
+                descriptors[1],
+                descriptors[2],
+                descriptors[3],
+                descriptors[4],
+                worker_control.as_raw_fd(),
+                capability.as_raw_fd(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            launch.contains("unavailable one-use accepted grant"),
+            "{launch}"
+        );
+        assert_eq!(fs::read_dir(state.join("works")).unwrap().count(), 0);
+        fs::write(work_state.join("root-work-intent-v1.json"), &intent).unwrap();
+        fs::write(work_state.join("root-work-accepted-v1.json"), &accepted).unwrap();
         let helper = work_state.join("delivery-helper");
         let file = File::options()
             .read(true)
@@ -1386,10 +1462,25 @@ fn sealed_helper_from_consumed_work_attests_owner() {
             return;
         }
         verify(&witness).unwrap();
-        let mut resolved_without_markers = witness.clone();
-        resolved_without_markers.owner_session_id = None;
-        resolved_without_markers.owner_invocation_uuid = None;
-        verify(&resolved_without_markers).unwrap();
+        let mut missing = witness.clone();
+        missing.owner_session_id = None;
+        assert!(
+            verify(&missing).is_err(),
+            "missing pinned session was admitted"
+        );
+        let mut missing = witness.clone();
+        missing.owner_invocation_uuid = None;
+        assert!(
+            verify(&missing).is_err(),
+            "missing pinned invocation was admitted"
+        );
+        let mut missing = witness.clone();
+        missing.owner_session_id = None;
+        missing.owner_invocation_uuid = None;
+        assert!(
+            verify(&missing).is_err(),
+            "missing owner identity was admitted"
+        );
         let mut wrong = witness.clone();
         wrong.root_id = uuid::Uuid::new_v4().to_string();
         assert!(verify(&wrong).is_err());

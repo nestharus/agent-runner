@@ -73,7 +73,7 @@ struct IntentMeta {
     delivery_helper: Option<HelperProvenance>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct HelperProvenance {
     path: PathBuf,
     device: u64,
@@ -229,15 +229,22 @@ fn sealed_helper(
     runner_image: &File,
 ) -> io::Result<Option<SealedHelper>> {
     let meta = &intent.meta;
+    // Standalone original work can include a delivery-helper snapshot, but
+    // carries no native owner permission. Once any native owner field is
+    // present, H must pin the complete set before K can launch the work.
+    if meta.owner_session_id.is_none()
+        && meta.owner_invocation_uuid.is_none()
+        && intent.registration_authority.is_none()
+    {
+        return Ok(None);
+    }
     let (Some(provenance), Some(session), Some(invocation), Some(authority)) = (
         &meta.delivery_helper,
         &meta.owner_session_id,
         &meta.owner_invocation_uuid,
         &intent.registration_authority,
     ) else {
-        // Standalone Bash work has no native owner/session permission. Keep
-        // its original H/K meaning without inventing helper hello authority.
-        return Ok(None);
+        return Err(io::Error::other("incomplete sealed helper owner binding"));
     };
     if session.is_empty()
         || uuid::Uuid::parse_str(invocation).is_err()
@@ -850,6 +857,47 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn partial_native_owner_fields_refuse_instead_of_downgrading_to_v2() {
+        let state_dir = File::open("/").unwrap();
+        let runner_image = File::open("/proc/self/exe").unwrap();
+        let provenance = HelperProvenance {
+            path: PathBuf::from("/not-opened/work/delivery-helper"),
+            device: 1,
+            inode: 1,
+            size: 1,
+            sha256: "11".repeat(32),
+            interpreter: None,
+        };
+        for fields in 1..15_u8 {
+            let intent = IntentIdentity {
+                protocol: "original-work-v1".into(),
+                work_id: "work".into(),
+                root_id: uuid::Uuid::new_v4().to_string(),
+                handle: "work".into(),
+                state_root: PathBuf::from("/not-opened"),
+                meta: IntentMeta {
+                    cwd: PathBuf::from("/"),
+                    delivery_helper: (fields & 1 != 0).then(|| provenance.clone()),
+                    owner_session_id: (fields & 2 != 0).then(|| "session".into()),
+                    owner_invocation_uuid: (fields & 4 != 0)
+                        .then(|| uuid::Uuid::new_v4().to_string()),
+                },
+                registration_authority: (fields & 8 != 0).then(|| b"11".repeat(32)),
+            };
+            let result = sealed_helper(&state_dir, &intent, &runner_image);
+            if fields == 1 {
+                assert!(result.unwrap().is_none(), "standalone helper snapshot");
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "incomplete sealed helper owner binding",
+                    "fields {fields:04b}"
+                );
+            }
+        }
     }
     use serde_json::json;
     use std::os::unix::fs::symlink;
