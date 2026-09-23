@@ -734,6 +734,7 @@ fn guardian(
             &mut root_authorities,
             &mut root_supervisor,
             &mut pending,
+            pinned.is_some(),
         );
         // Requests, especially cancellation, are admitted before this pass may
         // issue an execution grant. A cancel already visible to the guardian
@@ -859,6 +860,7 @@ fn retain_pending_requests(
     root_authorities: &mut super::original_work::RootAuthorities,
     root_supervisor: &mut super::root_supervisor::RootSupervisor,
     pending: &mut Vec<ControlRequest>,
+    kernel_pinned: bool,
 ) {
     for request in pending.drain(..pending.len().min(8)) {
         match request {
@@ -873,10 +875,17 @@ fn retain_pending_requests(
             ControlRequest::Work(request) => {
                 let authorized = match &request.submission.registration {
                     super::original_work::WorkRegistration::Root => {
-                        if let Some(parent_work_id) = root_supervisor.original_parent_for_peer(
-                            &request.submission.root_authority.root_id,
-                            &request.peer,
-                        ) {
+                        if kernel_pinned {
+                            // Pinned control consumed a one-use T ticket for
+                            // exact Root scope before queueing this request.
+                            root_authorities
+                                .authorize_capability(owner, &request.submission.root_authority)
+                        } else if let Some(parent_work_id) = root_supervisor
+                            .original_parent_for_peer(
+                                &request.submission.root_authority.root_id,
+                                &request.peer,
+                            )
+                        {
                             Err(format!(
                                 "paired peer is inside active parent {parent_work_id}; exact nested authority is required"
                             ))

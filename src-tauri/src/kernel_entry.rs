@@ -211,6 +211,10 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
             crate::completion_owner::join_private_accepted_work_fixture()?;
             return Ok(ExitCode::SUCCESS);
         }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::args().nth(1).as_deref() == Some("__age319-private-bash-work-v1") {
+            return private_bash_work();
+        }
         Ok(crate::process_entrypoint())
     })();
     Some(match result {
@@ -220,6 +224,20 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
             ExitCode::FAILURE
         }
     })
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_bash_work() -> Result<ExitCode, String> {
+    crate::completion_owner::join_private_accepted_work_fixture()?;
+    let bash =
+        std::env::var("AGE319_PRIVATE_BASH_IMAGE").map_err(|_| "private Bash image missing")?;
+    let script =
+        std::env::var("AGE319_PRIVATE_WORK_SCRIPT").map_err(|_| "private work script missing")?;
+    let exit = std::process::Command::new(bash)
+        .args(["run", "--delivery", "async", "--", "/bin/sh", "-c", &script])
+        .status()
+        .map_err(|error| error.to_string())?;
+    Ok(ExitCode::from(exit.code().unwrap_or(70) as u8))
 }
 
 pub(crate) fn host_entry() -> Option<ExitCode> {
@@ -280,7 +298,16 @@ fn supported_host_mode() -> Result<(), String> {
                 .map_err(|_| "non-UTF8 CLI argument".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if !protocol::supported_entry_args(&args) {
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let private_bash_fixture = args == ["__age319-private-bash-work-v1"]
+        && unsafe { libc::geteuid() } == 0
+        && std::fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+        && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some();
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    let private_bash_fixture = false;
+    if !private_bash_fixture && !protocol::supported_entry_args(&args) {
         return Err(
             "unsupported kernel CLI mode: only help and offline diagnostics are admitted".into(),
         );

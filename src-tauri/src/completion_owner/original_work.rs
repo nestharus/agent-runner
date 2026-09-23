@@ -3,10 +3,11 @@
 //! Durable intent lives in the exact agent-bash handle directory before this
 //! module can accept a request. Acceptance is exclusive and effects-possible
 //! acceptance is never replayed. The unpinned guardian owns legacy worker
-//! custody; the broker-pinned guardian prepares a grant but cannot fork work.
+//! custody; the broker-pinned guardian delegates its one accepted launch and
+//! physical drain observation to the host broker.
 
 use super::linux::identity;
-use oulipoly_kernel_broker::protocol::{self, AcceptedWorkSpec};
+use oulipoly_kernel_broker::protocol::{self, AcceptedWorkSpec, LaunchAcceptedWorkSpec};
 use oulipoly_state::completion_continuation::SourceProcessIdentity;
 use oulipoly_state::diagnostic_recorder::{
     DiagnosticPhase, PhaseObservation, SpanStart, process_recorder,
@@ -34,6 +35,7 @@ pub(super) const EXECUTOR_ARG: &str = "__root-original-work-v1";
 pub(super) const ACCEPTED_FILE: &str = "root-work-accepted-v1.json";
 pub(super) const RESULT_FILE: &str = "root-work-result-v1.json";
 const CANCEL_FILE: &str = "root-work-cancel-v1.json";
+const BROKER_DRAIN_FILE: &str = "root-work-broker-drain-v1.json";
 pub(super) const FD_COUNT: usize = 4;
 const MAX_INTENT_BYTES: u64 = 1024 * 1024;
 const RETRY_BASE: Duration = Duration::from_millis(50);
@@ -271,6 +273,18 @@ struct ResultReceipt<'a> {
     detail: Option<&'a str>,
 }
 
+#[derive(Serialize)]
+struct BrokerDrainReceipt<'a> {
+    protocol: &'a str,
+    root_id: &'a str,
+    work_id: &'a str,
+    grant_id: &'a str,
+    work_incarnation: &'a str,
+    worker_local_pid: i32,
+    worker_wait_status: i32,
+    physical_tree_drained: bool,
+}
+
 #[derive(Default, Deserialize)]
 struct TerminalSnapshot {
     state: Option<String>,
@@ -496,7 +510,13 @@ impl RootAuthorities {
 struct OriginalOperation {
     submission: WorkSubmission,
     intent: IntentIdentity,
-    worker: Child,
+    worker: Option<Child>,
+    /// Present only for the one-use broker launch. This is retained even when
+    /// K's response is lost: Q may resolve it, but K is never retried.
+    kernel_grant: Option<String>,
+    kernel_incarnation: Option<String>,
+    kernel_worker_local_pid: Option<i32>,
+    kernel_drain_recorded: bool,
     worker_identity: Option<SourceProcessIdentity>,
     worker_session: i64,
     control: UnixStream,
@@ -516,6 +536,8 @@ struct OriginalOperation {
     terminal_observed: bool,
     worker_wait_status: Option<i32>,
     cancellation_sent: bool,
+    broker_cancel_sent: bool,
+    broker_cancel_retry: RetrySchedule,
     session_signal_sent: bool,
     cancellation_cause: Option<String>,
     cancellation_requester: Option<SourceProcessIdentity>,
@@ -609,10 +631,9 @@ impl OriginalWorkSupervisor {
                 && operation.submission.work_id == parent_work_id
                 && capability_matches(&operation.child_capability_hash, parent_capability)
                 && !operation.admission_closed
-                && operation
-                    .worker_identity
-                    .as_ref()
-                    .is_some_and(|identity| exact_descendant(peer, identity))
+                && operation.worker_identity.as_ref().is_some_and(|identity| {
+                    operation.kernel_grant.is_some() || exact_descendant(peer, identity)
+                })
         })
     }
 
@@ -652,6 +673,7 @@ impl OriginalWorkSupervisor {
     pub fn worker_pids(&self) -> Vec<i64> {
         self.active
             .iter()
+            .filter(|operation| operation.worker.is_some())
             .map(|operation| operation.worker_session)
             .collect()
     }
@@ -659,6 +681,7 @@ impl OriginalWorkSupervisor {
     pub fn live_worker_pids(&self) -> Vec<i64> {
         self.active
             .iter()
+            .filter(|operation| operation.worker.is_some())
             .filter(|operation| !operation.terminal_observed)
             .filter_map(|operation| operation.worker_identity.as_ref())
             .filter(|worker| identity(worker.pid).as_ref() == Ok(worker))
@@ -870,10 +893,6 @@ impl OriginalWorkSupervisor {
             }
         }
         if self.kernel_pinned {
-            // This branch is deliberately the only post-acceptance path for a
-            // broker-bound guardian. Until the nested PID1/control/drain
-            // interface exists, preparing a positive grant cannot release a
-            // second worker through the legacy direct-spawn path.
             let prepared = prepare_kernel_grant(
                 owner,
                 &request.submission,
@@ -883,24 +902,135 @@ impl OriginalWorkSupervisor {
                 &cwd,
                 &state_dir,
             );
-            let detail = match prepared {
-                Ok(grant) => {
-                    format!("kernel accepted grant {grant} prepared; nested launch is disabled")
+            let grant = match prepared {
+                Ok(grant) => grant,
+                Err(error) => {
+                    let detail = format!("kernel accepted grant preparation uncertain: {error}");
+                    self.never_forked.push(NeverForkedOperation {
+                        submission: request.submission.clone(),
+                        intent,
+                        state_dir,
+                        result_nonce: new_capability(),
+                        detail: detail.clone(),
+                        handle_terminalized: false,
+                        result_written: false,
+                        result_failure_recorded: false,
+                        result_retry: RetrySchedule::default(),
+                    });
+                    return Err(detail);
                 }
-                Err(error) => format!("kernel accepted grant preparation uncertain: {error}"),
             };
-            self.never_forked.push(NeverForkedOperation {
+            // Persist the only Q handle before the irreversible K request.
+            // Failure here means K was never sent. An H response lost before
+            // this point cannot authorize a later launch by this guardian.
+            if let Err(error) = create_artifact(
+                &state_dir,
+                "root-work-broker-grant-v1.json",
+                &serde_json::json!({
+                    "protocol": PROTOCOL,
+                    "work_id": intent.work_id,
+                    "request_sha256": request.submission.request_sha256,
+                    "grant_id": grant,
+                }),
+            ) {
+                let detail =
+                    format!("kernel grant handle persistence failed before launch: {error}");
+                self.never_forked.push(NeverForkedOperation {
+                    submission: request.submission.clone(),
+                    intent,
+                    state_dir,
+                    result_nonce: new_capability(),
+                    detail: detail.clone(),
+                    handle_terminalized: false,
+                    result_written: false,
+                    result_failure_recorded: false,
+                    result_retry: RetrySchedule::default(),
+                });
+                return Err(detail);
+            }
+            let launch = launch_kernel_work(
+                &grant,
+                &executable,
+                &intent_fd,
+                &cwd,
+                &state_dir,
+                &worker_control,
+                &capability_fd,
+            );
+            drop(worker_control);
+            let (kernel_incarnation, worker_session, worker_identity, detail) = match launch {
+                Ok((incarnation, worker_pid)) => {
+                    let identity = identity(worker_pid).ok();
+                    let detail = identity.is_none().then(|| {
+                        "broker launched work but exact worker identity is unavailable".to_owned()
+                    });
+                    (Some(incarnation), worker_pid, identity, detail)
+                }
+                Err(error) => (
+                    None,
+                    0,
+                    None,
+                    Some(format!("kernel work launch uncertain: {error}")),
+                ),
+            };
+            self.active.push(OriginalOperation {
                 submission: request.submission.clone(),
                 intent,
+                worker: None,
+                kernel_grant: Some(grant),
+                kernel_incarnation,
+                kernel_worker_local_pid: None,
+                kernel_drain_recorded: false,
+                worker_identity: worker_identity.clone(),
+                worker_session,
+                control,
+                acceptance_response: worker_identity.is_some().then_some(acceptance_response),
+                control_input: Vec::new(),
+                control_closed: false,
+                prepared_for_grant: false,
+                grant_sent: false,
                 state_dir,
                 result_nonce: new_capability(),
+                child_capability_hash: digest(child_capability.as_bytes()),
+                cancel_capability_hash: digest(request.submission.cancel_capability.as_bytes()),
+                children: BTreeSet::new(),
+                admission_closed: false,
+                settlement_sent: false,
+                causal_terminal: false,
+                terminal_observed: false,
+                worker_wait_status: None,
+                cancellation_sent: false,
+                broker_cancel_sent: false,
+                broker_cancel_retry: RetrySchedule::default(),
+                session_signal_sent: false,
+                cancellation_cause: None,
+                cancellation_requester: None,
+                cancellation_pending: None,
+                cancellation_propagated: false,
+                cancellation_receipt_error: None,
                 detail: detail.clone(),
-                handle_terminalized: false,
+                session_drained: false,
+                drain_retry: RetrySchedule::default(),
                 result_written: false,
                 result_failure_recorded: false,
                 result_retry: RetrySchedule::default(),
             });
-            return Err(detail);
+            if detail.is_some() {
+                // K may have consumed its one-use grant even if its response
+                // vanished. Never release G on an uncertain launch; request
+                // work-specific cancellation and keep Q debt.
+                self.stage_cancellation(
+                    self.active.len() - 1,
+                    "kernel_launch_uncertain",
+                    None,
+                    Instant::now(),
+                );
+            }
+            return if let Some(detail) = detail {
+                Err(detail)
+            } else {
+                Ok(None)
+            };
         }
         let executable_fd = executable.as_raw_fd();
         let intent_raw = intent_fd.as_raw_fd();
@@ -978,7 +1108,11 @@ impl OriginalWorkSupervisor {
         let operation = OriginalOperation {
             submission: request.submission.clone(),
             intent,
-            worker,
+            worker: Some(worker),
+            kernel_grant: None,
+            kernel_incarnation: None,
+            kernel_worker_local_pid: None,
+            kernel_drain_recorded: false,
             worker_identity: worker_identity.clone(),
             worker_session,
             control,
@@ -998,6 +1132,8 @@ impl OriginalWorkSupervisor {
             terminal_observed: false,
             worker_wait_status: None,
             cancellation_sent: false,
+            broker_cancel_sent: false,
+            broker_cancel_retry: RetrySchedule::default(),
             session_signal_sent: false,
             cancellation_cause: None,
             cancellation_requester: None,
@@ -1346,15 +1482,53 @@ impl OriginalWorkSupervisor {
         }
         self.retry_pending_cancellations(now);
         self.propagate_accepted_cancellations(now);
+        for operation in &mut self.active {
+            if operation.cancellation_cause.is_some()
+                && operation.kernel_grant.is_some()
+                && !operation.broker_cancel_sent
+                && !operation.session_drained
+                && operation.broker_cancel_retry.due(now)
+            {
+                let grant = operation.kernel_grant.as_deref().unwrap();
+                match protocol::cancel_accepted_work_at(&super::linux::owner_broker_socket(), grant)
+                {
+                    Ok(response)
+                        if response.starts_with("cancel-signalled ")
+                            && response.trim_end().split_whitespace().count() == 2 =>
+                    {
+                        let incarnation = response.trim_end().split_whitespace().nth(1).unwrap();
+                        if operation
+                            .kernel_incarnation
+                            .as_deref()
+                            .is_none_or(|id| id == incarnation)
+                            && uuid::Uuid::parse_str(incarnation).is_ok()
+                        {
+                            operation.kernel_incarnation = Some(incarnation.to_owned());
+                            operation.broker_cancel_sent = true;
+                        } else {
+                            operation.detail = Some("broker cancellation identity conflict".into());
+                            operation.broker_cancel_retry.record_failure(now);
+                        }
+                    }
+                    Ok(response) => {
+                        operation.detail =
+                            Some(format!("broker cancellation refused: {}", response.trim()));
+                        operation.broker_cancel_retry.record_failure(now);
+                    }
+                    Err(error) => {
+                        operation.detail = Some(format!("broker cancellation uncertain: {error}"));
+                        operation.broker_cancel_retry.record_failure(now);
+                    }
+                }
+            }
+        }
         let settled_ids: BTreeMap<String, bool> = self
             .active
             .iter()
             .map(|operation| {
                 (
                     operation.submission.work_id.clone(),
-                    !self.adopted_child_live
-                        && operation.terminal_observed
-                        && operation.session_drained
+                    operation_tree_drained(operation, self.adopted_child_live)
                         && operation.causal_terminal
                         && operation.result_written,
                 )
@@ -1387,7 +1561,9 @@ impl OriginalWorkSupervisor {
                                 "cancellation control failed; signalled session directly: {error}"
                             )
                         });
-                        if process_session_live(operation.worker_session) {
+                        if operation.kernel_grant.is_none()
+                            && process_session_live(operation.worker_session)
+                        {
                             signal_session(operation.worker_session, libc::SIGTERM);
                             operation.session_signal_sent = true;
                         } else {
@@ -1453,7 +1629,8 @@ impl OriginalWorkSupervisor {
                     }
                 }
             }
-            if operation.control_closed
+            if operation.kernel_grant.is_none()
+                && operation.control_closed
                 && operation.cancellation_cause.is_some()
                 && !operation.session_signal_sent
                 && process_session_live(operation.worker_session)
@@ -1475,28 +1652,46 @@ impl OriginalWorkSupervisor {
                     }
                 }
             }
-            match operation.worker.try_wait() {
-                Ok(Some(status)) => {
-                    operation.terminal_observed = true;
-                    let status_text = status.to_string();
-                    use std::os::unix::process::ExitStatusExt;
-                    operation.worker_wait_status = Some(status.into_raw());
-                    if !operation.causal_terminal {
+            if let Some(worker) = &mut operation.worker {
+                match worker.try_wait() {
+                    Ok(Some(status)) => {
+                        operation.terminal_observed = true;
+                        let status_text = status.to_string();
+                        use std::os::unix::process::ExitStatusExt;
+                        operation.worker_wait_status = Some(status.into_raw());
+                        if !operation.causal_terminal {
+                            operation.detail.get_or_insert_with(|| {
+                                format!("worker exited before causal terminal: {status_text}")
+                            });
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                        operation.terminal_observed = true;
                         operation.detail.get_or_insert_with(|| {
-                            format!("worker exited before causal terminal: {status_text}")
+                            "exclusive worker wait was unavailable (ECHILD)".into()
                         });
                     }
+                    Err(error) => operation.detail = Some(format!("worker wait failed: {error}")),
                 }
-                Ok(None) => {}
-                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                    operation.terminal_observed = true;
-                    operation.detail.get_or_insert_with(|| {
-                        "exclusive worker wait was unavailable (ECHILD)".into()
-                    });
+            } else if operation.drain_retry.due(now) {
+                match observe_kernel_drain(operation) {
+                    Ok(Some((local_pid, status))) => {
+                        operation.terminal_observed = true;
+                        operation.session_drained = true;
+                        operation.kernel_worker_local_pid = Some(local_pid);
+                        operation.worker_wait_status = Some(status);
+                    }
+                    Ok(None) => operation.drain_retry.record_failure(now),
+                    Err(error) => {
+                        operation.detail =
+                            Some(format!("broker work observation uncertain: {error}"));
+                        operation.drain_retry.record_failure(now);
+                    }
                 }
-                Err(error) => operation.detail = Some(format!("worker wait failed: {error}")),
             }
-            if operation.terminal_observed
+            if operation.worker.is_some()
+                && operation.terminal_observed
                 && !operation.session_drained
                 && operation.drain_retry.due(now)
             {
@@ -1516,9 +1711,7 @@ impl OriginalWorkSupervisor {
             }
         }
         for operation in &mut self.active {
-            let drained = !self.adopted_child_live
-                && operation.terminal_observed
-                && operation.session_drained;
+            let drained = operation_tree_drained(operation, self.adopted_child_live);
             if drained
                 && operation.causal_terminal
                 && operation.cancellation_pending.is_none()
@@ -1526,15 +1719,26 @@ impl OriginalWorkSupervisor {
                 && !operation.result_written
                 && operation.result_retry.due(now)
             {
-                let result = write_result(
-                    &operation.state_dir,
-                    &operation.intent,
-                    &operation.result_nonce,
-                    &operation.children,
-                    "terminal",
-                    operation.worker_wait_status,
-                    operation.detail.as_deref(),
-                );
+                let drain_record =
+                    if operation.kernel_grant.is_some() && !operation.kernel_drain_recorded {
+                        write_kernel_drain_artifact(operation)
+                    } else {
+                        Ok(())
+                    };
+                if operation.kernel_grant.is_some() && drain_record.is_ok() {
+                    operation.kernel_drain_recorded = true;
+                }
+                let result = drain_record.and_then(|()| {
+                    write_result(
+                        &operation.state_dir,
+                        &operation.intent,
+                        &operation.result_nonce,
+                        &operation.children,
+                        "terminal",
+                        operation.worker_wait_status,
+                        operation.detail.as_deref(),
+                    )
+                });
                 operation.result_written = result.is_ok();
                 if let Err(error) = result
                     && !operation.result_failure_recorded
@@ -1562,9 +1766,7 @@ impl OriginalWorkSupervisor {
             }
         }
         self.active.retain(|operation| {
-            let drained = !self.adopted_child_live
-                && operation.terminal_observed
-                && operation.session_drained;
+            let drained = operation_tree_drained(operation, self.adopted_child_live);
             if drained
                 && operation.causal_terminal
                 && operation.cancellation_pending.is_none()
@@ -1649,6 +1851,76 @@ fn causal_children_terminal(
     children
         .iter()
         .all(|child| terminal.get(child).copied().unwrap_or(true))
+}
+
+fn operation_tree_drained(operation: &OriginalOperation, adopted_child_live: bool) -> bool {
+    operation.terminal_observed
+        && operation.session_drained
+        && (operation.kernel_grant.is_some() || !adopted_child_live)
+}
+
+fn write_kernel_drain_artifact(operation: &OriginalOperation) -> Result<(), String> {
+    let receipt = BrokerDrainReceipt {
+        protocol: PROTOCOL,
+        root_id: &operation.intent.root_id,
+        work_id: &operation.intent.work_id,
+        grant_id: operation.kernel_grant.as_deref().ok_or("Q grant missing")?,
+        work_incarnation: operation
+            .kernel_incarnation
+            .as_deref()
+            .ok_or("Q incarnation missing")?,
+        worker_local_pid: operation
+            .kernel_worker_local_pid
+            .ok_or("Q worker PID missing")?,
+        worker_wait_status: operation
+            .worker_wait_status
+            .ok_or("Q wait status missing")?,
+        physical_tree_drained: true,
+    };
+    create_artifact(&operation.state_dir, BROKER_DRAIN_FILE, &receipt)
+}
+
+fn observe_kernel_drain(operation: &mut OriginalOperation) -> Result<Option<(i32, i32)>, String> {
+    let grant = operation
+        .kernel_grant
+        .as_deref()
+        .ok_or("broker grant missing")?;
+    let response = protocol::observe_accepted_work_at(&super::linux::owner_broker_socket(), grant)
+        .map_err(|error| error.to_string())?;
+    let mut parts = response.split_whitespace();
+    let status = parts
+        .next()
+        .ok_or("broker returned empty work observation")?;
+    let incarnation = parts.next().ok_or("broker omitted work incarnation")?;
+    let matches = operation
+        .kernel_incarnation
+        .as_ref()
+        .is_none_or(|expected| expected == incarnation);
+    if status == "work-uncertain" {
+        return Err(response.trim().to_owned());
+    }
+    if !matches || uuid::Uuid::parse_str(incarnation).is_err() {
+        return Err("broker returned conflicting work incarnation".into());
+    }
+    operation.kernel_incarnation = Some(incarnation.to_owned());
+    match status {
+        "work-live" | "work-drain-pending" if parts.next().is_none() => Ok(None),
+        "work-drained" => {
+            let worker_local_pid = parts.next().and_then(|value| value.parse::<i32>().ok());
+            let wait_status = parts.next().and_then(|value| value.parse::<i32>().ok());
+            if !worker_local_pid.is_some_and(|pid| pid > 1)
+                || wait_status.is_none()
+                || parts.next().is_some()
+            {
+                return Err("broker returned malformed drain certificate".into());
+            }
+            Ok(Some((worker_local_pid.unwrap(), wait_status.unwrap())))
+        }
+        _ => Err(format!(
+            "broker returned invalid work observation: {}",
+            response.trim()
+        )),
+    }
 }
 
 fn observe_control(operation: &mut OriginalOperation) {
@@ -1914,6 +2186,59 @@ fn prepare_kernel_grant(
         .ok_or_else(|| format!("broker grant preparation refused: {}", response.trim()))?;
     uuid::Uuid::parse_str(grant).map_err(|_| "broker returned invalid grant ID".to_owned())?;
     Ok(grant.to_owned())
+}
+
+fn launch_kernel_work(
+    grant_id: &str,
+    executable: &OwnedFd,
+    intent: &OwnedFd,
+    cwd: &OwnedFd,
+    state_dir: &OwnedFd,
+    worker_control: &UnixStream,
+    capability: &OwnedFd,
+) -> Result<(String, i64), String> {
+    let accepted_fd = unsafe {
+        libc::openat(
+            state_dir.as_raw_fd(),
+            c"root-work-accepted-v1.json".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if accepted_fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let accepted = unsafe { OwnedFd::from_raw_fd(accepted_fd) };
+    let response = protocol::launch_accepted_work_at(
+        &super::linux::owner_broker_socket(),
+        &LaunchAcceptedWorkSpec {
+            grant_id: grant_id.to_owned(),
+        },
+        [
+            executable.as_raw_fd(),
+            intent.as_raw_fd(),
+            cwd.as_raw_fd(),
+            state_dir.as_raw_fd(),
+            accepted.as_raw_fd(),
+            worker_control.as_raw_fd(),
+            capability.as_raw_fd(),
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    let mut parts = response.split_whitespace();
+    if parts.next() != Some("launched-work") {
+        return Err(format!("broker launch refused: {}", response.trim()));
+    }
+    let incarnation = parts.next().ok_or("broker omitted work incarnation")?;
+    uuid::Uuid::parse_str(incarnation).map_err(|_| "broker returned invalid work incarnation")?;
+    let init_pid = parts.next().and_then(|part| part.parse::<i64>().ok());
+    let worker_pid = parts.next().and_then(|part| part.parse::<i64>().ok());
+    if !init_pid.is_some_and(|pid| pid > 0)
+        || !worker_pid.is_some_and(|pid| pid > 0)
+        || parts.next().is_some()
+    {
+        return Err("broker returned invalid launched work identity".into());
+    }
+    Ok((incarnation.to_owned(), worker_pid.unwrap()))
 }
 
 fn read_bounded(fd: &OwnedFd, max: u64) -> Result<Vec<u8>, String> {
@@ -2366,7 +2691,11 @@ mod tests {
                 },
                 cancel_owner: None,
             },
-            worker,
+            worker: Some(worker),
+            kernel_grant: None,
+            kernel_incarnation: None,
+            kernel_worker_local_pid: None,
+            kernel_drain_recorded: false,
             worker_identity: None,
             worker_session,
             control,
@@ -2386,6 +2715,8 @@ mod tests {
             terminal_observed: false,
             worker_wait_status: None,
             cancellation_sent: false,
+            broker_cancel_sent: false,
+            broker_cancel_retry: RetrySchedule::default(),
             session_signal_sent: false,
             cancellation_cause: None,
             cancellation_requester: None,
@@ -2443,6 +2774,30 @@ mod tests {
         };
         assert!(fd >= 0);
         unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    #[test]
+    fn kernel_result_requires_exact_q_fields_before_drain_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let (control, _worker_control) = UnixStream::pair().unwrap();
+        let mut operation = test_operation(open_directory(temp.path()), control, "work-q");
+        let grant = uuid::Uuid::new_v4().to_string();
+        let incarnation = uuid::Uuid::new_v4().to_string();
+        operation.kernel_grant = Some(grant.clone());
+        assert!(write_kernel_drain_artifact(&operation).is_err());
+        assert!(!temp.path().join(BROKER_DRAIN_FILE).exists());
+        operation.kernel_incarnation = Some(incarnation.clone());
+        operation.kernel_worker_local_pid = Some(2);
+        operation.worker_wait_status = Some(0);
+        write_kernel_drain_artifact(&operation).unwrap();
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join(BROKER_DRAIN_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(receipt["grant_id"], grant);
+        assert_eq!(receipt["work_incarnation"], incarnation);
+        assert_eq!(receipt["work_id"], "work-q");
+        assert_eq!(receipt["physical_tree_drained"], true);
+        assert!(!temp.path().join(RESULT_FILE).exists());
     }
 
     #[test]
@@ -2615,9 +2970,9 @@ mod tests {
         let mut parent =
             test_operation(open_directory(parent_dir.path()), parent_control, "parent");
         let mut child = test_operation(open_directory(child_dir.path()), child_control, "child");
-        child.worker.wait().unwrap();
-        child.worker = Command::new("sleep").arg("10").spawn().unwrap();
-        child.worker_session = i64::from(child.worker.id());
+        child.worker.as_mut().unwrap().wait().unwrap();
+        child.worker = Some(Command::new("sleep").arg("10").spawn().unwrap());
+        child.worker_session = i64::from(child.worker.as_ref().unwrap().id());
         child.submission.root_authority = parent.submission.root_authority.clone();
         child.intent.root_id = parent.intent.root_id.clone();
         child.submission.registration = WorkRegistration::Nested {
@@ -2640,7 +2995,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let premature = parent_dir.path().join(RESULT_FILE).exists();
-        supervisor.active[1].worker.kill().unwrap();
+        supervisor.active[1]
+            .worker
+            .as_mut()
+            .unwrap()
+            .kill()
+            .unwrap();
         assert!(
             !premature,
             "parent result preceded the accepted child outcome"
@@ -2704,7 +3064,7 @@ mod tests {
         assert!(operation.admission_closed);
         assert!(operation.causal_terminal);
         assert!(operation.detail.is_none());
-        operation.worker.wait().unwrap();
+        operation.worker.as_mut().unwrap().wait().unwrap();
     }
 
     #[test]
@@ -2757,7 +3117,12 @@ mod tests {
         let persisted: CancellationReceipt =
             serde_json::from_slice(&std::fs::read(temp.path().join(CANCEL_FILE)).unwrap()).unwrap();
         assert_eq!(persisted.requester, Some(requester));
-        supervisor.active[0].worker.wait().unwrap();
+        supervisor.active[0]
+            .worker
+            .as_mut()
+            .unwrap()
+            .wait()
+            .unwrap();
     }
 
     #[test]
@@ -2897,7 +3262,12 @@ mod tests {
         let unchanged: CancellationReceipt =
             serde_json::from_slice(&std::fs::read(temp.path().join(CANCEL_FILE)).unwrap()).unwrap();
         assert_eq!(unchanged, receipt);
-        supervisor.active[0].worker.wait().unwrap();
+        supervisor.active[0]
+            .worker
+            .as_mut()
+            .unwrap()
+            .wait()
+            .unwrap();
     }
 
     #[test]

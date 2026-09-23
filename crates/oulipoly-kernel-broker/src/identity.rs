@@ -267,6 +267,24 @@ impl PinnedProcess {
         }
     }
 
+    /// Signal the pinned incarnation, never a reused numeric PID.
+    pub fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+        self.verify()?;
+        if unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub fn namespace(&self) -> &File {
         &self.pidns
     }

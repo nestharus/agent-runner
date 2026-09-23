@@ -114,6 +114,9 @@ enum RequestPayload {
     ObserveAcceptedWork {
         grant_id: String,
     },
+    CancelAcceptedWork {
+        grant_id: String,
+    },
 }
 
 fn recv_request(
@@ -212,7 +215,7 @@ fn recv_request(
     let valid_length = match request[0] {
         b'G' => read == 65,
         b'P' => read == 37,
-        b'Q' => read == 33,
+        b'Q' | b'Z' => read == 33,
         b'A' => read == 33,
         b'J' => (18..=48 * 1024 + 17).contains(&read),
         b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' => (18..=2048 + 17).contains(&read),
@@ -262,6 +265,9 @@ fn recv_request(
             root_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
         b'Q' => RequestPayload::ObserveAcceptedWork {
+            grant_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+        },
+        b'Z' => RequestPayload::CancelAcceptedWork {
             grant_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
         b'J' => RequestPayload::Join {
@@ -1158,6 +1164,18 @@ fn serve() -> io::Result<()> {
                     &works,
                     &grants,
                     &terminal_path,
+                )
+            } else if operation == b'Z' {
+                let RequestPayload::CancelAcceptedWork { grant_id } = payload else {
+                    return Err(io::Error::other("invalid accepted cancellation payload"));
+                };
+                work_launch::cancel(
+                    &grant_id,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &works,
+                    &grants,
                 )
             } else {
                 dispatch_authenticated(

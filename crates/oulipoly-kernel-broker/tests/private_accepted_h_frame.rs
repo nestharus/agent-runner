@@ -309,7 +309,7 @@ fn send_k_without_reply(path: &Path, spec: &LaunchAcceptedWorkSpec, descriptors:
     drop(stream);
 }
 
-fn inner(kill_case: bool, lost_reply_case: bool) {
+fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool) {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("broker-state");
     let work_state = temp.path().join("accepted-h");
@@ -925,6 +925,31 @@ open(state + '/worker-done', 'w').write('done')
     wait_for(&work_state.join("worker-done"));
     let live = protocol::observe_accepted_work_at(&socket, grant_id).unwrap();
     assert_eq!(live, format!("work-live {incarnation}\n"));
+    if cancel_case {
+        let signalled = protocol::cancel_accepted_work_at(&socket, grant_id).unwrap();
+        assert_eq!(signalled, format!("cancel-signalled {incarnation}\n"));
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            let observed = protocol::observe_accepted_work_at(&socket, grant_id).unwrap();
+            if observed.starts_with(&format!("work-drained {incarnation} ")) {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "cancel did not drain work: {observed}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!work_state.join("grandchild-done").exists());
+        root.verify().unwrap();
+        source.verify().unwrap();
+        let replay = protocol::launch_accepted_work_at(&socket, &launch, launch_fds).unwrap();
+        assert!(
+            replay.contains("unavailable one-use accepted grant"),
+            "{replay}"
+        );
+        return;
+    }
     if kill_case {
         let init = PinnedProcess::open(init_pid).unwrap();
         assert_eq!(unsafe { libc::kill(init_pid, libc::SIGKILL) }, 0);
@@ -1093,7 +1118,7 @@ fn challenged_h_prepares_and_k_launches_one_nested_worker() {
         return;
     }
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
-        inner(false, false);
+        inner(false, false, false);
         return;
     }
     let output = Command::new("unshare")
@@ -1118,7 +1143,7 @@ fn challenged_h_prepares_and_k_launches_one_nested_worker() {
 #[test]
 fn killed_work_pid1_is_uncertain_without_terminal_receipt() {
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
-        inner(true, false);
+        inner(true, false, false);
         return;
     }
     let output = Command::new("unshare")
@@ -1143,7 +1168,7 @@ fn killed_work_pid1_is_uncertain_without_terminal_receipt() {
 #[test]
 fn lost_k_response_cannot_replay_accepted_worker() {
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
-        inner(false, true);
+        inner(false, true, false);
         return;
     }
     let output = Command::new("unshare")
@@ -1163,4 +1188,28 @@ fn lost_k_response_cannot_replay_accepted_worker() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+#[test]
+fn work_specific_cancel_drains_adopted_setsid_descendant() {
+    if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
+        inner(false, false, true);
+        return;
+    }
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "work_specific_cancel_drains_adopted_setsid_descendant",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_H_INNER", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

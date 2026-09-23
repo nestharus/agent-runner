@@ -15,8 +15,29 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const EXECUTOR_ARG: &str = "__root-original-work-v1";
+static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_cancel(_: libc::c_int) {
+    CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// PID1 is inside the accepted work namespace. Linux resolves kill(-1) in
+/// the caller's PID namespace, including child namespaces but excluding its
+/// parent and siblings. Repeating this during reaping catches late forks and
+/// adopted setsid children without process-group or host-PID guesses.
+fn signal_work_members(signal: libc::c_int) -> io::Result<()> {
+    if unsafe { libc::kill(-1, signal) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +138,11 @@ fn run_init(context: InitContext) -> io::Result<()> {
     {
         return Err(io::Error::other("work PID1 lost host sudo semantics"));
     }
+    CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    if unsafe { libc::signal(libc::SIGUSR1, request_cancel as libc::sighandler_t) } == libc::SIG_ERR
+    {
+        return Err(io::Error::last_os_error());
+    }
     control.write_all(b"I")?;
     let mut release = [0u8; 41];
     control.read_exact(&mut release)?;
@@ -189,13 +215,27 @@ fn run_init(context: InitContext) -> io::Result<()> {
     drop(control);
     drop(image);
     let mut worker_wait_status = None;
+    let mut cancellation_started = None;
     loop {
+        if CANCEL_REQUESTED.load(Ordering::Relaxed) {
+            let started = *cancellation_started.get_or_insert_with(Instant::now);
+            let signal = if started.elapsed() >= Duration::from_secs(2) {
+                libc::SIGKILL
+            } else {
+                libc::SIGTERM
+            };
+            signal_work_members(signal)?;
+        }
         let mut status = 0;
-        let reaped = unsafe { libc::waitpid(-1, &mut status, 0) };
+        let reaped = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
         if reaped == worker.id() as i32 {
             worker_wait_status = Some(status);
         }
         if reaped > 0 {
+            continue;
+        }
+        if reaped == 0 {
+            std::thread::sleep(Duration::from_millis(20));
             continue;
         }
         let error = io::Error::last_os_error();
@@ -595,5 +635,48 @@ pub(super) fn observe(
     Ok(format!(
         "work-drained {} {} {}\n",
         record.work_incarnation, receipt.worker_local_pid, receipt.worker_wait_status
+    ))
+}
+
+/// A signal acknowledgement is never interpreted as source completion or
+/// physical drain. Only the original bound guardian can request it; the PID1
+/// continues reaping and writes the terminal receipt after ECHILD.
+pub(super) fn cancel(
+    grant_id: &str,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    works: &WorkRegistry,
+    grants: &GrantRegistry,
+) -> io::Result<String> {
+    if !peer.process.in_namespace(host_namespace)?
+        || !peer.process.same_executable_as(runner_image)?
+    {
+        return Err(io::Error::other(
+            "work cancellation is not from host guardian",
+        ));
+    }
+    let grant = grants
+        .records()
+        .iter()
+        .find(|grant| {
+            grant.grant_id == grant_id
+                && grant.consumed
+                && grant.guardian == ProcessStamp::from(&peer.process)
+                && grant.owner_uid == peer.uid
+        })
+        .ok_or_else(|| io::Error::other("work cancellation authority absent"))?;
+    let work = works
+        .live_works()
+        .find(|work| {
+            work.record.accepted_grant_id.as_deref() == Some(grant_id)
+                && work.record.root_id == grant.root_id
+                && work.record.work_id == grant.work_id
+        })
+        .ok_or_else(|| io::Error::other("live work namespace absent"))?;
+    work.init.signal(libc::SIGUSR1)?;
+    Ok(format!(
+        "cancel-signalled {}\n",
+        work.record.work_incarnation
     ))
 }

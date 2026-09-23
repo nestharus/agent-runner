@@ -319,6 +319,21 @@ pub fn observe_accepted_work_at(path: &Path, grant_id: &str) -> io::Result<Strin
     read_response(stream)
 }
 
+/// Request cancellation of the exact consumed work grant. This only wakes its
+/// PID1; Q remains the separate terminal and physical drain certificate.
+pub fn cancel_accepted_work_at(path: &Path, grant_id: &str) -> io::Result<String> {
+    let id = uuid::Uuid::parse_str(grant_id).map_err(|_| io::Error::other("bad grant ID"))?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(33);
+    request.push(b'Z');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(id.as_bytes());
+    stream.write_all(&request)?;
+    read_response(stream)
+}
+
 pub fn launch_accepted_work_at(
     path: &Path,
     spec: &LaunchAcceptedWorkSpec,
@@ -410,7 +425,7 @@ pub fn prepare_accepted_work_at(
 /// observer against a privileged workload that can replace `/proc`.
 pub fn supported_entry_args(args: &[String]) -> bool {
     #[cfg(feature = "age319-private-broker-fixture")]
-    if matches!(args, [only] if only == "__age319-private-join-only-v1")
+    if matches!(args, [only] if only == "__age319-private-join-only-v1" || only == "__age319-private-bash-work-v1")
         && unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
             .ok()
