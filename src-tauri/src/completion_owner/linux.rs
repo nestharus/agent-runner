@@ -582,6 +582,23 @@ fn guardian(
     }
     let _ = std::fs::remove_file(endpoint); // lifetime election is held; no live peer is replaced.
     let listener = UnixListener::bind(endpoint).map_err(|e| e.to_string())?;
+    if pinned.is_some() {
+        // Accepted sockets inherit PASSCRED. Enable it before the endpoint is
+        // announced so even bytes queued before accept retain real senders.
+        let enabled: libc::c_int = 1;
+        if unsafe {
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PASSCRED,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of_val(&enabled) as _,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     redirect_stdio()?;
     let mut retained = vec![listener.as_raw_fd(), election.as_raw_fd()];
@@ -639,7 +656,11 @@ fn guardian(
     // bootstrap parent's inherited flock description.
     let admission = admission_gate(endpoint)?;
     let mut closing = false;
-    let mut control = ControlService::start(&listener, &owner)?;
+    let mut control = if let Some(pin) = pinned {
+        ControlService::start_pinned(&listener, &owner, &pin.root_id)?
+    } else {
+        ControlService::start(&listener, &owner)?
+    };
     let mut pending = Vec::new();
     loop {
         // This guardian is the only process-tree authority.  It accepts launch
@@ -696,7 +717,11 @@ fn guardian(
                     start_driver(path, endpoint, domain, listener.as_raw_fd(), pinned, false)?;
                 owner = replacement;
                 root_supervisor.replace_driver(driver_channel)?;
-                control = ControlService::start(&listener, &owner)?;
+                control = if let Some(pin) = pinned {
+                    ControlService::start_pinned(&listener, &owner, &pin.root_id)?
+                } else {
+                    ControlService::start(&listener, &owner)?
+                };
             }
         }
         if pending.is_empty() {

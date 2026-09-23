@@ -10,16 +10,18 @@ use oulipoly_kernel_broker::identity::{
 };
 use oulipoly_kernel_broker::protocol::{
     AcceptedWorkSpec, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, OwnerWitness,
-    ProcessWitness, SourceScope, SourceSocketWitness,
+    ProcessWitness, SourceControlUse, SourceScope, SourceSocketWitness, SourceTicketUse,
 };
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 const STATE: &str = "/var/lib/oulipoly-kernel-broker";
@@ -92,6 +94,10 @@ enum RequestPayload {
     },
     VerifySourceSocket {
         witness: SourceSocketWitness,
+        socket: File,
+    },
+    ConsumeSourceTicket {
+        spec: SourceTicketUse,
         socket: File,
     },
     VerifyJoinedChild {
@@ -209,7 +215,7 @@ fn recv_request(
         b'Q' => read == 33,
         b'A' => read == 33,
         b'J' => (18..=48 * 1024 + 17).contains(&read),
-        b'V' | b'S' | b'H' | b'K' | b'B' => (18..=2048 + 17).contains(&read),
+        b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' => (18..=2048 + 17).contains(&read),
         _ => read == 17,
     };
     if !valid_length
@@ -222,7 +228,7 @@ fn recv_request(
         || match request[0] {
             b'J' | b'H' => descriptors.len() != 5,
             b'K' => descriptors.len() != 7,
-            b'V' | b'S' => descriptors.len() != 1,
+            b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
         }
     {
@@ -268,8 +274,12 @@ fn recv_request(
             witness: serde_json::from_slice(&request[17..read as usize])?,
             socket: descriptors.remove(0),
         },
-        b'S' => RequestPayload::VerifySourceSocket {
+        b'S' | b's' => RequestPayload::VerifySourceSocket {
             witness: serde_json::from_slice(&request[17..read as usize])?,
+            socket: descriptors.remove(0),
+        },
+        b'T' => RequestPayload::ConsumeSourceTicket {
+            spec: serde_json::from_slice(&request[17..read as usize])?,
             socket: descriptors.remove(0),
         },
         b'B' => RequestPayload::VerifyJoinedChild {
@@ -453,8 +463,7 @@ fn verify_source_socket(
         .ok_or_else(|| io::Error::other("source witness entry absent"))?;
     if !entry.join_consumed
         || entry.joined_child.is_none()
-        || entry.owner_uid != peer.uid
-        || root.record.owner_uid != peer.uid
+        || entry.owner_uid != root.record.owner_uid
         || entry.domain_id.as_deref() != Some(witness.domain_id.as_str())
         || entry.supervisor_authority_id.as_deref() != Some(witness.supervisor_id.as_str())
     {
@@ -475,6 +484,14 @@ fn verify_source_socket(
         ));
     }
     let scope = classify_scope(peer, host_namespace, roots, works);
+    // A legitimate in-root sudo descendant may become host UID 0. Its exact
+    // PID namespace and source incarnation still bind it to this root/work;
+    // the outside cancel route retains the original owner UID.
+    if peer.uid != entry.owner_uid
+        && !(peer.uid == 0 && matches!(&scope, Scope::Root(_) | Scope::Work { .. }))
+    {
+        return Err(io::Error::other("source UID is outside root policy"));
+    }
     match (&witness.scope, scope) {
         (SourceScope::Root, Scope::Root(root_id)) if root_id == witness.root_id => {}
         (
@@ -561,7 +578,7 @@ fn verify_source_socket(
     } != 0
         || len as usize != std::mem::size_of_val(&credentials)
         || credentials.pid != guardian.host_pid
-        || credentials.uid != peer.uid
+        || credentials.uid != entry.owner_uid
     {
         return Err(io::Error::other(
             "source socket peer is not pinned host guardian",
@@ -571,6 +588,207 @@ fn verify_source_socket(
     root.init.verify()?;
     peer.process.verify()?;
     Ok(format!("verified-source {}\n", witness.root_id))
+}
+
+struct SourceTicket {
+    witness: SourceSocketWitness,
+    source_socket: File,
+    source_uid: u32,
+    source_gid: u32,
+    created: Instant,
+}
+
+fn socket_credentials(socket: &File) -> io::Result<libc::ucred> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of_val(&credentials) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    } != 0
+        || len as usize != std::mem::size_of_val(&credentials)
+    {
+        return Err(io::Error::other(
+            "source ticket socket has no exact peer credentials",
+        ));
+    }
+    Ok(credentials)
+}
+
+fn issue_source_ticket(
+    witness: SourceSocketWitness,
+    source_socket: File,
+    peer: &PeerIdentity,
+    tickets: &mut BTreeMap<String, SourceTicket>,
+) -> io::Result<String> {
+    tickets.retain(|_, ticket| ticket.created.elapsed() < Duration::from_secs(30));
+    if tickets.len() >= 128 {
+        return Err(io::Error::other("source ticket capacity exhausted"));
+    }
+    let ticket = uuid::Uuid::new_v4();
+    let mut marker = [0u8; 17];
+    marker[0] = b'@';
+    marker[1..].copy_from_slice(ticket.as_bytes());
+    // The broker writes the marker through the exact source-side open file
+    // description supplied to S. Only its connected guardian endpoint can
+    // read that ticket; it is never returned to the source caller.
+    if unsafe {
+        libc::send(
+            source_socket.as_raw_fd(),
+            marker.as_ptr().cast(),
+            marker.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } != marker.len() as isize
+    {
+        return Err(io::Error::other(
+            "source marker send failed; outcome uncertain",
+        ));
+    }
+    let root_id = witness.root_id.clone();
+    tickets.insert(
+        ticket.to_string(),
+        SourceTicket {
+            witness,
+            source_socket,
+            source_uid: peer.uid,
+            source_gid: peer.gid,
+            created: Instant::now(),
+        },
+    );
+    Ok(format!("verified-source-v2 {root_id}\n"))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "consume must recheck every broker trust root"
+)]
+fn consume_source_ticket(
+    spec: SourceTicketUse,
+    accepted_socket: File,
+    guardian_peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    grants: &GrantRegistry,
+    tickets: &mut BTreeMap<String, SourceTicket>,
+) -> io::Result<String> {
+    let ticket = tickets
+        .remove(&spec.ticket)
+        .ok_or_else(|| io::Error::other("source ticket absent or already consumed"))?;
+    if ticket.created.elapsed() >= Duration::from_secs(30) {
+        return Err(io::Error::other("source ticket expired"));
+    }
+    let root_id = ticket.witness.root_id.clone();
+    match (&ticket.witness.scope, &spec.request) {
+        (
+            SourceScope::Root,
+            SourceControlUse::WorkRoot {
+                root_id: actual,
+                work_id,
+            },
+        ) if actual == &root_id && !work_id.is_empty() && work_id.len() <= 256 => {}
+        (
+            SourceScope::Nested { parent_work_id },
+            SourceControlUse::WorkNested {
+                root_id: actual,
+                work_id,
+                parent_work_id: actual_parent,
+            },
+        ) if actual == &root_id
+            && actual_parent == parent_work_id
+            && !work_id.is_empty()
+            && work_id.len() <= 256 => {}
+        (
+            SourceScope::CancelOutside { work_id },
+            SourceControlUse::Cancel {
+                root_id: actual,
+                work_id: actual_work,
+            },
+        ) if actual == &root_id && actual_work == work_id => {}
+        (
+            SourceScope::Root | SourceScope::Nested { .. },
+            SourceControlUse::Cancel {
+                root_id: actual,
+                work_id,
+            },
+        ) if actual == &root_id && !work_id.is_empty() && work_id.len() <= 256 => {}
+        _ => return Err(io::Error::other("source ticket command or scope mismatch")),
+    }
+    let entry = entries
+        .record(&root_id)
+        .ok_or_else(|| io::Error::other("source ticket root entry absent"))?;
+    let guardian_stamp = entry
+        .guardian
+        .as_ref()
+        .ok_or_else(|| io::Error::other("source ticket guardian absent"))?;
+    if ProcessStamp::from(&guardian_peer.process) != *guardian_stamp
+        || !guardian_peer.process.in_namespace(host_namespace)?
+        || !guardian_peer.process.same_executable_as(runner_image)?
+        || guardian_peer.uid != entry.owner_uid
+    {
+        return Err(io::Error::other(
+            "source ticket caller is not bound guardian",
+        ));
+    }
+    let mut kind: libc::c_int = 0;
+    let mut kind_len = std::mem::size_of_val(&kind) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            accepted_socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut kind as *mut libc::c_int).cast(),
+            &mut kind_len,
+        )
+    } != 0
+        || kind != libc::SOCK_STREAM
+        || kind_len as usize != std::mem::size_of_val(&kind)
+    {
+        return Err(io::Error::other(
+            "source ticket accepted endpoint is not a stream",
+        ));
+    }
+    let connector = socket_credentials(&accepted_socket)?;
+    if (connector.pid, connector.uid, connector.gid)
+        != (
+            ticket.witness.source.host_pid,
+            ticket.source_uid,
+            ticket.source_gid,
+        )
+    {
+        return Err(io::Error::other(
+            "source ticket connector differs from S requester",
+        ));
+    }
+    let source = PeerIdentity {
+        uid: ticket.source_uid,
+        gid: ticket.source_gid,
+        process: PinnedProcess::open(connector.pid)?,
+    };
+    verify_source_socket(
+        ticket.witness,
+        ticket.source_socket,
+        &source,
+        host_namespace,
+        runner_image,
+        roots,
+        works,
+        entries,
+        grants,
+    )?;
+    guardian_peer.process.verify()?;
+    Ok(format!("verified-control {root_id}\n"))
 }
 
 fn verify_joined_child(
@@ -788,6 +1006,9 @@ fn serve() -> io::Result<()> {
         checked_root_path(&grants_path, true)?;
     }
     let mut grants = GrantRegistry::open(&grants_path)?;
+    // Ephemeral by design: a broker restart invalidates every pre-wire source
+    // decision. No work/cancel action can be authorized by a lost ticket.
+    let mut source_tickets = BTreeMap::<String, SourceTicket>::new();
     let terminal_path = Path::new(&state).join("terminals");
     if !terminal_path.exists() {
         use std::os::unix::fs::DirBuilderExt;
@@ -837,12 +1058,32 @@ fn serve() -> io::Result<()> {
                     return Err(io::Error::other("invalid owner witness payload"));
                 };
                 verify_owner_socket(witness, socket, &peer, &runner_image, &registry, &entries)
-            } else if operation == b'S' {
+            } else if operation == b'S' || operation == b's' {
                 let RequestPayload::VerifySourceSocket { witness, socket } = payload else {
                     return Err(io::Error::other("invalid source socket witness payload"));
                 };
                 verify_source_socket(
-                    witness,
+                    witness.clone(),
+                    socket.try_clone()?,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &registry,
+                    &works,
+                    &entries,
+                    &grants,
+                )?;
+                if operation == b's' {
+                    issue_source_ticket(witness, socket, &peer, &mut source_tickets)
+                } else {
+                    Ok(format!("verified-source {}\n", witness.root_id))
+                }
+            } else if operation == b'T' {
+                let RequestPayload::ConsumeSourceTicket { spec, socket } = payload else {
+                    return Err(io::Error::other("invalid source ticket use payload"));
+                };
+                consume_source_ticket(
+                    spec,
                     socket,
                     &peer,
                     &host_namespace,
@@ -851,6 +1092,7 @@ fn serve() -> io::Result<()> {
                     &works,
                     &entries,
                     &grants,
+                    &mut source_tickets,
                 )
             } else if operation == b'B' {
                 let RequestPayload::VerifyJoinedChild { witness } = payload else {

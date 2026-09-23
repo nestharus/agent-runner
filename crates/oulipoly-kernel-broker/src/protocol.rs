@@ -90,12 +90,65 @@ pub enum SourceScope {
     },
 }
 
+/// Version 2 binds the broker's source decision to the exact connected
+/// guardian socket. The broker writes `@` followed by a fresh 16-byte ticket
+/// on that socket before returning success. The guardian consumes the ticket
+/// only after checking the sender of every byte of a complete control frame.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceControlUse {
+    WorkRoot {
+        root_id: String,
+        work_id: String,
+    },
+    WorkNested {
+        root_id: String,
+        work_id: String,
+        parent_work_id: String,
+    },
+    Cancel {
+        root_id: String,
+        work_id: String,
+    },
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceTicketUse {
+    pub ticket: String,
+    pub request: SourceControlUse,
+}
+
+pub fn verify_source_socket_v2_at(
+    path: &Path,
+    witness: &SourceSocketWitness,
+    guardian_socket_fd: RawFd,
+) -> io::Result<()> {
+    verify_source_socket_operation_at(
+        path,
+        witness,
+        guardian_socket_fd,
+        b's',
+        "verified-source-v2",
+    )
+}
+
 /// This read-only attestation is valid only for this challenged request and
 /// this connected socket. It does not prepare or consume an H/K work grant.
 pub fn verify_source_socket_at(
     path: &Path,
     witness: &SourceSocketWitness,
     guardian_socket_fd: RawFd,
+) -> io::Result<()> {
+    verify_source_socket_operation_at(path, witness, guardian_socket_fd, b'S', "verified-source")
+}
+
+fn verify_source_socket_operation_at(
+    path: &Path,
+    witness: &SourceSocketWitness,
+    guardian_socket_fd: RawFd,
+    operation: u8,
+    accepted: &str,
 ) -> io::Result<()> {
     let body = serde_json::to_vec(witness)?;
     if body.len() > 2048 {
@@ -105,7 +158,7 @@ pub fn verify_source_socket_at(
     let mut challenge = [0u8; 16];
     stream.read_exact(&mut challenge)?;
     let mut request = Vec::with_capacity(17 + body.len());
-    request.push(b'S');
+    request.push(operation);
     request.extend_from_slice(&challenge);
     request.extend_from_slice(&body);
     let mut iov = libc::iovec {
@@ -131,9 +184,72 @@ pub fn verify_source_socket_at(
         return Err(io::Error::other("short source socket verification request"));
     }
     let response = read_response(stream)?;
-    if response != format!("verified-source {}\n", witness.root_id) {
+    if response != format!("{accepted} {}\n", witness.root_id) {
         return Err(io::Error::other(format!(
             "host source socket verification refused: {}",
+            response.trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Only the outside guardian calls this after the complete frame and its
+/// ancillary data have passed sender checks. Broker restart loses tickets and
+/// therefore refuses instead of reusing an old attestation.
+pub fn consume_source_ticket_at(
+    path: &Path,
+    ticket: [u8; 16],
+    request: SourceControlUse,
+    accepted_socket_fd: RawFd,
+) -> io::Result<()> {
+    let root_id = match &request {
+        SourceControlUse::WorkRoot { root_id, .. }
+        | SourceControlUse::WorkNested { root_id, .. }
+        | SourceControlUse::Cancel { root_id, .. } => root_id.clone(),
+    };
+    let spec = SourceTicketUse {
+        ticket: uuid::Uuid::from_bytes(ticket).to_string(),
+        request,
+    };
+    let body = serde_json::to_vec(&spec)?;
+    if body.len() > 2048 {
+        return Err(io::Error::other("source ticket use too large"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(b'T');
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: frame.as_mut_ptr().cast(),
+        iov_len: frame.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as usize;
+        *libc::CMSG_DATA(header).cast::<RawFd>() = accepted_socket_fd;
+    }
+    if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+        != frame.len() as isize
+    {
+        return Err(io::Error::other(
+            "short source ticket use; outcome uncertain",
+        ));
+    }
+    let response = read_response(stream)?;
+    if response != format!("verified-control {root_id}\n") {
+        return Err(io::Error::other(format!(
+            "source ticket refused: {}",
             response.trim()
         )));
     }

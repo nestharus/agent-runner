@@ -8,7 +8,7 @@ use oulipoly_kernel_broker::accepted_grant::{
 use oulipoly_kernel_broker::entry_registry::{EntryRecord, ProcessStamp};
 use oulipoly_kernel_broker::identity::PinnedProcess;
 use oulipoly_kernel_broker::protocol::{
-    self, AcceptedWorkSpec, LaunchAcceptedWorkSpec, ProcessWitness, SourceScope,
+    self, AcceptedWorkSpec, LaunchAcceptedWorkSpec, ProcessWitness, SourceControlUse, SourceScope,
     SourceSocketWitness,
 };
 use oulipoly_kernel_broker::{RootRecord, RootRegistry};
@@ -23,14 +23,45 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const ROOT_PROCESS: &str = r#"
-import os, subprocess, sys, time
+import array, json, os, socket, subprocess, sys, time
 def observer_pid():
     with open('/proc/self/status') as status:
         return int(next(line for line in status if line.startswith('NSpid:')).split()[1])
 path, mode, script = sys.argv[1:]
 if mode == 'source':
     open(path + '/source.pid', 'w').write(str(observer_pid()))
-    time.sleep(60)
+    for _ in range(600):
+        command_path = path + '/source-command.json'
+        if os.path.exists(command_path):
+            command = json.load(open(command_path))
+            control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            control.connect(command['guardian_socket'])
+            broker = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            broker.connect(command['broker_socket'])
+            challenge = b''
+            while len(challenge) < 16:
+                chunk = broker.recv(16 - len(challenge))
+                if not chunk: raise RuntimeError('broker challenge ended early')
+                challenge += chunk
+            witness = json.dumps(command['witness'], separators=(',', ':')).encode()
+            broker.sendmsg([b's' + challenge + witness], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [control.fileno()]))])
+            response = b''
+            while not response.endswith(b'\n') and len(response) < 256:
+                chunk = broker.recv(256 - len(response))
+                if not chunk: raise RuntimeError('broker response ended early')
+                response += chunk
+            if response != ('verified-source-v2 ' + command['witness']['root_id'] + '\n').encode():
+                open(path + '/source-error', 'w').write(repr(response))
+                break
+            nulls = [os.open('/dev/null', os.O_RDONLY) for _ in range(4)]
+            control.sendmsg([b'work!\n{}\n'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', nulls))])
+            control.shutdown(socket.SHUT_WR)
+            open(path + '/source-sent', 'w').write('yes')
+            while not os.path.exists(path + '/source-release'):
+                time.sleep(0.01)
+            time.sleep(60)
+            break
+        time.sleep(0.1)
 else:
     assert os.getpid() == 1
     open(path + '/root.pid', 'w').write(str(observer_pid()))
@@ -64,6 +95,55 @@ fn wait_for(path: &Path) {
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn read_cross_namespace_frame(socket: &UnixStream, source_pid: i32) {
+    let mut bytes = Vec::new();
+    let mut descriptors = Vec::<File>::new();
+    while bytes.iter().filter(|byte| **byte == b'\n').count() < 2 {
+        let mut byte = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        let mut control = [0usize; 32];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = std::mem::size_of_val(&control);
+        assert_eq!(
+            unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) },
+            1
+        );
+        assert_eq!(message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC), 0);
+        let mut credentials = None;
+        let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+        while !header.is_null() {
+            let item = unsafe { &*header };
+            if item.cmsg_type == libc::SCM_CREDENTIALS {
+                credentials = Some(unsafe { *libc::CMSG_DATA(header).cast::<libc::ucred>() });
+            } else if item.cmsg_type == libc::SCM_RIGHTS {
+                let count = (item.cmsg_len as usize - unsafe { libc::CMSG_LEN(0) } as usize)
+                    / std::mem::size_of::<RawFd>();
+                for index in 0..count {
+                    descriptors.push(unsafe {
+                        File::from_raw_fd(*libc::CMSG_DATA(header).cast::<RawFd>().add(index))
+                    });
+                }
+            }
+            header = unsafe { libc::CMSG_NXTHDR(&message, header) };
+        }
+        assert_eq!(credentials.unwrap().pid, source_pid);
+        bytes.push(byte[0]);
+    }
+    assert_eq!(bytes, b"work!\n{}\n");
+    assert_eq!(descriptors.len(), 4);
+    let mut trailing = [0u8; 1];
+    assert_eq!(
+        unsafe { libc::recv(socket.as_raw_fd(), trailing.as_mut_ptr().cast(), 1, 0) },
+        0
+    );
 }
 
 fn sibling_launch_probe() {
@@ -423,8 +503,21 @@ fn inner(kill_case: bool, lost_reply_case: bool) {
     assert!(root.verify().is_ok());
     assert!(source.verify().is_ok());
     let guardian_listener = UnixListener::bind(temp.path().join("guardian.sock")).unwrap();
+    let enabled: libc::c_int = 1;
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                guardian_listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PASSCRED,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of_val(&enabled) as _,
+            )
+        },
+        0
+    );
     let guardian_socket = UnixStream::connect(temp.path().join("guardian.sock")).unwrap();
-    let (_guardian_server, _) = guardian_listener.accept().unwrap();
+    let (mut guardian_server, _) = guardian_listener.accept().unwrap();
     let stamp = ProcessWitness {
         host_pid: guardian.host_pid,
         boot_id: guardian.boot_id.clone(),
@@ -442,12 +535,159 @@ fn inner(kill_case: bool, lost_reply_case: bool) {
     };
     protocol::verify_source_socket_at(&socket, &cancel_witness, guardian_socket.as_raw_fd())
         .unwrap();
+    protocol::verify_source_socket_v2_at(&socket, &cancel_witness, guardian_socket.as_raw_fd())
+        .unwrap();
+    let mut marker = [0u8; 17];
+    guardian_server.read_exact(&mut marker).unwrap();
+    assert_eq!(marker[0], b'@');
+    let mut ticket = [0u8; 16];
+    ticket.copy_from_slice(&marker[1..]);
+    let use_cancel = || SourceControlUse::Cancel {
+        root_id: spec.root_id.clone(),
+        work_id: spec.work_id.clone(),
+    };
+    protocol::consume_source_ticket_at(&socket, ticket, use_cancel(), guardian_server.as_raw_fd())
+        .unwrap();
+    assert!(
+        protocol::consume_source_ticket_at(
+            &socket,
+            ticket,
+            use_cancel(),
+            guardian_server.as_raw_fd()
+        )
+        .is_err()
+    );
+    protocol::verify_source_socket_v2_at(&socket, &cancel_witness, guardian_socket.as_raw_fd())
+        .unwrap();
+    guardian_server.read_exact(&mut marker).unwrap();
+    ticket.copy_from_slice(&marker[1..]);
+    assert!(
+        protocol::consume_source_ticket_at(
+            &socket,
+            ticket,
+            SourceControlUse::Cancel {
+                root_id: spec.root_id.clone(),
+                work_id: uuid::Uuid::new_v4().to_string()
+            },
+            guardian_server.as_raw_fd()
+        )
+        .is_err()
+    );
+    // A distinct same-UID process may inherit the already connected source
+    // end and legitimately pass S for its own outside cancel scope. T must
+    // still refuse because the guardian endpoint's original connector is the
+    // parent, not that live S requester.
+    let mut ready = [-1; 2];
+    let mut release = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
+    assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+    let inherited = unsafe { libc::fork() };
+    assert!(inherited >= 0);
+    if inherited == 0 {
+        unsafe {
+            libc::close(ready[0]);
+            libc::close(release[1]);
+        }
+        let child = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let mut claim = cancel_witness.clone();
+        claim.source = ProcessWitness {
+            host_pid: child.host_pid,
+            boot_id: child.boot_id,
+            starttime_ticks: child.starttime_ticks,
+        };
+        let passed =
+            protocol::verify_source_socket_v2_at(&socket, &claim, guardian_socket.as_raw_fd())
+                .is_ok();
+        let flag = [u8::from(passed)];
+        unsafe {
+            libc::write(ready[1], flag.as_ptr().cast(), 1);
+        }
+        let mut release_byte = [0u8; 1];
+        unsafe {
+            libc::read(release[0], release_byte.as_mut_ptr().cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    unsafe {
+        libc::close(ready[1]);
+        libc::close(release[0]);
+    }
+    let mut passed = [0u8; 1];
+    assert_eq!(
+        unsafe { libc::read(ready[0], passed.as_mut_ptr().cast(), 1) },
+        1
+    );
+    assert_eq!(passed, [1]);
+    guardian_server.read_exact(&mut marker).unwrap();
+    assert_eq!(marker[0], b'@');
+    ticket.copy_from_slice(&marker[1..]);
+    let transferred = protocol::consume_source_ticket_at(
+        &socket,
+        ticket,
+        use_cancel(),
+        guardian_server.as_raw_fd(),
+    );
+    assert!(transferred.is_err());
+    unsafe {
+        libc::write(release[1], b"x".as_ptr().cast(), 1);
+        libc::close(ready[0]);
+        libc::close(release[1]);
+        libc::waitpid(inherited, std::ptr::null_mut(), 0);
+    }
+    if !kill_case && !lost_reply_case {
+        let root_witness = SourceSocketWitness {
+            root_id: spec.root_id.clone(),
+            domain_id: domain.clone(),
+            supervisor_id: grants.records()[0].supervisor_authority_id.clone(),
+            guardian: cancel_witness.guardian.clone(),
+            source: ProcessWitness {
+                host_pid: source.host_pid,
+                boot_id: source.boot_id.clone(),
+                starttime_ticks: source.starttime_ticks,
+            },
+            scope: SourceScope::Root,
+        };
+        fs::write(
+            temp.path().join("source-command.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "guardian_socket": temp.path().join("guardian.sock"),
+                "broker_socket": socket,
+                "witness": root_witness,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (mut cross_server, _) = guardian_listener.accept().unwrap();
+        cross_server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        cross_server.read_exact(&mut marker).unwrap();
+        assert_eq!(marker[0], b'@');
+        ticket.copy_from_slice(&marker[1..]);
+        protocol::consume_source_ticket_at(
+            &socket,
+            ticket,
+            SourceControlUse::WorkRoot {
+                root_id: spec.root_id.clone(),
+                work_id: "new-work".into(),
+            },
+            cross_server.as_raw_fd(),
+        )
+        .unwrap();
+        wait_for(&temp.path().join("source-sent"));
+        read_cross_namespace_frame(&cross_server, source_pid);
+        fs::write(temp.path().join("source-release"), b"yes").unwrap();
+    }
     let mut sibling_cancel = cancel_witness.clone();
     sibling_cancel.scope = SourceScope::CancelOutside {
         work_id: "sibling-work".into(),
     };
     assert!(
         protocol::verify_source_socket_at(&socket, &sibling_cancel, guardian_socket.as_raw_fd())
+            .is_err()
+    );
+    assert!(
+        protocol::verify_source_socket_v2_at(&socket, &sibling_cancel, guardian_socket.as_raw_fd())
             .is_err()
     );
     let replay = protocol::prepare_accepted_work_at(&socket, &spec, descriptors).unwrap();
@@ -613,6 +853,10 @@ open(state + '/worker-done', 'w').write('done')
         );
         return;
     }
+    protocol::verify_source_socket_v2_at(&socket, &cancel_witness, guardian_socket.as_raw_fd())
+        .unwrap();
+    guardian_server.read_exact(&mut marker).unwrap();
+    ticket.copy_from_slice(&marker[1..]);
     // The worker and adopted grandchild remain owned by PID1 when the broker
     // itself exits. Reattach the exact record and keep replay spent.
     broker.0.kill().unwrap();
@@ -648,6 +892,17 @@ open(state + '/worker-done', 'w').write('done')
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    // A challenged S result from the previous broker incarnation is never
+    // reusable after restart, even while the source and guardian stay live.
+    assert!(
+        protocol::consume_source_ticket_at(
+            &socket,
+            ticket,
+            use_cancel(),
+            guardian_server.as_raw_fd()
+        )
+        .is_err()
+    );
     assert!(
         !state
             .join("terminals")

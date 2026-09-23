@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 
 pub(super) const PROTOCOL: &str = "original-work-v1";
 pub(super) const ROOT_PROTOCOL: &str = "root-authority-v1";
+pub(super) const SOURCE_CONTROL_PROTOCOL: &str = "source-control-v2";
+const LEGACY_CONTROL_PROTOCOL: &str = "stream-control-v1";
 pub(super) const EXECUTOR_ARG: &str = "__root-original-work-v1";
 pub(super) const ACCEPTED_FILE: &str = "root-work-accepted-v1.json";
 pub(super) const RESULT_FILE: &str = "root-work-result-v1.json";
@@ -41,6 +43,8 @@ const RETRY_MAX: Duration = Duration::from_secs(5);
 #[serde(deny_unknown_fields)]
 pub(super) struct RootAuthorityGrant {
     pub protocol: String,
+    #[serde(default = "legacy_control_protocol")]
+    pub control_protocol: String,
     pub completion_protocol: String,
     pub domain_id: String,
     pub supervisor_authority_id: String,
@@ -48,6 +52,10 @@ pub(super) struct RootAuthorityGrant {
     pub capability: String,
     pub root_identity: SourceProcessIdentity,
     pub guardian_identity: SourceProcessIdentity,
+}
+
+fn legacy_control_protocol() -> String {
+    LEGACY_CONTROL_PROTOCOL.into()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -301,7 +309,12 @@ impl RootAuthorities {
         owner: &CompletionDomainOwner,
         context: SourceProcessIdentity,
     ) -> Result<RootAuthorityGrant, String> {
-        self.fresh_with_root_id(owner, context, uuid::Uuid::new_v4().to_string())
+        self.fresh_with_protocol(
+            owner,
+            context,
+            uuid::Uuid::new_v4().to_string(),
+            LEGACY_CONTROL_PROTOCOL,
+        )
     }
 
     pub fn fresh_with_root_id(
@@ -309,6 +322,16 @@ impl RootAuthorities {
         owner: &CompletionDomainOwner,
         context: SourceProcessIdentity,
         root_id: String,
+    ) -> Result<RootAuthorityGrant, String> {
+        self.fresh_with_protocol(owner, context, root_id, SOURCE_CONTROL_PROTOCOL)
+    }
+
+    fn fresh_with_protocol(
+        &mut self,
+        owner: &CompletionDomainOwner,
+        context: SourceProcessIdentity,
+        root_id: String,
+        control_protocol: &str,
     ) -> Result<RootAuthorityGrant, String> {
         uuid::Uuid::parse_str(&root_id).map_err(|_| "invalid broker root ID")?;
         if self.scopes.contains_key(&root_id) {
@@ -324,6 +347,7 @@ impl RootAuthorities {
         );
         let grant = RootAuthorityGrant {
             protocol: ROOT_PROTOCOL.into(),
+            control_protocol: control_protocol.into(),
             completion_protocol: owner.protocol.clone(),
             domain_id: owner.domain_id.clone(),
             supervisor_authority_id: owner.supervisor_authority_id.clone(),
@@ -459,7 +483,8 @@ impl RootAuthorities {
             .scopes
             .get_mut(&grant.root_id)
             .ok_or("unknown root capability")?;
-        if scope.capability_hash != digest(grant.capability.as_bytes())
+        if scope.grant.control_protocol != grant.control_protocol
+            || scope.capability_hash != digest(grant.capability.as_bytes())
             || scope.grant.root_identity != grant.root_identity
         {
             return Err("root capability mismatch".into());
@@ -2398,6 +2423,7 @@ mod tests {
             .fresh_with_root_id(&owner, context.clone(), root_id.clone())
             .unwrap();
         assert_eq!(grant.root_id, root_id);
+        assert_eq!(grant.control_protocol, SOURCE_CONTROL_PROTOCOL);
         assert_eq!(grant.domain_id, owner.domain_id);
         assert_eq!(grant.guardian_identity, owner.guardian_identity);
         assert!(
@@ -2497,6 +2523,14 @@ mod tests {
         assert!(
             authorities
                 .authorize_capability(&owner, &wrong_protocol)
+                .is_err()
+        );
+
+        let mut wrong_control = grant.clone();
+        wrong_control.control_protocol = SOURCE_CONTROL_PROTOCOL.into();
+        assert!(
+            authorities
+                .authorize_capability(&owner, &wrong_control)
                 .is_err()
         );
 

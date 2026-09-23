@@ -22,6 +22,7 @@ fn root_join_response(owner: &CompletionDomainOwner) -> super::original_work::Ro
     super::original_work::RootJoinResponse {
         owner: owner.clone(),
         root_authority: super::original_work::RootAuthorityGrant {
+            control_protocol: super::original_work::SOURCE_CONTROL_PROTOCOL.into(),
             protocol: super::original_work::ROOT_PROTOCOL.into(),
             completion_protocol: owner.protocol.clone(),
             domain_id: owner.domain_id.clone(),
@@ -42,6 +43,7 @@ fn guardian_readiness_is_not_failed_by_the_retired_five_second_cap() {
         guardian.write_all(&[1]).unwrap();
         let identity = identity(i64::from(std::process::id())).unwrap();
         let grant = super::original_work::RootAuthorityGrant {
+            control_protocol: super::original_work::SOURCE_CONTROL_PROTOCOL.into(),
             protocol: super::original_work::ROOT_PROTOCOL.into(),
             completion_protocol: PROTOCOL.into(),
             domain_id: "readiness-test".into(),

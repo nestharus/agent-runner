@@ -4,6 +4,7 @@ use super::original_work::{
     CancelSubmission, FD_COUNT, InboundCancel, InboundWork, RootJoinRequest, WorkSubmission,
 };
 use super::{identity, peer_pid};
+use oulipoly_kernel_broker::protocol::{self, SourceControlUse};
 use oulipoly_state::completion_continuation::SourceProcessIdentity;
 use oulipoly_state::mailbox::CompletionDomainOwner;
 use serde::{Deserialize, Serialize};
@@ -15,11 +16,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use std::time::Instant;
 
 pub(super) const PENDING_LIMIT: usize = 128;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PEER_IDENTITY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+type ControlFrame = (Vec<u8>, Vec<OwnedFd>);
+type PinnedFrame = (Vec<u8>, Vec<OwnedFd>, Option<[u8; 16]>);
+type FrameError = (Option<u8>, String);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,24 +87,43 @@ pub(super) struct ControlService {
     commands: Sender<Command>,
     requests: Receiver<ControlRequest>,
     thread: Option<JoinHandle<()>>,
+    pinned_root_id: Option<String>,
 }
 
 impl ControlService {
     pub fn start(listener: &UnixListener, owner: &CompletionDomainOwner) -> Result<Self, String> {
+        Self::start_with_root(listener, owner, None)
+    }
+
+    pub fn start_pinned(
+        listener: &UnixListener,
+        owner: &CompletionDomainOwner,
+        root_id: &str,
+    ) -> Result<Self, String> {
+        Self::start_with_root(listener, owner, Some(root_id.to_owned()))
+    }
+
+    fn start_with_root(
+        listener: &UnixListener,
+        owner: &CompletionDomainOwner,
+        pinned_root_id: Option<String>,
+    ) -> Result<Self, String> {
         let listener = listener.try_clone().map_err(|e| e.to_string())?;
         let owner = owner.clone();
         let (commands, receive) = mpsc::channel();
         // A full queue fails without an admission ACK; it never discards a
         // committed lease. Do not turn slow storage into unbounded sockets.
         let (send, requests) = mpsc::sync_channel(PENDING_LIMIT);
+        let root = pinned_root_id.clone();
         let thread = std::thread::Builder::new()
             .name("completion-control".into())
-            .spawn(move || serve(listener, owner, receive, send))
+            .spawn(move || serve(listener, owner, root, receive, send))
             .map_err(|e| e.to_string())?;
         Ok(Self {
             commands,
             requests,
             thread: Some(thread),
+            pinned_root_id,
         })
     }
 
@@ -126,7 +150,7 @@ impl ControlService {
         // and its existing succession signal, never a healthy endpoint claim.
         self.join()?;
         let pending = self.pending();
-        *self = Self::start(listener, owner)?;
+        *self = Self::start_with_root(listener, owner, self.pinned_root_id.clone())?;
         Ok(pending)
     }
 
@@ -183,6 +207,7 @@ impl Drop for ControlService {
 fn serve(
     listener: UnixListener,
     owner: CompletionDomainOwner,
+    pinned_root_id: Option<String>,
     commands: Receiver<Command>,
     requests: SyncSender<ControlRequest>,
 ) {
@@ -214,6 +239,7 @@ fn serve(
                     continue;
                 }
                 let owner = owner.clone();
+                let pinned_root_id = pinned_root_id.clone();
                 let reply = reply.clone();
                 let requests = requests.clone();
                 let thread_readers = Arc::clone(&readers);
@@ -233,6 +259,7 @@ fn serve(
                             &thread_accepting,
                             &thread_answering,
                             &requests,
+                            pinned_root_id.as_deref(),
                         );
                         thread_readers.fetch_sub(1, Ordering::AcqRel);
                     }) {
@@ -313,8 +340,20 @@ fn serve_request(
     accepting: &AtomicBool,
     answering: &AtomicBool,
     requests: &SyncSender<ControlRequest>,
+    pinned_root_id: Option<&str>,
 ) {
-    let Ok(peer) = peer_pid(&socket) else { return };
+    let peer = if pinned_root_id.is_some() {
+        let Ok(credentials) = peer_credentials(&socket) else {
+            return;
+        };
+        if credentials.uid != unsafe { libc::geteuid() } && credentials.uid != 0 {
+            return;
+        }
+        i64::from(credentials.pid)
+    } else {
+        let Ok(peer) = peer_pid(&socket) else { return };
+        peer
+    };
     let Ok(context) = identity(peer) else {
         super::record_control_gap(owner, peer, "original_work_control_peer_disappeared");
         return;
@@ -322,7 +361,11 @@ fn serve_request(
     if socket.set_nonblocking(true).is_err() {
         return;
     }
-    let (request, descriptors) = match receive_request(&socket, &context) {
+    let incoming = match pinned_root_id {
+        Some(_) => receive_pinned_request(&socket, &context),
+        None => receive_request(&socket, &context).map(|(frame, fds)| (frame, fds, None)),
+    };
+    let (request, descriptors, ticket) = match incoming {
         Ok(request) => request,
         Err((Some(b'w' | b'c'), _)) => {
             super::record_control_gap(owner, peer, "original_work_control_envelope_invalid");
@@ -332,13 +375,13 @@ fn serve_request(
             return;
         }
     };
-    if socket.set_nonblocking(false).is_err() {
-        return;
-    }
     if !answering.load(Ordering::Acquire) {
         return;
     }
     if request == b"hello\n" && descriptors.is_empty() {
+        if socket.set_nonblocking(false).is_err() {
+            return;
+        }
         let _ = socket.write_all(reply);
         return; // EOF remains part of the existing hello protocol.
     }
@@ -352,6 +395,25 @@ fn serve_request(
     let json = &framed_json[1..];
     if identity(peer).as_ref() != Ok(&context) {
         super::record_control_gap(owner, peer, "original_work_control_peer_disappeared");
+        return;
+    }
+    if let Some(root_id) = pinned_root_id
+        && (command == b"work!" || command == b"cancel")
+    {
+        let Some(ticket) = ticket else {
+            super::record_control_gap(owner, peer, "original_work_control_source_ticket_missing");
+            return;
+        };
+        if attest_source_frame(owner, root_id, &socket, ticket, command, json).is_err()
+            || receive_pinned_eof(&socket, &context).is_err()
+        {
+            super::record_control_gap(owner, peer, "original_work_control_source_ticket_refused");
+            return;
+        }
+    } else if ticket.is_some() {
+        return;
+    }
+    if socket.set_nonblocking(false).is_err() {
         return;
     }
     let queued = match command {
@@ -457,8 +519,17 @@ fn refuse_retiring(owner: &CompletionDomainOwner, request: ControlRequest) {
 fn receive_request(
     socket: &UnixStream,
     peer: &SourceProcessIdentity,
-) -> Result<(Vec<u8>, Vec<OwnedFd>), (Option<u8>, String)> {
+) -> Result<ControlFrame, FrameError> {
     let (first, descriptors) = receive_first(socket, peer).map_err(|error| (None, error))?;
+    receive_request_from_first(socket, peer, first, descriptors)
+}
+
+fn receive_request_from_first(
+    socket: &UnixStream,
+    peer: &SourceProcessIdentity,
+    first: u8,
+    descriptors: Vec<OwnedFd>,
+) -> Result<ControlFrame, FrameError> {
     let mut request = vec![first];
     let required_lines = if first == b'h' { 1 } else { 2 };
     let mut lines = usize::from(first == b'\n');
@@ -507,6 +578,272 @@ fn receive_request(
         }
     }
     Ok((request, descriptors))
+}
+
+fn receive_pinned_request(
+    socket: &UnixStream,
+    peer: &SourceProcessIdentity,
+) -> Result<PinnedFrame, FrameError> {
+    let enabled: libc::c_int = 1;
+    if unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PASSCRED,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as _,
+        )
+    } != 0
+    {
+        return Err((None, std::io::Error::last_os_error().to_string()));
+    }
+    let (first, fds, marker_sender) =
+        receive_credentialled_byte(socket, peer, Some(Instant::now() + Duration::from_secs(10)))
+            .map_err(|error| (None, error))?;
+    if first != b'@' {
+        // The old join/hello exchange is still used to establish the owner.
+        // A pinned work/cancel request without S-v2 is refused below.
+        return receive_request_from_first(socket, peer, first, fds)
+            .map(|(frame, descriptors)| (frame, descriptors, None));
+    }
+    if !fds.is_empty() {
+        return Err((
+            Some(first),
+            "source ticket marker carried descriptors".into(),
+        ));
+    }
+    let mut ticket = [0u8; 16];
+    let marker_deadline = Instant::now() + Duration::from_secs(10);
+    for byte in &mut ticket {
+        let (next, fds, sender) = receive_credentialled_byte(socket, peer, Some(marker_deadline))
+            .map_err(|error| (Some(first), error))?;
+        if !fds.is_empty() || credential_tuple(sender) != credential_tuple(marker_sender) {
+            return Err((Some(first), "source ticket marker changed sender".into()));
+        }
+        *byte = next;
+    }
+    let connector = peer_credentials(socket).map_err(|error| (Some(first), error))?;
+    let mut frame = Vec::new();
+    let mut descriptors = Vec::new();
+    let mut lines = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if frame.len() >= MAX_REQUEST_BYTES || Instant::now() >= deadline {
+            return Err((
+                frame.first().copied(),
+                "bounded source frame incomplete".into(),
+            ));
+        }
+        let (byte, fds, sender) = receive_credentialled_byte(socket, peer, Some(deadline))
+            .map_err(|error| (frame.first().copied(), error))?;
+        if credential_tuple(sender) != credential_tuple(connector) {
+            return Err((
+                frame.first().copied(),
+                "source frame sender differs from connector".into(),
+            ));
+        }
+        if frame.is_empty() {
+            descriptors = fds;
+        } else if !fds.is_empty() {
+            return Err((
+                frame.first().copied(),
+                "late source frame descriptors".into(),
+            ));
+        }
+        frame.push(byte);
+        lines += usize::from(byte == b'\n');
+        if lines == 2 {
+            break;
+        }
+    }
+    if !frame.starts_with(b"work!\n") && !frame.starts_with(b"cancel\n") {
+        return Err((
+            frame.first().copied(),
+            "source ticket used for unsupported command".into(),
+        ));
+    }
+    Ok((frame, descriptors, Some(ticket)))
+}
+
+fn peer_credentials(socket: &UnixStream) -> Result<libc::ucred, String> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of_val(&credentials) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    } != 0
+        || len as usize != std::mem::size_of_val(&credentials)
+        || credentials.pid <= 0
+    {
+        return Err("invalid source connector credentials".into());
+    }
+    Ok(credentials)
+}
+
+fn credential_tuple(credentials: libc::ucred) -> (i32, u32, u32) {
+    (credentials.pid, credentials.uid, credentials.gid)
+}
+
+fn receive_credentialled_byte(
+    socket: &UnixStream,
+    peer: &SourceProcessIdentity,
+    deadline: Option<Instant>,
+) -> Result<(u8, Vec<OwnedFd>, libc::ucred), String> {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
+    let mut control = [0usize; 32];
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    let count = loop {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err("source control byte deadline elapsed".into());
+        }
+        message.msg_controllen = std::mem::size_of_val(&control);
+        message.msg_flags = 0;
+        let count =
+            unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+        if count >= 0 {
+            break count;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            wait_for_peer_progress(socket, peer)?;
+            continue;
+        }
+        return Err(error.to_string());
+    };
+    let mut sender = None;
+    let mut descriptors = Vec::new();
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    while !header.is_null() {
+        let item = unsafe { &*header };
+        if item.cmsg_level == libc::SOL_SOCKET && item.cmsg_type == libc::SCM_CREDENTIALS {
+            if sender.is_some()
+                || item.cmsg_len as usize
+                    != unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::ucred>() as _) } as usize
+            {
+                return Err("duplicate or malformed source credentials".into());
+            }
+            sender = Some(unsafe { *libc::CMSG_DATA(header).cast::<libc::ucred>() });
+        } else if item.cmsg_level == libc::SOL_SOCKET && item.cmsg_type == libc::SCM_RIGHTS {
+            let base = unsafe { libc::CMSG_LEN(0) } as usize;
+            let len = (item.cmsg_len as usize).saturating_sub(base);
+            if (item.cmsg_len as usize) < base || !len.is_multiple_of(std::mem::size_of::<RawFd>())
+            {
+                return Err("malformed source descriptors".into());
+            }
+            for index in 0..len / std::mem::size_of::<RawFd>() {
+                descriptors.push(unsafe {
+                    OwnedFd::from_raw_fd(*libc::CMSG_DATA(header).cast::<RawFd>().add(index))
+                });
+            }
+        } else {
+            return Err("unsupported source ancillary data".into());
+        }
+        header = unsafe { libc::CMSG_NXTHDR(&message, header) };
+    }
+    if count != 1 || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
+        return Err("incomplete source control byte or ancillary data".into());
+    }
+    let sender = sender.ok_or("missing source byte credentials")?;
+    if sender.pid <= 0 {
+        return Err("invalid source sender PID".into());
+    }
+    Ok((byte[0], descriptors, sender))
+}
+
+fn attest_source_frame(
+    owner: &CompletionDomainOwner,
+    root_id: &str,
+    socket: &UnixStream,
+    ticket: [u8; 16],
+    command: &[u8],
+    json: &[u8],
+) -> Result<(), String> {
+    let request = if command == b"work!" {
+        let work: WorkSubmission = serde_json::from_slice(json).map_err(|e| e.to_string())?;
+        if work.root_authority.root_id != root_id
+            || work.root_authority.domain_id != owner.domain_id
+            || work.root_authority.supervisor_authority_id != owner.supervisor_authority_id
+        {
+            return Err("source work root binding changed".into());
+        }
+        match work.registration {
+            super::original_work::WorkRegistration::Root => SourceControlUse::WorkRoot {
+                root_id: root_id.to_owned(),
+                work_id: work.work_id,
+            },
+            super::original_work::WorkRegistration::Nested { parent_work_id, .. } => {
+                SourceControlUse::WorkNested {
+                    root_id: root_id.to_owned(),
+                    work_id: work.work_id,
+                    parent_work_id,
+                }
+            }
+        }
+    } else if command == b"cancel" {
+        let cancel: CancelSubmission = serde_json::from_slice(json).map_err(|e| e.to_string())?;
+        if cancel.root_id != root_id
+            || cancel.supervisor_authority_id != owner.supervisor_authority_id
+        {
+            return Err("source cancel root binding changed".into());
+        }
+        SourceControlUse::Cancel {
+            root_id: root_id.to_owned(),
+            work_id: cancel.work_id,
+        }
+    } else {
+        return Err("source ticket cannot authorize command".into());
+    };
+    protocol::consume_source_ticket_at(
+        &super::linux::owner_broker_socket(),
+        ticket,
+        request,
+        socket.as_raw_fd(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn receive_pinned_eof(socket: &UnixStream, peer: &SourceProcessIdentity) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut byte = [0u8; 1];
+    loop {
+        if Instant::now() >= deadline {
+            return Err("source frame write half-close absent".into());
+        }
+        match unsafe { libc::recv(socket.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) } {
+            0 => return Ok(()),
+            count if count > 0 => return Err("duplicated or trailing source frame bytes".into()),
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    wait_for_peer_progress(socket, peer)?;
+                    continue;
+                }
+                return Err(error.to_string());
+            }
+        }
+    }
 }
 
 fn receive_first(
@@ -594,6 +931,221 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::time::Instant;
+
+    fn pinned_pair() -> (UnixStream, UnixStream, SourceProcessIdentity) {
+        let (server, client) = UnixStream::pair().unwrap();
+        let enabled: libc::c_int = 1;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    server.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PASSCRED,
+                    (&enabled as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&enabled) as _,
+                )
+            },
+            0
+        );
+        let peer = identity(i64::from(std::process::id())).unwrap();
+        (server, client, peer)
+    }
+
+    fn send_frame(socket: &UnixStream, bytes: &[u8], fds: &[RawFd]) {
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let mut control = [0u8; 128];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        if !fds.is_empty() {
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen =
+                unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as _) } as usize;
+            unsafe {
+                let header = libc::CMSG_FIRSTHDR(&msg);
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = libc::SCM_RIGHTS;
+                (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(fds) as _) as usize;
+                std::ptr::copy_nonoverlapping(
+                    fds.as_ptr(),
+                    libc::CMSG_DATA(header).cast::<RawFd>(),
+                    fds.len(),
+                );
+            }
+        }
+        assert_eq!(
+            unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) },
+            bytes.len() as isize
+        );
+    }
+
+    #[test]
+    fn pinned_complete_work_frame_has_one_sender_and_exact_four_fds() {
+        let (server, mut client, peer) = pinned_pair();
+        client.write_all(&[b'@']).unwrap();
+        client.write_all(&[7u8; 16]).unwrap();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        send_frame(&client, b"work!\n{}\n", &[file.as_raw_fd(); 4]);
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let (frame, fds, ticket) = receive_pinned_request(&server, &peer).unwrap();
+        assert_eq!(frame, b"work!\n{}\n");
+        assert_eq!(fds.len(), 4);
+        assert_eq!(ticket, Some([7u8; 16]));
+        receive_pinned_eof(&server, &peer).unwrap();
+    }
+
+    #[test]
+    fn pinned_complete_cancel_frame_has_no_fds() {
+        let (server, mut client, peer) = pinned_pair();
+        client.write_all(&[b'@']).unwrap();
+        client.write_all(&[4u8; 16]).unwrap();
+        send_frame(&client, b"cancel\n{}\n", &[]);
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let (frame, fds, ticket) = receive_pinned_request(&server, &peer).unwrap();
+        assert_eq!(frame, b"cancel\n{}\n");
+        assert!(fds.is_empty());
+        assert_eq!(ticket, Some([4u8; 16]));
+        receive_pinned_eof(&server, &peer).unwrap();
+    }
+
+    #[test]
+    fn pinned_inherited_socket_child_cannot_send_cancel_as_connector() {
+        let (server, mut client, peer) = pinned_pair();
+        client.write_all(&[b'@']).unwrap();
+        client.write_all(&[8u8; 16]).unwrap();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            drop(server);
+            let _ = client.write_all(b"cancel\n{}\n");
+            let _ = client.shutdown(std::net::Shutdown::Write);
+            unsafe { libc::_exit(0) };
+        }
+        drop(client);
+        server.set_nonblocking(true).unwrap();
+        let refusal = receive_pinned_request(&server, &peer);
+        assert!(refusal.is_err());
+        assert!(
+            refusal
+                .err()
+                .unwrap()
+                .1
+                .contains("sender differs from connector")
+        );
+        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+    }
+
+    #[test]
+    fn pinned_first_frame_byte_does_not_cover_later_child_bytes() {
+        let (server, mut client, peer) = pinned_pair();
+        client.write_all(&[b'@']).unwrap();
+        client.write_all(&[5u8; 16]).unwrap();
+        client.write_all(b"cancel\n").unwrap();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            drop(server);
+            let _ = client.write_all(b"{}\n");
+            let _ = client.shutdown(std::net::Shutdown::Write);
+            unsafe { libc::_exit(0) };
+        }
+        drop(client);
+        server.set_nonblocking(true).unwrap();
+        let refusal = receive_pinned_request(&server, &peer);
+        assert!(refusal.is_err());
+        assert!(
+            refusal
+                .err()
+                .unwrap()
+                .1
+                .contains("sender differs from connector")
+        );
+        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+    }
+
+    #[test]
+    fn pinned_unattested_work_never_reaches_owner_queue() {
+        let (server, mut client, _) = pinned_pair();
+        let endpoint = Path::new("/tmp/unused-pinned-control-test.sock");
+        let owner = owner(endpoint);
+        let reply = serde_json::to_vec(&owner).unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        client.write_all(b"work!\n{}\n").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        serve_request(
+            server,
+            &owner,
+            &reply,
+            &AtomicBool::new(true),
+            &AtomicBool::new(true),
+            &send,
+            Some("11111111-1111-4111-8111-111111111111"),
+        );
+        assert!(receive.try_recv().is_err());
+    }
+
+    #[test]
+    fn pinned_transferred_work_fd_never_reaches_owner_queue() {
+        let (server, mut client, _) = pinned_pair();
+        let endpoint = Path::new("/tmp/unused-transferred-control-test.sock");
+        let owner = owner(endpoint);
+        let reply = serde_json::to_vec(&owner).unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        client.write_all(&[b'@']).unwrap();
+        client.write_all(&[3u8; 16]).unwrap();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            drop(server);
+            let file = std::fs::File::open("/dev/null").unwrap();
+            send_frame(&client, b"work!\n{}\n", &[file.as_raw_fd(); 4]);
+            let _ = client.shutdown(std::net::Shutdown::Write);
+            unsafe { libc::_exit(0) };
+        }
+        drop(client);
+        serve_request(
+            server,
+            &owner,
+            &reply,
+            &AtomicBool::new(true),
+            &AtomicBool::new(true),
+            &send,
+            Some("11111111-1111-4111-8111-111111111111"),
+        );
+        assert!(receive.try_recv().is_err());
+        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+    }
+
+    #[test]
+    fn pinned_partial_duplicate_and_late_fds_refuse() {
+        for (frame, late_fd) in [
+            (b"cancel\n{".as_slice(), false),
+            (b"cancel\n{}\ncancel\n{}\n".as_slice(), false),
+            (b"cancel\n{}\n".as_slice(), true),
+        ] {
+            let (server, mut client, peer) = pinned_pair();
+            client.write_all(&[b'@']).unwrap();
+            client.write_all(&[9u8; 16]).unwrap();
+            if late_fd {
+                client.write_all(b"c").unwrap();
+                let file = std::fs::File::open("/dev/null").unwrap();
+                send_frame(&client, b"ancel\n{}\n", &[file.as_raw_fd()]);
+            } else {
+                client.write_all(frame).unwrap();
+            }
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            server.set_nonblocking(true).unwrap();
+            match receive_pinned_request(&server, &peer) {
+                Ok(_) => assert!(receive_pinned_eof(&server, &peer).is_err()),
+                Err(_) => {}
+            }
+        }
+    }
 
     fn owner(endpoint: &Path) -> CompletionDomainOwner {
         let id = identity(i64::from(std::process::id())).unwrap();
@@ -711,6 +1263,7 @@ mod tests {
             commands,
             requests,
             thread: None,
+            pinned_root_id: None,
         };
         let mut overlaps = 0;
         let requests = service.requests.try_iter().inspect(|_| {
