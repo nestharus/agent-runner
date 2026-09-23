@@ -364,7 +364,10 @@ fn verify_owner_socket(
     for id in [&witness.root_id, &witness.domain_id, &witness.supervisor_id] {
         uuid::Uuid::parse_str(id).map_err(|_| io::Error::other("invalid owner witness ID"))?;
     }
-    if roots.has_debt() || entries.has_debt() {
+    // Entry debt includes the normal exit of the original host entry after
+    // its one-use join. V is read-only: the live root and the exact joined
+    // child, guardian, work and grant bindings below carry its authority.
+    if roots.has_debt() || entries.has_uncertain_write() {
         return Err(io::Error::other("uncertain owner witness caller"));
     }
     let root = roots
@@ -376,6 +379,7 @@ fn verify_owner_socket(
         .ok_or_else(|| io::Error::other("owner witness entry absent"))?;
     if !entry.join_consumed
         || entry.owner_uid != peer.uid
+        || entry.owner_uid != root.record.owner_uid
         || entry.domain_id.as_deref() != Some(&witness.domain_id)
         || entry.supervisor_authority_id.as_deref() != Some(&witness.supervisor_id)
     {
@@ -385,6 +389,10 @@ fn verify_owner_socket(
         .joined_child
         .as_ref()
         .ok_or_else(|| io::Error::other("joined child absent"))?;
+    let guardian_stamp = entry
+        .guardian
+        .as_ref()
+        .ok_or_else(|| io::Error::other("owner witness guardian absent"))?;
     let original_child = joined_child == &ProcessStamp::from(&peer.process)
         && peer.process.direct_child_of(&root.init)?
         && peer.process.in_namespace(root.init.namespace())?
@@ -433,6 +441,7 @@ fn verify_owner_socket(
         if grant.version != 3
             || grant.owner_uid != peer.uid
             || grant.root_init != ProcessStamp::from(&root.init)
+            || grant.guardian != *guardian_stamp
             || grant.joined_child != *joined_child
             || grant.supervisor_authority_id != witness.supervisor_id
             || witness.owner_generation.as_deref() != Some(&grant.owner_generation)
@@ -454,10 +463,6 @@ fn verify_owner_socket(
         }
         work.init.verify()?;
     }
-    let guardian_stamp = entry
-        .guardian
-        .as_ref()
-        .ok_or_else(|| io::Error::other("owner witness guardian absent"))?;
     let guardian = PinnedProcess::open(guardian_stamp.host_pid)?;
     if ProcessStamp::from(&guardian) != *guardian_stamp
         || !witness_matches(&witness.guardian, &guardian)?

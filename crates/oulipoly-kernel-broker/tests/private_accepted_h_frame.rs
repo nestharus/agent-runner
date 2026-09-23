@@ -357,6 +357,10 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
     let session = uuid::Uuid::new_v4().to_string();
     let invocation = uuid::Uuid::new_v4().to_string();
     let registration_authority = "11".repeat(32);
+    // The host entry may finish its joined child while the guardian, root
+    // PID1 and an accepted work remain live for a later completion helper.
+    let mut historical_entry =
+        helper_probe.then(|| Command::new("sleep").arg("60").spawn().unwrap());
     let helper_driver = helper_probe.then(|| {
         PrivateProcess(
             Command::new(std::env::current_exe().unwrap())
@@ -385,13 +389,17 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
         })
         .unwrap();
     let guardian_stamp = ProcessStamp::from(&guardian);
+    let entry_stamp = historical_entry
+        .as_ref()
+        .map(|child| ProcessStamp::from(&PinnedProcess::open(child.id() as i32).unwrap()))
+        .unwrap_or_else(|| guardian_stamp.clone());
     fs::write(
         state.join("entries").join(format!("{root_id}.json")),
         serde_json::to_vec(&EntryRecord {
             version: 1,
             root_id: root_id.clone(),
             owner_uid: unsafe { libc::getuid() },
-            entry: guardian_stamp.clone(),
+            entry: entry_stamp,
             prepared_guardian: Some(guardian_stamp.clone()),
             domain_id: Some(domain.clone()),
             supervisor_authority_id: Some(supervisor.clone()),
@@ -987,6 +995,7 @@ if os.fork() == 0:
 os.waitpid(-1, 0)
 if os.path.exists(state + '/probe-helper'):
     import subprocess
+    while not os.path.exists(state + '/entry-exited'): time.sleep(.02)
     for role, image in [('sealed', state + '/delivery-helper'), ('fake', state + '/fake-helper')]:
         env = dict(os.environ, AGE319_HELPER_PROBE=role, AGE319_HELPER_STATE=state, OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY=open(state + '/helper-authority').read().strip())
         probe = subprocess.run([image, '--exact', 'sealed_helper_from_consumed_work_attests_owner', '--nocapture'], env=env, capture_output=True, text=True)
@@ -1101,6 +1110,16 @@ open(state + '/worker-done', 'w').write('done')
     }
     assert!(GrantRegistry::open(state.join("grants")).unwrap().records()[0].consumed);
     if helper_probe {
+        let mut entry = historical_entry.take().unwrap();
+        entry.kill().unwrap();
+        entry.wait().unwrap();
+        assert!(!RootRegistry::open(&state).unwrap().has_debt());
+        let reopened_entries =
+            oulipoly_kernel_broker::entry_registry::EntryRegistry::open(state.join("entries"))
+                .unwrap();
+        assert!(reopened_entries.has_debt());
+        assert!(!reopened_entries.has_uncertain_write());
+        fs::write(work_state.join("entry-exited"), b"yes").unwrap();
         wait_for(&work_state.join("first-probe-done"));
         broker.0.kill().unwrap();
         broker.0.wait().unwrap();
@@ -1502,6 +1521,19 @@ fn sealed_helper_from_consumed_work_attests_owner() {
         let mut wrong = witness.clone();
         wrong.driver.starttime_ticks += 1;
         assert!(verify(&wrong).is_err());
+        let mut wrong = witness.clone();
+        wrong.guardian.starttime_ticks += 1;
+        assert!(verify(&wrong).is_err());
+        let (wrong_socket, _other_end) = UnixStream::pair().unwrap();
+        assert!(
+            protocol::verify_owner_at(
+                &base.join("broker.sock"),
+                &witness,
+                wrong_socket.as_raw_fd()
+            )
+            .is_err(),
+            "a socket without the pinned guardian peer was admitted"
+        );
         return;
     }
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {

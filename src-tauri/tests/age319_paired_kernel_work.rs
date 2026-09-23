@@ -342,7 +342,7 @@ fn inner() {
 }
 
 #[test]
-#[ignore = "paired Bash image custodian remains live across PID domains; source/ACK/result/Q unproved"]
+#[ignore = "completion helper lacks exact owner witness; source/ACK and paired adversarial controls unproved"]
 fn real_bash_source_reaches_guardian_h_k_q() {
     if std::env::var_os("AGE319_PRIVATE_PAIRED_INNER").is_some() {
         inner();
