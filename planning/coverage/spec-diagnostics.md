@@ -53,6 +53,9 @@
 - `src-tauri/src/dispatch.rs`
 - `src-tauri/src/mailbox_delivery.rs`
 - `src-tauri/src/completion_owner/root_supervisor.rs`
+- `src-tauri/src/completion_owner/original_work.rs`
+- `src-tauri/src/completion_owner/control.rs`
+- `src-tauri/src/completion_owner/linux.rs`
 - `src-tauri/src/completion_owner/driver.rs`
 - `src-tauri/src/wake_coordinator/constants.rs`
 - `runtime-caps.json`
@@ -91,13 +94,14 @@ slice; a row is included only where the named source constructs a `SpanStart`.
 | Wake claim in `mailbox.rs` | `wake_claim_acquire` / `pid_mailbox_sqlite` | The selected wake-claim acquisition transaction. |
 | Wake recovery in `wake_coordinator/sweep/mod.rs` | `wake_recovery_sweep` / `wake_recovery_orchestration` | The bounded composite sweep outcome; it is not a synthetic SQLite commit. |
 | Runner-visible terminal handoff in `mailbox_delivery.rs` | `pty_terminal_handoff` / `runner_visible_handoff`, with observation beginning before mailbox open | The runner-side handoff attempt and bounded outcome; it is not an ACK, process-exit, or full delivery-settlement claim. |
+| Root-owned original work in `completion_owner/original_work.rs` | `root_original_work_submit`, `root_original_work_grant`, `root_original_work_cancel`, and `root_original_work_terminal` / `process_tree` | DB-independent initiation/acceptance classification, exact worker grant identity, durable cancellation acceptance, and exact terminal/session-drain integration. Completion listener ACKs remain separate. |
 
 Explicit omissions are every other State or PID-mailbox transaction not named
 above, including generic invocation/artifact/session writes, schema/migration and
 quota work, mailbox delivery/receipt/ACK writes, wake-claim release, and the
 remaining admission mutations. Agent-bash-local pre-runner registration,
-pre-spawn, provisional-result, and publication phases are also omitted, as are a
-single-root-supervisor authority cutover, lifecycle repair, universal SQLite
+pre-spawn, provisional-result, and publication phases outside the paired v1
+path are also omitted, as are lifecycle repair, universal SQLite
 instrumentation, and Tauri IPC diagnostics. Nested work is covered only when it
 has its own named parented span; merely executing inside a composite span does
 not make an omitted transaction a recorded participant.

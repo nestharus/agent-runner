@@ -1,21 +1,23 @@
 use super::*;
 use oulipoly_state::completion_continuation::{PROTOCOL, SourceProcessIdentity};
+use oulipoly_state::diagnostic_recorder::{
+    DiagnosticPhase, PhaseObservation, SpanStart, process_recorder,
+};
 use oulipoly_state::mailbox::{CompletionDomainOwner, MailboxDb};
 use oulipoly_state::pid_identity::{PidIdentityDb, read_live_process_identity};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const CLIENT_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const GUARDIAN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const OWNER_HELLO_MAX_BYTES: u64 = 8_192;
 #[path = "control.rs"]
 mod control;
-use control::{ControlService, JoinRefusal, JoinRequest, RefusalReason};
+use control::{ControlRequest, ControlService, JoinRefusal, JoinRequest, RefusalReason};
 #[path = "context_leases.rs"]
 mod context_leases;
 use context_leases::ContextLeases;
@@ -57,12 +59,6 @@ pub(super) fn require_owner(domain_id: &str) -> Result<CompletionDomainOwner, St
 fn hello(endpoint: &Path) -> Result<CompletionDomainOwner, String> {
     let mut socket = UnixStream::connect(endpoint).map_err(|e| e.to_string())?;
     let peer = peer_pid(&socket)?;
-    socket
-        .set_read_timeout(Some(CLIENT_CONTROL_IO_TIMEOUT))
-        .map_err(|e| e.to_string())?;
-    socket
-        .set_write_timeout(Some(CLIENT_CONTROL_IO_TIMEOUT))
-        .map_err(|e| e.to_string())?;
     socket.write_all(b"hello\n").map_err(|e| e.to_string())?;
     let mut response = Vec::new();
     socket
@@ -91,22 +87,38 @@ fn retain_context(socket: UnixStream) -> Result<(), String> {
         .map_err(|_| "native completion context already joined".into())
 }
 fn join(endpoint: &Path, expected: &CompletionDomainOwner) -> Result<(), String> {
-    retain_context(connect_context(endpoint, expected)?)
+    let (socket, grant) = connect_context(endpoint, expected)?;
+    unsafe {
+        std::env::set_var(
+            ROOT_AUTHORITY_ENV,
+            serde_json::to_string(&grant).map_err(|error| error.to_string())?,
+        );
+        std::env::set_var(super::ORIGINAL_WORK_REQUIRED_ENV, "1");
+    }
+    retain_context(socket)
 }
 
 fn connect_context(
     endpoint: &Path,
     expected: &CompletionDomainOwner,
-) -> Result<UnixStream, String> {
+) -> Result<(UnixStream, super::original_work::RootAuthorityGrant), String> {
     let mut socket = UnixStream::connect(endpoint).map_err(|e| e.to_string())?;
     let peer = peer_pid(&socket)?;
-    socket
-        .set_read_timeout(Some(CLIENT_CONTROL_IO_TIMEOUT))
-        .map_err(|e| e.to_string())?;
-    socket
-        .set_write_timeout(Some(CLIENT_CONTROL_IO_TIMEOUT))
-        .map_err(|e| e.to_string())?;
+    let mode = match std::env::var(ROOT_AUTHORITY_ENV) {
+        Ok(value) => super::original_work::RootJoinMode::Inherit {
+            grant: serde_json::from_str(&value)
+                .map_err(|_| "invalid inherited root authority capability")?,
+        },
+        Err(std::env::VarError::NotPresent) => super::original_work::RootJoinMode::Fresh,
+        Err(error) => return Err(error.to_string()),
+    };
+    let request = super::original_work::RootJoinRequest {
+        protocol: super::original_work::ROOT_PROTOCOL.into(),
+        mode,
+    };
     socket.write_all(b"join!\n").map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut socket, &request).map_err(|error| error.to_string())?;
+    socket.write_all(b"\n").map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
     for _ in 0..8193 {
         let mut byte = [0];
@@ -142,16 +154,26 @@ fn connect_context(
             RefusalReason::QueueFull => "queue full",
             RefusalReason::Retiring => "retirement pause",
             RefusalReason::Persistence => "persistence failure",
+            RefusalReason::Identity => "process or protocol identity mismatch",
         };
         return Err(format!(
             "completion join refused: {category}; admission outcome uncertain; no replay authorized"
         ));
     }
-    let owner: CompletionDomainOwner = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    let response: super::original_work::RootJoinResponse =
+        serde_json::from_value(value).map_err(|e| e.to_string())?;
+    let owner = &response.owner;
     if owner.guardian_identity != identity(peer)? || owner.endpoint != endpoint.to_string_lossy() {
         return Err("completion join peer conflict".into());
     }
-    Ok(socket)
+    if response.root_authority.guardian_identity != owner.guardian_identity
+        || response.root_authority.domain_id != owner.domain_id
+        || response.root_authority.supervisor_authority_id != owner.supervisor_authority_id
+        || response.root_authority.protocol != super::original_work::ROOT_PROTOCOL
+    {
+        return Err("root authority join response conflict".into());
+    }
+    Ok((socket, response.root_authority))
 }
 
 pub(super) fn bootstrap() -> Result<(), super::BootstrapError> {
@@ -269,14 +291,24 @@ pub(super) fn bootstrap() -> Result<(), super::BootstrapError> {
     // process exhaustion while the healthy guardian continued in the background.
     // Wait for exact readiness or channel closure; individual database and IPC
     // operations retain their own typed contention/failure bounds.
-    await_guardian_ready(&mut ready, pid)?;
+    let grant = await_guardian_ready(&mut ready, pid)?;
     unsafe { std::env::set_var(ENDPOINT_ENV, &endpoint) };
+    unsafe {
+        std::env::set_var(
+            ROOT_AUTHORITY_ENV,
+            serde_json::to_string(&grant).map_err(|error| error.to_string())?,
+        );
+        std::env::set_var(super::ORIGINAL_WORK_REQUIRED_ENV, "1");
+    };
     require_owner(&domain)?;
     retain_context(ready)?;
     Ok(())
 }
 
-fn await_guardian_ready(ready: &mut UnixStream, pid: i32) -> Result<(), String> {
+fn await_guardian_ready(
+    ready: &mut UnixStream,
+    pid: i32,
+) -> Result<super::original_work::RootAuthorityGrant, String> {
     let mut ready_byte = [0];
     ready.read_exact(&mut ready_byte).map_err(|error| {
         format!(
@@ -288,7 +320,21 @@ fn await_guardian_ready(ready: &mut UnixStream, pid: i32) -> Result<(), String> 
             "completion_guardian_startup_failed: guardian pid {pid} published an invalid readiness marker"
         ));
     }
-    Ok(())
+    let mut bytes = Vec::new();
+    loop {
+        if bytes.len() >= 16 * 1024 {
+            return Err("completion guardian root authority frame is too large".into());
+        }
+        let mut byte = [0];
+        ready.read_exact(&mut byte).map_err(|error| {
+            format!("completion_guardian_startup_failed: root authority frame missing: {error}")
+        })?;
+        if byte == [b'\n'] {
+            break;
+        }
+        bytes.push(byte[0]);
+    }
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
 /// Lock ordering: admission -> lifetime election -> State -> sidecar.
@@ -351,10 +397,14 @@ fn guardian(
     let (mut owner, driver_channel) = start_driver(path, endpoint, domain, listener.as_raw_fd())?;
     let mut root_supervisor = super::root_supervisor::RootSupervisor::new(path, driver_channel)?;
     let mut contexts = ContextLeases::inherit(path)?;
+    let mut root_authorities = super::original_work::RootAuthorities::default();
     if let Some(mut socket) = announce.take() {
         let context = identity(peer_pid(&socket)?)?;
         MailboxDb::open(path)?.retain_completion_context(&context)?;
+        let grant = root_authorities.fresh(&owner, context.clone())?;
         socket.write_all(&[1]).map_err(|e| e.to_string())?;
+        serde_json::to_writer(&mut socket, &grant).map_err(|error| error.to_string())?;
+        socket.write_all(b"\n").map_err(|error| error.to_string())?;
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
         contexts.retain_local(context, socket);
     }
@@ -369,7 +419,6 @@ fn guardian(
         // proposals, owns worker children, observes cancellation, reaps exact
         // terminal identities, and integrates retained results before generic
         // descendant cleanup can consume a wait status.
-        root_supervisor.tick(&owner)?;
         if !closing {
             append_pending(
                 &mut pending,
@@ -392,7 +441,8 @@ fn guardian(
             let pid = if driver_pid > 0 {
                 driver_pid
             } else {
-                super::custody::reap_unprotected(&mut status)
+                let protected = root_supervisor.original_worker_pids();
+                super::custody::reap_unprotected(&mut status, &protected)
             };
             if pid <= 0 {
                 if closing
@@ -425,9 +475,24 @@ fn guardian(
         if pending.is_empty() {
             append_pending(&mut pending, control.pending(), &owner);
         }
-        retain_pending_contexts(path, &owner, &mut contexts, &mut pending);
+        retain_pending_requests(
+            path,
+            &owner,
+            &mut contexts,
+            &mut root_authorities,
+            &mut root_supervisor,
+            &mut pending,
+        );
+        // Requests, especially cancellation, are admitted before this pass may
+        // issue an execution grant. A cancel already visible to the guardian
+        // therefore cannot race behind a same-pass grant.
+        root_supervisor.tick(&owner)?;
         // Errors leave the group owned for the next pass; never a release ACK.
         let _ = contexts.release_disconnected(path);
+        root_authorities.retain_live(
+            &contexts.identities(),
+            &root_supervisor.original_active_root_ids(),
+        );
         if !closing
             && contexts.is_empty()
             && pending.is_empty()
@@ -452,7 +517,7 @@ fn guardian(
 fn close_idle_owner(
     owner: &CompletionDomainOwner,
     control: &ControlService,
-    pending: &mut Vec<JoinRequest>,
+    pending: &mut Vec<ControlRequest>,
 ) -> bool {
     // The barrier exposes every earlier join without obstructing hello during
     // the State close. A failed reader cannot supply permission to retire.
@@ -472,27 +537,107 @@ fn close_idle_owner(
 // not been persisted or acknowledged. Preserve earlier accepted ordering when
 // a driver replacement transfers the old reader's queued sockets.
 fn append_pending(
-    pending: &mut Vec<JoinRequest>,
-    requests: Vec<JoinRequest>,
+    pending: &mut Vec<ControlRequest>,
+    requests: Vec<ControlRequest>,
     owner: &CompletionDomainOwner,
 ) {
-    for mut request in requests {
+    for request in requests {
         if pending.len() < control::PENDING_LIMIT {
             pending.push(request);
         } else {
-            JoinRefusal::new(owner, RefusalReason::QueueFull).send(&mut request.socket);
+            refuse_control_request(owner, request);
         }
     }
 }
 
-fn retain_pending_contexts(
+fn refuse_control_request(owner: &CompletionDomainOwner, request: ControlRequest) {
+    match request {
+        ControlRequest::Join(mut request) => {
+            JoinRefusal::new(owner, RefusalReason::QueueFull).send(&mut request.socket)
+        }
+        ControlRequest::Work(request) => reject_work(
+            owner,
+            request,
+            "root control queue is full before acceptance".into(),
+        ),
+        ControlRequest::Cancel(request) => reject_cancel(
+            owner,
+            request,
+            "root control queue is full before cancellation".into(),
+        ),
+    }
+}
+
+fn retain_pending_requests(
     path: &Path,
     owner: &CompletionDomainOwner,
     contexts: &mut ContextLeases,
-    pending: &mut Vec<JoinRequest>,
+    root_authorities: &mut super::original_work::RootAuthorities,
+    root_supervisor: &mut super::root_supervisor::RootSupervisor,
+    pending: &mut Vec<ControlRequest>,
 ) {
     for request in pending.drain(..pending.len().min(8)) {
-        retain_pending_context(path, owner, contexts, request);
+        match request {
+            ControlRequest::Join(request) => retain_pending_context(
+                path,
+                owner,
+                contexts,
+                root_authorities,
+                root_supervisor,
+                request,
+            ),
+            ControlRequest::Work(request) => {
+                let authorized = match &request.submission.registration {
+                    super::original_work::WorkRegistration::Root => {
+                        if let Some(parent_work_id) = root_supervisor.original_parent_for_peer(
+                            &request.submission.root_authority.root_id,
+                            &request.peer,
+                        ) {
+                            Err(format!(
+                                "paired peer is inside active parent {parent_work_id}; exact nested authority is required"
+                            ))
+                        } else {
+                            root_authorities.authorize_root(
+                                owner,
+                                &request.peer,
+                                &request.submission.root_authority,
+                            )
+                        }
+                    }
+                    super::original_work::WorkRegistration::Nested {
+                        parent_work_id,
+                        parent_capability,
+                    } => root_authorities
+                        .authorize_capability(owner, &request.submission.root_authority)
+                        .and_then(|()| {
+                            root_supervisor
+                                .original_accepts_nested(
+                                    &request.submission.root_authority.root_id,
+                                    parent_work_id,
+                                    parent_capability,
+                                    &request.peer,
+                                )
+                                .then_some(())
+                                .ok_or_else(|| {
+                                    "nested original work is not in its exact active parent tree"
+                                        .to_owned()
+                                })
+                        }),
+                };
+                if let Err(error) = authorized {
+                    reject_work(owner, request, error);
+                } else {
+                    root_supervisor.submit_original(owner, request);
+                }
+            }
+            ControlRequest::Cancel(request) => {
+                // Public control eligibility is bound to a private per-handle
+                // capability, not the caller's ambient root-wide grant. The
+                // supervisor validates that exact capability before accepting
+                // and persisting the actual peer principal.
+                root_supervisor.cancel_original(owner, request);
+            }
+        }
     }
 }
 
@@ -500,19 +645,214 @@ fn retain_pending_context(
     path: &Path,
     owner: &CompletionDomainOwner,
     contexts: &mut ContextLeases,
+    root_authorities: &mut super::original_work::RootAuthorities,
+    root_supervisor: &super::root_supervisor::RootSupervisor,
     mut request: JoinRequest,
 ) {
+    if matches!(
+        &request.request.mode,
+        super::original_work::RootJoinMode::Fresh
+    ) {
+        let existing_context_roots = root_authorities.roots_for_peer(&request.context);
+        let active_root = root_supervisor.original_root_for_peer(&request.context);
+        if !existing_context_roots.is_empty() || active_root.is_some() {
+            record_original_rejection(
+                owner,
+                &request.context,
+                active_root.or_else(|| existing_context_roots.iter().next().map(String::as_str)),
+                None,
+                "fresh_root_rejected_inside_existing_root",
+            );
+            JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+            return;
+        }
+        if !same_process_image(request.context.pid, i64::from(std::process::id())) {
+            JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+            return;
+        }
+    }
+    if request.request.protocol != super::original_work::ROOT_PROTOCOL {
+        JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+        return;
+    }
+    let inherit_from_active = match &request.request.mode {
+        super::original_work::RootJoinMode::Fresh => false,
+        super::original_work::RootJoinMode::Inherit { grant } => {
+            if root_authorities
+                .validate_inherit(owner, &request.context, grant)
+                .is_ok()
+            {
+                false
+            } else if root_authorities.authorize_capability(owner, grant).is_ok()
+                && root_supervisor.original_peer_in_root(&grant.root_id, &request.context)
+            {
+                true
+            } else {
+                JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+                return;
+            }
+        }
+    };
     if contexts.admit(path, &request.context).is_err() {
         JoinRefusal::new(owner, RefusalReason::Persistence).send(&mut request.socket);
         return;
     }
+    let grant = match &request.request.mode {
+        super::original_work::RootJoinMode::Fresh => {
+            match root_authorities.fresh(owner, request.context.clone()) {
+                Ok(grant) => grant,
+                Err(_) => {
+                    JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+                    return;
+                }
+            }
+        }
+        super::original_work::RootJoinMode::Inherit { grant } if inherit_from_active => {
+            match root_authorities.inherit_from_active_tree(owner, request.context.clone(), grant) {
+                Ok(grant) => grant,
+                Err(_) => {
+                    JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+                    return;
+                }
+            }
+        }
+        super::original_work::RootJoinMode::Inherit { grant } => {
+            match root_authorities.inherit(owner, request.context.clone(), grant) {
+                Ok(grant) => grant,
+                Err(_) => {
+                    JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+                    return;
+                }
+            }
+        }
+    };
     // Persistence preceded the reply. Even a lost reply is owned locally;
     // grouping sockets by incarnation prevents one release deleting another.
-    let _ = serde_json::to_writer(&mut request.socket, owner)
+    let response = super::original_work::RootJoinResponse {
+        owner: owner.clone(),
+        root_authority: grant,
+    };
+    let _ = serde_json::to_writer(&mut request.socket, &response)
         .map_err(|e| e.to_string())
         .and_then(|()| request.socket.write_all(b"\n").map_err(|e| e.to_string()));
     let _ = request.socket.set_nonblocking(true);
     contexts.retain_local(request.context, request.socket);
+}
+
+fn same_process_image(left: i64, right: i64) -> bool {
+    let Ok(left) = std::fs::metadata(format!("/proc/{left}/exe")) else {
+        return false;
+    };
+    let Ok(right) = std::fs::metadata(format!("/proc/{right}/exe")) else {
+        return false;
+    };
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+fn reject_work(
+    owner: &CompletionDomainOwner,
+    mut request: super::original_work::InboundWork,
+    error: String,
+) {
+    record_original_rejection(
+        owner,
+        &request.peer,
+        Some(&request.submission.root_authority.root_id),
+        Some(&request.submission.work_id),
+        "original_work_rejected_preaccept",
+    );
+    let response = super::original_work::WorkResponse {
+        protocol: super::original_work::PROTOCOL.into(),
+        work_id: request.submission.work_id.clone(),
+        status: "rejected_preaccept".into(),
+        root_id: request.submission.root_authority.root_id.clone(),
+        supervisor_authority_id: owner.supervisor_authority_id.clone(),
+        worker_identity: None,
+        detail: Some(error),
+    };
+    let _ = serde_json::to_writer(&mut request.socket, &response);
+    let _ = request.socket.write_all(b"\n");
+}
+
+fn reject_cancel(
+    owner: &CompletionDomainOwner,
+    mut request: super::original_work::InboundCancel,
+    error: String,
+) {
+    record_original_rejection(
+        owner,
+        &request.peer,
+        Some(&request.submission.root_id),
+        Some(&request.submission.work_id),
+        "original_work_cancellation_rejected",
+    );
+    let response = super::original_work::WorkResponse {
+        protocol: super::original_work::PROTOCOL.into(),
+        work_id: request.submission.work_id.clone(),
+        status: "rejected".into(),
+        root_id: request.submission.root_id.clone(),
+        supervisor_authority_id: owner.supervisor_authority_id.clone(),
+        worker_identity: None,
+        detail: Some(error),
+    };
+    let _ = serde_json::to_writer(&mut request.socket, &response);
+    let _ = request.socket.write_all(b"\n");
+}
+
+pub(super) fn record_control_gap(
+    owner: &CompletionDomainOwner,
+    peer_pid: i64,
+    cause: &'static str,
+) {
+    let peer = SourceProcessIdentity {
+        pid: peer_pid,
+        boot_id: String::new(),
+        starttime_ticks: 0,
+    };
+    record_original_rejection(owner, &peer, None, None, cause);
+}
+
+fn record_original_rejection(
+    owner: &CompletionDomainOwner,
+    peer: &SourceProcessIdentity,
+    root_id: Option<&str>,
+    work_id: Option<&str>,
+    cause: &'static str,
+) {
+    let mut start = SpanStart::new("root_original_work_rejection", "process_tree")
+        .with_lifecycle_phase("original_work_preaccept")
+        .with_identifier("supervisor_authority_id", &owner.supervisor_authority_id)
+        .with_identifier("authority_pid", &owner.guardian_identity.pid.to_string())
+        .with_identifier("authority_boot_id", &owner.guardian_identity.boot_id)
+        .with_identifier(
+            "authority_starttime_ticks",
+            &owner.guardian_identity.starttime_ticks.to_string(),
+        )
+        .with_identifier("initiator_pid", &peer.pid.to_string())
+        .with_identifier(
+            "initiator_boot_id",
+            if peer.boot_id.is_empty() {
+                "unavailable"
+            } else {
+                &peer.boot_id
+            },
+        )
+        .with_identifier(
+            "initiator_starttime_ticks",
+            &peer.starttime_ticks.to_string(),
+        );
+    if let Some(root_id) = root_id {
+        start = start.with_identifier("root_id", root_id);
+    }
+    if let Some(work_id) = work_id {
+        start = start.with_hashed_correlation("work_id", work_id);
+    }
+    process_recorder().with_requested_span(start, |span| {
+        let _ = span.record(
+            DiagnosticPhase::Failed,
+            PhaseObservation::not_started().with_cause(cause),
+        );
+    });
 }
 
 /// A lost socket owner does not erase a live native entry's ability to admit

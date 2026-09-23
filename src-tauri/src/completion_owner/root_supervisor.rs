@@ -163,6 +163,7 @@ pub(super) struct RootSupervisor {
     reconcile_cursor: Option<(String, String)>,
     reconcile_error: Option<String>,
     driver_error: Option<String>,
+    original: super::original_work::OriginalWorkSupervisor,
 }
 
 impl RootSupervisor {
@@ -180,6 +181,7 @@ impl RootSupervisor {
             reconcile_cursor: None,
             reconcile_error: None,
             driver_error: None,
+            original: super::original_work::OriginalWorkSupervisor::default(),
         })
     }
 
@@ -198,7 +200,65 @@ impl RootSupervisor {
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.active.is_empty()
+        self.active.is_empty() && self.original.is_empty()
+    }
+
+    pub(super) fn original_accepts_nested(
+        &self,
+        root_id: &str,
+        parent_work_id: &str,
+        parent_capability: &str,
+        peer: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+    ) -> bool {
+        self.original
+            .accepts_nested(root_id, parent_work_id, parent_capability, peer)
+    }
+
+    pub(super) fn original_peer_in_root(
+        &self,
+        root_id: &str,
+        peer: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+    ) -> bool {
+        self.original.peer_in_root(root_id, peer)
+    }
+
+    pub(super) fn original_parent_for_peer(
+        &self,
+        root_id: &str,
+        peer: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+    ) -> Option<&str> {
+        self.original.parent_for_peer(root_id, peer)
+    }
+
+    pub(super) fn original_root_for_peer(
+        &self,
+        peer: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+    ) -> Option<&str> {
+        self.original.root_for_peer(peer)
+    }
+
+    pub(super) fn original_worker_pids(&self) -> Vec<i64> {
+        self.original.worker_pids()
+    }
+
+    pub(super) fn original_active_root_ids(&self) -> std::collections::BTreeSet<String> {
+        self.original.active_root_ids()
+    }
+
+    pub(super) fn submit_original(
+        &mut self,
+        owner: &CompletionDomainOwner,
+        request: super::original_work::InboundWork,
+    ) {
+        self.original.submit(owner, request);
+    }
+
+    pub(super) fn cancel_original(
+        &mut self,
+        owner: &CompletionDomainOwner,
+        request: super::original_work::InboundCancel,
+    ) {
+        self.original.cancel(owner, request);
     }
 
     fn retain_never_forked(
@@ -240,6 +300,7 @@ impl RootSupervisor {
             }
         }
         self.observe_active(owner);
+        self.original.tick(owner);
         let now = Instant::now();
         if now >= self.next_reconcile {
             // Retained-result reconciliation is recovery, not guardian

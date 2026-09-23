@@ -1,5 +1,7 @@
-//! Pre-provider independent notification ownership. No workload argv crosses this
-//! endpoint; original Bash supervisor/guardian/workload ancestry is unchanged.
+//! Pre-provider root process-tree ownership. Completion-continuation operations
+//! retain their existing State/mailbox authority; original-work-v1 requests use
+//! a separate capability, acceptance, cancellation, and result protocol on the
+//! same inherited endpoint and guardian.
 //! Declared roles: orchestration, validator, accessor, parser, mapper.
 #[cfg(target_os = "linux")]
 mod custody;
@@ -8,12 +10,16 @@ mod driver;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+mod original_work;
+#[cfg(target_os = "linux")]
 mod root_supervisor;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
 pub(crate) const ENDPOINT_ENV: &str = "OULIPOLY_COMPLETION_ENDPOINT";
+pub(crate) const ROOT_AUTHORITY_ENV: &str = "OULIPOLY_ROOT_AUTHORITY_V1";
+pub(crate) const ORIGINAL_WORK_REQUIRED_ENV: &str = "OULIPOLY_ORIGINAL_WORK_REQUIRED_V1";
 
 /// Preserve the State open source at entry; unrelated owner/path text is operational.
 #[derive(Debug)]
@@ -114,7 +120,10 @@ pub fn bootstrap_service() -> Result<(), String> {
 fn bootstrap_entry_service() -> Result<(), BootstrapError> {
     #[cfg(target_os = "linux")]
     {
-        linux::bootstrap()
+        linux::bootstrap()?;
+        // The initial provider is launched by this process, not by the
+        // completion root worker. Establish lineage before dispatch can fork.
+        custody::establish_entry_lineage().map_err(BootstrapError::Operational)
     }
     #[cfg(not(target_os = "linux"))]
     {
