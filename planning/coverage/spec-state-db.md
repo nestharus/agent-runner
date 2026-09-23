@@ -29,8 +29,10 @@
 - `crates/oulipoly-state/src/mailbox.rs`
 - `crates/oulipoly-state/src/mailbox/retention.rs`
 - `crates/oulipoly-state/src/mailbox/schema.rs`
+- `crates/oulipoly-state/src/mailbox/completion_continuation/mod.rs`
 - `crates/oulipoly-state/src/mailbox/migrations/0022_live_history_barrier.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0023_record_timestamp_contract.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0024_kernel_root_owner.sql`
 - `crates/oulipoly-state/migrations/0012_session_ingress_evidence.sql`
 - `crates/oulipoly-state/migrations/0026_live_history_barrier.sql`
 - `crates/oulipoly-state/migrations/0027_record_timestamp_contract.sql`
@@ -87,6 +89,7 @@
 |-----------------|-----------------|
 | Fresh deployment, no DB file. | `db.rs` opens (creating), `migrations.rs` applies the full schema in one transaction, `schema_probe.rs` reports the resulting version. |
 | Existing DB at current version. | Open succeeds without migration writes; `schema_probe.rs` confirms version match. |
+| Pinned kernel guardian publishes a completion owner. | Sidecar v24 stores its root UUID in the same transaction as domain, supervisor, guardian, and driver identity; a replacement driver may reuse the root only beneath that exact guardian and authority. |
 | Existing DB one or more versions behind. | `migrations.rs` runs forward migrations in order; row-version triggers apply per `row_version/triggers_sql/`. |
 | Existing DB at a FUTURE version. | Open fails with `SchemaTooNew` carrying actual and expected versions; do NOT downgrade. |
 | Existing DB at a known-incompatible past version (no migration path). | Open fails with `MigrationUnsupported`; advise the operator to reset or restore. |

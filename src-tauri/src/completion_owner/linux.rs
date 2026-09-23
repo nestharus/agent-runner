@@ -278,7 +278,7 @@ pub(super) fn bootstrap() -> Result<(), super::BootstrapError> {
     }
     if pid == 0 {
         drop(ready);
-        let code = guardian(&path, &endpoint, &domain, election, Some(announce))
+        let code = guardian(&path, &endpoint, &domain, election, Some(announce), None)
             .map(|()| 0)
             .unwrap_or(70);
         unsafe { libc::_exit(code) }
@@ -302,6 +302,118 @@ pub(super) fn bootstrap() -> Result<(), super::BootstrapError> {
     };
     require_owner(&domain)?;
     retain_context(ready)?;
+    Ok(())
+}
+
+/// Continue in the broker-pinned host child. The entry has already verified G/A;
+/// the driver remains behind its owner-frame gate until a second A and a
+/// durable owner comparison after publication. Losing election is a refusal:
+/// this child cannot join another guardian and still satisfy the broker pin.
+pub(crate) fn run_pinned_guardian(
+    pin: &super::PinnedGuardian,
+    announce: UnixStream,
+) -> Result<(), String> {
+    let path = MailboxDb::default_path()?;
+    path.parent().ok_or("sidecar parent absent")?;
+    let transition = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path.with_extension("completion-bootstrap.lock"))
+        .map_err(|e| e.to_string())?;
+    <std::fs::File as fs4::FileExt>::lock(&transition).map_err(|e| e.to_string())?;
+    let state = oulipoly_state::schema_probe::run_schema_probe()
+        .map_err(|e| format!("State changed after broker binding: {e:?}"))?
+        .state_db;
+    if !state.exists || state.user_version != state.current_schema_version || !state.compatible {
+        return Err("State domain changed after broker binding".into());
+    }
+    let mailbox = MailboxDb::open_read_only(&path)?;
+    let domain = mailbox
+        .completion_continuation_domain()?
+        .ok_or("missing native domain after broker grant")?;
+    if domain != pin.domain_id {
+        return Err("native domain changed after broker guardian binding".into());
+    }
+    drop(mailbox);
+    drop(transition);
+
+    let directory = PathBuf::from("/tmp")
+        .join(format!("oulipoly-completion-{}-{domain}", unsafe {
+            libc::geteuid()
+        }));
+    match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let metadata = std::fs::symlink_metadata(&directory).map_err(|e| e.to_string())?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err("completion election directory is not private".into());
+    }
+    let endpoint = directory.join("owner.sock");
+    let admission = admission_gate(&endpoint)?;
+    <std::fs::File as fs4::FileExt>::lock(&admission).map_err(|e| e.to_string())?;
+    let election = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join("election.lock"))
+        .map_err(|e| e.to_string())?;
+    <std::fs::File as fs4::FileExt>::try_lock(&election)
+        .map_err(|_| "pinned guardian did not win completion owner election")?;
+    drop(admission);
+    guardian(
+        &path,
+        &endpoint,
+        &domain,
+        election,
+        Some(announce),
+        Some(pin),
+    )
+}
+
+pub(crate) fn verify_pinned_owner_ready(
+    announce: &mut UnixStream,
+    pin: &super::PinnedGuardian,
+    guardian_pid: i32,
+) -> Result<(), String> {
+    let grant = await_guardian_ready(announce, guardian_pid)?;
+    let expected_guardian = identity(i64::from(guardian_pid))?;
+    let expected_entry = identity(i64::from(std::process::id()))?;
+    if grant.protocol != super::original_work::ROOT_PROTOCOL
+        || grant.completion_protocol != PROTOCOL
+        || grant.root_id != pin.root_id
+        || grant.domain_id != pin.domain_id
+        || grant.supervisor_authority_id != pin.supervisor_authority_id
+        || grant.guardian_identity != expected_guardian
+        || grant.root_identity != expected_entry
+    {
+        return Err("pinned root authority grant does not match broker identities".into());
+    }
+    let mailbox = MailboxDb::open_read_only(&MailboxDb::default_path()?)?;
+    let owner = mailbox
+        .completion_continuation_owner()?
+        .ok_or("pinned completion owner was not published")?;
+    if owner.protocol != PROTOCOL
+        || owner.domain_id != pin.domain_id
+        || owner.supervisor_authority_id != pin.supervisor_authority_id
+        || owner.guardian_identity != expected_guardian
+        || owner.driver_identity != identity(owner.driver_identity.pid)?
+        || mailbox.completion_owner_kernel_root_id(&owner.owner_generation)?
+            != Some(pin.root_id.clone())
+    {
+        return Err("durable completion owner does not match broker identities".into());
+    }
     Ok(())
 }
 
@@ -378,6 +490,7 @@ fn guardian(
     domain: &str,
     election: std::fs::File,
     mut announce: Option<UnixStream>,
+    pinned: Option<&super::PinnedGuardian>,
 ) -> Result<(), String> {
     if unsafe { libc::setsid() } < 0
         || unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0
@@ -394,20 +507,50 @@ fn guardian(
     }
     retained.extend(super::custody::pending_birth_fds());
     close_except(&retained);
-    let (mut owner, driver_channel) = start_driver(path, endpoint, domain, listener.as_raw_fd())?;
-    let mut root_supervisor = super::root_supervisor::RootSupervisor::new(path, driver_channel)?;
+    let (mut owner, mut driver_channel) = start_driver(
+        path,
+        endpoint,
+        domain,
+        listener.as_raw_fd(),
+        pinned,
+        pinned.is_some(),
+    )?;
     let mut contexts = ContextLeases::inherit(path)?;
     let mut root_authorities = super::original_work::RootAuthorities::default();
     if let Some(mut socket) = announce.take() {
         let context = identity(peer_pid(&socket)?)?;
         MailboxDb::open(path)?.retain_completion_context(&context)?;
-        let grant = root_authorities.fresh(&owner, context.clone())?;
+        let grant = if let Some(pinned) = pinned {
+            root_authorities.fresh_with_root_id(&owner, context.clone(), pinned.root_id.clone())?
+        } else {
+            root_authorities.fresh(&owner, context.clone())?
+        };
         socket.write_all(&[1]).map_err(|e| e.to_string())?;
         serde_json::to_writer(&mut socket, &grant).map_err(|error| error.to_string())?;
         socket.write_all(b"\n").map_err(|error| error.to_string())?;
+        if pinned.is_some() {
+            let mut release = [0];
+            socket
+                .read_exact(&mut release)
+                .map_err(|error| error.to_string())?;
+            if release != [b'R'] {
+                return Err("pinned guardian owner verification refused".into());
+            }
+        }
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
         contexts.retain_local(context, socket);
     }
+    if pinned.is_some() {
+        let mailbox = MailboxDb::open(path)?;
+        if mailbox.completion_continuation_owner()?.as_ref() != Some(&owner)
+            || mailbox.completion_owner_kernel_root_id(&owner.owner_generation)?
+                != pinned.map(|pin| pin.root_id.clone())
+        {
+            return Err("pinned completion owner changed before driver release".into());
+        }
+        publish_driver_owner(&mut driver_channel, &owner)?;
+    }
+    let mut root_supervisor = super::root_supervisor::RootSupervisor::new(path, driver_channel)?;
     // Open a distinct description after close_except: never reuse the
     // bootstrap parent's inherited flock description.
     let admission = admission_gate(endpoint)?;
@@ -466,7 +609,7 @@ fn guardian(
                 // No control thread (or copied thread locks) may cross fork.
                 append_pending(&mut pending, control.stop()?, &owner);
                 let (replacement, driver_channel) =
-                    start_driver(path, endpoint, domain, listener.as_raw_fd())?;
+                    start_driver(path, endpoint, domain, listener.as_raw_fd(), pinned, false)?;
                 owner = replacement;
                 root_supervisor.replace_driver(driver_channel)?;
                 control = ControlService::start(&listener, &owner)?;
@@ -910,6 +1053,8 @@ fn start_driver(
     endpoint: &Path,
     domain: &str,
     listener: RawFd,
+    pinned: Option<&super::PinnedGuardian>,
+    hold_owner_frame: bool,
 ) -> Result<(CompletionDomainOwner, UnixStream), String> {
     let (mut release, gate) = UnixStream::pair().map_err(|e| e.to_string())?;
     let executable = std::ffi::CString::new("/proc/self/exe").expect("static path has no NUL");
@@ -952,11 +1097,15 @@ fn start_driver(
     // Driver replacement beneath the same living guardian stays in the same
     // process-tree authority. A later independent guardian always mints a new
     // root and publication explicitly adopts only unresolved predecessor debt.
-    let supervisor_authority_id = MailboxDb::open(path)?
-        .completion_continuation_owner()?
-        .filter(|current| current.guardian_identity == guardian_identity)
-        .map(|current| current.supervisor_authority_id)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let supervisor_authority_id = if let Some(pin) = pinned {
+        pin.supervisor_authority_id.clone()
+    } else {
+        MailboxDb::open(path)?
+            .completion_continuation_owner()?
+            .filter(|current| current.guardian_identity == guardian_identity)
+            .map(|current| current.supervisor_authority_id)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+    };
     let owner = CompletionDomainOwner {
         protocol: PROTOCOL.into(),
         domain_id: domain.into(),
@@ -966,10 +1115,25 @@ fn start_driver(
         driver_identity: identity(i64::from(pid))?,
         endpoint: endpoint.to_string_lossy().into_owned(),
     };
-    MailboxDb::open(path)?.publish_completion_continuation_owner(&owner)?;
-    serde_json::to_writer(&mut release, &owner).map_err(|e| e.to_string())?;
-    release.write_all(b"\n").map_err(|e| e.to_string())?;
+    MailboxDb::open(path)?.publish_completion_owner_with_kernel_root(
+        &owner,
+        pinned.map(|pin| pin.root_id.as_str()),
+    )?;
+    // On the first pinned publication the driver cannot read its owner frame
+    // until the entry has compared the durable row with broker A. Replacement
+    // drivers remain beneath the already verified guardian and authority.
+    if !hold_owner_frame {
+        publish_driver_owner(&mut release, &owner)?;
+    }
     Ok((owner, release))
+}
+
+fn publish_driver_owner(
+    release: &mut UnixStream,
+    owner: &CompletionDomainOwner,
+) -> Result<(), String> {
+    serde_json::to_writer(&mut *release, owner).map_err(|e| e.to_string())?;
+    release.write_all(b"\n").map_err(|e| e.to_string())
 }
 
 pub(super) fn read_driver_owner(socket: &mut UnixStream) -> Result<CompletionDomainOwner, String> {

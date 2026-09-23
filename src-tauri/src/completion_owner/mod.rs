@@ -21,6 +21,30 @@ pub(crate) const ENDPOINT_ENV: &str = "OULIPOLY_COMPLETION_ENDPOINT";
 pub(crate) const ROOT_AUTHORITY_ENV: &str = "OULIPOLY_ROOT_AUTHORITY_V1";
 pub(crate) const ORIGINAL_WORK_REQUIRED_ENV: &str = "OULIPOLY_ORIGINAL_WORK_REQUIRED_V1";
 
+#[cfg(target_os = "linux")]
+pub(crate) struct PinnedGuardian {
+    pub(crate) root_id: String,
+    pub(crate) domain_id: String,
+    pub(crate) supervisor_authority_id: String,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn run_pinned_guardian(
+    pin: &PinnedGuardian,
+    announce: std::os::unix::net::UnixStream,
+) -> Result<(), String> {
+    linux::run_pinned_guardian(pin, announce)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_pinned_owner_ready(
+    announce: &mut std::os::unix::net::UnixStream,
+    pin: &PinnedGuardian,
+    guardian_pid: i32,
+) -> Result<(), String> {
+    linux::verify_pinned_owner_ready(announce, pin, guardian_pid)
+}
+
 /// Preserve the State open source at entry; unrelated owner/path text is operational.
 #[derive(Debug)]
 pub(crate) enum BootstrapError {

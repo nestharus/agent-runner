@@ -1,10 +1,10 @@
-//! Host-side staging for the unfinished kernel handoff. The opt-in path never
-//! opens a writable database or starts completion recovery. The only pre-grant
-//! mailbox observation is a detached, physically nonmutating read-only snapshot.
-use oulipoly_kernel_broker::protocol::{self, Operation, request};
+//! Host-side pinned completion authority for the unfinished kernel handoff.
+//! No root child or accepted work is released by this entry.
+use oulipoly_kernel_broker::protocol::{self, Operation};
 use oulipoly_state::mailbox::MailboxDb;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 const REQUIRED_ENV: &str = "OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1";
@@ -16,8 +16,18 @@ pub(crate) fn host_entry() -> Option<ExitCode> {
     let result = stage_host_entry(
         || {
             // Probe before E: a detached snapshot cannot create or migrate the
-            // live mailbox. A missing/old domain is refused without reservation.
+            // live databases. Missing State/domain initialization is a separate
+            // administrative transition, never part of a failed custody grant.
             let path = MailboxDb::default_path()?;
+            let state = oulipoly_state::schema_probe::run_schema_probe()
+                .map_err(|e| format!("State preflight refused: {e:?}"))?
+                .state_db;
+            if !state.exists
+                || state.user_version != state.current_schema_version
+                || !state.compatible
+            {
+                return Err("current State domain must be initialized separately".into());
+            }
             let domain = MailboxDb::open_read_only(&path)?
                 .completion_continuation_domain()?
                 .ok_or("native completion domain is absent")?;
@@ -25,7 +35,8 @@ pub(crate) fn host_entry() -> Option<ExitCode> {
             Ok(domain)
         },
         || {
-            let response = request(Operation::ReserveEntry).map_err(|e| e.to_string())?;
+            let response = protocol::request_at(&broker_socket(), Operation::ReserveEntry)
+                .map_err(|e| e.to_string())?;
             let id = response
                 .strip_prefix("reserved ")
                 .and_then(|s| s.strip_suffix('\n'))
@@ -44,6 +55,21 @@ pub(crate) fn host_entry() -> Option<ExitCode> {
     }
 }
 
+// This socket override is reachable only in an isolated user namespace where
+// UID 0 is not host root. It permits a private unprivileged broker-like fixture
+// to run the production bootstrap code without installing a host service.
+fn broker_socket() -> PathBuf {
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if unsafe { libc::geteuid() } == 0
+        && std::fs::read_link("/proc/self/ns/user").ok()
+            != std::fs::read_link("/proc/1/ns/user").ok()
+        && let Some(path) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+    {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(protocol::INSTALLED_SOCKET)
+}
+
 fn stage_host_entry(
     preflight: impl FnOnce() -> Result<String, String>,
     reserve: impl FnOnce() -> Result<String, String>,
@@ -55,12 +81,13 @@ fn stage_host_entry(
     uuid::Uuid::parse_str(&root_id).map_err(|_| "invalid reserved root ID")?;
     let supervisor = uuid::Uuid::new_v4().to_string();
     bind(&root_id, &domain, &supervisor)?;
-    // The host grant only authorizes later bootstrap. There is no broker child
-    // join or accepted-work namespace yet, so no service or work starts here.
+    // The production binding owns its guardian until exit. No root child join
+    // or accepted-work namespace exists, so this path cannot release a Runner.
     Err("root child handoff is not implemented; no Runner was released".into())
 }
 
 fn bind_host_guardian(root: &str, domain: &str, supervisor: &str) -> Result<(), String> {
+    let broker = broker_socket();
     let (mut parent, mut child) = UnixStream::pair().map_err(|e| e.to_string())?;
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -74,7 +101,7 @@ fn bind_host_guardian(root: &str, domain: &str, supervisor: &str) -> Result<(), 
             if release != [b'P'] {
                 return Err("guardian gate refused".into());
             }
-            let response = protocol::bind_guardian(root, domain, supervisor)
+            let response = protocol::bind_guardian_at(&broker, root, domain, supervisor)
                 .map_err(|e| format!("broker guardian binding failed: {e}"))?;
             child
                 .write_all(response.as_bytes())
@@ -85,13 +112,21 @@ fn bind_host_guardian(root: &str, domain: &str, supervisor: &str) -> Result<(), 
             if done != [b'X'] {
                 return Err("guardian readback incomplete".into());
             }
-            Ok::<(), String>(())
+            unsafe { std::env::remove_var(REQUIRED_ENV) };
+            crate::completion_owner::run_pinned_guardian(
+                &crate::completion_owner::PinnedGuardian {
+                    root_id: root.into(),
+                    domain_id: domain.into(),
+                    supervisor_authority_id: supervisor.into(),
+                },
+                child,
+            )
         })();
         unsafe { libc::_exit(if result.is_ok() { 0 } else { 70 }) }
     }
     drop(child);
     let result = (|| {
-        let prepared = protocol::prepare_guardian(root, pid)
+        let prepared = protocol::prepare_guardian_at(&broker, root, pid)
             .map_err(|e| format!("broker guardian prepare failed: {e}"))?;
         if prepared != format!("prepared {root}\n") {
             return Err(format!(
@@ -117,24 +152,42 @@ fn bind_host_guardian(root: &str, domain: &str, supervisor: &str) -> Result<(), 
         if bound != format!("bound {root} {domain} {supervisor}\n").as_bytes() {
             return Err("broker guardian binding refused or mismatched".into());
         }
-        let readback =
-            protocol::read_entry(root).map_err(|e| format!("broker entry readback failed: {e}"))?;
+        let readback = protocol::read_entry_at(&broker, root)
+            .map_err(|e| format!("broker entry readback failed: {e}"))?;
         if readback != format!("bound-entry {root} {domain} {supervisor} {pid}\n") {
             return Err("broker durable grant readback mismatch".into());
         }
         parent.write_all(b"X").map_err(|e| e.to_string())?;
+        let pin = crate::completion_owner::PinnedGuardian {
+            root_id: root.into(),
+            domain_id: domain.into(),
+            supervisor_authority_id: supervisor.into(),
+        };
+        crate::completion_owner::verify_pinned_owner_ready(&mut parent, &pin, pid)?;
+        let readback = protocol::read_entry_at(&broker, root)
+            .map_err(|e| format!("broker final owner readback failed: {e}"))?;
+        if readback != format!("bound-entry {root} {domain} {supervisor} {pid}\n") {
+            return Err("broker final owner readback mismatch".into());
+        }
+        parent.write_all(b"R").map_err(|e| e.to_string())?;
+        // The child is the actual completion guardian. Hold the native context
+        // until a one-use root child join exists; this opt-in entry waits for
+        // the exact guardian and reports its loss.
+        eprintln!("OULIPOLY_KERNEL_ENTRY_GAP=root child join unavailable; pinned guardian active");
         Ok(())
     })();
-    drop(parent);
+    if result.is_err() {
+        let _ = parent.shutdown(std::net::Shutdown::Both);
+    }
     let mut status = 0;
     if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
         return Err("host guardian wait failed".into());
     }
+    drop(parent);
     result?;
-    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
-        return Err("host guardian exited before grant verification".into());
-    }
-    Ok(())
+    Err(format!(
+        "pinned host guardian exited with status {status}; no root child was released"
+    ))
 }
 
 #[cfg(test)]

@@ -148,6 +148,21 @@ impl MailboxDb {
             })).transpose()
     }
 
+    pub fn completion_owner_kernel_root_id(
+        &self,
+        generation: &str,
+    ) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT kernel_root_id FROM completion_continuation_owner WHERE generation=?1 AND phase='running'",
+                [generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+            .map(|root| root.flatten())
+    }
+
     /// The sidecar continuity head is the exact durable cursor for State repair.
     /// Recovery reads only the append-only suffix after this ordinal; accepted
     /// historical bindings before it are not part of the hot working set.
@@ -254,6 +269,20 @@ WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND
         &mut self,
         owner: &CompletionDomainOwner,
     ) -> Result<(), String> {
+        self.publish_completion_owner_with_kernel_root(owner, None)
+    }
+
+    pub fn publish_completion_owner_with_kernel_root(
+        &mut self,
+        owner: &CompletionDomainOwner,
+        kernel_root_id: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(root_id) = kernel_root_id {
+            let parsed = uuid::Uuid::parse_str(root_id).map_err(|_| "invalid kernel root ID")?;
+            if parsed.to_string() != root_id {
+                return Err("kernel root ID is not canonical".into());
+            }
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -268,6 +297,25 @@ WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND
         }
         let encoded_guardian =
             serde_json::to_string(&owner.guardian_identity).map_err(|e| e.to_string())?;
+        if let Some(root_id) = kernel_root_id {
+            let moved: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM completion_continuation_owner
+                     WHERE kernel_root_id=?1 AND
+                     (domain_id!=?2 OR supervisor_authority_id!=?3 OR guardian_identity!=?4))",
+                    params![
+                        root_id,
+                        owner.domain_id,
+                        owner.supervisor_authority_id,
+                        encoded_guardian
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if moved {
+                return Err("kernel root ID cannot move to another guardian or authority".into());
+            }
+        }
         let current_root: Option<(String, String)> = tx
             .query_row(
                 "SELECT supervisor_authority_id,guardian_identity
@@ -403,15 +451,16 @@ UPDATE completion_continuation_attempt SET phase='unknown_custody',revision=revi
         tx.execute(
             "INSERT INTO completion_continuation_owner(
                 generation,domain_id,phase,guardian_identity,driver_identity,
-                endpoint,supervisor_authority_id)
-             VALUES(?1,?2,'running',?3,?4,?5,?6)",
+                endpoint,supervisor_authority_id,kernel_root_id)
+             VALUES(?1,?2,'running',?3,?4,?5,?6,?7)",
             params![
                 owner.owner_generation,
                 owner.domain_id,
                 encoded_guardian,
                 serde_json::to_string(&owner.driver_identity).map_err(|e| e.to_string())?,
                 owner.endpoint,
-                owner.supervisor_authority_id
+                owner.supervisor_authority_id,
+                kernel_root_id,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -499,6 +548,9 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                     "../migrations/0022_completion_native_runtime.sql"
                 ))
                 .map_err(|e| e.to_string())?;
+            expected
+                .execute_batch(include_str!("../migrations/0024_kernel_root_owner.sql"))
+                .map_err(|e| e.to_string())?;
             definitions(&expected)
         })
         .as_ref()
@@ -552,6 +604,83 @@ mod tests {
         };
         db.publish_completion_continuation_owner(&owner).unwrap();
         (dir, db, owner)
+    }
+
+    #[test]
+    fn kernel_root_is_atomic_and_only_reused_for_same_guardian_succession() {
+        let (_dir, mut db, owner) = fixture();
+        assert_eq!(
+            db.completion_owner_kernel_root_id(&owner.owner_generation)
+                .unwrap(),
+            None
+        );
+        let root_id = uuid::Uuid::new_v4().to_string();
+        let mut pinned = owner.clone();
+        pinned.owner_generation = uuid::Uuid::new_v4().to_string();
+        pinned.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            db.publish_completion_owner_with_kernel_root(&pinned, Some("bad-root"))
+                .is_err()
+        );
+        assert_eq!(db.completion_continuation_owner().unwrap(), Some(owner));
+        db.publish_completion_owner_with_kernel_root(&pinned, Some(&root_id))
+            .unwrap();
+        assert_eq!(
+            db.completion_continuation_owner().unwrap(),
+            Some(pinned.clone())
+        );
+        assert_eq!(
+            db.completion_owner_kernel_root_id(&pinned.owner_generation)
+                .unwrap(),
+            Some(root_id.clone())
+        );
+        let mut replacement = pinned.clone();
+        replacement.owner_generation = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&replacement, Some(&root_id))
+            .unwrap();
+        assert_eq!(
+            db.completion_owner_kernel_root_id(&replacement.owner_generation)
+                .unwrap(),
+            Some(root_id.clone())
+        );
+        let mut replay = replacement.clone();
+        replay.owner_generation = uuid::Uuid::new_v4().to_string();
+        replay.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            db.publish_completion_owner_with_kernel_root(&replay, Some(&root_id))
+                .is_err()
+        );
+        assert_eq!(
+            db.completion_continuation_owner().unwrap(),
+            Some(replacement)
+        );
+    }
+
+    #[test]
+    fn populated_v23_owner_upgrades_without_inventing_a_kernel_root() {
+        let (dir, db, owner) = fixture();
+        drop(db);
+        let path = dir.path().join("pid-identity.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX completion_continuation_owner_kernel_root;
+                 ALTER TABLE completion_continuation_owner DROP COLUMN kernel_root_id;
+                 PRAGMA user_version=23;",
+            )
+            .unwrap();
+        drop(connection);
+        let upgraded = MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            upgraded.completion_continuation_owner().unwrap(),
+            Some(owner.clone())
+        );
+        assert_eq!(
+            upgraded
+                .completion_owner_kernel_root_id(&owner.owner_generation)
+                .unwrap(),
+            None
+        );
     }
 
     fn explain(db: &MailboxDb, sql: &str, supervisor_authority_id: &str) -> Vec<String> {

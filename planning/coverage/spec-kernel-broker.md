@@ -12,12 +12,15 @@
 - `crates/oulipoly-kernel-broker/src/work_registry.rs`
 - `src-tauri/src/kernel_entry.rs`
 - `src-tauri/src/completion_owner/linux.rs`
+- `src-tauri/src/completion_owner/mod.rs`
 - `src-tauri/src/completion_owner/original_work.rs`
 - `src-tauri/src/main.rs`
+- `src-tauri/tests/age319_persistent_guardian.rs`
 
 ## Preconditions
 
-- The broker source remains uninstalled. The opt-in Runner host-entry staging path is fail-closed before provider dispatch.
+- The broker source remains uninstalled. The opt-in Runner host entry starts a pinned completion guardian after a positive broker grant but does not release a child Runner.
+- State and mailbox domains are initialized separately before this opt-in entry; preflight is read-only.
 - An installed service would require host root in the initial user/PID namespaces, protected binary and state paths, and a fixed Runner image.
 - Only trusted in-process broker code can call `insert_prepared`, after a separate positive accepted-work check. There is no work-registration socket opcode.
 
@@ -33,6 +36,8 @@
 | Unsolicited descriptor in a challenged socket request. | Descriptor closed and request refused. |
 | Entry reservation from an unrelated child PID namespace classified `outside`. | Denied because the connector is not in the broker's host PID namespace. |
 | Host entry reserves before guardian fork, then prepares a gated exact child and binds its domain. | Fsynced root/entry/prepared-guardian/domain binding; repeated bind refused. |
+| Pinned guardian publishes a completion owner after broker G/A. | The owner row stores the exact root UUID, domain, supervisor UUID, and guardian incarnation; the driver remains gated until a second A and durable row comparison. |
+| P or G is refused, or the guardian dies. | No child Runner is released; debt remains and later readback/admission is denied. |
 | A sibling child tries to bind a prepared guardian's root ID. | Refused on pinned guardian incarnation mismatch. |
 | Legacy `L` request. | Refused; no ungated Runner is released. |
 | Host-connected socket inherited by a privileged child PID namespace process. | Ancestor PID claim fails in the kernel; a real child send fails the broker's per-request credential equality check. |
@@ -56,7 +61,7 @@
 - Classification is never positive work authority.
 - The source has no authenticated Runner join, CLI/GUI descriptor handoff, guardian acceptance handoff, work launch, clean physical drain receipt, or retirement operation.
 - The unprivileged user-namespace fixture cannot establish host-root sudo/setuid behavior.
-- Ordinary Runner/Bash entry and allocated-attempt NNP/seccomp remain. The opt-in host entry stages a guardian, then refuses dispatch.
+- Ordinary Runner/Bash entry and allocated-attempt NNP/seccomp remain. The opt-in host entry holds the live completion guardian while waiting for the still-unimplemented one-use child join; it releases no child Runner.
 
 ## Declared test patterns
 
@@ -64,7 +69,8 @@
 - `crates/oulipoly-kernel-broker/tests/private_work_pidns.rs` exercises root/work binding, sibling separation, adopted peer classification, persistence poisoning, and restart uncertainty.
 - `crates/oulipoly-kernel-broker/src/linux_main.rs` unit tests exercise challenged credentials, a `CAP_SYS_ADMIN` child namespace socket handoff, exact host namespace policy, descriptor rejection, and production dispatch E/P/G ordering.
 - `crates/oulipoly-kernel-broker/src/entry_registry.rs` exercises persisted exact prepare/bind and sibling/replay denial.
-- `src-tauri/src/kernel_entry.rs` exercises reserve-before-guardian staging and fail-closed root mismatch.
+- `src-tauri/src/kernel_entry.rs` exercises read-only preflight and reserve-before-guardian ordering.
+- `src-tauri/tests/age319_persistent_guardian.rs` uses an opt-in private user-namespace broker-like endpoint and the production Runner binary to verify refusal before grant, exact durable owner/root identity, sibling/replay denial, and dead guardian debt.
 - `src-tauri/src/completion_owner/linux_admission_tests.rs` exercises prepare-before-release of the guardian gate.
 - `src-tauri/src/completion_owner/original_work.rs` exercises exact broker root ID propagation into a one-use root authority.
 

@@ -37,6 +37,7 @@ fn broker_unavailable_after_read_only_preflight_does_not_open_state_or_migrate_m
         oulipoly_state::mailbox::MailboxDb::open_completion_continuation_domain(&path).unwrap();
     assert!(mailbox.completion_continuation_domain().unwrap().is_some());
     drop(mailbox);
+    drop(oulipoly_state::StateDb::open(&data.path().join("state.db")).unwrap());
     let before = data_files(data.path());
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"))
         .arg("--help")
@@ -47,7 +48,7 @@ fn broker_unavailable_after_read_only_preflight_does_not_open_state_or_migrate_m
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("OULIPOLY_KERNEL_ENTRY_GAP="));
     assert_eq!(data_files(data.path()), before);
-    assert!(!data.path().join("state.db").exists());
+    assert!(data.path().join("state.db").exists());
 }
 
 #[cfg(target_os = "linux")]

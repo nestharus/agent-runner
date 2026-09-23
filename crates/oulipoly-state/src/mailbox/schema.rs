@@ -52,7 +52,7 @@ fn migrate_record_timestamp_contract(conn: &Connection) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
-pub(super) const CURRENT_VERSION: i64 = 23;
+pub(super) const CURRENT_VERSION: i64 = 24;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -209,7 +209,46 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         owner: SidecarEntity::PayloadRetention,
         apply: migrate_record_timestamp_contract,
     },
+    MigrationStep {
+        target_version: 24,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_kernel_root_owner,
+    },
 ];
+
+fn migrate_kernel_root_owner(conn: &Connection) -> Result<(), String> {
+    let has_root_column: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('completion_continuation_owner') WHERE name='kernel_root_id')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_root_column {
+        return conn
+            .execute_batch(include_str!("migrations/0024_kernel_root_owner.sql"))
+            .map_err(|error| error.to_string());
+    }
+    // A synthetic downgrade or nonstandard recovery may retain the column
+    // while its version is old. Add only the missing index, with the canonical
+    // SQL text used by the current-schema fingerprint.
+    let has_root_index: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='completion_continuation_owner_kernel_root')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_root_index {
+        conn.execute_batch(
+            "CREATE INDEX completion_continuation_owner_kernel_root
+ON completion_continuation_owner(kernel_root_id)
+WHERE kernel_root_id IS NOT NULL;",
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
 
 fn migrate_notification_settlement(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("migrations/0019_notification_settlement.sql"))
@@ -751,7 +790,9 @@ pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
 pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &Connection) {
     remove_record_timestamp_contract_for_legacy_fixture(conn);
     conn.execute_batch(
-        "DROP INDEX IF EXISTS idx_mailbox_pending_session_live;
+        "DROP INDEX IF EXISTS completion_continuation_owner_kernel_root;
+         ALTER TABLE completion_continuation_owner DROP COLUMN kernel_root_id;
+         DROP INDEX IF EXISTS idx_mailbox_pending_session_live;
          DROP INDEX IF EXISTS idx_mailbox_pending_target_live;
          DROP INDEX IF EXISTS idx_mailbox_deliverable_session_live;
          DROP INDEX IF EXISTS idx_mailbox_deliverable_target_live;
